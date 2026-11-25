@@ -886,6 +886,7 @@ impl ActiveOpStateSlot {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
             route: None,
             deleted_record: None,
+            subscription_key: None,
         }
     );
     active_state_accessor!(
@@ -934,6 +935,7 @@ impl ActiveOpStateSlot {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             route: None,
             old_record: None,
+            old_subscription_key: None,
             is_noop_update: false,
         }
     );
@@ -1227,6 +1229,7 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    pub(crate) change_snapshot: crate::subscription::ChangeSnapshot,
     /// Whether this statement has passed a `Transaction` instruction and is
     /// counted in `Connection::n_active_read_statements`.
     pub(crate) is_active_read: bool,
@@ -1345,6 +1348,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            change_snapshot: Default::default(),
             is_active_read: false,
             is_active_destroy: false,
             tx_read_only_at_start: false,
@@ -1872,6 +1876,10 @@ impl ProgramState {
                 "ending a writer with {previous} active writer(s)"
             );
             self.is_active_write = false;
+            let snapshot = std::mem::take(&mut self.change_snapshot);
+            if end_statement == EndStatement::RollbackSavepoint {
+                connection.pending_changes.restore(snapshot);
+            }
         }
         // A write statement that keeps its changes must have applied them to
         // the materialized views first (see
@@ -4780,6 +4788,7 @@ mod tests {
             sub_state: OpInsertSubState::Seek,
             route: None,
             old_record: None,
+            old_subscription_key: None,
             is_noop_update: false,
         };
         state.seek_state = OpSeekState::MoveLast;

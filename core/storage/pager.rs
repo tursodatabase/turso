@@ -3612,6 +3612,11 @@ impl Pager {
                         connection.db.update_schema_if_newer(schema);
                     }
 
+                    if update_transaction_state {
+                        connection
+                            .pending_changes
+                            .finish(None, Some(&connection.db.subscriptions));
+                    }
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
                         complete_commit();
                         self.clear_savepoints()?;
@@ -3642,6 +3647,7 @@ impl Pager {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;
         };
+        connection.pending_changes.finish(None, None);
         let (is_write, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
             _ => (false, false),

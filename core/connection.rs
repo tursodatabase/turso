@@ -148,6 +148,7 @@ impl TempDbContext {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NamedSavepointFrame {
+    pub(crate) change_snapshot: crate::subscription::ChangeSnapshot,
     pub(crate) name: String,
     pub(crate) starts_transaction: bool,
     pub(crate) deferred_fk_violations: isize,
@@ -497,6 +498,7 @@ pub struct Connection {
 
     /// Ordered row changes captured once per connection transaction, with
     /// consumer indexes for materialized-view maintenance.
+    pub(crate) pending_changes: crate::subscription::PendingChanges,
     pub(crate) transaction_changes: crate::incremental::view::TransactionChanges,
     /// Prepared IVM bytecode keyed by schema epoch and physical view layout.
     pub(crate) maintenance_program_cache:
@@ -4816,6 +4818,7 @@ impl Connection {
             .iter()
             .rposition(|savepoint| savepoint.name == name)?;
         let frame = &savepoints[target_idx];
+        self.pending_changes.restore(frame.change_snapshot.clone());
         let info = RollbackFrameInfo {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),

@@ -543,6 +543,10 @@ fn dropped_waiter_after_log_tx_still_commits() {
 
     let conn_a = db.connect();
     let conn_b = db.connect();
+    let waiter_changes = conn_b.db.subscribe_changes(turso_core::ChangeFilter::Row {
+        table: "t".into(),
+        primary_key: vec![Value::from_i64(2)],
+    });
     conn_a.execute("BEGIN CONCURRENT").unwrap();
     conn_b.execute("BEGIN CONCURRENT").unwrap();
     conn_a.execute("INSERT INTO t VALUES (1, 1)").unwrap();
@@ -612,6 +616,11 @@ fn dropped_waiter_after_log_tx_still_commits() {
         vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
         "waiter dropped after log_tx must still commit"
     );
+    assert!(
+        waiter_changes.try_recv().is_some(),
+        "the leader must publish the waiter's committed row"
+    );
+    assert_eq!(waiter_changes.try_recv(), None);
     let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
     assert!(
         matches!(result, Err(LimboError::Busy)),
