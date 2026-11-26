@@ -221,13 +221,18 @@ fn is_run_by_core(op: &str, types: &[Option<Checked>]) -> bool {
 
 /// FIXME(registered-types): The engine stores numeric and double precision both as REAL, and cannot hold NaN or an exponent past a double, so these spellings are compared as text and give false. Once numeric is a registered type with its own storage, the input function of the type reads every spelling and this function goes away.
 /// Whether `literal` is a value of the type `oid` that PostgreSQL reads but
-/// the engine cannot store or the input check here does not know: a number in
-/// the hex, octal or binary spelling or with underscores between digits, NaN and the infinities of a real, a double
-/// precision or a numeric, and a number with an exponent past the range of a
-/// double, which a numeric holds. The engine names a numeric REAL, like a
-/// double precision, so that exponent is not refused for either. The operator
-/// is left to the engine for these, as for any literal.
+/// the engine cannot store or the input check here does not know. The integer
+/// types read every spelling themselves. For a real, a double precision or a
+/// numeric it is a number in the hex, octal or binary spelling or with
+/// underscores between digits, NaN and the infinities, and a number with an
+/// exponent past the range of a double, which a numeric holds. The engine
+/// names a numeric REAL, like a double precision, so that exponent is not
+/// refused for either. The operator is left to the engine for these, as for
+/// any literal.
 fn is_spelling_left_to_the_engine(literal: &str, oid: i64) -> bool {
+    if [INT2, INT4, INT8].contains(&oid) {
+        return false;
+    }
     let text = literal.trim();
     let digits = text.trim_start_matches(['+', '-']);
     let lower = digits.to_ascii_lowercase();
@@ -347,15 +352,20 @@ fn checked_registered_type(ty: &ast::Type) -> Option<Checked> {
     })
 }
 
+/// FIXME(registered-types): An integer that has no registered type is taken to be an integer (int4), but it may be a bigint, such as count(*) or an integer written with more digits. So a string literal next to it is cast to bigint, and `check_number_literal` only refuses one out of the range of int4 when it is out of the range of int8. A type for each value replaces this.
 fn checked_engine_type(ty: EngineType, array_dimensions: u32) -> Option<Checked> {
     if array_dimensions > 0 {
         return None;
     }
     let oid = engine_type_oid(ty)?;
+    let cast_to = match ty {
+        EngineType::Integer => "bigint",
+        _ => ty.sql_name(),
+    };
     Some(Checked {
         oid,
         cast_to: ast::Type {
-            name: ty.sql_name().to_string(),
+            name: cast_to.to_string(),
             size: None,
             array_dimensions: 0,
         },

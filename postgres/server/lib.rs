@@ -1604,8 +1604,6 @@ mod tests {
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute("CREATE TABLE t (i int, b bigint)").unwrap();
         conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
-        conn.execute("CREATE TABLE o (i int)").unwrap();
-        conn.execute("INSERT INTO o VALUES (3000000000)").unwrap();
         // Each field is a 4-byte length followed by the value.
         for (sql, expected_type, binary, text) in [
             (
@@ -1691,7 +1689,10 @@ mod tests {
             }
         }
         // A value that the column's binary type cannot hold is refused.
-        for sql in ["SELECT i FROM o", "SELECT 1 UNION ALL SELECT 12.5"] {
+        for sql in [
+            "SELECT i * 100000000 FROM t",
+            "SELECT 1 UNION ALL SELECT 12.5",
+        ] {
             let mut stmt = conn.prepare(sql).unwrap();
             let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary).unwrap());
             let Err(error) = execute_query(&mut stmt, fields) else {
@@ -1967,9 +1968,9 @@ mod tests {
         assert_ne!(first[0], second[0], "COMMIT ends the transaction");
     }
 
-    // 3000000000 doesn't fit the int4 column, so the second row is refused
-    // after the first row is inserted.
-    const INSERT_RETURNING_MISFIT: &str = "INSERT INTO r VALUES (1), (3000000000) RETURNING i";
+    // The product is described as int4, and 4000000000 doesn't fit it, so the
+    // second row is refused after the first row is inserted.
+    const INSERT_RETURNING_MISFIT: &str = "INSERT INTO r VALUES (1), (2) RETURNING i * 2000000000";
 
     #[test]
     fn a_refused_returning_row_rolls_back_the_insert() {

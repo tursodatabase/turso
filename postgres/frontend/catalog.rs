@@ -444,6 +444,7 @@ impl Dialect for PostgresDialect {
         false
     }
 
+    /// FIXME(registered-types): Core types the columns of the new table with the storage types of the engine. A column of a type that converts values is refused here. A copy of a smallint, integer, bigint or varchar(n) column is accepted, because its values stay what they are, but it is a plain column: it loses the range or length check, and a copied key is not described as its type. A CREATE TABLE AS that gives each column the registered type of its expression replaces this.
     fn check_ctas_column_type(&self, column: &str, type_name: Option<&str>) -> Result<()> {
         let message = match type_name {
             Some(type_name) => format!(

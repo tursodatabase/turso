@@ -7312,9 +7312,11 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             };
         }
 
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" => "int4".into(),
+        "BIGSERIAL" | "SERIAL8" => "bigint".into(),
+        "SMALLSERIAL" | "SERIAL2" => "smallint".into(),
+
         // Base types (no Turso custom type needed)
-        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
-        | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
@@ -11085,8 +11087,8 @@ mod tests {
         let a = PgTypeMapping::array;
 
         // Base types (no Turso custom type)
-        assert_eq!(map_pg_type("INTEGER", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("SERIAL", no_params), Some(s("INTEGER")));
+        assert_eq!(map_pg_type("INTEGER", no_params), Some(s("int4")));
+        assert_eq!(map_pg_type("SERIAL", no_params), Some(s("int4")));
         assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
         assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
         assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
@@ -11130,14 +11132,14 @@ mod tests {
         assert_eq!(map_pg_type("MACADDR8", no_params), Some(s("macaddr8")));
 
         // Array types → base type + dimensions
-        assert_eq!(map_pg_type("INTEGER[]", no_params), Some(a("INTEGER", 1)));
+        assert_eq!(map_pg_type("INTEGER[]", no_params), Some(a("int4", 1)));
         assert_eq!(map_pg_type("TEXT[]", no_params), Some(a("TEXT", 1)));
         assert_eq!(map_pg_type("TEXT[][]", no_params), Some(a("TEXT", 2)));
         assert_eq!(map_pg_type("BOOLEAN[]", no_params), Some(a("boolean", 1)));
         assert_eq!(map_pg_type("BIGINT[]", no_params), Some(a("bigint", 1)));
         assert_eq!(map_pg_type("VARCHAR[]", no_params), Some(a("TEXT", 1)));
         // PG internal array notation
-        assert_eq!(map_pg_type("_int4", no_params), Some(a("INTEGER", 1)));
+        assert_eq!(map_pg_type("_int4", no_params), Some(a("int4", 1)));
         assert_eq!(map_pg_type("_text", no_params), Some(a("TEXT", 1)));
 
         // Unknown types pass through as-is (for user-defined enums etc.)

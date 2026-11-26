@@ -767,6 +767,46 @@ fn vacuum_is_refused() {
     }
 }
 
+/// A primary key of one column of an integer type is the rowid of its table,
+/// so it has no index of its own.
+#[test]
+fn primary_key_of_each_integer_type_is_the_rowid() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    let index_count = || {
+        let mut rows = conn
+            .inner()
+            .prepare_sqlite(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND tbl_name LIKE '%key_of_%'",
+            )
+            .unwrap();
+        assert!(matches!(rows.step().unwrap(), StepResult::Row));
+        rows.row().unwrap().get_value(0).to_string()
+    };
+    for ty in [
+        "smallint",
+        "integer",
+        "bigint",
+        "smallserial",
+        "serial",
+        "bigserial",
+    ] {
+        conn.execute(format!(
+            "CREATE TABLE key_of_{ty} (id {ty} PRIMARY KEY, n {ty})"
+        ))
+        .unwrap();
+        assert_eq!(index_count(), "0", "{ty}");
+        conn.execute(format!("DROP TABLE key_of_{ty}")).unwrap();
+    }
+
+    conn.execute("CREATE TABLE key_of_two (a smallint, b bigint, PRIMARY KEY (a, b))")
+        .unwrap();
+    assert_eq!(index_count(), "1");
+    conn.execute("CREATE INDEX key_of_two_b ON key_of_two (b)")
+        .unwrap();
+    assert_eq!(index_count(), "2");
+}
+
 // VACUUM is refused in the PostgreSQL dialect. This test waits for VACUUM to be supported there.
 // #[test]
 // fn vacuum_keeps_identity_values_and_the_always_rule() {

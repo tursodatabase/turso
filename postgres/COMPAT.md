@@ -56,7 +56,7 @@ Basics not enumerated by the official feature matrix.
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
 | DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
-| CREATE TABLE AS / SELECT INTO | 🟡 Partial | Schema derived from the SELECT; a result column whose type converts values (timestamptz, timestamp, date, time, uuid, json, numeric, boolean, a comparison or other condition, inet, domains, now()), is rejected with 0A000 because the copy would be a plain column; a copy of a varchar(n) or smallint column keeps the values but not the length or range check; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
+| CREATE TABLE AS / SELECT INTO | 🟡 Partial | Schema derived from the SELECT; a result column whose type converts values (timestamptz, timestamp, date, time, uuid, json, numeric, boolean, a comparison or other condition, inet, domains, now()), is rejected with 0A000 because the copy would be a plain column; a copy of a varchar(n), smallint or integer column keeps the values but not the length or range check; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
 | ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, OWNER TO, ENABLE/DISABLE ROW LEVEL SECURITY work (RENAME TABLE, like CREATE INDEX, needs CREATE on the schema, which only a superuser has until GRANT exists); one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS (except for OWNER TO) and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS. An index expression or a WHERE clause that uses `->` or `->>` fails with `0A000` |
@@ -179,6 +179,13 @@ without a type as a number when its text is one, so refusing numbers would
 refuse such parameters too. `date::json` and `date::inet` are still accepted, as are `1::json`, `1::jsonb`,
 `1::inet`, `1::cidr` and `1::macaddr`, which PostgreSQL refuses. A jsonb value
 may be cast to a number: `'1'::jsonb::int`, `::bigint`, `::numeric`, `::float8`.
+A smallint, integer or bigint column refuses a value outside its range with
+22003, also when the column is the primary key. An error that names the type
+of an integer value may say `int4`, where PostgreSQL says `integer`. Text that is not an integer and
+a decimal written to such a column fail with 23000, where PostgreSQL fails with
+22P02 for the text and rounds the decimal. Arithmetic on these types is 64-bit:
+`2147483647::int4 + 1` gives 2147483648, where PostgreSQL fails with 22003.
+On the wire, smallint is still described as int4.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.
@@ -231,11 +238,12 @@ fails undoes its own changes.
 
 ## Data Types, Functions, & Operators
 
-Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
-`INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
-`<table>_<column>_seq`, or, when a relation of the schema has that name,
-the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
-smallint, bigint, uuid, date, timestamp[tz], bytea, json, jsonb, inet,
+Type mapping: serial, smallserial and bigserial (and serial2/4/8) become
+`int4`, `smallint` and `bigint` with `NOT NULL DEFAULT nextval(...)` and an
+implicit sequence named `<table>_<column>_seq`, or, when a relation of the
+schema has that name, the first of `<table>_<column>_seq1`, `..._seq2`, ...
+that none has. A primary key of one smallint, integer or bigint column is the
+rowid of its table and has no index of its own. boolean, smallint, integer, bigint, uuid, date, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
