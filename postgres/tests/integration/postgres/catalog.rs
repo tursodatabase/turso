@@ -10,6 +10,7 @@ fn test_pg_object_catalog_column_counts(db: TempDatabase) {
     for (table, columns) in [
         ("pg_language", 9),
         ("pg_operator", 15),
+        ("pg_aggregate", 22),
         ("pg_opclass", 9),
         ("pg_opfamily", 5),
         ("pg_ts_parser", 8),

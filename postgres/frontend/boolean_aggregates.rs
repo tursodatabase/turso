@@ -1,9 +1,25 @@
-//! The functions that PostgreSQL's bool_and, bool_or and every use.
+//! The boolean aggregates of PostgreSQL and the functions they use.
 
 use crate::error::sqlstate_error;
 use crate::functions::Boolean;
-use turso_core::{Register, Result, Value};
-use turso_pg_parser::sqlstate::SQLSTATE_INTERNAL_ERROR;
+use turso_core::native_ext::{Aggregate, AggregateFunction, ReturnType};
+use turso_core::types::IOResultOr;
+use turso_core::{ExternalFunc, LimboError, Register, Result, Value};
+use turso_pg_parser::sqlstate::{SQLSTATE_INTERNAL_ERROR, SQLSTATE_UNDEFINED_FUNCTION};
+
+/// Registers bool_and, bool_or and every so that the planner knows they are
+/// aggregates that return a boolean. The dialect runs them from their rows of
+/// pg_aggregate (see `aggregates::choose_aggregate`).
+pub(crate) fn boolean_aggregates() -> Vec<ExternalFunc> {
+    ["bool_and", "bool_or", "every"]
+        .into_iter()
+        .map(|name| {
+            ExternalFunc::new_native_aggregate(name.to_string(), 1, ChosenByTheDialect { name })
+                .expect("one argument is a valid argument count")
+                .returning(ReturnType::Custom("boolean"))
+        })
+        .collect()
+}
 
 pub(crate) fn booland_statefunc(args: &[Register]) -> Option<Boolean> {
     let (state, value) = both_booleans(args)?;
@@ -88,5 +104,41 @@ impl BoolCounts {
         bytes[..8].copy_from_slice(&self.rows.to_le_bytes());
         bytes[8..].copy_from_slice(&self.trues.to_le_bytes());
         Ok(Value::from_slice(&bytes)?)
+    }
+}
+
+#[derive(Debug)]
+struct ChosenByTheDialect {
+    name: &'static str,
+}
+
+impl AggregateFunction for ChosenByTheDialect {
+    type Accumulator = ChosenByTheDialect;
+
+    fn create_accumulator(&self) -> Result<ChosenByTheDialect> {
+        Ok(ChosenByTheDialect { name: self.name })
+    }
+}
+
+impl Aggregate for ChosenByTheDialect {
+    fn step(&mut self, _args: &[Value]) -> IOResultOr<()> {
+        Err(self.not_chosen().into())
+    }
+
+    fn finalize(&mut self) -> IOResultOr<Value> {
+        Err(self.not_chosen().into())
+    }
+}
+
+impl ChosenByTheDialect {
+    fn not_chosen(&self) -> LimboError {
+        sqlstate_error(
+            SQLSTATE_UNDEFINED_FUNCTION,
+            format!(
+                "function {}() does not exist for its argument type",
+                self.name
+            ),
+            None,
+        )
     }
 }

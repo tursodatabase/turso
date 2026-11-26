@@ -378,18 +378,18 @@ fn check_number_literal(literal: &str, ty: &Checked) -> Result<()> {
 }
 
 /// An operand whose type the rows of `OPERATORS` decide.
-struct Checked {
-    oid: i64,
+pub(crate) struct Checked {
+    pub(crate) oid: i64,
     /// The type that a string literal next to the operand is cast to.
     cast_to: ast::Type,
     /// The engine type of the operand, or `None` for a registered type.
-    engine: Option<EngineType>,
+    pub(crate) engine: Option<EngineType>,
 }
 
 /// Each operand as a `Checked`, `None` for an operand that fits any type: a
 /// string literal or a parameter. Gives `None` itself when an operand has no
 /// type, or a type that `CHECKED_TYPES` does not name.
-fn checked_operand_types(operands: &[OperandType]) -> Option<Vec<Option<Checked>>> {
+pub(crate) fn checked_operand_types(operands: &[OperandType]) -> Option<Vec<Option<Checked>>> {
     operands
         .iter()
         .map(|operand| match operand {
