@@ -673,6 +673,11 @@ impl<'a> Resolver<'a> {
             .unwrap_or_default()
     }
 
+    /// Whether a query is collecting the aggregates its subqueries move up.
+    pub(crate) fn is_collecting_aggregates_from_subqueries(&self) -> bool {
+        !self.enclosing_query_aggregates.borrow().is_empty()
+    }
+
     /// Number of aggregates moved up so far to the innermost collecting query.
     pub(crate) fn count_aggregates_moved_from_subqueries(&self) -> usize {
         self.enclosing_query_aggregates

@@ -304,3 +304,87 @@ test result-column-with-max-and-indexed-expression {
 expect {
     2222
 }
+
+# SQLite makes a query an aggregate query only for an aggregate in its result
+# columns, so HAVING without GROUP BY and without such an aggregate is an
+# error, also when HAVING has an aggregate.
+@setup tables
+test having-aggregate-only-in-having {
+    SELECT 1 FROM t HAVING sum(a) > 0;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup tables
+test having-with-only-a-window-function {
+    SELECT sum(a) OVER () FROM t HAVING 1;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+# count(t1.a) is an aggregate of the outer query, so the subquery has none.
+@setup tables
+test having-in-subquery-with-only-an-outer-aggregate {
+    SELECT (SELECT 1 FROM t AS t2 HAVING count(t1.a) > 0) FROM t AS t1;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+# An aggregate in a result-column subquery whose argument is a column of the
+# outer query belongs to the outer query and makes it an aggregate query.
+@setup tables
+test having-with-an-aggregate-moved-up-from-a-result-column-subquery {
+    SELECT (SELECT count(t.a)) FROM t HAVING 1;
+}
+expect {
+    3
+}
+
+@setup tables
+test having-subquery-moves-aggregate-up-order-by-error {
+    SELECT (SELECT sum(t.a)) FROM t HAVING 1 ORDER BY 5;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 1
+}
+
+@setup tables
+test having-subquery-moves-aggregate-up-order-by-name-error {
+    SELECT (SELECT count(a) FROM u) FROM t HAVING 1 ORDER BY nosuch;
+}
+expect error {
+    no such column: nosuch
+}
+
+# SQLite checks HAVING right after the result columns, so the HAVING error
+# comes before an error in WHERE or HAVING, but after an error in a
+# result-column subquery. Turso finds an aggregate that a result-column
+# subquery moves up only when it plans the subqueries, so when the result
+# columns contain a subquery, it reports errors in WHERE, HAVING and ORDER BY
+# first. There are no tests for that case.
+@setup tables
+test having-non-aggregate-where-error {
+    SELECT 1 FROM t WHERE nosuch HAVING 1;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup tables
+test having-non-aggregate-having-error {
+    SELECT 1 FROM t HAVING nosuch;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup tables
+test having-non-aggregate-result-column-subquery-error {
+    SELECT (SELECT nosuch FROM u) FROM t HAVING 1;
+}
+expect error {
+    no such column: nosuch
+}

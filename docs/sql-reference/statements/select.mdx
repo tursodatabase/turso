@@ -287,7 +287,7 @@ GROUP BY department
 HAVING COUNT(*) >= 5;
 ```
 
-Without GROUP BY, all rows form one group, and HAVING decides whether its single row is returned. A column outside an aggregate, in the select list, in HAVING, or in a subquery that references it, takes its value from the first row that reached the aggregates, or NULL when no row did. With a `MIN()` or `MAX()`, it takes its value from the row that set the minimum or maximum instead (see [aggregate functions](/docs/sql-reference/functions/aggregate)).
+Without GROUP BY, all rows form one group, and HAVING decides whether its single row is returned. A column outside an aggregate, in the select list, in HAVING, or in a subquery that references it, takes its value from the first row that reached the aggregates, or NULL when no row did. With a `MIN()` or `MAX()`, it takes its value from the row that set the minimum or maximum instead (see [aggregate functions](/docs/sql-reference/functions/aggregate)). As in SQLite, the select list must contain an aggregate function, otherwise the query fails with `HAVING clause on a non-aggregate query`; an aggregate that appears only in HAVING does not count.
 
 ```sql
 SELECT COUNT(*) FROM employees

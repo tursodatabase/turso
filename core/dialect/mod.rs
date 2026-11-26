@@ -737,6 +737,15 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Whether HAVING makes a query without GROUP BY an aggregate query, with
+    /// or without an aggregate function, as in `SELECT 1 FROM t HAVING 1 = 1`.
+    ///
+    /// PostgreSQL does. SQLite needs an aggregate in the result columns and
+    /// otherwise raises "HAVING clause on a non-aggregate query".
+    fn having_makes_query_aggregate(&self) -> bool {
+        false
+    }
 }
 
 /// The message of the default [Dialect::undefined_operator_error].
