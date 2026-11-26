@@ -1,6 +1,7 @@
 mod acl;
 mod auth_functions;
 mod auth_members;
+mod bytea_functions;
 mod cast_planning;
 mod casts;
 mod catalog;

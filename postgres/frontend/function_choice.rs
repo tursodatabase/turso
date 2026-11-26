@@ -141,14 +141,7 @@ fn resolve_error(error: ResolveError) -> LimboError {
 /// these rows, so the engine runs the call by its SQL name, as before.
 const LEFT_TO_THE_ENGINE: &[&str] = &[
     "btrim1",
-    "bytea_reverse",
-    "bytea_substr",
-    "bytea_substr_no_len",
-    "bytealtrim",
-    "byteaoctetlen",
     "byteapos",
-    "byteartrim",
-    "byteatrim",
     "dceil",
     "dexp",
     "dfloor",

@@ -1343,6 +1343,8 @@ expect @tursopg {
 }
 
 # Functions that ignore argument types: PostgreSQL 18's answers.
+# A cast to bytea keeps the text of its input as the bytes, so these differ
+# even though each bytea function now works on bytes.
 
 @compat-gap "function:length"
 test length-of-bytea-counts-bytes {
@@ -1374,7 +1376,7 @@ expect {
     \x41
 }
 expect @tursopg {
-    14x\
+    \x3134785c
 }
 
 @compat-gap "function:btrim"
@@ -1385,7 +1387,7 @@ expect {
     \x42
 }
 expect @tursopg {
-    2
+    \x32
 }
 
 @compat-gap "function:ltrim"
@@ -1396,7 +1398,7 @@ expect {
     \x42
 }
 expect @tursopg {
-    2
+    \x32
 }
 
 @compat-gap "function:rtrim"
@@ -1407,7 +1409,7 @@ expect {
     \x4142
 }
 expect @tursopg {
-    \x414
+    \x5c78343134
 }
 
 test abs-of-text-does-not-exist {
