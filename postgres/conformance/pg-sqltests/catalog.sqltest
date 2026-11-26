@@ -2941,6 +2941,36 @@ expect error {
     type "zz_qual_table" already exists
 }
 
+# PostgreSQL creates a type named without a schema in the first schema of
+# search_path that exists.
+test a-type-goes-to-the-first-schema-of-search-path-that-exists {
+    SET search_path = zz_no_such_schema, "$user", public;
+    CREATE TABLE zz_after_missing (a int);
+    CREATE TYPE zz_after_missing AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "zz_after_missing" already exists
+}
+
+test a-type-without-a-schema-to-create-in {
+    SET search_path = zz_no_such_schema;
+    CREATE TYPE zz_nowhere AS ENUM ('a');
+}
+@sqlstate 3F000
+expect error {
+    no schema has been selected to create in
+}
+
+test a-domain-without-a-schema-to-create-in {
+    SET search_path = zz_no_such_schema;
+    CREATE DOMAIN zz_nowhere AS int;
+}
+@sqlstate 3F000
+expect error {
+    no schema has been selected to create in
+}
+
 test a-repeated-type-name-is-a-duplicate-object {
     CREATE TYPE zz_twice AS ENUM ('a');
     CREATE DOMAIN zz_twice AS int;

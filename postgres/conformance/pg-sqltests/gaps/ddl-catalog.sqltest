@@ -895,6 +895,61 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
+# pg_catalog counts as the first schema of search_path when search_path
+# names it, so PostgreSQL creates the type there and public.mood is free for
+# the table.
+@compat-gap "syntax:create-type"
+test create-type-in-pg-catalog-from-search-path {
+    SET search_path = pg_catalog, public;
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE TABLE public.mood (a int);
+    SELECT n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE t.typname = 'mood' ORDER BY 1;
+}
+expect {
+    pg_catalog
+    public
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create-type"
+test create-domain-in-pg-catalog-from-search-path {
+    SET search_path = pg_catalog;
+    CREATE DOMAIN positive AS int CHECK (VALUE > 0);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# "$user" in the default search_path is the schema named after the current
+# role, when it exists.
+@compat-gap "syntax:create-type"
+test create-type-in-the-schema-of-the-current-user {
+    CREATE SCHEMA postgres;
+    CREATE TABLE public.mood (a int);
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE t.typname = 'mood' ORDER BY 1;
+}
+expect {
+    postgres
+    public
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create-type"
+test create-type-in-the-temporary-schema {
+    SET search_path = pg_temp, public;
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 # A quoted name keeps its letter case in PostgreSQL, so a type and a relation
 # whose names differ only in case are two names. tursopg folds the name of a
 # type to lower case and finds types and relations by a name in any case, so

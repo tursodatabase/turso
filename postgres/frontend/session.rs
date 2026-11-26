@@ -613,6 +613,12 @@ fn translate_statement<'a>(
         ast::Stmt::DropTable { tbl_name, .. } => {
             reject_drop_of_other_relation_kind(&pg_conn.conn, tbl_name, "table")?;
         }
+        ast::Stmt::CreateType {
+            namespace: None, ..
+        }
+        | ast::Stmt::CreateDomain {
+            namespace: None, ..
+        } => reject_type_outside_public(&pg_conn.conn)?,
         _ => {}
     }
     Ok(Translation::Translated(Box::new(TranslatedStatement {
@@ -2283,6 +2289,59 @@ fn reset_all_settings(conn: &Connection) -> Result<()> {
     session_state(conn)?.mutate(conn, ConnectionSettings::reset_all);
     set_search_path(conn, None, SettingScope::Session)?;
     Ok(())
+}
+
+/// FIXME(pg-namespace): This hand-codes that CREATE TYPE and CREATE DOMAIN
+/// with a name that has no schema can only create in public, because the
+/// engine keeps every type in public. A pg_namespace entry for each type,
+/// which CREATE TYPE takes from search_path, replaces this.
+/// Refuses CREATE TYPE or CREATE DOMAIN with a name that has no schema when
+/// PostgreSQL would create the type in a schema other than public.
+/// PostgreSQL creates it in the first schema of `search_path` that exists,
+/// where `"$user"` and `pg_catalog` count, though the engine's search order
+/// leaves them out.
+fn reject_type_outside_public(conn: &Connection) -> Result<()> {
+    match type_creation_schema(conn)? {
+        Some(schema) if schema == "public" => Ok(()),
+        Some(_) => Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "creating a type in a schema other than public is not supported",
+            None,
+        )),
+        None => Err(sqlstate_error(
+            SQLSTATE_INVALID_SCHEMA_NAME,
+            "no schema has been selected to create in",
+            None,
+        )),
+    }
+}
+
+/// The schema that PostgreSQL creates a type named without a schema in:
+/// the first schema of `search_path` that exists. `"$user"` is the schema
+/// named after the current role. PostgreSQL skips that schema when the role
+/// may not use it, but tursopg has no privileges on schemas, so it is always
+/// taken. `pg_temp` is the session's temporary schema, which PostgreSQL
+/// makes when it is needed. None when no schema of `search_path` exists.
+fn type_creation_schema(conn: &Connection) -> Result<Option<String>> {
+    let path = parse_search_path(
+        search_path_setting(conn)
+            .as_deref()
+            .unwrap_or(DEFAULT_SEARCH_PATH),
+    )?;
+    for name in path {
+        let name = if name == "$user" {
+            match crate::functions::role_name_in(&connection_roles(conn), conn.current_role()) {
+                Ok(role) => role,
+                Err(_) => continue,
+            }
+        } else {
+            name
+        };
+        if name == "pg_temp" || catalog::namespace_exists(conn, &name) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
 }
 
 /// Resets the session as DISCARD ALL does, including the current role.

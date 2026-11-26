@@ -112,7 +112,9 @@ name of a table, view or materialized view of public, and a table, view,
 materialized view or sequence of public cannot have the name of a type. An index
 can. `CREATE TYPE` and `CREATE DOMAIN` with a name that has no schema fail
 with SQLSTATE 0A000 (feature_not_supported) when the first schema of
-`search_path` is not public, because PostgreSQL creates the type in that schema.
+`search_path` that exists is not public, because PostgreSQL creates the type in
+that schema. Here `pg_catalog` and `pg_temp` count when `search_path` names
+them, and `"$user"` counts when a schema has the name of the current role.
 A name such as `public.mood` creates the type in public whatever `search_path`
 is.
 
