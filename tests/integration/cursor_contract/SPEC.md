@@ -13,10 +13,11 @@ Status: draft. Every rule marked **DECISION** needs a human OK.
 | `program.rs`, `index_program.rs`, `mod.rs` | Harness. Builds a VDBE program from a list of table or index operations, runs it on one engine, returns what each operation saw. Engines: WAL, MVCC, ephemeral. Layouts: all in memory, checkpointed. |
 | `model.rs`, `index_model.rs` | Reference model: the contract as a pure Rust function. No database. |
 | `walk.rs`, `index_walk.rs` | Random walks. Generate operations, run them on all engines and on the model, compare, shrink a failure. Known bugs are filtered by name; `NO_FILTER=1` turns the filters off. |
-| `index_tests.rs`, `overlay_tests.rs`, tests in `mod.rs` | Fixed scenarios. A test named `known_bug_*` asserts that a bug is still open (section 5b). |
+| `index_tests.rs`, `overlay_tests.rs`, tests in `mod.rs` | Fixed scenarios. A test named `known_bug_*` asserts that a bug is still open (section 5b). `index_tests.rs::collation` has the scenarios of section 2c: DESC and NOCASE seeks, scans and range loops, `Found`, and the replacement of a key by a case variant. |
 
 Run: `cargo test -p core_tester --test integration_tests cursor_contract`. Walk parameters:
-`SEED`, `ITERS`. Long walks: `random_walk_long` and `index_random_walk_long`, with
+`SEED`, `ITERS`; the index walk also has `IDEF` (`default`, `desc`, `nocase`, `rtrim`,
+`mixed`) to fix the index definition of section 2c. Long walks: `random_walk_long` and `index_random_walk_long`, with
 `--ignored`. They are the only ignored tests.
 
 ## 1. Abstract state
@@ -108,6 +109,48 @@ may use any of them for a read and they must agree. `OpenDup`, `OpenEphemeral` a
 (`Ephemeral`). `CreateBtree`, `Destroy` and `BlobRead/Write/Len` are not modelled here
 (`blob_io.rs` covers blobs).
 
+## 2c. Column order and collation
+
+Each index column has a sort order (`ASC` or `DESC`) and a collation (`BINARY`, `NOCASE` or
+`RTRIM`). The columns have no declared type, so values keep their type. The model
+knows three value types: NULL, integer and text. Evidence: SQLite `vdbeaux.c`
+(`sqlite3VdbeRecordCompareWithSkip`, `vdbeRecordCompareDebug`) and `vdbe.c`
+(`OP_Seek*`, `OP_Idx*`, `OP_Found`), checked with a test program on SQLite 3.54.1.
+
+**Order of one column.** The result of `cmp(stored, key)` for column `i`:
+
+1. Types decide first: NULL < integer < text. The collation does not matter across types.
+   A text value never equals an integer (no affinity): the key `'1'` does not find the
+   stored `1`.
+2. Two integers compare as numbers. NULL equals NULL.
+3. Two texts compare with the collation of the index column (not of the seek key):
+   - `BINARY`: byte order, then length.
+   - `NOCASE`: the ASCII letters `A` to `Z` are folded to lower case. Other bytes are not
+     folded. So the characters `[ \ ] ^ _ `` ` `` sort before the letters, and `É` is not `é`.
+   - `RTRIM`: trailing spaces (only `0x20`) are removed from both sides, then `BINARY`.
+4. A `DESC` column negates the result of steps 1 to 3. NULL then comes last, and text
+   comes before integers.
+5. The trailing rowid is always `ASC` and `BINARY`, also in a `DESC` index.
+
+Two values are equal when `cmp` is zero: `'A'` equals `'a'` under `NOCASE`, `'a'`
+equals `'a '` under `RTRIM`. Text with a NUL byte is not generated (SQLite stops the
+`NOCASE` compare at a NUL byte).
+
+**Prefix compare.** `cmp_prefix k p` compares the first `|p|` columns, each with its own sign
+and collation. If all are equal, the prefix is equal and the result is zero. A `DESC`
+column does not flip the tie-break: `SeekGE` still lands on the first entry of the equal
+prefix, in index order, and `Next` moves along the index order, so for a `DESC` column it
+moves to smaller values. `Seek*` and `Idx*` use this compare as in 2b.
+
+**Equality opcodes.** `Found`, `NotFound` and `NoConflict` test `cmp_prefix = 0` under the
+column collations. `DESC` does not matter. A hit lands on an arbitrary matching entry.
+
+**Same key.** Two full keys that are equal under the collations and have the same rowid are
+the same entry. A test must not `IdxInsert` a key that is equal to a stored key but is not
+identical (Undefined), and must not `IdxDelete` with a key that is equal but not
+identical (Undefined). A delete followed by an insert of a key that differs only by case
+(or trailing spaces) is legal. A later read must return the new bytes.
+
 ## 3. Insert seek contract
 
 Turso differs from SQLite: it seeks only when `REQUIRE_SEEK` is set. Otherwise the
@@ -189,13 +232,19 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | N6 | WAL | Own delete and a peer insert, then `Next`: wrong row |
 | N7 | WAL | Index: `Last; SeekEnd; Observe` gives "Corrupt database" |
 | N9 | WAL | Index: a seek-positioned cursor loses its position on a peer write |
-| N10 | WAL | Index: an ended cursor finds a peer's new entry |
+| N10 | WAL | Index: an ended cursor finds a peer's new entry. It keeps its cell index: a failed seek on an empty index (one peer insert) and a `Next` past the last entry (two peer inserts) both show it |
 | N11 | WAL | Index: `Found` hit, then `IdxInsert` with `use_seek`: the new key goes before the match and the index is out of order. SQLite seeks again. The model still lets a hit set the token; it must not |
 | N12 | WAL | Index: panic on `idx < cell_count` |
+| CL1 | MVCC | Index, NOCASE or RTRIM: `IdxDelete` of `('a', 1)` and `IdxInsert` of `('A', 1)` (equal under the collation, same rowid): a later read of the entry returns the old bytes `'a'`, not `'A'`. SQLite and WAL return the new bytes. Needs no checkpointed row |
+| IDX_N6 | WAL | Index: own `Delete`, then a peer `IdxInsert`, then `Next` or `Prev`: the cursor finds the wrong entry or the end. Shows with the default index; the walk found it only after the text values were added |
 | N8 | model | Index: `IdxGT` after own `IdxDelete` compares the successor. Probably a model choice. Open |
 
 Not modelled: `DeferredSeek`, direction switches (D3), covered-chain drops in the overlay,
-a failed eq-only seek that leaves the cursor on a neighbour. The table walk does not
+a failed eq-only seek that leaves the cursor on a neighbour. An eq-only `SeekGE` for a key
+that is equal to no entry jumps in every engine, even when larger entries exist. This is the
+hint of the translator, not a bug, so the tests of section 2c use eq-only seeks only for keys
+that have an equal entry. The index walk does not generate eq-only seeks (OV1 covers them).
+With a DESC or collation index, OV1 is the same as with the default index. The table walk does not
 generate `SeekEnd` and `Clear`.
 
 ## 6. Open questions
@@ -203,5 +252,6 @@ generate `SeekEnd` and `Clear`.
 1. D1 to D6 above.
 2. The index seek `FIXME` at `execute.rs:6928` (no affinity for index keys): in scope for
    this contract or not?
-3. Model order for index keys with DESC columns and non-default collations: start with
-   BINARY and ASC only?
+3. Model order for index keys with DESC columns and non-default collations: done, see
+   section 2c. Not covered: BLOB values, REAL values, affinity, custom collations, text with
+   a NUL byte, UTF-16 databases, expression indexes.

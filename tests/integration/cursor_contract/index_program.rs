@@ -1,14 +1,16 @@
 //! Index cursor programs (SPEC 2b). Like `program.rs`, an op list is compiled into one
 //! straight-line VDBE program and every op gives one result row.
 //!
-//! The index is `i_ab ON ti(a, b)` of the table `ti(id INTEGER PRIMARY KEY, a INTEGER,
-//! b INTEGER)`. An index key is `(a, b, rowid)`. The ops write the index b-tree directly, so
+//! The index is `i_ab ON ti(a, b)` of the table `ti(id INTEGER PRIMARY KEY, a, b)`. The columns
+//! have no type, so a value keeps its type. The index has the sort order and the collation of
+//! an `IdxDef` (SPEC 2c). An index key is `(a, b, rowid)`. The ops write the index b-tree directly, so
 //! the table may be out of step with the index after a program. Do not run `integrity_check`.
 
-use super::index_model::Val;
+use super::index_model::{ColDef, Coll, IdxDef, Order, Val};
 use super::program::{emit_column_read, ReadMode};
 use super::{catch_panic, open_database, step_rows, DbKind, Layout};
 use std::sync::Arc;
+use turso_core::ast::SortOrder;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{Index, IndexColumn};
 use turso_core::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
@@ -123,6 +125,8 @@ pub struct IndexRun<'a> {
     pub kind: DbKind,
     pub layout: Layout,
     pub rows: &'a [Row],
+    /// Sort order and collation of the index columns.
+    pub idef: IdxDef,
     /// The number of index cursors.
     pub nidx: usize,
     /// The number of table cursors (only `DeferredSeek` needs them).
@@ -152,8 +156,8 @@ fn run_index_inner(cfg: &IndexRun, ops: &[IOp]) -> Result<Outcome, String> {
         cfg.kind,
         cfg.layout,
         &[
-            "CREATE TABLE ti(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
-            "CREATE INDEX i_ab ON ti(a, b)",
+            "CREATE TABLE ti(id INTEGER PRIMARY KEY, a, b)",
+            &create_index_sql(cfg.idef),
         ],
         &fill,
     )?;
@@ -165,6 +169,27 @@ fn run_index_inner(cfg: &IndexRun, ops: &[IOp]) -> Result<Outcome, String> {
         .map(|(row, op)| to_iobs(row, op))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Outcome { obs, error })
+}
+
+/// `CREATE INDEX i_ab ON ti(a [COLLATE X] [DESC], b [COLLATE X] [DESC])`.
+fn create_index_sql(idef: IdxDef) -> String {
+    let column = |name: &str, def: ColDef| {
+        let coll = match def.coll {
+            Coll::Binary => "",
+            Coll::NoCase => " COLLATE NOCASE",
+            Coll::RTrim => " COLLATE RTRIM",
+        };
+        let order = match def.order {
+            Order::Asc => "",
+            Order::Desc => " DESC",
+        };
+        format!("{name}{coll}{order}")
+    };
+    format!(
+        "CREATE INDEX i_ab ON ti({}, {})",
+        column("a", idef.cols[0]),
+        column("b", idef.cols[1])
+    )
 }
 
 fn sql(value: &Val) -> String {
@@ -206,7 +231,7 @@ fn compile_index(conn: &Arc<Connection>, cfg: &IndexRun, ops: &[IOp]) -> Result<
         .map_err(|e| e.to_string())?;
     let ephemeral = cfg.kind == DbKind::Ephemeral;
     let index = if ephemeral {
-        Arc::new(ephemeral_index())
+        Arc::new(ephemeral_index(cfg.idef))
     } else {
         index
     };
@@ -301,15 +326,25 @@ fn compile_index(conn: &Arc<Connection>, cfg: &IndexRun, ops: &[IOp]) -> Result<
 }
 
 /// The index of an ephemeral run: `(a, b, rowid)` and no schema.
-fn ephemeral_index() -> Index {
+fn ephemeral_index(idef: IdxDef) -> Index {
+    let column = |name: &str, pos: usize, def: ColDef| {
+        let collation = match def.coll {
+            Coll::Binary => CollationSeq::BINARY,
+            Coll::NoCase => CollationSeq::NOCASE,
+            Coll::RTrim => CollationSeq::RTRIM,
+        };
+        let mut col = IndexColumn::new(name, pos, collation);
+        col.order = match def.order {
+            Order::Asc => SortOrder::Asc,
+            Order::Desc => SortOrder::Desc,
+        };
+        col
+    };
     Index {
         name: "ephemeral_ab".to_string(),
         table_name: String::new(),
         root_page: 0,
-        columns: vec![
-            IndexColumn::new("a", 0, CollationSeq::BINARY),
-            IndexColumn::new("b", 1, CollationSeq::BINARY),
-        ],
+        columns: vec![column("a", 0, idef.cols[0]), column("b", 1, idef.cols[1])],
         unique: false,
         ephemeral: true,
         has_rowid: true,

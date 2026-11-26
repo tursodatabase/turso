@@ -1,4 +1,5 @@
-//! Reference model of index cursors (SPEC 2b).
+//! Reference model of index cursors (SPEC 2b) with the sort order and the collation of the index
+//! columns (SPEC 2c, `IdxDef`).
 //!
 //! The model has these parts: `ipos`, `itok`, `icursor`, `istep`, `irun`, `iseek_ge`,
 //! `cmp_prefix`, and so on. A caller comes before the functions it calls. The unit tests at
@@ -61,6 +62,70 @@ impl From<&str> for Val {
     }
 }
 
+/// The sort order of an index column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    Asc,
+    Desc,
+}
+
+/// The collation of an index column (SPEC 2c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coll {
+    Binary,
+    NoCase,
+    RTrim,
+}
+
+/// Sort order and collation of one index column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColDef {
+    pub order: Order,
+    pub coll: Coll,
+}
+
+impl ColDef {
+    pub const fn new(order: Order, coll: Coll) -> ColDef {
+        ColDef { order, coll }
+    }
+}
+
+/// The definition of the index `i_ab ON ti(a, b)`: one `ColDef` for `a` and one for `b`. The
+/// trailing rowid is always ASC and BINARY. The default is `(ASC, BINARY)` for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdxDef {
+    pub cols: [ColDef; 2],
+}
+
+impl IdxDef {
+    pub const fn new(a: ColDef, b: ColDef) -> IdxDef {
+        IdxDef { cols: [a, b] }
+    }
+
+    /// The definition as Rust source, for the repro tests that the walker prints.
+    pub fn src(self) -> String {
+        let col = |c: ColDef| format!("ColDef::new(Order::{:?}, Coll::{:?})", c.order, c.coll);
+        format!("IdxDef::new({}, {})", col(self.cols[0]), col(self.cols[1]))
+    }
+
+    /// Is this the plain `(ASC, BINARY)` index?
+    pub fn is_default(self) -> bool {
+        self == IdxDef::default()
+    }
+}
+
+impl Default for ColDef {
+    fn default() -> ColDef {
+        ColDef::new(Order::Asc, Coll::Binary)
+    }
+}
+
+impl Default for IdxDef {
+    fn default() -> IdxDef {
+        IdxDef::new(ColDef::default(), ColDef::default())
+    }
+}
+
 /// The columns of an index key.
 pub type Cols = Vec<Val>;
 
@@ -105,6 +170,7 @@ pub struct ICursor {
 pub struct IState {
     pub irows: IStore,
     pub icurs: Vec<ICursor>,
+    pub idef: IdxDef,
 }
 
 /// The operations of the model. The harness `IOp` is mapped onto this type by
@@ -173,9 +239,14 @@ pub fn fresh_icursor() -> ICursor {
 // ---------------------------------------------------------------------------------------
 
 pub fn iinit(s: IStore, n: usize) -> IState {
+    iinit_with(s, n, IdxDef::default())
+}
+
+pub fn iinit_with(s: IStore, n: usize, idef: IdxDef) -> IState {
     IState {
         irows: s,
         icurs: vec![fresh_icursor(); n],
+        idef,
     }
 }
 
@@ -198,6 +269,7 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
         return None;
     }
     let s = &st.irows;
+    let d = st.idef;
     let put = |c2: ICursor, j: bool| iput(st, a.iacur, c2, j);
     let seek = |o: Option<IKey>, d: Dir| {
         let (c2, j) = imove_to(o, d);
@@ -216,7 +288,7 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
     };
     // `Found`-style opcodes: `hit_jump` is the jump flag on a hit.
     let found = |p: &Cols, hit_jump: bool| {
-        if has_prefix(p, s) {
+        if has_prefix(d, p, s) {
             put(
                 ICursor::new(
                     IPos::Matched(p.clone()),
@@ -240,17 +312,17 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
     };
     // `Idx*`: compare the entry under the cursor with the prefix; no state change.
     let idx = |p: &Cols, f: fn(Ordering) -> bool| match &c.icpos {
-        IPos::At(k) => put(c.clone(), f(cmp_prefix(k, p))),
+        IPos::At(k) => put(c.clone(), f(cmp_prefix(d, k, p))),
         IPos::Invalid => put(c.clone(), true),
         _ => None,
     };
     match &a.iaop {
         IMOp::IRewind => seek(imin(s), Dir::Fwd),
         IMOp::ILast => seek(imax(s), Dir::Bwd),
-        IMOp::ISeekGE(p) => seek(iseek_ge(p, s), Dir::Fwd),
-        IMOp::ISeekGT(p) => seek(iseek_gt(p, s), Dir::Fwd),
-        IMOp::ISeekLE(p) => seek(iseek_le(p, s), Dir::Bwd),
-        IMOp::ISeekLT(p) => seek(iseek_lt(p, s), Dir::Bwd),
+        IMOp::ISeekGE(p) => seek(iseek_ge(d, p, s), Dir::Fwd),
+        IMOp::ISeekGT(p) => seek(iseek_gt(d, p, s), Dir::Fwd),
+        IMOp::ISeekLE(p) => seek(iseek_le(d, p, s), Dir::Bwd),
+        IMOp::ISeekLT(p) => seek(iseek_lt(d, p, s), Dir::Bwd),
         IMOp::IFound(p) => found(p, true),
         IMOp::INotFound(p) => found(p, false),
         IMOp::INoConflict(p) => {
@@ -273,7 +345,7 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
             }
             match &c.icpos {
                 IPos::Invalid => put(c.clone(), false),
-                IPos::At(k) | IPos::Gone(k) => advance(isucc(k, s)),
+                IPos::At(k) | IPos::Gone(k) => advance(isucc(d, k, s)),
                 _ => None,
             }
         }
@@ -283,13 +355,13 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
             }
             match &c.icpos {
                 IPos::Invalid => put(c.clone(), false),
-                IPos::At(k) | IPos::Gone(k) => advance(ipred(k, s)),
+                IPos::At(k) | IPos::Gone(k) => advance(ipred(d, k, s)),
                 _ => None,
             }
         }
         IMOp::IdxInsert(key, use_seek) => {
-            if !imem(key, s) && (!*use_seek || tok_ok(&c, key, s)) {
-                let s2 = iins(key, s);
+            if !imem(d, key, s) && (!*use_seek || tok_ok(d, &c, key, s)) {
+                let s2 = iins(d, key, s);
                 let c2 = ICursor::new(IPos::At(key.clone()), c.icdir, false, ITok::ITNone);
                 Some(iwrite(st, s2, a.iacur, c2))
             } else {
@@ -297,8 +369,10 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
             }
         }
         IMOp::IdxDelete(key) => {
-            if imem(key, s) {
-                let s2 = idel(key, s);
+            // Only the stored bytes name the entry: a key that is equal under the collations
+            // but not identical is Undefined (SPEC 2c).
+            if s.contains(key) {
+                let s2 = idel(d, key, s);
                 let c2 = ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone);
                 Some(iwrite(st, s2, a.iacur, c2))
             } else {
@@ -306,8 +380,8 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
             }
         }
         IMOp::IDelete => match &c.icpos {
-            IPos::At(k) if imem(k, s) => {
-                let s2 = idel(k, s);
+            IPos::At(k) if imem(d, k, s) => {
+                let s2 = idel(d, k, s);
                 let c2 = ICursor::new(IPos::Gone(k.clone()), c.icdir, false, ITok::ITNone);
                 Some(iwrite(st, s2, a.iacur, c2))
             }
@@ -323,6 +397,7 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
                 IState {
                     irows: Vec::new(),
                     icurs: vec![ended; st.icurs.len()],
+                    idef: d,
                 },
                 IMObs {
                     ijumped: false,
@@ -344,6 +419,7 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
                 IState {
                     irows: s.clone(),
                     icurs: iset_nth(&st.icurs, a.iacur, c2),
+                    idef: d,
                 },
                 IMObs {
                     ijumped: false,
@@ -374,21 +450,22 @@ fn ok_after_null(o: &IMOp) -> bool {
 /// May an `IdxInsert` with `use_seek` go ahead? The cursor holds the token for exactly the
 /// columns of the key, or an append token and the key is above every key, or the columns have
 /// a NULL (Turso seeks then).
-fn tok_ok(c: &ICursor, key: &IKey, s: &IStore) -> bool {
+fn tok_ok(d: IdxDef, c: &ICursor, key: &IKey, s: &IStore) -> bool {
     (match &c.ictok {
-        ITok::ITKey(p) => cmp_cols(p, &key.0) == Ordering::Equal,
-        ITok::ITApp => above_all(key, s),
+        ITok::ITKey(p) => cmp_cols(d, p, &key.0) == Ordering::Equal,
+        ITok::ITApp => above_all(d, key, s),
         ITok::ITNone => false,
     }) || has_null(&key.0)
 }
 
 /// The store stays the same, one cursor changes.
 fn iput(st: &IState, i: usize, c2: ICursor, j: bool) -> Option<(IState, IMObs)> {
-    let o = iobs_of(&st.irows, &c2, j);
+    let o = iobs_of(st.idef, &st.irows, &c2, j);
     Some((
         IState {
             irows: st.irows.clone(),
             icurs: iset_nth(&st.icurs, i, c2),
+            idef: st.idef,
         },
         o,
     ))
@@ -396,11 +473,12 @@ fn iput(st: &IState, i: usize, c2: ICursor, j: bool) -> Option<(IState, IMObs)> 
 
 /// A write: new store, and every pending seek token ends.
 fn iwrite(st: &IState, s2: IStore, i: usize, c2: ICursor) -> (IState, IMObs) {
-    let o = iobs_of(&s2, &c2, false);
+    let o = iobs_of(st.idef, &s2, &c2, false);
     (
         IState {
             irows: s2,
             icurs: iset_nth(&iclear_toks(&st.icurs), i, c2),
+            idef: st.idef,
         },
         o,
     )
@@ -434,8 +512,8 @@ fn iset_nth(cs: &[ICursor], i: usize, c: ICursor) -> Vec<ICursor> {
 // ---------------------------------------------------------------------------------------
 
 /// After every action the test reads the jump flag, `IdxRowId` and `Column` (all columns).
-fn iobs_of(s: &IStore, c: &ICursor, j: bool) -> IMObs {
-    match iread(s, c) {
+fn iobs_of(d: IdxDef, s: &IStore, c: &ICursor, j: bool) -> IMObs {
+    match iread(d, s, c) {
         Spec::Unspec => IMObs {
             ijumped: j,
             irid: Spec::Unspec,
@@ -454,13 +532,15 @@ fn iobs_of(s: &IStore, c: &ICursor, j: bool) -> IMObs {
     }
 }
 
-fn iread(s: &IStore, c: &ICursor) -> Spec<Option<IKey>> {
+/// A cursor `At k` reads the stored entry that equals `k` under the collations. After a peer
+/// deleted `('a', 1)` and inserted `('A', 1)` the cursor reads `('A', 1)` (SPEC 2c).
+fn iread(d: IdxDef, s: &IStore, c: &ICursor) -> Spec<Option<IKey>> {
     if c.icnull {
         return Spec::Is(None);
     }
     match &c.icpos {
         IPos::Invalid => Spec::Is(None),
-        IPos::At(k) => Spec::Is(if imem(k, s) { Some(k.clone()) } else { None }),
+        IPos::At(k) => Spec::Is(s.iter().find(|k2| is_eq(cmp_key(d, k2, k))).cloned()),
         IPos::Matched(_) | IPos::Seeked(_) | IPos::Gone(_) | IPos::Lost => Spec::Unspec,
     }
 }
@@ -469,24 +549,47 @@ fn iread(s: &IStore, c: &ICursor) -> Spec<Option<IKey>> {
 // Keys and order (cmp_val, cmp_cols, cmp_key, cmp_pre, cmp_prefix, is_*)
 // ---------------------------------------------------------------------------------------
 
-/// NULL is smallest and equals NULL, then come integers, then text. Text compares by byte
-/// (BINARY).
-fn cmp_val(a: &Val, b: &Val) -> Ordering {
-    match (a, b) {
+/// Types decide first: NULL, then integers, then text. Two texts compare with the collation of
+/// the column. A DESC column negates the result (SPEC 2c).
+fn cmp_val(d: ColDef, a: &Val, b: &Val) -> Ordering {
+    let asc = match (a, b) {
         (Val::Null, Val::Null) => Ordering::Equal,
         (Val::Null, _) => Ordering::Less,
         (_, Val::Null) => Ordering::Greater,
         (Val::Int(x), Val::Int(y)) => x.cmp(y),
         (Val::Int(_), Val::Text(_)) => Ordering::Less,
         (Val::Text(_), Val::Int(_)) => Ordering::Greater,
-        (Val::Text(x), Val::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Val::Text(x), Val::Text(y)) => cmp_text(d.coll, x, y),
+    };
+    match d.order {
+        Order::Asc => asc,
+        Order::Desc => asc.reverse(),
     }
 }
 
+/// `NOCASE` folds only the ASCII letters. `RTRIM` drops trailing spaces (0x20) and then
+/// compares bytes.
+fn cmp_text(c: Coll, x: &str, y: &str) -> Ordering {
+    let (x, y) = (x.as_bytes(), y.as_bytes());
+    match c {
+        Coll::Binary => x.cmp(y),
+        Coll::NoCase => x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()),
+        Coll::RTrim => rtrim(x).cmp(rtrim(y)),
+    }
+}
+
+/// Drops trailing spaces. A tab or a newline stays.
+fn rtrim(mut x: &[u8]) -> &[u8] {
+    while let [rest @ .., b' '] = x {
+        x = rest;
+    }
+    x
+}
+
 /// Lexicographic order on whole column lists; a shorter list that is a prefix is smaller.
-pub fn cmp_cols(a: &[Val], b: &[Val]) -> Ordering {
-    for (x, y) in a.iter().zip(b) {
-        match cmp_val(x, y) {
+pub fn cmp_cols(d: IdxDef, a: &[Val], b: &[Val]) -> Ordering {
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        match cmp_val(d.cols[i], x, y) {
             Ordering::Equal => {}
             c => return c,
         }
@@ -494,20 +597,21 @@ pub fn cmp_cols(a: &[Val], b: &[Val]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
-pub fn cmp_key(a: &IKey, b: &IKey) -> Ordering {
-    match cmp_cols(&a.0, &b.0) {
+/// The rowid is always ASC.
+pub fn cmp_key(d: IdxDef, a: &IKey, b: &IKey) -> Ordering {
+    match cmp_cols(d, &a.0, &b.0) {
         Ordering::Equal => a.1.cmp(&b.1),
         c => c,
     }
 }
 
 /// Compare the first `|p|` columns of `a` with `p`. A key with fewer columns is smaller.
-fn cmp_pre(a: &[Val], p: &[Val]) -> Ordering {
+fn cmp_pre(d: IdxDef, a: &[Val], p: &[Val]) -> Ordering {
     for (i, y) in p.iter().enumerate() {
         let Some(x) = a.get(i) else {
             return Ordering::Less;
         };
-        match cmp_val(x, y) {
+        match cmp_val(d.cols[i], x, y) {
             Ordering::Equal => {}
             c => return c,
         }
@@ -515,8 +619,8 @@ fn cmp_pre(a: &[Val], p: &[Val]) -> Ordering {
     Ordering::Equal
 }
 
-pub fn cmp_prefix(k: &IKey, p: &[Val]) -> Ordering {
-    cmp_pre(&k.0, p)
+pub fn cmp_prefix(d: IdxDef, k: &IKey, p: &[Val]) -> Ordering {
+    cmp_pre(d, &k.0, p)
 }
 
 fn is_ge(c: Ordering) -> bool {
@@ -543,42 +647,42 @@ fn is_eq(c: Ordering) -> bool {
 // Store (iins, idel, imem, iseek_*, imin, imax, isucc, ipred, has_prefix, ...)
 // ---------------------------------------------------------------------------------------
 
-/// A key that is already in the store stays as it is.
-pub fn iins(k: &IKey, s: &IStore) -> IStore {
+/// A key that is equal to a stored key (under the collations) leaves the store as it is.
+pub fn iins(d: IdxDef, k: &IKey, s: &IStore) -> IStore {
     let mut out = s.clone();
-    if let Err(i) = out.binary_search_by(|k2| cmp_key(k2, k)) {
+    if let Err(i) = out.binary_search_by(|k2| cmp_key(d, k2, k)) {
         out.insert(i, k.clone());
     }
     out
 }
 
-pub fn idel(k: &IKey, s: &IStore) -> IStore {
+pub fn idel(d: IdxDef, k: &IKey, s: &IStore) -> IStore {
     s.iter()
-        .filter(|k2| !is_eq(cmp_key(k, k2)))
+        .filter(|k2| !is_eq(cmp_key(d, k, k2)))
         .cloned()
         .collect()
 }
 
-pub fn imem(k: &IKey, s: &IStore) -> bool {
-    s.iter().any(|k2| is_eq(cmp_key(k, k2)))
+pub fn imem(d: IdxDef, k: &IKey, s: &IStore) -> bool {
+    s.iter().any(|k2| is_eq(cmp_key(d, k, k2)))
 }
 
 /// First key whose prefix compares `>= p`, `> p`; last key whose prefix compares `<= p`,
 /// `< p`.
-pub fn iseek_ge(p: &[Val], s: &IStore) -> Option<IKey> {
-    s.iter().find(|k| is_ge(cmp_prefix(k, p))).cloned()
+pub fn iseek_ge(d: IdxDef, p: &[Val], s: &IStore) -> Option<IKey> {
+    s.iter().find(|k| is_ge(cmp_prefix(d, k, p))).cloned()
 }
 
-pub fn iseek_gt(p: &[Val], s: &IStore) -> Option<IKey> {
-    s.iter().find(|k| is_gt(cmp_prefix(k, p))).cloned()
+pub fn iseek_gt(d: IdxDef, p: &[Val], s: &IStore) -> Option<IKey> {
+    s.iter().find(|k| is_gt(cmp_prefix(d, k, p))).cloned()
 }
 
-pub fn iseek_le(p: &[Val], s: &IStore) -> Option<IKey> {
-    s.iter().rev().find(|k| is_le(cmp_prefix(k, p))).cloned()
+pub fn iseek_le(d: IdxDef, p: &[Val], s: &IStore) -> Option<IKey> {
+    s.iter().rev().find(|k| is_le(cmp_prefix(d, k, p))).cloned()
 }
 
-pub fn iseek_lt(p: &[Val], s: &IStore) -> Option<IKey> {
-    s.iter().rev().find(|k| is_lt(cmp_prefix(k, p))).cloned()
+pub fn iseek_lt(d: IdxDef, p: &[Val], s: &IStore) -> Option<IKey> {
+    s.iter().rev().find(|k| is_lt(cmp_prefix(d, k, p))).cloned()
 }
 
 pub fn imin(s: &IStore) -> Option<IKey> {
@@ -590,16 +694,16 @@ pub fn imax(s: &IStore) -> Option<IKey> {
 }
 
 /// Next and previous key in the full key order.
-pub fn isucc(k: &IKey, s: &IStore) -> Option<IKey> {
-    s.iter().find(|k2| is_gt(cmp_key(k2, k))).cloned()
+pub fn isucc(d: IdxDef, k: &IKey, s: &IStore) -> Option<IKey> {
+    s.iter().find(|k2| is_gt(cmp_key(d, k2, k))).cloned()
 }
 
-pub fn ipred(k: &IKey, s: &IStore) -> Option<IKey> {
-    s.iter().rev().find(|k2| is_lt(cmp_key(k2, k))).cloned()
+pub fn ipred(d: IdxDef, k: &IKey, s: &IStore) -> Option<IKey> {
+    s.iter().rev().find(|k2| is_lt(cmp_key(d, k2, k))).cloned()
 }
 
-pub fn has_prefix(p: &[Val], s: &IStore) -> bool {
-    s.iter().any(|k| is_eq(cmp_prefix(k, p)))
+pub fn has_prefix(d: IdxDef, p: &[Val], s: &IStore) -> bool {
+    s.iter().any(|k| is_eq(cmp_prefix(d, k, p)))
 }
 
 pub fn has_null(p: &[Val]) -> bool {
@@ -607,8 +711,8 @@ pub fn has_null(p: &[Val]) -> bool {
 }
 
 /// The key is above every key of the store: an append is legal.
-pub fn above_all(k: &IKey, s: &IStore) -> bool {
-    s.iter().all(|k2| is_lt(cmp_key(k2, k)))
+pub fn above_all(d: IdxDef, k: &IKey, s: &IStore) -> bool {
+    s.iter().all(|k2| is_lt(cmp_key(d, k2, k)))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -625,13 +729,13 @@ pub struct IReplay {
 impl IReplay {
     /// `ephemeral`: the program of an ephemeral run writes the setup entries through cursor 0,
     /// so that cursor starts in a position that the contract does not define (`Lost`).
-    pub fn new(rows: &[Row], nidx: usize, ephemeral: bool) -> IReplay {
+    pub fn new(rows: &[Row], nidx: usize, ephemeral: bool, idef: IdxDef) -> IReplay {
         let mut keys: IStore = rows
             .iter()
             .map(|(id, a, b)| (vec![a.clone(), b.clone()], *id))
             .collect();
-        keys.sort_by(cmp_key);
-        let mut st = iinit(keys, nidx);
+        keys.sort_by(|x, y| cmp_key(idef, x, y));
+        let mut st = iinit_with(keys, nidx, idef);
         if ephemeral && nidx > 0 {
             st.icurs[0].icpos = IPos::Lost;
         }
@@ -803,8 +907,15 @@ pub enum IVerdict {
 
 /// Replays `ops` on the model and compares every observation of the engine. When the engine
 /// stopped with an error, the observations before it are compared first.
-pub fn icheck(rows: &[Row], nidx: usize, ephemeral: bool, ops: &[IOp], got: &Outcome) -> IVerdict {
-    let mut rep = IReplay::new(rows, nidx, ephemeral);
+pub fn icheck(
+    rows: &[Row],
+    nidx: usize,
+    ephemeral: bool,
+    idef: IdxDef,
+    ops: &[IOp],
+    got: &Outcome,
+) -> IVerdict {
+    let mut rep = IReplay::new(rows, nidx, ephemeral, idef);
     let mut trace = Vec::new();
     for (step, (op, e)) in ops.iter().zip(&got.obs).enumerate() {
         let Some(m) = rep.apply(op) else {
@@ -866,8 +977,8 @@ pub fn compare_engines(
 }
 
 /// Is the whole program legal for the model?
-pub fn is_legal(rows: &[Row], nidx: usize, ephemeral: bool, ops: &[IOp]) -> bool {
-    let mut rep = IReplay::new(rows, nidx, ephemeral);
+pub fn is_legal(rows: &[Row], nidx: usize, ephemeral: bool, idef: IdxDef, ops: &[IOp]) -> bool {
+    let mut rep = IReplay::new(rows, nidx, ephemeral, idef);
     ops.iter().all(|op| rep.apply(op).is_some())
 }
 
@@ -882,16 +993,31 @@ pub fn assert_agrees(
     nidx: usize,
     ops: &[IOp],
 ) {
+    assert_agrees_def(kind, layout, mode, IdxDef::default(), rows, nidx, ops)
+}
+
+/// `assert_agrees` for an index with the definition `idef`.
+#[track_caller]
+pub fn assert_agrees_def(
+    kind: DbKind,
+    layout: Layout,
+    mode: ReadMode,
+    idef: IdxDef,
+    rows: &[Row],
+    nidx: usize,
+    ops: &[IOp],
+) {
     let cfg = IndexRun {
         kind,
         layout,
         rows,
+        idef,
         nidx,
         ntbl: 0,
         mode,
     };
     let got = run_index(&cfg, ops);
-    match icheck(rows, nidx, kind == DbKind::Ephemeral, ops, &got) {
+    match icheck(rows, nidx, kind == DbKind::Ephemeral, idef, ops, &got) {
         IVerdict::Pass(_) => {}
         IVerdict::Skip { step } => panic!(
             "{kind:?}/{layout:?}: the model says op {step} ({:?}) is illegal",
@@ -1451,12 +1577,252 @@ mod tests {
         );
     }
 
+    // Column order and collation (SPEC 2c). The expected orders are what SQLite gives for an
+    // index scan (checked with the `sqlite3` CLI).
+
+    const ASC_BIN: ColDef = ColDef::new(Order::Asc, Coll::Binary);
+
+    fn col(order: Order, coll: Coll) -> ColDef {
+        ColDef::new(order, coll)
+    }
+
+    fn txt(x: &str) -> Val {
+        Val::text(x)
+    }
+
+    /// The values in index order under the column definition `d`. Ties keep their input order.
+    fn sorted(d: ColDef, vals: &[Val]) -> Vec<Val> {
+        let mut out = vals.to_vec();
+        out.sort_by(|x, y| cmp_val(d, x, y));
+        out
+    }
+
+    #[test]
+    fn order_default_is_asc_binary() {
+        assert!(IdxDef::default().is_default());
+        assert_eq!(IdxDef::default().cols, [ASC_BIN, ASC_BIN]);
+        let vals = [txt("b"), some(2), NUL, txt("a"), some(1)];
+        assert_eq!(
+            sorted(ASC_BIN, &vals),
+            vec![NUL, some(1), some(2), txt("a"), txt("b")]
+        );
+    }
+
+    #[test]
+    fn order_desc_text_first_null_last() {
+        let vals = [txt("a"), some(1), NUL, some(2), txt("Z")];
+        assert_eq!(
+            sorted(col(Order::Desc, Coll::Binary), &vals),
+            vec![txt("a"), txt("Z"), some(2), some(1), NUL]
+        );
+    }
+
+    #[test]
+    fn order_text_never_equals_integer() {
+        for coll in [Coll::Binary, Coll::NoCase, Coll::RTrim] {
+            let d = col(Order::Asc, coll);
+            assert_eq!(cmp_val(d, &txt("1"), &some(1)), Ordering::Greater);
+            assert_eq!(cmp_val(d, &some(1), &txt("1")), Ordering::Less);
+        }
+    }
+
+    #[test]
+    fn order_binary_by_byte() {
+        let vals = [txt("a"), txt("`"), txt("_"), txt("["), txt("Z")];
+        assert_eq!(
+            sorted(ASC_BIN, &vals),
+            vec![txt("Z"), txt("["), txt("_"), txt("`"), txt("a")]
+        );
+        // A shorter text that is a prefix goes first. A non-ASCII letter goes after ASCII.
+        assert_eq!(cmp_val(ASC_BIN, &txt("a"), &txt("a ")), Ordering::Less);
+        assert_eq!(cmp_val(ASC_BIN, &txt("z"), &txt("é")), Ordering::Less);
+    }
+
+    #[test]
+    fn order_nocase_folds_only_ascii_letters() {
+        let d = col(Order::Asc, Coll::NoCase);
+        let vals = [txt("a"), txt("Z"), txt("`"), txt("_"), txt("["), txt("A")];
+        // `a` and `A` are equal, so they keep the input order.
+        assert_eq!(
+            sorted(d, &vals),
+            vec![txt("["), txt("_"), txt("`"), txt("a"), txt("A"), txt("Z")]
+        );
+        assert_eq!(cmp_val(d, &txt("a"), &txt("A")), Ordering::Equal);
+        assert_eq!(cmp_val(d, &txt("é"), &txt("É")), Ordering::Greater);
+        assert_eq!(cmp_val(d, &txt("a"), &txt("a ")), Ordering::Less);
+    }
+
+    #[test]
+    fn order_rtrim_drops_trailing_spaces_only() {
+        let d = col(Order::Asc, Coll::RTrim);
+        assert_eq!(cmp_val(d, &txt(""), &txt(" ")), Ordering::Equal);
+        assert_eq!(cmp_val(d, &txt(" "), &txt("  ")), Ordering::Equal);
+        assert_eq!(cmp_val(d, &txt("a"), &txt("a ")), Ordering::Equal);
+        assert_eq!(cmp_val(d, &txt("a"), &txt("a\t")), Ordering::Less);
+        // Only the end is trimmed, and the case matters.
+        assert_eq!(cmp_val(d, &txt(" a"), &txt("a")), Ordering::Less);
+        assert_eq!(cmp_val(d, &txt("a"), &txt("A")), Ordering::Greater);
+    }
+
+    #[test]
+    fn order_rowid_is_always_asc() {
+        let d = IdxDef::new(
+            col(Order::Desc, Coll::NoCase),
+            col(Order::Desc, Coll::Binary),
+        );
+        let (x, y) = (k(txt("a"), some(1), 2), k(txt("A"), some(1), 5));
+        assert_eq!(cmp_key(d, &x, &y), Ordering::Less);
+        assert_eq!(cmp_key(d, &y, &x), Ordering::Greater);
+        // The columns decide before the rowid, in the order of the column.
+        let (x, y) = (k(some(1), some(1), 9), k(some(2), some(1), 1));
+        assert_eq!(cmp_key(d, &x, &y), Ordering::Greater);
+    }
+
+    /// The index `(a DESC, b NOCASE)` with the rows of the SPEC 2c example.
+    fn desc_nocase() -> (IdxDef, IStore) {
+        let d = IdxDef::new(
+            col(Order::Desc, Coll::Binary),
+            col(Order::Asc, Coll::NoCase),
+        );
+        let rows = vec![
+            k(some(3), NUL, 8),
+            k(some(3), txt("z"), 7),
+            k(some(2), txt("a"), 5),
+            k(some(1), txt("B"), 3),
+            k(some(1), txt("b"), 4),
+            k(some(1), txt("a"), 2),
+            k(NUL, txt("x"), 6),
+        ];
+        let mut keys = rows.clone();
+        keys.sort_by(|x, y| cmp_key(d, x, y));
+        (d, keys)
+    }
+
+    #[test]
+    fn order_desc_nocase_index_order() {
+        let (_, keys) = desc_nocase();
+        let rowids: Vec<i64> = keys.iter().map(|k| k.1).collect();
+        // `a` goes 3, 2, 1, NULL. In `a = 1`, `'a'` is before the tie of `'B'` and `'b'`.
+        assert_eq!(rowids, vec![8, 7, 5, 2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn order_desc_nocase_seeks() {
+        let (d, keys) = desc_nocase();
+        let st = iinit_with(keys, 6, d);
+        let seek = |cur: usize, op: IMOp| a(cur, op);
+        let p = [
+            seek(0, ISeekGE(vec![some(3)])),
+            seek(1, ISeekGT(vec![some(3)])),
+            seek(2, ISeekGE(vec![some(1), txt("B")])),
+            seek(3, ISeekGT(vec![some(1), txt("B")])),
+            seek(4, ISeekLE(vec![some(1), txt("B")])),
+            seek(5, ISeekLT(vec![some(1), txt("B")])),
+        ];
+        let (_, obs) = irun(&st, &p).unwrap();
+        let rowids: Vec<Option<i64>> = obs
+            .iter()
+            .map(|o| match o.irid {
+                Spec::Is(r) => r,
+                Spec::Unspec => panic!("unspecified"),
+            })
+            .collect();
+        // SeekGE [3] is the first entry with a = 3, SeekGT [3] is a = 2. For [1, 'B'] the
+        // tie of (1, 'B', 3) and (1, 'b', 4): GE the first, GT the entry after both, LE the
+        // last, LT the entry before both.
+        assert_eq!(
+            rowids,
+            vec![Some(8), Some(5), Some(3), Some(6), Some(4), Some(2)]
+        );
+    }
+
+    #[test]
+    fn order_desc_scan_and_prefix_compare() {
+        // `Next` goes along the index order: for `a DESC` it goes to smaller values.
+        let (d, keys) = desc_nocase();
+        let st = iinit_with(keys, 1, d);
+        let (st, _) = istep(&st, &a(0, ISeekGE(vec![some(2)]))).unwrap();
+        let (_, o) = istep(&st, &a(0, INext)).unwrap();
+        assert_eq!(o.irid, Spec::Is(Some(2)));
+        // `IdxGT [2]` on the entry with a = 1 jumps: it is after the prefix in index order.
+        let (st, _) = istep(&st, &a(0, INext)).unwrap();
+        let (_, o) = istep(&st, &a(0, IdxGT(vec![some(2)]))).unwrap();
+        assert!(o.ijumped);
+        // `Found` ignores the order and the case.
+        let (_, o) = istep(&st, &a(0, IFound(vec![some(1), txt("B")]))).unwrap();
+        assert!(o.ijumped);
+        let (_, o) = istep(&st, &a(0, IFound(vec![some(1), txt("c")]))).unwrap();
+        assert!(!o.ijumped);
+    }
+
+    #[test]
+    fn same_key_rules() {
+        let d = IdxDef::new(col(Order::Asc, Coll::NoCase), ASC_BIN);
+        let keys = vec![k(txt("a"), some(1), 1)];
+        let st = iinit_with(keys, 1, d);
+        let del = |key: IKey| a(0, IdxDelete(key));
+        let ins = |key: IKey| a(0, IdxInsert(key, false));
+        // An equal but not identical key: neither insert nor delete is legal.
+        assert!(istep(&st, &ins(k(txt("A"), some(1), 1))).is_none());
+        assert!(istep(&st, &del(k(txt("A"), some(1), 1))).is_none());
+        // Another rowid is another key.
+        assert!(istep(&st, &ins(k(txt("A"), some(1), 2))).is_some());
+        // Delete, then insert the case variant: legal. A read gives the new bytes.
+        let p = [
+            a(0, IRewind),
+            del(k(txt("a"), some(1), 1)),
+            ins(k(txt("A"), some(1), 1)),
+            a(0, IRewind),
+        ];
+        let (_, obs) = irun(&st, &p).unwrap();
+        assert_eq!(obs[3], kobs(false, &k(txt("A"), some(1), 1)));
+    }
+
+    #[test]
+    fn peer_reads_the_replacement_of_an_equal_key() {
+        // Cursor 0 is on ('a', 1, 1). A peer replaces the entry by ('A', 1, 1). The cursor
+        // stays on the entry, and reads the new bytes.
+        let d = IdxDef::new(col(Order::Asc, Coll::NoCase), ASC_BIN);
+        let st = iinit_with(vec![k(txt("a"), some(1), 1)], 2, d);
+        let p = [
+            a(0, IRewind),
+            a(1, IdxDelete(k(txt("a"), some(1), 1))),
+            a(1, IdxInsert(k(txt("A"), some(1), 1), false)),
+            a(0, IObserve),
+        ];
+        let (_, obs) = irun(&st, &p).unwrap();
+        assert_eq!(obs[3], kobs(false, &k(txt("A"), some(1), 1)));
+    }
+
+    #[test]
+    fn rtrim_token_and_append_use_the_collation() {
+        let d = IdxDef::new(col(Order::Asc, Coll::RTrim), ASC_BIN);
+        let st = iinit_with(vec![k(txt("a"), some(1), 1)], 1, d);
+        // The token of `NotFound ['b ', 1]` fits the key `['b', 1]`.
+        let p = [
+            a(0, INotFound(vec![txt("b "), some(1)])),
+            a(0, IdxInsert(k(txt("b"), some(1), 5), true)),
+        ];
+        assert!(irun(&st, &p).is_some());
+        // `SeekEnd`: `('a ', 1, 2)` is above `('a', 1, 1)`, but `('a ', 1, 0)` is below.
+        let up = [
+            a(0, ISeekEnd),
+            a(0, IdxInsert(k(txt("a "), some(1), 2), true)),
+        ];
+        assert!(irun(&st, &up).is_some());
+        let down = [
+            a(0, ISeekEnd),
+            a(0, IdxInsert(k(txt("a "), some(1), 0), true)),
+        ];
+        assert!(irun(&st, &down).is_none());
+    }
+
     // The harness bridge.
 
     #[test]
     fn bridge_projects_reads_by_op() {
         let rows: Vec<Row> = vec![(1, some(1), some(10)), (2, NUL, some(5))];
-        let mut rep = IReplay::new(&rows, 1, false);
+        let mut rep = IReplay::new(&rows, 1, false, IdxDef::default());
         let ops = [
             IOp::Rewind(0),
             IOp::Column(0, 1),
@@ -1504,14 +1870,38 @@ mod tests {
         let rows: Vec<Row> = vec![(1, some(1), some(10))];
         // On a persistent database a fresh cursor is `Invalid`, so `IdxGE` jumps. In an
         // ephemeral run the position is open, so the model calls it illegal.
-        assert!(is_legal(&rows, 1, false, &[IOp::IdxGE(0, vec![some(1)])]));
-        assert!(!is_legal(&rows, 1, true, &[IOp::IdxGE(0, vec![some(1)])]));
-        assert!(is_legal(&rows, 1, true, &[IOp::Rewind(0), IOp::Next(0)]));
+        assert!(is_legal(
+            &rows,
+            1,
+            false,
+            IdxDef::default(),
+            &[IOp::IdxGE(0, vec![some(1)])]
+        ));
+        assert!(!is_legal(
+            &rows,
+            1,
+            true,
+            IdxDef::default(),
+            &[IOp::IdxGE(0, vec![some(1)])]
+        ));
+        assert!(is_legal(
+            &rows,
+            1,
+            true,
+            IdxDef::default(),
+            &[IOp::Rewind(0), IOp::Next(0)]
+        ));
     }
 
     #[test]
     fn bridge_unknown_ops_are_illegal() {
         let rows: Vec<Row> = vec![];
-        assert!(!is_legal(&rows, 1, false, &[IOp::FinishSeek(0)]));
+        assert!(!is_legal(
+            &rows,
+            1,
+            false,
+            IdxDef::default(),
+            &[IOp::FinishSeek(0)]
+        ));
     }
 }

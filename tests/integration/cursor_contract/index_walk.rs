@@ -7,17 +7,22 @@
 //! and printed as a Rust test body.
 //!
 //! The index is `i_ab ON ti(a, b)`. `a` has few values (0..5) and NULLs, so there are many
-//! duplicates in `a`, and the prefix of a seek has one or two columns.
+//! duplicates in `a`, and the prefix of a seek has one or two columns. A case draws the sort
+//! order and the collation of the two columns (`IdxDef`, SPEC 2c), and a value pool: integers
+//! only, or integers and a small pool of texts that differ by case and by trailing spaces.
 //!
 //! Environment:
 //! - `SEED`: seed of the first case (decimal or `0x` hex). Case `i` uses `SEED + i`, so the
 //!   seed in a failure report reproduces that case with `ITERS=1`.
 //! - `ITERS`: number of cases.
 //! - `NO_FILTER=1`: switch off the known gap filters, to see the known gaps again.
+//! - `IDEF`: the index definition family of all cases: `default` (ASC, BINARY), `desc`,
+//!   `nocase`, `rtrim`, `mixed` (any non-default definition). Unset: most cases use the
+//!   default definition and the others a random one.
 
 use super::index_model::{
-    above_all, compare_engines, icheck, imax, imem, is_legal, project, IFailure, IKey, IMObs, IPos,
-    IReplay, ITok, IVerdict, Val,
+    above_all, cmp_cols, cmp_key, compare_engines, icheck, imax, imem, is_legal, project, ColDef,
+    Coll, IFailure, IKey, IMObs, IPos, IReplay, ITok, IVerdict, IdxDef, Order, Val,
 };
 use super::index_program::{run_index, IOp, IndexRun, Outcome, Prefix, Row};
 use super::model::Spec;
@@ -25,6 +30,7 @@ use super::program::ReadMode;
 use super::{DbKind, Layout};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 /// Values of `a` are in `0..A_RANGE`, values of `b` in `0..B_RANGE`.
@@ -91,8 +97,9 @@ impl IdxGaps {
     /// another cursor writes to the index: reads give NULL or a neighbour, `Delete` and the
     /// compare ops act on the wrong entry. A cursor positioned by a seek keeps its position.
     pub const N9_WAL_PEER_WRITE_AFTER_OWN_INSERT: IdxGaps = IdxGaps(1 << 9);
-    /// N10: WAL: a seek that fails on an empty index leaves the cursor ended, but after a peer
-    /// inserted an entry `Next` finds it. The contract says an ended cursor stays ended.
+    /// N10: WAL: a cursor that ended (a failed seek or a `Next` past the last entry) keeps its
+    /// cell index. After peers inserted entries `Next` finds one. The contract says an ended
+    /// cursor stays ended.
     pub const N10_WAL_NEXT_AFTER_FAILED_SEEK_ON_EMPTY: IdxGaps = IdxGaps(1 << 10);
     /// N11: WAL and ephemeral: `IdxInsert` with `use_seek` after a `Found`, `NotFound` or
     /// `NoConflict` that hit puts the new key before the matched entry, whatever its rowid, so
@@ -108,8 +115,18 @@ impl IdxGaps {
     /// cursor is not adjusted).
     pub const N12_WAL_DELETE_AFTER_PEER_DELETE: IdxGaps = IdxGaps(1 << 13);
 
+    /// CL1: MVCC: `IdxInsert` of a key that equals, under the collations, a key that the index
+    /// held earlier in the run, but that is not identical to it (`('A', 1)` after
+    /// `('a', 1)`). The overlay keeps the bytes of the first key, so a read gives the old text.
+    pub const CL1_MVCC_EQUAL_KEY_REINSERT: IdxGaps = IdxGaps(1 << 14);
+
+    /// IDX_N6_WAL_OWN_DELETE_PEER_WRITE: WAL: `Next` or `Prev` of a cursor that deleted its
+    /// entry with `Delete`, after another cursor wrote to the index: the cursor finds the
+    /// wrong entry or the end. The index twin of the table gap N6.
+    pub const IDX_N6_WAL_OWN_DELETE_PEER_WRITE: IdxGaps = IdxGaps(1 << 15);
+
     pub const NONE: IdxGaps = IdxGaps(0);
-    pub const ALL: IdxGaps = IdxGaps((1 << 14) - 1);
+    pub const ALL: IdxGaps = IdxGaps((1 << 16) - 1);
 
     pub fn has(self, other: IdxGaps) -> bool {
         self.0 & other.0 == other.0
@@ -135,7 +152,7 @@ impl IdxGaps {
         }
     }
 
-    pub const NAMES: [(&'static str, IdxGaps); 14] = [
+    pub const NAMES: [(&'static str, IdxGaps); 16] = [
         ("IDX_D1_MVCC_CKPT", IdxGaps::IDX_D1_MVCC_CKPT),
         ("IDX_END_INSERT", IdxGaps::IDX_END_INSERT),
         ("ROWDATA_IDX_INSERT", IdxGaps::ROWDATA_IDX_INSERT),
@@ -156,6 +173,11 @@ impl IdxGaps {
             IdxGaps::IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN,
         ),
         ("N12", IdxGaps::N12_WAL_DELETE_AFTER_PEER_DELETE),
+        ("CL1", IdxGaps::CL1_MVCC_EQUAL_KEY_REINSERT),
+        (
+            "IDX_N6_WAL_OWN_DELETE_PEER_WRITE",
+            IdxGaps::IDX_N6_WAL_OWN_DELETE_PEER_WRITE,
+        ),
     ];
 }
 
@@ -165,6 +187,7 @@ impl IdxGaps {
 
 #[derive(Debug, Clone)]
 pub struct Case {
+    pub idef: IdxDef,
     pub rows: Vec<Row>,
     pub nidx: usize,
     pub mode: ReadMode,
@@ -188,7 +211,7 @@ impl Filter {
     /// True if the generator could have written `case`: every op is legal and none has a
     /// filtered pattern.
     fn clean(&self, case: &Case) -> bool {
-        let mut g = Gen::new(&case.rows, case.nidx, case.mode, self);
+        let mut g = Gen::new(&case.rows, case.nidx, case.mode, case.idef, self);
         for op in &case.ops {
             if g.blocked(op) || g.replay.clone().apply(op).is_none() {
                 return false;
@@ -207,6 +230,64 @@ pub struct WalkConfig {
     pub seed: u64,
     pub iters: usize,
     pub gaps: IdxGaps,
+    pub family: Family,
+}
+
+/// The index definitions that a walk draws (`IDEF`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Family {
+    /// Mostly the default definition, else a random one.
+    Any,
+    Default,
+    Desc,
+    NoCase,
+    RTrim,
+    /// A random definition that is not the default one.
+    Mixed,
+}
+
+impl Family {
+    fn from_env() -> Family {
+        match std::env::var("IDEF").as_deref() {
+            Err(_) | Ok("") => Family::Any,
+            Ok("default") => Family::Default,
+            Ok("desc") => Family::Desc,
+            Ok("nocase") => Family::NoCase,
+            Ok("rtrim") => Family::RTrim,
+            Ok("mixed") => Family::Mixed,
+            Ok(other) => panic!("unknown IDEF {other}"),
+        }
+    }
+
+    fn draw(self, rng: &mut ChaCha8Rng) -> IdxDef {
+        let both = |order, coll| IdxDef::new(ColDef::new(order, coll), ColDef::new(order, coll));
+        match self {
+            Family::Default => IdxDef::default(),
+            Family::Desc => both(Order::Desc, Coll::Binary),
+            Family::NoCase => both(Order::Asc, Coll::NoCase),
+            Family::RTrim => both(Order::Asc, Coll::RTrim),
+            Family::Any if rng.random_bool(0.6) => IdxDef::default(),
+            Family::Any | Family::Mixed => loop {
+                let mut col = || {
+                    let order = if rng.random_bool(0.5) {
+                        Order::Desc
+                    } else {
+                        Order::Asc
+                    };
+                    let coll = match rng.random_range(0..10) {
+                        0..=3 => Coll::Binary,
+                        4..=6 => Coll::NoCase,
+                        _ => Coll::RTrim,
+                    };
+                    ColDef::new(order, coll)
+                };
+                let def = IdxDef::new(col(), col());
+                if !def.is_default() {
+                    return def;
+                }
+            },
+        }
+    }
 }
 
 impl WalkConfig {
@@ -225,6 +306,7 @@ impl WalkConfig {
             seed,
             iters,
             gaps: IdxGaps::from_env(),
+            family: Family::from_env(),
         }
     }
 }
@@ -237,7 +319,7 @@ pub fn walk(cfg: &WalkConfig) -> Vec<String> {
     for i in 0..cfg.iters {
         let case_seed = cfg.seed.wrapping_add(i as u64);
         let mut rng = ChaCha8Rng::seed_from_u64(case_seed);
-        let (case, filter) = generate(&mut rng, cfg.gaps);
+        let (case, filter) = generate(&mut rng, cfg.gaps, cfg.family);
         ran += filter.scope.len();
         ops_total += case.ops.len();
         run_case(&case, &filter, case_seed, &mut seen, &mut reports);
@@ -275,6 +357,7 @@ fn run_one(kind: DbKind, layout: Layout, case: &Case) -> Outcome {
             kind,
             layout,
             rows: &case.rows,
+            idef: case.idef,
             nidx: case.nidx,
             ntbl: 0,
             mode: case.mode,
@@ -297,7 +380,7 @@ fn run_case(
     let mut failing: Vec<(Cfg, String)> = Vec::new();
     for (i, (&(kind, layout), got)) in configs.iter().zip(&outs).enumerate() {
         let eph = kind == DbKind::Ephemeral;
-        match icheck(&case.rows, case.nidx, eph, &case.ops, got) {
+        match icheck(&case.rows, case.nidx, eph, case.idef, &case.ops, got) {
             IVerdict::Pass(trace) => passes.push((i, trace)),
             IVerdict::Skip { .. } => {}
             IVerdict::Fail(f) => failing.push((Cfg::Single(kind, layout), f.signature(&case.ops))),
@@ -325,7 +408,14 @@ fn run_case(
 // ---------------------------------------------------------------------------------------
 
 /// Draws a case. The model runs along, so every op is legal.
-pub fn generate(rng: &mut ChaCha8Rng, gaps: IdxGaps) -> (Case, Filter) {
+pub fn generate(rng: &mut ChaCha8Rng, gaps: IdxGaps, family: Family) -> (Case, Filter) {
+    let idef = family.draw(rng);
+    // The default definition keeps the integer pool most of the time, the others have text.
+    let pool = if idef.is_default() && rng.random_bool(0.7) {
+        Pool::Ints
+    } else {
+        Pool::Mixed
+    };
     let nidx = rng.random_range(1..=3);
     let filter = Filter {
         gaps,
@@ -343,9 +433,10 @@ pub fn generate(rng: &mut ChaCha8Rng, gaps: IdxGaps) -> (Case, Filter) {
         rng.random_range(2..=14)
     };
     let rows: Vec<Row> = (1..=count)
-        .map(|id| (id, rand_a(rng), rand_b(rng)))
+        .map(|id| (id, rand_a(rng, pool), rand_b(rng, pool)))
         .collect();
-    let mut g = Gen::new(&rows, nidx, mode, &filter);
+    let mut g = Gen::new(&rows, nidx, mode, idef, &filter);
+    g.pool = pool;
     let len = rng.random_range(1..=MAX_OPS);
     let mut ops: Vec<IOp> = Vec::new();
     while ops.len() < len {
@@ -357,6 +448,7 @@ pub fn generate(rng: &mut ChaCha8Rng, gaps: IdxGaps) -> (Case, Filter) {
         }
     }
     let case = Case {
+        idef,
         rows,
         nidx,
         mode,
@@ -369,6 +461,8 @@ pub fn generate(rng: &mut ChaCha8Rng, gaps: IdxGaps) -> (Case, Filter) {
 #[derive(Clone)]
 struct Gen {
     replay: IReplay,
+    /// The values of new columns.
+    pool: Pool,
     gaps: IdxGaps,
     /// The configs the case runs on.
     scope: Vec<(DbKind, Layout)>,
@@ -382,20 +476,27 @@ struct Gen {
     after_seek_end: Vec<bool>,
     /// The last move of the cursor was `Count`.
     after_count: Vec<bool>,
+    /// The last write of the cursor was a `Delete` and it did not move since.
+    own_deleted: Vec<bool>,
     /// Another cursor wrote to the index since the cursor moved the last time.
     peer_wrote: Vec<bool>,
     /// Another cursor deleted an entry since the cursor moved the last time.
     peer_deleted: Vec<bool>,
-    /// The last move of the cursor ended on an empty index.
-    ended_empty: Vec<bool>,
+    /// The last move of the cursor ended the scan (the cursor is `Invalid`).
+    ended: Vec<bool>,
     /// Keys that an `IdxInsert` of this run wrote.
     written: Vec<IKey>,
+    /// Every key that the index held at some time of the run: the setup rows and `written`.
+    ever: Vec<IKey>,
 }
 
 impl Gen {
-    fn new(rows: &[Row], nidx: usize, mode: ReadMode, filter: &Filter) -> Gen {
+    fn new(rows: &[Row], nidx: usize, mode: ReadMode, idef: IdxDef, filter: &Filter) -> Gen {
+        let replay = IReplay::new(rows, nidx, filter.ephemeral(), idef);
         Gen {
-            replay: IReplay::new(rows, nidx, filter.ephemeral()),
+            ever: replay.st.irows.clone(),
+            replay,
+            pool: Pool::Ints,
             gaps: filter.gaps,
             scope: filter.scope.clone(),
             mode,
@@ -403,9 +504,10 @@ impl Gen {
             appended: vec![false; nidx],
             after_seek_end: vec![false; nidx],
             after_count: vec![false; nidx],
+            own_deleted: vec![false; nidx],
             peer_wrote: vec![false; nidx],
             peer_deleted: vec![false; nidx],
-            ended_empty: vec![false; nidx],
+            ended: vec![false; nidx],
             written: Vec::new(),
         }
     }
@@ -466,6 +568,7 @@ impl Gen {
             92 => one(IOp::NullRow(c)),
             93 => one(IOp::Count(c)),
             94 => one(IOp::SeekEnd(c)),
+            95..=96 => self.replace_with_variant(rng, c),
             _ => self.range_loop(rng, c),
         }
     }
@@ -494,6 +597,35 @@ impl Gen {
         ops
     }
 
+    /// Deletes a stored key and inserts a key with the same rowid and columns that differ by
+    /// case or by trailing spaces, then seeks to it and reads. Under NOCASE or RTRIM the new
+    /// key is equal to the old one, so the entry must read with the new bytes (SPEC 2c).
+    fn replace_with_variant(&self, rng: &mut ChaCha8Rng, c: usize) -> Vec<IOp> {
+        let s = &self.replay.st.irows;
+        if s.is_empty() {
+            return Vec::new();
+        }
+        let (cols, rowid) = s[rng.random_range(0..s.len())].clone();
+        let (a, b) = (variant(rng, &cols[0]), variant(rng, &cols[1]));
+        vec![
+            IOp::IdxDelete {
+                cur: c,
+                a: cols[0].clone(),
+                b: cols[1].clone(),
+                rowid,
+            },
+            IOp::IdxInsert {
+                cur: c,
+                a: a.clone(),
+                b,
+                rowid,
+                use_seek: false,
+            },
+            IOp::SeekGE(c, vec![a]),
+            IOp::Observe(c),
+        ]
+    }
+
     /// An `IdxInsert`. With `use_seek` the key must go with the seek token of the cursor.
     fn idx_insert(&self, rng: &mut ChaCha8Rng, c: usize) -> IOp {
         let cur = &self.replay.st.icurs[c];
@@ -518,9 +650,9 @@ impl Gen {
                     // A NULL in the key: Turso seeks, so no token is needed.
                     if rng.random_bool(0.4) {
                         let (a, b) = if rng.random_bool(0.7) {
-                            (Val::Null, rand_b(rng))
+                            (Val::Null, rand_b(rng, self.pool))
                         } else {
-                            (rand_a(rng), Val::Null)
+                            (rand_a(rng, self.pool), Val::Null)
                         };
                         let rowid = self.new_rowid(rng, &[a.clone(), b.clone()]);
                         return make(a, b, rowid, true);
@@ -528,7 +660,7 @@ impl Gen {
                 }
             }
         }
-        let (a, b) = (rand_a(rng), rand_b(rng));
+        let (a, b) = (rand_a(rng, self.pool), rand_b(rng, self.pool));
         let rowid = self.new_rowid(rng, &[a.clone(), b.clone()]);
         make(a, b, rowid, false)
     }
@@ -538,7 +670,11 @@ impl Gen {
         let s = &self.replay.st.irows;
         for _ in 0..20 {
             let r = rng.random_range(1..=ROWID_MAX);
-            if !s.iter().any(|k| k.0 == cols && k.1 == r) {
+            let d = self.replay.st.idef;
+            if !s
+                .iter()
+                .any(|k| k.1 == r && cmp_cols(d, &k.0, cols) == Ordering::Equal)
+            {
                 return r;
             }
         }
@@ -547,22 +683,31 @@ impl Gen {
 
     /// A key that is above every key of the index: an append.
     fn above_all_key(&self, rng: &mut ChaCha8Rng) -> (Val, Val, i64) {
-        match imax(&self.replay.st.irows) {
+        let (d, s) = (self.replay.st.idef, &self.replay.st.irows);
+        match imax(s) {
             // The same columns as the largest key, with a higher rowid.
             Some((cols, r)) if rng.random_bool(0.6) => {
                 (cols[0].clone(), cols[1].clone(), r + rng.random_range(1..4))
             }
-            Some((cols, _)) => (
-                Val::Int(
-                    match cols[0] {
-                        Val::Int(x) => x,
-                        _ => 0,
-                    } + rng.random_range(1..3),
-                ),
-                rand_b(rng),
+            // A random key, if it is above every key (the index order decides, so for a DESC
+            // column this is a small value).
+            Some((cols, r)) => {
+                for _ in 0..10 {
+                    let key = (
+                        vec![rand_a(rng, self.pool), rand_b(rng, self.pool)],
+                        rng.random_range(1..=ROWID_MAX),
+                    );
+                    if above_all(d, &key, s) {
+                        return (key.0[0].clone(), key.0[1].clone(), key.1);
+                    }
+                }
+                (cols[0].clone(), cols[1].clone(), r + 1)
+            }
+            None => (
+                rand_a(rng, self.pool),
+                rand_b(rng, self.pool),
                 rng.random_range(1..=ROWID_MAX),
             ),
-            None => (rand_a(rng), rand_b(rng), rng.random_range(1..=ROWID_MAX)),
         }
     }
 
@@ -572,8 +717,8 @@ impl Gen {
         if s.is_empty() {
             return IOp::IdxDelete {
                 cur: c,
-                a: rand_a(rng),
-                b: rand_b(rng),
+                a: rand_a(rng, self.pool),
+                b: rand_b(rng, self.pool),
                 rowid: 1,
             };
         }
@@ -591,7 +736,7 @@ impl Gen {
         match &self.replay.st.icurs[c].icpos {
             IPos::At(k) | IPos::Gone(k) if rng.random_bool(0.7) => {
                 let len = rng.random_range(1..=2);
-                perturb(rng, k.0[..len].to_vec())
+                perturb(rng, self.pool, k.0[..len].to_vec())
             }
             _ => self.prefix(rng, None),
         }
@@ -605,9 +750,9 @@ impl Gen {
         let base = if !s.is_empty() && rng.random_bool(0.75) {
             s[rng.random_range(0..s.len())].0.clone()
         } else {
-            vec![rand_a(rng), rand_b(rng)]
+            vec![rand_a(rng, self.pool), rand_b(rng, self.pool)]
         };
-        perturb(rng, base[..len].to_vec())
+        perturb(rng, self.pool, base[..len].to_vec())
     }
 
     /// Updates the model and the filter history after `op` was emitted.
@@ -650,17 +795,18 @@ impl Gen {
             self.after_seek_end[c] = matches!(op, IOp::SeekEnd(_));
             self.after_count[c] = matches!(op, IOp::Count(_));
             self.peer_wrote[c] = false;
+            self.own_deleted[c] = matches!(op, IOp::Delete(_));
             let insert = match op {
                 IOp::IdxInsert { a, b, rowid, .. } => Some((vec![a.clone(), b.clone()], *rowid)),
                 _ => None,
             };
-            self.ended_empty[c] =
-                self.replay.st.icurs[c].icpos == IPos::Invalid && self.replay.st.irows.is_empty();
+            self.ended[c] = self.replay.st.icurs[c].icpos == IPos::Invalid;
             if let Some(k) = &insert {
                 self.written.push(k.clone());
+                self.ever.push(k.clone());
             }
             self.after_insert[c] = insert.is_some();
-            self.appended[c] = insert.is_some_and(|k| above_all(&k, &before.irows));
+            self.appended[c] = insert.is_some_and(|k| above_all(before.idef, &k, &before.irows));
         }
     }
 
@@ -674,6 +820,7 @@ impl Gen {
             .iter()
             .any(|c| matches!(c.0, DbKind::Wal | DbKind::Ephemeral));
         let wal = self.scope.iter().any(|c| c.0 == DbKind::Wal);
+        let mvcc = self.scope.iter().any(|c| c.0 == DbKind::Mvcc);
         let mvcc_ckpt = self.scope.contains(&(DbKind::Mvcc, Layout::Checkpointed));
         (self.gaps.has(IdxGaps::IDX_D1_MVCC_CKPT) && mvcc_ckpt && self.idx_d1(op))
             || (self.gaps.has(IdxGaps::IDX_END_INSERT) && wal_or_eph && self.idx_end_insert(op))
@@ -697,8 +844,26 @@ impl Gen {
                 && wal
                 && matches!(*op, IOp::Delete(c) if self.peer_deleted[c]))
             || (self.gaps.has(IdxGaps::IDX_N2_READ_AFTER_COUNT) && self.idx_n2(op))
+            || (self.gaps.has(IdxGaps::CL1_MVCC_EQUAL_KEY_REINSERT) && mvcc && self.cl1(op))
+            || (self.gaps.has(IdxGaps::IDX_N6_WAL_OWN_DELETE_PEER_WRITE)
+                && wal
+                && matches!(*op, IOp::Next(c) | IOp::Prev(c)
+                    if self.own_deleted[c] && self.peer_wrote[c]))
             || (self.gaps.has(IdxGaps::N7_READ_AFTER_SEEK_END) && self.n7(op))
             || (self.gaps.has(IdxGaps::N8_IDX_COMPARE_AFTER_PEER_WRITE) && self.n8(op))
+    }
+
+    /// CL1: an `IdxInsert` of a key that is equal but not identical to a key that the index
+    /// held earlier.
+    fn cl1(&self, op: &IOp) -> bool {
+        let IOp::IdxInsert { a, b, rowid, .. } = op else {
+            return false;
+        };
+        let key = (vec![a.clone(), b.clone()], *rowid);
+        let d = self.replay.st.idef;
+        self.ever
+            .iter()
+            .any(|k| k != &key && cmp_key(d, k, &key) == Ordering::Equal)
     }
 
     /// IDX_G2_PEER_DELETE: a read of a cursor that is on an entry which is no longer in the
@@ -709,7 +874,7 @@ impl Gen {
         };
         let cur = &self.replay.st.icurs[c];
         match &cur.icpos {
-            IPos::At(k) => !cur.icnull && !imem(k, &self.replay.st.irows),
+            IPos::At(k) => !cur.icnull && !imem(self.replay.st.idef, k, &self.replay.st.irows),
             _ => false,
         }
     }
@@ -746,9 +911,9 @@ impl Gen {
         }
     }
 
-    /// N10: `Next` or `Prev` on a cursor that ended on an empty index, after a peer write.
+    /// N10: `Next` or `Prev` on a cursor that ended, after a peer write.
     fn n10(&self, op: &IOp) -> bool {
-        matches!(*op, IOp::Next(c) | IOp::Prev(c) if self.ended_empty[c] && self.peer_wrote[c])
+        matches!(*op, IOp::Next(c) | IOp::Prev(c) if self.ended[c] && self.peer_wrote[c])
     }
 
     /// N11: `IdxInsert` with `use_seek` on a cursor that sits on a `Found`-style hit.
@@ -794,7 +959,7 @@ impl Gen {
         };
         let cur = &self.replay.st.icurs[c];
         match &cur.icpos {
-            IPos::At(k) => !imem(k, &self.replay.st.irows),
+            IPos::At(k) => !imem(self.replay.st.idef, k, &self.replay.st.irows),
             _ => false,
         }
     }
@@ -840,24 +1005,61 @@ impl Gen {
     }
 }
 
-fn rand_a(rng: &mut ChaCha8Rng) -> Val {
+/// Where the values of new columns come from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pool {
+    /// NULL and small integers.
+    Ints,
+    /// NULL, small integers and the texts of `TEXTS`.
+    Mixed,
+}
+
+/// Texts that differ by case and by trailing blanks. There is no NUL byte (SPEC 2c).
+const TEXTS: [&str; 13] = [
+    "", " ", "  ", "a", "A", "a ", "a\t", "b", "B", "[", "_", "é", "É",
+];
+
+fn rand_text(rng: &mut ChaCha8Rng) -> Val {
+    Val::text(TEXTS[rng.random_range(0..TEXTS.len())])
+}
+
+fn rand_a(rng: &mut ChaCha8Rng, pool: Pool) -> Val {
     if rng.random_bool(0.15) {
         Val::Null
+    } else if pool == Pool::Mixed && rng.random_bool(0.65) {
+        rand_text(rng)
     } else {
         Val::Int(rng.random_range(0..A_RANGE))
     }
 }
 
-fn rand_b(rng: &mut ChaCha8Rng) -> Val {
+fn rand_b(rng: &mut ChaCha8Rng, pool: Pool) -> Val {
     if rng.random_bool(0.1) {
         Val::Null
+    } else if pool == Pool::Mixed && rng.random_bool(0.65) {
+        rand_text(rng)
     } else {
         Val::Int(rng.random_range(0..B_RANGE))
     }
 }
 
+/// A text with the other case, or with a trailing space added or removed. Other values stay.
+fn variant(rng: &mut ChaCha8Rng, v: &Val) -> Val {
+    let Val::Text(t) = v else { return v.clone() };
+    match rng.random_range(0..4) {
+        0 => Val::Text(t.clone()),
+        1 => Val::Text(t.to_ascii_uppercase()),
+        2 => Val::Text(t.to_ascii_lowercase()),
+        _ => Val::Text(match t.strip_suffix(' ') {
+            Some(shorter) => shorter.to_string(),
+            None => format!("{t} "),
+        }),
+    }
+}
+
 /// Moves some values of a prefix by one, or to NULL, so that a seek can land between entries.
-fn perturb(rng: &mut ChaCha8Rng, mut p: Prefix) -> Prefix {
+/// A text becomes a variant of itself or another text.
+fn perturb(rng: &mut ChaCha8Rng, pool: Pool, mut p: Prefix) -> Prefix {
     for v in p.iter_mut() {
         match rng.random_range(0..20) {
             0..=2 => {
@@ -871,6 +1073,8 @@ fn perturb(rng: &mut ChaCha8Rng, mut p: Prefix) -> Prefix {
                 }
             }
             6..=7 => *v = Val::Null,
+            8..=11 if pool == Pool::Mixed => *v = variant(rng, v),
+            12 if pool == Pool::Mixed => *v = rand_text(rng),
             _ => {}
         }
     }
@@ -986,6 +1190,7 @@ fn evaluate(cfg: Cfg, case: &Case) -> Option<String> {
             &case.rows,
             case.nidx,
             kind == DbKind::Ephemeral,
+            case.idef,
             &case.ops,
             got,
         )
@@ -1017,13 +1222,13 @@ fn shrink(case: &Case, cfg: Cfg, sig: &str, filter: &Filter) -> Case {
             && cfg
                 .configs()
                 .iter()
-                .all(|(k, _)| is_legal(&c.rows, c.nidx, *k == DbKind::Ephemeral, &c.ops))
+                .all(|(k, _)| is_legal(&c.rows, c.nidx, *k == DbKind::Ephemeral, c.idef, &c.ops))
             && filter.clean(c)
             && evaluate(cfg, c).as_deref() == Some(sig)
     };
     let mut cur = case.clone();
     loop {
-        let before = (cur.ops.len(), cur.rows.len(), cur.nidx);
+        let before = (cur.ops.len(), cur.rows.len(), cur.nidx, cur.idef);
         // Remove chunks of ops, from half of the program down to single ops.
         let mut chunk = (cur.ops.len() / 2).max(1);
         loop {
@@ -1052,6 +1257,22 @@ fn shrink(case: &Case, cfg: Cfg, sig: &str, filter: &Filter) -> Case {
                 i += 1;
             }
         }
+        // The definition may be the default one, or default for one column.
+        for cand_def in [
+            IdxDef::default(),
+            IdxDef::new(cur.idef.cols[0], ColDef::default()),
+            IdxDef::new(ColDef::default(), cur.idef.cols[1]),
+        ] {
+            if cand_def != cur.idef {
+                let cand = Case {
+                    idef: cand_def,
+                    ..cur.clone()
+                };
+                if still_fails(&cand) {
+                    cur = cand;
+                }
+            }
+        }
         // A prefix of two values may need only one.
         for i in 0..cur.ops.len() {
             if let Some(cand) = with_shorter_prefix(&cur, i) {
@@ -1075,7 +1296,7 @@ fn shrink(case: &Case, cfg: Cfg, sig: &str, filter: &Filter) -> Case {
                 }
             }
         }
-        if before == (cur.ops.len(), cur.rows.len(), cur.nidx) {
+        if before == (cur.ops.len(), cur.rows.len(), cur.nidx, cur.idef) {
             return cur;
         }
     }
@@ -1128,13 +1349,16 @@ fn report(case: &Case, original: &Case, cfg: Cfg, case_seed: u64) -> Report {
     text += &format!("=== index cursor contract failure: {sig}\n");
     text += &format!("seed {case_seed:#x} (rerun: SEED={case_seed:#x} ITERS=1)\n");
     text += &format!(
-        "config {cfg:?}, read mode {:?}, setup rows {:?}, {} cursors\n",
-        case.mode, case.rows, case.nidx
+        "config {cfg:?}, read mode {:?}, index {}, setup rows {:?}, {} cursors\n",
+        case.mode,
+        case.idef.src(),
+        case.rows,
+        case.nidx
     );
     for &(k, l) in &configs {
         let got = run_one(k, l, case);
         text += &format!("{k:?}/{l:?}, step: op | engine | model (jump rowid c0 c1, ? is open)\n");
-        let mut rep = IReplay::new(&case.rows, case.nidx, k == DbKind::Ephemeral);
+        let mut rep = IReplay::new(&case.rows, case.nidx, k == DbKind::Ephemeral, case.idef);
         if let Some(e) = &got.error {
             text += &format!("  engine error after {} ops: {e}\n", got.obs.len());
         }
@@ -1154,8 +1378,12 @@ fn report(case: &Case, original: &Case, cfg: Cfg, case_seed: u64) -> Report {
         }
     }
     text += &format!(
-        "unshrunk: {} cursors, mode {:?}, rows {:?}, ops {:?}\n",
-        original.nidx, original.mode, original.rows, original.ops
+        "unshrunk: {} cursors, mode {:?}, index {}, rows {:?}, ops {:?}\n",
+        original.nidx,
+        original.mode,
+        original.idef.src(),
+        original.rows,
+        original.ops
     );
     text += "repro:\n";
     text += "    #[test]\n    fn repro() {\n        use IOp::*;\n";
@@ -1167,8 +1395,10 @@ fn report(case: &Case, original: &Case, cfg: Cfg, case_seed: u64) -> Report {
     text += "        ];\n";
     for &(k, l) in &configs {
         text += &format!(
-            "        assert_agrees(DbKind::{k:?}, Layout::{l:?}, ReadMode::{:?}, &rows, {}, &ops);\n",
-            case.mode, case.nidx
+            "        assert_agrees_def(DbKind::{k:?}, Layout::{l:?}, ReadMode::{:?}, {}, &rows, {}, &ops);\n",
+            case.mode,
+            case.idef.src(),
+            case.nidx
         );
     }
     text += "    }\n";
@@ -1340,6 +1570,31 @@ mod tests {
         });
     }
 
+    /// IDX_N6, the index twin of the table gap N6: a cursor deletes its entry, a peer inserts
+    /// an entry, then `Next` or `Prev` of the first cursor finds the wrong entry (or the end).
+    /// The model keeps the position by key (SPEC D2): `Next` gives the first entry after the
+    /// deleted key, `Prev` the last one before it. The default index shows it too.
+    ///
+    /// Fails today because of IDX_N6; see SPEC section 5b.
+    #[test]
+    fn known_bug_idx_n6_own_delete_then_peer_insert_then_move() {
+        known_bug("IDX_N6", "Mismatch", || {
+            use IOp::*;
+            // The only entry is deleted, the new key is after it: `Next` must find it.
+            let rows = [(2, v(5), v(5))];
+            agree(
+                &WAL,
+                &rows,
+                2,
+                &[Rewind(1), Delete(1), ins(0, 5, 6, 24), Next(1)],
+            );
+            // Three entries, the middle one is deleted, the new key is above it.
+            let rows = [(1, v(1), v(1)), (2, v(5), v(5)), (3, v(9), v(9))];
+            let ops = [SeekGE(1, vec![v(5)]), Delete(1), ins(0, 7, 0, 24), Prev(1)];
+            agree(&WAL, &rows, 2, &ops);
+        });
+    }
+
     /// N7: a read after `SeekEnd`. The position is open, but WAL and ephemeral fail with
     /// "Corrupt database: Payload too small for indicated header size".
     ///
@@ -1403,9 +1658,11 @@ mod tests {
         });
     }
 
-    /// N10: a seek that fails on an empty index leaves the cursor ended. After a peer inserted
-    /// an entry, `Next` finds it in WAL. The contract says an ended cursor stays ended (MVCC
-    /// agrees). A failed `Rewind` or a failed seek on a non-empty index are fine.
+    /// N10: a cursor that ended keeps a stale cell index. In WAL, after peers inserted entries,
+    /// `Next` finds one. The contract says an ended cursor stays ended (MVCC agrees). The
+    /// first program is a failed seek on an empty index (one peer insert is enough), the
+    /// second a `Next` past the last entry (two peer inserts move the old cell index inside
+    /// the page).
     ///
     /// Fails today because of N10; see SPEC section 5b.
     #[test]
@@ -1414,6 +1671,15 @@ mod tests {
             use IOp::*;
             let ops = [SeekGE(0, vec![v(0)]), ins(1, 3, 3, 4), Next(0), Observe(0)];
             agree(&WAL, &[], 2, &ops);
+            let rows = [(1, v(4), v(1))];
+            let ops = [
+                Rewind(0),
+                Next(0),
+                ins(1, 1, 1, 5),
+                ins(1, 2, 1, 6),
+                Next(0),
+            ];
+            agree(&WAL, &rows, 2, &ops);
         });
     }
 
@@ -1462,12 +1728,38 @@ mod tests {
         });
     }
 
+    /// The walk must draw non-default definitions, texts, and the replacement of a key by a
+    /// case variant, or it tests nothing of SPEC 2c.
+    #[test]
+    fn index_generator_covers_collation_cases() {
+        let (mut defs, mut texts, mut replaces) = (0, 0, 0);
+        for seed in 0..300 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let (case, _) = generate(&mut rng, IdxGaps::ALL, Family::Any);
+            defs += usize::from(!case.idef.is_default());
+            texts += usize::from(case.rows.iter().any(|r| matches!(r.1, Val::Text(_))));
+            replaces += case
+                .ops
+                .windows(2)
+                .filter(|w| {
+                    matches!((&w[0], &w[1]),
+                    (IOp::IdxDelete { a: a0, rowid: r0, .. }, IOp::IdxInsert { a: a1, rowid: r1, .. })
+                    if r0 == r1 && a0 != a1)
+                })
+                .count();
+        }
+        assert!(
+            defs > 60 && texts > 60 && replaces > 5,
+            "{defs} {texts} {replaces}"
+        );
+    }
+
     #[test]
     fn index_generator_only_emits_legal_programs() {
         for seed in 0..300 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
-            let (case, filter) = generate(&mut rng, IdxGaps::ALL);
-            let mut rep = IReplay::new(&case.rows, case.nidx, filter.ephemeral());
+            let (case, filter) = generate(&mut rng, IdxGaps::ALL, Family::Any);
+            let mut rep = IReplay::new(&case.rows, case.nidx, filter.ephemeral(), case.idef);
             for op in &case.ops {
                 assert!(rep.apply(op).is_some(), "seed {seed}: {op:?}");
             }

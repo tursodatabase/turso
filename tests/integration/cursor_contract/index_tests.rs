@@ -6,7 +6,7 @@
 //! `(NULL,5,6) (1,10,1) (1,20,2) (2,10,3) (2,30,4) (3,NULL,5)`.
 //! Column `a` has duplicates, NULL sorts first, and `b` is NULL in the last entry.
 
-use super::index_model::Val;
+use super::index_model::{IdxDef, Val};
 use super::index_program::{run_index, IObs, IOp::*, IndexRun, Outcome, Row};
 use super::program::ReadMode;
 use super::{known_bug, DbKind, Layout};
@@ -126,6 +126,7 @@ fn run_all(rows: &[Row], opts: Opts, ops: &Ops) -> Vec<(String, Outcome)> {
                 kind,
                 layout,
                 rows,
+                idef: IdxDef::default(),
                 nidx: opts.nidx,
                 ntbl: opts.ntbl,
                 mode: *mode,
@@ -1115,6 +1116,7 @@ fn clear_empties_the_index_in_wal_and_errors_in_mvcc() {
                 kind,
                 layout,
                 rows: ROWS,
+                idef: IdxDef::default(),
                 nidx: 2,
                 ntbl: 0,
                 mode,
@@ -1433,6 +1435,7 @@ fn known_bug_o1_ephemeral_index_peer_cursor() {
             kind: DbKind::Ephemeral,
             layout: Layout::AllInMemory,
             rows: ROWS,
+            idef: IdxDef::default(),
             nidx: 2,
             ntbl: 0,
             mode: ReadMode::Column,
@@ -1441,4 +1444,527 @@ fn known_bug_o1_ephemeral_index_peer_cursor() {
         assert_eq!(got.error, None);
         assert_eq!(got.obs, vec![n(), n(), e(6, NULL, 5)]);
     });
+}
+
+/// Sort order and collation of the index columns (SPEC 2c). Each test runs one program on the
+/// engines and compares every observation with the model (`index_model.rs`), whose order has
+/// unit tests with values that SQLite gives.
+mod collation {
+    use super::super::index_model::{assert_agrees_def, ColDef, Coll, IdxDef, Order};
+    use super::super::index_program::{with_eq_only_seek_ge, IOp};
+    use super::*;
+
+    const WAL: [(DbKind, Layout); 2] = [CONFIGS[0], CONFIGS[1]];
+    const MVCC: [(DbKind, Layout); 2] = [CONFIGS[2], CONFIGS[3]];
+    const EPH: [(DbKind, Layout); 1] = [CONFIGS[4]];
+
+    const fn def(a: ColDef, b: ColDef) -> IdxDef {
+        IdxDef::new(a, b)
+    }
+
+    const BIN: ColDef = ColDef::new(Order::Asc, Coll::Binary);
+    const DESC: ColDef = ColDef::new(Order::Desc, Coll::Binary);
+    const NOCASE: ColDef = ColDef::new(Order::Asc, Coll::NoCase);
+    const RTRIM: ColDef = ColDef::new(Order::Asc, Coll::RTrim);
+
+    fn t(x: &str) -> Val {
+        Val::text(x)
+    }
+
+    /// Runs `ops` on `configs` in every read mode and asserts that the engine agrees with the
+    /// model.
+    #[track_caller]
+    fn agree_on(configs: &[(DbKind, Layout)], d: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) {
+        for &(kind, layout) in configs {
+            if kind == DbKind::Ephemeral && nidx > 1 {
+                continue;
+            }
+            for mode in ReadMode::ALL {
+                assert_agrees_def(kind, layout, mode, d, rows, nidx, ops);
+            }
+        }
+    }
+
+    #[track_caller]
+    fn agree(d: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) {
+        agree_on(&CONFIGS, d, rows, nidx, ops);
+    }
+
+    /// Asserts the observations of `ops` on every config, in `Column` mode.
+    #[track_caller]
+    fn expect(d: IdxDef, rows: &[Row], ops: &[IOp], want: &[IObs]) {
+        for &(kind, layout) in &CONFIGS {
+            let cfg = IndexRun {
+                kind,
+                layout,
+                rows,
+                idef: d,
+                nidx: 1,
+                ntbl: 0,
+                mode: ReadMode::Column,
+            };
+            let got = run_index(&cfg, ops);
+            assert_eq!(got.error, None, "{kind:?}/{layout:?}");
+            assert_eq!(got.obs, want, "{kind:?}/{layout:?}");
+        }
+    }
+
+    /// Observe after each op, to see where a move landed.
+    fn watch(ops: Vec<IOp>) -> Vec<IOp> {
+        ops.into_iter().flat_map(|op| [op, Observe(0)]).collect()
+    }
+
+    /// The rows of the SPEC 2c example, for the index `(a DESC, b NOCASE)`.
+    fn desc_nocase_rows() -> Vec<Row> {
+        vec![
+            (8, v(3), NULL),
+            (7, v(3), t("z")),
+            (5, v(2), t("a")),
+            (3, v(1), t("B")),
+            (4, v(1), t("b")),
+            (2, v(1), t("a")),
+            (6, NULL, t("x")),
+        ]
+    }
+
+    #[test]
+    fn desc_scan_both_ways() {
+        // `a DESC`: text first, then integers from large to small, NULL last.
+        let d = def(DESC, BIN);
+        let rows = vec![
+            (1, v(2), v(1)),
+            (2, t("a"), v(1)),
+            (3, NULL, v(1)),
+            (4, v(1), v(2)),
+            (5, t("Z"), v(1)),
+            (6, v(1), v(1)),
+            (7, v(2), NULL),
+        ];
+        let mut ops = vec![Rewind(0)];
+        ops.extend(std::iter::repeat_n(Next(0), 7));
+        ops.push(Last(0));
+        ops.extend(std::iter::repeat_n(Prev(0), 7));
+        agree(d, &rows, 1, &watch(ops));
+    }
+
+    #[test]
+    fn desc_scan_expected_order() {
+        // By hand: `a DESC` puts text first, then integers from large to small, NULL last.
+        let rows = vec![(1, v(2), NULL), (2, t("a"), NULL), (3, NULL, NULL)];
+        let ops = [
+            Rewind(0),
+            Observe(0),
+            Next(0),
+            Observe(0),
+            Next(0),
+            Observe(0),
+        ];
+        let want = [
+            n(),
+            e(2, t("a"), NULL),
+            j(),
+            e(1, v(2), NULL),
+            j(),
+            e(3, NULL, NULL),
+        ];
+        expect(def(DESC, BIN), &rows, &ops, &want);
+    }
+
+    #[test]
+    fn desc_nocase_seeks() {
+        let ops = watch(vec![
+            SeekGE(0, p![3]),
+            SeekGT(0, p![3]),
+            SeekLE(0, p![3]),
+            SeekLT(0, p![3]),
+            SeekGE(0, p![1, "B"]),
+            SeekGT(0, p![1, "B"]),
+            SeekLE(0, p![1, "B"]),
+            SeekLT(0, p![1, "B"]),
+            SeekGE(0, p![1, "b"]),
+            SeekLE(0, p![1, "b"]),
+            SeekGE(0, p![NULL]),
+            SeekGT(0, p![NULL]),
+            SeekLE(0, p![NULL]),
+            SeekLT(0, p![NULL]),
+            SeekGE(0, p![0]),
+            SeekLE(0, p![9]),
+            // Text sorts before integers in a DESC column.
+            SeekGE(0, p!["a"]),
+            SeekGT(0, p!["zz"]),
+        ]);
+        agree(def(DESC, NOCASE), &desc_nocase_rows(), 1, &ops);
+    }
+
+    #[test]
+    fn desc_nocase_seek_expected() {
+        // The example of SPEC 2c: the tie of `(1, 'B', 3)` and `(1, 'b', 4)`.
+        let ops = [
+            SeekGE(0, p![3]),
+            Observe(0),
+            SeekGT(0, p![3]),
+            Observe(0),
+            SeekGE(0, p![1, "B"]),
+            Observe(0),
+            SeekGT(0, p![1, "B"]),
+            Observe(0),
+            SeekLE(0, p![1, "B"]),
+            Observe(0),
+            SeekLT(0, p![1, "B"]),
+            Observe(0),
+        ];
+        let want = [
+            n(),
+            e(8, 3, NULL),
+            n(),
+            e(5, 2, "a"),
+            n(),
+            e(3, 1, "B"),
+            n(),
+            e(6, NULL, "x"),
+            n(),
+            e(4, 1, "b"),
+            n(),
+            e(2, 1, "a"),
+        ];
+        expect(def(DESC, NOCASE), &desc_nocase_rows(), &ops, &want);
+    }
+
+    #[test]
+    fn nocase_tie_walk() {
+        // 'B' and 'b' are one value: the walk goes by rowid through the tie.
+        let mut ops = vec![SeekGE(0, p![1, "b"])];
+        ops.extend(std::iter::repeat_n(Next(0), 4));
+        ops.push(SeekLE(0, p![1, "B"]));
+        ops.extend(std::iter::repeat_n(Prev(0), 4));
+        agree(def(DESC, NOCASE), &desc_nocase_rows(), 1, &watch(ops));
+    }
+
+    #[test]
+    fn collation_orders_scan() {
+        let rows = vec![
+            (1, t("a"), v(1)),
+            (2, t("A"), v(1)),
+            (3, t("["), v(1)),
+            (4, t("_"), v(1)),
+            (5, t("`"), v(1)),
+            (6, t("Z"), v(1)),
+            (7, t("a "), v(1)),
+            (8, t(""), v(1)),
+            (9, t(" "), v(1)),
+            (10, t("é"), v(1)),
+            (11, t("É"), v(1)),
+            (12, v(7), v(1)),
+            (13, NULL, v(1)),
+        ];
+        for coll in [Coll::Binary, Coll::NoCase, Coll::RTrim] {
+            for order in [Order::Asc, Order::Desc] {
+                let mut ops = vec![Rewind(0)];
+                ops.extend(std::iter::repeat_n(Next(0), 13));
+                ops.push(Last(0));
+                ops.extend(std::iter::repeat_n(Prev(0), 13));
+                agree(def(ColDef::new(order, coll), BIN), &rows, 1, &watch(ops));
+            }
+        }
+    }
+
+    #[test]
+    fn collation_seeks_on_text() {
+        let rows = vec![
+            (1, t("a"), v(1)),
+            (2, t("A"), v(2)),
+            (3, t("a "), v(3)),
+            (4, t("b"), v(4)),
+            (5, t(""), v(5)),
+            (6, t(" "), v(6)),
+            (7, v(1), v(7)),
+            (8, NULL, v(8)),
+        ];
+        let keys = [
+            t("a"),
+            t("A"),
+            t("a  "),
+            t("a\t"),
+            t(" "),
+            t(""),
+            t("B"),
+            v(1),
+        ];
+        for coll in [Coll::Binary, Coll::NoCase, Coll::RTrim] {
+            for order in [Order::Asc, Order::Desc] {
+                let mut ops = Vec::new();
+                for key in &keys {
+                    ops.push(SeekGE(0, vec![key.clone()]));
+                    ops.push(SeekGT(0, vec![key.clone()]));
+                    ops.push(SeekLE(0, vec![key.clone()]));
+                    ops.push(SeekLT(0, vec![key.clone()]));
+                }
+                agree(def(ColDef::new(order, coll), BIN), &rows, 1, &watch(ops));
+            }
+        }
+    }
+
+    #[test]
+    fn found_uses_the_collation_and_types() {
+        let rows = vec![
+            (1, t("a"), t("x ")),
+            (2, v(1), v(1)),
+            (3, t("1"), v(1)),
+            (4, NULL, v(1)),
+        ];
+        let probes = [
+            p!["A"],
+            p!["a "],
+            p!["a", "X"],
+            p!["a", "x"],
+            p![1],
+            p!["1"],
+            p![2],
+            p!["A", "x"],
+            p![NULL],
+            p![NULL, 1],
+        ];
+        for d in [
+            def(BIN, BIN),
+            def(NOCASE, RTRIM),
+            def(RTRIM, NOCASE),
+            def(DESC, NOCASE),
+            def(ColDef::new(Order::Desc, Coll::NoCase), DESC),
+        ] {
+            let mut ops = Vec::new();
+            for probe in &probes {
+                ops.push(Found(0, probe.clone()));
+                ops.push(NotFound(0, probe.clone()));
+                ops.push(NoConflict(0, probe.clone()));
+            }
+            agree(d, &rows, 1, &ops);
+        }
+    }
+
+    #[test]
+    fn idx_compare_ops_use_the_order() {
+        let mut ops = vec![SeekGE(0, p![1])];
+        for prefix in [p![2], p![1], p![0], p![1, "b"], p![1, "A"], p![NULL]] {
+            ops.push(IdxGE(0, prefix.clone()));
+            ops.push(IdxGT(0, prefix.clone()));
+            ops.push(IdxLE(0, prefix.clone()));
+            ops.push(IdxLT(0, prefix));
+        }
+        agree(def(DESC, NOCASE), &desc_nocase_rows(), 1, &ops);
+    }
+
+    #[test]
+    fn range_loop_on_desc_column() {
+        // The loop of a translator: `SeekGE p`, then `IdxGT p` ends, `Next` goes on. In a
+        // DESC column, `Next` goes to smaller values.
+        let rows = desc_nocase_rows();
+        let mut ops = vec![SeekGE(0, p![2])];
+        for _ in 0..4 {
+            ops.extend([IdxGT(0, p![2]), Observe(0), Next(0)]);
+        }
+        ops.push(SeekGE(0, p![1]));
+        for _ in 0..5 {
+            ops.extend([IdxGT(0, p![1]), Observe(0), Next(0)]);
+        }
+        agree(def(DESC, NOCASE), &rows, 1, &ops);
+        // The same with the equality seek that the translator emits. MVCC with all entries
+        // in the overlay loses `Next` after it (OV1, also with the default index).
+        let configs = [CONFIGS[0], CONFIGS[1], CONFIGS[3], CONFIGS[4]];
+        for d in [def(DESC, NOCASE), def(DESC, DESC), def(NOCASE, BIN)] {
+            with_eq_only_seek_ge(|| agree_on(&configs, d, &rows, 1, &ops));
+        }
+    }
+
+    #[test]
+    fn eq_only_seek_on_collation_columns() {
+        // `eq_only` seeks on a key that equals an entry only under the collation. A seek for
+        // a key that is equal to nothing jumps, whatever follows (the hint of the
+        // translator), so there is none here.
+        let rows = vec![
+            (1, t("a"), v(1)),
+            (2, t("a "), v(2)),
+            (3, t("b"), v(3)),
+            (4, t("B"), v(4)),
+            (5, v(1), v(5)),
+        ];
+        // No `Next`: see OV1.
+        let cases = [
+            (def(NOCASE, BIN), vec![t("A"), t("a"), t("B"), v(1)]),
+            (def(RTRIM, BIN), vec![t("a"), t("a  "), t("b "), v(1)]),
+            (def(DESC, BIN), vec![t("a"), t("B"), v(1)]),
+        ];
+        for (d, keys) in cases {
+            let mut ops = Vec::new();
+            for key in keys {
+                ops.push(SeekGE(0, vec![key.clone()]));
+                ops.extend([IdxGT(0, vec![key.clone()]), Observe(0)]);
+                ops.extend([IdxGE(0, vec![key.clone()]), IdxLE(0, vec![key.clone()])]);
+            }
+            with_eq_only_seek_ge(|| agree(d, &rows, 1, &ops));
+        }
+    }
+
+    /// Delete `old`, insert `new` with the same rowid and read the entry back after `Rewind`
+    /// and after a seek. The two keys are equal under the collation, so the entry reads with
+    /// the bytes of the new key.
+    fn replace_ops(old: Row, new: Row) -> Vec<IOp> {
+        let (_, a0, b0) = old;
+        let (id, a1, b1) = new;
+        vec![
+            IdxDelete {
+                cur: 0,
+                a: a0,
+                b: b0,
+                rowid: id,
+            },
+            IdxInsert {
+                cur: 0,
+                a: a1.clone(),
+                b: b1,
+                rowid: id,
+                use_seek: false,
+            },
+            Rewind(0),
+            Observe(0),
+            SeekGE(0, vec![a1]),
+            Observe(0),
+        ]
+    }
+
+    #[test]
+    fn nocase_replace_equal_key_reads_new_bytes_wal_and_ephemeral() {
+        let rows = vec![(1, t("a"), v(1))];
+        let ops = replace_ops((1, t("a"), v(1)), (1, t("A"), v(1)));
+        agree_on(&[WAL[0], WAL[1], EPH[0]], def(NOCASE, BIN), &rows, 1, &ops);
+        // The second column.
+        let rows = vec![(1, v(1), t("a"))];
+        let ops = replace_ops((1, v(1), t("a")), (1, v(1), t("A")));
+        agree_on(&[WAL[0], WAL[1], EPH[0]], def(BIN, NOCASE), &rows, 1, &ops);
+    }
+
+    #[test]
+    fn rtrim_replace_equal_key_reads_new_bytes_wal_and_ephemeral() {
+        let rows = vec![(1, t("a "), v(1))];
+        let ops = replace_ops((1, t("a "), v(1)), (1, t("a"), v(1)));
+        agree_on(&[WAL[0], WAL[1], EPH[0]], def(RTRIM, BIN), &rows, 1, &ops);
+        let rows = vec![(1, t("a"), v(1))];
+        let ops = replace_ops((1, t("a"), v(1)), (1, t("a   "), v(1)));
+        agree_on(&[WAL[0], WAL[1], EPH[0]], def(RTRIM, BIN), &rows, 1, &ops);
+    }
+
+    #[test]
+    fn desc_replace_equal_key_wal_and_ephemeral() {
+        let rows = vec![(1, t("a"), t("x")), (2, t("A"), t("y"))];
+        let mut ops = replace_ops((1, t("a"), t("x")), (1, t("A"), t("x")));
+        ops.extend([Last(0), Observe(0), Prev(0), Observe(0)]);
+        agree_on(
+            &[WAL[0], WAL[1], EPH[0]],
+            def(ColDef::new(Order::Desc, Coll::NoCase), DESC),
+            &rows,
+            1,
+            &ops,
+        );
+    }
+
+    #[test]
+    fn replace_with_a_different_key_all_engines() {
+        // A replacement that is not equal under the collation works everywhere.
+        let rows = vec![(1, t("a"), v(1))];
+        let ops = replace_ops((1, t("a"), v(1)), (1, t("b"), v(1)));
+        agree(def(NOCASE, BIN), &rows, 1, &ops);
+        // An equal key with another rowid is another entry.
+        let ops = vec![
+            IdxInsert {
+                cur: 0,
+                a: t("A"),
+                b: v(1),
+                rowid: 2,
+                use_seek: false,
+            },
+            Rewind(0),
+            Observe(0),
+            Next(0),
+            Observe(0),
+        ];
+        agree(def(NOCASE, BIN), &rows, 1, &ops);
+    }
+
+    /// CL1: the MVCC overlay keeps the key bytes of the deleted entry when a key that is equal
+    /// under the collation takes its place. `Rewind` and `SeekGE` read the old text.
+    ///
+    /// Fails today because of CL1; see SPEC section 5b.
+    #[test]
+    fn known_bug_cl1_nocase_replace_equal_key_reads_new_bytes() {
+        known_bug("CL1", "Mismatch", || {
+            let rows = vec![(1, t("a"), v(1))];
+            let ops = replace_ops((1, t("a"), v(1)), (1, t("A"), v(1)));
+            agree_on(&MVCC, def(NOCASE, BIN), &rows, 1, &ops);
+        });
+    }
+
+    /// CL1 with RTRIM: `'a '` is replaced by `'a'`, the read gives `'a '`.
+    ///
+    /// Fails today because of CL1; see SPEC section 5b.
+    #[test]
+    fn known_bug_cl1_rtrim_replace_equal_key_reads_new_bytes() {
+        known_bug("CL1", "Mismatch", || {
+            let rows = vec![(1, t("a "), v(1))];
+            let ops = replace_ops((1, t("a "), v(1)), (1, t("a"), v(1)));
+            agree_on(&MVCC, def(RTRIM, BIN), &rows, 1, &ops);
+        });
+    }
+
+    /// CL1, a key that this run inserted: insert `'a'`, delete it, insert `'A'`. This needs no
+    /// checkpointed row.
+    ///
+    /// Fails today because of CL1; see SPEC section 5b.
+    #[test]
+    fn known_bug_cl1_inserted_key_replaced_by_equal_key() {
+        known_bug("CL1", "Mismatch", || {
+            let ins = |a: &str| IdxInsert {
+                cur: 0,
+                a: t(a),
+                b: v(1),
+                rowid: 7,
+                use_seek: false,
+            };
+            let ops = [
+                ins("a"),
+                IdxDelete {
+                    cur: 0,
+                    a: t("a"),
+                    b: v(1),
+                    rowid: 7,
+                },
+                ins("A"),
+                Rewind(0),
+                Observe(0),
+            ];
+            agree_on(&MVCC, def(NOCASE, BIN), &[], 1, &ops);
+        });
+    }
+
+    /// A peer cursor that is on the replaced entry reads the new bytes.
+    #[test]
+    fn peer_on_replaced_entry_reads_new_bytes_wal() {
+        let rows = vec![(1, t("a"), v(1))];
+        let ops = vec![
+            Rewind(0),
+            IdxDelete {
+                cur: 1,
+                a: t("a"),
+                b: v(1),
+                rowid: 1,
+            },
+            IdxInsert {
+                cur: 1,
+                a: t("A"),
+                b: v(1),
+                rowid: 1,
+                use_seek: false,
+            },
+            Observe(0),
+        ];
+        agree_on(&WAL, def(NOCASE, BIN), &rows, 2, &ops);
+    }
 }

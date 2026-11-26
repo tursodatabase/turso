@@ -4,6 +4,7 @@
 //! expected sequence is the flat view of the store, which is what WAL gives. In WAL
 //! everything is in the B-tree, so WAL is the oracle.
 
+use super::index_model::IdxDef;
 use super::index_program::{run_index, with_eq_only_seek_ge, IObs, IOp, IndexRun, Row};
 use super::program::{Obs, ReadMode};
 use super::{known_bug, run, DbKind, Layout};
@@ -191,6 +192,7 @@ mod index {
                 kind,
                 layout: Layout::Checkpointed,
                 rows,
+                idef: IdxDef::default(),
                 nidx: 2,
                 ntbl: 0,
                 mode: ReadMode::Column,
