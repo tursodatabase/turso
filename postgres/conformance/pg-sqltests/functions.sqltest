@@ -2363,6 +2363,25 @@ expect {
     t|f
 }
 
+# booland_statefunc and boolor_statefunc are the functions that bool_and and
+# bool_or call for each row.
+test bool-statefunc-truth-table {
+    SELECT booland_statefunc(true, true), booland_statefunc(true, false),
+           booland_statefunc(false, false), boolor_statefunc(false, false),
+           boolor_statefunc(true, false), boolor_statefunc(true, true);
+}
+expect {
+    t|f|f|f|t|t
+}
+
+test bool-statefunc-null-gives-null {
+    SELECT booland_statefunc(true, NULL) IS NULL, booland_statefunc(NULL, NULL) IS NULL,
+           boolor_statefunc(NULL, false) IS NULL, boolor_statefunc(true, NULL) IS NULL;
+}
+expect {
+    t|t|t|t
+}
+
 # random() returns a double precision number from 0 up to but not including 1,
 # so the value is usually not a whole number.
 test random-is-a-fraction-between-zero-and-one {

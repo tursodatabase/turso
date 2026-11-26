@@ -417,6 +417,12 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
+        "booland_statefunc"(FunctionArity::Exact(2), true) => crate::boolean_aggregates::booland_statefunc(args),
+        "boolor_statefunc"(FunctionArity::Exact(2), true) => crate::boolean_aggregates::boolor_statefunc(args),
+        "bool_accum"(FunctionArity::Exact(2), true) => crate::boolean_aggregates::bool_accum(args)?,
+        "bool_accum_inv"(FunctionArity::Exact(2), true) => crate::boolean_aggregates::bool_accum_inv(args)?,
+        "bool_alltrue"(FunctionArity::Exact(1), true) => crate::boolean_aggregates::bool_alltrue(args)?,
+        "bool_anytrue"(FunctionArity::Exact(1), true) => crate::boolean_aggregates::bool_anytrue(args)?,
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
         "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
             exec_current_setting(connection, args)?
