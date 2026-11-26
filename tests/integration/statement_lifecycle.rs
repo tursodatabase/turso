@@ -1,12 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use turso_sqlite::SqliteDialect;
 
+use turso_core::index_method::{
+    BackingSchema, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
+    IndexMethodContext, IndexMethodCursor, IndexMethodDefinition, IndexMethodMvccSupport,
+};
 use turso_core::io::{MemoryIO, PlatformIO, IO};
 use turso_core::mvcc::cursor::CursorYieldPoint;
 use turso_core::mvcc::yield_hooks::YieldPointMarker;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 use turso_core::security::roles::SessionRole;
 use turso_core::sync::{Arc, Mutex};
+use turso_core::types::{IOResult, IOResultOr, SeekKey, SeekOp, SeekResult};
+use turso_core::vdbe::Register;
 #[cfg(any(feature = "fts", feature = "io_memory_yield"))]
 use turso_core::StepResult;
 use turso_core::{
@@ -25,6 +31,179 @@ struct FailingPrepareAttachment {
 #[derive(Debug, Default)]
 struct FailingPrepareCursor {
     dirty: bool,
+}
+
+#[derive(Debug)]
+struct ContinuationProbeIndexMethod;
+
+#[derive(Debug)]
+struct ContinuationProbeAttachment {
+    table_name: String,
+    index_name: String,
+    patterns: Vec<turso_core::ast::Select>,
+}
+
+struct ContinuationProbeCursor {
+    table_name: String,
+    backwards: bool,
+    cursor_op:
+        Option<Box<dyn FnMut(ContinuationProbeOp) -> IOResultOr<ContinuationProbeResult> + Send>>,
+}
+
+enum ContinuationProbeOp {
+    Seek(i64, SeekOp),
+    Exists(i64),
+    Step(bool),
+    Rowid,
+}
+
+enum ContinuationProbeResult {
+    Positioned(bool),
+    Rowid(Option<i64>),
+}
+
+impl ContinuationProbeResult {
+    fn positioned(self) -> bool {
+        let Self::Positioned(positioned) = self else {
+            unreachable!()
+        };
+        positioned
+    }
+
+    fn rowid(self) -> Option<i64> {
+        let Self::Rowid(rowid) = self else {
+            unreachable!()
+        };
+        rowid
+    }
+}
+
+impl IndexMethod for ContinuationProbeIndexMethod {
+    fn attach(
+        &self,
+        dialect: &dyn turso_core::Dialect,
+        configuration: &IndexMethodConfiguration,
+    ) -> Result<Arc<dyn IndexMethodAttachment>> {
+        let pattern = format!(
+            "SELECT * FROM {} WHERE continuation_filter({}, ?, ?)",
+            configuration.table_name, configuration.columns[0].name
+        );
+        let select = match turso_core::dialect::parse_statement(dialect, &pattern)? {
+            Some(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::Select(select))) => select,
+            _ => unreachable!(),
+        };
+        Ok(Arc::new(ContinuationProbeAttachment {
+            table_name: configuration.table_name.clone(),
+            index_name: configuration.index_name.clone(),
+            patterns: vec![select],
+        }))
+    }
+}
+
+impl IndexMethodAttachment for ContinuationProbeAttachment {
+    fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
+        IndexMethodDefinition {
+            method_name: "continuation_probe",
+            table_name: &self.table_name,
+            index_name: &self.index_name,
+            patterns: &self.patterns,
+            backing_btree: false,
+            results_materialized: false,
+            mvcc_support: IndexMethodMvccSupport::ExternalTransactional,
+        }
+    }
+
+    fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
+        Ok(Box::new(ContinuationProbeCursor {
+            table_name: self.table_name.clone(),
+            backwards: false,
+            cursor_op: None,
+        }))
+    }
+
+    fn backing_schema(&self) -> BackingSchema {
+        BackingSchema::default()
+    }
+}
+
+impl IndexMethodCursor for ContinuationProbeCursor {
+    fn create(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
+        Ok(IOResult::Done(()))
+    }
+
+    fn destroy(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
+        Ok(IOResult::Done(()))
+    }
+
+    fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        let mut cursor = context.open_table_cursor(&self.table_name)?;
+        self.cursor_op = Some(Box::new(move |op| match op {
+            ContinuationProbeOp::Seek(start, seek_op) => cursor
+                .seek(SeekKey::TableRowId(start), seek_op)
+                .map(|result| {
+                    result.map(|result| {
+                        ContinuationProbeResult::Positioned(matches!(result, SeekResult::Found))
+                    })
+                }),
+            ContinuationProbeOp::Exists(rowid) => cursor
+                .exists(&Value::from_i64(rowid))
+                .map(|result| result.map(ContinuationProbeResult::Positioned)),
+            ContinuationProbeOp::Step(backwards) => {
+                let result = if backwards {
+                    cursor.prev()
+                } else {
+                    cursor.next()
+                }?;
+                Ok(result.map(|()| ContinuationProbeResult::Positioned(cursor.has_record())))
+            }
+            ContinuationProbeOp::Rowid => cursor
+                .rowid()
+                .map(|result| result.map(ContinuationProbeResult::Rowid)),
+        }));
+        Ok(IOResult::Done(()))
+    }
+
+    fn open_write(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
+        Ok(IOResult::Done(()))
+    }
+
+    fn insert(&mut self, _values: &[Register]) -> IOResultOr<()> {
+        Ok(IOResult::Done(()))
+    }
+
+    fn delete(&mut self, _values: &[Register]) -> IOResultOr<()> {
+        Ok(IOResult::Done(()))
+    }
+
+    fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool> {
+        let start = values[1].get_value().as_int().unwrap();
+        let mode = values[2].get_value().as_int().unwrap();
+        self.backwards = mode == 2;
+        let cursor_op = self.cursor_op.as_mut().unwrap();
+        let op = match mode {
+            0 => ContinuationProbeOp::Seek(start, SeekOp::GE { eq_only: true }),
+            1 => ContinuationProbeOp::Exists(start),
+            2 => ContinuationProbeOp::Seek(start, SeekOp::LE { eq_only: true }),
+            _ => unreachable!("unknown continuation probe mode"),
+        };
+        cursor_op(op).map(|result| result.map(ContinuationProbeResult::positioned))
+    }
+
+    fn query_next(&mut self) -> IOResultOr<bool> {
+        let cursor_op = self.cursor_op.as_mut().unwrap();
+        cursor_op(ContinuationProbeOp::Step(self.backwards))
+            .map(|result| result.map(ContinuationProbeResult::positioned))
+    }
+
+    fn query_column(&mut self, _idx: usize) -> IOResultOr<Value> {
+        Ok(IOResult::Done(Value::Null))
+    }
+
+    fn query_rowid(&mut self) -> IOResultOr<Option<i64>> {
+        let cursor_op = self.cursor_op.as_mut().unwrap();
+        cursor_op(ContinuationProbeOp::Rowid)
+            .map(|result| result.map(ContinuationProbeResult::rowid))
+    }
 }
 
 impl turso_core::index_method::IndexMethod for FailingPrepareIndexMethod {
@@ -2538,5 +2717,64 @@ fn external_aggregate_context_lives_while_a_prepared_statement_uses_it() {
         KEEPALIVE_CONTEXT_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "dropping the last statement releases the replaced registration"
+    );
+}
+
+fn continuation_probe_fixture() -> Arc<Connection> {
+    let db = crate::common::TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    db.db.builtin_syms.write().index_methods.insert(
+        "continuation_probe".to_string(),
+        Arc::new(ContinuationProbeIndexMethod),
+    );
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_probe ON t USING continuation_probe(id)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (10),(30),(50)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (20),(40)").unwrap();
+    conn
+}
+
+/// The checkpoint leaves 10, 30, and 50 in the B-tree and 20 and 40 in MVCC.
+/// Each index-method positioning operation must therefore resume by merging
+/// both sources, in the direction promised by its SQL pattern.
+fn assert_index_method_continuation(sql: &str, expected_rowids: &[i64]) {
+    let conn = continuation_probe_fixture();
+    assert_eq!(
+        get_rows(&conn, sql),
+        expected_rowids
+            .iter()
+            .map(|rowid| vec![Value::from_i64(*rowid)])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn index_method_exact_seek_can_continue_through_mvcc_rows() {
+    assert_index_method_continuation(
+        "SELECT id FROM t WHERE continuation_filter(id, 30, 0)",
+        &[30, 40, 50],
+    );
+}
+
+#[test]
+fn index_method_exists_can_continue_through_mvcc_and_btree_rows() {
+    assert_index_method_continuation(
+        "SELECT id FROM t WHERE continuation_filter(id, 20, 1)",
+        &[20, 30, 40, 50],
+    );
+}
+
+#[test]
+fn index_method_exact_seek_can_continue_backward_through_mvcc_rows() {
+    assert_index_method_continuation(
+        "SELECT id FROM t WHERE continuation_filter(id, 30, 2) ORDER BY id DESC",
+        &[30, 20, 10],
     );
 }
