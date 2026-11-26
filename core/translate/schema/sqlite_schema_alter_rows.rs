@@ -37,11 +37,22 @@ pub(super) fn emit_rename_table_rows(
     } else {
         stored_old_name
     };
+    // As in SQLite, the stored SQL keeps the letter case that the statement
+    // gives the new name. The function folds the case for the name columns.
+    let new_name_argument = if table.is_virtual {
+        stored_new_name.to_string()
+    } else {
+        let namespace = NamespaceRef {
+            database_id: ctx.database_id,
+            id: table.namespace,
+        };
+        resolver.mangle_name(namespace, table.written_new_name)
+    };
     emit_rewrite_of_every_row(
         program,
         ctx,
         AlterTableFunc::RenameTable,
-        &[old_name_argument.to_string(), stored_new_name.to_string()],
+        &[old_name_argument.to_string(), new_name_argument],
         table.written_old_name,
     );
     if table.is_virtual {

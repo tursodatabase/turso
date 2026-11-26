@@ -1,0 +1,17 @@
+@database :memory:
+
+# The stored SQL keeps the letter case that RENAME TO gives the new name.
+@cross-check-integrity
+test alter-rename-table-keeps-letter-case-in-stored-sql {
+    CREATE TABLE b (a int);
+    CREATE INDEX bi ON b (a);
+    CREATE VIEW v AS SELECT a FROM b;
+    ALTER TABLE b RENAME TO "FcX";
+    SELECT type, instr(sql, 'FcX') > 0 FROM sqlite_schema ORDER BY type;
+    SELECT * FROM fcx;
+}
+expect {
+    index|1
+    table|1
+    view|1
+}
