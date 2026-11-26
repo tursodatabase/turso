@@ -914,6 +914,22 @@ setup oid_paths {
 }
 
 @setup oid_paths
+test oid-is-distinct-from-negative-integer {
+    SELECT count(*) FROM t WHERE o IS DISTINCT FROM -1;
+}
+expect {
+    0
+}
+
+@setup oid_paths
+test oid-is-not-distinct-from-integer-column {
+    SELECT count(*) FROM t WHERE o IS NOT DISTINCT FROM i;
+}
+expect {
+    1
+}
+
+@setup oid_paths
 test oid-between-negative-integers {
     SELECT count(*) FROM t WHERE o BETWEEN -1 AND -1;
 }
@@ -948,6 +964,22 @@ expect {
 @setup oid_paths
 test oid-row-equals-row-with-negative-integer {
     SELECT count(*) FROM t WHERE (o, 1) = (-1, 1);
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-row-in-list-with-negative-integer {
+    SELECT count(*) FROM t WHERE (o, 1) IN ((-1, 1));
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-row-in-list-of-two-rows {
+    SELECT count(*) FROM t WHERE (o, 1) IN ((5, 1), (-1, 1));
 }
 expect {
     1

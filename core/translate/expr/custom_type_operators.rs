@@ -242,7 +242,7 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
         ast::Expr::Binary(lhs, op, rhs) => {
             let name = comparison_symbol(op)
                 .or_else(|| binary_symbol(op))
-                .or_else(|| distinct_from_symbol(op, lhs, rhs));
+                .or_else(|| distinct_from_symbol(op, rhs));
             let Some(name) = name else {
                 return (vec![lhs.as_mut(), rhs.as_mut()], Vec::new());
             };
@@ -299,6 +299,38 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
         }
         ast::Expr::InList { lhs, not, rhs } => {
             let name = if *not { "<>" } else { "=" };
+            let row_len = match lhs.as_ref() {
+                ast::Expr::Parenthesized(left) if left.len() > 1 => Some(left.len()),
+                _ => None,
+            };
+            let are_rows_of_that_length = |row_len: usize| {
+                rhs.iter().all(|value| {
+                    matches!(value.as_ref(), ast::Expr::Parenthesized(row) if row.len() == row_len)
+                })
+            };
+            if let Some(row_len) = row_len.filter(|&len| are_rows_of_that_length(len)) {
+                let uses = (0..rhs.len())
+                    .flat_map(|row| {
+                        (0..row_len).map(move |i| OperatorUse {
+                            name,
+                            operands: vec![i, row_len + row * row_len + i],
+                            kind: UseKind::Each,
+                        })
+                    })
+                    .collect();
+                let ast::Expr::Parenthesized(left) = lhs.as_mut() else {
+                    unreachable!("the row value is parenthesized")
+                };
+                let mut operands: Vec<&mut ast::Expr> =
+                    left.iter_mut().map(|value| value.as_mut()).collect();
+                for value in rhs.iter_mut() {
+                    let ast::Expr::Parenthesized(row) = value.as_mut() else {
+                        unreachable!("every value is a row value")
+                    };
+                    operands.extend(row.iter_mut().map(|value| value.as_mut()));
+                }
+                return (operands, uses);
+            }
             let (with_columns, without_columns): (Vec<usize>, Vec<usize>) =
                 (1..=rhs.len()).partition(|&slot| reads_a_column(&rhs[slot - 1]));
             let mut uses = first_with_each(name, with_columns);
@@ -416,23 +448,12 @@ fn comparison_symbol(op: &ast::Operator) -> Option<&'static str> {
     })
 }
 
-/// FIXME(registered-types): `IS TRUE` and `IS NOT TRUE` are lowered to `IS 1` and `IS NOT 1`, and this cannot tell them from `IS [NOT] DISTINCT FROM 1`, so only a string literal operand is looked at. Once the parser keeps `IS DISTINCT FROM` as its own expression, every one is asked.
-/// `=` for `IS` and `IS NOT` next to a string literal, which is how
-/// `IS [NOT] DISTINCT FROM` reads. Next to anything else they are also what
-/// `IS TRUE` lowers to, so no operator is chosen.
-fn distinct_from_symbol(
-    op: &ast::Operator,
-    lhs: &ast::Expr,
-    rhs: &ast::Expr,
-) -> Option<&'static str> {
-    let is_string_literal = |expr| {
-        matches!(
-            without_wrappers(expr),
-            ast::Expr::Literal(ast::Literal::String(_))
-        )
-    };
-    let is_distinct_from = matches!(op, ast::Operator::Is | ast::Operator::IsNot);
-    (is_distinct_from && (is_string_literal(lhs) || is_string_literal(rhs))).then_some("=")
+/// `=` for `IS` and `IS NOT`, which is how `IS [NOT] DISTINCT FROM` reads. A
+/// truth test such as `x IS TRUE` compares nothing, so no operator is chosen.
+fn distinct_from_symbol(op: &ast::Operator, rhs: &ast::Expr) -> Option<&'static str> {
+    let is_distinct_from =
+        matches!(op, ast::Operator::Is | ast::Operator::IsNot) && truth_test_rhs(rhs).is_none();
+    is_distinct_from.then_some("=")
 }
 
 /// Whether `expr` is a hidden column, such as the argument of a table
