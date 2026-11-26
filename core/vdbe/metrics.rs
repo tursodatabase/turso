@@ -1,6 +1,9 @@
-#[cfg(debug_assertions)]
-use crate::sync::atomic::{AtomicU64, Ordering};
 use std::fmt;
+// The cursor work counters are statistics, not synchronization. They use std atomics
+// because under shuttle each access to a shuttle atomic is a scheduling step: the
+// counters would add about 2.6M steps to an iteration of the shuttle stress tests.
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The work that the MVCC cursors of a statement did inside their operations. Counted in
 /// debug builds only; all zero in release builds.
