@@ -360,6 +360,102 @@ expect {
     timestamptz|timestamp|a|f
 }
 
+test pg-cast-has-the-rows-of-postgresql-between-the-types-of-pg-type {
+    SELECT c.oid, s.typname, t.typname, c.castfunc, c.castcontext, c.castmethod
+    FROM pg_cast c
+    JOIN pg_type s ON s.oid = c.castsource
+    JOIN pg_type t ON t.oid = c.casttarget
+    WHERE s.typname IN (
+        '_bool', '_bytea', '_cidr', '_float4', '_float8', '_inet', '_int2', '_int4', '_int8',
+        '_json', '_jsonb', '_macaddr', '_numeric', '_oid', '_text', '_uuid', '_varchar', 'bool',
+        'bytea', 'cidr', 'date', 'float4', 'float8', 'inet', 'int2', 'int4', 'int8', 'json',
+        'jsonb', 'macaddr', 'numeric', 'oid', 'text', 'timestamp', 'timestamptz', 'uuid',
+        'varchar'
+    )
+      AND t.typname IN (
+        '_bool', '_bytea', '_cidr', '_float4', '_float8', '_inet', '_int2', '_int4', '_int8',
+        '_json', '_jsonb', '_macaddr', '_numeric', '_oid', '_text', '_uuid', '_varchar', 'bool',
+        'bytea', 'cidr', 'date', 'float4', 'float8', 'inet', 'int2', 'int4', 'int8', 'json',
+        'jsonb', 'macaddr', 'numeric', 'oid', 'text', 'timestamp', 'timestamptz', 'uuid',
+        'varchar'
+    )
+    ORDER BY c.oid;
+}
+expect {
+    10000|int8|int2|714|a|f
+    10001|int8|int4|480|a|f
+    10002|int8|float4|652|i|f
+    10003|int8|float8|482|i|f
+    10004|int8|numeric|1781|i|f
+    10005|int2|int8|754|i|f
+    10006|int2|int4|313|i|f
+    10007|int2|float4|236|i|f
+    10008|int2|float8|235|i|f
+    10009|int2|numeric|1782|i|f
+    10010|int4|int8|481|i|f
+    10011|int4|int2|314|a|f
+    10012|int4|float4|318|i|f
+    10013|int4|float8|316|i|f
+    10014|int4|numeric|1740|i|f
+    10015|float4|int8|653|a|f
+    10016|float4|int2|238|a|f
+    10017|float4|int4|319|a|f
+    10018|float4|float8|311|i|f
+    10019|float4|numeric|1742|a|f
+    10020|float8|int8|483|a|f
+    10021|float8|int2|237|a|f
+    10022|float8|int4|317|a|f
+    10023|float8|float4|312|a|f
+    10024|float8|numeric|1743|a|f
+    10025|numeric|int8|1779|a|f
+    10026|numeric|int2|1783|a|f
+    10027|numeric|int4|1744|a|f
+    10028|numeric|float4|1745|i|f
+    10029|numeric|float8|1746|i|f
+    10034|int4|bool|2557|e|f
+    10035|bool|int4|2558|e|f
+    10037|int8|oid|1287|i|f
+    10038|int2|oid|313|i|f
+    10039|int4|oid|0|i|b
+    10040|oid|int8|1288|a|f
+    10041|oid|int4|0|a|b
+    10126|text|varchar|0|i|b
+    10129|varchar|text|0|i|b
+    10143|int2|bytea|6367|e|f
+    10144|int4|bytea|6368|e|f
+    10145|int8|bytea|6369|e|f
+    10146|bytea|int2|6370|e|f
+    10147|bytea|int4|6371|e|f
+    10148|bytea|int8|6372|e|f
+    10158|date|timestamp|2024|i|f
+    10159|date|timestamptz|1174|i|f
+    10162|timestamp|date|2029|a|f
+    10164|timestamp|timestamptz|2028|i|f
+    10165|timestamptz|date|1178|a|f
+    10167|timestamptz|timestamp|2027|a|f
+    10187|cidr|inet|0|i|b
+    10188|inet|cidr|1715|a|f
+    10195|cidr|text|730|a|f
+    10196|inet|text|730|a|f
+    10197|bool|text|2971|a|f
+    10200|cidr|varchar|730|a|f
+    10201|inet|varchar|730|a|f
+    10202|bool|varchar|2971|a|f
+    10211|varchar|varchar|669|i|f
+    10213|timestamp|timestamp|1961|i|f
+    10214|timestamptz|timestamptz|1967|i|f
+    10219|numeric|numeric|1703|i|f
+    10220|json|jsonb|0|a|i
+    10221|jsonb|json|0|a|i
+    10222|jsonb|bool|3556|e|f
+    10223|jsonb|numeric|3449|e|f
+    10224|jsonb|int2|3450|e|f
+    10225|jsonb|int4|3451|e|f
+    10226|jsonb|int8|3452|e|f
+    10227|jsonb|float4|3453|e|f
+    10228|jsonb|float8|2580|e|f
+}
+
 test pg-cast-is-read-only {
     CREATE ROLE reader_of_cast_is_read_only_role;
     SET ROLE reader_of_cast_is_read_only_role;

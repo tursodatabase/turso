@@ -1,9 +1,10 @@
 //! Which casts PostgreSQL has between its types, and how they convert a value.
 //!
-//! `CASTS` lists the casts of `pg_cast`. A cast to text goes through the
-//! output function of the source type, and a cast from text through the input
-//! function of the target type, as in PostgreSQL. Any other pair of types is
-//! refused with SQLSTATE 42846.
+//! `PG_CASTS` holds the rows of `pg_cast`. `CASTS` lists the casts that
+//! `convert` runs. A cast to text goes through the output function of the
+//! source type, and a cast from text through the input function of the target
+//! type, as in PostgreSQL. Any other pair of types is refused with SQLSTATE
+//! 42846.
 //!
 //! Nothing here reads a statement: `resolve` and `convert` take the types as
 //! `CastType`. cast_planning.rs finds the `CastType` of an expression.
@@ -154,24 +155,6 @@ const CASTS: &[Cast] = &[
     cast(TimestampTz, Timestamp, A),
 ];
 
-/// The `oid` of the first row of `pg_cast`.
-pub(crate) const FIRST_CAST_OID: i64 = 10_000;
-
-/// The rows of `pg_cast`: source, target, the letter of the context and the
-/// letter of the method. Every cast in `CASTS` goes through a conversion
-/// function.
-pub(crate) fn cast_rows() -> impl Iterator<Item = (CastType, CastType, &'static str, &'static str)>
-{
-    CASTS.iter().map(|cast| {
-        let context = match cast.context {
-            CastContext::Implicit => "i",
-            CastContext::Assignment => "a",
-            CastContext::Explicit => "e",
-        };
-        (cast.source, cast.target, context, "f")
-    })
-}
-
 /// Whether the cast of a value of `source` to `target` changes the number that
 /// the engine stores, so that comparing the numbers as they are stored gives
 /// another answer than comparing the cast values. `source` is `None` for a
@@ -182,6 +165,136 @@ pub(crate) fn wraps_negative_integers(source: Option<CastType>, target: CastType
         && target.smallest_integer().is_some_and(|min| min >= 0)
         && source.is_none_or(|source| source.smallest_integer().is_some_and(|min| min < 0))
 }
+
+/// A row of `pg_cast`. A type is the `oid` of its `pg_type` row, and
+/// `function` the `oid` of the `pg_proc` row of the cast function, 0 for none.
+pub(crate) struct PgCast {
+    pub oid: i64,
+    pub source: i64,
+    pub target: i64,
+    pub function: i64,
+    pub context: CastContext,
+    pub method: CastMethod,
+}
+
+/// `pg_cast.castmethod`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CastMethod {
+    Function,
+    InputOutput,
+    Binary,
+}
+
+impl CastMethod {
+    pub(crate) fn letter(self) -> &'static str {
+        match self {
+            Self::Function => "f",
+            Self::InputOutput => "i",
+            Self::Binary => "b",
+        }
+    }
+}
+
+/// The `pg_cast.castcontext` letter of `context`.
+pub(crate) fn context_letter(context: CastContext) -> &'static str {
+    match context {
+        CastContext::Implicit => "i",
+        CastContext::Assignment => "a",
+        CastContext::Explicit => "e",
+    }
+}
+
+macro_rules! pg_casts {
+    ($(($oid:literal, $source:literal, $target:literal, $function:literal, $context:ident, $method:ident),)*) => {
+        &[$(PgCast {
+            oid: $oid,
+            source: $source,
+            target: $target,
+            function: $function,
+            context: CastContext::$context,
+            method: CastMethod::$method,
+        }),*]
+    };
+}
+
+/// The rows as PostgreSQL 18 has them, between the types of the frontend's
+/// `pg_type`: oid, castsource, casttarget, castfunc, castcontext and
+/// castmethod. postgres/conformance/tools/gen_casts.py writes them.
+#[rustfmt::skip]
+pub(crate) const PG_CASTS: &[PgCast] = pg_casts![
+    (10000, 20, 21, 714, Assignment, Function),
+    (10001, 20, 23, 480, Assignment, Function),
+    (10002, 20, 700, 652, Implicit, Function),
+    (10003, 20, 701, 482, Implicit, Function),
+    (10004, 20, 1700, 1781, Implicit, Function),
+    (10005, 21, 20, 754, Implicit, Function),
+    (10006, 21, 23, 313, Implicit, Function),
+    (10007, 21, 700, 236, Implicit, Function),
+    (10008, 21, 701, 235, Implicit, Function),
+    (10009, 21, 1700, 1782, Implicit, Function),
+    (10010, 23, 20, 481, Implicit, Function),
+    (10011, 23, 21, 314, Assignment, Function),
+    (10012, 23, 700, 318, Implicit, Function),
+    (10013, 23, 701, 316, Implicit, Function),
+    (10014, 23, 1700, 1740, Implicit, Function),
+    (10015, 700, 20, 653, Assignment, Function),
+    (10016, 700, 21, 238, Assignment, Function),
+    (10017, 700, 23, 319, Assignment, Function),
+    (10018, 700, 701, 311, Implicit, Function),
+    (10019, 700, 1700, 1742, Assignment, Function),
+    (10020, 701, 20, 483, Assignment, Function),
+    (10021, 701, 21, 237, Assignment, Function),
+    (10022, 701, 23, 317, Assignment, Function),
+    (10023, 701, 700, 312, Assignment, Function),
+    (10024, 701, 1700, 1743, Assignment, Function),
+    (10025, 1700, 20, 1779, Assignment, Function),
+    (10026, 1700, 21, 1783, Assignment, Function),
+    (10027, 1700, 23, 1744, Assignment, Function),
+    (10028, 1700, 700, 1745, Implicit, Function),
+    (10029, 1700, 701, 1746, Implicit, Function),
+    (10034, 23, 16, 2557, Explicit, Function),
+    (10035, 16, 23, 2558, Explicit, Function),
+    (10037, 20, 26, 1287, Implicit, Function),
+    (10038, 21, 26, 313, Implicit, Function),
+    (10039, 23, 26, 0, Implicit, Binary),
+    (10040, 26, 20, 1288, Assignment, Function),
+    (10041, 26, 23, 0, Assignment, Binary),
+    (10126, 25, 1043, 0, Implicit, Binary),
+    (10129, 1043, 25, 0, Implicit, Binary),
+    (10143, 21, 17, 6367, Explicit, Function),
+    (10144, 23, 17, 6368, Explicit, Function),
+    (10145, 20, 17, 6369, Explicit, Function),
+    (10146, 17, 21, 6370, Explicit, Function),
+    (10147, 17, 23, 6371, Explicit, Function),
+    (10148, 17, 20, 6372, Explicit, Function),
+    (10158, 1082, 1114, 2024, Implicit, Function),
+    (10159, 1082, 1184, 1174, Implicit, Function),
+    (10162, 1114, 1082, 2029, Assignment, Function),
+    (10164, 1114, 1184, 2028, Implicit, Function),
+    (10165, 1184, 1082, 1178, Assignment, Function),
+    (10167, 1184, 1114, 2027, Assignment, Function),
+    (10187, 650, 869, 0, Implicit, Binary),
+    (10188, 869, 650, 1715, Assignment, Function),
+    (10195, 650, 25, 730, Assignment, Function),
+    (10196, 869, 25, 730, Assignment, Function),
+    (10197, 16, 25, 2971, Assignment, Function),
+    (10200, 650, 1043, 730, Assignment, Function),
+    (10201, 869, 1043, 730, Assignment, Function),
+    (10202, 16, 1043, 2971, Assignment, Function),
+    (10211, 1043, 1043, 669, Implicit, Function),
+    (10213, 1114, 1114, 1961, Implicit, Function),
+    (10214, 1184, 1184, 1967, Implicit, Function),
+    (10219, 1700, 1700, 1703, Implicit, Function),
+    (10220, 114, 3802, 0, Assignment, InputOutput),
+    (10221, 3802, 114, 0, Assignment, InputOutput),
+    (10222, 3802, 16, 3556, Explicit, Function),
+    (10223, 3802, 1700, 3449, Explicit, Function),
+    (10224, 3802, 21, 3450, Explicit, Function),
+    (10225, 3802, 23, 3451, Explicit, Function),
+    (10226, 3802, 20, 3452, Explicit, Function),
+    (10227, 3802, 700, 3453, Explicit, Function),
+    (10228, 3802, 701, 2580, Explicit, Function),
+];
 
 pub(crate) enum Resolution {
     Unchanged,
@@ -416,4 +529,33 @@ fn to_text(value: &Value, source: CastType) -> Result<Value> {
         _ => return Ok(value.clone()),
     };
     Ok(Value::build_text(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_cast_that_convert_runs_is_a_row_of_pg_cast_with_its_context() {
+        let oid = |ty: CastType| crate::catalog::pg_type_oid(ty.name()).unwrap();
+        for cast in CASTS {
+            let row = PG_CASTS
+                .iter()
+                .find(|row| row.source == oid(cast.source) && row.target == oid(cast.target));
+            let row = row.unwrap_or_else(|| {
+                panic!(
+                    "no pg_cast row for {} to {}",
+                    cast.source.name(),
+                    cast.target.name()
+                )
+            });
+            assert_eq!(
+                row.context,
+                cast.context,
+                "{} to {}",
+                cast.source.name(),
+                cast.target.name()
+            );
+        }
+    }
 }
