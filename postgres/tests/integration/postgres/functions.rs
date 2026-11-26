@@ -596,6 +596,59 @@ fn test_pg_backend_pid_is_positive_integer(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_bool_accum_counts_values_and_bool_alltrue_reads_them(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    for (sql, expected) in [
+        (
+            "SELECT bool_alltrue(bool_accum(bool_accum(NULL, true), true))",
+            Value::from_i64(1),
+        ),
+        (
+            "SELECT bool_alltrue(bool_accum(bool_accum(NULL, true), false))",
+            Value::from_i64(0),
+        ),
+        (
+            "SELECT bool_anytrue(bool_accum(bool_accum(NULL, false), true))",
+            Value::from_i64(1),
+        ),
+        (
+            "SELECT bool_anytrue(bool_accum(bool_accum(NULL, false), false))",
+            Value::from_i64(0),
+        ),
+        (
+            "SELECT bool_alltrue(bool_accum(bool_accum(NULL, true), NULL))",
+            Value::from_i64(1),
+        ),
+        (
+            "SELECT bool_alltrue(bool_accum_inv(bool_accum(bool_accum(NULL, true), false), false))",
+            Value::from_i64(1),
+        ),
+        (
+            "SELECT bool_anytrue(bool_accum_inv(bool_accum(bool_accum(NULL, true), false), true))",
+            Value::from_i64(0),
+        ),
+        ("SELECT bool_alltrue(NULL)", Value::Null),
+        ("SELECT bool_anytrue(NULL)", Value::Null),
+        ("SELECT bool_alltrue(bool_accum(NULL, NULL))", Value::Null),
+        (
+            "SELECT bool_anytrue(bool_accum_inv(bool_accum(NULL, true), true))",
+            Value::Null,
+        ),
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    assert!(conn
+        .prepare("SELECT bool_alltrue(x'00')")
+        .unwrap()
+        .run_collect_rows()
+        .is_err());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     let conn = db.connect_limbo();
     for (sql, expected) in [

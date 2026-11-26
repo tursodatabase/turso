@@ -1,6 +1,7 @@
 mod acl;
 mod auth_functions;
 mod auth_members;
+mod boolean_aggregates;
 mod catalog;
 mod classes;
 mod copy;
