@@ -1411,6 +1411,12 @@ impl TursoConnection {
             return Err(sync_busy_error());
         }
         let sql_str = sql.as_ref();
+        // The cache keeps the SQL text and the program until the connection
+        // closes, so a statement that can hold an encryption key, such as
+        // `PRAGMA hexkey = '...'`, does not go into it.
+        if turso_core::may_hold_encryption_key(sql_str) {
+            return self.prepare_single(sql_str);
+        }
 
         // Check if we have a cached version
         if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
@@ -2965,6 +2971,25 @@ mod tests {
                 format!("{error:?}").contains("opened without encryption"),
                 "{error:?}"
             );
+        }
+
+        /// The statement cache keeps the SQL text and the program of a
+        /// statement until the connection closes, so it must not keep a
+        /// statement that holds a key.
+        #[test]
+        fn test_prepare_cached_does_not_keep_an_encryption_key() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let db = open_without_key(temp_file.path().to_str().unwrap());
+            let conn = db.connect().unwrap();
+            run(&conn, &format!("PRAGMA cipher = '{TEST_CIPHER}'"));
+            conn.prepare_cached(format!("PRAGMA hexkey = '{TEST_HEXKEY}'"))
+                .unwrap()
+                .execute(None)
+                .unwrap();
+            assert!(conn.cached_statements.lock().unwrap().is_empty());
+            run(&conn, "CREATE TABLE test (value TEXT)");
+            conn.prepare_cached("SELECT value FROM test").unwrap();
+            assert_eq!(conn.cached_statements.lock().unwrap().len(), 1);
         }
     }
 
