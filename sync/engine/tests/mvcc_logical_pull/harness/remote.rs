@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO};
@@ -14,6 +14,7 @@ pub struct Remote {
     conn: Arc<Connection>,
     pub(super) crypto: Option<turso_core::EncryptionContext>,
     db_path: PathBuf,
+    replace_base_snapshot: Mutex<Option<(Vec<u8>, usize)>>,
     _db: Arc<Database>,
     _dir: TempDir,
 }
@@ -62,6 +63,7 @@ impl Remote {
             conn,
             crypto,
             db_path,
+            replace_base_snapshot: Mutex::new(None),
             _db: db,
             _dir: dir,
         }))
@@ -77,6 +79,13 @@ impl Remote {
             self.conn.execute(sql)?;
         }
         self.conn.execute("COMMIT")?;
+        Ok(())
+    }
+
+    pub fn answer_next_pull_with_replace_base_snapshot(&self) -> Result<()> {
+        let database = self.checkpoint_and_read_database_file()?;
+        let log_end = self.read_logical_log()?.len();
+        *self.replace_base_snapshot.lock().unwrap() = Some((database, log_end));
         Ok(())
     }
 
@@ -96,6 +105,10 @@ impl Remote {
         } else {
             Ok(stored)
         }
+    }
+
+    pub(super) fn take_replace_base_snapshot(&self) -> Option<(Vec<u8>, usize)> {
+        self.replace_base_snapshot.lock().unwrap().take()
     }
 
     pub(super) fn read_logical_log(&self) -> Result<Vec<u8>> {

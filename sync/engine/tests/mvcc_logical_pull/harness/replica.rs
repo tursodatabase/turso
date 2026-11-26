@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use genawaiter::GeneratorState;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, IO};
+use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, Value, IO};
 use turso_sqlite::SqliteDialect;
 use turso_sync_engine::database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts};
 use turso_sync_engine::database_sync_operations::SyncEngineIoStats;
@@ -164,6 +164,11 @@ impl Replica {
             std::fs::write(path, bytes)?;
             self.engine.apply_changes_from_remote(coro, changes).await
         })
+    }
+
+    pub fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
+        let conn = drive(&self.io, async |coro| self.engine.connect_rw(coro).await)?;
+        Ok(conn.prepare(sql)?.run_collect_rows()?)
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
