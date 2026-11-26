@@ -1223,7 +1223,7 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-    bound_sequence_names: bool,
+    bound_names: bool,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
@@ -1562,7 +1562,7 @@ pub fn translate_create_table(
         .collect();
     let text = if let Some(ref info) = ctas_info {
         TableText::FromSelect(&info.schema_sql)
-    } else if bound_sequence_names {
+    } else if bound_names {
         TableText::Rewritten
     } else {
         TableText::Statement(input)

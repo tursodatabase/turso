@@ -353,6 +353,22 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// The name that an expression stored in the schema has for a call of
+    /// function `name` with `argument_count` arguments, when the dialect
+    /// expands the call and finds the function by the search path: a name
+    /// that finds the same function with any search path. None when the
+    /// expression stores `name`. Consulted when
+    /// [`Dialect::binds_names_at_create`] is true.
+    fn stored_function_name(
+        &self,
+        scope: &FunctionScope<'_>,
+        name: &str,
+        argument_count: usize,
+    ) -> Result<Option<String>> {
+        let _ = (scope, name, argument_count);
+        Ok(None)
+    }
+
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
     /// affinity metadata) regardless of the experimental database flag.
     /// A dialect whose type system leans on custom types (e.g. PostgreSQL)
@@ -392,9 +408,9 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a sequence named without a schema in an expression stored in
-    /// the schema is bound to the schema it is found in when the expression
-    /// is created.
+    /// Whether a sequence, or a function that the dialect expands, named
+    /// without a schema in an expression stored in the schema is bound to
+    /// the schema it is found in when the expression is created.
     fn binds_names_at_create(&self) -> bool {
         false
     }

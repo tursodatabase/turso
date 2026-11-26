@@ -1303,11 +1303,12 @@ pub(crate) fn emit_drop_sequence(
     Ok(true)
 }
 
-/// Qualifies each sequence named without a schema in the expressions that
-/// `stmt` stores in the schema with the schema it resolves to now, so the
-/// expressions keep that sequence after the search path changes. Returns
-/// whether a name was qualified.
-pub(crate) fn bind_sequence_names_in_stored_expressions(
+/// Qualifies each sequence, and each function that the dialect expands,
+/// named without a schema in the expressions that `stmt` stores in the
+/// schema with the schema it resolves to now, so the expressions keep that
+/// sequence or function after the search path changes. Returns whether a
+/// name was qualified.
+pub(crate) fn bind_names_in_stored_expressions(
     stmt: &mut ast::Stmt,
     resolver: &Resolver,
 ) -> Result<bool> {
@@ -1436,6 +1437,7 @@ fn bind_sequence_names(expr: &mut ast::Expr, resolver: &Resolver) -> Result<bool
     let mut bound = false;
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
         bound |= bind_sequence_call(expr, resolver);
+        bound |= bind_function_name(expr, resolver)?;
         if let ast::Expr::Subquery(select)
         | ast::Expr::Exists(select)
         | ast::Expr::InSelect { rhs: select, .. } = expr
@@ -1451,9 +1453,33 @@ fn bind_sequence_names_in_select(select: &mut ast::Select, resolver: &Resolver) 
     let mut bound = false;
     rewrite_select_expressions(select, &mut |expr: &mut ast::Expr| {
         bound |= bind_sequence_call(expr, resolver);
+        bound |= bind_function_name(expr, resolver)?;
+        // The walk does not go into a subquery of an expression.
+        if let ast::Expr::Subquery(select)
+        | ast::Expr::Exists(select)
+        | ast::Expr::InSelect { rhs: select, .. } = expr
+        {
+            bound |= bind_sequence_names_in_select(select, resolver)?;
+        }
         Ok(())
     })?;
     Ok(bound)
+}
+
+/// Gives the call `expr` of a function that the dialect expands the name
+/// that the dialect stores for it. Returns whether the name changed.
+fn bind_function_name(expr: &mut ast::Expr, resolver: &Resolver) -> Result<bool> {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        return Ok(false);
+    };
+    let Some(stored_name) = resolver
+        .catalog
+        .stored_function_name(name.as_str(), args.len())?
+    else {
+        return Ok(false);
+    };
+    *name = ast::Name::exact(stored_name);
+    Ok(true)
 }
 
 fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {

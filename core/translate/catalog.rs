@@ -265,6 +265,24 @@ impl<'a> CatalogContext<'a> {
         }
     }
 
+    /// [`crate::Dialect::stored_function_name`] for a call of function
+    /// `name` with `argument_count` arguments.
+    pub(crate) fn stored_function_name(
+        &self,
+        name: &str,
+        argument_count: usize,
+    ) -> Result<Option<String>> {
+        // The dialect expands only a name that names no function of its own.
+        if !matches!(
+            self.dialect.resolve_function(name, argument_count),
+            Ok(None)
+        ) {
+            return Ok(None);
+        }
+        self.dialect
+            .stored_function_name(&self.function_scope(), name, argument_count)
+    }
+
     /// Expands the calls in `expr` that the dialect expands. `expr` is a
     /// part of the expansion of a call of function `called`, `depth` levels
     /// below that call, and `expansions` counts the calls expanded for it.
