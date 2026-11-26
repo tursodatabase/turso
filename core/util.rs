@@ -120,6 +120,25 @@ const QUOTE_PAIRS: &[(char, char)] = &[
     ('\'', '\''), // string sometimes used as identifier quoting
 ];
 
+/// Returns true if `text` names `hexkey`, as `PRAGMA hexkey = '...'` and an
+/// ATTACH URI with a key do, so that `text` can hold an encryption key.
+/// Letter case does not matter, as in SQL.
+pub fn may_hold_encryption_key(text: &str) -> bool {
+    text.as_bytes()
+        .windows(b"hexkey".len())
+        .any(|word| word.eq_ignore_ascii_case(b"hexkey"))
+}
+
+/// Returns `sql` for a log message, or a placeholder when `sql` can hold
+/// an encryption key.
+pub(crate) fn redact_encryption_key_sql(sql: &str) -> &str {
+    if may_hold_encryption_key(sql) {
+        "<SQL text hidden because it can contain an encryption key>"
+    } else {
+        sql
+    }
+}
+
 pub fn normalize_ident(identifier: &str) -> String {
     // quotes normalization already happened in the parser layer (see Name ast node implementation)
     // so, we only need to apply SQLite's ASCII-only identifier case folding.
@@ -2192,6 +2211,20 @@ pub mod tests {
 
     use crate::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use crate::schema::Type as SchemaValueType;
+
+    #[test]
+    fn sql_that_can_hold_an_encryption_key_is_hidden_in_logs() {
+        for sql in [
+            "PRAGMA hexkey = 'abcd'",
+            "pragma HEXKEY='abcd'",
+            "ATTACH 'file:a.db?cipher=aegis256&hexkey=abcd' AS a",
+        ] {
+            assert!(!redact_encryption_key_sql(sql).contains("abcd"), "{sql}");
+        }
+        for sql in ["SELECT 1", "PRAGMA cipher = 'aegis256'"] {
+            assert_eq!(redact_encryption_key_sql(sql), sql);
+        }
+    }
 
     #[test]
     fn test_normalize_ident() {

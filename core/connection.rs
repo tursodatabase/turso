@@ -1156,7 +1156,7 @@ impl Connection {
         }
         let result = (|| {
             let sql = sql.as_ref();
-            tracing::debug!("Preparing: {}", sql);
+            tracing::debug!("Preparing: {}", crate::util::redact_encryption_key_sql(sql));
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
@@ -1518,7 +1518,10 @@ impl Connection {
             ));
         }
         let sql = sql.as_ref();
-        tracing::trace!("Preparing and executing batch: {}", sql);
+        tracing::trace!(
+            "Preparing and executing batch: {}",
+            crate::util::redact_encryption_key_sql(sql)
+        );
 
         let mut remaining = sql;
         while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
@@ -1538,7 +1541,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        tracing::trace!("Querying: {}", sql);
+        tracing::trace!("Querying: {}", crate::util::redact_encryption_key_sql(sql));
 
         let (cmd, byte_offset_end) = self.parse_sql(sql)?;
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
