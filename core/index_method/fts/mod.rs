@@ -3102,7 +3102,8 @@ impl IndexMethodCursor for FtsCursor {
             self.store.table_name()
         );
 
-        self.open_cursor(&conn, database_id)?;
+        // The backing store is not opened: a file can lack part of it, and
+        // the drop must still remove what is left.
         self.claim_writer_slot()?;
 
         // Drop in-memory state and shared caches. The drop is not committed

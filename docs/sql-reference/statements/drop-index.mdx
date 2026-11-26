@@ -29,6 +29,7 @@ DROP INDEX [IF EXISTS] [schema-name.]index-name;
 ### Behavior
 
 - Only explicitly created indexes can be dropped. Indexes automatically created for PRIMARY KEY and UNIQUE constraints cannot be dropped directly -- drop the table or use ALTER TABLE instead.
+- The internal indexes in which an index method, such as `fts`, keeps its data cannot be dropped. Their names start with `__turso_internal_`. Dropping the index that you created with `USING` also drops them.
 - Dropping an index may degrade query performance for queries that relied on it, but does not affect correctness.
 - `DROP INDEX` fails with `database table is locked` while any other statement on the same connection that reads the database is running. Finish or reset that statement first. While `DROP INDEX` waits for I/O, a statement that starts reading the database on the same connection fails with the same error.
 

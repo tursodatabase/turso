@@ -3301,7 +3301,12 @@ impl Schema {
             })
     }
 
-    fn backing_btree_has_owner(&self, namespace: NamespaceId, backing_btree: &Index) -> bool {
+    /// Whether an index method lists `backing_btree` in its backing schema.
+    pub(crate) fn backing_btree_has_owner(
+        &self,
+        namespace: NamespaceId,
+        backing_btree: &Index,
+    ) -> bool {
         let objects = self.namespace(namespace);
         objects
             .indexes
