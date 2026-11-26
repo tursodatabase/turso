@@ -1571,7 +1571,7 @@ fn emit_fk_delete_parent_existence_check_single(
 ///
 /// CASCADE/SET NULL/SET DEFAULT actions are handled later by
 /// `fire_fk_update_actions`; this function only emits counter-based checks
-/// for NO ACTION / RESTRICT foreign keys.
+/// for NO ACTION / RESTRICT foreign keys and for deferred foreign keys.
 ///
 /// Returns deferred NEW-key probes when `new_key_probe_mode` is `AfterReplace`,
 /// so the caller can run them only after the REPLACE write has established the
@@ -1595,7 +1595,7 @@ pub fn emit_fk_update_parent_actions(
     let mut deferred_new_key_plans = Vec::new();
     let check_fks: Vec<_> = affected_parent_fks
         .iter()
-        .filter(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict))
+        .filter(|fk| resolver.fk_counts_children_of_old_parent_key(&fk.fk, fk.fk.on_update))
         .collect();
     if check_fks.is_empty() {
         return Ok(deferred_new_key_plans);
@@ -2359,6 +2359,20 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                     )?;
                 }
                 RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
+                    if resolver
+                        .fk_counts_children_of_old_parent_key(&fk_ref.fk, fk_ref.fk.on_delete)
+                    {
+                        emit_fk_delete_parent_existence_check_single(
+                            program,
+                            &fk_ref,
+                            &parent_bt,
+                            parent_table_name,
+                            parent_cursor_id,
+                            parent_rowid_reg,
+                            database_id,
+                            resolver,
+                        )?;
+                    }
                     // Decode encoded values so they match the subprogram's decoded column reads
                     decode_fk_key_registers(
                         program,

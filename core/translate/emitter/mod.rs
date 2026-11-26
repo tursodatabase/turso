@@ -484,6 +484,14 @@ impl<'a> Resolver<'a> {
         action == RefAct::Restrict && !self.defer_foreign_keys
     }
 
+    /// Whether removing or changing a parent key counts the child rows that
+    /// still reference the old key. Like SQLite, a deferred key counts them
+    /// even when a CASCADE, SET NULL or SET DEFAULT action then changes those
+    /// rows, because each such change subtracts one from the deferred count.
+    pub fn fk_counts_children_of_old_parent_key(&self, fk: &ForeignKey, action: RefAct) -> bool {
+        matches!(action, RefAct::NoAction | RefAct::Restrict) || self.fk_is_deferred(fk)
+    }
+
     pub fn has_temp_database(&self) -> bool {
         self.catalog.has_temp_database()
     }
