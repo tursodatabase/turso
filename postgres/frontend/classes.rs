@@ -683,13 +683,35 @@ impl Catalog for PostgresCatalog {
                             kind: RelationKind::Index,
                             table: Some(index.table),
                             indexed_table: IndexedTable::Oid(table_oid),
-                            natts: 0,
+                            natts: match index.statement {
+                                ast::Stmt::CreateIndex { columns, .. } => columns.len(),
+                                _ => unreachable!("CreateIndex carries CREATE INDEX"),
+                            },
+                            has_index: false,
+                            checks: 0,
                         },
                     )?;
+                    rows.set_columns(program, index.namespace, index.table, &[("relhasindex", 1)]);
                 }
             }
             CatalogCmd::DropIndex(index) => {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    if let Some(catalog) = class_catalog(ctx.schema) {
+                        if let Some(class) = catalog.get_by_name(index.namespace, index.name) {
+                            let table = catalog
+                                .get_by_oid(class.relindrelid)
+                                .expect("index has a table");
+                            let has_index = catalog
+                                .indexes_of(table.oid)
+                                .any(|other| other.oid != class.oid);
+                            rows.set_columns(
+                                program,
+                                index.namespace,
+                                &table.relname,
+                                &[("relhasindex", i64::from(has_index))],
+                            );
+                        }
+                    }
                     rows.dropped_relation(program, index.namespace, index.name);
                 }
             }
@@ -754,6 +776,13 @@ impl Catalog for PostgresCatalog {
                         program,
                         NewRelation {
                             name: view.written_name.as_str(),
+                            natts: turso_core::schema::view::extract_view_columns(
+                                view.namespace,
+                                view.select,
+                                ctx.schema,
+                            )?
+                            .columns
+                            .len(),
                             ..NewRelation::of_relation(
                                 view.namespace,
                                 view.name,
@@ -806,11 +835,41 @@ impl Catalog for PostgresCatalog {
                     column.definition.col_name.as_str(),
                 )?;
             }
-            // A new column owns no sequence, so no class row changes.
-            CatalogCmd::AddColumn(_) => {}
+            CatalogCmd::AddColumn(column) => {
+                // Column changes in attached SQLite databases have no class
+                // row to update and do not change a relation's identity.
+                if ctx.database_id != MAIN_DB_ID {
+                    return Ok(());
+                }
+                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    rows.set_columns(
+                        program,
+                        column.namespace,
+                        column.name,
+                        &[
+                            ("relnatts", column.table.columns().len() as i64),
+                            ("relchecks", column.table.check_constraints.len() as i64),
+                        ],
+                    );
+                }
+            }
             // The statement drops the sequences that the column owns
             // itself, each with its class row.
             CatalogCmd::DropColumn(column) => {
+                if ctx.database_id != MAIN_DB_ID {
+                    return Ok(());
+                }
+                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    rows.set_columns(
+                        program,
+                        column.namespace,
+                        column.name,
+                        &[
+                            ("relnatts", column.table.columns().len() as i64),
+                            ("relchecks", column.table.check_constraints.len() as i64),
+                        ],
+                    );
+                }
                 if ctx.origin != CmdOrigin::Engine && ctx.database_id == MAIN_DB_ID {
                     emit_dropped_column_comments(program, ctx, column);
                 }
@@ -884,6 +943,8 @@ struct NewRelation<'a> {
     table: Option<&'a str>,
     indexed_table: IndexedTable,
     natts: usize,
+    has_index: bool,
+    checks: usize,
 }
 
 impl<'a> NewRelation<'a> {
@@ -898,6 +959,8 @@ impl<'a> NewRelation<'a> {
             table: None,
             indexed_table: IndexedTable::None,
             natts: if kind == RelationKind::Sequence { 3 } else { 0 },
+            has_index: false,
+            checks: 0,
         }
     }
 }
@@ -925,6 +988,10 @@ fn emit_new_table_rows(
         program,
         NewRelation {
             name: table.written_name.as_str(),
+            natts: table.table.columns().len(),
+            has_index: !table.automatic_indexes.is_empty()
+                || table.table.get_rowid_alias_column().is_some(),
+            checks: table.table.check_constraints.len(),
             ..NewRelation::of_relation(table.namespace, table.name, RelationKind::Table)
         },
     )?
@@ -949,7 +1016,12 @@ fn emit_new_table_rows(
                 kind: RelationKind::Index,
                 table: Some(table.name),
                 indexed_table: IndexedTable::Register(table_oid_reg),
-                natts: 0,
+                natts: match key {
+                    ConstraintKey::PrimaryKey => btree.primary_key_columns.len(),
+                    ConstraintKey::Unique(set) => set.columns.len(),
+                },
+                has_index: false,
+                checks: 0,
             },
         )?;
         Ok(())
@@ -1152,6 +1224,28 @@ impl<'a> ClassRowWriter<'a> {
             .and_then(|table| relation_owner(self.schema, new.namespace, table))
             .unwrap_or_else(|| self.connection.current_role());
         Ok(emit_class_row_insert(program, &self.cursors, new, owner))
+    }
+
+    /// Updates columns derived from the relation's definition in the same
+    /// statement that changes its schema row.
+    // FIXME(pg-catalog): A catalog with physical and virtual parts could derive
+    // relnatts, relchecks and relhasindex from the schema in its virtual part,
+    // removing the need to store and update these fields during DDL.
+    fn set_columns(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        name: &str,
+        columns: &[(&str, i64)],
+    ) {
+        emit_find_class_row(program, &self.cursors, namespace, name, |program, row| {
+            let changes = columns
+                .iter()
+                .map(|(name, value)| (column_position(name), ClassRecordColumn::LiteralInt(*value)))
+                .collect();
+            let record_reg = emit_class_record(program, row, changes);
+            emit_class_row_overwrite(program, &self.cursors, row.rowid_reg, record_reg);
+        });
     }
 
     /// The oid of the class row of the relation that the schema calls
@@ -1880,7 +1974,7 @@ fn new_class_values(new: &NewRelation<'_>, owner: RoleId) -> Vec<ClassValue> {
     set("reltuples", ClassValue::Real(reltuples));
     set("relallvisible", ClassValue::Int(0));
     set("reltoastrelid", ClassValue::Int(0));
-    set("relhasindex", ClassValue::Int(0));
+    set("relhasindex", ClassValue::Int(i64::from(new.has_index)));
     set("relisshared", ClassValue::Int(0));
     set("relpersistence", ClassValue::Text("p".to_string()));
     set(
@@ -1888,7 +1982,7 @@ fn new_class_values(new: &NewRelation<'_>, owner: RoleId) -> Vec<ClassValue> {
         ClassValue::Text(relkind_letter(kind).to_string()),
     );
     set("relnatts", ClassValue::Int(new.natts as i64));
-    set("relchecks", ClassValue::Int(0));
+    set("relchecks", ClassValue::Int(new.checks as i64));
     // FIXME(pg-rewrite): PostgreSQL gives views an INSTEAD SELECT _RETURN
     // rule. A stored rule catalog should supply this flag.
     set(

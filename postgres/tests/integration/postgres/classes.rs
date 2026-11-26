@@ -706,8 +706,8 @@ fn every_new_class_row_has_all_the_columns_of_pg_class(db: TempDatabase) {
     pg.execute("CREATE INDEX t_x ON t (x)").unwrap();
     pg.execute("CREATE VIEW v AS SELECT x FROM t").unwrap();
 
-    let table = "0,0,2,0,0,1,0,0,0,0,0,p,r,0,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
-    let index = "0,0,403,0,0,1,0,0,0,0,0,p,i,0,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
+    let table = "0,0,2,0,0,1,0,0,0,1,0,p,r,2,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
+    let index = "0,0,403,0,0,1,0,0,0,0,0,p,i,1,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
     let sequence = "0,0,0,0,0,1,1,0,0,0,0,p,S,3,0,0,0,0,0,1,n,0,0,0,0,NULL,NULL";
     let view = "0,0,0,0,0,1,0,0,0,0,0,p,v,1,0,1,0,0,0,1,n,0,0,0,0,NULL,NULL";
     assert_eq!(stored_pg_class_columns(&conn, "t"), table);
@@ -1207,6 +1207,53 @@ fn views_have_class_rows_and_return_rules(db: TempDatabase) {
         .run_collect_rows()
         .unwrap()
         .is_empty());
+}
+#[turso_macros::test(mvcc)]
+fn ddl_updates_stored_class_columns(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = pg.inner();
+    pg.execute("CREATE TABLE counts (id int PRIMARY KEY, x int CHECK (x > 0))")
+        .unwrap();
+    let read = || {
+        conn.prepare_engine_schema_statement("SELECT relnatts, relhasindex, relchecks FROM __turso_internal_classes WHERE relname = 'counts'").unwrap().run_collect_rows().unwrap()
+    };
+    assert_eq!(
+        read(),
+        vec![vec![
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::from_i64(1)
+        ]]
+    );
+    pg.execute("ALTER TABLE counts ADD COLUMN y int").unwrap();
+    assert_eq!(
+        read(),
+        vec![vec![
+            Value::from_i64(3),
+            Value::from_i64(1),
+            Value::from_i64(1)
+        ]]
+    );
+    pg.execute("ALTER TABLE counts DROP COLUMN y").unwrap();
+    assert_eq!(
+        read(),
+        vec![vec![
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::from_i64(1)
+        ]]
+    );
+    pg.execute("CREATE TABLE no_index (a int)").unwrap();
+    pg.execute("CREATE INDEX ix ON no_index (a)").unwrap();
+    pg.execute("DROP INDEX ix").unwrap();
+    let rows = conn
+        .prepare_engine_schema_statement(
+            "SELECT relhasindex FROM __turso_internal_classes WHERE relname='no_index'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
 }
 
 #[turso_macros::test(mvcc)]
