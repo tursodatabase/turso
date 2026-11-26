@@ -7981,29 +7981,23 @@ fn json_type_or_raise(
     }
 }
 
-/// FIXME(pg-catalog): This finds a cast to int8 by its type name and checks a numeric literal in the parser because there is no typed expression tree. The pg_cast entry from numeric to bigint (function int8(numeric)), applied to a literal typed numeric, replaces this.
-/// The operand of an int8 cast, made to raise "bigint out of range" when it is
-/// a numeric literal outside the bigint range, where `CAST(x AS INTEGER)` would
-/// clamp it. The literal is checked from its text, because a literal just past
-/// the range becomes a REAL equal to i64::MIN or 2^63.
+/// The operand of an int8 cast. A numeric literal is made a numeric, so the
+/// cast from numeric to bigint reads its digits and not a double.
 fn int8_cast_operand(arg: &pg_query::protobuf::Node, operand: ast::Expr) -> ast::Expr {
     match numeric_literal_text(arg) {
-        Some(literal) if numeric_literal_exceeds_int8(literal) => {
-            function_call("int8_out_of_range", vec![])
-        }
-        Some(literal) if numeric_literal_rounds_to_int8_max(literal) => {
-            ast::Expr::Literal(ast::Literal::Numeric(i64::MAX.to_string()))
-        }
-        _ => operand,
+        Some(literal) => ast::Expr::Cast {
+            expr: Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                "'{}'",
+                non_decimal_literal_as_decimal(literal).unwrap_or_else(|| literal.replace('_', ""))
+            )))),
+            type_name: Some(ast::Type {
+                name: "numeric".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        },
+        None => operand,
     }
-}
-
-/// A literal that is in range but reads as the REAL 2^63, such as 9223372036854775807.4.
-fn numeric_literal_rounds_to_int8_max(literal: &str) -> bool {
-    literal
-        .replace('_', "")
-        .parse::<f64>()
-        .is_ok_and(|value| value == 9223372036854775808.0)
 }
 
 /// The text of a non-integer numeric literal, also when written with a unary
@@ -8029,71 +8023,6 @@ fn numeric_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
         }
         _ => None,
     }
-}
-
-/// Rounds half away from zero before the range check, like PostgreSQL's
-/// numeric to int8 cast.
-fn numeric_literal_exceeds_int8(literal: &str) -> bool {
-    let literal = literal.replace('_', "");
-    let (negative, unsigned) = match literal.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, literal.as_str()),
-    };
-    let limit = if negative {
-        i64::MIN.unsigned_abs() as u128
-    } else {
-        i64::MAX as u128
-    };
-    let radix = match unsigned.get(..2) {
-        Some("0x" | "0X") => Some(16),
-        Some("0o" | "0O") => Some(8),
-        Some("0b" | "0B") => Some(2),
-        _ => None,
-    };
-    if let Some(radix) = radix {
-        let digits = unsigned[2..].trim_start_matches('0');
-        // Too many digits for a u128 is far outside the bigint range.
-        return u128::from_str_radix(digits, radix).map_or(!digits.is_empty(), |m| m > limit);
-    }
-    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => match exponent.parse::<i64>() {
-            Ok(exponent) => (mantissa, exponent),
-            Err(_) => return false,
-        },
-        None => (unsigned, 0),
-    };
-    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if !int_part
-        .bytes()
-        .chain(frac_part.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return false;
-    }
-    let all_digits = format!("{int_part}{frac_part}");
-    let digits = all_digits.trim_start_matches('0').as_bytes();
-    if digits.is_empty() {
-        return false;
-    }
-    let int_len = (digits.len() as i64)
-        .saturating_sub(frac_part.len() as i64)
-        .saturating_add(exponent);
-    if int_len > 19 {
-        return true;
-    }
-    if int_len < 0 {
-        return false;
-    }
-    let int_len = int_len as usize;
-    let mut magnitude: u128 = 0;
-    for i in 0..int_len {
-        let digit = digits.get(i).map_or(0, |d| d - b'0');
-        magnitude = magnitude * 10 + digit as u128;
-    }
-    if digits.get(int_len).is_some_and(|&d| d >= b'5') {
-        magnitude += 1;
-    }
-    magnitude > limit
 }
 
 /// Writes a hex (`0x`), octal (`0o`) or binary (`0b`) integer literal in
@@ -8135,7 +8064,7 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
-/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (oid and the serial types to INTEGER; numeric and money to REAL; varchar, json and inet to TEXT; every array element type), so the PostgreSQL type is gone before the cast is checked. float4, float8, text and uuid keep their PostgreSQL name, which the cast table of the frontend reads, and the integer types keep the name they are registered with. Once every type is registered, each cast keeps the name of its type and this map goes away.
+/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (oid and the serial types to INTEGER; money to REAL; varchar, json and inet to TEXT; every array element type), so the PostgreSQL type is gone before the cast is checked. float4, float8, text and uuid keep their PostgreSQL name, which the cast table of the frontend reads, and the integer types keep the name they are registered with. Once every type is registered, each cast keeps the name of its type and this map goes away.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// A type that the frontend registers, such as boolean, keeps its name, and
 /// so do other names, so that enums and domains resolve to their custom type.
@@ -11196,7 +11125,7 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 }
 
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
-const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range", "pg_cast"];
+const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["pg_cast"];
 
 // FIXME(pg-collation): This hand-codes the pg_collation entries that compare bytes (C, POSIX, ucs_basic) and counts default among them, where PostgreSQL's default collation is the one of the database (pg_database.datcollate, en_US.utf8 in the postgres:18 image). It matches the names without regard to case, so it accepts `COLLATE C`, which PostgreSQL folds to "c" and refuses. A lookup in a pg_collation table replaces this.
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
