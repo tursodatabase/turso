@@ -109,6 +109,10 @@ impl TursoSyncServer {
             "encrypted sync requires matching --sync-encryption-cipher and --sync-encryption-key-file");
         conn.wal_auto_actions_disable();
         conn.set_portable_logical_changes_enabled(true);
+        // All clients share the connection. One client must not encrypt the
+        // database with its own key, or start a setup that refuses the
+        // statements of all clients until the second value comes.
+        conn.disable_encryption_pragmas();
 
         Ok(Self {
             address,
@@ -1742,6 +1746,8 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
     );
     conn.set_portable_logical_changes_enabled(true);
     conn.wal_auto_actions_disable();
+    // See TursoSyncServer::new.
+    conn.disable_encryption_pragmas();
     Ok(Arc::new(DbHandle {
         conn: Mutex::new(conn),
         path: path_str,
@@ -1910,6 +1916,72 @@ mod tests {
             assert!(logs.contains(message), "{message} not logged:\n{logs}");
         }
         assert!(!logs.contains(KEY), "{logs}");
+    }
+
+    /// The server runs the SQL of all clients of a database on one
+    /// connection. So a client must not encrypt a new database with a key
+    /// that the server does not have, or leave the connection waiting for the
+    /// second encryption value, which refuses the requests of all clients.
+    #[test]
+    fn clients_cannot_run_the_encryption_pragmas() {
+        for directory in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let server = if directory {
+                let mut server = dir_server(dir.path());
+                if let DbSource::Dir { config, .. } = &mut server.source {
+                    config.db_opts = DatabaseOpts::new().with_encryption(true);
+                }
+                server
+            } else {
+                let path = dir.path().join("source.db");
+                let db = Database::open_file_with_flags(
+                    Arc::new(turso_core::PlatformIO::new().unwrap()),
+                    path.to_str().unwrap(),
+                    OpenFlags::Create,
+                    DatabaseOpts::new().with_encryption(true),
+                    None,
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let conn = db
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
+                TursoSyncServer::new(
+                    "127.0.0.1:0".into(),
+                    path.to_string_lossy().into_owned(),
+                    conn,
+                    Arc::new(AtomicUsize::new(0)),
+                    TEST_WORKERS,
+                    None,
+                )
+                .unwrap()
+            };
+            let target = if directory { "/db/new" } else { "" };
+            let execute = |sql: &str| {
+                let requests = serde_json::json!([{ "type": "execute", "stmt": { "sql": sql } }]);
+                let request = pipeline_request(target, requests);
+                let response = server.handle_request(request.as_bytes()).unwrap();
+                assert_eq!(response.status, 200);
+                let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                response["results"][0].clone()
+            };
+            for sql in [
+                "PRAGMA cipher = 'aegis256'",
+                "PRAGMA hexkey = '8d71289cf871b1d2357a560fe943995adcaf1400668e4dda5fd35b20101d8b47'",
+            ] {
+                let result = execute(sql);
+                assert_eq!(result["type"], "error", "{sql}: {result}");
+                let message = result["error"]["message"].as_str().unwrap();
+                assert!(message.contains("this connection does not accept them"), "{message}");
+            }
+            // No value waits for the other one, so other statements run.
+            assert_eq!(execute("CREATE TABLE t(x)")["type"], "ok");
+            let Ok(handle) = server.resolve_db(directory.then_some("new")) else {
+                panic!("the database must stay open");
+            };
+            let conn = handle.conn.lock().unwrap();
+            assert_eq!(conn.get_encryption_cipher_mode(), None);
+        }
     }
 
     #[test]

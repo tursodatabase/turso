@@ -3109,6 +3109,7 @@ impl Database {
             encryption_key: encryption_key.map_or_else(OnceLock::new, OnceLock::from),
             pending_encryption: Mutex::new(crate::connection::PendingEncryption::default()),
             encryption_setup_pending: AtomicBool::new(false),
+            encryption_pragmas_disabled: AtomicBool::new(false),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),

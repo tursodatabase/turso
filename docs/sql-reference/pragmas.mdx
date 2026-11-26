@@ -848,6 +848,8 @@ The database becomes encrypted when the second value is set. The assignments wor
 
 If a condition is false, the assignment returns an error and changes nothing. The assignment applies when the statement runs, so `EXPLAIN PRAGMA hexkey = ...` and a prepared statement that does not run change nothing.
 
+`tursodb --sync-server` refuses both assignments from its clients, because all clients of a database share one connection. To serve an encrypted database, use its [`--sync-encryption-cipher` and `--sync-encryption-key-file`](/docs/sql-reference/cli/command-line-options) options.
+
 After the first of the two values is set, the connection refuses all other statements until the second value is set. Thus a missing key cannot cause a plaintext database. If the second assignment fails, for example because the key size does not agree with the cipher, the first value stays and you can set the second value again. To stop the setup, close the connection.
 
 Run `PRAGMA page_size` before the encryption PRAGMAs. After the database is encrypted, its page size and reserved bytes cannot change.

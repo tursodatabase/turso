@@ -533,6 +533,9 @@ pub struct Connection {
     /// True while `pending_encryption` holds a value. Lets each statement
     /// check for an incomplete encryption setup without taking the lock.
     pub(super) encryption_setup_pending: AtomicBool,
+    /// True when the connection refuses `PRAGMA cipher = ...` and
+    /// `PRAGMA hexkey = ...`. See [Connection::disable_encryption_pragmas].
+    pub(super) encryption_pragmas_disabled: AtomicBool,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
     pub(super) data_sync_retry: AtomicBool,
@@ -4472,6 +4475,15 @@ impl Connection {
         ))
     }
 
+    /// Makes the connection refuse `PRAGMA cipher = ...` and
+    /// `PRAGMA hexkey = ...`. A server that runs the SQL of its clients on a
+    /// shared connection calls it, so that a client cannot encrypt the
+    /// database with a key that the server does not have.
+    pub fn disable_encryption_pragmas(&self) {
+        self.encryption_pragmas_disabled
+            .store(true, Ordering::Release);
+    }
+
     /// Checks an assignment to `PRAGMA cipher` or `PRAGMA hexkey` when it is
     /// prepared, so that a refused assignment fails before it runs.
     /// [Connection::set_encryption_pragma] checks again when it runs.
@@ -4533,6 +4545,11 @@ impl Connection {
     /// active statements checked: the running PRAGMA is one of them, and a
     /// PRAGMA that is prepared again when it starts to run is one as well.
     fn check_new_database_encryption(&self, running: bool) -> Result<()> {
+        if self.encryption_pragmas_disabled.load(Ordering::Acquire) {
+            return Err(encryption_pragma_refused(
+                "this connection does not accept them",
+            ));
+        }
         let pager = self.pager.load();
         if !pager.is_encryption_enabled() {
             return Err(LimboError::InvalidArgument(
