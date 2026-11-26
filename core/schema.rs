@@ -6990,18 +6990,8 @@ impl FromClauseSubquery {
             .is_some_and(|cte| cte.materialized == crate::ast::Materialized::Yes)
     }
 
-    /// True for explicit WITH ... AS NOT MATERIALIZED.
-    pub fn not_materialized_hint(&self) -> bool {
-        self.cte
-            .is_some_and(|cte| cte.materialized == crate::ast::Materialized::No)
-    }
-
     pub fn shared_materialization(&self) -> bool {
         self.cte.is_some_and(|cte| cte.shared_materialization)
-    }
-
-    pub fn uses_outer_reference_plan(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.uses_outer_reference_plan)
     }
 
     pub fn set_shared_materialization(&mut self, shared: bool) {

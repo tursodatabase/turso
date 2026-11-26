@@ -103,10 +103,10 @@ pub(crate) fn materialized_from_clause_subquery_storage(
 /// (`fromClauseTermCanBeCoroutine` and `isSelfJoinView` in SQLite's select.c).
 ///
 /// Reads that use the plan of an outer query reference
-/// ([FromClauseSubquery::uses_outer_reference_plan]) have the same cursors, so
-/// two of them must not run at the same time. They share one stored result
-/// when one query reads the CTE two or more times with its nested queries, also
-/// when SQLite would compute the CTE again for each of them. Reads in different
+/// ([FromClauseSubqueryCteMetadata::uses_outer_reference_plan]) have the same
+/// cursors, so two of them must not run at the same time. They share one stored
+/// result when one query reads the CTE two or more times with its nested
+/// queries, also when SQLite would compute the CTE again for each of them. Reads in different
 /// subqueries run one after the other and compute the CTE again.
 ///
 /// A read in a subquery or in a later compound arm is only known once the
@@ -116,7 +116,7 @@ pub(crate) fn materialized_from_clause_subquery_storage(
 /// read two or more times is stored, and `NOT MATERIALIZED` is not looked at.
 ///
 /// [optimize_plan]: crate::translate::optimizer::optimize_plan
-/// [FromClauseSubquery::uses_outer_reference_plan]: crate::schema::FromClauseSubquery::uses_outer_reference_plan
+/// [FromClauseSubqueryCteMetadata::uses_outer_reference_plan]: crate::schema::FromClauseSubqueryCteMetadata::uses_outer_reference_plan
 /// [Dialect::stores_cte_read_more_than_once]: crate::dialect::Dialect::stores_cte_read_more_than_once
 pub(crate) fn mark_shared_cte_materialization_requirements(
     plan: &mut Plan,
@@ -150,7 +150,10 @@ fn count_stored_cte_reads(
     stores_every_read: bool,
 ) {
     let not_materialized = |from_clause_subquery: &crate::schema::FromClauseSubquery| {
-        !stores_every_read && from_clause_subquery.not_materialized_hint()
+        !stores_every_read
+            && from_clause_subquery
+                .cte
+                .is_some_and(|cte| cte.materialized == ast::Materialized::No)
     };
     for_each_query_of_plan(
         plan,
@@ -231,7 +234,10 @@ fn mark_stored_cte_reads(
     merged_into: Option<FlatteningReader>,
 ) {
     let not_materialized = |from_clause_subquery: &crate::schema::FromClauseSubquery| {
-        !stores_every_read && from_clause_subquery.not_materialized_hint()
+        !stores_every_read
+            && from_clause_subquery
+                .cte
+                .is_some_and(|cte| cte.materialized == ast::Materialized::No)
     };
     fn count_not_materialized_reads(
         counts: &mut HashMap<usize, usize>,
@@ -284,7 +290,8 @@ fn mark_stored_cte_reads(
                     let from_clause_subquery = Arc::make_mut(from_clause_subquery);
                     let may_be_merged =
                         !stores_every_read && reader.may_merge(from_clause_subquery);
-                    if let Some(cte_id) = from_clause_subquery.cte_id() {
+                    if let Some(cte) = from_clause_subquery.cte {
+                        let cte_id = cte.id;
                         let query_reads: QueryCteReads =
                             query_reads.get(&cte_id).copied().unwrap_or_default();
                         let reads = if may_be_merged {
@@ -297,13 +304,12 @@ fn mark_stored_cte_reads(
                         } else {
                             stored_reads.get(&cte_id).copied().unwrap_or_default()
                         };
-                        let shares_plan =
-                            from_clause_subquery.uses_outer_reference_plan() && query_reads.all > 1;
+                        let shares_plan = cte.uses_outer_reference_plan && query_reads.all > 1;
                         // SQLite reuses a stored result for each read that it
                         // does not merge. A read that uses the plan of the
                         // stored read has to reuse it.
                         let reuses_stored = stored_by_outer_queries.contains(&cte_id)
-                            && (!may_be_merged || from_clause_subquery.uses_outer_reference_plan());
+                            && (!may_be_merged || cte.uses_outer_reference_plan);
                         let shared = (reads > 1 || shares_plan || reuses_stored)
                             && !plan_has_outer_scope_dependency(&from_clause_subquery.plan);
                         from_clause_subquery.set_shared_materialization(shared);
