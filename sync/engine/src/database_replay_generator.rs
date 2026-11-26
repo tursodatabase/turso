@@ -31,7 +31,7 @@ pub struct ReplayInfo {
 
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
 
-fn sql_string_literal(value: &str) -> String {
+pub(crate) fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 

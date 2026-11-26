@@ -21,10 +21,11 @@ use crate::{
         bootstrap_db_file, connect_untracked, count_local_changes, has_table,
         is_logically_replayable_table, list_user_tables, max_local_change_id,
         pull_updates_to_staging, push_logical_changes, read_last_change_id,
-        read_logical_replay_table_map, read_wal_salt, reset_wal_file, should_replay_local_change,
-        sync_file, update_last_change_id, wait_all_results, wait_file_completion,
-        wal_apply_from_file, wal_apply_from_staging, wal_pull_to_staging, PullUpdatesV1Result,
-        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        read_logical_replay_table_map, read_wal_salt, rename_tables_in_local_changes,
+        reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
+        wait_all_results, wait_file_completion, wal_apply_from_file, wal_apply_from_staging,
+        wal_pull_to_staging, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE,
+        WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         replay_without_triggers, run_stmt_ignore_rows, try_wal_watermark_read_page,
@@ -2300,6 +2301,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 	                self.main_db_path,
 	                remote_apply_stats.touched_rows.len()
 	            );
+            if had_cdc_table && !remote_apply_stats.renamed_tables.is_empty() {
+                rename_tables_in_local_changes(coro, &conn, &remote_apply_stats.renamed_tables)
+                    .await?;
+            }
 
             let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
                 let meta = self.meta();
@@ -2325,7 +2330,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let local_changes = precollected_local_changes
                 .into_iter()
                 .filter(|change| change.change_id > replay_floor)
-                .collect::<Vec<_>>();
+                .map(|change| remote_apply_stats.renamed_tables.move_local_change(change))
+                .collect::<Result<Vec<_>>>()?;
             let mut skipped_internal_local_changes = 0usize;
             let local_changes = local_changes
                 .into_iter()

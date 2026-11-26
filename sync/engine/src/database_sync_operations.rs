@@ -19,7 +19,7 @@ use crate::{
     client_proto::{
         LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
     },
-    database_replay_generator::DatabaseReplayGenerator,
+    database_replay_generator::{sql_string_literal, DatabaseReplayGenerator},
     database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
@@ -599,6 +599,98 @@ fn logical_txn_to_tape_operations_with_table_map(
 #[derive(Debug, Default)]
 pub struct LogicalReplayApplyStats {
     pub touched_rows: std::collections::BTreeSet<(String, i64)>,
+    pub renamed_tables: RenamedTables,
+}
+
+#[derive(Debug, Default)]
+pub struct RenamedTables {
+    old_and_current_names: Vec<(String, Option<String>)>,
+}
+
+impl RenamedTables {
+    pub fn is_empty(&self) -> bool {
+        self.old_and_current_names.is_empty()
+    }
+
+    /// Moves an unpushed local change to the current name of its table. Local schema
+    /// changes keep their SQL, which names the old table, so they cannot be replayed
+    /// after the rename and fail the pull instead.
+    pub fn move_local_change(
+        &self,
+        mut change: DatabaseTapeRowChange,
+    ) -> Result<DatabaseTapeRowChange> {
+        if change.table_name == "sqlite_schema" {
+            let schema_rows = match &change.change {
+                DatabaseTapeRowChangeType::Delete { before, .. } => vec![before],
+                DatabaseTapeRowChangeType::Insert { after } => vec![after],
+                DatabaseTapeRowChangeType::Update { before, after, .. } => vec![before, after],
+            };
+            for row in schema_rows {
+                let Some(turso_core::Value::Text(table_name)) = row.get(2) else {
+                    continue;
+                };
+                let current_name = self.current_name(table_name.as_str());
+                if current_name != table_name.as_str() {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "unpushed local schema change to table {table_name} cannot be replayed: the remote renamed the table to {current_name}"
+                    )));
+                }
+            }
+        }
+        change.table_name = self.current_name(&change.table_name).to_string();
+        Ok(change)
+    }
+
+    fn current_name<'a>(&'a self, old_name: &'a str) -> &'a str {
+        match self
+            .old_and_current_names
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(old_name))
+        {
+            Some((_, current_name)) => current_name
+                .as_deref()
+                .expect("a table renamed to a temporary name must be renamed back"),
+            None => old_name,
+        }
+    }
+
+    fn observe(&mut self, operation: &DatabaseTapeOperation) {
+        let DatabaseTapeOperation::SchemaReplay(replay) = operation else {
+            return;
+        };
+        match replay {
+            DatabaseSchemaReplay::RenameTable { old_name, new_name } => {
+                self.rename(Some(old_name), Some(new_name))
+            }
+            DatabaseSchemaReplay::RenameTableToTemporaryName { name } => {
+                self.rename(Some(name), None)
+            }
+            DatabaseSchemaReplay::RenameTemporaryTable { new_name } => {
+                self.rename(None, Some(new_name))
+            }
+            _ => {}
+        }
+    }
+
+    fn rename(&mut self, from: Option<&str>, to: Option<&str>) {
+        let to = to.map(str::to_string);
+        let renamed_before =
+            self.old_and_current_names
+                .iter_mut()
+                .find(|(_, current_name)| match (current_name.as_deref(), from) {
+                    (Some(current_name), Some(from)) => current_name.eq_ignore_ascii_case(from),
+                    (None, None) => true,
+                    _ => false,
+                });
+        match renamed_before {
+            Some((_, current_name)) => *current_name = to,
+            None => {
+                let from = from
+                    .expect("a table renamed from a temporary name must be renamed to it first");
+                self.old_and_current_names.push((from.to_string(), to));
+            }
+        }
+    }
 }
 
 fn logical_operations_touched_rows(
@@ -741,6 +833,7 @@ async fn replay_logical_transaction<Ctx>(
         for row in logical_operations_touched_rows(std::slice::from_ref(&operation)) {
             stats.touched_rows.insert(row);
         }
+        stats.renamed_tables.observe(&operation);
         replay.replay(coro, operation).await?;
     }
     Ok(())
@@ -2737,6 +2830,32 @@ pub async fn has_table<Ctx>(
         _ => panic!("expected single row"),
     };
     Ok(count > 0)
+}
+
+pub async fn rename_tables_in_local_changes<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    renamed_tables: &RenamedTables,
+) -> Result<()> {
+    let mut when_clauses = String::new();
+    let mut old_names = Vec::new();
+    for (old_name, current_name) in &renamed_tables.old_and_current_names {
+        let current_name = current_name
+            .as_deref()
+            .expect("a table renamed to a temporary name must be renamed back");
+        let old_name = sql_string_literal(&old_name.to_ascii_lowercase());
+        when_clauses.push_str(&format!(
+            " WHEN {old_name} THEN {}",
+            sql_string_literal(current_name)
+        ));
+        old_names.push(old_name);
+    }
+    let mut stmt = conn.prepare(format!(
+        "UPDATE turso_cdc SET table_name = CASE lower(table_name){when_clauses} END WHERE lower(table_name) IN ({})",
+        old_names.join(", ")
+    ))?;
+    run_stmt_ignore_rows(coro, &mut stmt).await?;
+    Ok(())
 }
 
 /// Counts local changes above `change_id` which the next push will send to the remote.

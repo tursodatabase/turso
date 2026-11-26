@@ -1,3 +1,4 @@
+use turso_core::Value;
 use turso_sync_engine::Result;
 
 use crate::harness::Remote;
@@ -249,6 +250,131 @@ fn swap_table_names_when_the_replica_has_a_table_named_like_the_temporary_name()
 }
 
 #[test]
+fn rename_table_with_unpushed_local_changes() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE t (x PRIMARY KEY, y)",
+        "INSERT INTO t VALUES (1, 2)",
+        "INSERT INTO t VALUES (3, 4)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+    replica.execute("INSERT INTO t VALUES (5, 6)")?;
+    replica.execute("UPDATE t SET y = 7 WHERE x = 1")?;
+    replica.execute("DELETE FROM t WHERE x = 3")?;
+
+    remote.execute_transaction(&["ALTER TABLE t RENAME TO u"])?;
+    replica.pull()?;
+    replica.pull()?;
+
+    assert_eq!(
+        replica.query("SELECT name FROM sqlite_schema WHERE name IN ('t', 'u')")?,
+        vec![vec![Value::build_text("u")]]
+    );
+    assert_eq!(
+        replica.query("SELECT * FROM u ORDER BY x")?,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(7)],
+            vec![Value::from_i64(5), Value::from_i64(6)],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn pull_remote_changes_after_a_rename_with_unpushed_local_changes() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE t (x PRIMARY KEY, y)",
+        "INSERT INTO t VALUES (1, 2)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+    replica.execute("INSERT INTO t VALUES (5, 6)")?;
+
+    remote.execute_transaction(&["ALTER TABLE t RENAME TO u"])?;
+    replica.pull()?;
+    remote.execute_transaction(&["INSERT INTO u VALUES (10, 10)"])?;
+    replica.pull()?;
+    remote.execute_transaction(&["ALTER TABLE u RENAME TO v"])?;
+    replica.pull()?;
+    remote.execute_transaction(&["INSERT INTO v VALUES (11, 11)"])?;
+    replica.pull()?;
+
+    assert_eq!(
+        replica.query("SELECT * FROM v ORDER BY x")?,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2)],
+            vec![Value::from_i64(5), Value::from_i64(6)],
+            vec![Value::from_i64(10), Value::from_i64(10)],
+            vec![Value::from_i64(11), Value::from_i64(11)],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn rename_table_with_a_non_ascii_name_and_unpushed_local_changes() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE \"Äb\" (x PRIMARY KEY, y)",
+        "INSERT INTO \"Äb\" VALUES (1, 2)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+    replica.execute("INSERT INTO \"Äb\" VALUES (5, 6)")?;
+
+    remote.execute_transaction(&["ALTER TABLE \"Äb\" RENAME TO u"])?;
+    replica.pull()?;
+    remote.execute_transaction(&["INSERT INTO u VALUES (10, 10)"])?;
+    replica.pull()?;
+
+    assert_eq!(
+        replica.query("SELECT * FROM u ORDER BY x")?,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2)],
+            vec![Value::from_i64(5), Value::from_i64(6)],
+            vec![Value::from_i64(10), Value::from_i64(10)],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn swap_table_names_with_unpushed_local_changes() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE a (x PRIMARY KEY)",
+        "CREATE TABLE b (y PRIMARY KEY)",
+        "INSERT INTO a VALUES (1)",
+        "INSERT INTO b VALUES (2)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+    replica.execute("INSERT INTO a VALUES (3)")?;
+    replica.execute("INSERT INTO b VALUES (4)")?;
+
+    remote.execute_transaction(&[
+        "ALTER TABLE a RENAME TO c",
+        "ALTER TABLE b RENAME TO a",
+        "ALTER TABLE c RENAME TO b",
+    ])?;
+    replica.pull()?;
+    remote.execute_transaction(&["INSERT INTO a VALUES (6)", "INSERT INTO b VALUES (7)"])?;
+    replica.pull()?;
+
+    assert_eq!(
+        replica.query("SELECT * FROM a ORDER BY y")?,
+        vec![
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(6)]
+        ]
+    );
+    assert_eq!(
+        replica.query("SELECT * FROM b ORDER BY x")?,
+        vec![
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(3)],
+            vec![Value::from_i64(7)]
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn drop_newest_table_and_create_index_in_one_transaction() -> Result<()> {
     let remote = Remote::new(&[
         "CREATE TABLE kept (x)",
@@ -297,5 +423,30 @@ fn drop_newest_table_and_create_another_table_in_one_transaction() -> Result<()>
     replica.pull()?;
 
     assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+#[test]
+fn rename_table_with_an_unpushed_local_schema_change_to_it_fails_the_pull() -> Result<()> {
+    let remote = Remote::new(&["CREATE TABLE t (x, y)", "INSERT INTO t VALUES (1, 2)"])?;
+    let replica = remote.bootstrap_replica()?;
+    replica.execute("ALTER TABLE t ADD COLUMN z")?;
+    replica.execute("INSERT INTO t VALUES (3, 4, 5)")?;
+
+    remote.execute_transaction(&["ALTER TABLE t RENAME TO u"])?;
+    let error = replica.pull().unwrap_err().to_string();
+
+    assert!(
+        error.contains("unpushed local schema change to table t")
+            && error.contains("renamed the table to u"),
+        "{error}"
+    );
+    assert_eq!(
+        replica.query("SELECT * FROM t ORDER BY x")?,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2), Value::Null],
+            vec![Value::from_i64(3), Value::from_i64(4), Value::from_i64(5)],
+        ]
+    );
     Ok(())
 }
