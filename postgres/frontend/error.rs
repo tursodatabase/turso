@@ -124,6 +124,18 @@ pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> Limbo
     }))
 }
 
+/// The error of a CREATE that gives a type, or the row type of a relation,
+/// the name of a type of the same schema, with the HINT `hint` if there is
+/// one.
+pub fn type_already_exists(name: &str, hint: Option<&str>) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: SQLSTATE_DUPLICATE_OBJECT,
+        message: format!("type \"{name}\" already exists"),
+        detail: None,
+        hint: hint.map(Into::into),
+    }))
+}
+
 /// The engine error for SQL that `turso_pg_parser` refuses, which keeps the
 /// SQLSTATE and the HINT that the parser gave it.
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {

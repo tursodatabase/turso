@@ -865,6 +865,63 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
+# CREATE TYPE and CREATE DOMAIN create in the first schema of search_path,
+# but tursopg keeps every type in public. A table of public with the name
+# does not matter.
+@compat-gap "syntax:create-type"
+test create-type-in-the-first-schema-of-search-path {
+    CREATE SCHEMA api;
+    CREATE TABLE public.mood (a int);
+    SET search_path = api;
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE t.typname = 'mood' ORDER BY 1;
+}
+expect {
+    api
+    public
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create-type"
+test create-domain-in-the-first-schema-of-search-path {
+    CREATE SCHEMA api;
+    SET search_path = api;
+    CREATE DOMAIN positive AS int CHECK (VALUE > 0);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# A quoted name keeps its letter case in PostgreSQL, so a type and a relation
+# whose names differ only in case are two names. tursopg folds the name of a
+# type to lower case and finds types and relations by a name in any case, so
+# it refuses the second statement.
+@compat-gap "syntax:quoted-identifier"
+test a-type-after-a-table-whose-name-differs-in-case {
+    CREATE TABLE "Mood" (a int);
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT typname FROM pg_type WHERE typname IN ('mood', 'Mood') ORDER BY 1;
+}
+expect {
+    Mood
+    mood
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:quoted-identifier"
+test a-domain-after-a-table-whose-name-differs-in-case {
+    CREATE TABLE zone (a int);
+    CREATE DOMAIN "Zone" AS int;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 # E-85: table in a quoted non-ASCII schema
 @compat-gap "syntax:create-schema"
 test table-in-a-quoted-non-ascii-schema {

@@ -2745,6 +2745,92 @@ expect error {
     relation "zz_rn_view" already exists
 }
 
+# A table, view or materialized view has a row type of its name in its
+# schema, so its name is taken for types, and a type's name is taken for it.
+test a-type-may-not-share-its-name-with-a-table {
+    CREATE TABLE zz_ty_table (a int);
+    CREATE TYPE zz_ty_table AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "zz_ty_table" already exists
+}
+
+test a-type-may-not-share-its-name-with-a-view {
+    CREATE VIEW zz_ty_view AS SELECT 1 AS a;
+    CREATE TYPE zz_ty_view AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "zz_ty_view" already exists
+}
+
+test a-domain-may-not-share-its-name-with-a-table {
+    CREATE TABLE zz_dom_table (a int);
+    CREATE DOMAIN zz_dom_table AS int;
+}
+@sqlstate 42710
+expect error {
+    type "zz_dom_table" already exists
+}
+
+# A table keeps the letter case of its quoted name.
+test a-type-may-not-share-its-quoted-name-with-a-table {
+    CREATE TABLE "Zz_Ty_Quoted" (a int);
+    CREATE TYPE "Zz_Ty_Quoted" AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "Zz_Ty_Quoted" already exists
+}
+
+test a-type-may-share-its-name-with-a-sequence {
+    CREATE SEQUENCE zz_type_seq;
+    CREATE TYPE zz_type_seq AS ENUM ('a');
+    SELECT 'a'::zz_type_seq, nextval('zz_type_seq');
+}
+expect {
+    a|1
+}
+
+# pg_dump empties search_path and names the schema of every object.
+test a-type-named-with-public-is-created-with-an-empty-search-path {
+    SELECT pg_catalog.set_config('search_path', '', false);
+    CREATE TYPE public.zz_dump_mood AS ENUM ('sad', 'happy');
+    CREATE DOMAIN public.zz_dump_positive AS integer CHECK (VALUE > 0);
+    CREATE TABLE public.zz_dump_t (m public.zz_dump_mood, p public.zz_dump_positive);
+    INSERT INTO public.zz_dump_t VALUES ('happy', 3);
+    SELECT m, p FROM public.zz_dump_t;
+}
+expect {
+
+    happy|3
+}
+
+test a-type-named-with-public-is-created-in-public {
+    CREATE SCHEMA zz_qual_schema;
+    SET search_path = zz_qual_schema;
+    CREATE TYPE public.zz_qual_enum AS ENUM ('a');
+    CREATE DOMAIN public.zz_qual_domain AS int;
+    SELECT t.typname, n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE t.typname LIKE 'zz_qual_%' ORDER BY 1;
+}
+expect {
+    zz_qual_domain|public
+    zz_qual_enum|public
+}
+
+test a-type-named-with-public-may-not-take-a-public-tables-name {
+    CREATE SCHEMA zz_qual_schema2;
+    SET search_path = zz_qual_schema2;
+    CREATE TABLE public.zz_qual_table (a int);
+    CREATE TYPE public.zz_qual_table AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "zz_qual_table" already exists
+}
+
 test a-repeated-type-name-is-a-duplicate-object {
     CREATE TYPE zz_twice AS ENUM ('a');
     CREATE DOMAIN zz_twice AS int;
