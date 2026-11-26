@@ -173,6 +173,8 @@ impl InProcessServer {
             self.page_bootstrap(false)
         } else if self.replace_once.swap(false, Ordering::SeqCst) {
             self.page_bootstrap(true)
+        } else if let Some((database, log_end)) = self.remote.take_replace_base_snapshot() {
+            self.page_stream(&database, log_end, true)
         } else {
             self.logical_log_since(log_offset_of(&request.client_revision)?)
         }
@@ -189,6 +191,10 @@ impl InProcessServer {
         } else {
             self.bootstrap_base.read_logical_log()?.len()
         };
+        self.page_stream(&database, log_end, replace)
+    }
+
+    fn page_stream(&self, database: &[u8], log_end: usize, replace: bool) -> Result<Vec<u8>> {
         let header = PullUpdatesRespProtoBody {
             server_revision: revision_at(log_end),
             db_size: (database.len() / PAGE_SIZE) as u64,
