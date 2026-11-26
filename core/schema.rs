@@ -3723,30 +3723,6 @@ impl Schema {
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
-        for unparsed_sql_from_index in from_sql_indexes {
-            let (namespace, table_name) = self.demangle_name(&unparsed_sql_from_index.table_name);
-            let table = self.get_btree_table(namespace, table_name).ok_or_else(|| {
-                LimboError::Corrupt(format!(
-                    "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
-                    unparsed_sql_from_index.table_name,
-                    unparsed_sql_from_index.root_page,
-                    unparsed_sql_from_index.sql
-                ))
-            })?;
-            let mut index = Index::from_sql(
-                dialect,
-                syms,
-                &unparsed_sql_from_index.sql,
-                unparsed_sql_from_index.root_page,
-                table.as_ref(),
-                self,
-            )?;
-            let index_name = self.demangle_name(&index.name).1.to_string();
-            index.name = index_name;
-            index.table_name.clone_from(&table.name);
-            self.add_index(namespace, Arc::new(index))?;
-        }
-
         for automatic_index in automatic_indices {
             // Autoindexes must be parsed in definition order.
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
@@ -3866,6 +3842,35 @@ impl Schema {
                     automatic_indexes.len()
                 );
             }
+        }
+
+        // add_index puts each index at the head of the table's list. SQLite reads
+        // sqlite_schema in rowid order, and the automatic indexes of a table come
+        // before the indexes that CREATE INDEX made for it. Add them in that order,
+        // so that the list has the same newest-first order as in SQLite. UPSERT
+        // selects the first index in this list that matches its conflict target.
+        for unparsed_sql_from_index in from_sql_indexes {
+            let (namespace, table_name) = self.demangle_name(&unparsed_sql_from_index.table_name);
+            let table = self.get_btree_table(namespace, table_name).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
+                    unparsed_sql_from_index.table_name,
+                    unparsed_sql_from_index.root_page,
+                    unparsed_sql_from_index.sql
+                ))
+            })?;
+            let mut index = Index::from_sql(
+                dialect,
+                syms,
+                &unparsed_sql_from_index.sql,
+                unparsed_sql_from_index.root_page,
+                table.as_ref(),
+                self,
+            )?;
+            let index_name = self.demangle_name(&index.name).1.to_string();
+            index.name = index_name;
+            index.table_name.clone_from(&table.name);
+            self.add_index(namespace, Arc::new(index))?;
         }
         Ok(())
     }
