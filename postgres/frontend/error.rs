@@ -510,8 +510,6 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 fn raise_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
-    } else if msg == "integer out of range for smallint" {
-        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else if msg == "value too long for varchar" {
         SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
     } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {

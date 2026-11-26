@@ -479,9 +479,6 @@ expect {
     2
 }
 
-# tursopg does not tell an integer column from a bigint that a function
-# returns, so it checks the literal against the range of bigint.
-@compat-gap "type:int4"
 @setup operands
 test string-literal-out-of-the-range-of-integer-errors {
     SELECT i = '9999999999' FROM operands;
@@ -489,9 +486,6 @@ test string-literal-out-of-the-range-of-integer-errors {
 @sqlstate 22003
 expect error {
     value "9999999999" is out of range for type integer
-}
-expect @tursopg {
-    f
 }
 
 @setup operands
@@ -599,6 +593,14 @@ test hex-and-underscore-literals-next-to-an-integer-are-not-an-error {
 }
 expect {
     f|f
+}
+
+@setup operands
+test hex-octal-binary-and-underscore-literals-next-to-an-integer-are-read-as-numbers {
+    SELECT i = '0x1', i2 = '0b10', i8 = '0o3', i + '0x10', 16 = '0x10', 1000 = '1_000' FROM operands;
+}
+expect {
+    t|t|t|17|t|t
 }
 
 @setup operands

@@ -155,10 +155,7 @@ impl TempDatabaseBuilder {
         let mut opts = self
             .opts
             .unwrap_or_else(|| turso_core::DatabaseOpts::new().with_encryption(true));
-        opts = opts
-            .with_vacuum(true)
-            .with_without_rowid(true)
-            .with_custom_types(true);
+        opts = opts.with_without_rowid(true).with_custom_types(true);
 
         if self.enable_views {
             opts = opts.with_views(true);

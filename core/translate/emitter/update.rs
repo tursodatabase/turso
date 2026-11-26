@@ -882,10 +882,35 @@ fn emit_update_column_values<'a>(
                         &t_ctx.resolver,
                     )?;
 
+                    let key_may_be_generated = t_ctx
+                        .resolver
+                        .catalog
+                        .dialect
+                        .generates_integer_primary_keys();
+                    if table_column.is_rowid_alias() && !key_may_be_generated {
+                        emit_notnull_constraint_check(
+                            program,
+                            table_references,
+                            rowid_set_clause_reg,
+                            table_column,
+                            column_ctx.table_name(),
+                            notnull_conflict_resolution(program, table_column),
+                            skip_row_label,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,
                         target_pc: None,
                     });
+                    if table_column.is_rowid_alias() {
+                        crate::translate::expr::emit_coerce_rowid(
+                            program,
+                            table_column,
+                            rowid_set_clause_reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
 
                     program.emit_null(target_reg, None);
                 } else {

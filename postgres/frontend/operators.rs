@@ -4,8 +4,12 @@
 use crate::catalog::{pg_type_category, pg_type_name, pg_type_oid};
 use crate::error::sqlstate_error;
 use crate::functions::{format_type, undefined_operator_of, validate_pg_input};
+use crate::pg_type::{IntegerOperator, IntegerType};
 use turso_core::ast;
-use turso_core::dialect::{ChosenOperator, EngineType, OperandType, OperatorChoice};
+use turso_core::dialect::{
+    ChosenOperator, EngineType, OperandType, OperatorChoice, OperatorFunction,
+};
+use turso_core::types::Type as _;
 use turso_core::Result;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_TEXT_REPRESENTATION,
@@ -53,7 +57,7 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     let (literal, ty) = match (operands, types.as_slice()) {
         ([OperandType::StringLiteral(literal), _], [_, Some(ty)])
         | ([_, OperandType::StringLiteral(literal)], [Some(ty), _]) => (literal, ty),
-        _ => return Ok(OperatorChoice::LeftToTheEngine),
+        _ => return Ok(integer_operator_choice(op, &types)),
     };
     // The engine reads a literal next to a value of another type as that
     // type already, with the input function of the type.
@@ -71,7 +75,67 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     Ok(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: vec![ty.cast_to.clone(), ty.cast_to.clone()],
+        function: integer_operator_function(op, &[ty, ty]),
     }))
+}
+
+/// FIXME(registered-types): Two integers that have no registered type, such as two integers written in the statement or count(*), are left to the engine, because one engine type stands for integer and bigint (see `engine_type_oid`). So `2147483647 + 1` gives 2147483648, where PostgreSQL fails with 22003. A type for an integer literal by its value, and for a function result from prorettype of its pg_proc row, replace this.
+/// The choice of the operator that runs `op` on operands that are all
+/// integers, one of them at least of a registered integer type.
+fn integer_operator_choice(op: &str, types: &[Option<Checked>]) -> OperatorChoice {
+    let Some(types) = types.iter().map(Option::as_ref).collect::<Option<Vec<_>>>() else {
+        return OperatorChoice::LeftToTheEngine;
+    };
+    let Some(function) = integer_operator_function(op, &types) else {
+        return OperatorChoice::LeftToTheEngine;
+    };
+    let oids: Vec<i64> = types.iter().map(|ty| ty.oid).collect();
+    let takes_these = |row: &&Operator| match oids[..] {
+        [right] => row.name == op && row.left == NONE && row.right == right,
+        [left, right] => row.name == op && row.left == left && row.right == right,
+        _ => false,
+    };
+    let row = OPERATORS
+        .iter()
+        .find(takes_these)
+        .expect("an integer operator function is the oprcode of a row");
+    OperatorChoice::Chosen(ChosenOperator {
+        id: row.oid,
+        operands: types.iter().map(|ty| ty.cast_to.clone()).collect(),
+        function: Some(function),
+    })
+}
+
+fn integer_operator_function(op: &str, types: &[&Checked]) -> Option<OperatorFunction> {
+    if types.iter().all(|ty| ty.engine.is_some()) {
+        return None;
+    }
+    let integer_types = types
+        .iter()
+        .map(|ty| integer_type(ty.oid))
+        .collect::<Option<Vec<_>>>()?;
+    let operator = match integer_types[..] {
+        [right] => IntegerOperator::find(op, None, right),
+        [left, right] => IntegerOperator::find(op, Some(left), right),
+        _ => None,
+    }?;
+    Some(OperatorFunction {
+        name: operator.function_name(),
+        result: ast::Type {
+            name: operator.result().name().to_string(),
+            size: None,
+            array_dimensions: 0,
+        },
+    })
+}
+
+fn integer_type(oid: i64) -> Option<IntegerType> {
+    match oid {
+        INT2 => Some(IntegerType::Int2),
+        INT4 => Some(IntegerType::Int4),
+        INT8 => Some(IntegerType::Int8),
+        _ => None,
+    }
 }
 
 /// PostgreSQL's choice of the `=` (`<>` for NOT IN) of `x IN (a, b, ...)` for
@@ -133,6 +197,7 @@ pub(crate) fn choose_list_operator(
     Ok(Some(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: vec![ty.cast_to.clone(); operands.len()],
+        function: None,
     })))
 }
 
@@ -221,13 +286,18 @@ fn is_run_by_core(op: &str, types: &[Option<Checked>]) -> bool {
 
 /// FIXME(registered-types): The engine stores numeric and double precision both as REAL, and cannot hold NaN or an exponent past a double, so these spellings are compared as text and give false. Once numeric is a registered type with its own storage, the input function of the type reads every spelling and this function goes away.
 /// Whether `literal` is a value of the type `oid` that PostgreSQL reads but
-/// the engine cannot store or the input check here does not know: a number in
-/// the hex, octal or binary spelling or with underscores between digits, NaN and the infinities of a real, a double
-/// precision or a numeric, and a number with an exponent past the range of a
-/// double, which a numeric holds. The engine names a numeric REAL, like a
-/// double precision, so that exponent is not refused for either. The operator
-/// is left to the engine for these, as for any literal.
+/// the engine cannot store or the input check here does not know. The integer
+/// types read every spelling themselves. For a real, a double precision or a
+/// numeric it is a number in the hex, octal or binary spelling or with
+/// underscores between digits, NaN and the infinities, and a number with an
+/// exponent past the range of a double, which a numeric holds. The engine
+/// names a numeric REAL, like a double precision, so that exponent is not
+/// refused for either. The operator is left to the engine for these, as for
+/// any literal.
 fn is_spelling_left_to_the_engine(literal: &str, oid: i64) -> bool {
+    if [INT2, INT4, INT8].contains(&oid) {
+        return false;
+    }
     let text = literal.trim();
     let digits = text.trim_start_matches(['+', '-']);
     let lower = digits.to_ascii_lowercase();
@@ -294,7 +364,6 @@ fn check_number_literal(literal: &str, ty: &Checked) -> Result<()> {
     let Some((message, sqlstate)) = validate_pg_input(literal, type_name) else {
         return check_a_double_keeps(literal, ty);
     };
-    // FIXME(pg-catalog): The engine names every integer that is not a smallint or bigint column INTEGER, also the bigint that count(*) returns. So a literal out of the range of int4 is only refused when it is out of the range of int8. The type of each value, from pg_proc and pg_operator, replaces this.
     let out_of_range = sqlstate == SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE;
     let is_engine_integer = ty.engine == Some(EngineType::Integer);
     if out_of_range && is_engine_integer && validate_pg_input(literal, "int8").is_none() {
@@ -347,15 +416,20 @@ fn checked_registered_type(ty: &ast::Type) -> Option<Checked> {
     })
 }
 
+/// FIXME(registered-types): An integer that has no registered type is taken to be an integer (int4), but it may be a bigint, such as count(*) or an integer written with more digits. So a string literal next to it is cast to bigint, and `check_number_literal` only refuses one out of the range of int4 when it is out of the range of int8. A type for each value replaces this.
 fn checked_engine_type(ty: EngineType, array_dimensions: u32) -> Option<Checked> {
     if array_dimensions > 0 {
         return None;
     }
     let oid = engine_type_oid(ty)?;
+    let cast_to = match ty {
+        EngineType::Integer => "bigint",
+        _ => ty.sql_name(),
+    };
     Some(Checked {
         oid,
         cast_to: ast::Type {
-            name: ty.sql_name().to_string(),
+            name: cast_to.to_string(),
             size: None,
             array_dimensions: 0,
         },

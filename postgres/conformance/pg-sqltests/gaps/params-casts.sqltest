@@ -19,82 +19,17 @@ setup t_b {
     CREATE TABLE t (b boolean);
 }
 
-# A-07: int4 overflow literal cast
-@compat-gap "type:int4"
-test int4-overflow-literal-cast {
-    SELECT '2147483648'::int4;
-}
-@sqlstate 22003
-expect error {}
-expect @tursopg {
-    2147483648
-}
-
-# A-08: int2 overflow literal cast
-@compat-gap "type:int2"
-test int2-overflow-literal-cast {
-    SELECT '40000'::smallint;
-}
-@sqlstate 22003
-expect error {}
-expect @tursopg {
-    40000
-}
-
-# A-09: int8 overflow arithmetic
-@compat-gap "operator:int8 + int4"
-test int8-overflow-arithmetic {
-    SELECT 9223372036854775807::bigint + 1;
-}
-@sqlstate 22003
-expect error {}
-expect @tursopg {
-    9.223372036854776e18
-}
-
-# A-10: int4 overflow arithmetic
-@compat-gap "operator:int4 + int4"
-test int4-overflow-arithmetic {
-    SELECT 2147483647::int4 + 1;
-}
-@sqlstate 22003
-expect error {}
-expect @tursopg {
-    2147483648
-}
-
-# A-11: invalid int literal cast
-@compat-gap "type:int4"
-test invalid-int-literal-cast {
-    SELECT 'abc'::integer;
-}
-@sqlstate 22P02
-expect error {}
-expect @tursopg {
-    0
-}
-
-# A-13: '1.5'::int (text) is invalid
-@compat-gap "type:int4"
-test decimal-text-cast-to-int4-is-invalid {
-    SELECT '1.5'::integer;
-}
-@sqlstate 22P02
-expect error {}
-expect @tursopg {
-    1
-}
-
-# A-14: numeric->int rounds half away from zero
-@compat-gap "cast:numeric -> int4"
-test numeric-int-rounds-half-away-from-zero {
-    SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
+# PostgreSQL rounds a float8 to the nearest even integer when it is halfway
+# between two. tursopg rounds it away from zero, as it rounds a numeric.
+@compat-gap "cast:float8 -> int4"
+test float8-int-rounds-half-to-even {
+    SELECT 0.5::float8::integer, 2.5::float8::integer, 3.5::float8::integer;
 }
 expect {
-    2|3|-3
+    0|2|4
 }
 expect @tursopg {
-    1|2|-2
+    1|3|4
 }
 
 # A-16: int with surrounding spaces
@@ -397,16 +332,6 @@ test int-literal-cast-output {
 expect {
     {1,2,3}
 }
-
-# A-52: invalid int[] literal
-@compat-gap "type:_int4"
-test invalid-int-literal {
-    SELECT '{1,x}'::int[];
-}
-@sqlstate 22P02
-expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-58: ARRAY[] constructor output
 test array-constructor-output {

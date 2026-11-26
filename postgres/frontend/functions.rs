@@ -1,6 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
+use crate::pg_type::{split_sign, IntegerType};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
 use std::collections::HashSet;
@@ -53,6 +54,7 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
+    let options = crate::pg_type::register_integer_operator_functions(options);
     options
         .extension_function(
             pg_scalar_function(
@@ -757,13 +759,7 @@ fn parse_oid(text: &str) -> Result<i64> {
         || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
     let out_of_range =
         || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
-    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
-    let number = text.trim_matches(is_space);
-    let (negative, unsigned) = match number.as_bytes().first() {
-        Some(b'-') => (true, &number[1..]),
-        Some(b'+') => (false, &number[1..]),
-        _ => (false, number),
-    };
+    let (negative, unsigned) = split_sign(text);
     let (radix, digits) = if let Some(hex) = unsigned
         .strip_prefix("0x")
         .or_else(|| unsigned.strip_prefix("0X"))
@@ -2380,44 +2376,9 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "int2" | "smallint" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type smallint"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type smallint: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type integer"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type integer: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int8" | "bigint" => match trimmed.parse::<i64>() {
-            Ok(_) => None,
-            Err(_) => {
-                if trimmed.parse::<i128>().is_ok() {
-                    Some((
-                        format!("value \"{input}\" is out of range for type bigint"),
-                        "22003".to_string(),
-                    ))
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bigint: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
-                }
-            }
-        },
+        "int2" | "smallint" => check_integer_input(IntegerType::Int2, input),
+        "int4" | "integer" | "int" => check_integer_input(IntegerType::Int4, input),
+        "int8" | "bigint" => check_integer_input(IntegerType::Int8, input),
         "float4" | "real" => match trimmed.parse::<f32>() {
             Ok(v) if v.is_infinite() => Some((
                 format!("value \"{input}\" is out of range for type real"),
@@ -2589,6 +2550,16 @@ pub fn parse_pg_bool(text: &str) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+/// Reads `input` as a cast to the integer type `ty` does, so
+/// `pg_input_is_valid` and the type agree on what is valid.
+fn check_integer_input(ty: IntegerType, input: &str) -> Option<(String, String)> {
+    match ty.parse(input) {
+        Ok(_) => None,
+        Err(LimboError::Dialect(error)) => Some((error.message, error.code.to_string())),
+        Err(other) => unreachable!("integer input failed with {other}"),
     }
 }
 

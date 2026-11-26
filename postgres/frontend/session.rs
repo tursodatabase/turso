@@ -74,7 +74,6 @@ pub fn tursopg_database_opts() -> turso_core::DatabaseOpts {
         .with_custom_types(true)
         .with_encryption(true)
         .with_index_method(true)
-        .with_autovacuum(true)
         .with_attach(true)
 }
 

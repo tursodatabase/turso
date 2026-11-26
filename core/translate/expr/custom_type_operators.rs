@@ -6,7 +6,7 @@
 //! Nothing is written into the expression tree.
 
 use super::*;
-use crate::dialect::{Dialect, EngineType, OperandType, OperatorChoice};
+use crate::dialect::{ChosenOperator, Dialect, EngineType, OperandType, OperatorChoice};
 use crate::function::Deterministic;
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
@@ -480,6 +480,9 @@ pub(super) fn find_operator_call(
     if custom_types.is_empty() {
         return Ok(None);
     }
+    if let Some(call) = call_the_dialect_chose(op, &operands, env)? {
+        return Ok(Some(call));
+    }
     let found = custom_types
         .iter()
         .flat_map(|ty| {
@@ -502,6 +505,52 @@ pub(super) fn find_operator_call(
         });
     };
     call_for(signature, ty, env)
+}
+
+/// The call of the function that the dialect names for `op` on `operands`,
+/// or `None` when the dialect names none.
+fn call_the_dialect_chose(
+    op: &'static str,
+    operands: &[Operand],
+    env: &TypeEnv,
+) -> Result<Option<OperatorCall>> {
+    let Some(resolver) = env.resolver() else {
+        return Ok(None);
+    };
+    let operand_types = || {
+        operands
+            .iter()
+            .map(|operand| dialect_operand_type(operand.expr, operand.expr_type.clone(), env))
+            .collect()
+    };
+    let choice = resolver
+        .catalog
+        .dialect
+        .choose_operator(op, &operand_types)?;
+    let OperatorChoice::Chosen(ChosenOperator {
+        function: Some(function),
+        ..
+    }) = choice
+    else {
+        return Ok(None);
+    };
+    let Some(func) = env.resolve_function(&function.name, operands.len())? else {
+        return Err(LimboError::InternalError(format!(
+            "function {} for operator {op} does not exist",
+            function.name
+        )));
+    };
+    if !func.is_deterministic() {
+        return Err(LimboError::InternalError(format!(
+            "function {} for operator {op} must be deterministic",
+            function.name
+        )));
+    }
+    Ok(Some(OperatorCall {
+        func,
+        encode: vec![None; operands.len()],
+        result: function.result,
+    }))
 }
 
 /// The symbol and operands of `expr` when it is an operator that custom types
@@ -577,6 +626,7 @@ struct Operand<'a> {
     is_blob: bool,
     /// The operand's type, as `type_of` gives it.
     expr_type: &'a ExprType,
+    expr: &'a ast::Expr,
 }
 
 impl<'a> Operand<'a> {
@@ -619,6 +669,7 @@ impl<'a> Operand<'a> {
             is_real,
             is_blob,
             expr_type,
+            expr,
         })
     }
 

@@ -4750,12 +4750,13 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
-        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts int2 and float4 to the wider INTEGER and REAL, so int2(70000) does not raise "smallint out of range" as it does in PostgreSQL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
-        // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
+        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts float4 to the wider REAL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
+        // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS int4), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
-            "INT4" | "INT2" => Some("INTEGER"),
-            "INT8" => Some("BIGINT"),
+            "INT2" => Some("smallint"),
+            "INT4" => Some("int4"),
+            "INT8" => Some("bigint"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
             _ => None,
@@ -7312,9 +7313,11 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             };
         }
 
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" => "int4".into(),
+        "BIGSERIAL" | "SERIAL8" => "bigint".into(),
+        "SMALLSERIAL" | "SERIAL2" => "smallint".into(),
+
         // Base types (no Turso custom type needed)
-        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
-        | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
@@ -7909,15 +7912,16 @@ fn pg_type_name_to_ast_type(
     let pg_type = supported_type_name(type_name)?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
-        | "REGCLASS" | "REGTYPE" => "INTEGER",
-        // Casts like INTEGER; the name types the result as int8.
-        "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
+        "SERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "BIGSERIAL" => "BIGINT",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
         // The frontend registers these types, so the cast names the type
         // and converts the value as a column of the type does.
+        "SMALLINT" | "INT2" => "smallint",
+        "INTEGER" | "INT" | "INT4" => "int4",
+        "BIGINT" | "INT8" => "bigint",
         "BOOLEAN" | "BOOL" => "boolean",
         "DATE" => "date",
         "TIME" => "time",
@@ -11085,8 +11089,8 @@ mod tests {
         let a = PgTypeMapping::array;
 
         // Base types (no Turso custom type)
-        assert_eq!(map_pg_type("INTEGER", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("SERIAL", no_params), Some(s("INTEGER")));
+        assert_eq!(map_pg_type("INTEGER", no_params), Some(s("int4")));
+        assert_eq!(map_pg_type("SERIAL", no_params), Some(s("int4")));
         assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
         assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
         assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
@@ -11130,14 +11134,14 @@ mod tests {
         assert_eq!(map_pg_type("MACADDR8", no_params), Some(s("macaddr8")));
 
         // Array types → base type + dimensions
-        assert_eq!(map_pg_type("INTEGER[]", no_params), Some(a("INTEGER", 1)));
+        assert_eq!(map_pg_type("INTEGER[]", no_params), Some(a("int4", 1)));
         assert_eq!(map_pg_type("TEXT[]", no_params), Some(a("TEXT", 1)));
         assert_eq!(map_pg_type("TEXT[][]", no_params), Some(a("TEXT", 2)));
         assert_eq!(map_pg_type("BOOLEAN[]", no_params), Some(a("boolean", 1)));
         assert_eq!(map_pg_type("BIGINT[]", no_params), Some(a("bigint", 1)));
         assert_eq!(map_pg_type("VARCHAR[]", no_params), Some(a("TEXT", 1)));
         // PG internal array notation
-        assert_eq!(map_pg_type("_int4", no_params), Some(a("INTEGER", 1)));
+        assert_eq!(map_pg_type("_int4", no_params), Some(a("int4", 1)));
         assert_eq!(map_pg_type("_text", no_params), Some(a("TEXT", 1)));
 
         // Unknown types pass through as-is (for user-defined enums etc.)

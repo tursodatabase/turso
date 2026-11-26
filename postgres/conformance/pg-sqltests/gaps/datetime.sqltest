@@ -865,7 +865,7 @@ expect error {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    adding an interval is supported only for timestamp and timestamptz, not integer
+    adding an interval is supported only for timestamp and timestamptz, not int4
 }
 
 # PostgreSQL compares a date with a timestamp as the timestamp at midnight of

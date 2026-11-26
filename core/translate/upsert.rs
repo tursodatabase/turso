@@ -799,7 +799,8 @@ pub fn emit_upsert(
         );
         program.target_union_type = prev_union;
         translate_result?;
-        if col.notnull() && !col.is_rowid_alias() {
+        let key_may_be_generated = resolver.catalog.dialect.generates_integer_primary_keys();
+        if col.notnull() && (!col.is_rowid_alias() || !key_may_be_generated) {
             program.emit_insn(Insn::HaltIfNull {
                 constraint_info: None,
                 target_reg: layout.to_register(new_start, *col_idx),
@@ -820,6 +821,7 @@ pub fn emit_upsert(
                 reg: r,
                 target_pc: None,
             });
+            crate::translate::expr::emit_coerce_rowid(program, col, r, resolver)?;
             new_rowid_reg = Some(r);
         }
     }
