@@ -7,10 +7,12 @@ mod boolean;
 mod integer;
 mod integer_operators;
 mod oid;
+mod regclass;
 
 pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
 pub(crate) use oid::{check_oid_range, oid_input};
+pub(crate) use regclass::{parse_regclass, RegClassInput};
 
 use crate::error::sqlstate_error;
 use crate::session::relation_lookup_namespaces;
@@ -82,7 +84,7 @@ macro_rules! built_in_types {
 /// another type without reading its text, such as point, xml or money, and a
 /// type that it refuses as the type of a column, such as interval or time,
 /// has no row.
-pub(crate) static BUILT_IN_TYPES: [BuiltInType; 20] = built_in_types! {
+pub(crate) static BUILT_IN_TYPES: [BuiltInType; 21] = built_in_types! {
     (16, "bool", "B", true, 1, true, "c", "p", 1000, ",", Support::Registered(&boolean::Boolean)),
     // FIXME(registered-types): bytea: the frontend uses the type that core registers, which stores text as its bytes and does not read the hex and escape formats. A bytea type registered in the frontend, with its INPUT, replaces this.
     (17, "bytea", "U", false, -1, false, "i", "x", 1001, ",", Support::NotRegistered),
@@ -114,6 +116,7 @@ pub(crate) static BUILT_IN_TYPES: [BuiltInType; 20] = built_in_types! {
     (1184, "timestamptz", "D", true, 8, true, "d", "p", 0, ",", Support::NotRegistered),
     // FIXME(registered-types): numeric with a precision is the type that core registers, and without one it is the REAL of the engine, which does not keep all its digits. A numeric type registered in the frontend, with its INPUT, replaces this.
     (1700, "numeric", "N", false, -1, false, "i", "m", 1231, ",", Support::NotRegistered),
+    (2205, "regclass", "N", false, 4, true, "i", "p", 2210, ",", Support::Registered(&regclass::RegClass)),
     // FIXME(registered-types): uuid: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A uuid type registered in the frontend, with its INPUT, replaces this.
     (2950, "uuid", "U", false, 16, false, "c", "p", 2951, ",", Support::NotRegistered),
     // FIXME(registered-types): jsonb: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A jsonb type registered in the frontend, with its INPUT, replaces this.

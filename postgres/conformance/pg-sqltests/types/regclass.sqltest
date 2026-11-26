@@ -1,0 +1,319 @@
+# regclass is the oid of a relation. A cast from text looks the name up the
+# way the search path does, and a cast to text prints the name back.
+
+@database :memory:
+
+setup relations {
+    CREATE TABLE t (id int PRIMARY KEY, label text);
+    CREATE TABLE "Mixed Case" (id int);
+    CREATE SEQUENCE seq;
+    CREATE SCHEMA other;
+    CREATE TABLE other.t (id int);
+    CREATE TABLE other.only_there (id int);
+}
+
+@setup relations
+test regclass-gives-the-oid-of-a-table {
+    SELECT CASE WHEN 't'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 't' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')) THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+}
+
+@setup relations
+test regclass-finds-rows-by-oid {
+    SELECT count(*) FROM pg_attribute WHERE attrelid = 't'::regclass AND attnum > 0;
+}
+expect {
+    2
+}
+
+@setup relations
+test regclass-reads-a-schema-and-a-name {
+    SELECT 'public.t'::regclass::text, 'other.t'::regclass::text;
+}
+expect {
+    t|other.t
+}
+
+@setup relations
+test regclass-folds-unquoted-names-to-lowercase {
+    SELECT 'T'::regclass::text, ' public . T '::regclass::text;
+}
+expect {
+    t|t
+}
+
+@setup relations
+test regclass-keeps-the-case-of-a-quoted-name {
+    SELECT '"Mixed Case"'::regclass::text;
+}
+expect {
+    "Mixed Case"
+}
+
+@setup relations
+test regclass-finds-a-sequence {
+    SELECT 'seq'::regclass::text;
+}
+expect {
+    seq
+}
+
+@setup relations
+test regclass-prints-the-schema-of-a-relation-off-the-search-path {
+    SELECT 'other.only_there'::regclass::text;
+}
+expect {
+    other.only_there
+}
+
+@setup relations
+test regclass-follows-the-search-path {
+    SELECT set_config('search_path', 'other, public', false);
+    SELECT 't'::regclass::text, 'public.t'::regclass::text, 'only_there'::regclass::text;
+}
+expect {
+    other, public
+    t|public.t|only_there
+}
+
+@setup relations
+test regclass-reads-a-catalog-table {
+    SELECT 'pg_class'::regclass::text, 'pg_catalog.pg_class'::regclass::oid;
+}
+expect {
+    pg_class|1259
+}
+
+@setup relations
+test regclass-reads-digits-as-the-oid {
+    SELECT '1259'::regclass::text, '4294967295'::regclass::oid;
+}
+expect {
+    pg_class|4294967295
+}
+
+test regclass-reads-the-catalog-tables-that-pg_dump-asks-for {
+    SELECT 'pg_rewrite'::regclass::oid, 'pg_extension'::regclass::oid, 'pg_default_acl'::regclass::oid, 'pg_trigger'::regclass::oid, 'pg_description'::regclass::oid;
+}
+expect {
+    2618|3079|826|2620|2609
+}
+
+test regclass-prints-an-oid-with-no-relation-as-the-number {
+    SELECT 999999::regclass::text, 0::regclass::text;
+}
+expect {
+    999999|-
+}
+
+@setup relations
+test regclass-compares-as-an-oid {
+    SELECT 't'::regclass = 't'::regclass, 't'::regclass = 'other.t'::regclass;
+}
+expect {
+    t|f
+}
+
+test regclass-orders-as-an-oid {
+    SELECT 'pg_proc'::regclass < 'pg_class'::regclass, 'pg_class'::regclass = 1259::int4, 1259::int8 = 'pg_class'::regclass, 'pg_class'::regclass = 1259::oid;
+}
+expect {
+    t|t|t|t
+}
+
+test regclass-in-lists-and-ranges {
+    SELECT 'pg_class'::regclass IN (1259, 1), 'pg_class'::regclass BETWEEN 1 AND 2000, 'pg_class'::regclass = ANY (ARRAY[1259::oid]);
+}
+expect {
+    t|t|t
+}
+
+test regclass-next-to-a-negative-integer-wraps-like-an-oid {
+    SELECT 4294967295::oid::regclass = -1;
+}
+expect {
+    t
+}
+
+test regclass-reads-a-string-next-to-it-as-an-oid {
+    SELECT 'pg_class'::regclass = 'pg_class';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "pg_class"
+}
+
+test regclass-has-no-arithmetic {
+    SELECT 'pg_class'::regclass + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: regclass
+}
+
+test regclass-has-no-negation {
+    SELECT -'pg_class'::regclass;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: - regclass
+}
+
+test regclass-is-not-compared-with-a-decimal-number {
+    SELECT 'pg_class'::regclass = 1259.0;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: regclass = numeric
+}
+
+@setup relations
+test regclass-casts-to-integers {
+    SELECT 'pg_class'::regclass::int4, 'pg_class'::regclass::int8, 'pg_class'::regclass::oid;
+}
+expect {
+    1259|1259|1259
+}
+
+@setup relations
+test regclass-casts-from-integers {
+    SELECT 1259::int4::regclass::text, 1259::int8::regclass::text, 1259::oid::regclass::text;
+}
+expect {
+    pg_class|pg_class|pg_class
+}
+
+@setup relations
+test regclass-of-a-missing-relation-fails {
+    SELECT 'nosuch'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}
+
+@setup relations
+test regclass-of-a-missing-relation-in-a-schema-fails {
+    SELECT 'other.nosuch'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "other.nosuch" does not exist
+}
+
+@setup relations
+test regclass-of-a-missing-schema-fails {
+    SELECT 'nosuch.t'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch.t" does not exist
+}
+
+@setup relations
+test regclass-refuses-another-case-for-a-quoted-name {
+    SELECT '"mixed case"'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "mixed case" does not exist
+}
+
+test regclass-refuses-hex-digits {
+    SELECT '0x10'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "0x10" does not exist
+}
+
+test regclass-refuses-a-number-above-the-largest-oid {
+    SELECT '4294967296'::regclass;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+test regclass-refuses-empty-text {
+    SELECT ''::regclass;
+}
+@sqlstate 42602
+expect error {
+    invalid name syntax
+}
+
+test regclass-refuses-a-trailing-dot {
+    SELECT 't.'::regclass;
+}
+@sqlstate 42602
+expect error {
+    invalid name syntax
+}
+
+test regclass-refuses-an-unclosed-quote {
+    SELECT '"t'::regclass;
+}
+@sqlstate 42602
+expect error {
+    invalid name syntax
+}
+
+test regclass-refuses-four-names {
+    SELECT 'a.b.c.d'::regclass;
+}
+@sqlstate 42601
+expect error {
+    improper relation name
+}
+
+test regclass-refuses-another-database {
+    SELECT 'db.pg_catalog.pg_class'::regclass;
+}
+@sqlstate 0A000
+expect error {
+    cross-database references are not implemented: "db.pg_catalog.pg_class"
+}
+
+test regclass-refuses-a-cast-to-boolean {
+    SELECT 'pg_class'::regclass::boolean;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type regclass to boolean
+}
+@sqlstate 42846
+expect @tursopg error {
+    cannot cast type regclass to bool
+}
+
+test regclass-refuses-a-cast-from-a-decimal-number {
+    SELECT 1.5::regclass;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type numeric to regclass
+}
+
+@setup relations
+test regclass-column-stores-the-oid {
+    CREATE TABLE uses (r regclass);
+    INSERT INTO uses VALUES ('t'), ('other.t');
+    SELECT r::text FROM uses ORDER BY r::oid;
+}
+expect {
+    t
+    other.t
+}
+
+@setup relations
+test regclass-column-refuses-a-missing-relation {
+    CREATE TABLE uses (r regclass);
+    INSERT INTO uses VALUES ('nosuch');
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}

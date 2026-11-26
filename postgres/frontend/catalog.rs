@@ -28,7 +28,9 @@ use turso_core::{
 use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_pg_parser::quote_identifier;
-use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR, SQLSTATE_UNDEFINED_TABLE,
+};
 
 use crate::error::{sql_parse_error, sqlstate_error};
 
@@ -681,6 +683,7 @@ pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
+        "REGCLASS" => 2205,
         _ => return None,
     };
     Some(oid)
@@ -724,6 +727,215 @@ fn user_tables_with_oids(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>
         })
         .collect()
 }
+
+/// The oid of the relation that a regclass input names: a table, an index or
+/// a sequence, or a catalog table when the name is not qualified with another
+/// schema than pg_catalog. Fails with 42P01 when there is none.
+pub(crate) fn regclass_oid(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<i64> {
+    if schema.is_none_or(|schema| schema == "pg_catalog") {
+        if let Some(&(_, oid)) = CATALOG_TABLE_OIDS.iter().find(|(table, _)| *table == name) {
+            return Ok(oid);
+        }
+    }
+    if schema.is_none_or(|schema| schema == "pg_catalog") && is_catalog_view_name(name) {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("regclass of \"{name}\" is not supported: it is a view"),
+            None,
+        ));
+    }
+    let namespaces = crate::session::relation_lookup_namespaces(conn, schema);
+    for namespace in namespaces {
+        let found = conn.with_schema(namespace.database_id(), |schema| {
+            find_relation(schema, namespace.target.id, name)
+        });
+        match found {
+            RelationLookup::Oid(oid) => return Ok(oid),
+            RelationLookup::Unsupported => {
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!("regclass of \"{name}\" is not supported: only tables, indexes and sequences have an oid"),
+                    None,
+                ))
+            }
+            RelationLookup::Missing => {}
+        }
+    }
+    let written = match schema {
+        Some(schema) => format!("{schema}.{name}"),
+        None => name.to_string(),
+    };
+    Err(sqlstate_error(
+        SQLSTATE_UNDEFINED_TABLE,
+        format!("relation \"{written}\" does not exist"),
+        None,
+    ))
+}
+
+enum RelationLookup {
+    Oid(i64),
+    Unsupported,
+    Missing,
+}
+
+/// The oid that pg_class gives the relation `name` of `namespace`. A view has
+/// no row in pg_class, so it has no oid.
+fn find_relation(schema: &Schema, namespace: NamespaceId, name: &str) -> RelationLookup {
+    if namespace.is_root() {
+        return if schema.relation_kind(namespace, name).is_some() {
+            RelationLookup::Unsupported
+        } else {
+            RelationLookup::Missing
+        };
+    }
+    match class_relations(schema)
+        .into_iter()
+        .find(|relation| relation.namespace == namespace && relation.name == name)
+    {
+        Some(relation) => RelationLookup::Oid(relation.oid),
+        None if is_view_kind(schema.relation_kind(namespace, name)) => RelationLookup::Unsupported,
+        None => RelationLookup::Missing,
+    }
+}
+
+fn is_view_kind(kind: Option<RelationKind>) -> bool {
+    matches!(
+        kind,
+        Some(RelationKind::View | RelationKind::MaterializedView)
+    )
+}
+
+/// The text of the regclass value `oid`: the name of the relation, with its
+/// schema when the relation is not on the search path, or the number when no
+/// relation has that oid. 0 is `-`.
+pub(crate) fn regclass_text(conn: &Arc<Connection>, oid: i64) -> String {
+    if oid == 0 {
+        return "-".to_string();
+    }
+    if let Some(&(name, _)) = CATALOG_TABLE_OIDS
+        .iter()
+        .find(|(_, table_oid)| *table_oid == oid)
+    {
+        return name.to_string();
+    }
+    let schema = conn.current_schema();
+    let relations = class_relations(&schema);
+    let Some(relation) = relations.iter().find(|relation| relation.oid == oid) else {
+        return oid.to_string();
+    };
+    let first_visible = conn
+        .search_order()
+        .into_iter()
+        .filter(|namespace| namespace.database_id() == MAIN_DB_ID)
+        .map(|namespace| namespace.target.id)
+        .find(|namespace| {
+            relations
+                .iter()
+                .any(|other| other.namespace == *namespace && other.name == relation.name)
+        });
+    if first_visible == Some(relation.namespace) {
+        quote_identifier(&relation.name)
+    } else {
+        format!(
+            "{}.{}",
+            quote_identifier(schema_name_of(&schema, relation.namespace)),
+            quote_identifier(&relation.name)
+        )
+    }
+}
+
+/// A table, index or sequence as pg_class lists it.
+struct ClassRelation {
+    namespace: NamespaceId,
+    name: String,
+    oid: i64,
+}
+
+fn class_relations(schema: &Schema) -> Vec<ClassRelation> {
+    let tables =
+        user_tables_with_oids(schema)
+            .into_iter()
+            .filter_map(|(namespace, _, table, oid)| match table.as_ref() {
+                Table::BTree(btree) => Some(ClassRelation {
+                    namespace,
+                    name: btree.declared_name.clone(),
+                    oid,
+                }),
+                _ => None,
+            });
+    let indexes = catalog_indexes(schema)
+        .into_iter()
+        .map(|index| ClassRelation {
+            namespace: index.namespace,
+            name: index.name,
+            oid: index.oid,
+        });
+    let sequences =
+        sequence_catalog_entries(schema)
+            .into_iter()
+            .map(|(oid, namespace, sequence)| ClassRelation {
+                namespace,
+                name: sequence.name.clone(),
+                oid,
+            });
+    tables.chain(indexes).chain(sequences).collect()
+}
+
+/// The catalog tables, with the oid that PostgreSQL gives each. PostgreSQL
+/// fixes these oids, unlike those of its catalog views.
+const CATALOG_TABLE_OIDS: &[(&str, i64)] = &[
+    ("pg_am", 2601),
+    ("pg_amop", 2602),
+    ("pg_amproc", 2603),
+    ("pg_attrdef", 2604),
+    ("pg_attribute", 1249),
+    ("pg_auth_members", 1261),
+    ("pg_cast", 2605),
+    ("pg_class", 1259),
+    ("pg_collation", 3456),
+    ("pg_constraint", 2606),
+    ("pg_conversion", 2607),
+    ("pg_database", 1262),
+    ("pg_default_acl", 826),
+    ("pg_depend", 2608),
+    ("pg_description", 2609),
+    ("pg_event_trigger", 3466),
+    ("pg_extension", 3079),
+    ("pg_foreign_data_wrapper", 2328),
+    ("pg_foreign_server", 1417),
+    ("pg_foreign_table", 3118),
+    ("pg_index", 2610),
+    ("pg_inherits", 2611),
+    ("pg_init_privs", 3394),
+    ("pg_language", 2612),
+    ("pg_largeobject_metadata", 2995),
+    ("pg_namespace", 2615),
+    ("pg_opclass", 2616),
+    ("pg_operator", 2617),
+    ("pg_opfamily", 2753),
+    ("pg_partitioned_table", 3350),
+    ("pg_policy", 3256),
+    ("pg_proc", 1255),
+    ("pg_publication", 6104),
+    ("pg_publication_namespace", 6237),
+    ("pg_publication_rel", 6106),
+    ("pg_range", 3541),
+    ("pg_rewrite", 2618),
+    ("pg_sequence", 2224),
+    ("pg_subscription", 6100),
+    ("pg_tablespace", 1213),
+    ("pg_transform", 3576),
+    ("pg_trigger", 2620),
+    ("pg_ts_config", 3602),
+    ("pg_ts_dict", 3600),
+    ("pg_ts_parser", 3601),
+    ("pg_ts_template", 3764),
+    ("pg_type", 1247),
+];
 
 /// Build a mapping from namespace and table name to OID for all user tables.
 fn table_oid_map(schema: &Schema) -> HashMap<(NamespaceId, String), i64> {

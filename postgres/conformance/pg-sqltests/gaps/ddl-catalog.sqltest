@@ -250,15 +250,11 @@ expect {
 
 # E-19: 't'::regclass resolves
 @setup t_id
-@compat-gap "type:regclass"
 test t-regclass-resolves {
     SELECT 't'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 't');
 }
 expect {
     t
-}
-expect @tursopg {
-    f
 }
 
 # E-20: view in pg_class relkind v
@@ -1088,16 +1084,11 @@ expect @tursopg {
 }
 
 # E-105: regclass cast of an unknown name
-# Fails because every regclass cast returns 0, see E-19.
-@compat-gap "type:regclass"
 test regclass-cast-of-an-unknown-name {
     SELECT 'nosuch'::regclass;
 }
 @sqlstate 42P01
 expect error {}
-expect @tursopg {
-    0
-}
 
 # E-106: pg_class row level security flags
 test pg-class-row-level-security-flags {
