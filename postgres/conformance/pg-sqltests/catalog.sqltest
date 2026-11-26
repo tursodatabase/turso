@@ -2745,6 +2745,15 @@ expect error {
     relation "zz_rn_view" already exists
 }
 
+test a-repeated-type-name-is-a-duplicate-object {
+    CREATE TYPE zz_twice AS ENUM ('a');
+    CREATE DOMAIN zz_twice AS int;
+}
+@sqlstate 42710
+expect error {
+    type "?zz_twice"? already exists
+}
+
 test constraint-oids-are-not-relation-oids {
     CREATE TABLE zz_con_t (a int PRIMARY KEY, b int UNIQUE);
     CREATE TABLE zz_con_u (a int);

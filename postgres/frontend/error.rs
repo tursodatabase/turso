@@ -384,8 +384,8 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
 /// come first, because their messages end with the error that the dependent
 /// object gives, for example "no such column". A duplicate object is checked
 /// before the "no such ..." rules, because its name sits inside the message, for
-/// example a table named "no such table". A role is not a relation, so a
-/// duplicate role has its own SQLSTATE.
+/// example a table named "no such table". A role or a type is not a
+/// relation, so a duplicate role or type has its own SQLSTATE.
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
@@ -403,7 +403,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_PARAMETER_VALUE
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
-    } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
+    } else if (msg.starts_with("role \"") || msg.starts_with("type "))
+        && msg.ends_with(" already exists")
+    {
         SQLSTATE_DUPLICATE_OBJECT
     } else if msg.contains("no such table")
         || msg.starts_with("no such view")
@@ -487,14 +489,13 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
 /// start and can end with ` already exists` when the column name does, so it
 /// is excluded.
 fn is_duplicate_object_error(msg: &str) -> bool {
-    const KINDS: [&str; 8] = [
+    const KINDS: [&str; 7] = [
         "table ",
         "view ",
         "View ",
         "index ",
         "trigger ",
         "schema ",
-        "type ",
         "sequence ",
     ];
     msg.ends_with(" already exists")
@@ -710,6 +711,8 @@ mod tests {
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
             ("role \"r\" already exists", SQLSTATE_DUPLICATE_OBJECT),
+            ("type t already exists", SQLSTATE_DUPLICATE_OBJECT),
+            ("type no such table already exists", SQLSTATE_DUPLICATE_OBJECT),
             (
                 "role \"no such table\" already exists",
                 SQLSTATE_DUPLICATE_OBJECT,
