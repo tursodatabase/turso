@@ -372,13 +372,6 @@ fn emit_compound_select(
             jump_if_null: false,
         });
     }
-    let mut right_most_ctx = TranslateCtx::new_boxed(
-        program,
-        resolver.fork_with_expr_cache(),
-        right_most.table_references.joined_tables().len(),
-        false,
-    );
-    right_most_ctx.reg_result_cols_start = reg_result_cols_start;
     match left.split_last_mut() {
         Some(((plan, operator), left)) => match operator {
             CompoundOperator::UnionAll => {
@@ -411,26 +404,18 @@ fn emit_compound_select(
                         target_pc: label_next_select,
                         jump_if_null: true,
                     });
-                    right_most.limit.clone_from(limit);
-                    right_most_ctx.limit_ctx = Some(limit_ctx);
                 }
-                if offset_reg.is_some() {
-                    right_most.offset.clone_from(offset);
-                    right_most_ctx.reg_offset = offset_reg;
-                }
-
-                emit_explain!(
+                emit_compound_term(
                     program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::UnionAll,
-                        temp_btree: false,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
+                    right_most,
+                    EqpCompoundOp::UnionAll,
+                    limit,
+                    offset,
+                    resolver,
+                    limit_ctx,
+                    offset_reg,
+                    reg_result_cols_start,
+                )?;
                 program.preassign_label_to_next_insn(label_next_select);
             }
             CompoundOperator::Union => {
@@ -474,19 +459,17 @@ fn emit_compound_select(
                     affinity_str,
                     is_delete: false,
                 };
-
-                emit_explain!(
+                emit_compound_term(
                     program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::Union,
-                        temp_btree: true,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
+                    right_most,
+                    EqpCompoundOp::Union,
+                    limit,
+                    offset,
+                    resolver,
+                    None,
+                    None,
+                    reg_result_cols_start,
+                )?;
 
                 if new_dedupe_index {
                     read_deduplicated_union_or_except_rows(
@@ -535,19 +518,17 @@ fn emit_compound_select(
                     None,
                     reg_result_cols_start,
                 )?;
-
-                emit_explain!(
+                emit_compound_term(
                     program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::Intersect,
-                        temp_btree: true,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
+                    right_most,
+                    EqpCompoundOp::Intersect,
+                    limit,
+                    offset,
+                    resolver,
+                    None,
+                    None,
+                    reg_result_cols_start,
+                )?;
                 read_intersect_rows(
                     program,
                     left_cursor_id,
@@ -595,18 +576,17 @@ fn emit_compound_select(
                     affinity_str: None,
                     is_delete: true,
                 };
-                emit_explain!(
+                emit_compound_term(
                     program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::Except,
-                        temp_btree: true,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
+                    right_most,
+                    EqpCompoundOp::Except,
+                    limit,
+                    offset,
+                    resolver,
+                    None,
+                    None,
+                    reg_result_cols_start,
+                )?;
                 if new_index {
                     read_deduplicated_union_or_except_rows(
                         program,
@@ -621,31 +601,66 @@ fn emit_compound_select(
             }
         },
         None => {
-            if let Some(limit_ctx) = limit_ctx {
-                right_most_ctx.limit_ctx = Some(limit_ctx);
-                right_most.limit.clone_from(limit);
-            }
-            if offset_reg.is_some() {
-                right_most.offset.clone_from(offset);
-                right_most_ctx.reg_offset = offset_reg;
-            }
-            emit_explain!(
+            emit_compound_term(
                 program,
-                true,
-                EqpDetail::CompoundArm {
-                    op: EqpCompoundOp::LeftMost,
-                    temp_btree: false,
-                }
-            );
-            right_most_ctx.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-            emit_query(program, right_most, &mut right_most_ctx)?;
-            program.pop_current_parent_explain();
+                right_most,
+                EqpCompoundOp::LeftMost,
+                limit,
+                offset,
+                resolver,
+                limit_ctx,
+                offset_reg,
+                reg_result_cols_start,
+            )?;
         }
     }
 
     program.preassign_label_to_next_insn(compound_select_end);
 
+    Ok(())
+}
+
+/// Emits the query of one term of a compound SELECT. `limit_ctx` and `offset_reg` are the
+/// LIMIT and OFFSET of the compound when the term applies them itself.
+#[allow(clippy::too_many_arguments)]
+fn emit_compound_term(
+    program: &mut ProgramBuilder,
+    term: &mut SelectPlan,
+    op: EqpCompoundOp,
+    limit: &Option<Box<Expr>>,
+    offset: &Option<Box<Expr>>,
+    resolver: &Resolver,
+    limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
+    reg_result_cols_start: Option<usize>,
+) -> crate::Result<()> {
+    let mut term_ctx = TranslateCtx::new_boxed(
+        program,
+        resolver.fork_with_expr_cache(),
+        term.table_references.joined_tables().len(),
+        false,
+    );
+    term_ctx.reg_result_cols_start = reg_result_cols_start;
+    if let Some(limit_ctx) = limit_ctx {
+        term_ctx.limit_ctx = Some(limit_ctx);
+        term.limit.clone_from(limit);
+    }
+    if offset_reg.is_some() {
+        term.offset.clone_from(offset);
+        term_ctx.reg_offset = offset_reg;
+    }
+    emit_explain!(
+        program,
+        true,
+        EqpDetail::CompoundArm {
+            op,
+            temp_btree: !matches!(op, EqpCompoundOp::UnionAll | EqpCompoundOp::LeftMost),
+        }
+    );
+    term_ctx.materialized_build_inputs =
+        emit_materialized_build_inputs(program, &term_ctx.resolver, term)?;
+    emit_query(program, term, &mut term_ctx)?;
+    program.pop_current_parent_explain();
     Ok(())
 }
 
