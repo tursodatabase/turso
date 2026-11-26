@@ -396,6 +396,7 @@ pub struct AlterColumn<'a> {
     pub old_name: &'a str,
     pub written_old_name: &'a str,
     pub definition: &'a ast::ColumnDefinition,
+    pub statement: &'a str,
 }
 
 /// A table that gets a new last column. `table` is the table with it.
