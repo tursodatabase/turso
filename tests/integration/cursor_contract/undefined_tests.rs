@@ -206,6 +206,18 @@ table_case!(
     [Op::Last(0), Op::Next(0)]
 );
 table_case!(
+    known_bug_u1_prev_after_seek_rowid_hit,
+    "U1",
+    1,
+    [Op::SeekRowid(0, 20), Op::Prev(0)]
+);
+table_case!(
+    known_bug_u1_prev_after_not_exists_hit,
+    "U1",
+    1,
+    [Op::NotExists(0, 20), Op::Prev(0)]
+);
+table_case!(
     known_bug_u1_prev_after_next,
     "U1",
     1,

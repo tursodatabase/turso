@@ -162,7 +162,7 @@ engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 
 | Id | Undefined sequence | Decision |
 |---|---|---|
-| U1 | `Next` without a forward position, or `Prev` without a backward one (`Rewind` then `Prev`, `Last` then `Next`, `Next` then `Prev`) | D3 |
+| U1 | `Next` without a forward position, or `Prev` without a backward one (`Rewind` then `Prev`, `Last` then `Next`, `Next` then `Prev`). Also `Prev` after a `SeekRowid` or `NotExists` hit: only `Next` may follow it, and a backward scan starts with `Last`, `SeekLE` or `SeekLT` | D3 |
 | U2 | `Next` or `Prev` from a position that has no direction: after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete` | section 1 |
 | U3 | After `NullRow`: `Next`, `Prev`, `Insert`, `IdxInsert`, `Delete`, `Count`, `NewRowid` | section 2 |
 | U4 | `Delete` with no entry under the cursor: fresh cursor, scan ended, failed seek | D4 |
