@@ -215,30 +215,6 @@ impl<'a> CursorWorkRef<'a> {
             counter.store(0, Ordering::Relaxed);
         }
     }
-
-    /// Sets one counter to zero. Ignores a counter that is not cursor work.
-    pub(crate) fn reset_counter(self, counter: crate::statement::StatementStatusCounter) {
-        use crate::statement::StatementStatusCounter as C;
-        #[cfg(debug_assertions)]
-        let counter = match counter {
-            C::MvccEntriesExamined => &self.counters.mvcc_entries_examined,
-            C::BtreeRowsExamined => &self.counters.btree_rows_examined,
-            C::MvccSeeks => &self.counters.mvcc_seeks,
-            C::BtreeSeeks => &self.counters.btree_seeks,
-            C::VisibilityChecks => &self.counters.visibility_checks,
-            C::FullscanStep
-            | C::Sort
-            | C::VmStep
-            | C::Reprepare
-            | C::Run
-            | C::RowsRead
-            | C::RowsWritten => return,
-        };
-        #[cfg(debug_assertions)]
-        counter.store(0, Ordering::Relaxed);
-        #[cfg(not(debug_assertions))]
-        let _: C = counter;
-    }
 }
 
 /// Hash join spill/probe metrics.

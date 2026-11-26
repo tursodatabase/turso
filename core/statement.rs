@@ -85,18 +85,6 @@ pub enum StatementStatusCounter {
     Run,
     RowsRead,
     RowsWritten,
-    /// Raw MvStore entries that MVCC cursors looked at. See [`crate::vdbe::metrics::CursorWork`].
-    /// This counter and the four after it are counted in debug builds only; they are zero
-    /// in release builds.
-    MvccEntriesExamined,
-    /// Raw B-tree rows that MVCC cursors looked at.
-    BtreeRowsExamined,
-    /// Positionings of MvStore iterators by MVCC cursors.
-    MvccSeeks,
-    /// Root-to-leaf positionings of the B-tree cursors inside MVCC cursors.
-    BtreeSeeks,
-    /// Visibility decisions of MVCC cursors.
-    VisibilityChecks,
 }
 
 impl StatementOrigin {
@@ -509,13 +497,6 @@ impl Statement {
             StatementStatusCounter::Run => metrics.runs,
             StatementStatusCounter::RowsRead => metrics.rows_read,
             StatementStatusCounter::RowsWritten => metrics.rows_written,
-            StatementStatusCounter::MvccEntriesExamined => {
-                metrics.cursor_work.mvcc_entries_examined
-            }
-            StatementStatusCounter::BtreeRowsExamined => metrics.cursor_work.btree_rows_examined,
-            StatementStatusCounter::MvccSeeks => metrics.cursor_work.mvcc_seeks,
-            StatementStatusCounter::BtreeSeeks => metrics.cursor_work.btree_seeks,
-            StatementStatusCounter::VisibilityChecks => metrics.cursor_work.visibility_checks,
         }
     }
 

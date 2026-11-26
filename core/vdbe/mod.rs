@@ -1801,13 +1801,6 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::Run => self.metrics.runs = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
-            crate::statement::StatementStatusCounter::MvccEntriesExamined
-            | crate::statement::StatementStatusCounter::BtreeRowsExamined
-            | crate::statement::StatementStatusCounter::MvccSeeks
-            | crate::statement::StatementStatusCounter::BtreeSeeks
-            | crate::statement::StatementStatusCounter::VisibilityChecks => {
-                cursor_work(&self.cursor_work).reset_counter(counter)
-            }
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_stmt_status(counter);
