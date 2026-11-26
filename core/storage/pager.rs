@@ -38,7 +38,6 @@ use crate::{
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use tracing::{instrument, trace, Level};
 
 use super::btree::offset::{
@@ -1709,8 +1708,9 @@ pub struct Pager {
     /// `cache_insert` has not yet succeeded because the cache was full and we
     /// yielded waiting for a spill to complete. The next call to
     /// `read_page_nonblock(idx)` reuses the stored `(page, disk_read)` pair
-    /// instead of issuing a duplicate disk read.
-    pending_reads: RwLock<HashMap<i64, PendingRead>>,
+    /// instead of issuing a duplicate disk read. Each read from disk adds and
+    /// removes an entry, so the map hashes with FxHash, not SipHash.
+    pending_reads: RwLock<rustc_hash::FxHashMap<i64, PendingRead>>,
     /// True while `pending_reads` may hold an entry. Set before an entry is
     /// added and cleared after the last one is removed, both under the write
     /// lock, so a reader that sees false can skip the lock: every page read
@@ -2028,7 +2028,7 @@ impl Pager {
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
-            pending_reads: RwLock::new(HashMap::new()),
+            pending_reads: RwLock::new(rustc_hash::FxHashMap::default()),
             has_pending_reads: AtomicBool::new(false),
             #[cfg(any(test, feature = "test_helper"))]
             spill_yield: SpillYieldHook::new(),
