@@ -28,8 +28,9 @@ Run the `export` lines it prints: `PATH`, so `scripts/diff.sh` uses our sqlite3 
 - Reproduce the bug on `main` (for a `main` build next to your branch: `git worktree add ../turso-main origin/main`):
   - SQLite frontend: `scripts/diff.sh "SQL"` runs the SQL in `sqlite3` and `tursodb` and prints PASS, or FAIL with a diff.
   - PostgreSQL frontend: `psql "$PG_DSN" -c "SQL"` and `cargo run -q -p tursopg -- :memory: "SQL"`.
-- Do not answer from what you remember SQLite or PostgreSQL does. Run it. A different error message is not always a bug. A different result is.
-- Read their source for the behaviour (`--sources` above; SQLite: `src/`, PostgreSQL: `src/backend/`). Find how it stores and converts the value. Do the same, not a different way that gives the same output on your example.
+- Do not answer from what you remember SQLite or PostgreSQL does. Run it. Different wording of an error is not a bug. A different result is, and so is a different error class: on the PostgreSQL frontend the SQLSTATE is part of the result, and an error where SQLite or PostgreSQL succeeds, or the reverse, is a wrong result.
+- Read their source for the behaviour (`--sources` above; SQLite: `src/`, PostgreSQL: `src/backend/`). Find the function that does this. Put your fix at the matching place in Turso, in the same layer, not wherever your example happens to pass through, and not a different way that gives the same output on your example.
+- Where SQLite and PostgreSQL have no equivalent (sync, MVCC, CDC, encryption, the CLI), the reference is what the feature promises: the remote database after a pull, the same rows as without MVCC, `main`'s output. Test sequences of operations (a change, then a rename, a drop, a second pull), not single statements.
 - If neither SQLite, PostgreSQL nor current Turso behaviour decides the answer, stop and ask the user. With no user to ask, leave it unfixed and say so in the PR. Do not decide it inside a fix.
 
 ## 2. The fix and its test
@@ -37,11 +38,12 @@ Run the `export` lines it prints: `PATH`, so `scripts/diff.sh` uses our sqlite3 
 - Fix the bug for every input, not only the reported query. Find every input that breaks the same rule: other statement types (INSERT, UPDATE, DELETE, UPSERT), other query shapes (joins, subqueries, ORDER BY, GROUP BY, indexes, views, triggers), and the other callers of each function you change (`rg` for them).
 - Fix the other defects in the same feature (the same function, cast or statement) in the same PR if the risk is low.
 - If one rule is checked in many places, move it to the one place that should decide it. A check that every new caller must remember will be missed.
+- If your change adds data or a function that must stay in step with another (a list kept beside the struct it describes, a `_mut` twin of a reader, a match that repeats another's arms), merge them so one source answers. Two copies that must agree will drift.
 - Before you write a helper, type or constant, search for code that already does the job, by what it does, not only by name. Reuse it or extend it. Delete the code you replace.
 - Keep the scope to the bug. PostgreSQL-only behaviour goes in `postgres/`, not in `core`. A fix for a rare case must not change code that every query runs through.
 - If a value is already wrong when it reaches your code, fix the code that produces it, not the code that reads it.
-- Do not change an existing test's expected output to make it pass, unless SQLite or PostgreSQL gives the new output. Show that output in the PR.
-- Write the test with the fix. Then prove that it fails without the fix: revert only the non-test change, run the test, see it fail, restore the change, see it pass. Use `.sqltest` files where you can (the `testing` skill says how to run them). A test that passes on `main` does not test this change.
+- Weaken no existing check: no changed expected output, removed or relaxed assertion, ignored test, allowed lint, swallowed error, or error the simulator or fuzzer now accepts. If an old check is wrong, prove it with SQLite or PostgreSQL output, or a seed, and show that in the PR.
+- Write the test with the fix. Then prove that it fails without the fix: revert the non-test change, run the test, see it fail, restore the change, see it pass. Then break each part of the fix on its own (revert one hunk, or skip one call site) and run the tests. For each part, some test must fail. If no test notices a part, add a test for it or delete the part. Use `.sqltest` files where you can (the `testing` skill says how to run them). A test that passes on `main` does not test this change.
 - The test uses the reported input, or a smaller input that still fails the same way.
 
 ## 3. Risk check (full pass only)
@@ -79,9 +81,9 @@ Check each failure it reports by running its commands yourself. A failure that `
   - Does any comment say what the code does, instead of why? Delete it or fix it.
   - Does a skip, a catch-all or a default value hide a case the change knows is wrong?
 - Run what CI runs for the crates you changed, with the same flags (`.github/workflows/`): `cargo fmt`, clippy, and the tests near your change. Once, on the final tree (the fail-without-the-fix run in step 2 is separate).
+- Re-read the PR description against the final diff. Delete every claim about a part the diff no longer has.
 - In the PR description:
   - state what you ran and what it printed. Do not call the change correct, safe or complete; the reviewer judges that from the evidence.
   - the test's failure on `main` (the command and the failing line of output);
-  - the inputs you tried from step 2 and what each gave on your branch and on SQLite or PostgreSQL;
   - on a full pass, which risk areas from step 3 you checked, and which you could not and why;
   - the weakest part of the change in one sentence: the input you are least sure of, the risk you could not check, or the choice a reviewer might dispute.
