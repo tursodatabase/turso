@@ -4,7 +4,7 @@
 use crate::casts::{resolve, wraps_negative_integers, CastType};
 use crate::catalog::{pg_type_category, pg_type_name, pg_type_oid};
 use crate::error::sqlstate_error;
-use crate::functions::{format_type, undefined_operator_of, validate_pg_input};
+use crate::functions::{format_builtin_type, undefined_operator_of, validate_pg_input};
 use crate::pg_type::{built_in_type, IntegerOperator, IntegerType};
 use turso_core::ast;
 use turso_core::dialect::{
@@ -533,7 +533,7 @@ fn check_operator(op: &str, types: &[Option<i64>]) -> Result<()> {
     let names: Vec<String> = types
         .iter()
         .map(|ty| match ty {
-            Some(oid) => format_type(*oid, -1),
+            Some(oid) => format_builtin_type(*oid),
             None => "unknown".to_string(),
         })
         .collect();

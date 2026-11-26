@@ -4,7 +4,7 @@
 
 use crate::casts::{convert, resolve, CastType, CastType::*, Resolution};
 use crate::error::sqlstate_error;
-use crate::functions::format_type;
+use crate::functions::format_builtin_type;
 use turso_core::ast;
 use turso_core::dialect::{CastContext, CastDecision, CastSource, TypeIdentity, TypeRef};
 use turso_core::{DialectError, LimboError, Register, Result, Value};
@@ -50,8 +50,8 @@ pub(crate) fn check_column_default(
         code: SQLSTATE_DATATYPE_MISMATCH,
         message: format!(
             "column \"{column_name}\" is of type {} but default expression is of type {}",
-            format_type(type_oid(column_type.name()), -1),
-            format_type(type_oid(cast.source.name()), -1),
+            format_builtin_type(type_oid(column_type.name())),
+            format_builtin_type(type_oid(cast.source.name())),
         ),
         detail: None,
         hint: Some("You will need to rewrite or cast the expression.".to_string()),

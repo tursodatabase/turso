@@ -404,6 +404,36 @@ expect {
     invalid input syntax for type date: "zzz"|22007
 }
 
+test pg-input-error-info-integer-beyond-bigint {
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999', 'integer');
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999', 'smallint');
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999999999999999999999999', 'bigint');
+    SELECT message, sql_error_code FROM pg_input_error_info('1x', 'integer');
+    SELECT count(*) FROM pg_input_error_info(' -12 ', 'int4') WHERE message IS NULL;
+}
+expect {
+    value "99999999999999999999" is out of range for type integer|22003
+    value "99999999999999999999" is out of range for type smallint|22003
+    value "99999999999999999999999999999999999999999" is out of range for type bigint|22003
+    invalid input syntax for type integer: "1x"|22P02
+    1
+}
+
+test pg-input-is-valid-integer-prefixes-and-underscores {
+    SELECT pg_input_is_valid('0x_ff', 'int4'), pg_input_is_valid('-0x8000_0000', 'int4'),
+           pg_input_is_valid('0O17', 'int2'), pg_input_is_valid('_1', 'int4'),
+           pg_input_is_valid('1_', 'int4'), pg_input_is_valid('1__0', 'int8'),
+           pg_input_is_valid('0x', 'int4'), pg_input_is_valid('0b2', 'int4'),
+           pg_input_is_valid('-0x8000000000000000', 'int8');
+    SELECT message, sql_error_code FROM pg_input_error_info('0x8000_0000', 'integer');
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999_', 'bigint');
+}
+expect {
+    t|t|t|f|f|f|f|f|t
+    value "0x8000_0000" is out of range for type integer|22003
+    value "99999999999999999999_" is out of range for type bigint|22003
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }
@@ -1162,6 +1192,88 @@ expect {
     integer[]
     text[]
     character varying(50)
+}
+
+test format-type-names-domains-and-enums {
+    CREATE DOMAIN dint AS int;
+    CREATE TYPE mood AS ENUM ('a');
+    SELECT typname, typtype, format_type(oid, NULL), format_type(oid, 3)
+    FROM pg_type WHERE typname IN ('dint', 'mood') ORDER BY typname;
+}
+expect {
+    dint|d|dint|dint(3)
+    mood|e|mood|mood(3)
+}
+
+test format-type-names-array-types-by-element {
+    SELECT typname, format_type(oid, NULL) FROM pg_type
+    WHERE typname IN ('_varchar', '_int4', '_numeric', '_json') ORDER BY typname;
+    SELECT format_type(1015, 14), format_type(1231, 655366), format_type(1014, -1),
+           format_type(1002, NULL), format_type(1183, 3), format_type(2211, NULL);
+}
+expect {
+    _int4|integer[]
+    _json|json[]
+    _numeric|numeric[]
+    _varchar|character varying[]
+    character varying(10)[]|numeric(10,2)[]|bpchar[]|"char"[]|time(3) without time zone[]|regtype[]
+}
+
+test format-type-unknown-and-invalid-oids {
+    SELECT format_type(999999, NULL), format_type(0, NULL), format_type(19, NULL);
+}
+expect {
+    ???|-|name
+}
+
+test format-type-typmods {
+    SELECT format_type(1042, NULL), format_type(1042, -1), format_type(1042, 9),
+           format_type(1114, 3), format_type(1184, 0), format_type(1083, 2),
+           format_type(1700, 4), format_type(1700, 655363), format_type(25, 5),
+           format_type(1043, '9'), format_type(1043, ' 9 ');
+}
+expect {
+    character|bpchar|character(5)|timestamp(3) without time zone|timestamp(0) with time zone|time(2) without time zone|numeric(0,0)|numeric(9,-1)|text(5)|character varying(5)|character varying(5)
+}
+
+test format-type-interval-typmods {
+    SELECT format_type(1186, 2147418115), format_type(1187, 196607), format_type(1186, 458751),
+           format_type(1186, 469827583), format_type(1186, -1), format_type(1186, 2147418112);
+}
+expect {
+    interval(3)|interval month[]|interval year to month|interval hour to second|interval|interval(0)
+}
+
+test format-type-invalid-interval-typmod {
+    SELECT format_type(1186, 5);
+}
+@sqlstate XX000
+expect error {
+    invalid INTERVAL typmod: 0x5
+}
+
+test format-type-text-typmod-with-prefix-and-underscores {
+    SELECT format_type(1043, '0x10'), format_type(1043, ' 1_6 '), format_type(1043, '0o20'),
+           format_type(1043, '+0B1_0000');
+}
+expect {
+    character varying(12)|character varying(12)|character varying(12)|character varying(12)
+}
+
+test format-type-text-typmod-not-an-integer {
+    SELECT format_type(1043, 'abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "abc"
+}
+
+test format-type-text-typmod-out-of-range {
+    SELECT format_type(1043, '3000000000');
+}
+@sqlstate 22003
+expect error {
+    value "3000000000" is out of range for type integer
 }
 
 test pg-type-is-visible {
