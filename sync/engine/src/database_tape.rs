@@ -4089,6 +4089,37 @@ mod tests {
     }
 
     /// A CREATE TABLE replay onto an existing table changes the generated
+    /// column `next`, which `twice` uses, so the replay must drop `twice` and
+    /// add it again at the end. `note` comes after `twice`, so that changes the
+    /// column order. The replay must fail instead.
+    #[test]
+    pub fn test_create_table_replay_keeps_column_order_around_changed_generated_column() {
+        let error = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, next INT AS (a + 1), twice INT AS (next * 2), note TEXT)",
+                "INSERT INTO t (id, a, note) VALUES (1, 10, 'x')",
+            ],
+            vec![DatabaseTapeOperation::SchemaReplay(
+                DatabaseSchemaReplay::Create {
+                    sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, next INT AS (a + 2), twice INT AS (next * 2), note TEXT)"
+                        .to_string(),
+                },
+            )],
+            "SELECT * FROM t",
+        )
+        .unwrap_err();
+        let crate::errors::Error::DatabaseTapeError(message) = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(
+            message.contains(
+                "the generated columns twice of table t use a dropped column, but they are not the last columns of the remote table"
+            ),
+            "{message}"
+        );
+    }
+
+    /// A CREATE TABLE replay onto an existing table changes the generated
     /// column `next`, which `twice` uses. Both are the last columns, so the
     /// replay drops `twice` first and adds both again in the same order.
     #[test]
