@@ -618,6 +618,9 @@ fn translate_statement<'a>(
         } => {
             reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, true)?;
         }
+        ast::Stmt::DropIndex { idx_name, .. } => {
+            reject_drop_of_foreign_key_index(&pg_conn.conn, idx_name)?
+        }
         _ => {}
     }
     Ok(Translation::Translated(Box::new(TranslatedStatement {
@@ -1822,6 +1825,53 @@ fn reject_removal_of_referenced_table(
             None,
         )
     })
+}
+
+/// Rejects DROP INDEX of the unique index that a foreign key uses to find its
+/// parent row, like PostgreSQL. Core would instead fail every later write
+/// that checks the foreign key with "foreign key mismatch".
+fn reject_drop_of_foreign_key_index(
+    conn: &Arc<Connection>,
+    idx_name: &ast::QualifiedName,
+) -> Result<()> {
+    let schema_name = idx_name.namespace.as_ref().map(|name| name.as_str());
+    let name = idx_name.name.as_str();
+    let schema = conn.current_schema();
+    let Some((namespace, index)) = relation_lookup_namespaces(conn, schema_name)
+        .into_iter()
+        .filter(|candidate| candidate.database_id() == turso_core::MAIN_DB_ID)
+        .find_map(|candidate| {
+            let namespace = candidate.target.id;
+            let index = schema
+                .indexes(namespace)
+                .find(|index| index.name.eq_ignore_ascii_case(name))?;
+            Some((namespace, Arc::clone(index)))
+        })
+    else {
+        return Ok(());
+    };
+    let used_by_foreign_key = schema
+        .resolved_fks_referencing(namespace, &index.table_name)?
+        .iter()
+        .any(|fk_ref| {
+            fk_ref
+                .parent_unique_index
+                .as_ref()
+                .is_some_and(|parent_index| Arc::ptr_eq(parent_index, &index))
+        });
+    if !used_by_foreign_key {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+        match schema_name {
+            Some(schema_name) if !namespace.is_root() => {
+                format!("cannot drop index {schema_name}.{name} because other objects depend on it")
+            }
+            _ => format!("cannot drop index {name} because other objects depend on it"),
+        },
+        None,
+    ))
 }
 
 /// The B-tree table `tbl_name` and its namespace, if it is in the main

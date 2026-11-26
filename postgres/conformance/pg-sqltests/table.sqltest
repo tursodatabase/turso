@@ -1591,6 +1591,40 @@ expect error {
     cannot drop table fkd_s.p because other objects depend on it
 }
 
+test fk-drop-referenced-unique-index-rejected {
+    CREATE TABLE fki_p (id int, u int);
+    CREATE UNIQUE INDEX fki_pu ON fki_p (u);
+    CREATE TABLE fki_c (pid int REFERENCES fki_p (u));
+    DROP INDEX fki_pu;
+}
+expect error {
+    cannot drop index fki_pu because other objects depend on it
+}
+
+test fk-drop-referenced-unique-index-in-schema-rejected {
+    CREATE SCHEMA fki_s;
+    CREATE TABLE fki_s.p (id int, u int);
+    CREATE UNIQUE INDEX pu ON fki_s.p (u);
+    CREATE TABLE fki_s.c (pid int REFERENCES fki_s.p (u));
+    DROP INDEX fki_s.pu;
+}
+expect error {
+    cannot drop index fki_s.pu because other objects depend on it
+}
+
+test fk-drop-index-not-used-by-foreign-key {
+    CREATE TABLE fkin_p (id int PRIMARY KEY, u int);
+    CREATE UNIQUE INDEX fkin_pu ON fkin_p (u);
+    CREATE TABLE fkin_c (pid int REFERENCES fkin_p (id));
+    DROP INDEX fkin_pu;
+    INSERT INTO fkin_p VALUES (1, 1);
+    INSERT INTO fkin_c VALUES (1);
+    SELECT pid FROM fkin_c;
+}
+expect {
+    1
+}
+
 test fk-truncate-referenced-table-rejected {
     CREATE TABLE fkt_p (id int PRIMARY KEY);
     CREATE TABLE fkt_c (pid int REFERENCES fkt_p (id) ON DELETE CASCADE);
