@@ -1,10 +1,11 @@
 use crate::alloc::StatementAllocationSite;
 use crate::ast::{self, Expr, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{BTreeTable, Column, Trigger};
-use crate::sync::Arc;
+use crate::schema::{BTreeTable, Column, ForeignKey, Trigger};
+use crate::sync::{Arc, OnceLock, Weak};
 use crate::translate::collate::column_collation;
 use crate::translate::expr::WalkControl;
+use crate::translate::fkeys::FkActionParentChange;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
 };
@@ -19,10 +20,11 @@ use crate::translate::{
 use crate::util::normalize_ident;
 use crate::vdbe::builder::DmlRowForm;
 use crate::vdbe::insn::{Insn, Subprogram};
-use crate::vdbe::BranchOffset;
+use crate::vdbe::{BranchOffset, PreparedProgram};
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
+use std::rc::Rc;
 
 /// Context for trigger execution
 #[derive(Debug)]
@@ -144,6 +146,116 @@ impl ParamAllocator {
     /// Total number of parameters allocated so far.
     fn num_params(&self) -> usize {
         self.next_param - 1
+    }
+}
+
+/// The foreign-key action subprograms compiled so far for the statement being
+/// compiled.
+///
+/// Like SQLite's `getRowTrigger`, which also compiles foreign-key actions, a
+/// statement compiles each subprogram once and calls it from every place it
+/// fires, including places inside other subprograms. Compiling a copy at every
+/// place makes the statement grow exponentially with the number of foreign-key
+/// actions that fire each other.
+///
+/// This is shared with forked resolvers, because UPDATE and DELETE fire their
+/// foreign-key actions through a forked resolver.
+#[derive(Clone, Default)]
+pub(super) struct CompiledSubprograms(Rc<RefCell<Vec<CompiledSubprogram>>>);
+
+/// One compiled, or still compiling, subprogram.
+struct CompiledSubprogram {
+    key: SubprogramKey,
+    /// `Subprogram::Pending` while it is being compiled. A subprogram that
+    /// fires itself again calls the pending program.
+    program: Subprogram,
+}
+
+/// What a subprogram runs. A statement compiles one subprogram for each key.
+pub(super) enum SubprogramKey {
+    FkAction {
+        foreign_key: Arc<ForeignKey>,
+        parent_change: FkActionParentChange,
+    },
+}
+
+impl SubprogramKey {
+    fn is_same(&self, other: &SubprogramKey) -> bool {
+        match (self, other) {
+            (
+                Self::FkAction {
+                    foreign_key,
+                    parent_change,
+                },
+                Self::FkAction {
+                    foreign_key: other_foreign_key,
+                    parent_change: other_parent_change,
+                },
+            ) => {
+                Arc::ptr_eq(foreign_key, other_foreign_key) && parent_change == other_parent_change
+            }
+        }
+    }
+}
+
+impl CompiledSubprograms {
+    /// The subprogram for `key`, if the statement has compiled it or is
+    /// compiling it.
+    pub(super) fn find(&self, key: &SubprogramKey) -> Option<Subprogram> {
+        self.0
+            .borrow()
+            .iter()
+            .find(|entry| entry.key.is_same(key))
+            .map(|entry| entry.program.clone())
+    }
+
+    /// Add a pending subprogram for `key`, to be filled by
+    /// `PendingSubprogram::finish` when its compilation ends.
+    pub(super) fn start(&self, key: SubprogramKey) -> PendingSubprogram {
+        let slot = Arc::new(OnceLock::new());
+        let mut entries = self.0.borrow_mut();
+        let index = entries.len();
+        entries.push(CompiledSubprogram {
+            key,
+            program: Subprogram::Pending(slot.clone()),
+        });
+        PendingSubprogram {
+            subprograms: self.clone(),
+            index,
+            slot,
+        }
+    }
+}
+
+/// A subprogram in `CompiledSubprograms` that is being compiled.
+///
+/// Dropping it before `finish`, when compilation fails, removes it and every
+/// subprogram added after it: those were compiled inside it and may call the
+/// pending program, which will never be filled.
+pub(super) struct PendingSubprogram {
+    subprograms: CompiledSubprograms,
+    index: usize,
+    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+}
+
+impl PendingSubprogram {
+    /// Store the compiled program, for the calls emitted while it was
+    /// compiling and for the calls emitted later.
+    pub(super) fn finish(self, prepared: Arc<PreparedProgram>) -> Subprogram {
+        self.slot
+            .set(Arc::downgrade(&prepared))
+            .expect("subprogram should be set exactly once");
+        let program = Subprogram::PreparedProgram(prepared);
+        self.subprograms.0.borrow_mut()[self.index].program = program.clone();
+        program
+    }
+}
+
+impl Drop for PendingSubprogram {
+    fn drop(&mut self) {
+        if self.slot.get().is_none() {
+            self.subprograms.0.borrow_mut().truncate(self.index);
+        }
     }
 }
 
