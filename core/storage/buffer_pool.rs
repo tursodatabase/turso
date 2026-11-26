@@ -174,6 +174,14 @@ impl BufferPool {
         inner.get_wal_frame_buffer()
     }
 
+    /// Request a `Buffer` for a WAL frame, as [`BufferPool::get_wal_frame`]
+    /// does, that holds `header` and then `page`.
+    #[inline]
+    pub fn get_wal_frame_from(&self, header: &[u8], page: &[u8]) -> Buffer {
+        let inner = self.inner_mut();
+        inner.get_wal_frame_buffer_from(header, page)
+    }
+
     #[inline]
     fn inner(&self) -> &PoolInner {
         unsafe { &*self.inner.get() }
@@ -275,6 +283,31 @@ impl PoolInner {
             .as_ref()
             .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
             .unwrap_or_else(|| Buffer::new_temporary(len))
+    }
+
+    fn get_wal_frame_buffer_from(&mut self, header: &[u8], page: &[u8]) -> Buffer {
+        let len = self.get_db_page_size() + WAL_FRAME_HEADER_SIZE;
+        turso_assert!(
+            header.len() + page.len() == len,
+            "WAL frame parts must fill the frame",
+            { "header_len": header.len(), "page_len": page.len(), "frame_len": len }
+        );
+        // A large transaction can use all the slots of the arena. A new
+        // temporary buffer is then built from the two parts instead of a
+        // buffer of zeros that the two copies write over.
+        match self
+            .wal_frame_arena
+            .as_ref()
+            .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
+        {
+            Some(buffer) => {
+                let (header_bytes, page_bytes) = buffer.as_mut_slice().split_at_mut(header.len());
+                header_bytes.copy_from_slice(header);
+                page_bytes.copy_from_slice(page);
+                buffer
+            }
+            None => Buffer::new_temporary_from(header, page),
+        }
     }
 
     /// Allocate a new arena for the pool to use

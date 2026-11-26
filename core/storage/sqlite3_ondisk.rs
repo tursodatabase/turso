@@ -2154,13 +2154,25 @@ pub fn prepare_wal_frame(
 ) -> ((u32, u32), Arc<Buffer>) {
     tracing::trace!(page_number);
 
-    let buffer = prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size);
-    let frame = buffer.as_mut_slice();
-    frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(page);
-
-    let final_checksum = recompute_wal_frame_checksum(frame, wal_header, prev_checksums);
+    let buffer = prepare_wal_frame_with_page(buffer_pool, wal_header, page_number, db_size, page);
+    let final_checksum =
+        recompute_wal_frame_checksum(buffer.as_mut_slice(), wal_header, prev_checksums);
 
     (final_checksum, buffer)
+}
+
+/// Prepares a WAL frame with a copy of `page` as its body. The checksum in the
+/// header is not set. The caller can change the body, and then must compute the
+/// frame checksum before it submits the frame to storage.
+pub(crate) fn prepare_wal_frame_with_page(
+    buffer_pool: &Arc<BufferPool>,
+    wal_header: &WalHeader,
+    page_number: u32,
+    db_size: u32,
+    page: &[u8],
+) -> Arc<Buffer> {
+    let header = wal_frame_header(wal_header, page_number, db_size);
+    Arc::new(buffer_pool.get_wal_frame_from(&header, page))
 }
 
 /// Prepares a WAL frame header while leaving the page body for a transform to fill.
@@ -2173,13 +2185,24 @@ pub(crate) fn prepare_wal_frame_header(
     page_number: u32,
     db_size: u32,
 ) -> Arc<Buffer> {
+    let header = wal_frame_header(wal_header, page_number, db_size);
     let buffer = Arc::new(buffer_pool.get_wal_frame());
-    let frame = buffer.as_mut_slice();
-    frame[0..4].copy_from_slice(&page_number.to_be_bytes());
-    frame[4..8].copy_from_slice(&db_size.to_be_bytes());
-    frame[8..12].copy_from_slice(&wal_header.salt_1.to_be_bytes());
-    frame[12..16].copy_from_slice(&wal_header.salt_2.to_be_bytes());
+    buffer.as_mut_slice()[..WAL_FRAME_HEADER_SIZE].copy_from_slice(&header);
     buffer
+}
+
+/// The header of a WAL frame, with zeros in place of the checksum.
+fn wal_frame_header(
+    wal_header: &WalHeader,
+    page_number: u32,
+    db_size: u32,
+) -> [u8; WAL_FRAME_HEADER_SIZE] {
+    let mut header = [0; WAL_FRAME_HEADER_SIZE];
+    header[0..4].copy_from_slice(&page_number.to_be_bytes());
+    header[4..8].copy_from_slice(&db_size.to_be_bytes());
+    header[8..12].copy_from_slice(&wal_header.salt_1.to_be_bytes());
+    header[12..16].copy_from_slice(&wal_header.salt_2.to_be_bytes());
+    header
 }
 
 /// Recompute a frame checksum after transforming its page body in place.
