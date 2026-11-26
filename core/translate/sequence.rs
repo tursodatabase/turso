@@ -796,8 +796,8 @@ pub(crate) fn emit_sqlite_sequence_sync(
 /// Emits the bytecode that scans the `sqlite_sequence` cursor
 /// `seq_cursor_id` for the row named by `name_reg` and leaves its `seq`
 /// in `value_reg`, zero when there is no such row, and its rowid in
-/// `rowid_reg`, NULL when there is none. `name_reg` gets the name as the
-/// row stores it, which may differ in case.
+/// `rowid_reg`, NULL when there is none. The row is found as
+/// `emit_find_sqlite_sequence_row_name` describes.
 pub fn emit_sqlite_sequence_row_read(
     program: &mut ProgramBuilder,
     seq_cursor_id: usize,
@@ -814,6 +814,7 @@ pub fn emit_sqlite_sequence_row_read(
         dest_end: None,
     });
 
+    let table_row_name_reg = emit_find_sqlite_sequence_row_name(program, seq_cursor_id, name_reg);
     let loop_start_label = program.allocate_label();
     let loop_end_label = program.allocate_label();
     let next_label = program.allocate_label();
@@ -827,16 +828,11 @@ pub fn emit_sqlite_sequence_row_read(
     let name_col_reg = program.alloc_register();
     program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
     program.emit_insn(Insn::Ne {
-        lhs: name_reg,
-        rhs: name_col_reg,
+        lhs: name_col_reg,
+        rhs: table_row_name_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default().jump_if_null(),
-        collation: CollationSeq::NOCASE,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: name_col_reg,
-        dst_reg: name_reg,
-        extra_amount: 0,
+        collation: CollationSeq::for_internal_values(),
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, value_reg);
@@ -886,7 +882,8 @@ pub fn emit_sqlite_sequence_row_write(
 
     let name_reg = program.emit_string8_new_reg(name.to_string());
 
-    // Delete every existing row matching `name`.
+    // Delete every existing row of the table.
+    let table_row_name_reg = emit_find_sqlite_sequence_row_name(program, sseq_cursor, name_reg);
     let insert_label = program.allocate_label();
     let loop_top_label = program.allocate_label();
     let skip_delete_label = program.allocate_label();
@@ -899,7 +896,7 @@ pub fn emit_sqlite_sequence_row_write(
     program.emit_column_or_rowid(sseq_cursor, 0, col_name_reg);
     program.emit_insn(Insn::Ne {
         lhs: col_name_reg,
-        rhs: name_reg,
+        rhs: table_row_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default().jump_if_null(),
         collation: CollationSeq::for_internal_values(),
@@ -958,6 +955,70 @@ pub fn emit_sqlite_sequence_row_write(
     program.emit_insn(Insn::Close {
         cursor_id: sseq_cursor,
     });
+}
+
+/// Emit a scan of `sqlite_sequence` that finds the name of the row of the
+/// table stored as the name in `table_name_reg`, and return the register
+/// holding it, or NULL when the table has no row. Like SQLite, the table's row
+/// is the one named exactly as the table was written in CREATE TABLE. Older
+/// versions of Turso stored and matched names ignoring case, so their files can
+/// hold a row whose name differs from the table's only in case; when no row has
+/// the exact name, the first such row is the table's row.
+pub(crate) fn emit_find_sqlite_sequence_row_name(
+    program: &mut ProgramBuilder,
+    seq_cursor_id: usize,
+    table_name_reg: usize,
+) -> usize {
+    let row_name_reg = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: row_name_reg,
+        dest_end: None,
+    });
+    let candidate_reg = program.alloc_register();
+    let done_label = program.allocate_label();
+    program.cursor_loop(seq_cursor_id, |program, _rowid| {
+        let exact_match_label = program.allocate_label();
+        let next_row_label = program.allocate_label();
+        program.emit_column_or_rowid(seq_cursor_id, 0, candidate_reg);
+        program.emit_insn(Insn::Eq {
+            lhs: candidate_reg,
+            rhs: table_name_reg,
+            target_pc: exact_match_label,
+            flags: CmpInsFlags::default(),
+            collation: CollationSeq::for_internal_values(),
+        });
+        program.emit_insn(Insn::NotNull {
+            reg: row_name_reg,
+            target_pc: next_row_label,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: candidate_reg,
+            rhs: table_name_reg,
+            target_pc: next_row_label,
+            flags: CmpInsFlags::default(),
+            collation: CollationSeq::NOCASE,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: candidate_reg,
+            dst_reg: row_name_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: next_row_label,
+        });
+        program.preassign_label_to_next_insn(exact_match_label);
+        program.emit_insn(Insn::Copy {
+            src_reg: candidate_reg,
+            dst_reg: row_name_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: done_label,
+        });
+        program.preassign_label_to_next_insn(next_row_label);
+    });
+    program.preassign_label_to_next_insn(done_label);
+    row_name_reg
 }
 
 /// If `seq` is an AUTOINCREMENT-backing sequence (its name begins with
