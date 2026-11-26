@@ -90,6 +90,14 @@ test quote-ident-null-is-null {
 expect {
 }
 
+test quote-ident-bytea-errors {
+    SELECT quote_ident('\x01'::bytea);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(bytea\) does not exist
+}
+
 test quote-literal-plain {
     SELECT quote_literal('abc');
 }
@@ -402,6 +410,222 @@ test pg-input-error-info-date-bad-syntax {
 }
 expect {
     invalid input syntax for type date: "zzz"|22007
+}
+
+test pg-input-is-valid-null-argument-is-null {
+    SELECT CASE WHEN pg_input_is_valid('1', NULL) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN pg_input_is_valid(NULL, 'int4') IS NULL THEN 'null' ELSE 'not null' END;
+}
+expect {
+    null
+    null
+}
+
+test pg-input-is-valid-bytea-type-name-errors {
+    SELECT pg_input_is_valid('1', '\x01'::bytea);
+}
+@sqlstate 42883
+expect error {}
+
+test pg-input-is-valid-bytea-input-errors {
+    SELECT pg_input_is_valid('\x01'::bytea, 'int4');
+}
+@sqlstate 42883
+expect error {}
+
+test to-char-null-format-is-null {
+    SELECT CASE WHEN to_char(1, NULL) IS NULL THEN 'null' ELSE 'not null' END;
+}
+expect {
+    null
+}
+
+test to-char-bytea-format-errors {
+    SELECT to_char(1, '\x01'::bytea);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(integer, bytea\) does not exist
+}
+
+test text-functions-read-json-numbers-as-text {
+    SELECT pg_input_is_valid('{"a":12}'::json->>'a', 'int4');
+    SELECT pg_input_is_valid('{"a":true}'::jsonb->>'a', 'bool');
+    SELECT quote_ident('{"a":12}'::json->>'a');
+    SELECT '[' || to_char(5, '{"f":9}'::json->>'f') || ']';
+}
+expect {
+    t
+    t
+    "12"
+    [ 5]
+}
+
+test quote-ident-integer-errors {
+    SELECT quote_ident(12);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(integer\) does not exist
+}
+
+test quote-ident-boolean-errors {
+    SELECT quote_ident(true);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(boolean\) does not exist
+}
+
+test to-char-integer-format-errors {
+    SELECT to_char(1, 5);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(integer, integer\) does not exist
+}
+
+test to-char-numeric-format-errors {
+    SELECT to_char(1, 5.5);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(integer, numeric\) does not exist
+}
+
+test pg-input-is-valid-integer-input-errors {
+    SELECT pg_input_is_valid(12, 'int4');
+}
+@sqlstate 42883
+expect error {
+    function pg_input_is_valid\(integer, 
+}
+
+test quote-ident-timestamptz-errors {
+    SELECT quote_ident(now());
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(timestamp with time zone\) does not exist
+}
+
+# A cast to json reaches the function as text, so it is read as text.
+@compat-gap "type:json"
+test quote-ident-json-errors {
+    SELECT quote_ident('{"a":1}'::json);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(json\) does not exist
+}
+expect @tursopg {
+    "{""a"":1}"
+}
+
+test quote-ident-null-date-errors {
+    SELECT quote_ident(NULL::date);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(date\) does not exist
+}
+
+test to-char-date-format-errors {
+    SELECT to_char(1, '2020-01-01'::date);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(integer, date\) does not exist
+}
+
+# A cast to jsonb reaches the function as text, so it is read as text.
+@compat-gap "type:jsonb"
+test pg-input-is-valid-jsonb-input-errors {
+    SELECT pg_input_is_valid('{"a":1}'::jsonb, 'int4');
+}
+@sqlstate 42883
+expect error {
+    function pg_input_is_valid\(jsonb,
+}
+expect @tursopg {
+    f
+}
+
+test text-functions-accept-string-typed-arguments {
+    CREATE TABLE text_args (t text, v varchar, n name);
+    CREATE DOMAIN text_arg_domain AS text;
+    CREATE TABLE domain_args (d text_arg_domain);
+    INSERT INTO text_args VALUES ('A', '12', 'int4');
+    INSERT INTO domain_args VALUES ('999');
+    SELECT quote_ident(t), quote_ident(v), quote_ident(n) FROM text_args;
+    SELECT pg_input_is_valid(v, n) FROM text_args;
+    SELECT '[' || to_char(7, d) || ']' FROM domain_args;
+    SELECT quote_ident(12::text);
+}
+expect {
+    "A"|"12"|int4
+    t
+    [   7]
+    "12"
+}
+
+test text-functions-accept-values-columns {
+    SELECT quote_ident(x) FROM (VALUES ('a')) v(x);
+    SELECT quote_ident(x) FROM (VALUES ('a'::text)) v(x);
+    WITH c(x) AS (VALUES ('b')) SELECT quote_ident(x) FROM c;
+    SELECT '[' || to_char(5, f) || ']' FROM (VALUES ('999')) v(f);
+}
+expect {
+    a
+    a
+    b
+    [   5]
+}
+
+test text-functions-accept-null-in-values-columns {
+    SELECT coalesce(quote_ident(x), 'null') FROM (VALUES ('a'), (NULL)) v(x);
+    SELECT coalesce(quote_ident(x), 'null') FROM (VALUES (NULL::text)) v(x);
+    WITH c(x) AS (VALUES ('b'), (NULL)) SELECT coalesce(quote_ident(x), 'null') FROM c;
+    SELECT coalesce('[' || to_char(5, f) || ']', 'null') FROM (VALUES ('999'), (NULL)) v(f);
+    SELECT CASE WHEN pg_input_is_valid(x, 'int4') IS NULL THEN 'null' ELSE 'not null' END
+    FROM (VALUES ('1'), (NULL)) v(x);
+    SELECT CASE WHEN pg_input_is_valid('1', t) IS NULL THEN 'null' ELSE 'not null' END
+    FROM (VALUES ('int4'), (NULL)) v(t);
+}
+expect {
+    a
+    null
+    null
+    b
+    null
+    [   5]
+    null
+    not null
+    null
+    not null
+    null
+}
+
+test quote-ident-integer-values-column-errors {
+    SELECT quote_ident(x) FROM (VALUES (1)) v(x);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(integer\) does not exist
+}
+
+# A NULL argument is not checked against its declared type, because a column
+# of a VALUES list is declared integer whatever it holds.
+@compat-gap "function:quote_ident"
+test quote-ident-integer-null-errors {
+    SELECT coalesce(quote_ident(NULL::integer), 'null');
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(integer\) does not exist
+}
+expect @tursopg {
+    null
 }
 
 test current-setting-numeric-parameter-name-errors {
