@@ -433,8 +433,8 @@ impl Dialect for PostgresDialect {
                 None,
             ));
         }
-        // A table keeps the letter case of its name in `declared_name`. The
-        // engine keeps the name of a view in lower case only.
+        // The engine looks relations up by the lower-case name. The row type
+        // has the name in the letter case that CREATE gave it.
         let row_type_name = match schema.relation_kind(namespace.id, name) {
             Some(RelationKind::Table | RelationKind::MaterializedView) => Some(
                 schema
@@ -447,7 +447,7 @@ impl Dialect for PostgresDialect {
                 schema
                     .get_view(namespace.id, name)
                     .expect("relation_kind found a view of this name")
-                    .name
+                    .declared_name
                     .clone(),
             ),
             Some(RelationKind::Sequence | RelationKind::Index) | None => None,

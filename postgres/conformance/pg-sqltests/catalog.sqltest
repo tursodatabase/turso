@@ -2765,6 +2765,24 @@ expect error {
     type "zz_ty_view" already exists
 }
 
+test a-type-may-not-share-its-quoted-name-with-a-view {
+    CREATE VIEW "ZZ_TY_VIEW" AS SELECT 1 AS a;
+    CREATE TYPE "ZZ_TY_VIEW" AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "ZZ_TY_VIEW" already exists
+}
+
+test a-domain-may-not-share-its-quoted-name-with-a-view {
+    CREATE VIEW "ZZ_DOM_VIEW" AS SELECT 1 AS a;
+    CREATE DOMAIN "ZZ_DOM_VIEW" AS int;
+}
+@sqlstate 42710
+expect error {
+    type "ZZ_DOM_VIEW" already exists
+}
+
 test a-domain-may-not-share-its-name-with-a-table {
     CREATE TABLE zz_dom_table (a int);
     CREATE DOMAIN zz_dom_table AS int;

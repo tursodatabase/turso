@@ -933,6 +933,26 @@ expect {
 expect @tursopg error {}
 
 @compat-gap "syntax:quoted-identifier"
+test a-type-after-a-view-whose-name-differs-in-case {
+    CREATE VIEW "Vw" AS SELECT 1 AS a;
+    CREATE TYPE vw AS ENUM ('a');
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:quoted-identifier"
+test a-domain-after-a-view-whose-name-differs-in-case {
+    CREATE VIEW dvw AS SELECT 1 AS a;
+    CREATE DOMAIN "DVW" AS int;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:quoted-identifier"
 test rename-onto-a-type-name-that-differs-in-case {
     CREATE TYPE level AS ENUM ('low');
     CREATE TABLE t (a int);
