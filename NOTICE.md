@@ -129,6 +129,13 @@ postgres/frontend/copy/pgwire_text.rs, with local buffer and API adaptations:
 * License: licenses/pgwire-mit-license.md (MIT License)
 * Homepage: https://github.com/sunng87/pgwire
 
+The PostgreSQL frontend contains Rust translated from PostgreSQL 18.6 in
+postgres/frontend/resolve/, the rules that choose a function or an operator
+from the types of its arguments:
+
+* License: licenses/postgres-license.md (PostgreSQL License)
+* Homepage: https://www.postgresql.org
+
 The PostgreSQL frontend depends on hex, distributed by its authors:
 
 * License: licenses/hex-mit-license.md (MIT License)

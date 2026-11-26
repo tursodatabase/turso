@@ -17,6 +17,8 @@ mod options;
 mod pg_type;
 mod policies;
 mod procs;
+#[cfg(test)]
+mod resolve;
 mod roles;
 mod schema_init;
 mod schema_state;
