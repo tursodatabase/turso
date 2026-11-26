@@ -5807,6 +5807,105 @@ expect {
     p
 }
 
+# The rows of a table that references itself go away together with the rows
+# they reference, so DROP TABLE leaves no violation for them.
+test fk-defer-pragma-drop-self-referencing-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id));
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    DROP TABLE cat;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+test fk-defer-pragma-drop-self-referencing-table-with-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO cat VALUES(1, NULL), (2, 99);
+    DROP TABLE cat;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+test fk-deferred-drop-self-referencing-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO cat VALUES(1, 2), (2, 1);
+    DROP TABLE cat;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+test fk-immediate-drop-self-referencing-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id));
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    DROP TABLE cat;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# DROP TABLE deletes the rows in rowid order. With ON DELETE RESTRICT it fails
+# when a row is deleted before a row that references it.
+test fk-restrict-drop-self-referencing-table-later-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id) ON DELETE RESTRICT);
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    DROP TABLE cat;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-restrict-drop-self-referencing-table-earlier-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, k UNIQUE, parent REFERENCES cat(k) ON DELETE RESTRICT);
+    INSERT INTO cat VALUES(1, 10, 20), (2, 20, NULL), (3, 30, 30);
+    DROP TABLE cat;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+test fk-restrict-deferred-drop-self-referencing-table-later-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    DROP TABLE cat;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-defer-pragma-restrict-drop-self-referencing-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id) ON DELETE RESTRICT);
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    DROP TABLE cat;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
 # The violations counted for the rows of another child table remain.
 test fk-deferred-drop-child-table-keeps-other-violations {
     PRAGMA foreign_keys=ON;

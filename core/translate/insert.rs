@@ -39,7 +39,7 @@ use crate::{
             build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
             emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
             fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
-            open_read_table, table_scan_match_any, ForeignKeyActions,
+            open_read_table, table_scan_match_any, ForeignKeyActions, SkipChildRowid,
         },
         plan::{
             ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, NonFromClauseSubquery, Operation,
@@ -4857,7 +4857,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program,
                 &pref,
                 new_pk_start,
-                new_row_rowid,
+                new_row_rowid.map(SkipChildRowid::Equal),
                 database_id,
                 resolver,
                 |p| {

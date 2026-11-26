@@ -494,17 +494,29 @@ pub(super) fn emit_skip_if_any_null(
     }
 }
 
+/// Child rows of a self-referential key that `table_scan_match_any` leaves out.
+#[derive(Clone, Copy)]
+pub enum SkipChildRowid {
+    /// Skip the row whose rowid is in this register. The row may match the
+    /// OLD parent key only because it has not been rewritten yet, while the
+    /// same statement changes its child key too.
+    Equal(usize),
+    /// Skip each row whose rowid is less than or equal to the rowid in this
+    /// register. DROP TABLE deletes rows in rowid order, so these rows are
+    /// gone before the parent row with that rowid is deleted.
+    AtMost(usize),
+}
+
 /// Iterate a table and call `on_match` when all child columns equal the
 /// non-NULL key at `parent_key_start`.
 ///
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
-/// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
-/// its old child key is being updated away by the same statement.
+/// self-referential keys, `skip_child_rowid` skips rows by their rowid.
 pub fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     fk_ref: &ResolvedFkRef,
     parent_key_start: usize,
-    self_exclude_rowid: Option<usize>,
+    skip_child_rowid: Option<SkipChildRowid>,
     database_id: usize,
     resolver: &Resolver,
     mut on_match: F,
@@ -588,23 +600,31 @@ where
         program.preassign_label_to_next_insn(cont);
     }
 
-    // The current row may match the OLD parent key only because it has not been
-    // physically rewritten yet. If the caller knows this row's child key is
-    // changing too, do not count that disappearing old self-reference.
-    if let Some(parent_rowid) = self_exclude_rowid {
+    if let Some(skip_child_rowid) = skip_child_rowid {
         let child_rowid = program.alloc_register();
         let skip = program.allocate_label();
         program.emit_insn(Insn::RowId {
             cursor_id: ccur,
             dest: child_rowid,
         });
-        program.emit_insn(Insn::Eq {
-            lhs: child_rowid,
-            rhs: parent_rowid,
-            target_pc: skip,
-            flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
-        });
+        let flags = CmpInsFlags::default();
+        let collation = CollationSeq::for_internal_values();
+        match skip_child_rowid {
+            SkipChildRowid::Equal(rhs) => program.emit_insn(Insn::Eq {
+                lhs: child_rowid,
+                rhs,
+                target_pc: skip,
+                flags,
+                collation,
+            }),
+            SkipChildRowid::AtMost(rhs) => program.emit_insn(Insn::Le {
+                lhs: child_rowid,
+                rhs,
+                target_pc: skip,
+                flags,
+                collation,
+            }),
+        }
         on_match(program)?;
         program.preassign_label_to_next_insn(skip);
     } else {
@@ -986,7 +1006,7 @@ fn emit_fk_parent_key_probe(
             program,
             fk_ref,
             parent_key_start,
-            self_exclude_rowid,
+            self_exclude_rowid.map(SkipChildRowid::Equal),
             database_id,
             resolver,
             on_match,
@@ -1552,11 +1572,7 @@ fn emit_fk_delete_parent_existence_check_single(
             program,
             fk_ref,
             parent_key_start,
-            if is_self_ref {
-                Some(parent_rowid_reg)
-            } else {
-                None
-            },
+            is_self_ref.then_some(SkipChildRowid::Equal(parent_rowid_reg)),
             database_id,
             resolver,
             |p| {
@@ -2654,10 +2670,27 @@ pub fn emit_fk_drop_table_check(
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))
         })?;
 
-    // Get all FK references to this parent table
-    let fk_refs = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(namespace.id, parent_table_name)
-    })?;
+    let is_self_ref = |fk_ref: &ResolvedFkRef| {
+        fk_ref.child_namespace == namespace.id
+            && fk_ref
+                .child_table
+                .name
+                .eq_ignore_ascii_case(&parent_tbl.name)
+    };
+    // Get all FK references to this parent table. SQLite's
+    // `sqlite3FkDropTable` deletes the rows in rowid order, so the child rows
+    // of a key of the table on itself go away together with the parent rows,
+    // and the counts cancel. Only RESTRICT fails at once, when a parent row
+    // is deleted before a row that references it.
+    let fk_refs: Vec<_> = resolver
+        .with_schema(database_id, |s| {
+            s.resolved_fks_referencing(namespace.id, parent_table_name)
+        })?
+        .into_iter()
+        .filter(|fk_ref| {
+            !is_self_ref(fk_ref) || resolver.fk_action_is_restrict(fk_ref.fk.on_delete)
+        })
+        .collect();
 
     if fk_refs.is_empty() {
         return Ok(());
@@ -2806,7 +2839,7 @@ pub fn emit_fk_drop_table_check(
             program,
             fk_ref,
             parent_key_start,
-            None,
+            is_self_ref(fk_ref).then_some(SkipChildRowid::AtMost(current_rowid_reg)),
             database_id,
             resolver,
             |p| {
