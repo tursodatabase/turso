@@ -6,6 +6,7 @@ mod catalog;
 mod coerce;
 mod error;
 mod function;
+mod operator;
 #[cfg(test)]
 mod oracle;
 
@@ -42,8 +43,20 @@ pub(crate) struct ResolvedCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Resolution {
-    Resolved(ResolvedCall),
+pub(crate) struct ResolvedOperator {
+    /// The oid of the chosen `pg_operator` row.
+    pub oid: i64,
+    /// The oid of the `pg_proc` row that runs the operator.
+    pub function: i64,
+    /// One type for the operand of a prefix operator, two for a binary operator.
+    pub operand_types: Vec<i64>,
+    pub coercions: Vec<ArgCoercion>,
+    pub result_type: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolution<Chosen = ResolvedCall> {
+    Resolved(Chosen),
     Unsupported(Reason),
     Error(ResolveError),
 }
@@ -78,6 +91,20 @@ pub(crate) fn resolve_function(
 ) -> Resolution {
     match function::parse_func_or_column(catalog, name, arguments) {
         Ok(Ok(call)) => Resolution::Resolved(call),
+        Ok(Err(error)) => Resolution::Error(error),
+        Err(reason) => Resolution::Unsupported(reason),
+    }
+}
+
+/// Chooses the operator that PostgreSQL runs for `left name right`, or for `name right` without a left operand.
+pub(crate) fn resolve_operator(
+    catalog: &dyn Catalog,
+    name: &str,
+    left: Option<ArgType>,
+    right: ArgType,
+) -> Resolution<ResolvedOperator> {
+    match operator::make_op(catalog, name, left, right) {
+        Ok(Ok(operator)) => Resolution::Resolved(operator),
         Ok(Err(error)) => Resolution::Error(error),
         Err(reason) => Resolution::Unsupported(reason),
     }

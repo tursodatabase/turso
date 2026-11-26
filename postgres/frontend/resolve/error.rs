@@ -1,11 +1,11 @@
-// Translated from PostgreSQL 18.6, src/backend/parser/parse_func.c and src/backend/parser/parse_coerce.c. See licenses/postgres-license.md.
+// Translated from PostgreSQL 18.6, src/backend/parser/parse_func.c, src/backend/parser/parse_oper.c and src/backend/parser/parse_coerce.c. See licenses/postgres-license.md.
 
 /// The error PostgreSQL raises when it cannot choose a function or an operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolveError {
     NoMatch {
         message: String,
-        hint: &'static str,
+        hint: Option<&'static str>,
     },
     Ambiguous {
         message: String,
@@ -41,7 +41,8 @@ impl ResolveError {
 
     pub(crate) fn hint(&self) -> Option<&'static str> {
         match self {
-            ResolveError::NoMatch { hint, .. } | ResolveError::Ambiguous { hint, .. } => Some(hint),
+            ResolveError::NoMatch { hint, .. } => *hint,
+            ResolveError::Ambiguous { hint, .. } => Some(hint),
             ResolveError::DatatypeMismatch { .. } | ResolveError::UndefinedObject { .. } => None,
         }
     }
@@ -59,7 +60,7 @@ impl ResolveError {
 pub(crate) fn function_does_not_exist(signature: &str) -> ResolveError {
     ResolveError::NoMatch {
         message: format!("function {signature} does not exist"),
-        hint: "No function matches the given name and argument types. You might need to add explicit type casts.",
+        hint: Some("No function matches the given name and argument types. You might need to add explicit type casts."),
     }
 }
 
@@ -68,6 +69,32 @@ pub(crate) fn function_is_not_unique(signature: &str) -> ResolveError {
         message: format!("function {signature} is not unique"),
         hint:
             "Could not choose a best candidate function. You might need to add explicit type casts.",
+    }
+}
+
+pub(crate) fn operator_does_not_exist(signature: &str, has_two_operands: bool) -> ResolveError {
+    ResolveError::NoMatch {
+        message: format!("operator does not exist: {signature}"),
+        hint: Some(if has_two_operands {
+            "No operator matches the given name and argument types. You might need to add explicit type casts."
+        } else {
+            "No operator matches the given name and argument type. You might need to add an explicit type cast."
+        }),
+    }
+}
+
+pub(crate) fn operator_is_not_unique(signature: &str) -> ResolveError {
+    ResolveError::Ambiguous {
+        message: format!("operator is not unique: {signature}"),
+        hint:
+            "Could not choose a best candidate operator. You might need to add explicit type casts.",
+    }
+}
+
+pub(crate) fn operator_is_only_a_shell(signature: &str) -> ResolveError {
+    ResolveError::NoMatch {
+        message: format!("operator is only a shell: {signature}"),
+        hint: None,
     }
 }
 

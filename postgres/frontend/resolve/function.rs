@@ -426,7 +426,7 @@ fn keep_candidates_with_most_matches(
     Ok(kept)
 }
 
-fn make_fn_arguments(
+pub(crate) fn make_fn_arguments(
     catalog: &dyn Catalog,
     actual_arg_types: &[i64],
     declared_arg_types: &[i64],

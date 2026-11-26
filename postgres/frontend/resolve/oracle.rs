@@ -8,6 +8,7 @@ pub(crate) struct OracleCase {
     pub name: String,
     pub args: Vec<i64>,
     pub chosen: Option<i64>,
+    pub function: Option<i64>,
     pub result: Option<i64>,
     pub coercions: Vec<String>,
     pub node: Option<String>,
@@ -37,6 +38,7 @@ static CASES: LazyLock<Vec<OracleCase>> = LazyLock::new(|| {
                 .map(|arg| arg.as_i64().unwrap_or(UNKNOWNOID))
                 .collect(),
             chosen: case["chosen"].as_i64(),
+            function: case["function"].as_i64(),
             result: case["result"].as_i64(),
             coercions: case["coercions"]
                 .as_array()

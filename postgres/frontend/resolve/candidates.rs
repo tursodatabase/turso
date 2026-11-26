@@ -56,6 +56,51 @@ pub(crate) fn funcname_get_candidates(
     Ok(result_list)
 }
 
+pub(crate) fn opername_get_oprid(
+    catalog: &dyn Catalog,
+    opername: &str,
+    oprleft: i64,
+    oprright: i64,
+) -> i64 {
+    catalog
+        .pg_operator(opername)
+        .into_iter()
+        .find(|operform| operform.left == oprleft && operform.right == oprright)
+        .map_or(INVALID_OID, |operform| operform.oid)
+}
+
+pub(crate) fn opername_get_candidates(
+    catalog: &dyn Catalog,
+    opername: &str,
+    oprkind: char,
+) -> Vec<FuncCandidate> {
+    let mut result_list: Vec<FuncCandidate> = Vec::new();
+
+    for operform in catalog.pg_operator(opername) {
+        if oprkind != '\0' && operform.kind != oprkind {
+            continue;
+        }
+
+        let args = vec![operform.left, operform.right];
+        assert!(
+            result_list
+                .iter()
+                .all(|prev_result| prev_result.args != args),
+            "two operators named {opername} take the same operand types"
+        );
+
+        result_list.insert(
+            0,
+            FuncCandidate {
+                oid: operform.oid,
+                args,
+            },
+        );
+    }
+
+    result_list
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +183,47 @@ mod tests {
             funcname_get_candidates(catalog, "pg_terminate_backend", 0),
             Ok(vec![])
         );
+    }
+
+    #[test]
+    fn an_operator_is_found_by_its_name_and_its_exact_operand_types() {
+        let catalog = FixtureCatalog::get();
+        assert_eq!(opername_get_oprid(catalog, "+", 23, 23), 551);
+        assert_eq!(opername_get_oprid(catalog, "+", 23, 20), 692);
+        assert_eq!(opername_get_oprid(catalog, "-", INVALID_OID, 23), 558);
+        assert_eq!(opername_get_oprid(catalog, "+", 23, 25), INVALID_OID);
+        assert_eq!(
+            opername_get_oprid(catalog, "+", 23, INVALID_OID),
+            INVALID_OID
+        );
+        assert_eq!(opername_get_oprid(catalog, "no such", 23, 23), INVALID_OID);
+    }
+
+    #[test]
+    fn the_candidates_of_an_operator_are_the_rows_with_the_name_and_the_kind() {
+        let catalog = FixtureCatalog::get();
+        let between_two = opername_get_candidates(catalog, "-", 'b');
+        assert!(between_two.contains(&FuncCandidate {
+            oid: 555,
+            args: vec![23, 23],
+        }));
+        assert!(between_two
+            .iter()
+            .all(|candidate| candidate.args[0] != INVALID_OID));
+        let before_one = opername_get_candidates(catalog, "-", 'l');
+        assert!(before_one.contains(&FuncCandidate {
+            oid: 558,
+            args: vec![INVALID_OID, 23],
+        }));
+        assert!(before_one
+            .iter()
+            .all(|candidate| candidate.args[0] == INVALID_OID));
+        assert_eq!(
+            opername_get_candidates(catalog, "-", '\0').len(),
+            between_two.len() + before_one.len()
+        );
+        assert_eq!(opername_get_candidates(catalog, "no such", 'b'), vec![]);
+        assert_eq!(opername_get_candidates(catalog, "||", 'l'), vec![]);
     }
 
     struct TwoRowsWithTheSameArguments;
