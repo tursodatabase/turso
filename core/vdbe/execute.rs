@@ -16382,6 +16382,25 @@ pub fn op_open_ephemeral(
                 *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::ClearExisting;
                 return Ok(InsnFunctionStepResult::Step);
             }
+            #[cfg(debug_assertions)]
+            if connection.model_ephemeral() {
+                let (_, cursor_type) = program
+                    .cursor_ref
+                    .get(cursor_id)
+                    .expect("cursor_id should exist in cursor_ref");
+                let cursor = match cursor_type {
+                    CursorType::BTreeTable(_) => ModelCursor::new_table(pager.clone()),
+                    CursorType::BTreeIndex(index) => ModelCursor::new_index(
+                        pager.clone(),
+                        Arc::new(IndexInfo::new_from_index(index)?),
+                    ),
+                    other => panic!("OpenEphemeral on {other:?}"),
+                };
+                state.cursors[cursor_id] = Some(Cursor::new_btree_dyn(Box::new(cursor)));
+                state.pc += 1;
+                state.active_op_state.clear();
+                return Ok(InsnFunctionStepResult::Step);
+            }
             // Ephemeral tables always use the main DB's page size (db index 0)
             // regardless of which database triggered the ephemeral allocation.
             let page_size = return_if_io!(
@@ -16567,6 +16586,14 @@ pub fn op_open_dup(
 
     let original_cursor = state.get_cursor(*original_cursor_id);
     let original_cursor = original_cursor.as_btree_mut();
+
+    #[cfg(debug_assertions)]
+    if let Some(model) = (original_cursor as &mut dyn Any).downcast_mut::<ModelCursor>() {
+        let cursor = Cursor::new_btree_dyn(Box::new(model.dup()));
+        state.cursors[*new_cursor_id] = Some(cursor);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     let root_page = original_cursor.root_page();
     // We use the pager from the original cursor instead of the one attached to

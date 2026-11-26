@@ -3073,6 +3073,8 @@ impl Database {
             query_only: AtomicBool::new(false),
             tx_read_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            model_ephemeral: AtomicBool::new(crate::storage::model::ephemeral_default()),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
             fts_merge_threshold: AtomicI64::new(crate::index_method::DEFAULT_FTS_MERGE_THRESHOLD),
