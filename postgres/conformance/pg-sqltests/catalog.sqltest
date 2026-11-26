@@ -882,6 +882,56 @@ expect {
     6396|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17|aggregate_dummy
 }
 
+# The rows of pg_proc for the math functions match PostgreSQL 18.
+test pg-proc-math-rows-match-postgresql {
+    SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
+           proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
+           prorettype, prosrc
+    FROM pg_proc
+    WHERE oid IN (
+        753, 940, 941, 947, 1340, 1341, 1342, 1343, 1344, 1347, 1368, 1598, 1608, 1609, 1610, 1706,
+        1707, 1709, 1711, 1712, 1728, 1730, 1732, 1734, 1736, 2167, 2169, 2308, 2309, 2310, 2320, 6339,
+        6340, 6341
+    )
+    ORDER BY oid;
+}
+expect {
+    753|trunc|f|f|t|f|i|s|1|0|0|829|829|macaddr_trunc
+    940|mod|f|f|t|f|i|s|1|0|0|21 21|21|int2mod
+    941|mod|f|f|t|f|i|s|1|0|0|23 23|23|int4mod
+    947|mod|f|f|t|f|i|s|1|0|0|20 20|20|int8mod
+    1340|log|f|f|t|f|i|s|1|0|0|701|701|dlog10
+    1341|ln|f|f|t|f|i|s|1|0|0|701|701|dlog1
+    1342|round|f|f|t|f|i|s|1|0|0|701|701|dround
+    1343|trunc|f|f|t|f|i|s|1|0|0|701|701|dtrunc
+    1344|sqrt|f|f|t|f|i|s|1|0|0|701|701|dsqrt
+    1347|exp|f|f|t|f|i|s|1|0|0|701|701|dexp
+    1368|power|f|f|t|f|i|s|1|0|0|701 701|701|dpow
+    1598|random|f|f|t|f|v|r|1|0|0||701|drandom
+    1608|degrees|f|f|t|f|i|s|1|0|0|701|701|degrees
+    1609|radians|f|f|t|f|i|s|1|0|0|701|701|radians
+    1610|pi|f|f|t|f|i|s|1|0|0||701|dpi
+    1706|sign|f|f|t|f|i|s|1|0|0|1700|1700|numeric_sign
+    1707|round|f|f|t|f|i|s|1|0|0|1700 23|1700|numeric_round
+    1709|trunc|f|f|t|f|i|s|1|0|0|1700 23|1700|numeric_trunc
+    1711|ceil|f|f|t|f|i|s|1|0|0|1700|1700|numeric_ceil
+    1712|floor|f|f|t|f|i|s|1|0|0|1700|1700|numeric_floor
+    1728|mod|f|f|t|f|i|s|1|0|0|1700 1700|1700|numeric_mod
+    1730|sqrt|f|f|t|f|i|s|1|0|0|1700|1700|numeric_sqrt
+    1732|exp|f|f|t|f|i|s|1|0|0|1700|1700|numeric_exp
+    1734|ln|f|f|t|f|i|s|1|0|0|1700|1700|numeric_ln
+    1736|log|f|f|t|f|i|s|1|0|0|1700 1700|1700|numeric_log
+    2167|ceiling|f|f|t|f|i|s|1|0|0|1700|1700|numeric_ceil
+    2169|power|f|f|t|f|i|s|1|0|0|1700 1700|1700|numeric_power
+    2308|ceil|f|f|t|f|i|s|1|0|0|701|701|dceil
+    2309|floor|f|f|t|f|i|s|1|0|0|701|701|dfloor
+    2310|sign|f|f|t|f|i|s|1|0|0|701|701|dsign
+    2320|ceiling|f|f|t|f|i|s|1|0|0|701|701|dceil
+    6339|random|f|f|t|f|v|r|1|0|0|23 23|23|int4random
+    6340|random|f|f|t|f|v|r|1|0|0|20 20|20|int8random
+    6341|random|f|f|t|f|v|r|1|0|0|1700 1700|1700|numeric_random
+}
+
 test pg-object-opclass-is-read-only {
     CREATE ROLE reader_of_object_opclass_is_read_only_role;
     SET ROLE reader_of_object_opclass_is_read_only_role;

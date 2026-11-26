@@ -42,6 +42,8 @@ SEED_OIDS = [
 # ("only"), those without ("without"), or all ("all").
 FAMILIES = [
     ("seed", {"oids": SEED_OIDS}),
+    ("math", {"names": """abs ceil ceiling degrees exp floor ln log mod pi power radians random
+        round sign sqrt trunc""".split(), "bytea": "all"}),
 ]
 
 
