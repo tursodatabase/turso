@@ -39,10 +39,7 @@ pub(crate) fn try_extract_copy_to_stdout(
     // PostgreSQL reads the options before it opens the destination.
     check_copy_options(&copy.options, false)?;
     if copy.is_program {
-        return Err(ParseError::sqlstate(
-            crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "COPY TO PROGRAM is not supported",
-        ));
+        return Err(ParseError::not_supported("COPY TO PROGRAM"));
     }
     if !copy.filename.is_empty() {
         return Err(ParseError::sqlstate(
@@ -85,13 +82,10 @@ pub(crate) fn try_extract_copy_to_stdout(
             unreachable!("COPY options are DefElem nodes");
         };
         if option.defname != "format" {
-            return Err(ParseError::sqlstate(
-                crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
-                format!(
-                    "COPY TO STDOUT option '{}' is not supported",
-                    option.defname
-                ),
-            ));
+            return Err(ParseError::not_supported(format!(
+                "COPY TO STDOUT option '{}'",
+                option.defname
+            )));
         }
         match option.arg.as_ref().and_then(|arg| arg.node.as_ref()) {
             Some(Node::String(format)) if format.sval == "text" => {}
@@ -167,7 +161,7 @@ pub(crate) fn check_copy_options(
             ));
         }
         if !seen.insert(name) {
-            return Err(ParseError::syntax_error("conflicting or redundant options"));
+            return Err(ParseError::conflicting_options());
         }
         let arg = option.arg.as_ref().and_then(|arg| arg.node.as_ref());
         match name {

@@ -6754,7 +6754,7 @@ impl SequenceOptions {
                 let is_repeated = !seen.insert(elem.defname.as_str())
                     || (elem.defname == "as" && data_type.is_some());
                 if is_repeated {
-                    return Err(conflicting_options());
+                    return Err(ParseError::conflicting_options());
                 }
                 match elem.defname.as_str() {
                     "as" => {
@@ -6917,13 +6917,6 @@ fn type_does_not_exist(name: &str) -> ParseError {
     )
 }
 
-fn conflicting_options() -> ParseError {
-    ParseError::sqlstate(
-        SQLSTATE_SYNTAX_ERROR,
-        "conflicting or redundant options".to_string(),
-    )
-}
-
 /// The sequence name an identity column's `SEQUENCE NAME` option gives, if
 /// any, and the identity options without it. The name has to be in the
 /// table's schema.
@@ -6967,7 +6960,7 @@ fn identity_sequence_name(
             }
         };
         if sequence_name.replace(name.to_string()).is_some() {
-            return Err(conflicting_options());
+            return Err(ParseError::conflicting_options());
         }
     }
     Ok((sequence_name, rest))
@@ -11266,15 +11259,22 @@ fn set_operand_column_count(select: &pg_query::protobuf::SelectStmt) -> Option<u
             _ => None,
         };
     }
+    // `t.*` and `(row).*` expand to an unknown number of columns.
+    let ends_in_star = |nodes: &[pg_query::protobuf::Node]| {
+        matches!(
+            nodes.last().and_then(|node| node.node.as_ref()),
+            Some(Node::AStar(_))
+        )
+    };
     let has_star = select.target_list.iter().any(|target| {
         let Some(Node::ResTarget(target)) = &target.node else {
             return false;
         };
-        matches!(
-            target.val.as_ref().and_then(|val| val.node.as_ref()),
-            Some(Node::ColumnRef(column))
-                if matches!(column.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_)))
-        )
+        match target.val.as_ref().and_then(|val| val.node.as_ref()) {
+            Some(Node::ColumnRef(column)) => ends_in_star(&column.fields),
+            Some(Node::AIndirection(indirection)) => ends_in_star(&indirection.indirection),
+            _ => false,
+        }
     });
     (!has_star).then_some(select.target_list.len())
 }

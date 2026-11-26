@@ -393,3 +393,16 @@ test error-create-index-with-an-unknown-access-method {
 }
 @sqlstate 42704
 expect error {}
+
+@compat-gap "syntax:row-star"
+test union-of-a-row-star-and-two-columns {
+    CREATE TABLE u2(a int, b int);
+    INSERT INTO u2 VALUES (1, 2);
+    SELECT (u2).* FROM u2 UNION ALL SELECT 3, 4 ORDER BY 1;
+}
+expect {
+    1|2
+    3|4
+}
+@sqlstate 0A000
+expect @tursopg error {}

@@ -107,10 +107,7 @@ fn function_options(
             continue;
         }
         if by_name.insert(def.defname.as_str(), def).is_some() {
-            return Err(ParseError::sqlstate(
-                SQLSTATE_SYNTAX_ERROR,
-                "conflicting or redundant options".to_string(),
-            ));
+            return Err(ParseError::conflicting_options());
         }
     }
     for (name, clause) in [("cost", "COST"), ("rows", "ROWS")] {
