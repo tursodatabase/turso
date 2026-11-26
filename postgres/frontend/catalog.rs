@@ -4671,36 +4671,6 @@ struct CatalogIndexColumn {
     order: SortOrder,
 }
 
-/// The names of the PRIMARY KEY and UNIQUE constraints of `table`. PostgreSQL
-/// gives the index of each constraint the same name.
-pub(crate) fn key_constraint_names(table: &BTreeTable) -> Vec<String> {
-    let rowid_primary_key = table
-        .get_rowid_alias_column()
-        .map(|_| primary_key_constraint_name(table));
-    let unique_sets = table.unique_sets.iter().map(|set| {
-        if unique_set_is_primary_key(table, set) {
-            primary_key_constraint_name(table)
-        } else {
-            unique_constraint_name(table, set)
-        }
-    });
-    rowid_primary_key.into_iter().chain(unique_sets).collect()
-}
-
-fn primary_key_constraint_name(table: &BTreeTable) -> String {
-    table
-        .primary_key_constraint_name
-        .clone()
-        .unwrap_or_else(|| format!("{}_pkey", table.declared_name))
-}
-
-fn unique_constraint_name(table: &BTreeTable, set: &UniqueSet) -> String {
-    set.constraint_name.clone().unwrap_or_else(|| {
-        let columns: Vec<&str> = set.columns.iter().map(|c| c.name.as_str()).collect();
-        format!("{}_{}_key", table.declared_name, columns.join("_"))
-    })
-}
-
 pub(crate) fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
     table.get_rowid_alias_column().is_none()
         && set.columns.len() == table.primary_key_columns.len()

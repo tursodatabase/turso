@@ -30,7 +30,7 @@ use turso_pg_parser::translator::{
     is_catalog_table_name, PgCommentObject, PgCommentOnStmt, PG_CLASS_OID, PG_NAMESPACE_OID,
 };
 
-use crate::catalog::{key_constraint_names, namespace_oid, PUBLIC_NAMESPACE_OID};
+use crate::catalog::{namespace_oid, PUBLIC_NAMESPACE_OID};
 use crate::classes::{class_catalog, RelationClass};
 use crate::error::{not_supported, sqlstate_error};
 use crate::roles::schema_roles;
@@ -270,14 +270,11 @@ fn is_constraint_index(schema: &Schema, namespaces: &[NamespaceId], name: &str) 
     let Some(classes) = class_catalog(schema) else {
         return false;
     };
-    classes
-        .classes()
-        .filter(|class| {
-            class.relkind == RelationKind::Table && namespaces.contains(&class.relnamespace)
-        })
-        .filter_map(|class| schema.get_btree_table(class.relnamespace, &class.relname))
-        .flat_map(|table| key_constraint_names(&table))
-        .any(|constraint| constraint.eq_ignore_ascii_case(name))
+    classes.classes().any(|class| {
+        class.relkind == RelationKind::Index
+            && namespaces.contains(&class.relnamespace)
+            && class.relname.eq_ignore_ascii_case(name)
+    })
 }
 
 /// Fails unless the current role has the privileges of the owner of

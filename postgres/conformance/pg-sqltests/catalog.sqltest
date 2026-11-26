@@ -2245,23 +2245,49 @@ expect error {
     COMMENT ON a system catalog relation is not supported
 }
 
-@skip-if postgres "PostgreSQL stores comments on the index of a constraint"
+@compat-gap "syntax:COMMENT ON INDEX of a constraint"
 test comment-on-primary-key-index-is-not-supported {
     CREATE TABLE comment_keyed (id int PRIMARY KEY, a int UNIQUE);
     COMMENT ON INDEX comment_keyed_pkey IS 'x';
 }
+expect {}
 @sqlstate 0A000
-expect error {
+expect @tursopg error {
     COMMENT ON the index of a constraint is not supported
 }
 
-@skip-if postgres "PostgreSQL stores comments on the index of a constraint"
+@compat-gap "syntax:COMMENT ON INDEX of a constraint"
 test comment-on-unique-constraint-index-is-not-supported {
     CREATE TABLE comment_unique (a int UNIQUE, b int, CONSTRAINT comment_named_unique UNIQUE (b));
     COMMENT ON INDEX comment_named_unique IS 'x';
 }
+expect {}
 @sqlstate 0A000
-expect error {
+expect @tursopg error {
+    COMMENT ON the index of a constraint is not supported
+}
+
+@compat-gap "syntax:COMMENT ON INDEX of a constraint"
+test comment-on-renamed-tables-constraint-index-is-not-supported {
+    CREATE TABLE original (id int PRIMARY KEY);
+    ALTER TABLE original RENAME TO renamed;
+    COMMENT ON INDEX original_pkey IS 'x';
+}
+expect {}
+@sqlstate 0A000
+expect @tursopg error {
+    COMMENT ON the index of a constraint is not supported
+}
+
+@compat-gap "syntax:COMMENT ON INDEX of a constraint"
+test comment-on-numbered-constraint-index-is-not-supported {
+    CREATE TABLE numbered_pkey (id int);
+    CREATE TABLE numbered (id int PRIMARY KEY);
+    COMMENT ON INDEX numbered_pkey1 IS 'x';
+}
+expect {}
+@sqlstate 0A000
+expect @tursopg error {
     COMMENT ON the index of a constraint is not supported
 }
 
