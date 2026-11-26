@@ -10,6 +10,7 @@ mod test_multi_index_scan;
 mod test_read_path;
 mod test_vacuum;
 mod test_vacuum_into_mvcc;
+mod test_vacuum_peak_rss;
 mod test_write_path;
 
 mod encryption;
