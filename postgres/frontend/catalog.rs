@@ -6,7 +6,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::ast::{self, RefAct, SortOrder};
-use turso_core::schema::RelationKind;
+use turso_core::schema::{ForeignKey, RelationKind};
 use turso_core::{
     dialect::{
         call_builtin_scalar, identity_table_sql_marker, split_identity_table_sql_marker,
@@ -2586,11 +2586,7 @@ impl SnapshotRows for PgConstraintTable {
 
             // FK constraints from foreign_keys
             for fk in &btree.foreign_keys {
-                let child_cols = fk.child_columns.join("_");
-                let conname = fk
-                    .constraint_name
-                    .clone()
-                    .unwrap_or_else(|| format!("{table_name}_{child_cols}_fkey"));
+                let conname = foreign_key_constraint_name(btree, fk);
 
                 let conkey: String = fk
                     .child_columns
@@ -4671,6 +4667,18 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
     }
 
     None
+}
+
+/// The name of the foreign key `fk` of table `table` in pg_constraint: its
+/// declared name, or the name PostgreSQL gives it.
+pub(crate) fn foreign_key_constraint_name(table: &BTreeTable, fk: &ForeignKey) -> String {
+    fk.constraint_name.clone().unwrap_or_else(|| {
+        format!(
+            "{}_{}_fkey",
+            table.declared_name,
+            fk.child_columns.join("_")
+        )
+    })
 }
 
 /// The name of relation `name` of `namespace` as PostgreSQL writes it in

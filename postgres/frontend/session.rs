@@ -18,10 +18,11 @@ use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::ast::{self};
 use turso_core::dialect::Dialect;
 use turso_core::function::Func;
-use turso_core::schema::{Schema, Table};
+use turso_core::schema::{BTreeTable, ForeignKey, Schema, Table};
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
-    Connection, FkImmediateViolations, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
+    Connection, FkImmediateViolations, IOResult, LimboError, Qualifier, Result, Statement,
+    StepResult, Value,
 };
 use turso_core::{DependentObject, NamespaceId};
 use turso_pg_parser::foreign_key_tables;
@@ -1877,38 +1878,53 @@ fn reject_removal_of_referenced_table(
     }
     let schema_name = tbl_name.namespace.as_ref().map(|name| name.as_str());
     let table = tbl_name.name.as_str();
-    let Some((namespace, _)) = find_main_db_table(conn, tbl_name) else {
+    let Some((namespace, referenced)) = find_main_db_table(conn, tbl_name) else {
         return Ok(());
     };
-    let referenced = conn
-        .current_schema()
+    let schema = conn.current_schema();
+    let referencing: Vec<_> = schema
         .resolved_fks_referencing(namespace, table)?
-        .iter()
-        .any(|fk_ref| {
+        .into_iter()
+        .filter(|fk_ref| {
             fk_ref.child_namespace != namespace
                 || !fk_ref.child_table.name.eq_ignore_ascii_case(table)
-        });
-    if !referenced {
+        })
+        .collect();
+    // PostgreSQL names one of the referencing tables.
+    let Some(child) = referencing
+        .iter()
+        .map(|fk_ref| &fk_ref.child_table.declared_name)
+        .min()
+    else {
         return Ok(());
+    };
+    if truncate {
+        return Err(crate::error::truncate_of_referenced_table(
+            child,
+            &referenced.declared_name,
+        ));
     }
-    Err(if truncate {
-        sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "cannot truncate a table referenced in a foreign key constraint",
-            None,
-        )
-    } else {
-        sqlstate_error(
-            SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-            match schema_name {
-                Some(schema_name) if !namespace.is_root() => format!(
-                    "cannot drop table {schema_name}.{table} because other objects depend on it"
-                ),
-                _ => format!("cannot drop table {table} because other objects depend on it"),
-            },
-            None,
-        )
-    })
+    let dropped = match schema_name {
+        Some(schema_name) if !namespace.is_root() => format!("table {schema_name}.{table}"),
+        _ => format!("table {table}"),
+    };
+    let mut dependents: Vec<String> = referencing
+        .iter()
+        .map(|fk_ref| {
+            foreign_key_dependent(
+                conn,
+                &schema,
+                fk_ref.child_namespace,
+                &fk_ref.child_table,
+                &fk_ref.fk,
+                &dropped,
+            )
+        })
+        .collect();
+    // Sorted, because the schema keeps its tables in no order. PostgreSQL
+    // lists them in the order they were created.
+    dependents.sort();
+    Err(LimboError::dependent_objects(dropped, dependents))
 }
 
 /// Rejects DROP INDEX of the unique index that a foreign key uses to find its
@@ -1934,28 +1950,54 @@ fn reject_drop_of_foreign_key_index(
     else {
         return Ok(());
     };
-    let used_by_foreign_key = schema
+    let dropped = match schema_name {
+        Some(schema_name) if !namespace.is_root() => format!("index {schema_name}.{name}"),
+        _ => format!("index {name}"),
+    };
+    let mut dependents: Vec<String> = schema
         .resolved_fks_referencing(namespace, &index.table_name)?
         .iter()
-        .any(|fk_ref| {
+        .filter(|fk_ref| {
             fk_ref
                 .parent_unique_index
                 .as_ref()
                 .is_some_and(|parent_index| Arc::ptr_eq(parent_index, &index))
-        });
-    if !used_by_foreign_key {
+        })
+        .map(|fk_ref| {
+            foreign_key_dependent(
+                conn,
+                &schema,
+                fk_ref.child_namespace,
+                &fk_ref.child_table,
+                &fk_ref.fk,
+                &dropped,
+            )
+        })
+        .collect();
+    if dependents.is_empty() {
         return Ok(());
     }
-    Err(sqlstate_error(
-        SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-        match schema_name {
-            Some(schema_name) if !namespace.is_root() => {
-                format!("cannot drop index {schema_name}.{name} because other objects depend on it")
-            }
-            _ => format!("cannot drop index {name} because other objects depend on it"),
-        },
-        None,
-    ))
+    // Sorted, as in reject_removal_of_referenced_table.
+    dependents.sort();
+    Err(LimboError::dependent_objects(dropped, dependents))
+}
+
+/// The line of the DETAIL of a refused DROP of `dropped` that names the
+/// foreign key `fk` of table `child` of namespace `child_namespace`, which
+/// depends on it: "constraint c_pid_fkey on table c depends on table p".
+fn foreign_key_dependent(
+    conn: &Connection,
+    schema: &Schema,
+    child_namespace: NamespaceId,
+    child: &BTreeTable,
+    fk: &ForeignKey,
+    dropped: &str,
+) -> String {
+    format!(
+        "constraint {} on table {} depends on {dropped}",
+        catalog::foreign_key_constraint_name(child, fk),
+        catalog::relation_name(conn, schema, child_namespace, &child.name),
+    )
 }
 
 /// The B-tree table `tbl_name` and its namespace, if it is in the main
@@ -2697,7 +2739,11 @@ fn drop_schema_commands(
                 SchemaObject::View(_) | SchemaObject::Sequence(_) => None,
             })
             .collect();
-        if let Some((table, _)) = foreign_key_from_outside(&conn.current_schema(), &dropped) {
+        if let Some((_, table, _)) = foreign_keys_from_outside(&conn.current_schema(), &dropped)
+            .into_iter()
+            .next()
+        {
+            let table = &table.declared_name;
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!(
@@ -2780,24 +2826,35 @@ fn drop_relations_commands(
     }
     let relations: Vec<Relation> = targets.iter().map(|(target, _)| target.clone()).collect();
     let dropped = in_drop_order(&schema, &relations, stmt.cascade);
-    if let Some((table, referenced)) = foreign_key_from_outside(&schema, &dropped) {
-        return Err(if stmt.cascade {
-            sqlstate_error(
+    let from_outside = foreign_keys_from_outside(&schema, &dropped);
+    if let Some((_, table, fk)) = from_outside.first() {
+        if stmt.cascade {
+            return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!(
                     "DROP ... CASCADE is not supported when a foreign key of a table that is \
-                     not dropped references a dropped table: table {table} references table \
-                     {referenced}"
+                     not dropped references a dropped table: table {} references table {}",
+                    table.declared_name, fk.parent_table
                 ),
                 None,
-            )
-        } else {
-            sqlstate_error(
-                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop desired object(s) because other objects depend on them",
-                Some(format!("table {table} references table {referenced}")),
-            )
-        });
+            ));
+        }
+        let dropped_name = |fk: &ForeignKey| {
+            let parent =
+                catalog::relation_name(conn, &schema, fk.parent_namespace, &fk.parent_table);
+            format!("table {parent}")
+        };
+        let mut dependents: Vec<String> = from_outside
+            .iter()
+            .map(|(namespace, table, fk)| {
+                foreign_key_dependent(conn, &schema, *namespace, table, fk, &dropped_name(fk))
+            })
+            .collect();
+        // Sorted, as in reject_removal_of_referenced_table.
+        dependents.sort();
+        return Err(crate::error::several_dropped_objects_have_dependents(
+            LimboError::dependent_objects(dropped_name(fk), dependents),
+        ));
     }
     for relation in dropped {
         let target_sql = targets
@@ -2856,32 +2913,36 @@ fn namespace_with_relation(
         })
 }
 
-/// The names of a table that is not among `dropped` and of a table among
-/// `dropped` that a foreign key of the first one references. PostgreSQL
-/// drops such a foreign key with CASCADE, which is not supported.
-fn foreign_key_from_outside(schema: &Schema, dropped: &[Relation]) -> Option<(String, String)> {
+/// The foreign keys, with the namespace and the table that has each one, of
+/// the tables that are not among `dropped` and that reference a table among
+/// `dropped`. PostgreSQL drops such a foreign key with CASCADE, which is not
+/// supported.
+fn foreign_keys_from_outside(
+    schema: &Schema,
+    dropped: &[Relation],
+) -> Vec<(NamespaceId, Arc<BTreeTable>, Arc<ForeignKey>)> {
     let is_dropped = |namespace: NamespaceId, name: &str| {
         dropped
             .iter()
             .any(|relation| relation.0 == namespace && relation.1.eq_ignore_ascii_case(name))
     };
-    schema.namespace_ids().find_map(|namespace| {
-        schema
-            .tables(namespace)
-            .filter(|table| !is_dropped(namespace, table.get_name()))
-            .find_map(|table| {
-                let foreign_key = table
-                    .btree()?
-                    .foreign_keys
-                    .iter()
-                    .find(|fk| is_dropped(fk.parent_namespace, &fk.parent_table))?
-                    .clone();
-                Some((
-                    table.get_name().to_string(),
-                    foreign_key.parent_table.clone(),
-                ))
-            })
-    })
+    let mut found = Vec::new();
+    for namespace in schema.namespace_ids() {
+        for table in schema.tables(namespace) {
+            let Some(table) = table.btree() else {
+                continue;
+            };
+            if is_dropped(namespace, &table.name) {
+                continue;
+            }
+            for fk in &table.foreign_keys {
+                if is_dropped(fk.parent_namespace, &fk.parent_table) {
+                    found.push((namespace, Arc::clone(&table), Arc::clone(fk)));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// `relations` in an order in which they can be dropped: each one after the
