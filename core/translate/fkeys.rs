@@ -1770,7 +1770,7 @@ fn emit_fk_action_subprogram(
     };
     let subprograms = resolver.compiled_subprograms.clone();
 
-    let subprogram = if let Some(subprogram) = subprograms.find(&key) {
+    let subprogram = if let Some((subprogram, _)) = subprograms.find(&key) {
         assert!(
             !matches!(subprogram, Subprogram::Pending(_)) || program.flags.is_subprogram(),
             "recursive foreign-key action calls must be emitted from a subprogram"
@@ -1790,7 +1790,7 @@ fn emit_fk_action_subprogram(
         subprogram_builder
             .flags
             .set_writes_stored_values(ctx.new_key_is_stored);
-        let pending = subprograms.start(key);
+        let pending = subprograms.start(key, None);
         subprogram_builder.prologue();
         // Foreign-key actions see every row and need no privileges, as in
         // PostgreSQL, so a cascading delete also removes the rows that

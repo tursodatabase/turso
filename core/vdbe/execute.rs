@@ -6164,9 +6164,20 @@ pub fn op_program(
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
-                // The compiler stops at the same depth. But a foreign key action
-                // that cascades to its own table executes one program for each
-                // level of the cascade, with no compilation.
+                // Recursive triggers are disabled, as in SQLite without PRAGMA
+                // recursive_triggers: a trigger does not fire while it is running.
+                // The statement compiles each trigger once and calls it from every
+                // place it fires, so this cannot be decided when compiling.
+                if let Some(trigger) = &subprogram.trigger {
+                    if connection.is_trigger_executing(trigger) {
+                        state.pc += 1;
+                        state.active_op_state.clear();
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                }
+                // The compiler stops at the same depth. But a subprogram compiled
+                // once runs at every level where it fires, for example a foreign
+                // key action that cascades to its own table, with no compilation.
                 if state.subprogram_depth >= crate::vdbe::MAX_TRIGGER_DEPTH {
                     return Err(
                         LimboError::SqlError(crate::vdbe::TRIGGER_DEPTH_ERROR.to_string()).into(),

@@ -174,7 +174,7 @@ pub struct Resolver<'a> {
     pub(crate) automatic_index: bool,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
-    /// Foreign-key action subprograms compiled so far for this
+    /// Trigger and foreign-key action subprograms compiled so far for this
     /// statement, shared with forked resolvers.
     pub(super) compiled_subprograms: CompiledSubprograms,
     /// Number of queries that the planner plans one inside the other: subqueries,

@@ -1,9 +1,62 @@
 @database :memory:
 
-# A statement compiles each foreign-key action once and calls that program
-# from every place it fires, including inside other actions. Turso used to
-# compile a new copy at every place, so the program grew exponentially with
-# the number of actions that fire each other.
+# A statement compiles each trigger and each foreign-key action once and calls
+# that program from every place it fires, including inside other triggers and
+# actions. Turso used to compile a new copy at every place, so a table with nine
+# triggers whose bodies fire each other took minutes to compile one INSERT.
+
+test triggers-that-fire-each-other-compile-once {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    CREATE TRIGGER tr_ins_0 BEFORE INSERT ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_del_0 BEFORE DELETE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_upd_0 BEFORE UPDATE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_ins_1 BEFORE INSERT ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_del_1 BEFORE DELETE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_upd_1 BEFORE UPDATE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_ins_2 BEFORE INSERT ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_del_2 BEFORE DELETE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_upd_2 BEFORE UPDATE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    INSERT INTO t VALUES(5,5);
+    SELECT count(*) FROM t;
+}
+expect {
+    16
+}
+
+# The INSERT fires tr_t first. tr_a is compiled inside tr_t, where tr_a's own
+# call to tr_t is recursive. The INSERT then fires tr_a directly and reuses that
+# program, and there tr_a must fire tr_t, so a trigger that is already running
+# is skipped when the program runs, not when it is compiled.
+test trigger-program-compiled-inside-another-trigger-fires-it-when-reused {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr_t AFTER INSERT ON t WHEN NEW.a < 3 BEGIN INSERT INTO log VALUES('T' || NEW.a); INSERT INTO t VALUES(NEW.a + 1); END;
+    CREATE TRIGGER tr_a AFTER INSERT ON t WHEN NEW.a < 3 BEGIN INSERT INTO log VALUES('A' || NEW.a); INSERT INTO t VALUES(NEW.a + 1); END;
+    INSERT INTO t VALUES(0);
+    SELECT group_concat(x, ',') FROM log;
+    SELECT group_concat(a, ',') FROM t;
+}
+expect {
+    A0,T1,T0,A1
+    0,1,2,1,2
+}
+
+setup two_tables_whose_triggers_fire_each_other {
+    CREATE TABLE p(a INTEGER);
+    CREATE TABLE q(a INTEGER);
+    CREATE TRIGGER p_ai AFTER INSERT ON p BEGIN INSERT INTO q VALUES(NEW.a); DELETE FROM q WHERE a = NEW.a; END;
+    CREATE TRIGGER q_ai AFTER INSERT ON q BEGIN INSERT INTO p VALUES(NEW.a); END;
+    CREATE TRIGGER q_ad AFTER DELETE ON q BEGIN INSERT INTO p VALUES(OLD.a); END;
+}
+
+# Each trigger appears as one subprogram. p_ai's body calls itself through
+# q_ai and q_ad; those calls run the program being compiled and are skipped
+# when they run.
+@skip-if mvcc "mvcc has different root pages"
+@setup two_tables_whose_triggers_fire_each_other
+snapshot triggers-that-fire-each-other-are-one-subprogram-each {
+    INSERT INTO p VALUES(1);
+}
 
 # Each cascade on t runs an UPDATE or DELETE on t, which fires all eight
 # actions again.

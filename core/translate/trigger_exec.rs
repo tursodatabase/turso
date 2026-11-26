@@ -2,6 +2,7 @@ use crate::alloc::StatementAllocationSite;
 use crate::ast::{self, Expr, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, Column, ForeignKey, Trigger};
+use crate::security::roles::RoleId;
 use crate::sync::{Arc, OnceLock, Weak};
 use crate::translate::collate::column_collation;
 use crate::translate::expr::WalkControl;
@@ -79,7 +80,7 @@ impl TriggerContext {
 /// Only columns actually referenced in the trigger body get assigned a parameter,
 /// reducing bind_at calls from N (total columns) to K (referenced columns).
 #[derive(Debug)]
-struct ParamAllocator {
+pub(super) struct ParamAllocator {
     /// For each column index, the assigned 1-based parameter index, or None if unreferenced.
     new_entries: Vec<Option<NonZero<usize>>>,
     /// Parameter index for NEW.rowid, if referenced.
@@ -149,30 +150,42 @@ impl ParamAllocator {
     }
 }
 
-/// The foreign-key action subprograms compiled so far for the statement being
-/// compiled.
+/// The trigger and foreign-key action subprograms compiled so far for the
+/// statement being compiled.
 ///
 /// Like SQLite's `getRowTrigger`, which also compiles foreign-key actions, a
 /// statement compiles each subprogram once and calls it from every place it
 /// fires, including places inside other subprograms. Compiling a copy at every
-/// place makes the statement grow exponentially with the number of foreign-key
-/// actions that fire each other.
+/// place makes the statement grow exponentially with the number of triggers or
+/// foreign-key actions that fire each other.
 ///
 /// This is shared with forked resolvers, because UPDATE and DELETE fire their
-/// foreign-key actions through a forked resolver.
+/// triggers and foreign-key actions through a forked resolver.
 #[derive(Clone, Default)]
 pub(super) struct CompiledSubprograms(Rc<RefCell<Vec<CompiledSubprogram>>>);
 
 /// One compiled, or still compiling, subprogram.
 struct CompiledSubprogram {
     key: SubprogramKey,
+    /// The parameters that stand for the NEW and OLD values a trigger body
+    /// uses. `None` for a foreign-key action, whose parameters are the old
+    /// parent key and then the new parent key.
+    trigger_params: Option<Rc<ParamAllocator>>,
     /// `Subprogram::Pending` while it is being compiled. A subprogram that
-    /// fires itself again calls the pending program.
+    /// fires itself again calls the pending program. For a trigger, that call
+    /// is skipped when it runs, because recursive triggers are disabled.
     program: Subprogram,
 }
 
 /// What a subprogram runs. A statement compiles one subprogram for each key.
 pub(super) enum SubprogramKey {
+    Trigger {
+        trigger: Arc<Trigger>,
+        override_conflict: Option<ast::ResolveType>,
+        /// The role the trigger body is compiled for. Foreign-key actions
+        /// compile the triggers they fire as the superuser.
+        row_security_role: RoleId,
+    },
     FkAction {
         foreign_key: Arc<ForeignKey>,
         parent_change: FkActionParentChange,
@@ -182,6 +195,22 @@ pub(super) enum SubprogramKey {
 impl SubprogramKey {
     fn is_same(&self, other: &SubprogramKey) -> bool {
         match (self, other) {
+            (
+                Self::Trigger {
+                    trigger,
+                    override_conflict,
+                    row_security_role,
+                },
+                Self::Trigger {
+                    trigger: other_trigger,
+                    override_conflict: other_override_conflict,
+                    row_security_role: other_row_security_role,
+                },
+            ) => {
+                Arc::ptr_eq(trigger, other_trigger)
+                    && override_conflict == other_override_conflict
+                    && row_security_role == other_row_security_role
+            }
             (
                 Self::FkAction {
                     foreign_key,
@@ -194,29 +223,39 @@ impl SubprogramKey {
             ) => {
                 Arc::ptr_eq(foreign_key, other_foreign_key) && parent_change == other_parent_change
             }
+            (Self::Trigger { .. }, Self::FkAction { .. })
+            | (Self::FkAction { .. }, Self::Trigger { .. }) => false,
         }
     }
 }
 
 impl CompiledSubprograms {
-    /// The subprogram for `key`, if the statement has compiled it or is
-    /// compiling it.
-    pub(super) fn find(&self, key: &SubprogramKey) -> Option<Subprogram> {
+    /// The subprogram for `key` and its trigger parameters, if the statement
+    /// has compiled it or is compiling it.
+    pub(super) fn find(
+        &self,
+        key: &SubprogramKey,
+    ) -> Option<(Subprogram, Option<Rc<ParamAllocator>>)> {
         self.0
             .borrow()
             .iter()
             .find(|entry| entry.key.is_same(key))
-            .map(|entry| entry.program.clone())
+            .map(|entry| (entry.program.clone(), entry.trigger_params.clone()))
     }
 
     /// Add a pending subprogram for `key`, to be filled by
     /// `PendingSubprogram::finish` when its compilation ends.
-    pub(super) fn start(&self, key: SubprogramKey) -> PendingSubprogram {
+    pub(super) fn start(
+        &self,
+        key: SubprogramKey,
+        trigger_params: Option<Rc<ParamAllocator>>,
+    ) -> PendingSubprogram {
         let slot = Arc::new(OnceLock::new());
         let mut entries = self.0.borrow_mut();
         let index = entries.len();
         entries.push(CompiledSubprogram {
             key,
+            trigger_params,
             program: Subprogram::Pending(slot.clone()),
         });
         PendingSubprogram {
@@ -619,8 +658,9 @@ fn rewrite_trigger_expr_single_for_subprogram(
     Ok(())
 }
 
-/// Execute trigger commands by compiling them as a subprogram and emitting Program instruction
-/// Returns true if there are triggers that will fire.
+/// Emit an `Insn::Program` that runs the trigger's WHEN clause and commands,
+/// compiling them into a subprogram the first time the statement fires the
+/// trigger.
 #[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 fn execute_trigger_commands(
     program: &mut ProgramBuilder,
@@ -630,29 +670,101 @@ fn execute_trigger_commands(
     connection: &Arc<crate::Connection>,
     namespace: NamespaceRef,
     ignore_jump_target: BranchOffset,
-) -> Result<bool> {
-    struct TriggerCompilationGuard {
-        connection: Arc<crate::Connection>,
-    }
+) -> Result<()> {
+    let key = SubprogramKey::Trigger {
+        trigger: trigger.clone(),
+        override_conflict: ctx.override_conflict,
+        row_security_role: resolver.row_security_role,
+    };
+    let (subprogram, params) = match resolver.compiled_subprograms.find(&key) {
+        Some((subprogram, params)) => (
+            subprogram,
+            params.expect("a trigger subprogram has trigger parameters"),
+        ),
+        None => {
+            let Some(depth) = program.nested_subprogram_depth() else {
+                return Ok(());
+            };
+            compile_trigger_subprogram(
+                program, resolver, key, trigger, ctx, connection, namespace, depth,
+            )?
+        }
+    };
 
-    impl Drop for TriggerCompilationGuard {
-        fn drop(&mut self) {
-            self.connection.end_trigger_compilation();
+    // Trigger subprograms do not emit Transaction opcodes, so the parent statement
+    // must acquire any attached/temp database transactions the trigger body needs
+    // before OP_Program enters the subprogram. A pending subprogram is one this
+    // program is nested in, and the parent of that subprogram acquires them.
+    if let Subprogram::PreparedProgram(subprogram_prepared) = &subprogram {
+        for db_id in &subprogram_prepared.write_databases {
+            if db_id == crate::MAIN_DB_ID {
+                program.begin_write_operation()?;
+            } else {
+                let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
+                program.begin_write_on_database(db_id, schema_cookie)?;
+            }
+        }
+        for db_id in &subprogram_prepared.read_databases {
+            if subprogram_prepared.write_databases.get(db_id) {
+                continue;
+            }
+            if db_id == crate::MAIN_DB_ID {
+                program.begin_read_operation()?;
+            } else {
+                let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
+                program.begin_read_on_database(db_id, schema_cookie)?;
+            }
         }
     }
 
-    if connection.trigger_is_compiling(trigger) {
-        // Do not recursively compile the same trigger
-        return Ok(false);
-    }
-    let Some(depth) = program.nested_subprogram_depth() else {
-        return Ok(true);
-    };
-    connection.start_trigger_compilation(trigger.clone());
-    let _trigger_compilation_guard = TriggerCompilationGuard {
-        connection: connection.clone(),
-    };
+    // Build the param_registers Vec from the sparse allocator: maps each parameter
+    // index to the parent register that holds the value.
+    let total_params = params.num_params();
+    let mut param_registers = vec![0usize; total_params];
 
+    if let Some(new_regs) = &ctx.new_registers {
+        for (col_idx, opt_param) in params.new_entries.iter().enumerate() {
+            if let Some(param_idx) = opt_param {
+                param_registers[param_idx.get() - 1] = new_regs[col_idx];
+            }
+        }
+        if let Some(param_idx) = params.new_rowid {
+            param_registers[param_idx.get() - 1] = *new_regs.last().unwrap();
+        }
+    }
+    if let Some(old_regs) = &ctx.old_registers {
+        for (col_idx, opt_param) in params.old_entries.iter().enumerate() {
+            if let Some(param_idx) = opt_param {
+                param_registers[param_idx.get() - 1] = old_regs[col_idx];
+            }
+        }
+        if let Some(param_idx) = params.old_rowid {
+            param_registers[param_idx.get() - 1] = *old_regs.last().unwrap();
+        }
+    }
+
+    program.emit_insn(Insn::Program {
+        param_registers,
+        program: subprogram,
+        ignore_jump_target,
+    });
+
+    Ok(())
+}
+
+/// Compile the trigger's commands into a subprogram and add it to
+/// `resolver.compiled_subprograms` under `key`.
+#[allow(clippy::too_many_arguments)]
+fn compile_trigger_subprogram(
+    program: &ProgramBuilder,
+    resolver: &mut Resolver,
+    key: SubprogramKey,
+    trigger: &Arc<Trigger>,
+    ctx: &TriggerContext,
+    connection: &Arc<crate::Connection>,
+    namespace: NamespaceRef,
+    depth: usize,
+) -> Result<(Subprogram, Rc<ParamAllocator>)> {
     let has_new = ctx.new_registers.is_some();
     let has_old = ctx.old_registers.is_some();
     let num_cols = ctx.table.columns().len();
@@ -683,6 +795,9 @@ fn execute_trigger_commands(
         override_conflict: ctx.override_conflict,
         db_name,
     };
+    // Rewrite the WHEN clause and every command before compiling any of them,
+    // so that the parameters are final when a nested trigger calls this
+    // pending program.
     let when_expr = match &trigger.when_clause {
         Some(when_expr) => {
             let mut when_expr = when_expr.clone();
@@ -691,6 +806,17 @@ fn execute_trigger_commands(
         }
         None => None,
     };
+    let stmts = trigger
+        .commands
+        .iter()
+        .map(|command| trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx))
+        .collect::<Result<Vec<_>>>()?;
+    let params = Rc::new(subprogram_ctx.param_alloc.into_inner());
+
+    let pending = resolver
+        .compiled_subprograms
+        .start(key, Some(params.clone()));
+
     // The compilation of nested triggers recurses one time for each level, so
     // new_program_builder makes the large builder in its own stack frame, and
     // not in the frame of this function.
@@ -769,8 +895,7 @@ fn execute_trigger_commands(
                 target_pc: trigger_end,
             });
         }
-        for command in trigger.commands.iter() {
-            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+        for (command, stmt) in trigger.commands.iter().zip(stmts) {
             translate_inner(
                 stmt,
                 resolver,
@@ -793,68 +918,8 @@ fn execute_trigger_commands(
     resolver.register_columns = saved_register_columns;
     result?;
     subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram =
-        build_program(subprogram_builder, connection, true, "trigger subprogram")?;
-    let subprogram_prepared = built_subprogram.prepared();
-
-    // Trigger subprograms do not emit Transaction opcodes, so the parent statement
-    // must acquire any attached/temp database transactions the trigger body needs
-    // before OP_Program enters the subprogram.
-    for db_id in &subprogram_prepared.write_databases {
-        if db_id == crate::MAIN_DB_ID {
-            program.begin_write_operation()?;
-        } else {
-            let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_write_on_database(db_id, schema_cookie)?;
-        }
-    }
-    for db_id in &subprogram_prepared.read_databases {
-        if subprogram_prepared.write_databases.get(db_id) {
-            continue;
-        }
-        if db_id == crate::MAIN_DB_ID {
-            program.begin_read_operation()?;
-        } else {
-            let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_read_on_database(db_id, schema_cookie)?;
-        }
-    }
-
-    // Build the param_registers Vec from the sparse allocator: maps each parameter
-    // index to the parent register that holds the value.
-    let alloc = subprogram_ctx.param_alloc.borrow();
-    let total_params = alloc.num_params();
-    let mut param_registers = vec![0usize; total_params];
-
-    if let Some(new_regs) = &ctx.new_registers {
-        for (col_idx, opt_param) in alloc.new_entries.iter().enumerate() {
-            if let Some(param_idx) = opt_param {
-                param_registers[param_idx.get() - 1] = new_regs[col_idx];
-            }
-        }
-        if let Some(param_idx) = alloc.new_rowid {
-            param_registers[param_idx.get() - 1] = *new_regs.last().unwrap();
-        }
-    }
-    if let Some(old_regs) = &ctx.old_registers {
-        for (col_idx, opt_param) in alloc.old_entries.iter().enumerate() {
-            if let Some(param_idx) = opt_param {
-                param_registers[param_idx.get() - 1] = old_regs[col_idx];
-            }
-        }
-        if let Some(param_idx) = alloc.old_rowid {
-            param_registers[param_idx.get() - 1] = *old_regs.last().unwrap();
-        }
-    }
-    drop(alloc);
-
-    program.emit_insn(Insn::Program {
-        param_registers,
-        program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
-        ignore_jump_target,
-    });
-
-    Ok(true)
+    let built = build_program(subprogram_builder, connection, true, "trigger subprogram")?;
+    Ok((pending.finish(built.prepared().clone()), params))
 }
 
 /// Rewrite NEW and OLD references in a trigger's WHEN clause into parameters.
@@ -1125,8 +1190,7 @@ pub fn fire_trigger(
         connection,
         namespace,
         ignore_jump_target,
-    )?;
-    Ok(())
+    )
 }
 
 fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
