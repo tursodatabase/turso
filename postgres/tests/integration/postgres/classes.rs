@@ -1025,3 +1025,26 @@ fn long_relation_names_survive_schema_reload(db: TempDatabase) {
         pg.execute(format!("DROP TABLE \"{name}\"")).unwrap();
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn quoted_relation_names_keep_engine_lookup(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE \"MiXeD\" (id int, x text)")
+        .unwrap();
+    pg.execute("CREATE INDEX \"IxX\" ON \"MiXeD\"(x)").unwrap();
+    pg.execute("CREATE VIEW \"ViEw\" AS SELECT x FROM \"MiXeD\"")
+        .unwrap();
+    for name in ["MiXeD", "IxX", "ViEw"] {
+        assert!(class_row(pg.inner(), name).is_some(), "missing {name}");
+    }
+    let oid = class_row(pg.inner(), "MiXeD").unwrap().0;
+    pg.execute("ALTER TABLE \"MiXeD\" RENAME TO \"NewName\"")
+        .unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    assert_eq!(class_row(pg.inner(), "NewName").unwrap().0, oid);
+    pg.execute("INSERT INTO \"NewName\" VALUES (1, 'x')")
+        .unwrap();
+    pg.execute("DROP VIEW \"ViEw\"").unwrap();
+    pg.execute("DROP TABLE \"NewName\"").unwrap();
+    assert!(class_rows(pg.inner()).is_empty());
+}
