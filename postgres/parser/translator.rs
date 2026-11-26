@@ -2195,6 +2195,20 @@ impl PostgreSQLTranslator {
                     "Write INSERT ... SELECT * FROM (VALUES ...) AS v ORDER BY ... LIMIT n.",
                 ));
             }
+            // PostgreSQL treats VALUES with its own WITH clause as a general
+            // SELECT (isGeneralSelect in transformInsertStmt), where DEFAULT is
+            // not allowed. Core would replace DEFAULT with the column default.
+            if select_stmt.with_clause.is_some()
+                && select_stmt.values_lists.iter().any(|row| {
+                    matches!(&row.node, Some(Node::List(list)) if list.items.iter().any(
+                        |item| matches!(item.node, Some(Node::SetToDefault(_)))
+                    ))
+                })
+            {
+                return Err(ParseError::syntax_error(
+                    "DEFAULT is not allowed in this context",
+                ));
+            }
             let select = ast::Select {
                 with: self.translate_with_clause(&select_stmt.with_clause)?,
                 body: ast::SelectBody {

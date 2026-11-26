@@ -192,6 +192,30 @@ test error-drop-type-used-by-a-cast-in-a-policy {
 @sqlstate 2BP01
 expect error {}
 
+test error-insert-with-values-default {
+    CREATE TABLE t (a int DEFAULT 9, b int);
+    INSERT INTO t (a) WITH x AS (SELECT 1) VALUES (DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+@compat-gap "syntax:values"
+test error-insert-values-union-default {
+    CREATE TABLE t (a int DEFAULT 9, b int);
+    INSERT INTO t (a) VALUES (DEFAULT) UNION VALUES (1);
+}
+@sqlstate 42601
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-insert-select-from-values-default {
+    CREATE TABLE t (a int DEFAULT 9, b int);
+    INSERT INTO t (a) SELECT * FROM (VALUES (DEFAULT)) v;
+}
+@sqlstate 42601
+expect error {}
+
 # The statements below are valid PostgreSQL that tursopg refuses. A refusal
 # has SQLSTATE 0A000, never a syntax error or an internal error.
 
