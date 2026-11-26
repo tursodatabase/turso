@@ -307,6 +307,7 @@ impl Affinity {
     /// in `OP_Eq` (see `applyNumericAffinity` in `vdbeaux.c`); int-vs-real
     /// comparisons fall through to `sqlite3IntFloatCompare`, which keeps the
     /// integer at full 64-bit precision.
+    #[inline]
     pub fn convert_for_compare<'a>(
         &self,
         val: &'a impl AsValueRef,
@@ -318,8 +319,11 @@ impl Affinity {
                 .then(|| apply_numeric_affinity(val_ref, false))
                 .flatten()
                 .map(Either::Left),
-            Affinity::Text => self.convert(val),
-            Affinity::Blob | Affinity::None => None,
+            // TEXT affinity converts only numbers (see `convert`). With this
+            // test first, a comparison of two texts, for example with a
+            // NOCASE collation, does not call `convert`.
+            Affinity::Text if matches!(val_ref, ValueRef::Numeric(_)) => self.convert(val),
+            Affinity::Text | Affinity::Blob | Affinity::None => None,
         }
     }
 
