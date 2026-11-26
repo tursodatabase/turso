@@ -2004,6 +2004,26 @@ snapshot gencol_explain_column_range_after_virtual_names_stored_columns {
     SELECT c, d FROM t;
 }
 
+# The ephemeral table that buffers RETURNING rows holds the RETURNING values in
+# their own order, not the stored columns of the table.
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_stored_columns_after_virtual
+snapshot gencol_explain_insert_returning_names_returning_columns {
+    INSERT INTO t(a, b, c, d) VALUES (1, 2, 'x', 4) RETURNING d, v, a;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_stored_columns_after_virtual
+snapshot gencol_explain_update_returning_names_returning_columns {
+    UPDATE t SET d = 1 RETURNING d, v, a;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_stored_columns_after_virtual
+snapshot gencol_explain_delete_returning_names_returning_columns {
+    DELETE FROM t RETURNING c, a;
+}
+
 # A WITHOUT ROWID table stores its primary key columns first.
 setup gencol_without_rowid_primary_key_last {
     CREATE TABLE w(x INT, v AS (x + 1), y INT, z INT PRIMARY KEY) WITHOUT ROWID;
@@ -2013,6 +2033,12 @@ setup gencol_without_rowid_primary_key_last {
 @setup gencol_without_rowid_primary_key_last
 snapshot gencol_explain_without_rowid_names_stored_columns {
     SELECT x, y, z FROM w;
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@setup gencol_without_rowid_primary_key_last
+snapshot gencol_explain_without_rowid_returning_names_returning_columns {
+    INSERT INTO w(x, y, z) VALUES (1, 2, 3) RETURNING z, v, x;
 }
 
 # =============================================================================

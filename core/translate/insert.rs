@@ -482,15 +482,12 @@ pub fn translate_insert(
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
     if !result_columns.is_empty() {
-        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: ret_cursor_id,
-            is_table: true,
-        });
-        ctx.returning_buffer = Some(ReturningBufferCtx {
-            cursor_id: ret_cursor_id,
-            num_columns: result_columns.len(),
-        });
+        ctx.returning_buffer = Some(ReturningBufferCtx::open(
+            program,
+            &btree_table.name,
+            &result_columns,
+            &table_references,
+        )?);
     }
 
     if resolver
@@ -3609,15 +3606,12 @@ fn translate_virtual_table_insert(
     let returning_buffer = if result_columns.is_empty() {
         None
     } else {
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table()?));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id,
-            is_table: true,
-        });
-        Some(ReturningBufferCtx {
-            cursor_id,
-            num_columns: result_columns.len(),
-        })
+        Some(ReturningBufferCtx::open(
+            program,
+            &virtual_table.name,
+            &result_columns,
+            &table_references,
+        )?)
     };
     emit_non_from_clause_subqueries_for_eval_at(
         program,
