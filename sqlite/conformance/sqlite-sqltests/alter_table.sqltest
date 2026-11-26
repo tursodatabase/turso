@@ -16,6 +16,24 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-leaves-rows-of-other-tables {
+    CREATE TABLE a(x UNIQUE);
+    CREATE TABLE a_b(y UNIQUE);
+    CREATE TABLE u(c);
+    CREATE TRIGGER a AFTER INSERT ON u BEGIN SELECT 1; END;
+    ALTER TABLE a RENAME TO z;
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY rowid;
+}
+expect {
+    table|z|z
+    index|sqlite_autoindex_z_1|z
+    table|a_b|a_b
+    index|sqlite_autoindex_a_b_1|a_b
+    table|u|u
+    trigger|a|u
+}
+
+@cross-check-integrity
 test alter-table-rename-table {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY, u);
     ALTER TABLE t1 RENAME TO t2;
