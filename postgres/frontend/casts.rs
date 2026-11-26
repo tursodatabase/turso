@@ -78,6 +78,17 @@ impl CastType {
         matches!(self, Self::Int2 | Self::Int4 | Self::Int8)
     }
 
+    /// The smallest number that a type of integers holds.
+    fn smallest_integer(self) -> Option<i64> {
+        match self {
+            Self::Int2 => Some(i64::from(i16::MIN)),
+            Self::Int4 => Some(i64::from(i32::MIN)),
+            Self::Int8 => Some(i64::MIN),
+            Self::Oid => Some(0),
+            _ => None,
+        }
+    }
+
     fn is_float(self) -> bool {
         matches!(self, Self::Float4 | Self::Float8)
     }
@@ -159,6 +170,17 @@ pub(crate) fn cast_rows() -> impl Iterator<Item = (CastType, CastType, &'static 
         };
         (cast.source, cast.target, context, "f")
     })
+}
+
+/// Whether the cast of a value of `source` to `target` changes the number that
+/// the engine stores, so that comparing the numbers as they are stored gives
+/// another answer than comparing the cast values. `source` is `None` for a
+/// value of unknown type, such as a parameter. A negative integer cast to a
+/// type that holds no negative number wraps around to a large one.
+pub(crate) fn wraps_negative_integers(source: Option<CastType>, target: CastType) -> bool {
+    source != Some(target)
+        && target.smallest_integer().is_some_and(|min| min >= 0)
+        && source.is_none_or(|source| source.smallest_integer().is_some_and(|min| min < 0))
 }
 
 pub(crate) enum Resolution {

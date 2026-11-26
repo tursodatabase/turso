@@ -834,3 +834,230 @@ expect error {
 expect @tursopg {
     f
 }
+
+# An oid has comparisons and no arithmetic. An integer converts to oid, and
+# an oid converts to no other type, so an integer next to an oid is read as
+# an oid.
+
+setup oid_operands {
+    CREATE TABLE oid_operands (
+        o oid, o2 oid, i integer, i2 smallint, i8 bigint, n numeric,
+        f double precision, s text
+    );
+    INSERT INTO oid_operands VALUES (3000000000, 5, 5, 5, 5, 5.5, 5.5, '5');
+}
+
+@setup oid_operands
+test oid-compares-with-oid {
+    SELECT o = o, o <> o2, o < o2, o > o2, o <= o2, o >= o2 FROM oid_operands;
+}
+expect {
+    t|t|f|t|f|t
+}
+
+@setup oid_operands
+test oid-compares-with-integers {
+    SELECT o2 = i, i = o2, o > i, o2 < 6 FROM oid_operands;
+}
+expect {
+    t|t|t|t
+}
+
+@setup oid_operands
+test oid-compares-with-smallint {
+    SELECT o2 = i2, i2 <> o2 FROM oid_operands;
+}
+expect {
+    t|f
+}
+
+@setup oid_operands
+test oid-compares-with-bigint {
+    SELECT o2 <= i8, i8 >= o2 FROM oid_operands;
+}
+expect {
+    t|t
+}
+
+test oid-compares-with-negative-integer {
+    SELECT 4294967295::oid = -1, -1 = 4294967295::oid, 4294967295::oid > -1, -1 >= 4294967295::oid,
+        4294967291::oid = (-5)::int2, 2147483648::oid < (-2147483647)::int4;
+}
+expect {
+    t|t|f|t|t|t
+}
+
+test oid-in-list-with-negative-integer {
+    SELECT 4294967295::oid IN (-1, 5), 4294967295::oid NOT IN (-1, 5), 4294967295::oid BETWEEN -2 AND -1;
+}
+expect {
+    t|f|t
+}
+
+test oid-compares-with-negative-bigint-errors {
+    SELECT 4294967295::oid = (-1)::int8;
+}
+@sqlstate 22003
+expect error {
+    OID out of range
+}
+
+@setup oid_operands
+test oid-compares-with-text-read-as-oid {
+    SELECT o2 = '5', ' 5' = o2, o > '4294967295' FROM oid_operands;
+}
+expect {
+    t|t|f
+}
+
+@setup oid_operands
+test oid-compares-with-hex-text {
+    SELECT '0x5' = o2 FROM oid_operands;
+}
+expect {
+    t
+}
+
+@setup oid_operands
+test oid-in-list-with-hex-text {
+    SELECT o2 IN ('0x5', 1) FROM oid_operands;
+}
+expect {
+    t
+}
+
+@setup oid_operands
+test oid-compares-with-text-that-is-not-an-oid {
+    SELECT o2 = 'five' FROM oid_operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "five"
+}
+
+@setup oid_operands
+test oid-compares-with-text-above-the-largest-oid {
+    SELECT o2 = '4294967296' FROM oid_operands;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+@setup oid_operands
+test oid-in-list-and-between {
+    SELECT o2 IN (1, 5), o2 NOT IN (1, 2), o2 BETWEEN 1 AND 6, o > 2147483647
+    FROM oid_operands;
+}
+expect {
+    t|t|t|t
+}
+
+@setup oid_operands
+test oid-plus-integer-errors {
+    SELECT o + i FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+@setup oid_operands
+test integer-minus-oid-errors {
+    SELECT i - o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer - oid
+}
+
+@setup oid_operands
+test oid-times-bigint-errors {
+    SELECT o * i8 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \* bigint
+}
+
+@setup oid_operands
+test oid-plus-oid-errors {
+    SELECT o + o2 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ oid
+}
+
+@setup oid_operands
+test oid-plus-literal-errors {
+    SELECT o + 1 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+@setup oid_operands
+test negative-oid-errors {
+    SELECT -o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: - oid
+}
+
+@setup oid_operands
+test oid-bit-and-integer-errors {
+    SELECT o & i FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid & integer
+}
+
+@setup oid_operands
+test oid-equals-numeric-errors {
+    SELECT o = n FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid = numeric
+}
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: oid = double precision
+}
+
+@setup oid_operands
+test double-precision-less-than-oid-errors {
+    SELECT f < o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: double precision < oid
+}
+
+@setup oid_operands
+test oid-equals-text-errors {
+    SELECT o = s FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid = text
+}
+
+test oid-cast-plus-integer-errors {
+    SELECT 1::oid + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+test oid-cast-compares-with-integer {
+    SELECT 1::oid = 1, 3000000000::oid > 5, 5 < 3000000000::oid;
+}
+expect {
+    t|t|t
+}

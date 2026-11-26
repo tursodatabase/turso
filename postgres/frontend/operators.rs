@@ -1,13 +1,14 @@
 //! The operators of PostgreSQL's `pg_operator` that the frontend has, and
 //! the refusal of an operator that has no row for the types of its operands.
 
+use crate::casts::{resolve, wraps_negative_integers, CastType};
 use crate::catalog::{pg_type_category, pg_type_name, pg_type_oid};
 use crate::error::sqlstate_error;
 use crate::functions::{format_type, undefined_operator_of, validate_pg_input};
 use crate::pg_type::{IntegerOperator, IntegerType};
 use turso_core::ast;
 use turso_core::dialect::{
-    ChosenOperator, EngineType, OperandType, OperatorChoice, OperatorFunction,
+    CastContext, ChosenOperator, EngineType, OperandType, OperatorChoice, OperatorFunction,
 };
 use turso_core::types::Type as _;
 use turso_core::Result;
@@ -57,7 +58,10 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     let (literal, ty) = match (operands, types.as_slice()) {
         ([OperandType::StringLiteral(literal), _], [_, Some(ty)])
         | ([_, OperandType::StringLiteral(literal)], [Some(ty), _]) => (literal, ty),
-        _ => return Ok(integer_operator_choice(op, &types)),
+        _ => {
+            let choice = implicit_cast_choice(op, &types);
+            return Ok(choice.unwrap_or_else(|| integer_operator_choice(op, &types)));
+        }
     };
     // The engine reads a literal next to a value of another type as that
     // type already, with the input function of the type.
@@ -77,6 +81,57 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
         operands: vec![ty.cast_to.clone(), ty.cast_to.clone()],
         cast_operands: vec![],
         function: integer_operator_function(op, &[ty, ty]),
+    }))
+}
+
+/// FIXME(registered-types): The engine casts an operand that is not a string literal only when the choice says so (`cast_operands`), and this says so only for a cast that wraps a negative integer, which is the cast of an integer to oid. The cast of any other operand to the type of the row is left to the engine, which compares the stored numbers. Once the operand casts come from the operator that `id` names, the choice of any operator says so.
+/// PostgreSQL's choice of an operator for operands that no row takes as they
+/// are (`oper_select_candidate` in parse_oper.c): of the rows named `op` that
+/// every operand converts to with an implicit cast, the one that most operands
+/// have the type of. An operand of unknown type is taken to have the type of
+/// the other. A choice is only given when a cast wraps a negative integer,
+/// as an integer next to an oid does, and the operands that it casts are those.
+fn implicit_cast_choice(op: &str, types: &[Option<Checked>]) -> Option<OperatorChoice> {
+    let [left, right] = types else {
+        return None;
+    };
+    let (left_oid, right_oid) = match (left, right) {
+        (Some(left), Some(right)) => (left.oid, right.oid),
+        (Some(known), None) | (None, Some(known)) => (known.oid, known.oid),
+        (None, None) => return None,
+    };
+    let exact_matches =
+        |row: &Operator| usize::from(row.left == left_oid) + usize::from(row.right == right_oid);
+    let candidates = || {
+        OPERATORS.iter().filter(|row| {
+            row.name == op
+                && row.left != NONE
+                && implicitly_casts(left_oid, row.left)
+                && implicitly_casts(right_oid, row.right)
+        })
+    };
+    let most = candidates().map(exact_matches).max()?;
+    let mut best = candidates().filter(|row| exact_matches(row) == most);
+    let row = best.next().filter(|_| best.next().is_none())?;
+    let cast_operands = vec![
+        casts_wrapping(left.as_ref(), row.left),
+        casts_wrapping(right.as_ref(), row.right),
+    ];
+    if !cast_operands.contains(&true) {
+        return None;
+    }
+    let wanted = |oid: i64| ast::Type {
+        name: pg_type_name(oid)
+            .expect("a row names types of pg_type")
+            .to_string(),
+        size: None,
+        array_dimensions: 0,
+    };
+    Some(OperatorChoice::Chosen(ChosenOperator {
+        id: row.oid,
+        operands: vec![wanted(row.left), wanted(row.right)],
+        cast_operands,
+        function: None,
     }))
 }
 
@@ -199,7 +254,10 @@ pub(crate) fn choose_list_operator(
     Ok(Some(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: vec![ty.cast_to.clone(); operands.len()],
-        cast_operands: vec![],
+        cast_operands: types
+            .iter()
+            .map(|operand| casts_wrapping(operand.as_ref(), common))
+            .collect(),
         function: None,
     })))
 }
@@ -290,7 +348,7 @@ fn is_run_by_core(op: &str, types: &[Option<Checked>]) -> bool {
 /// FIXME(registered-types): The engine stores numeric and double precision both as REAL, and cannot hold NaN or an exponent past a double, so these spellings are compared as text and give false. Once numeric is a registered type with its own storage, the input function of the type reads every spelling and this function goes away.
 /// Whether `literal` is a value of the type `oid` that PostgreSQL reads but
 /// the engine cannot store or the input check here does not know. The integer
-/// types read every spelling themselves. For a real, a double precision or a
+/// types and oid read every spelling themselves. For a real, a double precision or a
 /// numeric it is a number in the hex, octal or binary spelling or with
 /// underscores between digits, NaN and the infinities, and a number with an
 /// exponent past the range of a double, which a numeric holds. The engine
@@ -298,7 +356,7 @@ fn is_run_by_core(op: &str, types: &[Option<Checked>]) -> bool {
 /// refused for either. The operator is left to the engine for these, as for
 /// any literal.
 fn is_spelling_left_to_the_engine(literal: &str, oid: i64) -> bool {
-    if [INT2, INT4, INT8].contains(&oid) {
+    if [INT2, INT4, INT8, OID].contains(&oid) {
         return false;
     }
     let text = literal.trim();
@@ -488,8 +546,9 @@ fn check_operator(op: &str, types: &[Option<i64>]) -> Result<()> {
 /// FIXME(pg-catalog): `OPERATORS` has no rows for interval, time, bytea, json, jsonb, inet, arrays and enums, and for a comparison of date with timestamp or timestamptz (which tursopg refuses with 0A000), so an operand of those types is not checked. Once pg_operator has all 799 rows, every operand is checked and a type with no row is an error.
 /// The types whose operators are decided by the rows of `OPERATORS`. Varchar
 /// has no rows of its own: it takes the operators of text.
-const CHECKED_TYPES: [i64; 13] = [
+const CHECKED_TYPES: [i64; 14] = [
     BOOL,
+    OID,
     INT2,
     INT4,
     INT8,
@@ -509,12 +568,51 @@ const CHECKED_TYPES: [i64; 13] = [
 /// Whether an operand of type `operand` may be given to an operator that
 /// takes `expected`. `None` is an operand that fits any type.
 fn fits(operand: Option<i64>, expected: i64) -> bool {
+    if operand == Some(OID) || expected == OID {
+        return fits_oid(operand, expected);
+    }
     let expected = pg_type_category(expected);
     match operand {
         None => true,
         Some(TEXT) => matches!(expected, Some("S" | "I" | "U")),
         Some(operand) => pg_type_category(operand) == expected,
     }
+}
+
+/// An oid has the same typcategory as the integers but takes none of their
+/// operators, so it fits an operand that casts to oid implicitly.
+fn fits_oid(operand: Option<i64>, expected: i64) -> bool {
+    expected == OID && operand.is_none_or(|operand| implicitly_casts(operand, OID))
+}
+
+/// Whether casting `operand`, an operand of unknown type when it is `None`, to
+/// the type `wanted` wraps a negative integer around.
+fn casts_wrapping(operand: Option<&Checked>, wanted: i64) -> bool {
+    let source = match operand {
+        Some(operand) => match cast_type_of(operand.oid) {
+            Some(source) => Some(source),
+            None => return false,
+        },
+        None => None,
+    };
+    cast_type_of(wanted).is_some_and(|target| wraps_negative_integers(source, target))
+}
+
+fn cast_type_of(oid: i64) -> Option<CastType> {
+    CastType::from_name(pg_type_name(oid)?)
+}
+
+/// Whether a value of the type `from` converts to the type `to` with an
+/// implicit cast: the rows of `pg_cast` of `casts.rs` for the types that have
+/// them, and `IMPLICIT_CASTS` for the others.
+fn implicitly_casts(from: i64, to: i64) -> bool {
+    from == to
+        || casts_implicitly(from, to)
+        || matches!(
+            (cast_type_of(from), cast_type_of(to)),
+            (Some(source), Some(target))
+                if resolve(source, target, CastContext::Implicit).is_ok()
+        )
 }
 
 const COMPARISONS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
@@ -525,6 +623,7 @@ const INT8: i64 = 20;
 const INT2: i64 = 21;
 const INT4: i64 = 23;
 const TEXT: i64 = 25;
+const OID: i64 = 26;
 const FLOAT4: i64 = 700;
 const FLOAT8: i64 = 701;
 const DATE: i64 = 1082;
@@ -637,6 +736,12 @@ pub(crate) const OPERATORS: &[Operator] = operators![
     (592, "-", FLOAT8, FLOAT8, FLOAT8, 0, 0, false, false),
     (593, "/", FLOAT8, FLOAT8, FLOAT8, 0, 0, false, false),
     (594, "*", FLOAT8, FLOAT8, FLOAT8, 594, 0, false, false),
+    (607, "=", OID, OID, BOOL, 607, 608, true, true),
+    (608, "<>", OID, OID, BOOL, 608, 607, false, false),
+    (609, "<", OID, OID, BOOL, 610, 612, false, false),
+    (610, ">", OID, OID, BOOL, 609, 611, false, false),
+    (611, "<=", OID, OID, BOOL, 612, 610, false, false),
+    (612, ">=", OID, OID, BOOL, 611, 609, false, false),
     (620, "=", FLOAT4, FLOAT4, BOOL, 620, 621, true, true),
     (621, "<>", FLOAT4, FLOAT4, BOOL, 621, 620, false, false),
     (622, "<", FLOAT4, FLOAT4, BOOL, 623, 625, false, false),
