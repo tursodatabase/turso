@@ -4,6 +4,7 @@ mod auth_members;
 mod cast_planning;
 mod casts;
 mod catalog;
+mod catalog_column_types;
 mod catalog_table;
 mod classes;
 mod copy;

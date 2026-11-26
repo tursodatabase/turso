@@ -1610,6 +1610,10 @@ impl VirtualTableModule for EmptyPgCatalogTable {
     fn innocuous(&self) -> bool {
         true
     }
+
+    fn declares_column_type(&self, column: &str) -> bool {
+        crate::catalog_column_types::has_postgres_type(&self.create_sql, column)
+    }
 }
 
 impl VirtualTable for EmptyPgCatalogTable {
@@ -2711,6 +2715,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         crate::options::TwoColumnFunction {
             schema: "CREATE TABLE pg_json_each (key TEXT, value TEXT, input TEXT HIDDEN)",
+            columns_of_their_postgres_type: &["key"],
             append_rows: crate::functions::exec_json_each,
         },
     );
@@ -2719,6 +2724,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         crate::options::TwoColumnFunction {
             schema: "CREATE TABLE pg_options_to_table (option_name TEXT, option_value TEXT, options_array TEXT HIDDEN)",
+            columns_of_their_postgres_type: &["option_name", "option_value"],
             append_rows: crate::options::append_options,
         },
     );
@@ -3754,6 +3760,10 @@ impl<T: SnapshotRows> VirtualTableModule for SnapshotCatalog<T> {
     fn innocuous(&self) -> bool {
         true
     }
+
+    fn declares_column_type(&self, column: &str) -> bool {
+        crate::catalog_column_types::has_postgres_type(T::SCHEMA, column)
+    }
 }
 
 impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
@@ -3859,6 +3869,10 @@ where
 
     fn innocuous(&self) -> bool {
         true
+    }
+
+    fn declares_column_type(&self, column: &str) -> bool {
+        crate::catalog_column_types::has_postgres_type(&(self.schema)(), column)
     }
 }
 

@@ -1361,6 +1361,14 @@ expect {
     empty|
 }
 
+test pg-options-to-table-columns-are-text {
+    SELECT quote_ident(option_name) || ' ' || quote_literal(option_value)
+    FROM pg_options_to_table(ARRAY['Name=it''s']);
+}
+expect {
+    "Name" 'it''s'
+}
+
 test pg-options-to-table-nested {
     SELECT * FROM pg_options_to_table(ARRAY[['a=b', 'c=d'], ['e=f', 'g=h']]);
 }
