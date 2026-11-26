@@ -742,6 +742,27 @@ pub(crate) fn emit_store_value(
     Ok(())
 }
 
+/// Runs the COERCE of the type of the rowid alias column `column` on the
+/// rowid in `reg`. A rowid alias of a custom type has no ENCODE (see
+/// `Type::can_be_rowid_alias`).
+pub(crate) fn emit_coerce_rowid(
+    program: &mut ProgramBuilder,
+    column: &Column,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(resolved) = resolver.schema().resolve_type_unchecked(&column.ty_str)? else {
+        return Ok(());
+    };
+    emit_store_value(
+        program,
+        &resolved,
+        reg,
+        Coerce::WithArgs(&column.ty_params),
+        resolver,
+    )
+}
+
 /// FIXME(pg-catalog): This decides by type properties whether a pg_cast entry from `source` to `target` exists, and the text-reading target test stands in for the target side of that lookup. A source that casts to numbers and booleans skips the check for every target, so jsonb::bytea is not refused, although pg_cast has no entry from jsonb to bytea. A lookup in a pg_cast table replaces this.
 /// Fails when a CAST of a value of the custom type `source` to `target`, which
 /// `custom_type_cast_chain` resolves for a custom type and is None for a plain

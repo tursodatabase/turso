@@ -1589,9 +1589,71 @@ fn schema_has_at_most_one_type_of_conditions() {
     );
 }
 
-/// A dialect that registers three types written in Rust: `loud`, a
-/// `boolean` that replaces the type of core, and `truth`, the type of
-/// conditions.
+/// A primary key of a type that can be a rowid alias is the rowid of its
+/// table, and the type still checks the values written to it.
+#[test]
+fn primary_key_of_a_type_that_can_be_a_rowid_alias_is_the_rowid() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-rowid-alias.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (k percent PRIMARY KEY, v TEXT) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (7, 'a')").unwrap();
+    let rows = |sql: &str| conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+
+    assert_eq!(
+        rows("SELECT rowid, k FROM t"),
+        vec![vec![Value::from_i64(7), Value::from_i64(7)]]
+    );
+    assert_eq!(
+        rows("SELECT count(*) FROM sqlite_schema WHERE type = 'index'"),
+        vec![vec![Value::from_i64(0)]]
+    );
+
+    for sql in [
+        "INSERT INTO t VALUES (101, 'b')",
+        "UPDATE t SET k = 101",
+        "INSERT INTO t VALUES (7, 'b') ON CONFLICT (k) DO UPDATE SET k = 101",
+    ] {
+        let error = conn.execute(sql).unwrap_err();
+        assert!(
+            error.to_string().contains("101 is not a percent"),
+            "{sql}: {error}"
+        );
+    }
+    assert_eq!(rows("SELECT k FROM t"), vec![vec![Value::from_i64(7)]]);
+
+    // A key of a type that does not say so has an index of its own.
+    conn.execute("CREATE TABLE u (k truth PRIMARY KEY) STRICT")
+        .unwrap();
+    assert_eq!(
+        rows("SELECT count(*) FROM sqlite_schema WHERE type = 'index'"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    conn.close().unwrap();
+}
+
+#[test]
+fn a_type_with_an_encode_cannot_be_a_rowid_alias() {
+    let Err(error) = turso_core::schema::builtin::schema_builder(true)
+        .unwrap()
+        .builtin_type(&EncodedRowid)
+    else {
+        panic!("a rowid alias type with an ENCODE was accepted");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("must have BASE integer and no ENCODE or DECODE"),
+        "{error}"
+    );
+}
+
+/// A dialect that registers four types written in Rust: `loud`, a
+/// `boolean` that replaces the type of core, `truth`, the type of
+/// conditions, and `percent`, whose primary key is the rowid.
 struct RustTypesDialect;
 
 impl Dialect for RustTypesDialect {
@@ -1639,7 +1701,8 @@ impl Dialect for RustTypesDialect {
         turso_core::schema::builtin::schema_builder(enable_custom_types)?
             .builtin_type(&Loud)?
             .builtin_type(&SiNoBoolean)?
-            .builtin_type(&Truth)
+            .builtin_type(&Truth)?
+            .builtin_type(&Percent)
     }
 }
 
@@ -1754,6 +1817,62 @@ impl Type for Verdict {
     }
 
     fn is_type_of_conditions(&self) -> bool {
+        true
+    }
+}
+
+/// An integer from 0 to 100. A primary key of the type is the rowid.
+#[derive(Debug)]
+struct Percent;
+
+impl Type for Percent {
+    fn name(&self) -> &str {
+        "percent"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn coerce(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| match value {
+            Value::Numeric(Numeric::Integer(0..=100)) => Ok(value.clone()),
+            other => Err(LimboError::Constraint(format!("{other} is not a percent"))),
+        }))
+    }
+
+    fn can_be_rowid_alias(&self) -> bool {
+        true
+    }
+}
+
+/// A type that says its primary key is the rowid although it has an ENCODE,
+/// which a schema refuses.
+#[derive(Debug)]
+struct EncodedRowid;
+
+impl Type for EncodedRowid {
+    fn name(&self) -> &str {
+        "encoded_rowid"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn encode(&self) -> Option<Conversion> {
+        Some(Conversion::Unchanged)
+    }
+
+    fn can_be_rowid_alias(&self) -> bool {
         true
     }
 }

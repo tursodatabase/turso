@@ -1485,6 +1485,11 @@ pub fn translate_create_table(
             )?;
         }
     }
+    // The schema of the table's database does the same when it loads the
+    // table, so the catalog sees the table as a later statement will.
+    resolver.with_schema(database_id, |schema| {
+        table.resolve_types_and_domains(schema)
+    })?;
     let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
@@ -1537,11 +1542,6 @@ pub fn translate_create_table(
     } else {
         TableText::Statement(input)
     };
-    // The schema of the table's database does the same when it loads the
-    // table, so the catalog sees the table as a later statement will.
-    resolver.with_schema(database_id, |schema| {
-        table.resolve_types_and_domains(schema)
-    })?;
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -3237,6 +3237,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         stored_form_sorts_in_value_order: _,
         is_type_of_conditions: _,
         casts_to_numbers_and_booleans: _,
+        can_be_rowid_alias: _,
         sql: _,
         domain_checks,
         kind,

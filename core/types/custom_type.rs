@@ -159,6 +159,13 @@ pub trait Type: Debug + Send + Sync {
         false
     }
 
+    /// Whether a PRIMARY KEY of one column of the type is the rowid of its
+    /// table, as `INTEGER PRIMARY KEY` is. Such a type has BASE integer and
+    /// no ENCODE or DECODE, so the rowid is the value.
+    fn can_be_rowid_alias(&self) -> bool {
+        false
+    }
+
     /// How values of the type compare, when the stored forms do not compare
     /// in the order of the values.
     fn ordering(&self) -> Option<TypeOrdering> {
