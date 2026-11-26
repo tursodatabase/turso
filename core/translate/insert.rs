@@ -2565,32 +2565,13 @@ fn init_source_emission<'a>(
                 )
             } else {
                 // Multiple rows - use coroutine for value population
-                let yield_reg = program.alloc_register();
-                let jump_on_definition_label = program.allocate_label();
-                let start_offset_label = program.allocate_label();
-                program.emit_insn(Insn::InitCoroutine {
-                    yield_reg,
-                    jump_on_definition: jump_on_definition_label,
-                    start_offset: start_offset_label,
-                });
-                program.preassign_label_to_next_insn(start_offset_label);
-
-                let query_destination = QueryDestination::CoroutineYield {
-                    yield_reg,
-                    coroutine_implementation_start: ctx.halt_label,
-                };
-                let num_result_cols = program.nested(|program| {
-                    translate_insert_source_select(
-                        select,
-                        resolver,
-                        program,
-                        query_destination,
-                        connection,
-                    )
-                })?;
-
-                program.emit_insn(Insn::EndCoroutine { yield_reg });
-                program.preassign_label_to_next_insn(jump_on_definition_label);
+                let (yield_reg, num_result_cols) = emit_insert_select_coroutine(
+                    program,
+                    select,
+                    ctx.halt_label,
+                    resolver,
+                    connection,
+                )?;
                 let cursor_id = program.alloc_cursor_id_keyed(
                     CursorKey::table(table_references.joined_tables()[0].internal_id),
                     CursorType::BTreeTable(ctx.table.clone()),
@@ -2607,59 +2588,12 @@ fn init_source_emission<'a>(
                  ** temp table in the case of row triggers.
                  */
                 if program.is_table_open(table) || has_insert_triggers {
-                    let temp_cursor_id =
-                        program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone()));
-                    ctx.temp_table_ctx = Some(TempTableCtx {
-                        cursor_id: temp_cursor_id,
-                        loop_start_label: program.allocate_label(),
-                        loop_end_label: program.allocate_label(),
-                    });
-
-                    program.emit_insn(Insn::OpenEphemeral {
-                        cursor_id: temp_cursor_id,
-                        is_table: true,
-                    });
-
-                    // Main loop
-                    program.preassign_label_to_next_insn(ctx.loop_labels.loop_start);
-                    let yield_label = program.allocate_label();
-                    program.emit_insn(Insn::Yield {
+                    ctx.temp_table_ctx = Some(emit_insert_select_into_temp_table(
+                        program,
+                        ctx.table.clone(),
                         yield_reg,
-                        end_offset: yield_label, // stays local, we’ll route at loop end
-                        subtype_clear_start_reg: 0,
-                        subtype_clear_count: 0,
-                    });
-
-                    let record_reg = program.alloc_register();
-                    program.emit_insn(Insn::MakeRecord {
-                        start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
-                        count: to_u32(num_result_cols),
-                        dest_reg: to_u32(record_reg),
-                        index_name: None,
-                        affinity_str: None,
-                    });
-
-                    let rowid_reg = program.alloc_register();
-                    program.emit_insn(Insn::NewRowid {
-                        cursor: temp_cursor_id,
-                        rowid_reg,
-                        prev_largest_reg: 0,
-                    });
-                    program.emit_insn(Insn::Insert {
-                        cursor: temp_cursor_id,
-                        key_reg: rowid_reg,
-                        record_reg,
-                        // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
-                        flag: InsertFlags::new()
-                            .require_seek()
-                            .is_ephemeral_table_insert(),
-                        table_name: "".to_string(),
-                    });
-                    // loop back
-                    program.emit_insn(Insn::Goto {
-                        target_pc: ctx.loop_labels.loop_start,
-                    });
-                    program.preassign_label_to_next_insn(yield_label);
+                        num_result_cols,
+                    ));
 
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id,
@@ -3714,6 +3648,103 @@ fn translate_virtual_table_insert(
     program.preassign_label_to_next_insn(halt_label);
 
     Ok(())
+}
+
+/// Emits a coroutine that yields the rows of the SELECT, or of the multi-row
+/// VALUES, that an INSERT reads. Returns the coroutine's yield register and
+/// the number of columns in each row.
+fn emit_insert_select_coroutine(
+    program: &mut ProgramBuilder,
+    select: ast::Select,
+    halt_label: BranchOffset,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<(usize, usize)> {
+    let yield_reg = program.alloc_register();
+    let jump_on_definition_label = program.allocate_label();
+    let start_offset_label = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: jump_on_definition_label,
+        start_offset: start_offset_label,
+    });
+    program.preassign_label_to_next_insn(start_offset_label);
+
+    let query_destination = QueryDestination::CoroutineYield {
+        yield_reg,
+        coroutine_implementation_start: halt_label,
+    };
+    let num_result_cols = program.nested(|program| {
+        translate_insert_source_select(select, resolver, program, query_destination, connection)
+    })?;
+
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(jump_on_definition_label);
+    Ok((yield_reg, num_result_cols))
+}
+
+/// Copies every row that the coroutine of [emit_insert_select_coroutine] yields
+/// into a new ephemeral table, so that the INSERT reads its rows from there.
+/// An INSERT does this when its SELECT reads the table it writes to.
+fn emit_insert_select_into_temp_table(
+    program: &mut ProgramBuilder,
+    temp_table: Arc<BTreeTable>,
+    yield_reg: usize,
+    num_result_cols: usize,
+) -> TempTableCtx {
+    let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(temp_table));
+    let temp_table_ctx = TempTableCtx {
+        cursor_id: temp_cursor_id,
+        loop_start_label: program.allocate_label(),
+        loop_end_label: program.allocate_label(),
+    };
+
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: temp_cursor_id,
+        is_table: true,
+    });
+
+    let fill_loop_start = program.allocate_label();
+    program.preassign_label_to_next_insn(fill_loop_start);
+    let yield_label = program.allocate_label();
+    program.emit_insn(Insn::Yield {
+        yield_reg,
+        end_offset: yield_label,
+        subtype_clear_start_reg: 0,
+        subtype_clear_count: 0,
+    });
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+        count: to_u32(num_result_cols),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: temp_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: temp_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
+        flag: InsertFlags::new()
+            .require_seek()
+            .is_ephemeral_table_insert(),
+        table_name: "".to_string(),
+    });
+    // loop back
+    program.emit_insn(Insn::Goto {
+        target_pc: fill_loop_start,
+    });
+    program.preassign_label_to_next_insn(yield_label);
+    temp_table_ctx
 }
 
 /// Build the UNIQUE constraint error description to match sqlite
