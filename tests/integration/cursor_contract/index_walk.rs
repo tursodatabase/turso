@@ -21,8 +21,8 @@
 //!   default definition and the others a random one.
 
 use super::index_model::{
-    above_all, cmp_cols, cmp_key, compare_engines, icheck, imax, imem, is_legal, project, ColDef,
-    Coll, IFailure, IKey, IMObs, IPos, IReplay, ITok, IVerdict, IdxDef, Order, Val,
+    above_all, cmp_cols, cmp_key, compare_engines, icheck, imax, is_legal, project, ColDef, Coll,
+    IFailure, IKey, IMObs, IPos, IReplay, ITok, IVerdict, IdxDef, Order, Val,
 };
 use super::index_program::{run_index, IOp, IndexRun, Outcome, Prefix, Row};
 use super::model::Spec;
@@ -71,50 +71,24 @@ impl IdxGaps {
     /// `RowData` mode: a read of a cursor with the null-row flag returns the real entry.
     pub const ROWDATA_NULL_ROW: IdxGaps = IdxGaps(1 << 3);
 
-    /// IDX_G2_PEER_DELETE: a read of a cursor whose entry another cursor deleted. The contract
-    /// (D5) says NULL. MVCC reads the deleted entry. The index twin of the table filter `G2`.
-    pub const IDX_G2_PEER_DELETE: IdxGaps = IdxGaps(1 << 6);
-
-    /// IDX_G3_PEER_WRITE_NULL_ROW: WAL: a write by another cursor clears the null-row flag, so
-    /// the cursor reads the real entry. The index twin of the table filter `G3`. Blocks a write
-    /// while another cursor has the flag, and `NullRow` on a cursor that a peer write hit.
-    pub const IDX_G3_PEER_WRITE_NULL_ROW: IdxGaps = IdxGaps(1 << 8);
-    /// N9: WAL: a cursor that an `IdxInsert` of its own positioned loses the position when
-    /// another cursor writes to the index: reads give NULL or a neighbour, `Delete` and the
-    /// compare ops act on the wrong entry. A cursor positioned by a seek keeps its position.
-    pub const N9_WAL_PEER_WRITE_AFTER_OWN_INSERT: IdxGaps = IdxGaps(1 << 9);
-    /// N10: WAL: a cursor that ended (a failed seek or a `Next` past the last entry) keeps its
-    /// cell index. After peers inserted entries `Next` finds one. The contract says an ended
-    /// cursor stays ended.
-    pub const N10_WAL_NEXT_AFTER_FAILED_SEEK_ON_EMPTY: IdxGaps = IdxGaps(1 << 10);
     /// IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN: MVCC with checkpointed entries: `Delete` of an entry
     /// that an `IdxInsert` of this run wrote loses the position (`Next` and `Prev` after it
     /// give the wrong answer). The index twin of the table gap N4.
     pub const IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN: IdxGaps = IdxGaps(1 << 12);
-
-    /// N12: WAL: `Delete` on a cursor that sits on the last cell of a page, after another cursor
-    /// deleted an entry of that page, panics with `idx < cell_count` (the cell index of the
-    /// cursor is not adjusted).
-    pub const N12_WAL_DELETE_AFTER_PEER_DELETE: IdxGaps = IdxGaps(1 << 13);
 
     /// CL1: MVCC: `IdxInsert` of a key that equals, under the collations, a key that the index
     /// held earlier in the run, but that is not identical to it (`('A', 1)` after
     /// `('a', 1)`). The overlay keeps the bytes of the first key, so a read gives the old text.
     pub const CL1_MVCC_EQUAL_KEY_REINSERT: IdxGaps = IdxGaps(1 << 14);
 
-    /// IDX_N6_WAL_OWN_DELETE_PEER_WRITE: WAL: `Next` or `Prev` of a cursor that deleted its
-    /// entry with `Delete`, after another cursor wrote to the index: the cursor finds the
-    /// wrong entry or the end. The index twin of the table gap N6.
-    pub const IDX_N6_WAL_OWN_DELETE_PEER_WRITE: IdxGaps = IdxGaps(1 << 15);
-
     pub const NONE: IdxGaps = IdxGaps(0);
-    pub const ALL: IdxGaps = IdxGaps((1 << 16) - 1);
+    pub const ALL: IdxGaps = IdxGaps(0b101_0000_0000_1111);
 
     pub fn has(self, other: IdxGaps) -> bool {
         self.0 & other.0 == other.0
     }
 
-    /// `NO_FILTER=1` switches all filters off. `NO_FILTER=N9,N12` switches off the named
+    /// `NO_FILTER=1` switches all filters off. `NO_FILTER=CL1,ROWDATA_NULL_ROW` switches off the named
     /// filters only (the names of `NAMES`), to see one gap again.
     pub fn from_env() -> IdxGaps {
         match std::env::var("NO_FILTER") {
@@ -134,28 +108,16 @@ impl IdxGaps {
         }
     }
 
-    pub const NAMES: [(&'static str, IdxGaps); 12] = [
+    pub const NAMES: [(&'static str, IdxGaps); 6] = [
         ("IDX_D1_MVCC_CKPT", IdxGaps::IDX_D1_MVCC_CKPT),
         ("IDX_END_INSERT", IdxGaps::IDX_END_INSERT),
         ("ROWDATA_IDX_INSERT", IdxGaps::ROWDATA_IDX_INSERT),
         ("ROWDATA_NULL_ROW", IdxGaps::ROWDATA_NULL_ROW),
-        ("IDX_G2_PEER_DELETE", IdxGaps::IDX_G2_PEER_DELETE),
-        (
-            "IDX_G3_PEER_WRITE_NULL_ROW",
-            IdxGaps::IDX_G3_PEER_WRITE_NULL_ROW,
-        ),
-        ("N9", IdxGaps::N9_WAL_PEER_WRITE_AFTER_OWN_INSERT),
-        ("N10", IdxGaps::N10_WAL_NEXT_AFTER_FAILED_SEEK_ON_EMPTY),
         (
             "IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN",
             IdxGaps::IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN,
         ),
-        ("N12", IdxGaps::N12_WAL_DELETE_AFTER_PEER_DELETE),
         ("CL1", IdxGaps::CL1_MVCC_EQUAL_KEY_REINSERT),
-        (
-            "IDX_N6_WAL_OWN_DELETE_PEER_WRITE",
-            IdxGaps::IDX_N6_WAL_OWN_DELETE_PEER_WRITE,
-        ),
     ];
 }
 
@@ -450,14 +412,7 @@ struct Gen {
     /// The last write of the cursor was an `IdxInsert` of a key above every key, and the
     /// cursor did not move since.
     appended: Vec<bool>,
-    /// The last write of the cursor was a `Delete` and it did not move since.
-    own_deleted: Vec<bool>,
     /// Another cursor wrote to the index since the cursor moved the last time.
-    peer_wrote: Vec<bool>,
-    /// Another cursor deleted an entry since the cursor moved the last time.
-    peer_deleted: Vec<bool>,
-    /// The last move of the cursor ended the scan (the cursor is `Invalid`).
-    ended: Vec<bool>,
     /// Keys that an `IdxInsert` of this run wrote.
     written: Vec<IKey>,
     /// Every key that the index held at some time of the run: the setup rows and `written`.
@@ -476,10 +431,6 @@ impl Gen {
             mode,
             after_insert: vec![false; nidx],
             appended: vec![false; nidx],
-            own_deleted: vec![false; nidx],
-            peer_wrote: vec![false; nidx],
-            peer_deleted: vec![false; nidx],
-            ended: vec![false; nidx],
             written: Vec::new(),
         }
     }
@@ -746,31 +697,14 @@ impl Gen {
                 | IOp::IdxLE(..)
                 | IOp::IdxLT(..)
         );
-        if matches!(
-            op,
-            IOp::IdxInsert { .. } | IOp::IdxDelete { .. } | IOp::Delete(_) | IOp::Clear(_)
-        ) {
-            for j in (0..self.peer_wrote.len()).filter(|&j| j != c) {
-                self.peer_wrote[j] = true;
-            }
-        }
-        if matches!(op, IOp::IdxDelete { .. } | IOp::Delete(_)) {
-            for j in (0..self.peer_deleted.len()).filter(|&j| j != c) {
-                self.peer_deleted[j] = true;
-            }
-        }
         // `NoConflict` with a NULL does not touch the engine cursor, so the history of the
         // cursor stays as it is (a position that `Count` or `SeekEnd` broke stays broken).
         let keeps_position = matches!(op, IOp::NoConflict(_, p) if p.contains(&Val::Null));
         if moves && !keeps_position {
-            self.peer_deleted[c] = false;
-            self.peer_wrote[c] = false;
-            self.own_deleted[c] = matches!(op, IOp::Delete(_));
             let insert = match op {
                 IOp::IdxInsert { a, b, rowid, .. } => Some((vec![a.clone(), b.clone()], *rowid)),
                 _ => None,
             };
-            self.ended[c] = self.replay.st.icurs[c].icpos == IPos::Invalid;
             if let Some(k) = &insert {
                 self.written.push(k.clone());
                 self.ever.push(k.clone());
@@ -789,7 +723,6 @@ impl Gen {
             .scope
             .iter()
             .any(|c| matches!(c.0, DbKind::Wal | DbKind::Ephemeral));
-        let wal = self.scope.iter().any(|c| c.0 == DbKind::Wal);
         let mvcc = self.scope.iter().any(|c| c.0 == DbKind::Mvcc);
         let mvcc_ckpt = self.scope.contains(&(DbKind::Mvcc, Layout::Checkpointed));
         (self.gaps.has(IdxGaps::IDX_D1_MVCC_CKPT) && mvcc_ckpt && self.idx_d1(op))
@@ -798,25 +731,10 @@ impl Gen {
                 && wal_or_eph
                 && self.rowdata_idx_insert(op))
             || (self.gaps.has(IdxGaps::ROWDATA_NULL_ROW) && self.rowdata_null_row(op))
-            || (self.gaps.has(IdxGaps::IDX_G2_PEER_DELETE) && self.idx_g2(op))
-            || (self.gaps.has(IdxGaps::IDX_G3_PEER_WRITE_NULL_ROW) && self.idx_g3(op))
-            || (self.gaps.has(IdxGaps::N9_WAL_PEER_WRITE_AFTER_OWN_INSERT) && wal && self.n9(op))
-            || (self
-                .gaps
-                .has(IdxGaps::N10_WAL_NEXT_AFTER_FAILED_SEEK_ON_EMPTY)
-                && wal
-                && self.n10(op))
             || (self.gaps.has(IdxGaps::IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN)
                 && mvcc_ckpt
                 && self.idx_n4(op))
-            || (self.gaps.has(IdxGaps::N12_WAL_DELETE_AFTER_PEER_DELETE)
-                && wal
-                && matches!(*op, IOp::Delete(c) if self.peer_deleted[c]))
             || (self.gaps.has(IdxGaps::CL1_MVCC_EQUAL_KEY_REINSERT) && mvcc && self.cl1(op))
-            || (self.gaps.has(IdxGaps::IDX_N6_WAL_OWN_DELETE_PEER_WRITE)
-                && wal
-                && matches!(*op, IOp::Next(c) | IOp::Prev(c)
-                    if self.own_deleted[c] && self.peer_wrote[c]))
     }
 
     /// CL1: an `IdxInsert` of a key that is equal but not identical to a key that the index
@@ -830,56 +748,6 @@ impl Gen {
         self.ever
             .iter()
             .any(|k| k != &key && cmp_key(d, k, &key) == Ordering::Equal)
-    }
-
-    /// IDX_G2_PEER_DELETE: a read of a cursor that is on an entry which is no longer in the
-    /// index.
-    fn idx_g2(&self, op: &IOp) -> bool {
-        let (IOp::Observe(c) | IOp::Column(c, _) | IOp::IdxRowId(c)) = *op else {
-            return false;
-        };
-        let cur = &self.replay.st.icurs[c];
-        match &cur.icpos {
-            IPos::At(k) => !cur.icnull && !imem(self.replay.st.idef, k, &self.replay.st.irows),
-            _ => false,
-        }
-    }
-
-    /// IDX_G3_PEER_WRITE_NULL_ROW: a write while another cursor has the null-row flag, and
-    /// `NullRow` on a cursor that a peer write has hit since its last move.
-    fn idx_g3(&self, op: &IOp) -> bool {
-        if let IOp::NullRow(c) = *op {
-            return self.peer_wrote[c];
-        }
-        let (IOp::IdxInsert { cur: c, .. } | IOp::IdxDelete { cur: c, .. } | IOp::Delete(c)) = *op
-        else {
-            return false;
-        };
-        let curs = &self.replay.st.icurs;
-        curs.iter().enumerate().any(|(j, cj)| j != c && cj.icnull)
-    }
-
-    /// N9: an op that uses the position of a cursor that wrote an entry and was hit by a peer
-    /// write since.
-    fn n9(&self, op: &IOp) -> bool {
-        match op {
-            IOp::Next(c)
-            | IOp::Prev(c)
-            | IOp::Delete(c)
-            | IOp::Observe(c)
-            | IOp::Column(c, _)
-            | IOp::IdxRowId(c)
-            | IOp::IdxGE(c, _)
-            | IOp::IdxGT(c, _)
-            | IOp::IdxLE(c, _)
-            | IOp::IdxLT(c, _) => self.after_insert[*c] && self.peer_wrote[*c],
-            _ => false,
-        }
-    }
-
-    /// N10: `Next` or `Prev` on a cursor that ended, after a peer write.
-    fn n10(&self, op: &IOp) -> bool {
-        matches!(*op, IOp::Next(c) | IOp::Prev(c) if self.ended[c] && self.peer_wrote[c])
     }
 
     /// IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN: `Delete` of an entry that an `IdxInsert` of this run
@@ -1369,8 +1237,8 @@ mod tests {
 
     // Gaps that the walk found. Each test is the minimal program that the shrinker printed. The
     // tests are `known_bug_*` tests: they pass while the bug is present (the body must panic).
-    // Each one asserts what the model says. The ids N7 to N12 continue the table
-    // gaps N1 to N6 of `mod.rs`; the others are index twins of gaps in SPEC.md.
+    // Each one asserts what the model says. The ids are in SPEC.md section 5b; an `idx` in
+    // the name marks the index twin of a table gap.
 
     use super::super::index_model::{assert_agrees, Val};
     use super::super::known_bug;
@@ -1381,11 +1249,6 @@ mod tests {
         Val::Int(x)
     }
 
-    const WAL: [(DbKind, Layout); 2] = [
-        (DbKind::Wal, Layout::AllInMemory),
-        (DbKind::Wal, Layout::Checkpointed),
-    ];
-    const ALL_FOUR: [(DbKind, Layout); 4] = CONFIGS;
     const MVCC_CKPT: [(DbKind, Layout); 1] = [(DbKind::Mvcc, Layout::Checkpointed)];
 
     /// Runs the program on each config and asserts that the engine agrees with the model.
@@ -1394,60 +1257,6 @@ mod tests {
         for &(kind, layout) in configs {
             assert_agrees(kind, layout, ReadMode::Column, rows, nidx, ops);
         }
-    }
-
-    fn ins(cur: usize, a: i64, b: i64, rowid: i64) -> IOp {
-        IOp::IdxInsert {
-            cur,
-            a: Val::Int(a),
-            b: Val::Int(b),
-            rowid,
-            use_seek: false,
-        }
-    }
-
-    fn del(cur: usize, a: Val, b: Val, rowid: i64) -> IOp {
-        IOp::IdxDelete { cur, a, b, rowid }
-    }
-
-    /// IDX_G2 (D5), the index twin of the table gap G2: a peer deletes the entry of our
-    /// cursor, so we read NULL. MVCC reads the deleted entry, WAL reads the next one.
-    ///
-    /// Fails today because of IDX_G2; see SPEC section 5b.
-    #[test]
-    fn known_bug_idx_g2_peer_delete_then_read() {
-        known_bug("IDX_G2", "Mismatch", || {
-            use IOp::*;
-            let rows = [(4, v(2), v(6))];
-            let ops = [
-                SeekLE(0, vec![v(2)]),
-                SeekGE(1, vec![v(2)]),
-                Delete(0),
-                IdxRowId(1),
-            ];
-            agree(&ALL_FOUR, &rows, 2, &ops);
-            let ops = [
-                SeekGE(0, vec![v(2)]),
-                SeekGE(1, vec![v(2)]),
-                del(0, v(2), v(6), 4),
-                Observe(1),
-            ];
-            agree(&ALL_FOUR, &rows, 2, &ops);
-        });
-    }
-
-    /// IDX_G3, the index twin of the table gap G3: a write by a peer clears the null-row flag
-    /// (WAL), so the cursor reads the real entry.
-    ///
-    /// Fails today because of IDX_G3; see SPEC section 5b.
-    #[test]
-    fn known_bug_idx_g3_peer_write_keeps_null_row() {
-        known_bug("IDX_G3", "Mismatch", || {
-            use IOp::*;
-            let rows = [(10, v(4), v(5)), (11, v(5), v(5)), (12, v(6), v(1))];
-            let ops = [Rewind(1), NullRow(1), ins(0, 9, 9, 4), Observe(1)];
-            agree(&ALL_FOUR, &rows, 2, &ops);
-        });
     }
 
     /// IDX_D1 and IDX_N4, the index twin of the table gap N4: `Delete` of an entry that an
@@ -1473,98 +1282,6 @@ mod tests {
                 Next(0),
             ];
             agree(&MVCC_CKPT, &rows, 1, &ops);
-        });
-    }
-
-    /// IDX_N6, the index twin of the table gap N6: a cursor deletes its entry, a peer inserts
-    /// an entry, then `Next` or `Prev` of the first cursor finds the wrong entry (or the end).
-    /// The model keeps the position by key (SPEC D2): `Next` gives the first entry after the
-    /// deleted key, `Prev` the last one before it. The default index shows it too.
-    ///
-    /// Fails today because of IDX_N6; see SPEC section 5b.
-    #[test]
-    fn known_bug_idx_n6_own_delete_then_peer_insert_then_move() {
-        known_bug("IDX_N6", "Mismatch", || {
-            use IOp::*;
-            // The only entry is deleted, the new key is after it: `Next` must find it.
-            let rows = [(2, v(5), v(5))];
-            agree(
-                &WAL,
-                &rows,
-                2,
-                &[Rewind(1), Delete(1), ins(0, 5, 6, 24), Next(1)],
-            );
-            // Three entries, the middle one is deleted, the new key is above it.
-            let rows = [(1, v(1), v(1)), (2, v(5), v(5)), (3, v(9), v(9))];
-            let ops = [SeekGE(1, vec![v(5)]), Delete(1), ins(0, 7, 0, 24), Prev(1)];
-            agree(&WAL, &rows, 2, &ops);
-        });
-    }
-
-    /// N9: a cursor that an `IdxInsert` of its own positioned loses its position when another
-    /// cursor writes (WAL). The read gives NULL, or a neighbour. After a seek the position is
-    /// kept (see the checks of the walk).
-    ///
-    /// Fails today because of N9; see SPEC section 5b.
-    #[test]
-    fn known_bug_n9_own_insert_then_peer_write_then_read() {
-        known_bug("N9", "Mismatch", || {
-            use IOp::*;
-            let rows = [(4, v(3), v(3))];
-            // A peer delete.
-            agree(
-                &WAL,
-                &rows,
-                2,
-                &[ins(1, 2, 1, 16), del(0, v(3), v(3), 4), Observe(1)],
-            );
-            // A peer insert after our entry.
-            let rows = [(10, v(4), v(5))];
-            agree(
-                &WAL,
-                &rows,
-                2,
-                &[ins(1, 1, 6, 13), ins(0, 4, 6, 7), Observe(1)],
-            );
-        });
-    }
-
-    /// N10: a cursor that ended keeps a stale cell index. In WAL, after peers inserted entries,
-    /// `Next` finds one. The contract says an ended cursor stays ended (MVCC agrees). The
-    /// first program is a failed seek on an empty index (one peer insert is enough), the
-    /// second a `Next` past the last entry (two peer inserts move the old cell index inside
-    /// the page).
-    ///
-    /// Fails today because of N10; see SPEC section 5b.
-    #[test]
-    fn known_bug_n10_next_after_failed_seek_on_empty_index() {
-        known_bug("N10", "Mismatch", || {
-            use IOp::*;
-            let ops = [SeekGE(0, vec![v(0)]), ins(1, 3, 3, 4), Next(0), Observe(0)];
-            agree(&WAL, &[], 2, &ops);
-            let rows = [(1, v(4), v(1))];
-            let ops = [
-                Rewind(0),
-                Next(0),
-                ins(1, 1, 1, 5),
-                ins(1, 2, 1, 6),
-                Next(0),
-            ];
-            agree(&WAL, &rows, 2, &ops);
-        });
-    }
-
-    /// N12: `Delete` on a cursor on the last cell of a page, after a peer deleted an entry
-    /// of that page. WAL panics with `idx < cell_count`: the cell index is not adjusted.
-    ///
-    /// Fails today because of N12; see SPEC section 5b.
-    #[test]
-    fn known_bug_n12_delete_after_peer_delete() {
-        known_bug("N12", "idx < cell_count", || {
-            use IOp::*;
-            let rows = [(5, NUL, v(6)), (12, v(3), v(4)), (13, v(3), v(2))];
-            let ops = [Last(1), del(0, NUL, v(6), 5), Delete(1)];
-            agree(&WAL, &rows, 2, &ops);
         });
     }
 

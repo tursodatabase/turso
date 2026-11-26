@@ -410,13 +410,17 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
                 },
             ))
         }
-        IMOp::INullRow => put(
-            ICursor {
-                icnull: true,
-                ..c.clone()
-            },
-            false,
-        ),
+        // A cursor without a position (`Lost`) cannot be set to the null row: Undefined (U9).
+        IMOp::INullRow => match c.icpos {
+            IPos::Lost => None,
+            _ => put(
+                ICursor {
+                    icnull: true,
+                    ..c.clone()
+                },
+                false,
+            ),
+        },
         IMOp::ICount => {
             let c2 = ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone);
             Some((
@@ -486,7 +490,7 @@ fn iwrite(st: &IState, s2: IStore, i: usize, c2: ICursor) -> (IState, IMObs) {
     (
         IState {
             irows: s2,
-            icurs: iset_nth(&iclear_toks(&st.icurs), i, c2),
+            icurs: iset_nth(&ilose_peers(&st.icurs), i, c2),
             idef: st.idef,
         },
         o,
@@ -500,13 +504,12 @@ fn imove_to(o: Option<IKey>, d: Dir) -> (ICursor, bool) {
     }
 }
 
-/// A write by any cursor ends every pending seek token.
-fn iclear_toks(cs: &[ICursor]) -> Vec<ICursor> {
+/// A write by a cursor leaves every cursor of the index without a position, and ends every
+/// pending seek token (U9). The writer gets its own position afterwards. See `lose_peers` in
+/// `model.rs`.
+fn ilose_peers(cs: &[ICursor]) -> Vec<ICursor> {
     cs.iter()
-        .map(|c| ICursor {
-            ictok: ITok::ITNone,
-            ..c.clone()
-        })
+        .map(|_| ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone))
         .collect()
 }
 
@@ -1444,41 +1447,17 @@ mod tests {
 
     #[test]
     fn example_iidxdelete() {
-        // Another cursor goes on with `Next` and skips the deleted entry.
-        let p = [
-            a(0, ISeekGE(some_p(&[1]))),
-            a(1, IdxDelete(k3())),
-            a(0, INext),
-        ];
-        assert_eq!(
-            obs_of_run(2, &p),
-            Some(vec![kobs(false, &k2()), iunspec(false), kobs(true, &k4())])
-        );
+        // Another cursor loses its position (U9): `Next` and a read are illegal.
+        for op in [INext, IObserve] {
+            let p = [a(0, ISeekGE(some_p(&[1]))), a(1, IdxDelete(k3())), a(0, op)];
+            assert_eq!(obs_of_run(2, &p), None);
+        }
         // The deleting cursor is `Lost`.
         let p = [a(0, IdxDelete(k3())), a(0, INext)];
         assert_eq!(obs_of_run(1, &p), None);
         // The key must be in the index.
         let p = [a(0, IdxDelete(k(some(7), NUL, 1)))];
         assert_eq!(obs_of_run(1, &p), None);
-    }
-
-    #[test]
-    fn example_ipeer_delete() {
-        let p = [
-            a(0, ISeekGE(some_p(&[1, 2]))),
-            a(1, IdxDelete(k3())),
-            a(0, IObserve),
-            a(0, INext),
-        ];
-        assert_eq!(
-            obs_of_run(2, &p),
-            Some(vec![
-                kobs(false, &k3()),
-                iunspec(false),
-                iend(false),
-                kobs(true, &k4())
-            ])
-        );
     }
 
     #[test]
@@ -1778,22 +1757,6 @@ mod tests {
             del(k(txt("a"), some(1), 1)),
             ins(k(txt("A"), some(1), 1)),
             a(0, IRewind),
-        ];
-        let (_, obs) = irun(&st, &p).unwrap();
-        assert_eq!(obs[3], kobs(false, &k(txt("A"), some(1), 1)));
-    }
-
-    #[test]
-    fn peer_reads_the_replacement_of_an_equal_key() {
-        // Cursor 0 is on ('a', 1, 1). A peer replaces the entry by ('A', 1, 1). The cursor
-        // stays on the entry, and reads the new bytes.
-        let d = IdxDef::new(col(Order::Asc, Coll::NoCase), ASC_BIN);
-        let st = iinit_with(vec![k(txt("a"), some(1), 1)], 2, d);
-        let p = [
-            a(0, IRewind),
-            a(1, IdxDelete(k(txt("a"), some(1), 1))),
-            a(1, IdxInsert(k(txt("A"), some(1), 1), false)),
-            a(0, IObserve),
         ];
         let (_, obs) = irun(&st, &p).unwrap();
         assert_eq!(obs[3], kobs(false, &k(txt("A"), some(1), 1)));

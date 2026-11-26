@@ -817,41 +817,6 @@ fn idx_delete_with_null_columns() {
 }
 
 #[test]
-fn peer_idx_delete_then_next() {
-    // SPEC 1: when a peer deletes our entry, we sit in the gap, and `Next` goes to the entry
-    // after it. `Prev` goes to the entry before it.
-    let ops = [
-        SeekGE(0, p![2, 10]),
-        SeekGE(1, p![2, 10]),
-        IdxDelete {
-            cur: 1,
-            a: v(2),
-            b: v(10),
-            rowid: 3,
-        },
-        Next(0),
-        Observe(0),
-    ];
-    let expected = [n(), n(), n(), j(), e(4, 2, 30)];
-    check_all(ROWS, 2, &ops, &expected);
-
-    let ops = [
-        SeekGE(0, p![2, 10]),
-        SeekGE(1, p![2, 10]),
-        IdxDelete {
-            cur: 1,
-            a: v(2),
-            b: v(10),
-            rowid: 3,
-        },
-        Prev(0),
-        Observe(0),
-    ];
-    let expected = [n(), n(), n(), j(), e(2, 1, 20)];
-    check_all(ROWS, 2, &ops, &expected);
-}
-
-#[test]
 fn delete_then_next() {
     let ops = [
         SeekGE(0, p![2, 10]),
@@ -913,73 +878,6 @@ fn delete_every_entry_with_scan() {
         r(0),
     ];
     check_all(ROWS, 1, &ops, &expected);
-}
-
-#[test]
-fn peer_insert_is_seen_by_next() {
-    // SPEC 1: no snapshot inside one transaction. The peer inserts after our entry.
-    let ops = [
-        SeekGE(0, p![1, 20]),
-        IdxInsert {
-            cur: 1,
-            a: v(1),
-            b: v(25),
-            rowid: 9,
-            use_seek: false,
-        },
-        Next(0),
-        Observe(0),
-        Next(0),
-        Observe(0),
-    ];
-    let expected = [n(), n(), j(), e(9, 1, 25), j(), e(3, 2, 10)];
-    check_all(ROWS, 2, &ops, &expected);
-}
-
-#[test]
-fn peer_insert_before_is_seen_by_prev() {
-    let ops = [
-        SeekGE(0, p![1, 20]),
-        IdxInsert {
-            cur: 1,
-            a: v(1),
-            b: v(15),
-            rowid: 8,
-            use_seek: false,
-        },
-        Prev(0),
-        Observe(0),
-        // Going on backwards: the entry before the new one.
-        Prev(0),
-        Observe(0),
-    ];
-    let expected = [n(), n(), j(), e(8, 1, 15), j(), e(1, 1, 10)];
-    check_all(ROWS, 2, &ops, &expected);
-}
-
-#[test]
-fn peer_insert_keeps_our_entry() {
-    // `At k` stays `At k` while `k` exists.
-    let ops = [
-        SeekGE(0, p![2, 10]),
-        IdxInsert {
-            cur: 1,
-            a: v(0),
-            b: v(1),
-            rowid: 30,
-            use_seek: false,
-        },
-        IdxInsert {
-            cur: 1,
-            a: v(2),
-            b: v(10),
-            rowid: 4,
-            use_seek: false,
-        },
-        Observe(0),
-    ];
-    let expected = [n(), n(), n(), e(3, 2, 10)];
-    check_all(ROWS, 2, &ops, &expected);
 }
 
 #[test]
@@ -1942,29 +1840,5 @@ mod collation {
             ];
             agree_on(&MVCC, def(NOCASE, BIN), &[], 1, &ops);
         });
-    }
-
-    /// A peer cursor that is on the replaced entry reads the new bytes.
-    #[test]
-    fn peer_on_replaced_entry_reads_new_bytes_wal() {
-        let rows = vec![(1, t("a"), v(1))];
-        let ops = vec![
-            Rewind(0),
-            IdxDelete {
-                cur: 1,
-                a: t("a"),
-                b: v(1),
-                rowid: 1,
-            },
-            IdxInsert {
-                cur: 1,
-                a: t("A"),
-                b: v(1),
-                rowid: 1,
-                use_seek: false,
-            },
-            Observe(0),
-        ];
-        agree_on(&WAL, def(NOCASE, BIN), &rows, 2, &ops);
     }
 }

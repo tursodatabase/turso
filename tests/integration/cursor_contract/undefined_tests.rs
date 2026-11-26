@@ -624,3 +624,218 @@ index_case!(
     1,
     [IOp::NoConflict(0, vec![Val::Null]), IOp::Observe(0)]
 );
+
+// ---------------------------------------------------------------------------------------
+// U9: a write by one cursor leaves every other cursor of the tree without a position. A
+// read, `Next`, `Prev`, `Delete`, `NullRow` or an `Idx*` compare from the old position is
+// refused. Only a seek, `Rewind` or `Last` places the cursor again. SQLite saves the other
+// cursors by key, but Turso does not promise this and no plan needs it.
+// ---------------------------------------------------------------------------------------
+
+table_case!(
+    known_bug_u9_next_after_peer_insert,
+    "U9",
+    2,
+    [Op::SeekRowid(0, 20), insert(1, 25, true), Op::Next(0)]
+);
+table_case!(
+    known_bug_u9_prev_after_peer_insert,
+    "U9",
+    2,
+    [Op::Last(0), insert(1, 5, true), Op::Prev(0)]
+);
+table_case!(
+    known_bug_u9_read_after_peer_insert,
+    "U9",
+    2,
+    [Op::SeekRowid(0, 20), insert(1, 25, true), Op::RowId(0)]
+);
+table_case!(
+    known_bug_u9_column_after_peer_overwrite,
+    "U9",
+    2,
+    [
+        Op::SeekRowid(0, 20),
+        Op::Insert {
+            cur: 1,
+            rowid: 20,
+            value: 999,
+            require_seek: true
+        },
+        Op::Column(0, 1)
+    ]
+);
+table_case!(
+    known_bug_u9_column_after_peer_delete,
+    "U9",
+    2,
+    [
+        Op::SeekRowid(0, 20),
+        Op::SeekRowid(1, 20),
+        Op::Delete(1),
+        Op::Column(0, 1)
+    ]
+);
+table_case!(
+    known_bug_u9_delete_after_peer_delete,
+    "U9",
+    2,
+    [
+        Op::SeekRowid(0, 20),
+        Op::SeekRowid(1, 20),
+        Op::Delete(1),
+        Op::Delete(0)
+    ]
+);
+table_case!(
+    known_bug_u9_next_after_own_delete_and_peer_insert,
+    "U9",
+    2,
+    [
+        Op::SeekRowid(0, 20),
+        Op::Delete(0),
+        insert(1, 25, true),
+        Op::Next(0)
+    ]
+);
+table_case!(
+    known_bug_u9_next_of_ended_cursor_after_peer_insert,
+    "U9",
+    2,
+    [
+        Op::Rewind(0),
+        Op::Next(0),
+        Op::Next(0),
+        Op::Next(0),
+        insert(1, 40, true),
+        Op::Next(0)
+    ]
+);
+table_case!(
+    known_bug_u9_read_of_null_row_after_peer_insert,
+    "U9",
+    2,
+    [
+        Op::Rewind(0),
+        Op::NullRow(0),
+        insert(1, 5, true),
+        Op::RowId(0)
+    ]
+);
+table_case!(
+    known_bug_u9_null_row_without_position,
+    "U9",
+    2,
+    [insert(1, 25, true), Op::NullRow(0)]
+);
+index_case!(
+    known_bug_u9_idx_next_after_peer_insert,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        IOp::SeekGE(0, vec![v(2)]),
+        add(1, 7, 7, 70, false),
+        IOp::Next(0)
+    ]
+);
+index_case!(
+    known_bug_u9_idx_read_after_peer_insert,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        IOp::SeekGE(0, vec![v(2)]),
+        add(1, 7, 7, 70, false),
+        IOp::Observe(0)
+    ]
+);
+index_case!(
+    known_bug_u9_idx_read_after_own_insert_and_peer_insert,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        add(0, 7, 7, 70, false),
+        add(1, 8, 8, 80, false),
+        IOp::Observe(0)
+    ]
+);
+index_case!(
+    known_bug_u9_idx_read_after_peer_delete,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        IOp::SeekGE(0, vec![v(1)]),
+        IOp::SeekGE(1, vec![v(1)]),
+        del(1, 1, 10, 1),
+        IOp::Observe(0)
+    ]
+);
+index_case!(
+    known_bug_u9_idx_delete_after_peer_insert,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        IOp::SeekGE(0, vec![v(1)]),
+        add(1, 7, 7, 70, false),
+        IOp::Delete(0)
+    ]
+);
+index_case!(
+    known_bug_u9_idx_compare_after_peer_insert,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        IOp::SeekGE(0, vec![v(1)]),
+        add(1, 7, 7, 70, false),
+        IOp::IdxGT(0, vec![v(1)])
+    ]
+);
+index_case!(
+    known_bug_u9_idx_next_of_ended_cursor_after_peer_insert,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        IOp::SeekGE(0, vec![v(9)]),
+        add(1, 7, 7, 70, false),
+        IOp::Next(0)
+    ]
+);
+index_case!(
+    known_bug_u9_idx_next_after_own_delete_and_peer_insert,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        IOp::SeekGE(0, vec![v(1)]),
+        IOp::Delete(0),
+        add(1, 7, 7, 70, false),
+        IOp::Next(0)
+    ]
+);
+index_case!(
+    known_bug_u9_idx_read_of_null_row_after_peer_insert,
+    "U9",
+    default_idef(),
+    index_rows(),
+    2,
+    [
+        IOp::Rewind(0),
+        IOp::NullRow(0),
+        add(1, 7, 7, 70, false),
+        IOp::Observe(0)
+    ]
+);

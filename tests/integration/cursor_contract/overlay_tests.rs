@@ -133,18 +133,6 @@ mod table {
             check("T3 B-tree hit", &ops, &[3, 4, 5]);
         });
     }
-
-    /// T4: a peer cursor inserts row 9 after the seek. `Next` must see it at the end.
-    /// Fails today because of N1; see SPEC section 5b.
-    #[test]
-    fn known_bug_n1_t4_seek_rowid_hit_peer_write_then_next() {
-        known_bug("N1", "T4 Mvcc: expected rowids", || {
-            let mut ops = overlay_writes();
-            ops.extend([SeekRowid(0, 3), RowId(0), insert(9, 99)]);
-            ops.extend(steps(4));
-            check("T4", &ops, &[4, 5, 7, 9]);
-        });
-    }
 }
 
 mod index {

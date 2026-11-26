@@ -633,29 +633,6 @@ mod tests {
     }
 
     #[test]
-    fn peer_cursor_insert_is_seen_by_next() {
-        // SPEC 1: there is no snapshot inside one transaction.
-        let ops = [
-            Rewind(0),
-            Insert {
-                cur: 1,
-                rowid: 15,
-                value: 150,
-                require_seek: true,
-            },
-            Next(0),
-            RowId(0),
-        ];
-        let expected = [
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(true, None, None),
-            obs(false, Some(15), None),
-        ];
-        check_all(ROWS, 2, &ops, &expected);
-    }
-
-    #[test]
     fn new_rowid_is_larger_than_max() {
         // D6: only the predicate holds, MVCC may skip rowids.
         let ops = [
@@ -813,116 +790,9 @@ mod tests {
         });
     }
 
-    /// G4, with a peer cursor that updates the row.
-    ///
-    /// Fails today because of G4; see SPEC section 5b.
-    #[test]
-    fn known_bug_g4_column_after_update_by_peer() {
-        known_bug("G4", "Checkpointed / Column differs", || {
-            let ops = [
-                SeekRowid(0, 20),
-                Insert {
-                    cur: 1,
-                    rowid: 20,
-                    value: 999,
-                    require_seek: true,
-                },
-                Column(0, 1),
-            ];
-            let expected = [
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, Some(999)),
-            ];
-            check_all(ROWS, 2, &ops, &expected);
-        });
-    }
-
-    /// G2 / D5: a peer deletes the row of our cursor, so we read NULL. WAL reads the next
-    /// row (30), MVCC reads the deleted row (20).
-    ///
-    /// Fails today because of G2; see SPEC section 5b.
-    #[test]
-    fn known_bug_g2_peer_delete_then_read() {
-        known_bug("G2", "Wal / AllInMemory / Column differs", || {
-            let ops = [
-                SeekRowid(0, 20),
-                SeekRowid(1, 20),
-                Delete(1),
-                RowId(0),
-                Column(0, 1),
-            ];
-            let expected = [
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, None),
-            ];
-            check_all(ROWS, 2, &ops, &expected);
-        });
-    }
-
-    /// G2: after the peer deleted our row, `Delete` on our cursor must not delete another
-    /// row. WAL deletes the next row (count 1). MVCC does nothing (count 2).
-    ///
-    /// Fails today because of G2; see SPEC section 5b.
-    #[test]
-    fn known_bug_g2_peer_delete_then_delete() {
-        known_bug("G2", "Wal / AllInMemory / Column differs", || {
-            let ops = [
-                SeekRowid(0, 20),
-                SeekRowid(1, 20),
-                Delete(1),
-                Delete(0),
-                Count(0),
-            ];
-            // Rows: 10, 20, 30. The peer removes 20 and our `Delete` must remove nothing.
-            let rows = &ROWS[..3];
-            let expected = [
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, Some(2), None),
-            ];
-            check_all(rows, 2, &ops, &expected);
-        });
-    }
-
-    /// G3: a write by a peer must not clear the null-row flag. WAL clears it and reads the
-    /// real row. MVCC keeps the flag.
-    ///
-    /// Fails today because of G3; see SPEC section 5b.
-    #[test]
-    fn known_bug_g3_peer_write_keeps_null_row() {
-        known_bug("G3", "Wal / AllInMemory / Column differs", || {
-            let ops = [
-                Rewind(0),
-                NullRow(0),
-                Insert {
-                    cur: 1,
-                    rowid: 5,
-                    value: 5,
-                    require_seek: true,
-                },
-                RowId(0),
-                Column(0, 1),
-            ];
-            let expected = [
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, None),
-                obs(false, None, None),
-            ];
-            check_all(ROWS, 2, &ops, &expected);
-        });
-    }
-
     // Gaps found by the random walk (`walk.rs`). Each test is the minimal program that the
-    // shrinker printed, checked against the model on all four configs. The proposed gap ids
-    // N1 to N6 are the names of the generator filters. They are not in SPEC.md yet.
+    // shrinker printed, checked against the model on all four configs. The ids are in SPEC.md
+    // section 5b and name the generator filters.
 
     /// Runs the program on all four configs and asserts that the engine agrees with the model.
     #[track_caller]
@@ -976,73 +846,6 @@ mod tests {
                 1,
                 &[insert(20), SeekRowid(0, 20), Delete(0), Next(0), RowId(0)],
             );
-        });
-    }
-
-    /// N4, with a row that a peer cursor wrote: `Delete` itself panics ("no current row").
-    ///
-    /// Fails today because of N4; see SPEC section 5b.
-    #[test]
-    fn known_bug_n4_delete_of_peer_inserted_row() {
-        known_bug("N4", "Cannot delete: no current row", || {
-            let ops = [
-                NewRowid(1),
-                NewRowid(0),
-                InsertNew {
-                    cur: 0,
-                    value: 1,
-                    require_seek: true,
-                },
-                SeekRowid(1, 31),
-                Delete(1),
-            ];
-            model::assert_agrees(DbKind::Mvcc, Layout::Checkpointed, ROWS, 2, &ops);
-        });
-    }
-
-    /// N5: a cursor deletes the last row, a peer inserts a row, then `Prev` on the first
-    /// cursor. WAL panics on `self.current_page >= 0`. `Next` is fine.
-    ///
-    /// Fails today because of N5; see SPEC section 5b.
-    #[test]
-    fn known_bug_n5_prev_after_delete_emptied_table_and_peer_insert() {
-        known_bug("N5", "self.current_page >= 0", || {
-            let rows = [(8, 53)];
-            let ops = [
-                Last(0),
-                Delete(0),
-                Insert {
-                    cur: 1,
-                    rowid: 16,
-                    value: 9,
-                    require_seek: true,
-                },
-                Prev(0),
-            ];
-            agree_all(&rows, 2, &ops);
-        });
-    }
-
-    /// N6: the cursor deletes its row, a peer inserts a row, then `Next` or `Prev`. WAL lands
-    /// on the wrong row. Per the contract the cursor is in the gap of the deleted key.
-    ///
-    /// Fails today because of N6; see SPEC section 5b.
-    #[test]
-    fn known_bug_n6_move_after_delete_and_peer_insert() {
-        known_bug("N6", "Mismatch", || {
-            let insert = |rowid| Insert {
-                cur: 1,
-                rowid,
-                value: 1,
-                require_seek: true,
-            };
-            // The deleted row was the last one: `Next` must end. A row that the peer inserted
-            // before the gap must not be found.
-            agree_all(ROWS, 2, &[SeekRowid(0, 30), Delete(0), insert(25), Next(0)]);
-            // The peer inserts the deleted key again: `Next` goes past it.
-            agree_all(ROWS, 2, &[SeekRowid(0, 20), Delete(0), insert(20), Next(0)]);
-            // The deleted row was the first one: `Prev` must end.
-            agree_all(ROWS, 2, &[SeekRowid(0, 10), Delete(0), insert(5), Prev(0)]);
         });
     }
 }

@@ -39,13 +39,13 @@ A cursor has a position and a null-row flag. The position is one of:
 
 Rules that hold for all opcodes:
 
-- A write through any cursor changes the store. Other cursors on the same tree keep
-  their logical position. `At k` stays `At k` while `k` exists. If `k` is deleted, it
-  becomes `Gap(pred k, succ k)`. SQLite saves other cursors by key and never adjusts them.
-- Rows that another cursor inserts after `At k` are seen by the next `Next`. There is no
-  snapshot inside one transaction.
+- A write through a cursor changes the store and leaves every other cursor of the tree
+  without a position (U9). SQLite saves the other cursors by key and restores them; Turso
+  does not promise this. Only a seek, `Rewind` or `Last` places such a cursor again. A
+  read, `Next`, `Prev`, `Delete` or an `Idx*` compare from the old position is Undefined.
 - `Column` and `RowId` return NULL when the null-row flag is set, and when the position is
-  `Invalid` or `Gap`. They return the row when the position is `At k`.
+  `Invalid`. They return the row when the position is `At k`. At any other position the read
+  is Undefined (U8).
 - Each opcode is either defined, or its precondition is violated. A violated
   precondition is **Undefined**: the model has no result and the generator never emits it.
   An engine must refuse an Undefined sequence in a debug build (section 2d). So an opcode is
@@ -170,6 +170,7 @@ engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 | U6 | `IdxGE/GT/LE/LT` on a cursor whose entry was deleted (by itself or by another cursor) | SQLite asserts, `vdbe.c:7112` |
 | U7 | `IdxInsert` of a key that is in the index, `IdxDelete` of a key that is not, and the collation-equal variants of both (section 2c) | section 2c |
 | U8 | A read (`Column`, `RowId`, `IdxRowId`) at a position that is not defined: after `Count`, `SeekEnd`, `NewRowid`, an own `Delete`, `IdxDelete`, a seek that missed, `Found`, `NotFound`, `NoConflict` with a NULL | section 1 |
+| U9 | After a write by another cursor on the same tree: a read, `Next`, `Prev`, `Delete`, `IdxGE/GT/LE/LT` or `DeferredSeek` from the old position. Only a seek, `Rewind` or `Last` places the cursor again | section 1 |
 
 The goal is that no op sequence has an open result: it has one defined result, or it is in
 this list. The entry that a `Found` hit lands on cannot be seen, because a read or a move
@@ -201,8 +202,8 @@ caller must have left the cursor at a `Seeked k` or `At k` position for the same
   debug build refuses it (U1, section 2d).
 - **D4.** `Delete` with no current row is Undefined. Today BTree ignores it and MVCC
   panics. A debug build refuses it with an `unsupported` message (U4).
-- **D5.** Peer reads follow SQLite: a cursor whose row was deleted by another cursor reads
-  NULL.
+- **D5.** Another cursor's write leaves our cursor without a position (U9). SQLite saves
+  the other cursors by key. Turso does not promise this, and no translator plan needs it.
 - **D6.** `NewRowid` returns a value with a predicate, not an exact number.
 
 ## 5. Known gaps between this contract and the code
@@ -213,8 +214,8 @@ unclear, write the test and see, **by design** = contract already accounts for i
 | # | Gap | Source | Class |
 |---|---|---|---|
 | G1 | `Prev` after a non-balancing `Delete` skips one row | btree.rs notes 6.1 | bug |
-| G2 | After a peer deletes our row, `RowId`/`Column` read the next row and `Delete` removes it | 6.5 | bug (D5) |
-| G3 | Peer write clears the null-row flag, then `Column` reads the real row | 6.4 | bug |
+| G2 | After a peer deletes our row, `RowId`/`Column` read the next row and `Delete` removes it | 6.5 | by design (U9) |
+| G3 | Peer write clears the null-row flag, then `Column` reads the real row | 6.4 | by design (U9) |
 | G4 | MVCC `Column` after `Insert` that updates a B-tree-resident row reads the old record | mvcc 3.8 | probe, likely bug (D1) |
 | G5 | Overlay key dropped when a chain becomes "covered" and the B-tree peek differs | mvcc D3 | probe |
 | G6 | B-tree rows already skipped as shadowed are not revisited after rollback to a savepoint | mvcc D14 | probe |
@@ -243,21 +244,13 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | Id | Engine | Bug |
 |---|---|---|
 | D1 | MVCC, checkpointed | After `Insert`, `Next` and `Prev` lose the position |
-| G4 | MVCC, checkpointed | After an overwrite by `Insert`, `Column` reads the old record |
-| G2 | WAL, MVCC | A peer deletes our row: WAL reads the next row, MVCC reads the deleted row |
-| G3 | WAL | A peer write clears the null-row flag |
+| G4 | MVCC, checkpointed | After an overwrite by `Insert` on the same cursor, `Column` reads the old record |
 | R1 | all | `RowData` and `Column` disagree: on a null row, after `IdxInsert`, on a cursor without an entry, and with a pending `DeferredSeek` |
 | O1 | ephemeral | `OpenDup` rejects index cursors |
 | OV1 | MVCC | Index: an equality-only prefix seek, then `Next`, skips overlay keys or ends early |
-| N1 | MVCC | `SeekRowid` or `NotExists` hit, then `Next`: rows are lost (overlay tests T1 to T4 show the cases) |
+| N1 | MVCC | `SeekRowid` or `NotExists` hit, then `Next`: rows are lost (overlay tests T1 to T3 show the cases) |
 | N4 | MVCC, checkpointed | `Delete` of a row written in this run, then `Next` or `Prev`: nothing is found |
-| N5 | WAL | `Prev` panics after a peer insert, when the only row was deleted |
-| N6 | WAL | Own delete and a peer insert, then `Next`: wrong row |
-| N9 | WAL | Index: a seek-positioned cursor loses its position on a peer write |
-| N10 | WAL | Index: an ended cursor finds a peer's new entry. It keeps its cell index: a failed seek on an empty index (one peer insert) and a `Next` past the last entry (two peer inserts) both show it |
-| N12 | WAL | Index: panic on `idx < cell_count` |
 | CL1 | MVCC | Index, NOCASE or RTRIM: `IdxDelete` of `('a', 1)` and `IdxInsert` of `('A', 1)` (equal under the collation, same rowid): a later read of the entry returns the old bytes `'a'`, not `'A'`. SQLite and WAL return the new bytes. Needs no checkpointed row. Reachable from SQL (`UPDATE t SET a='A'`, then a covering index scan): issue 9285 |
-| IDX_N6 | WAL | Index: own `Delete`, then a peer `IdxInsert`, then `Next` or `Prev`: the cursor finds the wrong entry or the end. Shows with the default index; the walk found it only after the text values were added. Not reachable from SQL: only the one-pass `DELETE` calls `Next` after its own delete, and it has no second writer |
 | U1 | all | Undefined: `Next` or `Prev` in the wrong direction (D3). No engine refuses it with `unsupported` |
 | U2 | all | Undefined: `Next` or `Prev` after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete`. No engine refuses it |
 | U3 | all | Undefined: `Next`, `Prev`, `Insert`, `IdxInsert`, `Delete`, `Count` or `NewRowid` after `NullRow`. WAL answers a `NewRowid` with 1 (was N3). No engine refuses it |
@@ -266,6 +259,7 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | U6 | all | Undefined: `IdxGE/GT/LE/LT` after the entry was deleted (was N8; SQLite asserts, `vdbe.c:7112`). The engines compare the next entry or the end |
 | U7 | all | Undefined: `IdxInsert` of an existing key, `IdxDelete` of a missing key, and the collation-equal variants (section 2c). No engine refuses it |
 | U8 | all | Undefined: a read at an undefined position (was N2 and N7: WAL panics with an overflow after `Count`, and reports "Corrupt database" after `SeekEnd`). No engine refuses it |
+| U9 | all | Undefined: a read or a move after another cursor wrote (was G2, G3, N5, N6, N9, N10, N12, IDX_G2, IDX_G3 and IDX_N6). WAL reads or moves to the wrong entry, loses the cell index, panics, or clears the null-row flag; MVCC keeps a deleted row. No engine refuses it. Not reachable from SQL: about 16 statements for IDX_N6 gave only two-pass plans for every plan with a second writer |
 
 Not modelled: `DeferredSeek`, direction switches (D3), covered-chain drops in the overlay,
 a failed eq-only seek that leaves the cursor on a neighbour. An eq-only `SeekGE` for a key

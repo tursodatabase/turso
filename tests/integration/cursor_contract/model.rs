@@ -272,7 +272,11 @@ pub fn step(st: &State, a: &Action) -> Option<(State, MObs)> {
             }
             _ => None,
         },
-        MOp::NullRow => put(Cursor { cnull: true, ..c }, false),
+        // A cursor without a position (`Lost`) cannot be set to the null row: Undefined (U9).
+        MOp::NullRow => match c.cpos {
+            Pos::Lost => None,
+            _ => put(Cursor { cnull: true, ..c }, false),
+        },
         MOp::Count => {
             if c.cnull {
                 return None;
@@ -367,7 +371,7 @@ fn write_cursor(st: &State, s2: Tbl, i: usize, c2: Cursor) -> (State, MObs) {
     (
         State {
             rows: s2,
-            curs: set_nth_cursor(&clear_toks(&st.curs), i, c2),
+            curs: set_nth_cursor(&lose_peers(&st.curs), i, c2),
         },
         o,
     )
@@ -396,12 +400,18 @@ fn move_to(o: Option<i64>, d: Dir) -> (Cursor, bool) {
     }
 }
 
-/// A write by any cursor ends every pending seek token.
-fn clear_toks(cs: &[Cursor]) -> Vec<Cursor> {
+/// A write by a cursor leaves every cursor of the tree without a position, and ends every
+/// pending seek token (U9). The writer gets its own position afterwards. A cursor without a
+/// position can only be placed again by a seek, `Rewind` or `Last`. SQLite saves the other
+/// cursors by key; Turso does not promise that, so a read or a move from the old position
+/// is Undefined.
+fn lose_peers(cs: &[Cursor]) -> Vec<Cursor> {
     cs.iter()
-        .map(|c| Cursor {
+        .map(|_| Cursor {
+            cpos: Pos::Lost,
+            cdir: Dir::DNone,
+            cnull: false,
             ctok: Tok::TNone,
-            ..*c
         })
         .collect()
 }
@@ -887,25 +897,19 @@ mod tests {
         assert_eq!(got, [is(5, 50), jumped(is(3, 30)), OPEN, jumped(is(1, 10))]);
     }
 
+    /// A write by another cursor leaves our cursor without a position (U9): a read or a move
+    /// from the old position is illegal. A seek places it again.
     #[test]
-    fn example_peer_delete() {
-        let got = obs_of_run(
-            2,
-            &[
-                (0, Rewind),
-                (0, Next),
-                (1, SeekRowid(3)),
-                (1, Delete),
-                (0, Observe),
-                (0, Next),
-            ],
-        );
-        // `SeekRowid` and `Delete` have no example here, only the other ops have.
-        assert_eq!(got[0], is(1, 10));
-        assert_eq!(got[1], jumped(is(3, 30)));
-        assert_eq!(got[3], OPEN);
-        assert_eq!(got[4], NONE);
-        assert_eq!(got[5], jumped(is(5, 50)));
+    fn example_peer_write_loses_the_position() {
+        let before = [(0, Rewind), (0, Next), (1, SeekRowid(3)), (1, Delete)];
+        for op in [Observe, Next, Prev, Delete] {
+            let mut p = before.to_vec();
+            p.push((0, op));
+            assert!(!legal(2, &p), "{op:?}");
+        }
+        let mut p = before.to_vec();
+        p.extend([(0, SeekGE(3)), (0, Observe)]);
+        assert!(legal(2, &p));
     }
 
     fn legal(n: usize, p: &[(usize, MOp)]) -> bool {

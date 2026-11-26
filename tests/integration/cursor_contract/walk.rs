@@ -39,11 +39,6 @@ const CONFIGS: [(DbKind, Layout); 4] = [
 pub struct KnownGaps(u32);
 
 impl KnownGaps {
-    /// A peer deleted the row of a cursor, and the cursor reads (WAL reads the next row,
-    /// MVCC reads the old row).
-    pub const G2: KnownGaps = KnownGaps(1);
-    /// A peer writes while a cursor has the null-row flag (WAL clears the flag).
-    pub const G3: KnownGaps = KnownGaps(1 << 1);
     /// MVCC with checkpointed rows: `Next` or `Prev` right after an `Insert` loses the position.
     pub const D1: KnownGaps = KnownGaps(1 << 2);
     /// MVCC with checkpointed rows: `Column` after an update by `Insert` reads the old record.
@@ -64,16 +59,8 @@ impl KnownGaps {
     /// (added or updated) loses the position (`Next` or `Prev` after it find nothing) or panics.
     pub const N4: KnownGaps = KnownGaps(1 << 8);
 
-    /// WAL: `Prev` on a cursor whose `Delete` emptied the table panics
-    /// (`self.current_page >= 0`) once a peer has inserted a row.
-    pub const N5: KnownGaps = KnownGaps(1 << 9);
-
-    /// WAL: `Next` or `Prev` after the cursor's own `Delete`, when a peer inserted a row
-    /// in between. The move lands on the wrong row (or finds none).
-    pub const N6: KnownGaps = KnownGaps(1 << 10);
-
     pub const NONE: KnownGaps = KnownGaps(0);
-    pub const ALL: KnownGaps = KnownGaps(0b111_1111_1111);
+    pub const ALL: KnownGaps = KnownGaps(0b1_1011_1100);
 
     pub fn has(self, other: KnownGaps) -> bool {
         self.0 & other.0 == other.0
@@ -284,11 +271,6 @@ struct Gen {
     /// The last move of the cursor was a `SeekRowid` or `NotExists` that hit.
     exact: Vec<bool>,
     /// Another cursor wrote since the cursor moved the last time.
-    peer_wrote: Vec<bool>,
-    /// Another cursor inserted since the cursor moved the last time.
-    peer_inserted: Vec<bool>,
-    /// The cursor deleted the last row of the table and did not move since.
-    emptied: Vec<bool>,
     /// Keys that an `Insert` of this run wrote (added or updated).
     written: HashSet<i64>,
 }
@@ -302,9 +284,6 @@ impl Gen {
             inserted: vec![false; ncursors],
             stale: vec![false; ncursors],
             exact: vec![false; ncursors],
-            peer_wrote: vec![false; ncursors],
-            peer_inserted: vec![false; ncursors],
-            emptied: vec![false; ncursors],
             written: HashSet::new(),
         }
     }
@@ -408,16 +387,6 @@ impl Gen {
             .apply(op, None)
             .expect("the generator checked legality");
         let c = cursor_of(op).expect("every op has a cursor");
-        if matches!(op, Op::Insert { .. } | Op::InsertNew { .. } | Op::Delete(_)) {
-            for j in (0..self.peer_wrote.len()).filter(|&j| j != c) {
-                self.peer_wrote[j] = true;
-            }
-        }
-        if inserted_key.is_some() {
-            for j in (0..self.peer_inserted.len()).filter(|&j| j != c) {
-                self.peer_inserted[j] = true;
-            }
-        }
         if let Some(k) = inserted_key {
             let existed = lookup(k, &before.rows).is_some();
             self.written.insert(k);
@@ -436,9 +405,6 @@ impl Gen {
                 && matches!(self.replay.st.curs[c].cpos, Pos::At(_));
             self.inserted[c] = inserted_key.is_some();
             self.exact[c] = hit;
-            self.peer_wrote[c] = false;
-            self.peer_inserted[c] = false;
-            self.emptied[c] = matches!(op, Op::Delete(_)) && self.replay.st.rows.is_empty();
             if inserted_key.is_none() {
                 self.stale[c] = false;
             }
@@ -451,35 +417,17 @@ impl Gen {
 
     fn blocked(&self, op: &Op) -> bool {
         let mvcc = |c: &(DbKind, Layout)| c.0 == DbKind::Mvcc;
-        let wal = |c: &(DbKind, Layout)| c.0 == DbKind::Wal;
         let mvcc_ckpt = |c: &(DbKind, Layout)| *c == (DbKind::Mvcc, Layout::Checkpointed);
-        (self.gaps.has(KnownGaps::G2) && self.g2(op))
-            || (self.gaps.has(KnownGaps::G3) && self.g3(op))
-            || (self.gaps.has(KnownGaps::D1) && self.scope.iter().any(mvcc_ckpt) && self.d1(op))
+        (self.gaps.has(KnownGaps::D1) && self.scope.iter().any(mvcc_ckpt) && self.d1(op))
             || (self.gaps.has(KnownGaps::G4) && self.scope.iter().any(mvcc_ckpt) && self.g4(op))
             || (self.gaps.has(KnownGaps::N1) && self.scope.iter().any(mvcc) && self.n1(op))
             || (self.gaps.has(KnownGaps::N3) && self.n3(op))
-            || (self.gaps.has(KnownGaps::N5) && self.scope.iter().any(wal) && self.n5(op))
-            || (self.gaps.has(KnownGaps::N6) && self.scope.iter().any(wal) && self.n6(op))
             || (self.gaps.has(KnownGaps::N4) && self.scope.iter().any(mvcc_ckpt) && self.n4(op))
     }
 
     /// N3: `NewRowid` or `Count` on a cursor with the null-row flag.
     fn n3(&self, op: &Op) -> bool {
         matches!(*op, Op::NewRowid(c) | Op::Count(c) if self.replay.st.curs[c].cnull)
-    }
-
-    /// N6: `Next` or `Prev` on a cursor that deleted its row, after a peer insert.
-    fn n6(&self, op: &Op) -> bool {
-        let (Op::Next(c) | Op::Prev(c)) = *op else {
-            return false;
-        };
-        self.peer_inserted[c] && matches!(self.replay.st.curs[c].cpos, Pos::Gone(_))
-    }
-
-    /// N5: `Prev` on a cursor whose last `Delete` left the table empty.
-    fn n5(&self, op: &Op) -> bool {
-        matches!(*op, Op::Prev(c) if self.emptied[c])
     }
 
     /// N4: `Delete` of a row that an `Insert` of this run wrote.
@@ -491,31 +439,6 @@ impl Gen {
     /// N1: `Next` after a `SeekRowid` or `NotExists` that hit.
     fn n1(&self, op: &Op) -> bool {
         matches!(*op, Op::Next(c) if self.exact[c])
-    }
-
-    /// G2: read a cursor whose row a peer deleted. The model says NULL.
-    fn g2(&self, op: &Op) -> bool {
-        let (Op::RowId(c) | Op::Column(c, _)) = *op else {
-            return false;
-        };
-        let cur = &self.replay.st.curs[c];
-        match cur.cpos {
-            Pos::At(k) => !cur.cnull && lookup(k, &self.replay.st.rows).is_none(),
-            _ => false,
-        }
-    }
-
-    /// G3: a write while another cursor has the null-row flag, and `NullRow` on a cursor
-    /// that a peer write has hit since its last move (the flag is lost at the next read).
-    fn g3(&self, op: &Op) -> bool {
-        if let Op::NullRow(c) = *op {
-            return self.peer_wrote[c];
-        }
-        let (Op::Insert { cur: c, .. } | Op::InsertNew { cur: c, .. } | Op::Delete(c)) = *op else {
-            return false;
-        };
-        let curs = &self.replay.st.curs;
-        curs.iter().enumerate().any(|(j, cj)| j != c && cj.cnull)
     }
 
     /// D1: `Next` or `Prev` right after an `Insert` of the same cursor.
