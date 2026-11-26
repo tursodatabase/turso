@@ -327,16 +327,15 @@ test pg-dump-function-discovery-excludes-builtins {
 }
 expect {}
 
-@skip-if postgres "PostgreSQL has six abs() functions, and pg_is_in_recovery() has the language internal"
 test pg-object-native-function-languages {
     SET search_path TO '';
-    SELECT p.proname, l.lanname, CASE WHEN l.lanispl THEN 1 ELSE 0 END, l.tableoid
+    SELECT DISTINCT p.proname, l.lanname, CASE WHEN l.lanispl THEN 1 ELSE 0 END, l.tableoid
     FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
     WHERE p.proname IN ('abs', 'pg_is_in_recovery') ORDER BY p.proname;
 }
 expect {
     abs|internal|0|2612
-    pg_is_in_recovery|c|0|2612
+    pg_is_in_recovery|internal|0|2612
 }
 
 @skip-if postgres "PostgreSQL has the plpgsql language"
@@ -709,6 +708,81 @@ test pg-object-operator-is-read-only {
 expect error {permission denied for table pg_operator}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_operator"}
+
+# pg_proc has the rows of PostgreSQL for the functions of the frontend: the
+# aggregates count, sum, avg, min, max, stddev and string_agg over the number,
+# text, bytea, date and timestamp types, and a few scalar functions.
+test pg-proc-lists-the-functions-of-the-frontend {
+    SELECT oid, proname, pronamespace, proowner, prolang, procost::int, prorows::int, provariadic,
+           prokind, prosecdef, proleakproof, proisstrict, proretset, provolatile, proparallel,
+           pronargs, pronargdefaults, prorettype, proargtypes::text
+    FROM pg_proc
+    WHERE proname IN ('abs', 'avg', 'count', 'format_type', 'max', 'min', 'now', 'pg_get_constraintdef',
+                      'pg_is_in_recovery', 'quote_ident', 'stddev', 'string_agg', 'sum')
+      AND proargtypes::text IN ('', '17', '17 17', '20', '21', '23', '25', '25 25', '26', '26 16',
+                                '26 23', '700', '701', '1082', '1114', '1184', '1700', '2276')
+    ORDER BY oid;
+}
+expect {
+    1081|format_type|11|10|12|1|0|0|f|f|f|f|f|s|s|2|0|25|26 23
+    1282|quote_ident|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|25|25
+    1299|now|11|10|12|1|0|0|f|f|f|t|f|s|s|0|0|1184|
+    1387|pg_get_constraintdef|11|10|12|1|0|0|f|f|f|t|f|s|s|1|0|25|26
+    1394|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|700|700
+    1395|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|701|701
+    1396|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|20|20
+    1397|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|23|23
+    1398|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|21|21
+    1705|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|1700|1700
+    2100|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20
+    2101|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|23
+    2102|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|21
+    2103|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
+    2104|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|700
+    2105|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
+    2107|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20
+    2108|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|23
+    2109|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|21
+    2110|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700
+    2111|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
+    2114|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
+    2115|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|20
+    2116|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|23|23
+    2117|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|21|21
+    2118|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|26|26
+    2119|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700
+    2120|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
+    2122|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1082|1082
+    2126|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1114|1114
+    2127|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1184|1184
+    2129|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|25|25
+    2130|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
+    2131|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|20
+    2132|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|23|23
+    2133|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|21|21
+    2134|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|26|26
+    2135|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700
+    2136|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
+    2138|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1082|1082
+    2142|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1114|1114
+    2143|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1184|1184
+    2145|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|25|25
+    2146|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
+    2147|count|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|2276
+    2154|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20
+    2155|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|23
+    2156|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|21
+    2157|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|700
+    2158|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
+    2159|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
+    2508|pg_get_constraintdef|11|10|12|1|0|0|f|f|f|t|f|s|s|2|0|25|26 16
+    2803|count|11|10|12|1|0|0|a|f|f|f|f|i|s|0|0|20|
+    3538|string_agg|11|10|12|1|0|0|a|f|f|f|f|i|s|2|0|25|25 25
+    3545|string_agg|11|10|12|1|0|0|a|f|f|f|f|i|s|2|0|17|17 17
+    3810|pg_is_in_recovery|11|10|12|1|0|0|f|f|f|t|f|v|s|0|0|16|
+    6395|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17
+    6396|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17
+}
 
 test pg-object-opclass-is-read-only {
     CREATE ROLE reader_of_object_opclass_is_read_only_role;
