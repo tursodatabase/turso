@@ -21,7 +21,7 @@ use crate::sync::atomic::{
     AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use crate::sync::Arc;
-use crate::sync::{Mutex, RwLock};
+use crate::sync::{ArcMutexGuard, Mutex, RwLock};
 use crate::types::IOResultOr;
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
@@ -1578,7 +1578,11 @@ impl Savepoint {
 }
 
 pub struct SharedPagerState {
-    init_lock: Mutex<()>,
+    /// Serializes the allocation of page 1 (and the pre-allocation page size
+    /// change) across all pagers of the database. The allocating pager keeps
+    /// an owned guard inside its [AllocatePage1State] across the page-1
+    /// write and fsync, hence the `Arc`.
+    init_lock: Arc<Mutex<()>>,
     init_page_1: ArcSwapOption<Page>,
     // Encryption
     encryption_cipher: CipherMode,
@@ -1621,7 +1625,7 @@ impl SharedPagerState {
             None
         };
         Ok(Self {
-            init_lock: Mutex::new(()),
+            init_lock: Arc::new(Mutex::new(())),
             init_page_1: ArcSwapOption::new(init_page_1),
             encryption_cipher: cipher,
             encryption_verifier,
@@ -1718,6 +1722,8 @@ pub struct Pager {
     has_pending_reads: AtomicBool,
     #[cfg(any(test, feature = "test_helper"))]
     spill_yield: SpillYieldHook,
+    #[cfg(any(test, feature = "test_helper"))]
+    allocate_page1_gap_hook: Mutex<Option<AllocatePage1GapHook>>,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     /// Counts every `add_dirty` call, monotonically: the dirty-page set
@@ -1883,6 +1889,11 @@ impl SpillYieldHook {
     }
 }
 
+/// Test-only one-shot hook run by [Pager::maybe_allocate_page1] between its
+/// `db_initialized()` check and taking `init_lock`.
+#[cfg(any(test, feature = "test_helper"))]
+type AllocatePage1GapHook = Box<dyn FnOnce() + Send + Sync>;
+
 #[cfg(feature = "autovacuum")]
 pub struct VacuumState {
     /// State machine for [Pager::ptrmap_get]
@@ -1920,11 +1931,15 @@ enum AllocatePage1State {
     Start,
     Writing {
         page: PageRef,
+        /// Held [SharedPagerState::init_lock] until the state moves to `Done`
+        /// or back to `Start` (in an `Arc` because the state is cloned).
+        init_lock: Arc<ArcMutexGuard<()>>,
     },
     /// Fsyncing the freshly written page 1 to the main database file, so a
     /// WAL can never exist next to an empty (0-byte on disk) database file.
     Syncing {
         page: PageRef,
+        init_lock: Arc<ArcMutexGuard<()>>,
     },
     Done,
 }
@@ -2032,6 +2047,8 @@ impl Pager {
             has_pending_reads: AtomicBool::new(false),
             #[cfg(any(test, feature = "test_helper"))]
             spill_yield: SpillYieldHook::new(),
+            #[cfg(any(test, feature = "test_helper"))]
+            allocate_page1_gap_hook: Mutex::new(None),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             pages_dirtied_count: AtomicU64::new(0),
             subjournal: RwLock::new(None),
@@ -3208,19 +3225,25 @@ impl Pager {
         self.ephemeral.store(true, Ordering::Relaxed);
     }
 
-    /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
-    pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
+    /// Set the page size of an empty database for all of its pagers. Returns
+    /// `false` without doing anything once page 1 exists, or while another pager
+    /// is writing it: the page size is fixed at that point, and the allocation
+    /// holds `init_lock` across its IO, so waiting for it here could block the
+    /// thread that has to drive it.
+    pub fn set_initial_page_size(&self, size: PageSize) -> Result<bool> {
         if self.encryption_cipher() != CipherMode::None {
             if self.get_page_size_unchecked() == size {
-                return Ok(());
+                return Ok(false);
             }
             return Err(LimboError::InvalidArgument(
                 "encrypted database page size is fixed when opening the database".into(),
             ));
         }
-        let _lock = self.shared.init_lock.lock();
+        let Some(_lock) = self.shared.init_lock.try_lock() else {
+            return Ok(false);
+        };
         if self.db_initialized() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(codec) = self.page_codec_external() {
             let reserved_space = codec.required_reserved_bytes();
@@ -3265,7 +3288,7 @@ impl Pager {
         // size, so keep the IO context aligned with the pager before the first
         // page write.
         self.reset_page_size_in_encryption_ctx(size);
-        Ok(())
+        Ok(true)
     }
 
     /// Update the encryption page size in the pager IO context and its WAL copy.
@@ -3458,14 +3481,12 @@ impl Pager {
             self.is_authenticated(),
             "page allocation requires an authenticated pager"
         );
-        if !self.db_initialized() {
-            if let Some(_lock) = self.shared.init_lock.try_lock() {
-                return Ok(self.allocate_page1()?.map(|_| ()));
-            }
-            // Give a chance for the allocation to happen elsewhere
-            io_yield_one!(Completion::new_yield());
+        if self.db_initialized() {
+            return Ok(IOResult::Done(()));
         }
-        Ok(IOResult::Done(()))
+        #[cfg(any(test, feature = "test_helper"))]
+        self.run_allocate_page1_gap_hook();
+        self.allocate_page1()
     }
 
     #[inline(always)]
@@ -3956,6 +3977,27 @@ impl Pager {
         self.page_cache
             .read()
             .contains_key(&PageCacheKey::new(page_idx))
+    }
+
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn arm_allocate_page1_gap_hook(&self, hook: impl FnOnce() + Send + Sync + 'static) {
+        *self.allocate_page1_gap_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Taken out of its lock before it runs so it can drive other connections.
+    #[cfg(any(test, feature = "test_helper"))]
+    fn run_allocate_page1_gap_hook(&self) {
+        let hook = self.allocate_page1_gap_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Whether this pager's `init_lock` is currently held (by any connection).
+    /// Exposed for the page-1 allocation regression tests.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn is_init_locked(&self) -> bool {
+        self.shared.is_init_locked()
     }
 
     // Get a page from the cache, if it exists.
@@ -5890,16 +5932,48 @@ impl Pager {
         Ok(IOResult::Done(()))
     }
 
+    /// Allocate page 1 of an empty database. [SharedPagerState::init_lock] is
+    /// taken in `Start` and held until the page is written (and fsynced) and
+    /// published, so exactly one pager allocates page 1: the others get
+    /// [LimboError::Busy] while the lock is held and find the database
+    /// initialized once it is released. Callers normally go through
+    /// [Pager::maybe_allocate_page1].
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page1(&self) -> IOResultOr<PageRef> {
+    pub fn allocate_page1(&self) -> IOResultOr<()> {
         turso_assert!(
             self.is_authenticated(),
             "page allocation requires an authenticated pager"
         );
+        let result = self.allocate_page1_step();
+        if result.is_err() {
+            // Don't stay parked in `Writing`/`Syncing` holding the lock: go back
+            // to `Start` so this or any other pager can retry the allocation.
+            self.reset_allocate_page1();
+        }
+        result
+    }
+
+    fn allocate_page1_step(&self) -> IOResultOr<()> {
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
-                turso_assert!(!self.db_initialized());
+                let Some(init_lock) = self.shared.init_lock.try_lock_arc() else {
+                    // Another pager is allocating page 1 and holds the lock
+                    // until it has published it.
+                    if self.db_initialized() {
+                        return Ok(IOResult::Done(()));
+                    }
+                    // Report it like any other write-lock contention, so the
+                    // busy handler decides whether and when to retry. Waiting
+                    // here instead would never end if the allocating
+                    // statement is not stepped again.
+                    return Err(LimboError::Busy.into());
+                };
+                // The pager that held the lock may have just finished: it clears
+                // `init_page_1` before releasing the lock, so check again under it.
+                if self.db_initialized() {
+                    return Ok(IOResult::Done(()));
+                }
                 tracing::trace!("allocate_page1(Start)");
                 self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
 
@@ -5956,10 +6030,13 @@ impl Pager {
 
                 // Pin page1 to prevent eviction while stored in state machine
                 page1.pin();
-                *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
+                *self.allocate_page1_state.write() = AllocatePage1State::Writing {
+                    page: page1,
+                    init_lock: Arc::new(init_lock),
+                };
                 io_yield_one!(c);
             }
-            AllocatePage1State::Writing { page } => {
+            AllocatePage1State::Writing { page, init_lock } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
                 if self.wal.is_some() {
@@ -5977,14 +6054,18 @@ impl Pager {
                         self.syncing.clone(),
                         self.get_sync_type(),
                     )?;
-                    *self.allocate_page1_state.write() = AllocatePage1State::Syncing { page };
+                    *self.allocate_page1_state.write() =
+                        AllocatePage1State::Syncing { page, init_lock };
                     io_yield_one!(c);
                 }
                 self.finish_allocate_page1(page)
             }
-            AllocatePage1State::Syncing { page } => {
+            AllocatePage1State::Syncing { page, init_lock } => {
                 tracing::trace!("allocate_page1(Syncing done)");
-                self.finish_allocate_page1(page)
+                let result = self.finish_allocate_page1(page);
+                // Released only now that `init_page_1` has been cleared.
+                drop(init_lock);
+                result
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
         }
@@ -5993,7 +6074,7 @@ impl Pager {
     /// Final step of [Pager::allocate_page1]: page 1 is written (and, for
     /// WAL-backed databases, fsync'd) to the main database file; publish it
     /// in the page cache and mark the database initialized.
-    fn finish_allocate_page1(&self, page: PageRef) -> IOResultOr<PageRef> {
+    fn finish_allocate_page1(&self, page: PageRef) -> IOResultOr<()> {
         let page_key = PageCacheKey::new(page.get().id());
         let mut cache = self.page_cache.write();
         cache.insert(page_key, page.clone()).map_err(|e| {
@@ -6003,7 +6084,19 @@ impl Pager {
         self.shared.set_initial_page_1(None);
         page.unpin();
         *self.allocate_page1_state.write() = AllocatePage1State::Done;
-        Ok(IOResult::Done(page))
+        Ok(IOResult::Done(()))
+    }
+
+    /// Abandon an allocation left in `Writing`/`Syncing`: unpin page 1 and go
+    /// back to `Start`, which also releases `init_lock`. No-op in `Start`/`Done`.
+    fn reset_allocate_page1(&self) {
+        let mut state = self.allocate_page1_state.write();
+        if let AllocatePage1State::Writing { page, .. } | AllocatePage1State::Syncing { page, .. } =
+            &*state
+        {
+            page.unpin();
+            *state = AllocatePage1State::Start;
+        }
     }
 
     pub fn allocating_page1(&self) -> bool {
@@ -6363,6 +6456,10 @@ impl Pager {
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
         *self.allocate_page_state.write() = AllocatePageState::Start;
+        // An abandoned allocation (statement reset or dropped, connection
+        // closed) must release `init_lock`, or every other pager's first write
+        // keeps failing with Busy.
+        self.reset_allocate_page1();
         *self.free_page_state.write() = FreePageState::Start;
         *self.spill_state.write() = SpillState::Idle;
         #[cfg(feature = "autovacuum")]

@@ -318,7 +318,8 @@ impl Connection {
                     "encrypted attached database reserved bytes must match its cipher".into(),
                 ));
             }
-            return attached_db_pager.set_initial_page_size(self.get_page_size());
+            attached_db_pager.set_initial_page_size(self.get_page_size())?;
+            return Ok(());
         }
         let target_page_size = self.get_page_size();
         let attached_min_reserved_space =
