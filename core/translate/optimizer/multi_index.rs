@@ -1543,6 +1543,7 @@ mod tests {
             "item",
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id".to_string(),
+                declared_name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["id"]),
@@ -1690,6 +1691,7 @@ mod tests {
             "item",
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_a".to_string(),
+                declared_name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
                 columns: crate::alloc::vec![IndexColumn::new(
@@ -1806,6 +1808,7 @@ mod tests {
             "item",
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id_kind".to_string(),
+                declared_name: "idx_item_id_kind".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["id", "kind"]),
@@ -1991,6 +1994,7 @@ mod tests {
             "item",
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id".to_string(),
+                declared_name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["id"]),

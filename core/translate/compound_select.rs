@@ -605,6 +605,7 @@ fn create_dedupe_index(
     let dedupe_index = Arc::new(Index {
         columns: dedupe_columns,
         name: "compound_dedupe".to_string(),
+        declared_name: "compound_dedupe".to_string(),
         root_page: 0,
         ephemeral: true,
         table_name: String::new(),
@@ -808,6 +809,7 @@ fn create_collection_index(
     let index = Arc::new(Index {
         columns,
         name: "compound_collection".to_string(),
+        declared_name: "compound_collection".to_string(),
         root_page: 0,
         ephemeral: true,
         table_name: String::new(),

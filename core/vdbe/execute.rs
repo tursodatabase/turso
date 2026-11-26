@@ -17114,7 +17114,7 @@ pub fn op_rename_table(
                     &mangled_from,
                     &mangled_to,
                 ) {
-                    index.name = name;
+                    index.set_name(name);
                 }
             });
 

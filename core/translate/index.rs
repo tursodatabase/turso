@@ -279,6 +279,7 @@ pub fn translate_create_index(
     }
     let idx = Arc::new(Index {
         name: idx_name.clone(),
+        declared_name: original_idx_name.name.as_str().to_string(),
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
         columns,
