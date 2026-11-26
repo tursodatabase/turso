@@ -1,0 +1,93 @@
+# Known tursopg gaps against PostgreSQL: functions of float4 and float8
+#
+# See errors.sqltest for how a gap test reads.
+
+@database :memory:
+
+# Core's round rounds half away from zero. PostgreSQL rounds a float to the
+# nearest even number.
+@compat-gap "function:round"
+test round-of-a-float-rounds-half-to-even {
+    SELECT round(2.5::float8), round(3.5::float8), round(2.5::float4);
+}
+expect {
+    2|4|2
+}
+expect @tursopg {
+    3.0|4.0|3.0
+}
+
+# The result of abs has no registered type, so it is written as a plain REAL.
+@compat-gap "function:abs"
+test abs-of-an-infinity-is-written-as-postgres-writes-it {
+    SELECT abs('-Infinity'::float8);
+}
+expect {
+    Infinity
+}
+expect @tursopg {
+    inf
+}
+
+# The result of sum and avg has no registered type, so it is written as a
+# plain REAL.
+@compat-gap "function:sum"
+test sum-and-avg-of-floats-are-written-as-postgres-writes-them {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (1.5), (2.5);
+    SELECT sum(x), avg(x) FROM t;
+}
+expect {
+    4|2
+}
+expect @tursopg {
+    4.0|2.0
+}
+
+@compat-gap "function:sum"
+test sum-of-an-infinity-and-a-number-is-written-as-postgres-writes-it {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('Infinity'), (1.5);
+    SELECT sum(x) FROM t;
+}
+expect {
+    Infinity
+}
+expect @tursopg {
+    inf
+}
+
+# Core returns NULL for these log domain errors; PostgreSQL fails.
+@compat-gap "function:ln"
+test ln-of-zero-fails {
+    SELECT ln(0::float8);
+}
+@sqlstate 2201E
+expect error {}
+expect @tursopg {
+
+}
+
+@compat-gap "function:ln"
+test ln-of-a-negative-number-fails {
+    SELECT ln(-1::float8);
+}
+@sqlstate 2201E
+expect error {}
+expect @tursopg {
+
+}
+
+# An element of an array is written by the engine, not by the float type.
+@compat-gap "type:float8"
+test array-of-floats-is-written-as-postgres-writes-it {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('NaN'), ('Infinity'), ('-Infinity'), ('-0'), (1.5);
+    SELECT array_agg(x) FROM t;
+}
+expect {
+    {NaN,Infinity,-Infinity,-0,1.5}
+}
+expect @tursopg {
+    {NaN,inf,-inf,0.0,1.5}
+}

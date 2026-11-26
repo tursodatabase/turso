@@ -1,0 +1,218 @@
+# Functions and aggregates of float4 and float8 that are given NaN or an
+# infinity.
+
+@database :memory:
+
+test functions-of-nan-are-nan {
+    SELECT abs('NaN'::float8), sqrt('NaN'::float8), exp('NaN'::float8),
+        ln('NaN'::float8), trunc('NaN'::float8), round('NaN'::float8);
+}
+expect {
+    NaN|NaN|NaN|NaN|NaN|NaN
+}
+
+test sum-and-avg-with-a-nan-are-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('NaN'), (1.5), (0.5);
+    SELECT sum(x), avg(x) FROM t;
+}
+expect {
+    NaN|NaN
+}
+
+test min-and-max-order-nan-last {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('NaN'), (1.5), (0.5);
+    SELECT min(x), max(x) FROM t;
+}
+expect {
+    0.5|NaN
+}
+
+test sum-of-opposite-infinities-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('Infinity'), ('-Infinity');
+    SELECT sum(x), avg(x) FROM t;
+}
+expect {
+    NaN|NaN
+}
+
+test nan-cast-to-numeric-is-nan {
+    SELECT ('NaN'::float8)::numeric, ('NaN'::float4)::numeric;
+}
+expect {
+    NaN|NaN
+}
+
+test nan-in-a-sorted-subquery-stays-nan {
+    CREATE TABLE t (id int, x float8);
+    INSERT INTO t VALUES (1, 'NaN'), (2, 1.5);
+    SELECT id, abs(x) FROM (SELECT * FROM t ORDER BY id DESC) s ORDER BY id;
+}
+expect {
+    1|NaN
+    2|1.5
+}
+
+test window-sum-is-a-number-again-after-a-nan-leaves-the-frame {
+    CREATE TABLE t (n int, x float8);
+    INSERT INTO t VALUES (1, 1), (2, 'NaN'), (3, 2), (4, 4), (5, 8);
+    SELECT n, sum(x) OVER w < 7, avg(x) OVER w = 6
+    FROM t WINDOW w AS (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY n;
+}
+expect {
+    1|t|f
+    2|f|f
+    3|f|f
+    4|t|f
+    5|f|t
+}
+
+
+test percentile-of-nan-is-nan {
+    CREATE TABLE t(x float8);
+    INSERT INTO t VALUES ('NaN');
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x),
+           percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect {
+    NaN|NaN
+}
+
+test percentile-interpolation-can-produce-nan {
+    CREATE TABLE t(x float8);
+    INSERT INTO t VALUES ('-Infinity'), ('Infinity');
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect {
+    NaN
+}
+
+test percentile-nan-survives-a-subquery-and-a-predicate {
+    CREATE TABLE t(x float8);
+    INSERT INTO t VALUES (1), ('NaN');
+    SELECT p IS NULL, p = 'NaN'::float8 FROM
+        (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS p FROM t) s;
+}
+expect {
+    f|t
+}
+
+test percentile-orders-an-arithmetic-nan-after-numbers {
+    CREATE TABLE t(x float8);
+    INSERT INTO t VALUES (-('NaN'::float8)), ('Infinity'::float8 - 'Infinity'::float8), (1);
+    SELECT percentile_cont(0) WITHIN GROUP (ORDER BY x) = 1,
+           percentile_cont(1) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect {
+    t|NaN
+}
+
+
+test sqrt-of-a-negative-float8-fails {
+    SELECT sqrt(-1::float8);
+}
+@sqlstate 2201F
+expect error {}
+
+test sqrt-of-a-negative-float4-fails {
+    SELECT sqrt(-1::float4);
+}
+@sqlstate 2201F
+expect error {}
+
+test sqrt-of-negative-infinity-fails {
+    SELECT sqrt('-Infinity'::float8);
+}
+@sqlstate 2201F
+expect error {}
+
+test sqrt-keeps-null-zero-and-positive-results {
+    SELECT sqrt(NULL::float8) IS NULL, sqrt('-0'::float8) = 0, sqrt(4::float8) = 2,
+           sqrt('Infinity'::float8) = 'Infinity'::float8;
+}
+expect {
+    t|t|t|t
+}
+
+test float-function-arguments-use-the-declared-precision {
+    SELECT float4um('0.1')::float8 = -0.1::float8,
+           float4pl('1.0000000596046448', '0')::float8 = '1.0000001192092896'::float8,
+           float4pl('9007199791611905'::bigint, 0)::float8::bigint;
+    SELECT sqrt('NaN') IS NULL, sqrt('Infinity') IS NULL,
+           sqrt('0x1p2') = 2::float8;
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (float4um('0.1'));
+    SELECT x = -0.1::float8 FROM t;
+}
+expect {
+    f|t|9007200328482816
+    f|f|t
+    f
+}
+
+test float-function-input-overflow-fails {
+    SELECT float4pl('1', '1e39');
+}
+@sqlstate 22003
+expect error {}
+
+test float-function-input-underflow-fails {
+    SELECT float4pl('1', '1e-46');
+}
+@sqlstate 22003
+expect error {}
+
+test float-function-null-does-not-hide-invalid-input {
+    SELECT float4pl(NULL, '1e39');
+}
+@sqlstate 22003
+expect error {}
+
+test float-function-typed-text-is-not-an-implicit-float {
+    SELECT float4pl('1'::text, '2');
+}
+@sqlstate 42883
+expect error {}
+
+test float-function-float8-is-not-implicitly-narrowed {
+    SELECT float4um(0.1::float8);
+}
+@sqlstate 42883
+expect error {}
+
+test sqrt-untyped-invalid-input-fails {
+    SELECT sqrt('bad');
+}
+@sqlstate 22P02
+expect error {}
+
+test sqrt-untyped-negative-infinity-fails {
+    SELECT sqrt('-Infinity');
+}
+@sqlstate 2201F
+expect error {}
+
+test float-function-conversion-applies-to-each-row {
+    CREATE TABLE t (id integer, v bigint);
+    INSERT INTO t VALUES (1, '9007199791611905'), (2, '-9007199791611905');
+    SELECT id, float4um(v)::float8::bigint FROM t ORDER BY id;
+    SELECT id, float4pl(v, 0)::float8::bigint FROM t ORDER BY id;
+}
+expect {
+    1|-9007200328482816
+    2|9007200328482816
+    1|9007200328482816
+    2|-9007200328482816
+}
+
+test float-function-conversion-in-window-ordering {
+    CREATE TABLE t (id integer, v bigint);
+    INSERT INTO t VALUES (1, '9007199791611905'), (2, '9007199791611904');
+    SELECT id, rank() OVER (ORDER BY float4um(v)) FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|2
+}

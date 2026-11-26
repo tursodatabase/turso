@@ -1,0 +1,91 @@
+# Arithmetic on float4 and float8. The result of an operator on two values of
+# a float type has that type, so it is written as that type, and a NaN, an
+# infinity and a zero with a sign are kept through arithmetic.
+
+@database :memory:
+
+# The result of arithmetic on two float4 is a float4, so it has the digits of one.
+test float4-addition-gives-float4-digits {
+    CREATE TABLE t (a float4, b float4);
+    INSERT INTO t VALUES (0.1, 0);
+    SELECT a + b FROM t;
+}
+expect {
+    0.1
+}
+
+# The text of a float8 has no ".0" for a whole number.
+test float8-arithmetic-is-written-as-a-float8 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (1.5);
+    SELECT x + x FROM t;
+}
+expect {
+    3
+}
+
+test float8-product-keeps-negative-zero {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('-0');
+    SELECT x * 1 FROM t;
+}
+expect {
+    -0
+}
+
+test float8-nan-plus-number-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('NaN');
+    SELECT x + 1 FROM t;
+}
+expect {
+    NaN
+}
+
+test float8-infinity-times-zero-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('Infinity');
+    SELECT x * 0 FROM t;
+}
+expect {
+    NaN
+}
+
+test float8-times-an-infinity-literal {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (2);
+    SELECT x * 'Infinity' FROM t;
+}
+expect {
+    Infinity
+}
+
+test float8-division-by-nan-is-nan {
+    CREATE TABLE t (x float8, y float8);
+    INSERT INTO t VALUES (0, 'NaN');
+    SELECT x / y FROM t;
+}
+expect {
+    NaN
+}
+
+test float8-overflow-is-an-error {
+    CREATE TABLE t (x float8, y float8);
+    INSERT INTO t VALUES ('1e308', 10);
+    SELECT x * y FROM t;
+}
+@sqlstate 22003
+expect error {
+    value out of range: overflow
+}
+
+# 0.1 times 9007199254740992 is halfway between 900719925474099.2 and
+# 900719925474099.3, and PostgreSQL writes the first.
+test float8-product-writes-the-digits-that-postgresql-writes {
+    CREATE TABLE t (x float8, y float8);
+    INSERT INTO t VALUES (0.1, 9007199254740993);
+    SELECT x * y FROM t;
+}
+expect {
+    900719925474099.2
+}
