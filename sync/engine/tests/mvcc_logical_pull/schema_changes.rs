@@ -335,6 +335,32 @@ fn rename_table_with_a_non_ascii_name_and_unpushed_local_changes() -> Result<()>
 }
 
 #[test]
+fn rename_table_right_after_a_replace_base_snapshot_with_unpushed_local_changes() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE t (x PRIMARY KEY, y)",
+        "INSERT INTO t VALUES (1, 2)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+    replica.execute("INSERT INTO t VALUES (5, 6)")?;
+
+    remote.answer_next_pull_with_replace_base_snapshot()?;
+    remote.execute_transaction(&["ALTER TABLE t RENAME TO u"])?;
+    replica.pull()?;
+    remote.execute_transaction(&["INSERT INTO u VALUES (10, 10)"])?;
+    replica.pull()?;
+
+    assert_eq!(
+        replica.query("SELECT * FROM u ORDER BY x")?,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2)],
+            vec![Value::from_i64(5), Value::from_i64(6)],
+            vec![Value::from_i64(10), Value::from_i64(10)],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn swap_table_names_with_unpushed_local_changes() -> Result<()> {
     let remote = Remote::new(&[
         "CREATE TABLE a (x PRIMARY KEY)",
@@ -446,6 +472,34 @@ fn rename_table_with_an_unpushed_local_schema_change_to_it_fails_the_pull() -> R
         vec![
             vec![Value::from_i64(1), Value::from_i64(2), Value::Null],
             vec![Value::from_i64(3), Value::from_i64(4), Value::from_i64(5)],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn rename_table_after_a_replace_base_snapshot_with_an_unpushed_local_schema_change_to_it_fails_the_pull(
+) -> Result<()> {
+    let remote = Remote::new(&["CREATE TABLE t (x, y)", "INSERT INTO t VALUES (1, 2)"])?;
+    let replica = remote.bootstrap_replica()?;
+    replica.execute("CREATE INDEX t_y ON t (y)")?;
+
+    remote.answer_next_pull_with_replace_base_snapshot()?;
+    remote.execute_transaction(&["ALTER TABLE t RENAME TO u"])?;
+    let error = replica.pull().unwrap_err().to_string();
+
+    assert!(
+        error.contains("unpushed local schema change to table t")
+            && error.contains("renamed the table to u"),
+        "{error}"
+    );
+    assert_eq!(
+        replica.query(
+            "SELECT type, name FROM sqlite_schema WHERE tbl_name IN ('t', 'u') ORDER BY name"
+        )?,
+        vec![
+            vec![Value::build_text("table"), Value::build_text("t")],
+            vec![Value::build_text("index"), Value::build_text("t_y")],
         ]
     );
     Ok(())

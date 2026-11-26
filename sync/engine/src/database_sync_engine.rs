@@ -24,8 +24,8 @@ use crate::{
         read_logical_replay_table_map, read_wal_salt, rename_tables_in_local_changes,
         reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
         wait_all_results, wait_file_completion, wal_apply_from_file, wal_apply_from_staging,
-        wal_pull_to_staging, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE,
-        WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        wal_pull_to_staging, PullUpdatesV1Result, RenamedTables, SyncEngineIoStats,
+        SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         replay_without_triggers, run_stmt_ignore_rows, try_wal_watermark_read_page,
@@ -2659,6 +2659,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let applied_raw_db_size: u32;
             let mut revert_since_wal_watermark = None;
             let mut followup_revision = None;
+            let mut followup_renamed_tables = RenamedTables::default();
             match stream_kind {
                 stream_kind if stream_kind_applies_remote_pages(stream_kind) => {
                     if matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages) {
@@ -2834,7 +2835,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                                 use_implicit_rowid: true,
                                             },
                                         );
-                                        apply_logical_transactions_staging_without_commit(
+                                        followup_renamed_tables = apply_logical_transactions_staging_without_commit(
                                             coro,
                                             &mut replay,
                                             changes_file,
@@ -2846,7 +2847,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                             Error::DatabaseSyncEngineError(format!(
                                                 "failed to apply replace-base follow-up logical transactions: {error}",
                                             ))
-                                        })?;
+                                        })?
+                                        .renamed_tables;
                                     }
                                 }
                                 (
@@ -3006,7 +3008,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 precollected_local_changes
                     .into_iter()
                     .filter(|change| change.change_id > replay_floor)
-                    .collect::<Vec<_>>()
+                    .map(|change| followup_renamed_tables.move_local_change(change))
+                    .collect::<Result<Vec<_>>>()?
             } else {
                 let iterate_opts = DatabaseChangesIteratorOpts {
                     first_change_id: Some(replay_floor + 1),
