@@ -835,3 +835,9 @@ Upgrade is not supported.
 Not applicable: the Turso Postgres frontend is Rust and builds on every
 platform Turso supports; PostgreSQL's platform/compiler feature entries do
 not carry over.
+
+Only implemented catalogs have relation identities in `pg_class`; empty
+compatibility placeholders do not. Catalog relation identities are stored when
+a database is created. They use
+PostgreSQL 18's OIDs in `pg_catalog`. Their attribute counts describe the columns
+that this frontend exposes, and `pg_attribute` lists those same columns.

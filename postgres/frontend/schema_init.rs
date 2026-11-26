@@ -34,13 +34,18 @@ const STORED_CATALOG_TABLES: [&str; 1] = [DESCRIPTION_TABLE_NAME];
 pub(crate) fn initialize_statements(
     schema: &Schema,
     read_only: bool,
-) -> Result<impl Iterator<Item = &'static str> + '_> {
+) -> Result<std::vec::IntoIter<String>> {
     classes::refuse_relations_without_class_table(schema)?;
     let is_missing = |table| schema.get_btree_table(NamespaceId::ROOT, table).is_none();
-    Ok(TABLE_INITS
+    let mut statements: Vec<String> = TABLE_INITS
         .iter()
-        .filter(move |init| !read_only && is_missing(init.table))
-        .flat_map(|init| init.statements.iter().copied()))
+        .filter(|init| !read_only && is_missing(init.table))
+        .flat_map(|init| init.statements.iter().map(|sql| sql.to_string()))
+        .collect();
+    if !read_only && is_missing(classes::CLASSES_TABLE_NAME) {
+        statements.extend(classes::bootstrap_statements(schema));
+    }
+    Ok(statements.into_iter())
 }
 
 /// Whether `name` in the root namespace is a catalog table that this

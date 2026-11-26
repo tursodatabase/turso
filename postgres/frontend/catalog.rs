@@ -592,7 +592,8 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>)> 
             .tables(namespace)
             .map(|table| (namespace, table.get_name(), table))
             .filter(|(_, name, table)| {
-                !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
+                turso_core::schema::is_user_relation_name(RelationKind::Table, name)
+                    && matches!(table.as_ref(), Table::BTree(_))
             })
             .collect();
         namespace_tables.sort_by_key(|(_, name, _)| *name);
@@ -760,6 +761,63 @@ fn ref_act_to_char(act: &RefAct) -> &'static str {
         RefAct::SetNull => "n",
         RefAct::SetDefault => "d",
     }
+}
+
+/// Implemented catalog relations. Empty compatibility placeholders have no row. The OIDs and kinds were
+/// checked against PostgreSQL 18's pg_class after initdb.
+/// FIXME(pg-catalog): These binary-defined relations are seeded into the on-disk
+/// catalog. A virtual part should supply them from the binary, combined with
+/// physical rows for relations that exist in the database.
+pub(crate) const BUILTIN_CATALOGS: &[(i64, &str, RelationKind, bool)] = &[
+    (2601, "pg_am", RelationKind::Table, false),
+    (2604, "pg_attrdef", RelationKind::Table, false),
+    (1249, "pg_attribute", RelationKind::Table, false),
+    (1261, "pg_auth_members", RelationKind::Table, true),
+    (2605, "pg_cast", RelationKind::Table, false),
+    (1259, "pg_class", RelationKind::Table, false),
+    (2606, "pg_constraint", RelationKind::Table, false),
+    (1262, "pg_database", RelationKind::Table, true),
+    (2608, "pg_depend", RelationKind::Table, false),
+    (2609, "pg_description", RelationKind::Table, false),
+    (2610, "pg_index", RelationKind::Table, false),
+    (12043, "pg_indexes", RelationKind::View, false),
+    (2612, "pg_language", RelationKind::Table, false),
+    (2615, "pg_namespace", RelationKind::Table, false),
+    (2617, "pg_operator", RelationKind::Table, false),
+    (12018, "pg_policies", RelationKind::View, false),
+    (3256, "pg_policy", RelationKind::Table, false),
+    (1255, "pg_proc", RelationKind::Table, false),
+    (2618, "pg_rewrite", RelationKind::Table, false),
+    (12000, "pg_roles", RelationKind::View, false),
+    (2224, "pg_sequence", RelationKind::Table, false),
+    (12048, "pg_sequences", RelationKind::View, false),
+    (12104, "pg_settings", RelationKind::View, false),
+    (12033, "pg_tables", RelationKind::View, false),
+    (1247, "pg_type", RelationKind::Table, false),
+];
+
+/// The exposed columns, excluding hidden implementation and system columns.
+pub(crate) fn builtin_catalog_columns(
+    schema: &Schema,
+    name: &str,
+) -> Vec<turso_core::schema::Column> {
+    let table = schema.get_table(NamespaceId::ROOT, name);
+    let fallback;
+    let columns = if let Some(table) = table.as_ref() {
+        table.columns()
+    } else {
+        // pg_description is created after the bootstrap statements are built.
+        assert_eq!(name, "pg_description");
+        fallback = PostgresDialect
+            .parse_table_sql(crate::descriptions::TABLE_INIT.statements[0], 0)
+            .expect("catalog DDL is valid");
+        fallback.columns()
+    };
+    columns
+        .iter()
+        .filter(|column| !column.hidden())
+        .cloned()
+        .collect()
 }
 
 /// Virtual table implementation for pg_catalog.pg_class
@@ -1146,10 +1204,7 @@ impl SnapshotRows for PgAttributeTable {
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = match schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    Some(td) if !td.is_builtin => user_type_oid(&td.name),
-                    _ => sqlite_type_to_pg_oid(&col.ty_str),
-                };
+                let type_oid = attribute_type_oid(&schema, col, table.is_strict());
                 let storage = if col.is_array() {
                     "x"
                 } else {
@@ -1198,7 +1253,117 @@ impl SnapshotRows for PgAttributeTable {
             }
         }
 
+        for rule in view_rules(&schema) {
+            for (position, column) in rule.view.columns.iter().enumerate() {
+                rows.push(simple_attribute_row(
+                    &schema,
+                    rule.view_oid,
+                    position,
+                    column,
+                ));
+            }
+        }
+        for index in catalog_indexes(&schema) {
+            let classes = crate::classes::class_catalog(&schema).expect("indexes have classes");
+            let class = classes
+                .get_by_oid(index.table_oid)
+                .expect("an index has a table");
+            let table = schema
+                .get_btree_table(class.relnamespace, &class.relname)
+                .expect("an index has a table");
+            for (position, indexed) in index.columns.iter().enumerate() {
+                let mut column = if let Some(expression) = &indexed.expression {
+                    let sql = format!(
+                        "SELECT {expression} FROM {}",
+                        quote_identifier(&class.relname)
+                    );
+                    let (Some(ast::Cmd::Stmt(ast::Stmt::Select(select))), _) = PostgresDialect
+                        .parse_internal(&sql)
+                        .expect("index expressions are valid engine SQL")
+                    else {
+                        unreachable!("the statement is SELECT");
+                    };
+                    turso_core::schema::view::extract_view_columns(
+                        class.relnamespace,
+                        &select,
+                        &schema,
+                    )
+                    .expect("index expressions reference their table")
+                    .columns
+                    .remove(0)
+                    .column
+                } else {
+                    table.columns()[indexed.position].clone()
+                };
+                column.name = Some(indexed.name.clone());
+                // FIXME(pg-catalog): PostgreSQL index attributes have no NOT NULL
+                // constraint. A stored pg_attribute should own this flag.
+                column.set_notnull(false);
+                column.set_rowid_alias(false);
+                rows.push(simple_attribute_row(&schema, index.oid, position, &column));
+            }
+        }
+        let sequence = PostgresDialect.parse_table_sql("CREATE TABLE sequence_columns (last_value BIGINT, log_cnt BIGINT, is_called BOOLEAN)", 0).expect("sequence definition is valid");
+        for (oid, _, _) in sequence_catalog_entries(&schema) {
+            for (position, column) in sequence.columns().iter().enumerate() {
+                rows.push(simple_attribute_row(&schema, oid, position, column));
+            }
+        }
+        for &(oid, name, _, _) in BUILTIN_CATALOGS {
+            for (position, column) in builtin_catalog_columns(&schema, name).iter().enumerate() {
+                rows.push(simple_attribute_row(&schema, oid, position, column));
+            }
+        }
         rows
+    }
+}
+
+/// Attributes of catalog and view columns, which have no defaults or identity.
+fn simple_attribute_row(
+    schema: &Schema,
+    oid: i64,
+    position: usize,
+    column: &turso_core::schema::Column,
+) -> Vec<Value> {
+    vec![
+        Value::from_i64(oid),
+        Value::build_text(column.name.clone().unwrap_or_default()),
+        Value::from_i64(attribute_type_oid(schema, column, true)),
+        Value::from_i64(-1),
+        Value::from_i64(-1),
+        Value::from_i64(position as i64 + 1),
+        Value::from_i64(0),
+        Value::from_i64(-1),
+        Value::from_i64(-1),
+        Value::from_i64(1),
+        Value::build_text("p"),
+        Value::build_text("i"),
+        Value::build_text(""),
+        Value::from_i64(i64::from(column.notnull())),
+        Value::from_i64(0),
+        Value::from_i64(0),
+        Value::build_text(""),
+        Value::build_text(""),
+        Value::from_i64(0),
+        Value::from_i64(1),
+        Value::from_i64(0),
+        Value::from_i64(0),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+/// Resolves declared column types for table, view and index attributes.
+fn attribute_type_oid(
+    schema: &Schema,
+    column: &turso_core::schema::Column,
+    is_strict: bool,
+) -> i64 {
+    match schema.get_type_def(&column.ty_str, is_strict) {
+        Some(td) if !td.is_builtin => user_type_oid(&td.name),
+        _ => sqlite_type_to_pg_oid(&column.ty_str),
     }
 }
 

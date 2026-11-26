@@ -249,6 +249,39 @@ pub(crate) const TABLE_INIT: TableInit = TableInit {
     ],
 };
 
+/// Seeds the identities of the catalogs before the first user DDL runs.
+/// The column counts come from the schemas this frontend exposes.
+pub(crate) fn bootstrap_statements(schema: &Schema) -> Vec<String> {
+    crate::catalog::BUILTIN_CATALOGS
+        .iter()
+        .map(|&(oid, name, kind, shared)| {
+            let new = NewRelation {
+                natts: crate::catalog::builtin_catalog_columns(schema, name).len(),
+                ..NewRelation::of_relation(NamespaceId::ROOT, name, kind)
+            };
+            let mut values = new_class_values(&new, RoleId::SUPERUSER);
+            values[column_position("oid")] = ClassValue::Int(oid);
+            values[column_position("relnamespace")] = ClassValue::Int(11);
+            values[column_position("relisshared")] = ClassValue::Int(i64::from(shared));
+            let values = values
+                .into_iter()
+                .map(|value| match value {
+                    ClassValue::Null => "NULL".to_string(),
+                    ClassValue::Int(value) => value.to_string(),
+                    ClassValue::Real(value) => format!("{value:.1}"),
+                    ClassValue::Text(value) => format!("'{}'", value.replace('\'', "''")),
+                    ClassValue::Register(_) => unreachable!("bootstrap values are constants"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "INSERT INTO {CLASSES_TABLE_NAME} ({}) VALUES ({values})",
+                CLASS_COLUMNS.join(", ")
+            )
+        })
+        .collect()
+}
+
 /// PostgreSQL's `pg_class.relkind` letter for `kind`.
 pub(crate) fn relkind_letter(kind: RelationKind) -> &'static str {
     match kind {
@@ -481,7 +514,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
             Value::Numeric(Numeric::Integer(relownedby)),
             Value::Numeric(Numeric::Integer(relrowsecurity @ (0 | 1))),
             Value::Numeric(Numeric::Integer(relindrelid)),
-        ) if *oid >= FIRST_NORMAL_OBJECT_ID
+        ) if *oid > 0
             && u32::try_from(*relnamespace).is_ok()
             && *relowner >= 0
             && *relownedby >= 0
@@ -519,7 +552,11 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                 relname: relname.as_str().to_string(),
                 engine_name,
                 relindrelid: *relindrelid,
-                relnamespace: NamespaceId::new(*relnamespace as u32),
+                relnamespace: if *oid < FIRST_NORMAL_OBJECT_ID {
+                    NamespaceId::ROOT
+                } else {
+                    NamespaceId::new(*relnamespace as u32)
+                },
                 relkind,
                 relowner: RoleId::from_stored(*relowner),
                 relownedby: *relownedby,

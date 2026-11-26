@@ -285,16 +285,12 @@ expect @tursopg error {}
 
 # E-22: view columns in pg_attribute
 @setup t_id_view_v
-@compat-gap "syntax:catalog"
 test view-columns-in-pg-attribute {
     SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'v' AND a.attnum > 0;
 }
 expect {
     id|integer
 }
-expect @tursopg {
-}
-
 # E-23: pg_enum
 @setup type_mood
 @compat-gap "syntax:catalog"

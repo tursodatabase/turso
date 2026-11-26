@@ -11,7 +11,7 @@ use turso_core::{Connection, Numeric, SessionRole, Value};
 /// ordered by oid.
 fn class_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, String, i64)> {
     let rows = conn
-        .prepare_engine_schema_statement("SELECT oid, relname, relnamespace, relkind, relowner FROM __turso_internal_classes ORDER BY oid")
+        .prepare_engine_schema_statement("SELECT oid, relname, relnamespace, relkind, relowner FROM __turso_internal_classes WHERE oid >= 16384 ORDER BY oid")
         .unwrap()
         .run_collect_rows()
         .unwrap();
@@ -1257,6 +1257,53 @@ fn ddl_updates_stored_class_columns(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn catalog_class_rows_match_the_exposed_attributes(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = pg.inner();
+    let rows = conn
+        .prepare_engine_schema_statement(
+            "SELECT oid, relnamespace FROM __turso_internal_classes WHERE relname='pg_class'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1259), Value::from_i64(11)]]);
+    let rows = conn.prepare_engine_schema_statement("SELECT c.relname, c.relnatts, count(a.attnum) FROM main.__turso_internal_classes c LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 WHERE c.oid<16384 GROUP BY c.oid, c.relname, c.relnatts HAVING c.relnatts<>count(a.attnum)").unwrap().run_collect_rows().unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
+}
+
+#[turso_macros::test(mvcc)]
+fn user_tables_with_catalog_names_have_attributes(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE public.pg_class (id int PRIMARY KEY, x text)")
+        .unwrap();
+    let rows = pg
+        .prepare(
+            "SELECT c.relname, c.relnatts, count(a.attnum) FROM pg_catalog.pg_class c \
+         LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 \
+         WHERE c.relnamespace=2200 GROUP BY c.oid,c.relname,c.relnatts ORDER BY c.relname",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::build_text("pg_class"),
+                Value::from_i64(2),
+                Value::from_i64(2)
+            ],
+            vec![
+                Value::build_text("pg_class_pkey"),
+                Value::from_i64(1),
+                Value::from_i64(1)
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn long_relation_names_survive_schema_reload(db: TempDatabase) {
     let pg = db.connect_postgres();
     pg.inner().pragma_update("foreign_keys", "ON").unwrap();
@@ -1301,4 +1348,56 @@ fn quoted_relation_names_keep_engine_lookup(db: TempDatabase) {
     pg.execute("DROP VIEW \"ViEw\"").unwrap();
     pg.execute("DROP TABLE \"NewName\"").unwrap();
     assert!(class_rows(pg.inner()).is_empty());
+}
+
+#[turso_macros::test(mvcc)]
+fn stored_catalog_lists_only_implemented_relations(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    assert_implemented_catalog_rows(pg.inner());
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    assert_implemented_catalog_rows(pg.inner());
+}
+
+fn assert_implemented_catalog_rows(conn: &Arc<Connection>) {
+    let rows = conn
+        .prepare_engine_schema_statement(
+            "SELECT relname FROM __turso_internal_classes WHERE oid < 16384 ORDER BY relname",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    let expected = [
+        "pg_am",
+        "pg_attrdef",
+        "pg_attribute",
+        "pg_auth_members",
+        "pg_cast",
+        "pg_class",
+        "pg_constraint",
+        "pg_database",
+        "pg_depend",
+        "pg_description",
+        "pg_index",
+        "pg_indexes",
+        "pg_language",
+        "pg_namespace",
+        "pg_operator",
+        "pg_policies",
+        "pg_policy",
+        "pg_proc",
+        "pg_rewrite",
+        "pg_roles",
+        "pg_sequence",
+        "pg_sequences",
+        "pg_settings",
+        "pg_tables",
+        "pg_type",
+    ];
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|name| vec![Value::from_text(name)])
+        .collect();
+    assert_eq!(rows, expected);
 }

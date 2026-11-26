@@ -612,6 +612,24 @@ fn dv_empty_database() {
     );
 }
 
+#[test]
+fn dv_lists_user_views_without_catalog_views() {
+    let output = run_tursopg(
+        b"CREATE VIEW pg_user_view AS SELECT 1 AS x;\nCREATE SCHEMA reporting;\nCREATE VIEW reporting.user_view AS SELECT 2 AS x;\n\\dv\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("pg_user_view"), "{out}");
+    assert!(
+        out.lines()
+            .any(|line| line.split('|').any(|cell| cell.trim() == "user_view")),
+        "{out}"
+    );
+    for catalog in ["pg_indexes", "pg_roles", "pg_tables", "pg_settings"] {
+        assert!(!out.contains(catalog), "\\dv listed {catalog}: {out}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Meta-commands: \dn
 // ---------------------------------------------------------------------------

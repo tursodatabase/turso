@@ -321,7 +321,11 @@ fn cmd_list_indexes(conn: &Connection, w: &mut dyn Write) -> bool {
 }
 
 fn cmd_list_views(conn: &Connection, w: &mut dyn Write) -> bool {
-    let sql = "SELECT relname FROM pg_class WHERE relkind = 'v' ORDER BY relname";
+    let sql = "SELECT c.relname FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE c.relkind = 'v' \
+                 AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+               ORDER BY c.relname";
     match conn.query(sql) {
         Ok(Some(mut rows)) => {
             let mut table = Table::new();

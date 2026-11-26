@@ -2,12 +2,53 @@
 
 @database :memory:
 
+test pg-attribute-index-and-view-columns-do-not-inherit-not-null {
+    CREATE TABLE source (id int PRIMARY KEY, value text NOT NULL);
+    CREATE INDEX source_value_idx ON source(value);
+    CREATE VIEW source_view AS SELECT id, value FROM source;
+    SELECT c.relname, a.attname, a.attnotnull
+    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND a.attnum > 0
+    ORDER BY c.relname, a.attnum;
+}
+expect {
+    source|id|t
+    source|value|t
+    source_pkey|id|f
+    source_value_idx|value|f
+    source_view|id|f
+    source_view|value|f
+}
+
 test pg-collation-pgdump-columns {
     SELECT tableoid, oid, collname, collnamespace, collowner, collencoding
     FROM pg_catalog.pg_collation
     WHERE oid >= 16384;
 }
 expect {}
+
+test pg-attribute-view-and-index-user-types {
+    CREATE TYPE mood AS ENUM ('happy', 'sad');
+    CREATE DOMAIN label AS text;
+    CREATE TABLE typed (m mood, l label);
+    CREATE INDEX typed_idx ON typed(m, l);
+    CREATE VIEW typed_view AS SELECT m, l FROM typed;
+    SELECT c.relname, a.attname, t.typname
+    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+    JOIN pg_type t ON t.oid = a.atttypid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND a.attnum > 0
+    ORDER BY c.relname, a.attnum;
+}
+expect {
+    typed|m|mood
+    typed|l|label
+    typed_idx|m|mood
+    typed_idx|l|label
+    typed_view|m|mood
+    typed_view|l|label
+}
 
 setup indexed_tables {
     CREATE TABLE items (id int, name text, price int);
