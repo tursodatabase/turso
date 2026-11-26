@@ -307,14 +307,12 @@ impl Limbo {
             .with_experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)
             .with_unsafe_testing(opts.unsafe_testing);
 
-        let db_file = normalize_db_path(db_file);
-
-        let (io, conn) = if db_file.starts_with("file:") {
+        let (io, conn) = if let Some(uri) = database_uri(&db_file) {
             anyhow::ensure!(
                 sync_encryption.is_none(),
                 "use a database path, not a file URI, with --sync-encryption-cipher"
             );
-            Connection::from_uri(&db_file, db_opts, Arc::new(SqliteDialect))?
+            Connection::from_uri(&uri, db_opts, Arc::new(SqliteDialect))?
         } else {
             let flags = open_flags(opts.readonly);
             let (io, db) = Database::open_new(
@@ -531,7 +529,21 @@ impl Limbo {
     }
 
     fn open_db(&mut self, path: &str, vfs_name: Option<&str>) -> anyhow::Result<()> {
+        let uri = database_uri(path);
+        // The VFS path below cannot read a URI: it would use the whole URI,
+        // with the query, as the file name.
+        anyhow::ensure!(
+            uri.is_none() || vfs_name.is_none(),
+            "a VFS argument cannot be used with a database URI"
+        );
         self.conn.close()?;
+        if let Some(uri) = uri {
+            let (io, conn) = Connection::from_uri(&uri, self.db_opts, Arc::new(SqliteDialect))?;
+            self.io = io;
+            self.conn = conn;
+            self.opts.db_file = path.to_string();
+            return Ok(());
+        }
         let (io, db) = if let Some(vfs_name) = vfs_name {
             self.conn
                 .open_new(path, vfs_name, Arc::new(SqliteDialect))?
@@ -2106,17 +2118,35 @@ impl Limbo {
 
     fn clone_database(&mut self, output_file: &str) -> anyhow::Result<()> {
         use std::path::Path;
-        if Path::new(output_file).exists() {
-            anyhow::bail!("Refusing to overwrite existing file: {output_file}");
-        }
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-        let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
-        let target = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        let target = if let Some(uri) = database_uri(output_file) {
+            self.open_clone_target_uri(&uri)?
+        } else {
+            if Path::new(output_file).exists() {
+                anyhow::bail!("Refusing to overwrite existing file: {output_file}");
+            }
+            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
+            let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
+            db.connect(ConnectOpts::new(SessionRole::Superuser))?
+        };
 
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;
         applier.finish()?;
         Ok(())
+    }
+
+    /// Opens the new database of `.clone` that the URI `uri` names, with the
+    /// options of the shell. Fails if the database file exists.
+    fn open_clone_target_uri(&self, uri: &str) -> anyhow::Result<Arc<Connection>> {
+        // Examine the file that the URI names, not the URI, and do it before
+        // the open. An open can change an existing database: for example, it
+        // sets WAL mode in the header of a database in rollback journal mode.
+        let path = turso_core::database_path_from_uri(uri)?;
+        if std::path::Path::new(&path).exists() {
+            anyhow::bail!("Refusing to overwrite existing file: {path}");
+        }
+        let (_io, conn) = Connection::from_uri(uri, self.db_opts, Arc::new(SqliteDialect))?;
+        Ok(conn)
     }
 
     fn read_sql_file(&mut self, path: &str) -> anyhow::Result<()> {
@@ -2426,13 +2456,42 @@ fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
     result.ok_or_else(|| anyhow!("query did not return a row"))
 }
 
+/// Returns the database name `name` without its URI query, for messages.
+/// The query can hold the encryption key, which a message must not show.
+pub(crate) fn database_name_without_query(name: &str) -> &str {
+    if name.starts_with("file:") {
+        // The URI parser ends the path at the first '?' or '#'.
+        return name.split(['?', '#']).next().unwrap_or(name);
+    }
+    match name.rfind('?') {
+        // database_uri reads the name as a URI, and normalize_db_path
+        // starts the query at the last '?'.
+        Some(pos) if database_uri(name).is_some() => &name[..pos],
+        _ => name,
+    }
+}
+
+/// Returns the `file:` URI that the database name `name` stands for, or
+/// `None` if `name` is a plain file name. The database argument of tursodb,
+/// `.open` and the `open_database` tool of the MCP server use this
+/// function. Thus all of them take the open options, such as the `cipher`
+/// and `hexkey` of an encrypted database, from the URI query, and none of
+/// them uses the query as a part of a file name.
+pub(crate) fn database_uri(name: &str) -> Option<String> {
+    let name = normalize_db_path(name.to_string());
+    name.starts_with("file:").then_some(name)
+}
+
 /// Normalize `path?key=val` to `file:path?key=val` so query parameters
 /// are parsed as URI options (e.g. `?locking=shared_reads`) instead of
 /// being treated as part of the filename.
 ///
 /// Only the *last* `?` that introduces a valid `key=value` query string is
-/// treated as the query separator. Earlier `?` characters are
-/// percent-encoded (`%3F`) so they remain part of the filename.
+/// treated as the query separator. In the path before it, `%`, `#` and `?`
+/// are percent-encoded (`%25`, `%23`, `%3F`) so they remain part of the
+/// filename. The URI has no authority: after `file:`, a `//` starts an
+/// authority, and the parser changes a path after an authority. If the path
+/// starts with `//`, the second `/` is written as `%2F`.
 /// A trailing `?` with no `key=value` pair is left alone (it is just part
 /// of the filename).
 fn normalize_db_path(db_file: String) -> String {
@@ -2446,9 +2505,21 @@ fn normalize_db_path(db_file: String) -> String {
         let query = &db_file[pos + 1..];
         if query.contains('=') {
             let path = &db_file[..pos];
-            // Percent-encode any '?' inside the path portion so the URI
-            // parser does not mistake them for the query separator.
-            let encoded_path = path.replace('?', "%3F");
+            // The URI parser decodes '%' escapes, cuts the URI at the first
+            // '#' (the fragment) and at the first '?' (the query). Encode
+            // these characters in the path, so that they stay in the file
+            // name and the query is not lost. Encode '%' first, so that the
+            // escapes of '#' and '?' are not encoded again.
+            let mut encoded_path = path
+                .replace('%', "%25")
+                .replace('#', "%23")
+                .replace('?', "%3F");
+            // After `file:`, a "//" starts an authority, and the parser
+            // changes a path after an authority. Encode the second '/', so
+            // that the URI has no authority and the path stays the same.
+            if encoded_path.starts_with("//") {
+                encoded_path.replace_range(1..2, "%2F");
+            }
             return format!("file:{encoded_path}?{query}");
         }
     }
@@ -2528,6 +2599,51 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_db_path_backslash_absolute_path_with_query() {
+        // The URI parser changes a path after an authority. It must not
+        // change this path, so no authority is written.
+        assert_eq!(
+            normalize_db_path("/C:\\zz.db?mode=rwc".into()),
+            "file:/C:\\zz.db?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_keeps_the_whole_path() {
+        // The real URI parser must give back the part of the name before the
+        // query, character for character.
+        for name in [
+            "notes#2.db?mode=ro",
+            "100%41.db?mode=ro",
+            "a%#?b.db?mode=ro",
+            "/tmp/x.db?mode=ro",
+            "//tmp/s.db?mode=rwc",
+            "///x.db?mode=rwc",
+            "/C:\\zz.db?mode=rwc",
+            "/C:/zz.db?mode=rwc",
+            "rel/dir/x.db?mode=rwc",
+            "a b.db?cipher=aegis256&hexkey=00",
+        ] {
+            let expected = &name[..name.rfind('?').unwrap()];
+            let uri = normalize_db_path(name.to_string());
+            assert_eq!(
+                turso_core::database_path_from_uri(&uri).unwrap(),
+                expected,
+                "name {name:?}, uri {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_db_path_double_slash_path_with_query() {
+        // `file://tmp/s.db` would make "tmp" the authority (a host name).
+        assert_eq!(
+            normalize_db_path("//tmp/s.db?mode=rwc".into()),
+            "file:/%2Ftmp/s.db?mode=rwc"
+        );
+    }
+
+    #[test]
     fn test_normalize_db_path_question_mark_in_filename_no_query() {
         // '?' is legitimately part of the filename, no key=value follows
         assert_eq!(normalize_db_path("what?.db".into()), "what?.db");
@@ -2542,6 +2658,55 @@ mod tests {
             normalize_db_path("foo.bar?mode=ro?mode=ro".into()),
             "file:foo.bar%3Fmode=ro?mode=ro"
         );
+    }
+
+    #[test]
+    fn test_normalize_db_path_hash_in_filename_with_query() {
+        // Without the escape, the URI parser would read "#2.db?mode=ro" as a
+        // fragment, and open "notes" without the query.
+        assert_eq!(
+            normalize_db_path("notes#2.db?mode=ro".into()),
+            "file:notes%232.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_percent_in_filename_with_query() {
+        // Without the escape, the URI parser would decode "%41" to "A".
+        assert_eq!(
+            normalize_db_path("100%41.db?mode=ro".into()),
+            "file:100%2541.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_escapes_percent_before_other_characters() {
+        assert_eq!(
+            normalize_db_path("a%#?b.db?mode=ro".into()),
+            "file:a%25%23%3Fb.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_database_name_without_query() {
+        for (name, shown) in [
+            ("x.db", "x.db"),
+            (":memory:", ":memory:"),
+            ("what?.db", "what?.db"),
+            ("x.db?cipher=aegis256&hexkey=00", "x.db"),
+            ("a?b.db?mode=ro", "a?b.db"),
+            ("notes#2.db?mode=ro", "notes#2.db"),
+            ("file:x.db?cipher=aegis256&hexkey=00", "file:x.db"),
+            ("file:x.db#fragment", "file:x.db"),
+        ] {
+            assert_eq!(database_name_without_query(name), shown, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_normalize_db_path_hash_and_percent_without_query_unchanged() {
+        assert_eq!(normalize_db_path("notes#2.db".into()), "notes#2.db");
+        assert_eq!(normalize_db_path("100%41.db".into()), "100%41.db");
     }
 
     #[test]
