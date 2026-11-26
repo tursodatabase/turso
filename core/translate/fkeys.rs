@@ -2718,10 +2718,28 @@ pub fn emit_fk_drop_table_check(
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))
         })?;
 
-    // Get all FK references to this parent table
-    let fk_refs = resolver.with_schema(database_id, |s| {
+    // Get all FK references to this parent table. A table's references to
+    // itself are left out: its child rows are dropped along with their parents.
+    // RESTRICT is the exception when it fails at the first row, because a
+    // parent row can be deleted before its child row.
+    let restrict_fails_at_row = !resolver
+        .catalog
+        .dialect
+        .checks_fk_restrict_after_statement();
+    let mut fk_refs = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(namespace.id, parent_table_name)
     })?;
+    let is_self_ref = |fk_ref: &ResolvedFkRef| {
+        fk_ref.child_namespace == namespace.id
+            && fk_ref
+                .child_table
+                .name
+                .eq_ignore_ascii_case(parent_table_name)
+    };
+    fk_refs.retain(|fk_ref| {
+        !is_self_ref(fk_ref)
+            || (restrict_fails_at_row && matches!(fk_ref.fk.on_delete, RefAct::Restrict))
+    });
 
     if fk_refs.is_empty() {
         return Ok(());
@@ -2866,11 +2884,13 @@ pub fn emit_fk_drop_table_check(
             resolver,
         )?;
 
+        // A row that references itself does not block its own deletion.
+        let self_exclude_rowid = is_self_ref(fk_ref).then_some(current_rowid_reg);
         table_scan_match_any(
             program,
             fk_ref,
             parent_key_start,
-            None,
+            self_exclude_rowid,
             database_id,
             resolver,
             |p| {

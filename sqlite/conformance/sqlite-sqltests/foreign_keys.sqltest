@@ -5477,6 +5477,42 @@ expect {
     bx|ax
 }
 
+@cross-check-integrity
+test fk-drop-self-ref-table-with-parent-and-child-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# RESTRICT fails at the first parent row deleted, before its child row is gone.
+@cross-check-integrity
+test fk-drop-self-ref-restrict-table-with-parent-and-child-rows-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE RESTRICT);
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DROP TABLE t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-self-ref-restrict-table-with-row-referencing-itself {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE RESTRICT);
+    INSERT INTO t VALUES (1, 1);
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
 # The child row comes before its parent in rowid order: the parent's later
 # key change gives the child's new value its parent again.
 @cross-check-integrity
