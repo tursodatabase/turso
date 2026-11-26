@@ -485,19 +485,11 @@ index_case!(
 );
 
 // ---------------------------------------------------------------------------------------
-// U7: `IdxInsert` of a key that is in the index, and `IdxDelete` of a key that is not. Two
-// keys that are equal under the collation but not identical count as different for a delete
-// and as the same for an insert.
+// U7: `IdxDelete` with P5 of a key that is not in the index. A key that is equal under the
+// collation but not identical counts as missing. (An `IdxInsert` of a key that is in the
+// index is defined: it replaces the entry.)
 // ---------------------------------------------------------------------------------------
 
-index_case!(
-    known_bug_u7_idx_insert_of_existing_key,
-    "U7",
-    default_idef(),
-    index_rows(),
-    1,
-    [add(0, 1, 10, 1, false)]
-);
 index_case!(
     known_bug_u7_idx_delete_of_missing_key,
     "U7",
@@ -505,20 +497,6 @@ index_case!(
     index_rows(),
     1,
     [del(0, 9, 9, 99)]
-);
-index_case!(
-    known_bug_u7_idx_insert_of_equal_but_not_identical_key,
-    "U7",
-    nocase(),
-    text_rows(),
-    1,
-    [IOp::IdxInsert {
-        cur: 0,
-        a: Val::text("A"),
-        b: v(1),
-        rowid: 1,
-        use_seek: false,
-    }]
 );
 index_case!(
     known_bug_u7_idx_delete_of_equal_but_not_identical_key,

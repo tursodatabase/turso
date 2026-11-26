@@ -74,8 +74,8 @@ Rules that hold for all opcodes:
 | `NewRowid` | table | returns `r` with `r` not in the store and `r > max key` (D6). Position after it: no position; a read is Undefined (U8). Only a no-seek `Insert` of `r` may follow |
 | `Insert k v` | see section 3 | store has `k -> v` (overwrite if present). Position: `At k` (**DECISION D1**) |
 | `Delete` | position is `At` | key removed. Position: `Gap(pred, succ)` (**DECISION D2**). `Column`/`RowId` before the next move: Undefined |
-| `IdxInsert key` | see section 3 | key added. A full-key duplicate is an error (unique check) or no-op, as the flags say. Position: `At key` |
-| `IdxDelete key` | none | key removed. Missing key is an error when P5 is set, else no-op. Position: Undefined |
+| `IdxInsert key` | see section 3 | key added. A key equal to a stored key replaces it, the new bytes win. On a unique index with `NO_OP_DUPLICATE`, a key whose unique columns are in the index is a no-op, and the position is lost; without the flag it is the error "UNIQUE constraint failed". Position: `At key` |
+| `IdxDelete key` | none | key removed. Missing key: with P5 the opcode reports a corrupt index; without P5 it is a no-op. Position afterwards: none |
 | `Count` | none | result is the number of entries. Position afterwards: none; a read or a move is Undefined (U2, U8) |
 | `Clear` | WAL only | store empty. Every cursor on the tree is `Invalid`. In MVCC the contract is "returns an error" (current limitation) |
 
@@ -93,11 +93,11 @@ the cursor is on some entry with prefix `p`, not always the first; reads and
 |---|---|---|
 | `SeekGE p` / `SeekGT p` | none | first key with `cmp_prefix k p` `>= 0` / `> 0`; else `Invalid` and jump |
 | `SeekLE p` / `SeekLT p` | none | last key with `cmp_prefix k p` `<= 0` / `< 0`; else `Invalid` and jump |
-| `Found p` / `NotFound p` | none | some key has prefix `p`. `Found` jumps iff yes, `NotFound` iff no. Hit gives `Matched p`, miss gives `Seeked p` (token `p`) |
+| `Found p` / `NotFound p` | none | some key has prefix `p`. `Found` jumps iff yes, `NotFound` iff no. Hit gives `Matched p`, miss gives `Seeked p` (token `p`). On a unique index, when `p` covers all unique columns and has no NULL, only one entry can match: a hit is `At` that entry, so a read is defined (a move is not) |
 | `NoConflict p` | none | if `p` has a NULL: jump, no position (a read is Undefined, U8). Else like `NotFound` |
 | `IdxGE/GT/LE/LT p` | position is `At` | jump iff `cmp_prefix k p` is `>= 0`, `> 0`, `<= 0`, `< 0`. State unchanged. On `Invalid` the model jumps (Turso) |
-| `IdxInsert key use_seek` | full key not in the set; null-row clear | key added, position `At key`, all tokens cleared. Without `use_seek` it always seeks. With `use_seek` the cursor must hold the token for `key.cols`, unless `key.cols` has a NULL (Turso seeks then) |
-| `IdxDelete key` | key is in the set | key removed, no position (`Lost`): a read or a move is Undefined (U2, U8). All tokens cleared |
+| `IdxInsert key use_seek` | null-row clear | key added (an equal key is replaced, the new bytes win), position `At key`, all tokens cleared. Without `use_seek` it always seeks. With `use_seek` the cursor must hold the token for `key.cols`, unless `key.cols` has a NULL (Turso seeks then). A token of a hit allows only the same whole key |
+| `IdxDelete key` | with P5: key is in the set | key removed, no position (`Lost`): a read or a move is Undefined (U2, U8). All tokens cleared. Without P5 a missing key is a no-op, also with the position `Lost` |
 | `Delete` | position `At k`, `k` in the set | same as for tables: position `Gone k` |
 | `Column i`, `IdxRowId` | none | `cols[i]` and `rowid` of the entry at `At k`; NULL on `Invalid` or null-row; Undefined (U8) at `Seeked`, `Matched`, `Gone` and `Lost` |
 | `SeekEnd` | none | position `Lost`, token "append": the next `Insert`/`IdxInsert` without a seek is legal iff its key is above every key in the store |
@@ -147,15 +147,20 @@ moves to smaller values. `Seek*` and `Idx*` use this compare as in 2b.
 column collations. `DESC` does not matter. A hit gives `Matched` (section 2b): the entry it lands on cannot be seen.
 
 **Same key.** Two full keys that are equal under the collations and have the same rowid are
-the same entry. A test must not `IdxInsert` a key that is equal to a stored key but is not
-identical (Undefined), and must not `IdxDelete` with a key that is equal but not
-identical (Undefined). A delete followed by an insert of a key that differs only by case
-(or trailing spaces) is legal. A later read must return the new bytes.
+the same entry. An `IdxInsert` of a key that is equal to a stored key replaces the entry, also
+when the bytes differ (a case variant under `NOCASE`): a later read returns the new bytes. This
+is what the B-tree does: it overwrites the cell. A test must not `IdxDelete` with a key that
+is equal but not identical (Undefined, U7). A delete followed by an insert of a key that
+differs only by case (or trailing spaces) is legal. A later read must return the new bytes.
+
+**Keys without a rowid.** An index with `has_rowid = false` (the indexes of `DISTINCT` and of
+compound selects) stores only the columns. Two keys with equal columns are the same entry.
 
 ## 2d. Undefined sequences
 
 **Rule.** When an op violates its precondition, a debug build of the engine returns an
-error or panics with a message that contains `unsupported`. A release build may do
+error or panics with a message that contains `unsupported`. The model storage (section 2e)
+panics with `unsupported: U<n>: <why>`. A release build may do
 anything (for now). The model calls the op illegal (`step` returns `None`) and the generator
 never emits it. `undefined_tests.rs` checks both sides: the model says illegal, and every
 engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
@@ -168,7 +173,7 @@ engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 | U4 | `Delete` with no entry under the cursor: fresh cursor, scan ended, failed seek | D4 |
 | U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key. A `Found` or `NotFound` hit gives no token (SQLite seeks again); a miss does | section 3 |
 | U6 | `IdxGE/GT/LE/LT` on a cursor whose entry was deleted (by itself or by another cursor) | SQLite asserts, `vdbe.c:7112` |
-| U7 | `IdxInsert` of a key that is in the index, `IdxDelete` of a key that is not, and the collation-equal variants of both (section 2c) | section 2c |
+| U7 | `IdxDelete` with P5 of a key that is not in the index, and of a key that is equal under the collation but not identical (section 2c). The opcode reports a corrupt index | section 2c |
 | U8 | A read (`Column`, `RowId`, `IdxRowId`) at a position that is not defined: after `Count`, `SeekEnd`, `NewRowid`, an own `Delete`, `IdxDelete`, a seek that missed, `Found`, `NotFound`, `NoConflict` with a NULL | section 1 |
 | U9 | After a write by another cursor on the same tree: a read, `Next`, `Prev`, `Delete`, `IdxGE/GT/LE/LT` or `DeferredSeek` from the old position. Only a seek, `Rewind` or `Last` places the cursor again | section 1 |
 
@@ -177,6 +182,29 @@ this list. The entry that a `Found` hit lands on cannot be seen, because a read 
 from it is Undefined. `NewRowid` is defined by a predicate (D6): any rowid that is unused and
 above every key. SQLite documents only "not previously used as a key". A column with
 AUTOINCREMENT needs a stricter rule (never below an earlier rowid); it is not modelled.
+
+## 2e. Model storage
+
+`core/storage/model/` is the contract in code, for debug builds. `spec.rs` is a pure step
+function: a cursor shape and an opcode give the new shape and the write, or the rule of
+section 2d. `cursor.rs` is `ModelCursor`, a `CursorTrait` implementation that keeps a tree in
+a sorted collection (a map for a table, a sorted list of records for an index, ordered with
+the B-tree record compare) and does no I/O. An illegal opcode panics with
+`unsupported: U<n>: ...`.
+
+With `TURSO_MODEL_EPHEMERAL=1` (debug builds), `OpenEphemeral`, `OpenAutoindex` and `OpenDup`
+open their trees on the model. The variable sets the default of a connection flag
+(`Connection::set_model_ephemeral`). A process that opened a model tree prints counters
+(trees, steps per opcode) to stderr at exit. Run the corpus:
+`TURSO_MODEL_EPHEMERAL=1 make -C sqlite/conformance run-rust ARGS="--snapshot-filter __never__"`.
+
+An opcode can make several cursor calls (`IdxInsert` seeks, reads and inserts), and two
+opcodes can make the same call (`Found` and an eq-only `SeekGE`). In debug builds the VDBE
+tells the cursor which opcode starts (`CursorTrait::note_opcode`). The calls inside the opcode
+are not checked one by one; the opcode is one step.
+
+`NewRowid` gives `max + 1`, or 1 for an empty table (D6). The model accepts it with an append
+token: the next no-seek `Insert` must be above every key.
 
 ## 3. Insert seek contract
 
@@ -263,7 +291,7 @@ ephemeral table) wherever one cursor would write and another would read the same
 | U4 | WAL, MVCC | Undefined: `Delete` without an entry (D4). WAL panics on `current_page >= 0`, MVCC with "Cannot delete: no current row". Neither message says `unsupported` |
 | U5 | all | Undefined: an insert without the seek token of its key, also after a `Found` or `NotFound` hit (was N11: WAL and ephemeral write the new key at the hit and leave the index out of order). No engine refuses it |
 | U6 | all | Undefined: `IdxGE/GT/LE/LT` after the entry was deleted (was N8; SQLite asserts, `vdbe.c:7112`). The engines compare the next entry or the end |
-| U7 | all | Undefined: `IdxInsert` of an existing key, `IdxDelete` of a missing key, and the collation-equal variants (section 2c). No engine refuses it |
+| U7 | all | Undefined: `IdxDelete` of a missing key, and the collation-equal variant (section 2c). WAL and MVCC report a corrupt index, not `unsupported`. (`IdxInsert` of an existing key was U7; it is now defined as a replace) |
 | U8 | all | Undefined: a read at an undefined position (was N2 and N7: WAL panics with an overflow after `Count`, and reports "Corrupt database" after `SeekEnd`). No engine refuses it |
 | U9 | all | Undefined: a read or a move after another cursor wrote (was G2, G3, N5, N6, N9, N10, N12, IDX_G2, IDX_G3 and IDX_N6). WAL reads or moves to the wrong entry, loses the cell index, panics, or clears the null-row flag; MVCC keeps a deleted row. No engine refuses it. Not reachable from SQL: about 16 statements for IDX_N6 gave only two-pass plans for every plan with a second writer |
 

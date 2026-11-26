@@ -363,8 +363,9 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
                 _ => None,
             }
         }
+        // A key that is equal to a stored key replaces it: the new bytes win (SPEC 2c).
         IMOp::IdxInsert(key, use_seek) => {
-            if !imem(d, key, s) && (!*use_seek || tok_ok(d, &c, key, s)) {
+            if !*use_seek || tok_ok(d, &c, key, s) {
                 let s2 = iins(d, key, s);
                 let c2 = ICursor::new(IPos::At(key.clone()), c.icdir, false, ITok::ITNone);
                 Some(iwrite(st, s2, a.iacur, c2))
@@ -659,11 +660,12 @@ fn is_eq(c: Ordering) -> bool {
 // Store (iins, idel, imem, iseek_*, imin, imax, isucc, ipred, has_prefix, ...)
 // ---------------------------------------------------------------------------------------
 
-/// A key that is equal to a stored key (under the collations) leaves the store as it is.
+/// A key that is equal to a stored key (under the collations) replaces it.
 pub fn iins(d: IdxDef, k: &IKey, s: &IStore) -> IStore {
     let mut out = s.clone();
-    if let Err(i) = out.binary_search_by(|k2| cmp_key(d, k2, k)) {
-        out.insert(i, k.clone());
+    match out.binary_search_by(|k2| cmp_key(d, k2, k)) {
+        Ok(i) => out[i] = k.clone(),
+        Err(i) => out.insert(i, k.clone()),
     }
     out
 }
@@ -1413,8 +1415,9 @@ mod tests {
 
     #[test]
     fn example_iinsert_duplicate() {
+        // An insert of a stored key replaces the entry.
         let p = [a(0, IdxInsert(k3(), false))];
-        assert_eq!(obs_of_run(1, &p), None);
+        assert_eq!(obs_of_run(1, &p), Some(vec![kobs(false, &k3())]));
     }
 
     #[test]
@@ -1746,8 +1749,9 @@ mod tests {
         let st = iinit_with(keys, 1, d);
         let del = |key: IKey| a(0, IdxDelete(key));
         let ins = |key: IKey| a(0, IdxInsert(key, false));
-        // An equal but not identical key: neither insert nor delete is legal.
-        assert!(istep(&st, &ins(k(txt("A"), some(1), 1))).is_none());
+        // An equal but not identical key: the insert replaces the entry, the delete is illegal.
+        let (st2, _) = istep(&st, &ins(k(txt("A"), some(1), 1))).unwrap();
+        assert_eq!(st2.irows, vec![k(txt("A"), some(1), 1)]);
         assert!(istep(&st, &del(k(txt("A"), some(1), 1))).is_none());
         // Another rowid is another key.
         assert!(istep(&st, &ins(k(txt("A"), some(1), 2))).is_some());
