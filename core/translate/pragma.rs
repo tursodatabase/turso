@@ -1298,7 +1298,7 @@ fn query_pragma(
                             };
 
                             program.emit_int(seq as i64, base_reg);
-                            program.emit_string8(index.name.clone(), base_reg + 1);
+                            program.emit_string8(index.declared_name.clone(), base_reg + 1);
                             program.emit_int(index.unique as i64, base_reg + 2);
                             program.emit_string8(origin.to_string(), base_reg + 3);
                             program.emit_int(index.where_clause.is_some() as i64, base_reg + 4);
@@ -1985,7 +1985,10 @@ fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> 
     let index = Index::automatic_from_primary_key(
         table,
         (
-            format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1", table.name),
+            format!(
+                "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1",
+                table.declared_name
+            ),
             table.root_page,
         ),
         table.primary_key_columns.len(),
