@@ -1860,11 +1860,25 @@ expect error {
 }
 
 # PostgreSQL finds a unique key with the same columns in any order.
-@skip-if postgres "PostgreSQL accepts a foreign key listing the key columns in another order"
-test fk-create-table-composite-key-in-other-order-rejected {
+test fk-composite-key-in-other-order {
     CREATE TABLE fkro_p (a int, b int, PRIMARY KEY (a, b));
-    CREATE TABLE fkro_c (x int, y int, FOREIGN KEY (x, y) REFERENCES fkro_p (b, a));
+    CREATE TABLE fkro_c (x int, y int, FOREIGN KEY (x, y) REFERENCES fkro_p (b, a) ON UPDATE CASCADE ON DELETE CASCADE);
+    INSERT INTO fkro_p VALUES (1, 2), (3, 4);
+    INSERT INTO fkro_c VALUES (2, 1), (4, 3);
+    UPDATE fkro_p SET b = 5 WHERE a = 1;
+    DELETE FROM fkro_p WHERE a = 3;
+    SELECT x, y FROM fkro_c;
+}
+expect {
+    5|1
+}
+
+test fk-composite-key-in-other-order-orphan-rejected {
+    CREATE TABLE fkroo_p (a int, b int, UNIQUE (a, b));
+    CREATE TABLE fkroo_c (x int, y int, FOREIGN KEY (x, y) REFERENCES fkroo_p (b, a));
+    INSERT INTO fkroo_p VALUES (1, 2);
+    INSERT INTO fkroo_c VALUES (1, 2);
 }
 expect error {
-    there is no unique constraint matching given keys for referenced table "fkro_p"
+    violates foreign key constraint
 }

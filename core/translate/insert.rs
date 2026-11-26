@@ -4496,7 +4496,7 @@ pub fn emit_fk_child_insert_checks(
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
-        for cname in &fk_ref.fk.child_columns {
+        for cname in &fk_ref.child_cols {
             let (i, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
@@ -4517,7 +4517,7 @@ pub fn emit_fk_child_insert_checks(
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
             // first child col carries rowid
-            let (i_child, col_child) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
+            let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -4586,7 +4586,7 @@ pub fn emit_fk_child_insert_checks(
                 .parent_unique_index
                 .as_ref()
                 .expect("parent unique index required");
-            let ncols = fk_ref.fk.child_columns.len();
+            let ncols = fk_ref.child_cols.len();
 
             if is_self_ref {
                 // A self-referential INSERT is checked before the new row has
@@ -4645,7 +4645,7 @@ pub fn emit_fk_child_insert_checks(
             // Build NEW child probe from child NEW values, apply parent-index affinities.
             let probe = {
                 let start = program.alloc_registers(ncols);
-                for (k, cname) in fk_ref.fk.child_columns.iter().enumerate() {
+                for (k, cname) in fk_ref.child_cols.iter().enumerate() {
                     let (i, col) = child_tbl.get_column(cname).unwrap();
                     program.emit_insn(Insn::Copy {
                         src_reg: if col.is_rowid_alias() {

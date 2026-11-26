@@ -511,17 +511,7 @@ where
     F: FnMut(&mut ProgramBuilder) -> Result<()>,
 {
     let child_tbl = &fk_ref.child_table;
-    let child_positions = fk_ref
-        .fk
-        .child_columns
-        .iter()
-        .map(|cname| {
-            child_tbl
-                .get_column(cname)
-                .map(|(pos, _)| pos)
-                .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let child_positions = &fk_ref.child_pos;
     let some_fk_cols_are_virtual = child_positions
         .iter()
         .any(|&pos| child_tbl.columns()[pos].is_virtual_generated());
@@ -1030,7 +1020,7 @@ pub(super) fn child_index_for_fk(
     database_id: usize,
     fk_ref: &ResolvedFkRef,
 ) -> Option<Arc<Index>> {
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_cols;
     resolver.with_schema(database_id, |s| {
         s.get_indices(fk_ref.child_namespace, &fk_ref.child_table.name)
             .find(|ix| {
@@ -1182,11 +1172,11 @@ pub fn emit_fk_child_update_counters(
             continue;
         }
 
-        let ncols = fk_ref.fk.child_columns.len();
+        let ncols = fk_ref.child_cols.len();
 
         // Pass 1: OLD tuple handling
         if let Some((dml_ctx, fk_col_positions, null_skip)) =
-            load_old_fk_values(program, &fk_ref.fk.child_columns)?
+            load_old_fk_values(program, &fk_ref.child_cols)?
         {
             // With no violation counted there is nothing to cancel, so the
             // parent probe is skipped, as in SQLite.
@@ -1282,7 +1272,7 @@ pub fn emit_fk_child_update_counters(
                 .child_table
                 .name
                 .eq_ignore_ascii_case(&fk_ref.fk.parent_table);
-        for cname in &fk_ref.fk.child_columns {
+        for cname in &fk_ref.child_cols {
             let (i, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
@@ -1356,7 +1346,7 @@ pub fn emit_fk_child_update_counters(
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
             // Take the first child column value from NEW image
-            let (i_child, col_child) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
+            let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -1446,7 +1436,7 @@ pub fn emit_fk_child_update_counters(
             // Build NEW probe (in FK child column order, aligns with parent index columns)
             let probe = {
                 let start = program.alloc_registers(ncols);
-                for (k, cname) in fk_ref.fk.child_columns.iter().enumerate() {
+                for (k, cname) in fk_ref.child_cols.iter().enumerate() {
                     let (i, col) = child_tbl.get_column(cname).unwrap();
                     program.emit_insn(Insn::Copy {
                         src_reg: if col.is_rowid_alias() {
@@ -2182,7 +2172,7 @@ fn fire_fk_cascade_delete(
     database_id: usize,
 ) -> Result<()> {
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_cols;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_cascade_delete_stmt(
         &fk_ref.child_table.name,
@@ -2213,7 +2203,7 @@ fn fire_fk_set_null(
     database_id: usize,
 ) -> Result<()> {
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_cols;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_set_null_stmt(
         &fk_ref.child_table.name,
@@ -2244,7 +2234,7 @@ fn fire_fk_set_default(
     database_id: usize,
 ) -> Result<()> {
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_cols;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_set_default_stmt(
         &fk_ref.child_table,
@@ -2275,7 +2265,7 @@ fn fire_fk_cascade_update(
     database_id: usize,
 ) -> Result<()> {
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_cols;
     // CASCADE UPDATE needs new params for the SET clause
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);
     let stmt = generate_cascade_update_stmt(

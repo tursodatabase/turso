@@ -383,12 +383,7 @@ pub fn emit_fk_child_decrement_on_delete(
             deferred: fk_ref.fk.deferred,
             target_pc: null_skip,
         });
-        let child_positions: Vec<usize> = fk_ref
-            .fk
-            .child_columns
-            .iter()
-            .map(|cname| child_tbl.get_column(cname).unwrap().0)
-            .collect();
+        let child_positions = &fk_ref.child_pos;
         let child_key = emit_columns_and_dependencies(
             program,
             child_tbl,
@@ -399,7 +394,7 @@ pub fn emit_fk_child_decrement_on_delete(
         )?;
 
         // Fast path: if any FK column is NULL can't be a violation
-        for &pos in &child_positions {
+        for &pos in child_positions.iter() {
             program.emit_insn(Insn::IsNull {
                 reg: child_key.to_column_reg(pos),
                 target_pc: null_skip,
@@ -456,7 +451,7 @@ pub fn emit_fk_child_decrement_on_delete(
             let icur = open_read_index(program, idx, database_id);
 
             // Build probe from current child row
-            let n = fk_ref.fk.child_columns.len();
+            let n = fk_ref.child_cols.len();
             let probe = program.alloc_registers(n);
             for (i, &pos) in child_positions.iter().enumerate() {
                 program.emit_insn(Insn::Copy {

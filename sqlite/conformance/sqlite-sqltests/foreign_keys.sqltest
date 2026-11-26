@@ -5865,3 +5865,104 @@ test fk-self-ref-update-new-parent-is-own-old-key-cascade {
 expect {
     91|91
 }
+
+# A foreign key may list the columns of the parent's unique key in another
+# order. SQLite's sqlite3FkLocateIndex finds the index and maps each of its
+# columns to the child column.
+test fk-composite-key-in-other-order-insert {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (a INT, b INT, UNIQUE (a, b));
+    CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a));
+    INSERT INTO p VALUES (1, 2);
+    INSERT INTO c VALUES (2, 1);
+    SELECT x, y FROM c;
+}
+expect {
+    2|1
+}
+
+test fk-composite-key-in-other-order-orphan-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (a INT, b INT, UNIQUE (a, b));
+    CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a));
+    INSERT INTO p VALUES (1, 2);
+    INSERT INTO c VALUES (1, 2);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-composite-key-in-other-order-update-child-to-orphan-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (a INT, b INT, UNIQUE (a, b));
+    CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a));
+    INSERT INTO p VALUES (1, 2);
+    INSERT INTO c VALUES (2, 1);
+    UPDATE c SET x = 1, y = 2;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-composite-key-in-other-order-delete-parent-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (a INT, b INT, UNIQUE (a, b));
+    CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a));
+    INSERT INTO p VALUES (1, 2), (2, 1);
+    INSERT INTO c VALUES (2, 1);
+    DELETE FROM p WHERE a = 2;
+    DELETE FROM p WHERE a = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-composite-key-in-other-order-update-parent-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (a INT, b INT, UNIQUE (a, b));
+    CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a));
+    INSERT INTO p VALUES (1, 2), (2, 1);
+    INSERT INTO c VALUES (2, 1);
+    UPDATE p SET b = 3 WHERE a = 2;
+    UPDATE p SET b = 3 WHERE a = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-composite-key-in-other-order-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (a INT, b INT, PRIMARY KEY (a, b));
+    CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a) ON UPDATE CASCADE ON DELETE CASCADE);
+    INSERT INTO p VALUES (1, 2), (3, 4);
+    INSERT INTO c VALUES (2, 1), (4, 3);
+    UPDATE p SET b = 5 WHERE a = 1;
+    DELETE FROM p WHERE a = 3;
+    SELECT x, y FROM c;
+}
+expect {
+    5|1
+}
+
+test fk-composite-key-in-other-order-self-reference {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (a INT, b INT, x INT, y INT, UNIQUE (a, b), FOREIGN KEY (x, y) REFERENCES t (b, a));
+    INSERT INTO t VALUES (1, 2, 2, 1), (3, 4, 2, 1);
+    UPDATE t SET x = 4, y = 3 WHERE a = 1;
+    SELECT a, b, x, y FROM t ORDER BY a;
+}
+expect {
+    1|2|4|3
+    3|4|2|1
+}
+
+test fk-composite-key-in-other-order-foreign-key-check {
+    CREATE TABLE p (a INT, b INT, UNIQUE (a, b));
+    CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a));
+    INSERT INTO p VALUES (1, 2);
+    INSERT INTO c VALUES (2, 1), (1, 2);
+    PRAGMA foreign_key_check(c);
+}
+expect {
+    c|2|p|0
+}
