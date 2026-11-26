@@ -7546,7 +7546,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "XML" | "TSVECTOR" | "TSQUERY" => "TEXT".into(),
         "MONEY" => "REAL".into(),
         "BIT" | "VARBIT" => "TEXT".into(),
-        "OID" | "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
+        "OID" => "oid".into(),
+        "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
@@ -8153,6 +8154,7 @@ fn pg_type_name_to_ast_type(
         ("DOUBLE PRECISION" | "FLOAT8", false) => "float8",
         ("TEXT", false) => "text",
         ("UUID", false) => "uuid",
+        ("OID", false) => "oid",
         ("SERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE", _) => "INTEGER",
         ("BIGSERIAL", _) => "BIGINT",
         (

@@ -10,7 +10,7 @@
 
 use crate::error::sqlstate_error;
 use crate::functions::{float8_text, parse_pg_bool, validate_pg_input};
-use crate::pg_type::IntegerType;
+use crate::pg_type::{parse_oid, IntegerType};
 use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
 use turso_core::{LimboError, Numeric, Result, Value};
@@ -29,6 +29,7 @@ pub(crate) enum CastType {
     Numeric,
     Text,
     Bool,
+    Oid,
     // FIXME(pg-catalog): bytea is not a registered type yet, so the engine casts it as before. It is listed here and in CASTS once bytea has a pg_type row.
     Timestamp,
     TimestampTz,
@@ -45,6 +46,7 @@ impl CastType {
             Self::Numeric => "numeric",
             Self::Text => "text",
             Self::Bool => "bool",
+            Self::Oid => "oid",
             Self::Timestamp => "timestamp",
             Self::TimestampTz => "timestamptz",
         }
@@ -65,6 +67,7 @@ impl CastType {
             "numeric" => Self::Numeric,
             "text" => Self::Text,
             "bool" => Self::Bool,
+            "oid" => Self::Oid,
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::TimestampTz,
             _ => return None,
@@ -113,6 +116,11 @@ const CASTS: &[Cast] = &[
     cast(Int2, Numeric, I),
     cast(Int4, Numeric, I),
     cast(Int8, Numeric, I),
+    cast(Int2, Oid, I),
+    cast(Int4, Oid, I),
+    cast(Int8, Oid, I),
+    cast(Oid, Int4, A),
+    cast(Oid, Int8, A),
     cast(Int4, Bool, E),
     cast(Bool, Int4, E),
     cast(Bool, Text, A),
@@ -198,9 +206,28 @@ pub(crate) fn convert(value: &Value, source: CastType, target: CastType) -> Resu
     if target.is_float() {
         return to_float(value, source, target);
     }
+    if target == Oid {
+        return to_oid(value, source);
+    }
     match target {
         Text => to_text(value, source),
         Bool => to_bool(value),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn to_oid(value: &Value, source: CastType) -> Result<Value> {
+    match value {
+        Value::Text(text) => parse_oid(text.as_str()).map(Value::from_i64),
+        Value::Numeric(Numeric::Integer(n)) => match *n {
+            0..=0xFFFF_FFFF => Ok(value.clone()),
+            -0x8000_0000..=-1 if source != Int8 => Ok(Value::from_i64(n + (1 << 32))),
+            _ => Err(sqlstate_error(
+                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                "OID out of range",
+                None,
+            )),
+        },
         _ => Ok(value.clone()),
     }
 }
@@ -213,6 +240,7 @@ fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value
         (Value::Text(text), _) => {
             return parse_integer(text.as_str(), target).map(Value::from_i64);
         }
+        (Value::Numeric(Numeric::Integer(n)), Oid) if target == Int4 => i64::from(*n as u32 as i32),
         (Value::Numeric(Numeric::Integer(n)), _) => *n,
         // The server reads the text of a parameter with no type as a float
         // when it looks like one. As text it is not an integer.

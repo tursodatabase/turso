@@ -1,7 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::{sqlstate_error, sqlstate_error_with_hint};
-use crate::pg_type::{split_sign, IntegerType};
+use crate::pg_type::IntegerType;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
 use std::collections::HashSet;
@@ -769,44 +769,11 @@ fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
     let value = args[i].get_value();
     match value {
         Value::Null => Ok(None),
-        Value::Text(text) => parse_oid(text.as_str()).map(Some),
+        Value::Text(text) => crate::pg_type::parse_oid(text.as_str()).map(Some),
         value => value.as_int().map(Some).ok_or_else(|| {
             LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
         }),
     }
-}
-
-fn parse_oid(text: &str) -> Result<i64> {
-    let invalid =
-        || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
-    let out_of_range =
-        || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
-    let (negative, unsigned) = split_sign(text);
-    let (radix, digits) = if let Some(hex) = unsigned
-        .strip_prefix("0x")
-        .or_else(|| unsigned.strip_prefix("0X"))
-        .filter(|hex| hex.starts_with(|c: char| c.is_ascii_hexdigit()))
-    {
-        (16, hex)
-    } else if unsigned.len() > 1 && unsigned.starts_with('0') {
-        (8, &unsigned[1..])
-    } else {
-        (10, unsigned)
-    };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return Err(invalid());
-    }
-    let magnitude = u64::from_str_radix(digits, radix).map_err(|_| out_of_range())?;
-    let value = if negative {
-        magnitude.wrapping_neg()
-    } else {
-        magnitude
-    };
-    let oid = value as u32;
-    if value != u64::from(oid) && value != oid as i32 as i64 as u64 {
-        return Err(out_of_range());
-    }
-    Ok(i64::from(oid))
 }
 
 fn text_arg(args: &[Register], i: usize) -> String {
@@ -2394,9 +2361,9 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "int2" | "smallint" => check_integer_input(IntegerType::Int2, input),
-        "int4" | "integer" | "int" => check_integer_input(IntegerType::Int4, input),
-        "int8" | "bigint" => check_integer_input(IntegerType::Int8, input),
+        "int2" | "smallint" => check_integer_input(IntegerType::Int2.parse(input)),
+        "int4" | "integer" | "int" => check_integer_input(IntegerType::Int4.parse(input)),
+        "int8" | "bigint" => check_integer_input(IntegerType::Int8.parse(input)),
         "float4" | "real" => float_input_error(input, "real", true),
         "float8" | "double precision" => float_input_error(input, "double precision", false),
         "numeric" | "decimal" => match trimmed.parse::<f64>() {
@@ -2515,16 +2482,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "oid" => {
-            if trimmed.parse::<u32>().is_ok() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type oid: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            }
-        }
+        "oid" => check_integer_input(crate::pg_type::parse_oid(input)),
         _ => Some((
             format!("type \"{type_name}\" does not exist"),
             "42704".to_string(),
@@ -2576,10 +2534,10 @@ pub fn parse_pg_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// Reads `input` as a cast to the integer type `ty` does, so
-/// `pg_input_is_valid` and the type agree on what is valid.
-fn check_integer_input(ty: IntegerType, input: &str) -> Option<(String, String)> {
-    match ty.parse(input) {
+/// The message and SQLSTATE of the error that reading an integer or oid from
+/// text gave, so `pg_input_is_valid` and the type agree on what is valid.
+fn check_integer_input(parsed: Result<i64>) -> Option<(String, String)> {
+    match parsed {
         Ok(_) => None,
         Err(LimboError::Dialect(error)) => Some((error.message, error.code.to_string())),
         Err(other) => unreachable!("integer input failed with {other}"),
