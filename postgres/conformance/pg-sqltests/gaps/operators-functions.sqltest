@@ -1359,3 +1359,206 @@ expect {
 expect @tursopg {
     t
 }
+
+# Functions that ignore argument types: PostgreSQL 18's answers.
+
+@compat-gap "function:length"
+test length-of-bytea-counts-bytes {
+    SELECT length('\x41'::bytea);
+}
+expect {
+    1
+}
+expect @tursopg {
+    4
+}
+
+@compat-gap "function:octet_length"
+test octet-length-of-bytea-counts-bytes {
+    SELECT octet_length('\x41'::bytea);
+}
+expect {
+    1
+}
+expect @tursopg {
+    4
+}
+
+@compat-gap "function:reverse"
+test reverse-of-bytea-reverses-bytes {
+    SELECT reverse('\x41'::bytea);
+}
+expect {
+    \x41
+}
+expect @tursopg {
+    14x\
+}
+
+@compat-gap "function:btrim"
+test btrim-of-bytea-trims-bytes {
+    SELECT btrim('\x4142'::bytea, '\x41'::bytea);
+}
+expect {
+    \x42
+}
+expect @tursopg {
+    2
+}
+
+@compat-gap "function:ltrim"
+test ltrim-of-bytea-trims-bytes {
+    SELECT ltrim('\x4142'::bytea, '\x41'::bytea);
+}
+expect {
+    \x42
+}
+expect @tursopg {
+    2
+}
+
+@compat-gap "function:rtrim"
+test rtrim-of-bytea-trims-bytes {
+    SELECT rtrim('\x4142'::bytea, '\x32'::bytea);
+}
+expect {
+    \x4142
+}
+expect @tursopg {
+    \x414
+}
+
+@compat-gap "function:abs"
+test abs-of-text-does-not-exist {
+    SELECT abs('abc'::text);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "function:round"
+test round-of-text-does-not-exist {
+    SELECT round('abc'::text);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "function:sqrt"
+test sqrt-of-text-does-not-exist {
+    SELECT sqrt('abc'::text);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    
+}
+
+@compat-gap "function:quote_ident"
+test quote-ident-of-integer-does-not-exist {
+    SELECT quote_ident(7);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    ""
+}
+
+@compat-gap "function:lower"
+test lower-of-integer-does-not-exist {
+    SELECT lower(7);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    7
+}
+
+@compat-gap "function:upper"
+test upper-of-integer-does-not-exist {
+    SELECT upper(7);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    7
+}
+
+@compat-gap "function:length"
+test length-of-integer-does-not-exist {
+    SELECT length(7);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    1
+}
+
+@compat-gap "function:ceil"
+test ceil-of-numeric-has-no-fraction-digits {
+    SELECT ceil(2.5::numeric);
+}
+expect {
+    3
+}
+expect @tursopg {
+    3.0
+}
+
+@compat-gap "function:floor"
+test floor-of-numeric-has-no-fraction-digits {
+    SELECT floor(2.5::numeric);
+}
+expect {
+    2
+}
+expect @tursopg {
+    2.0
+}
+
+@compat-gap "function:round"
+test round-of-numeric-has-no-fraction-digits {
+    SELECT round(2.5::numeric);
+}
+expect {
+    3
+}
+expect @tursopg {
+    3.0
+}
+
+@compat-gap "function:round"
+test round-of-numeric-keeps-the-scale {
+    SELECT round(2.5::numeric, 7);
+}
+expect {
+    2.5000000
+}
+expect @tursopg {
+    2.5
+}
+
+@compat-gap "function:trunc"
+test trunc-of-numeric-has-no-fraction-digits {
+    SELECT trunc(2.5::numeric);
+}
+expect {
+    2
+}
+expect @tursopg {
+    2.0
+}
+
+@compat-gap "function:mod"
+test mod-of-two-quoted-literals-is-ambiguous {
+    SELECT mod('7', '7');
+}
+@sqlstate 42725
+expect error {}
+expect @tursopg {
+    0
+}
