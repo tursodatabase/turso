@@ -119,6 +119,63 @@ expect error {
     ambiguous column name: x.b
 }
 
+# x.* adds the columns of every FROM item with the alias x, and each column
+# binds like x.<column>.
+@cross-check-integrity
+test table-star-with-repeated-alias-expands-every-item {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, d INT);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    INSERT INTO u VALUES('2', 5), ('3', 6);
+    SELECT x.* FROM t AS x RIGHT JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x FULL JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x LEFT JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x NATURAL JOIN t AS x ORDER BY 1;
+}
+expect {
+    2|y|2|5
+    3||3|6
+    1|x|1|
+    2|y|2|5
+    3||3|6
+    1|x|1|
+    2|y|2|5
+    1|x|1|x
+    2|y|2|y
+}
+
+test table-star-with-repeated-alias-and-unmerged-column-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE w(a TEXT, b INT);
+    SELECT x.* FROM t AS x JOIN w AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
+# SQLite expands x.* to <schema>.x.<column>, so with a subquery or a table
+# of another database named x, each column binds to its own FROM item. Turso
+# expands x.* this way only when all FROM items named x are tables of one
+# database, and reports the error otherwise.
+@skip-if sqlite "SQLite expands x.* by schema; Turso reports the error"
+test table-star-with-repeated-alias-in-other-schema-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TEMP TABLE u(a TEXT, d INT);
+    SELECT x.* FROM t AS x FULL JOIN u AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
+@skip-if sqlite "SQLite expands x.* by schema; Turso reports the error"
+test table-star-with-repeated-alias-of-subquery-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    SELECT x.* FROM (SELECT 2 AS a) AS x FULL JOIN t AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
 # A declared column named rowid wins over the implicit rowid of the other
 # FROM item with the same alias, in either order.
 @cross-check-integrity
@@ -170,4 +227,25 @@ expect {
     A
     A
     A
+}
+
+# A view's `x.*` columns come from every FROM item named x, and each column
+# takes its type the way `x.<column>` does.
+test view-table-star-with-repeated-alias-lists-every-item {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, d INT);
+    CREATE VIEW v_right AS SELECT x.* FROM t AS x RIGHT JOIN u AS x USING(a);
+    CREATE VIEW v_full AS SELECT x.* FROM t AS x FULL JOIN u AS x USING(a);
+    SELECT name, type FROM pragma_table_info('v_right');
+    SELECT name, type FROM pragma_table_info('v_full');
+}
+expect {
+    a|TEXT
+    b|TEXT
+    a:1|TEXT
+    d|INT
+    a|
+    b|TEXT
+    a:1|
+    d|INT
 }

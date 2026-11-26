@@ -1416,19 +1416,54 @@ pub(super) fn expand_table_star(
     let normalized_name = crate::util::normalize_ident(table_name);
     let tables = table_references.joined_tables();
 
-    let mut direct_matches = tables.iter().enumerate().filter(|(_, table)| {
+    let is_direct_match = |table: &JoinedTable| {
         table.table.parenthesized_join_columns().is_none()
             && alias_or_stored_name(table) == normalized_name
-    });
+    };
+    let mut direct_matches = tables
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| is_direct_match(table));
     let first_direct_match = direct_matches.next();
     if let (Some((_, first_table)), Some(_)) = (first_direct_match, direct_matches.next()) {
-        let column_name = first_table
-            .columns()
-            .iter()
-            .find(|column| !column.hidden())
-            .and_then(|column| column.name.as_deref())
-            .unwrap_or("?");
-        crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, column_name);
+        let names_parenthesized_table = tables.iter().any(|table| {
+            table
+                .table
+                .parenthesized_join_columns()
+                .is_some_and(|join_columns| {
+                    join_columns
+                        .iter()
+                        .any(|column| column.source.matches_table(None, &normalized_name))
+                })
+        });
+        // SQLite expands `x.*` to `<schema>.x.<column>` for each FROM item
+        // named x, and the schema of a subquery matches only other
+        // subqueries. Binding `x.<column>` reaches the same FROM items only
+        // when all of them are tables of one database, so a view or a
+        // subquery named x keeps the error.
+        let all_tables_of_one_database =
+            tables
+                .iter()
+                .filter(|table| is_direct_match(table))
+                .all(|table| {
+                    matches!(&table.table, Table::BTree(_) | Table::Virtual(_))
+                        && table.namespace.database_id == first_table.namespace.database_id
+                });
+        if names_parenthesized_table || !all_tables_of_one_database {
+            let column_name = first_table
+                .columns()
+                .iter()
+                .find(|column| !column.hidden())
+                .and_then(|column| column.name.as_deref())
+                .unwrap_or("?");
+            crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, column_name);
+        }
+        return expand_star_of_repeated_alias(
+            table_references,
+            out_columns,
+            &normalized_name,
+            long_names,
+        );
     }
 
     // SQLite binds each column after it expands `<table>.*`. A table outside
@@ -1504,6 +1539,66 @@ pub(super) fn expand_table_star(
             long_names,
             resolved_column.expr,
         ));
+    }
+    for (table_id, column_index) in used_columns {
+        table_references.mark_column_used(table_id, column_index);
+    }
+    Ok(())
+}
+
+/// Add the columns selected by `x.*` when several FROM items have the alias `x`.
+///
+/// As in SQLite, every such item adds its columns in FROM order, and each
+/// column binds like the qualified name `x.<column>`: a column that USING or
+/// NATURAL merges follows the rules for unqualified names, and any other
+/// column in two of the items is ambiguous.
+///
+/// ```sql
+/// SELECT x.* FROM t(a, b) AS x RIGHT JOIN u(a, d) AS x USING(a);  -- u.a, b, u.a, d
+/// SELECT x.* FROM t(a, b) AS x JOIN w(a, b) AS x USING(a);  -- ambiguous column name: b
+/// ```
+fn expand_star_of_repeated_alias(
+    table_references: &mut TableReferences,
+    out_columns: &mut Vec<ResultSetColumn>,
+    normalized_name: &str,
+    long_names: bool,
+) -> crate::Result<()> {
+    let tables = table_references.joined_tables();
+    let other_tables: Vec<TableInternalId> = tables
+        .iter()
+        .filter(|table| {
+            table.table.parenthesized_join_columns().is_some()
+                || alias_or_stored_name(table) != normalized_name
+        })
+        .map(|table| table.internal_id)
+        .collect();
+    let mut used_columns = Vec::new();
+    for table in tables
+        .iter()
+        .filter(|table| !other_tables.contains(&table.internal_id))
+    {
+        for (column_index, column) in table.columns_for_star() {
+            // SQLite cannot add a nameless column to a qualified star result.
+            let Some(column_name) = column.name.as_deref() else {
+                continue;
+            };
+            // The only error is an ambiguous name, reported with its qualifier.
+            let resolved_column =
+                resolve_unqualified_column_except(tables, column_name, &other_tables)
+                    .map_err(|_| {
+                        crate::LimboError::ParseError(format!(
+                            "ambiguous column name: {normalized_name}.{column_name}"
+                        ))
+                    })?
+                    .expect("the FROM item has this column");
+            used_columns.extend(resolved_column.source_columns);
+            out_columns.push(star_result_column(
+                table,
+                column_index,
+                long_names,
+                resolved_column.expr,
+            ));
+        }
     }
     for (table_id, column_index) in used_columns {
         table_references.mark_column_used(table_id, column_index);

@@ -413,7 +413,7 @@ fn expand_view_star(sources: &[ViewSource]) -> Vec<ViewColumn> {
                     .is_some_and(|join_info| join_info.merges_column(name))
             });
             if !is_right_using_copy {
-                columns.push(view_star_column(sources, source_index, source_column));
+                columns.push(view_star_column(sources, source_index, source_column, None));
             }
         }
     }
@@ -423,11 +423,14 @@ fn expand_view_star(sources: &[ViewSource]) -> Vec<ViewColumn> {
 /// Return the metadata source for one `*` or `table.*` column.
 ///
 /// SQLite binds this column as an unqualified name when a later USING clause
-/// merges it and a later RIGHT or FULL JOIN exists.
+/// merges it and a later RIGHT or FULL JOIN exists. Otherwise, when
+/// `repeated_qualifier` is set because several sources share that name, it
+/// binds as `qualifier.column`.
 fn view_star_column(
     sources: &[ViewSource],
     source_index: usize,
     source_column: &ViewColumn,
+    repeated_qualifier: Option<&str>,
 ) -> ViewColumn {
     let Some(column_name) = view_column_name(source_column) else {
         return view_output_column(source_column);
@@ -439,6 +442,10 @@ fn view_star_column(
         column_name,
     ) {
         return resolve_view_column(sources, None, column_name)
+            .expect("source_column itself has this name");
+    }
+    if let Some(qualifier) = repeated_qualifier {
+        return resolve_view_column(sources, Some(qualifier), column_name)
             .expect("source_column itself has this name");
     }
     view_output_column(source_column)
@@ -583,18 +590,33 @@ fn extract_view_columns_inner(
             }
             ast::ResultColumn::TableStar(table_ref) => {
                 let qualifier = normalize_ident(table_ref.as_str());
-                if let Some(source_index) = sources.iter().position(|source| {
-                    source
-                        .qualifiers
-                        .iter()
-                        .any(|candidate| candidate.eq_ignore_ascii_case(&qualifier))
-                }) {
+                let matching_sources: Vec<usize> = sources
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, source)| {
+                        source
+                            .qualifiers
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(&qualifier))
+                    })
+                    .map(|(source_index, _)| source_index)
+                    .collect();
+                // SQLite expands `x.*` to `x.<column>` for every FROM item
+                // named x, so when several items share the name, each column
+                // binds like a qualified name.
+                let repeated_qualifier = (matching_sources.len() > 1).then_some(&*qualifier);
+                for source_index in matching_sources {
                     for source_column in sources[source_index]
                         .columns
                         .iter()
                         .filter(|column| !column.column.hidden())
                     {
-                        let mut column = view_star_column(&sources, source_index, source_column);
+                        let mut column = view_star_column(
+                            &sources,
+                            source_index,
+                            source_column,
+                            repeated_qualifier,
+                        );
                         deduplicate_view_column_name(&mut column, &mut column_name_counts);
                         columns.push(column);
                     }
