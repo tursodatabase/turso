@@ -1852,7 +1852,8 @@ impl Limbo {
             }
         }
 
-        if !self.input_buff.ends_with(char::is_whitespace) {
+        // rustyline drops the newline, and a `--` comment only ends at one.
+        if !self.input_buff.ends_with('\n') {
             let _ = self.input_buff.write_char('\n');
         }
         self.read_state

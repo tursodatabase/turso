@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import os
+import pty
+import select
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -211,6 +214,48 @@ def test_statement_end_detection():
         "A string after a semicolon starts a statement that ends at the next semicolon",
     )
     shell.quit()
+
+
+def test_terminal_line_comment_ends_at_line_end():
+    # rustyline is only used when stdin is a terminal, and it drops the
+    # newline of each line, so this test runs the shell on a pty.
+    exe = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+    controller, terminal = pty.openpty()
+    proc = subprocess.Popen([exe], stdin=terminal, stdout=terminal, stderr=terminal)
+    os.close(terminal)
+    output = b""
+
+    def read_until_quiet(quiet_seconds):
+        # Input sent before rustyline is ready is lost, so wait until the
+        # shell stops writing before sending the next line.
+        nonlocal output
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            ready, _, _ = select.select([controller], [], [], quiet_seconds)
+            if not ready:
+                return
+            try:
+                chunk = os.read(controller, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            output += chunk
+
+    try:
+        read_until_quiet(2.0)
+        for line in [".mode list", "SELECT 11 -- c ", ", 22;", ".quit"]:
+            os.write(controller, line.encode() + b"\r")
+            read_until_quiet(1.0)
+    finally:
+        proc.kill()
+        proc.wait()
+        os.close(controller)
+    text = output.decode(errors="replace")
+    if "11|22" not in text:
+        console.error(f"Line comment with a trailing space absorbed the next line: {text!r}")
+        sys.exit(1)
+    console.test("line comment with a trailing space ends at the end of the line", _stack_offset=1)
 
 
 def test_import_csv():
@@ -600,6 +645,7 @@ def main():
     test_multi_line_single_line_comments_succession()
     test_comments()
     test_statement_end_detection()
+    test_terminal_line_comment_ends_at_line_end()
     test_import_csv()
     test_import_csv_verbose()
     test_import_csv_skip()
