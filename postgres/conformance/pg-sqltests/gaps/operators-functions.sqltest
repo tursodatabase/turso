@@ -165,7 +165,7 @@ expect {
     3
     4
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-16: ILIKE ALL(array)
@@ -179,7 +179,7 @@ expect {
     3
     4
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-17: ~ regex is case-sensitive
@@ -262,7 +262,7 @@ test all-any-non-equality {
 expect {
     t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-28: = ANY(array) with NULL element
@@ -511,7 +511,7 @@ test to-tsvector-plainto-tsquery {
 expect {
     t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-56: websearch_to_tsquery
@@ -522,7 +522,7 @@ test websearch-to-tsquery {
 expect {
     t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-57: to_tsquery / phraseto_tsquery
@@ -533,7 +533,7 @@ test to-tsquery-phraseto-tsquery {
 expect {
     t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-58: text col @@ to_tsquery
@@ -545,7 +545,7 @@ test text-col-to-tsquery {
 expect {
     1
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-59: to_tsvector output
@@ -578,7 +578,7 @@ test range-overlap-strictly-left-adjacent {
 expect {
     t|t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-62: tstzrange contains
@@ -815,7 +815,7 @@ test caret-is-the-power-operator {
 expect {
     8
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-84: || with NULL and int
@@ -1152,7 +1152,7 @@ test with-insert-returning-data-modifying-cte {
 expect {
     9
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-110: row comparison (a,b) > (x,y) (keyset pagination)

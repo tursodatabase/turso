@@ -106,3 +106,218 @@ test error-drop-type-used-by-a-cast-in-a-policy {
 }
 @sqlstate 2BP01
 expect error {}
+
+# The statements below are valid PostgreSQL that tursopg refuses. A refusal
+# has SQLSTATE 0A000, never a syntax error or an internal error.
+
+@compat-gap "syntax:select"
+test error-unsupported-select-without-columns {
+    CREATE TABLE t (a int);
+    SELECT FROM t;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:values"
+test error-unsupported-values-in-a-set-operation {
+    VALUES (1) UNION VALUES (2) ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create-function"
+test error-unsupported-function-cost-with-underscores {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql COST 1_000.5 AS 'SELECT 1';
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:select-into"
+test error-unsupported-select-into-in-a-set-operation {
+    SELECT 1 AS a INTO t UNION SELECT 2;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:array-slice"
+test error-unsupported-array-slice-without-lower-bound {
+    SELECT (ARRAY[1, 2, 3])[:2];
+}
+expect {
+    {1,2}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:from-function"
+test error-unsupported-coalesce-in-from {
+    SELECT * FROM coalesce(1, 2);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-cast"
+test error-unsupported-drop-cast {
+    DROP CAST IF EXISTS (int AS text);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-operator"
+test error-unsupported-drop-operator {
+    DROP OPERATOR IF EXISTS ### (int, int);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:copy"
+test error-unsupported-copy-to-program {
+    CREATE TABLE t (a int);
+    COPY t TO PROGRAM 'cat';
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:with-search"
+test error-unsupported-search-depth-first {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+        SEARCH DEPTH FIRST BY n SET ord
+    SELECT n FROM r ORDER BY ord;
+}
+expect {
+    1
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-drop-policy-on-a-table-of-another-database {
+    DROP POLICY p ON db.s.t;
+}
+@sqlstate 0A000
+expect error {}
+
+test error-json-to-record-with-two-arguments {
+    SELECT * FROM json_to_record('{"a": 1}', 1) AS x(a int);
+}
+@sqlstate 42883
+expect error {}
+
+test error-distinct-on-a-function-that-is-not-an-aggregate {
+    SELECT int4(DISTINCT a) FROM (VALUES (1)) AS t(a);
+}
+@sqlstate 42809
+expect error {}
+
+# The statements below fail in PostgreSQL with an error other than
+# feature_not_supported, and tursopg reports the same SQLSTATE.
+
+test error-update-assigns-a-column-twice {
+    CREATE TABLE t (a int);
+    UPDATE t SET a = 1, a = 2;
+}
+@sqlstate 42601
+expect error {}
+
+test error-on-conflict-assigns-a-column-twice {
+    CREATE TABLE t (a int PRIMARY KEY);
+    INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2, a = 3;
+}
+@sqlstate 42601
+expect error {}
+
+test error-into-on-a-later-select-of-a-set-operation {
+    SELECT 1 UNION SELECT 2 INTO t;
+}
+@sqlstate 42601
+expect error {}
+
+test error-explain-option-with-a-non-boolean-value {
+    EXPLAIN (ANALYZE foo) SELECT 1;
+}
+@sqlstate 42601
+expect error {}
+
+test error-copy-to-with-freeze {
+    CREATE TABLE t (a int);
+    COPY t TO STDOUT (FREEZE);
+}
+@sqlstate 22023
+expect error {}
+
+test error-copy-from-with-an-unknown-option {
+    CREATE TABLE t (a int);
+    COPY t FROM '/nonexistent' (FOO 1);
+}
+@sqlstate 42601
+expect error {}
+
+test error-copy-from-with-an-unknown-format {
+    CREATE TABLE t (a int);
+    COPY t FROM '/nonexistent' (FORMAT xml);
+}
+@sqlstate 22023
+expect error {}
+
+test error-copy-with-a-repeated-format {
+    CREATE TABLE t (a int);
+    COPY t TO STDOUT (FORMAT text, FORMAT text);
+}
+@sqlstate 42601
+expect error {
+    conflicting or redundant options
+}
+
+@compat-gap "syntax:copy"
+test copy-to-with-freeze-false {
+    CREATE TABLE t (a int);
+    COPY t TO STDOUT (FREEZE false);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-alter-sequence-owned-by-one-name {
+    CREATE SEQUENCE s;
+    ALTER SEQUENCE s OWNED BY x;
+}
+@sqlstate 42601
+expect error {}
+
+test error-unknown-operator {
+    SELECT 1 ### 2;
+}
+@sqlstate 42883
+expect error {}
+
+test error-field-of-a-row-that-does-not-exist {
+    SELECT (ROW(1, 2)).f9;
+}
+@sqlstate 42703
+expect error {}
+
+test error-field-of-an-array {
+    SELECT (ARRAY[1]).x;
+}
+@sqlstate 42809
+expect error {}

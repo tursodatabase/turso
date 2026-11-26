@@ -11,7 +11,7 @@ pub(crate) fn object_name(
 ) -> Result<String, ParseError> {
     let names = extract_key_columns(names)?;
     if names.is_empty() {
-        return Err(ParseError::ParseError(format!("missing {kind} name")));
+        return Err(ParseError::internal_error(format!("missing {kind} name")));
     }
     unqualified_name(&names, allowed_schema)
         .cloned()
@@ -32,7 +32,10 @@ pub(crate) fn extract_key_columns(
     let mut cols = Vec::new();
     for key_node in keys {
         let Some(Node::String(s)) = &key_node.node else {
-            return Err(ParseError::ParseError("expected a name".into()));
+            return Err(ParseError::sqlstate(
+                crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "expected a name",
+            ));
         };
         cols.push(s.sval.clone());
     }

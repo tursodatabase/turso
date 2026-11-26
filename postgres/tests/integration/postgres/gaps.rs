@@ -430,7 +430,7 @@ fn gap_b_24_in_list_with_params(db: TempDatabase) {
 }
 
 // B-27 (S2): col > ANY($1::int[])
-// tursopg: > ANY with an array param fails with a syntax error.
+// tursopg: > ANY with an array param is refused as not supported.
 // PostgreSQL: 3
 #[turso_macros::test(views)]
 fn gap_b_27_tursopg_returns_wrong_result_col_any_1_int(db: TempDatabase) {
@@ -444,7 +444,7 @@ fn gap_b_27_tursopg_returns_wrong_result_col_any_1_int(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 42601");
+    assert_eq!(out, "ERROR 0A000");
 }
 
 // B-32: int[] @> $1::int[]

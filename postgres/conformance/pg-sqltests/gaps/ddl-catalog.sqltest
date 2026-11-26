@@ -95,7 +95,7 @@ test alter-column-set-default {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-05: ALTER COLUMN DROP DEFAULT
@@ -106,7 +106,7 @@ test alter-column-drop-default {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-06: ALTER COLUMN SET NOT NULL
@@ -117,7 +117,7 @@ test alter-column-set-not-null {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-07: ALTER COLUMN DROP NOT NULL
@@ -128,7 +128,7 @@ test alter-column-drop-not-null {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-08: ALTER COLUMN TYPE
@@ -150,7 +150,7 @@ test add-constraint-unique {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-10: ADD CONSTRAINT FOREIGN KEY
@@ -162,7 +162,7 @@ test add-constraint-foreign-key {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-11: ADD CONSTRAINT CHECK
@@ -173,7 +173,7 @@ test add-constraint-check {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-12: DROP CONSTRAINT
@@ -184,7 +184,7 @@ test drop-constraint {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-13: ALTER TABLE RENAME TO

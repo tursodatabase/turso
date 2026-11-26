@@ -775,7 +775,7 @@ test jsonb-matches-jsonpath {
 expect {
     t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 @compat-gap "operator:jsonb #- _text"
@@ -785,7 +785,7 @@ test jsonb-delete-path {
 expect {
     {"a": {}}
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # jsonb_insert() of tursopg is the function of SQLite, which takes a JSON

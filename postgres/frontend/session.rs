@@ -1939,7 +1939,7 @@ fn try_prepare_special(
 /// The engine error for an error of the translator.
 fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
     match error {
-        ParseError::ParseError(_) | ParseError::Sqlstate { .. } => sql_parse_error(error),
+        ParseError::PgQuery(_) | ParseError::Sqlstate { .. } => sql_parse_error(error),
         ParseError::SchemaQualifiedName { ref schema, .. } => {
             match check_schema_exists(conn, schema) {
                 Err(missing_schema) => missing_schema,

@@ -7,8 +7,8 @@
 use crate::cmdtag::CommandTag;
 use crate::names::{extract_key_columns, is_default_schema, object_name};
 use crate::sqlstate::{
-    SQLSTATE_INVALID_FUNCTION_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_FUNCTION_DEFINITION,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_OBJECT,
 };
 use crate::{FunctionTypeUse, ParseError};
 use pg_query::protobuf::{
@@ -131,7 +131,7 @@ fn def_elems(options: &[pg_query::protobuf::Node]) -> Result<Vec<&DefElem>, Pars
         .iter()
         .map(|option| match &option.node {
             Some(Node::DefElem(def)) => Ok(def.as_ref()),
-            _ => Err(ParseError::ParseError(
+            _ => Err(ParseError::internal_error(
                 "expected a function option".to_string(),
             )),
         })
@@ -141,11 +141,13 @@ fn def_elems(options: &[pg_query::protobuf::Node]) -> Result<Vec<&DefElem>, Pars
 fn numeric_value(def: &DefElem) -> Result<f64, ParseError> {
     match def.arg.as_ref().and_then(|arg| arg.node.as_ref()) {
         Some(Node::Integer(integer)) => Ok(integer.ival as f64),
-        Some(Node::Float(float)) => float
-            .fval
-            .parse()
-            .map_err(|_| ParseError::ParseError(format!("invalid number: {}", float.fval))),
-        _ => Err(ParseError::ParseError(format!(
+        Some(Node::Float(float)) => float.fval.parse().map_err(|_| {
+            ParseError::sqlstate(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("invalid number: {}", float.fval),
+            )
+        }),
+        _ => Err(ParseError::internal_error(format!(
             "{} requires a numeric value",
             def.defname.to_uppercase()
         ))),
@@ -180,7 +182,7 @@ fn function_language(
 fn string_value(def: &DefElem) -> Result<&str, ParseError> {
     match def.arg.as_ref().and_then(|arg| arg.node.as_ref()) {
         Some(Node::String(string)) => Ok(&string.sval),
-        _ => Err(ParseError::ParseError(format!(
+        _ => Err(ParseError::internal_error(format!(
             "{} requires a name",
             def.defname.to_uppercase()
         ))),
@@ -192,7 +194,7 @@ fn function_parameters(stmt: &CreateFunctionStmt) -> Result<Vec<&FunctionParamet
         .iter()
         .map(|node| match &node.node {
             Some(Node::FunctionParameter(parameter)) => Ok(parameter.as_ref()),
-            _ => Err(ParseError::ParseError(
+            _ => Err(ParseError::internal_error(
                 "expected a function parameter".to_string(),
             )),
         })
@@ -208,7 +210,7 @@ fn check_parameter_type(
     let type_name = parameter
         .arg_type
         .as_ref()
-        .ok_or_else(|| ParseError::ParseError("function parameter without a type".to_string()))?;
+        .ok_or_else(|| ParseError::internal_error("function parameter without a type"))?;
     match classify_type(type_name)? {
         TypeClass::Pseudo(name) if is_sql => Err(ParseError::sqlstate(
             SQLSTATE_INVALID_FUNCTION_DEFINITION,
@@ -307,7 +309,7 @@ fn function_body<'a>(
         return Err(invalid("duplicate function body specified"));
     }
     let Some(Node::List(items)) = as_item.arg.as_ref().and_then(|arg| arg.node.as_ref()) else {
-        return Err(ParseError::ParseError(
+        return Err(ParseError::internal_error(
             "AS requires a function body".to_string(),
         ));
     };
@@ -318,7 +320,7 @@ fn function_body<'a>(
     };
     match &body.node {
         Some(Node::String(body)) => Ok(Some(&body.sval)),
-        _ => Err(ParseError::ParseError(
+        _ => Err(ParseError::internal_error(
             "AS requires a function body".to_string(),
         )),
     }
@@ -339,12 +341,12 @@ fn parse_body(body: &str) -> Result<pg_query::ParseResult, ParseError> {
 /// Whether the token after the AS keyword at `as_location` of `sql` is a
 /// dollar-quoted string.
 fn is_dollar_quoted_after(sql: &str, as_location: i32) -> Result<bool, ParseError> {
-    let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
     let body = scan
         .tokens
         .iter()
         .find(|token| token.start > as_location)
-        .ok_or_else(|| ParseError::ParseError("AS requires a function body".to_string()))?;
+        .ok_or_else(|| ParseError::internal_error("AS requires a function body".to_string()))?;
     Ok(sql[body.start as usize..].starts_with('$'))
 }
 
