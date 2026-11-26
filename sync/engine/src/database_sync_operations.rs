@@ -300,6 +300,29 @@ fn logical_op_to_tape_operations(
                     }
                     DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Alter { sql: op.sql })
                 }
+                LogicalSchemaAction::RenameTable => {
+                    if op.table_name.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical table rename must include table_name".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::RenameTable {
+                        old_name: op.table_name,
+                        new_name: op.schema_name,
+                    })
+                }
+                LogicalSchemaAction::RenameTableToTemporaryName => {
+                    DatabaseTapeOperation::SchemaReplay(
+                        DatabaseSchemaReplay::RenameTableToTemporaryName {
+                            name: op.schema_name,
+                        },
+                    )
+                }
+                LogicalSchemaAction::RenameTemporaryTable => DatabaseTapeOperation::SchemaReplay(
+                    DatabaseSchemaReplay::RenameTemporaryTable {
+                        new_name: op.schema_name,
+                    },
+                ),
             };
             Ok(vec![operation])
         }
@@ -490,7 +513,10 @@ impl LogicalReplayTableMap {
             return;
         }
         match schema_action {
-            LogicalSchemaAction::Unspecified => {}
+            LogicalSchemaAction::Unspecified
+            | LogicalSchemaAction::RenameTable
+            | LogicalSchemaAction::RenameTableToTemporaryName
+            | LogicalSchemaAction::RenameTemporaryTable => {}
             LogicalSchemaAction::Create
             | LogicalSchemaAction::Refresh
             | LogicalSchemaAction::Alter => {
@@ -1286,6 +1312,7 @@ fn append_schema_ops(
     ops: &mut Vec<LogicalOp>,
 ) -> Result<()> {
     let mut drops = Vec::new();
+    let mut table_renames = Vec::new();
     let mut table_refreshes_and_creates = Vec::new();
     let mut non_table_creates = Vec::new();
     for delta in deltas.into_values() {
@@ -1309,8 +1336,13 @@ fn append_schema_ops(
                     new.name, old.row_type, new.row_type
                 )));
             }
-            (Some(_), Some(new)) if is_table(&new) => table_refreshes_and_creates
-                .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?),
+            (Some(old), Some(new)) if is_table(&new) => {
+                if old.name != new.name {
+                    table_renames.push((Some(old.name), created_table_name(&new.sql)?));
+                }
+                table_refreshes_and_creates
+                    .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
+            }
             (Some(old), Some(new)) => {
                 drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
                 non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
@@ -1318,10 +1350,76 @@ fn append_schema_ops(
         }
     }
     ops.extend(drops);
+    append_table_rename_ops(table_renames, ops);
     ops.extend(table_refreshes_and_creates);
     // these may depend on new or altered tables, so we emit them after all tables have been updated
     ops.extend(non_table_creates);
     Ok(())
+}
+
+fn created_table_name(create_table: &str) -> Result<String> {
+    let mut parser = turso_parser::parser::Parser::new(create_table.as_bytes());
+    match parser.next() {
+        Some(Ok(turso_core::ast::Cmd::Stmt(
+            turso_core::ast::Stmt::CreateTable { tbl_name, .. }
+            | turso_core::ast::Stmt::CreateVirtualTable(turso_core::ast::CreateVirtualTable {
+                tbl_name,
+                ..
+            }),
+        ))) => Ok(tbl_name.name.as_str().to_string()),
+        _ => Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema table row has unexpected sql: {create_table}"
+        ))),
+    }
+}
+
+fn append_table_rename_ops(mut renames: Vec<(Option<String>, String)>, ops: &mut Vec<LogicalOp>) {
+    while !renames.is_empty() {
+        let next_with_free_name = renames.iter().position(|(_, new_name)| {
+            !renames.iter().any(|(old_name, _)| {
+                old_name
+                    .as_deref()
+                    .is_some_and(|old_name| old_name.eq_ignore_ascii_case(new_name))
+            })
+        });
+        match next_with_free_name {
+            Some(i) => {
+                let (old_name, new_name) = renames.remove(i);
+                ops.push(match old_name {
+                    Some(old_name) => {
+                        table_rename_op(LogicalSchemaAction::RenameTable, &old_name, &new_name)
+                    }
+                    None => {
+                        table_rename_op(LogicalSchemaAction::RenameTemporaryTable, "", &new_name)
+                    }
+                });
+            }
+            None => {
+                let old_name = renames[0].0.take().unwrap();
+                ops.push(table_rename_op(
+                    LogicalSchemaAction::RenameTableToTemporaryName,
+                    "",
+                    &old_name,
+                ));
+            }
+        }
+    }
+}
+
+fn table_rename_op(action: LogicalSchemaAction, old_name: &str, name: &str) -> LogicalOp {
+    LogicalOp {
+        op_type: LogicalOpType::Schema as i32,
+        table_name: old_name.to_string(),
+        rowid: 0,
+        record: Bytes::new(),
+        sql: String::new(),
+        user_version: None,
+        application_id: None,
+        schema_action: Some(action as i32),
+        schema_kind: Some(LogicalSchemaKind::Table as i32),
+        schema_name: name.to_string(),
+        stable_table_id: 0,
+    }
 }
 
 fn is_table(row: &DecodedSchemaRow) -> bool {

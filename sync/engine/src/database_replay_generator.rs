@@ -882,7 +882,26 @@ impl DatabaseReplayGenerator {
         Ok(Some(columns))
     }
 
-    fn execute_ddl(&self, ddl: &str) -> Result<()> {
+    pub(crate) async fn unused_temporary_table_name<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+    ) -> Result<String> {
+        let mut n = 1;
+        loop {
+            let name = format!("turso_sync_rename_{n}");
+            let query = format!(
+                "SELECT 1 FROM sqlite_schema WHERE name = {} COLLATE NOCASE",
+                sql_string_literal(&name)
+            );
+            let mut stmt = self.conn.prepare(query)?;
+            if run_stmt_once(coro, &mut stmt).await?.is_none() {
+                return Ok(name);
+            }
+            n += 1;
+        }
+    }
+
+    pub(crate) fn execute_ddl(&self, ddl: &str) -> Result<()> {
         self.conn.execute(ddl).map_err(|error| {
             Error::DatabaseTapeError(format!("failed to execute DDL `{ddl}`: {error}"))
         })
