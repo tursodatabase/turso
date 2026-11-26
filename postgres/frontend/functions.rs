@@ -403,7 +403,10 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             exec_jsonb_exists_keys(args[0].get_value(), args[1].get_value(), true)?
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), false) => {
-            let typemod = args.get(1).and_then(|arg| arg.get_value().as_int());
+            let typemod = match args.get(1) {
+                Some(_) => int4_arg(args, 1)?,
+                None => None,
+            };
             oid_arg(args, 0)?
                 .map(|type_oid| format_type(connection, type_oid, typemod))
                 .transpose()?
@@ -777,6 +780,16 @@ fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
         value => value.as_int().map(Some).ok_or_else(|| {
             LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
         }),
+    }
+}
+
+/// Argument `i` as a PostgreSQL `integer`, or None when it is NULL. Text is
+/// read the way a quoted literal is cast to `integer`.
+fn int4_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
+    match args[i].get_value() {
+        Value::Null => Ok(None),
+        Value::Text(text) => IntegerType::Int4.parse(text.as_str()).map(Some),
+        value => Ok(value.as_int()),
     }
 }
 

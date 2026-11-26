@@ -1229,10 +1229,35 @@ expect {
 test format-type-typmods {
     SELECT format_type(1042, NULL), format_type(1042, -1), format_type(1042, 9),
            format_type(1114, 3), format_type(1184, 0), format_type(1083, 2),
-           format_type(1700, 4), format_type(1700, 655363), format_type(25, 5);
+           format_type(1700, 4), format_type(1700, 655363), format_type(25, 5),
+           format_type(1043, '9'), format_type(1043, ' 9 ');
 }
 expect {
-    character|bpchar|character(5)|timestamp(3) without time zone|timestamp(0) with time zone|time(2) without time zone|numeric(0,0)|numeric(9,-1)|text(5)
+    character|bpchar|character(5)|timestamp(3) without time zone|timestamp(0) with time zone|time(2) without time zone|numeric(0,0)|numeric(9,-1)|text(5)|character varying(5)|character varying(5)
+}
+
+test format-type-text-typmod-with-prefix-and-underscores {
+    SELECT format_type(1043, '0x10'), format_type(1043, ' 1_6 '), format_type(1043, '0o20'),
+           format_type(1043, '+0B1_0000');
+}
+expect {
+    character varying(12)|character varying(12)|character varying(12)|character varying(12)
+}
+
+test format-type-text-typmod-not-an-integer {
+    SELECT format_type(1043, 'abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "abc"
+}
+
+test format-type-text-typmod-out-of-range {
+    SELECT format_type(1043, '3000000000');
+}
+@sqlstate 22003
+expect error {
+    value "3000000000" is out of range for type integer
 }
 
 test pg-type-is-visible {
