@@ -11,6 +11,8 @@ mod model;
 #[cfg(test)]
 mod overlay_tests;
 mod program;
+#[cfg(all(test, debug_assertions))]
+mod undefined_tests;
 mod walk;
 
 use crate::common::TempDatabase;
@@ -918,25 +920,6 @@ mod tests {
         });
     }
 
-    /// D4 / G10: `Delete` without a current row. The contract says Undefined, but
-    /// an engine must not panic. WAL asserts `self.current_page >= 0` on an empty cursor.
-    /// MVCC panics with "Cannot delete: no current row", also after a scan that ended.
-    ///
-    /// Fails today because of D4; see SPEC section 5b.
-    #[test]
-    fn known_bug_d4_delete_without_row_does_not_panic() {
-        known_bug("D4", "self.current_page >= 0", || {
-            for ops in [
-                vec![Delete(0), Count(0)],
-                vec![Rewind(0), Next(0), Next(0), Next(0), Delete(0), Count(0)],
-            ] {
-                for (kind, layout, got) in run_all(ROWS, 1, &ops) {
-                    assert!(got.is_ok(), "{kind:?}/{layout:?} {ops:?}: {got:?}");
-                }
-            }
-        });
-    }
-
     // Gaps found by the random walk (`walk.rs`). Each test is the minimal program that the
     // shrinker printed, checked against the model on all four configs. The proposed gap ids
     // N1 to N6 are the names of the generator filters. They are not in SPEC.md yet.
@@ -976,26 +959,6 @@ mod tests {
             ] {
                 for (kind, layout, got) in run_all(ROWS, 1, &ops) {
                     assert!(got.is_ok(), "{kind:?}/{layout:?} {ops:?}: {got:?}");
-                }
-            }
-        });
-    }
-
-    /// N3: `NewRowid` after `NullRow` (also after `NullRow` and `Count`). SPEC makes it
-    /// undefined, but the rowid must still not be one that is in use. WAL returns 1.
-    ///
-    /// Fails today because of N3; see SPEC section 5b.
-    #[test]
-    fn known_bug_n3_new_rowid_after_null_row_is_fresh() {
-        known_bug("N3", "BadRowid", || {
-            for ops in [
-                vec![NullRow(0), NewRowid(0)],
-                vec![NullRow(0), Count(0), NewRowid(0)],
-            ] {
-                for (kind, layout, got) in run_all(ROWS, 1, &ops) {
-                    let got = got.unwrap_or_else(|e| panic!("{kind:?}/{layout:?}: {e}"));
-                    let new = got.last().and_then(|o| o.rowid).expect("a rowid");
-                    assert!(new > 30, "{kind:?}/{layout:?} {ops:?}: new rowid {new}");
                 }
             }
         });

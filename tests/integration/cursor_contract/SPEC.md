@@ -47,8 +47,9 @@ Rules that hold for all opcodes:
 - `Column` and `RowId` return NULL when the null-row flag is set, and when the position is
   `Invalid` or `Gap`. They return the row when the position is `At k`.
 - Each opcode is either defined, or its precondition is violated. A violated
-  precondition is **Undefined**: the model has no result, the generator never emits it, and
-  a test may check that Turso does not corrupt data.
+  precondition is **Undefined**: the model has no result and the generator never emits it.
+  An engine must refuse an Undefined sequence in a debug build (section 2d). So an opcode is
+  either supported or refused, and the translator never emits a refused one.
 
 ## 2. Opcode contract
 
@@ -151,6 +152,27 @@ identical (Undefined), and must not `IdxDelete` with a key that is equal but not
 identical (Undefined). A delete followed by an insert of a key that differs only by case
 (or trailing spaces) is legal. A later read must return the new bytes.
 
+## 2d. Undefined sequences
+
+**Rule.** When an op violates its precondition, a debug build of the engine returns an
+error or panics with a message that contains `unsupported`. A release build may do
+anything (for now). The model calls the op illegal (`step` returns `None`) and the generator
+never emits it. `undefined_tests.rs` checks both sides: the model says illegal, and every
+engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
+
+| Id | Undefined sequence | Decision |
+|---|---|---|
+| U1 | `Next` without a forward position, or `Prev` without a backward one (`Rewind` then `Prev`, `Last` then `Next`, `Next` then `Prev`) | D3 |
+| U2 | `Next` or `Prev` from a position that has no direction: after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete` | section 1 |
+| U3 | After `NullRow`: `Next`, `Prev`, `Insert`, `IdxInsert`, `Delete`, `Count`, `NewRowid` | section 2 |
+| U4 | `Delete` with no entry under the cursor: fresh cursor, scan ended, failed seek | D4 |
+| U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key | section 3 |
+| U6 | `IdxGE/GT/LE/LT` on a cursor whose entry was deleted (by itself or by another cursor) | SQLite asserts, `vdbe.c:7112` |
+| U7 | `IdxInsert` of a key that is in the index, `IdxDelete` of a key that is not, and the collation-equal variants of both (section 2c) | section 2c |
+
+Not Undefined, so not in this list: a read after `Count`, `IdxDelete` or `SeekEnd` has an
+open result (any entry or NULL) but never an error (N2, N7).
+
 ## 3. Insert seek contract
 
 Turso differs from SQLite: it seeks only when `REQUIRE_SEEK` is set. Otherwise the
@@ -171,10 +193,10 @@ caller must have left the cursor at a `Seeked k` or `At k` position for the same
 - **D2.** After `Delete`, the cursor is in the gap. This is SQLite `SAVEPOSITION`. Turso's
   `skip_advance` exists for this.
 - **D3.** A direction change (`Next` after `Prev` and the reverse) is Undefined. SQLite's
-  own asserts forbid it. The MVCC overlay has no direction state. Do not fix it; add a debug
-  assertion if we want to enforce this.
+  own asserts forbid it. The MVCC overlay has no direction state. Do not make it work: a
+  debug build refuses it (U1, section 2d).
 - **D4.** `Delete` with no current row is Undefined. Today BTree ignores it and MVCC
-  panics.
+  panics. A debug build refuses it with an `unsupported` message (U4).
 - **D5.** Peer reads follow SQLite: a cursor whose row was deleted by another cursor reads
   NULL.
 - **D6.** `NewRowid` returns a value with a predicate, not an exact number.
@@ -220,8 +242,6 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | G4 | MVCC, checkpointed | After an overwrite by `Insert`, `Column` reads the old record |
 | G2 | WAL, MVCC | A peer deletes our row: WAL reads the next row, MVCC reads the deleted row |
 | G3 | WAL | A peer write clears the null-row flag |
-| D4 | WAL, MVCC | `Delete` without a row panics |
-| N3 | WAL | `NewRowid` on a null-row cursor returns 1 |
 | R1 | all | `RowData` and `Column` disagree: on a null row, after `IdxInsert`, on a cursor without an entry, and with a pending `DeferredSeek` |
 | O1 | ephemeral | `OpenDup` rejects index cursors |
 | OV1 | MVCC | Index: an equality-only prefix seek, then `Next`, skips overlay keys or ends early |
@@ -237,7 +257,13 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | N12 | WAL | Index: panic on `idx < cell_count` |
 | CL1 | MVCC | Index, NOCASE or RTRIM: `IdxDelete` of `('a', 1)` and `IdxInsert` of `('A', 1)` (equal under the collation, same rowid): a later read of the entry returns the old bytes `'a'`, not `'A'`. SQLite and WAL return the new bytes. Needs no checkpointed row. Reachable from SQL (`UPDATE t SET a='A'`, then a covering index scan): issue 9285 |
 | IDX_N6 | WAL | Index: own `Delete`, then a peer `IdxInsert`, then `Next` or `Prev`: the cursor finds the wrong entry or the end. Shows with the default index; the walk found it only after the text values were added. Not reachable from SQL: only the one-pass `DELETE` calls `Next` after its own delete, and it has no second writer |
-| N8 | model | Index: `IdxGT` after own `IdxDelete` compares the successor. Probably a model choice. Open |
+| U1 | all | Undefined: `Next` or `Prev` in the wrong direction (D3). No engine refuses it with `unsupported` |
+| U2 | all | Undefined: `Next` or `Prev` after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete`. No engine refuses it |
+| U3 | all | Undefined: `Next`, `Prev`, `Insert`, `IdxInsert`, `Delete`, `Count` or `NewRowid` after `NullRow`. WAL answers a `NewRowid` with 1 (was N3). No engine refuses it |
+| U4 | WAL, MVCC | Undefined: `Delete` without an entry (D4). WAL panics on `current_page >= 0`, MVCC with "Cannot delete: no current row". Neither message says `unsupported` |
+| U5 | all | Undefined: an insert without the seek token of its key. No engine refuses it |
+| U6 | all | Undefined: `IdxGE/GT/LE/LT` after the entry was deleted (was N8; SQLite asserts, `vdbe.c:7112`). The engines compare the next entry or the end |
+| U7 | all | Undefined: `IdxInsert` of an existing key, `IdxDelete` of a missing key, and the collation-equal variants (section 2c). No engine refuses it |
 
 Not modelled: `DeferredSeek`, direction switches (D3), covered-chain drops in the overlay,
 a failed eq-only seek that leaves the cursor on a neighbour. An eq-only `SeekGE` for a key
