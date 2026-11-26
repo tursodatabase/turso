@@ -29,7 +29,7 @@ Run the `export` lines it prints: `PATH`, so `scripts/diff.sh` uses our sqlite3 
   - SQLite frontend: `scripts/diff.sh "SQL"` runs the SQL in `sqlite3` and `tursodb` and prints PASS, or FAIL with a diff.
   - PostgreSQL frontend: `psql "$PG_DSN" -c "SQL"` and `cargo run -q -p tursopg -- :memory: "SQL"`.
 - Do not answer from what you remember SQLite or PostgreSQL does. Run it. Different wording of an error is not a bug. A different result is, and so is a different error class: on the PostgreSQL frontend the SQLSTATE is part of the result, and an error where SQLite or PostgreSQL succeeds, or the reverse, is a wrong result.
-- Read their source for the behaviour (`--sources` above; SQLite: `src/`, PostgreSQL: `src/backend/`). Find the function that does this. Put your fix at the matching place in Turso, in the same layer, not wherever your example happens to pass through, and not a different way that gives the same output on your example.
+- Read their source for the behaviour (`--sources` above; SQLite: `src/`, PostgreSQL: `src/backend/`). Find the function that does this. Put your fix at the matching place in Turso, in the same layer, not wherever your example happens to pass through, and not a different way that gives the same output on your example. If the function you found does not do what your fix does, that does not prove the fix is unneeded: follow the value back to where SQLite or PostgreSQL creates it (a page buffer to the pager, a datum to its input function), and look there.
 - Where SQLite and PostgreSQL have no equivalent (sync, MVCC, CDC, encryption, the CLI), the reference is what the feature promises: the remote database after a pull, the same rows as without MVCC, `main`'s output. Test sequences of operations (a change, then a rename, a drop, a second pull), not single statements.
 - If neither SQLite, PostgreSQL nor current Turso behaviour decides the answer, stop and ask the user. With no user to ask, leave it unfixed and say so in the PR. Do not decide it inside a fix.
 
@@ -42,6 +42,8 @@ Run the `export` lines it prints: `PATH`, so `scripts/diff.sh` uses our sqlite3 
 - Before you write a helper, type or constant, search for code that already does the job, by what it does, not only by name. Reuse it or extend it. Delete the code you replace.
 - Keep the scope to the bug. PostgreSQL-only behaviour goes in `postgres/`, not in `core`. A fix for a rare case must not change code that every query runs through.
 - If a value is already wrong when it reaches your code, fix the code that produces it, not the code that reads it.
+- If the change adds a check or a refusal (an option list, a value check, a "not supported" error), run every case it covers against SQLite or PostgreSQL: each valid value must still succeed, and each invalid one, misspelled or repeated, must fail with the same SQLSTATE and message. Take the list from their source (for PostgreSQL options, the function that parses them), not from your examples.
+- Follow the rules in `AGENTS.md` and the `CLAUDE.md` files for the directories you change, such as how to mark data copied by hand from PostgreSQL's catalogs.
 - Weaken no existing check: no changed expected output, removed or relaxed assertion, ignored test, allowed lint, swallowed error, or error the simulator or fuzzer now accepts. If an old check is wrong, prove it with SQLite or PostgreSQL output, or a seed, and show that in the PR.
 - Write the test with the fix. Then prove that it fails without the fix: revert the non-test change, run the test, see it fail, restore the change, see it pass. Then break each part of the fix on its own (revert one hunk, or skip one call site) and run the tests. For each part, some test must fail. If no test notices a part, add a test for it or delete the part. Use `.sqltest` files where you can (the `testing` skill says how to run them). A test that passes on `main` does not test this change.
 - The test uses the reported input, or a smaller input that still fails the same way.
@@ -71,7 +73,7 @@ Do not give it your notes, your plan or your explanation. Give it this brief:
 
 > Find inputs on which the branch gives a wrong result. Do not review style or run the test suite. Say what must be true for the change to be right. List the other ways to reach the same code. Run each one on the branch, on `origin/main`, and on SQLite or PostgreSQL; do not answer from memory. Shrink each failure to the smallest input, then say which kinds of input fail. Stop any run that takes longer than 60 seconds. Report a failure only with the commands you ran and their output.
 
-Check each failure it reports by running its commands yourself. A failure that `main` also has, in the same feature or in code you changed, belongs in this PR. A failure far from the change goes in a new issue that names its cause, not only its symptom.
+Check each failure it reports by running its commands yourself, and give each one a verdict: reproduced, or not reproduced with your output. "Could not check" is not a verdict. A failure that `main` also has, in the same feature or in code you changed, belongs in this PR. A failure far from the change goes in a new issue that names its cause, not only its symptom.
 
 ## 5. Before you push
 
