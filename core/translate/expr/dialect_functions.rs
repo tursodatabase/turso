@@ -12,7 +12,7 @@ use crate::dialect::{ChosenFunction, FunctionChoice, OperandType};
 #[allow(clippy::vec_box)]
 pub(super) struct ChosenCall {
     pub(super) func: Func,
-    /// The arguments of the call, each cast to the type the function takes.
+    /// The arguments of the call, each cast to the type the dialect gave for it.
     pub(super) arguments: Vec<Box<ast::Expr>>,
     pub(super) result_type: Option<ast::Type>,
 }
@@ -61,11 +61,12 @@ pub(super) fn choose_function_call(
     let arguments = args
         .iter()
         .zip(argument_types)
-        .map(|(arg, ty)| {
-            Box::new(ast::Expr::Cast {
+        .map(|(arg, ty)| match ty {
+            Some(ty) => Box::new(ast::Expr::Cast {
                 expr: arg.clone(),
                 type_name: Some(ty),
-            })
+            }),
+            None => arg.clone(),
         })
         .collect();
     Ok(Some(ChosenCall {

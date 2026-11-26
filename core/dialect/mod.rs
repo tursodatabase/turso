@@ -799,7 +799,7 @@ pub enum FunctionChoice {
     /// The engine's own rules run the call. SQLite always gives this.
     LeftToTheEngine,
     /// The dialect's function runs. The engine casts each argument to the type
-    /// the function takes.
+    /// the dialect gives for it.
     Chosen(ChosenFunction),
 }
 
@@ -808,8 +808,9 @@ pub enum FunctionChoice {
 pub struct ChosenFunction {
     /// The name the function is registered under.
     pub implementation: String,
-    /// The type of each argument, in order.
-    pub argument_types: Vec<ast::Type>,
+    /// The type each argument is cast to, in order. `None` leaves the
+    /// argument as it is.
+    pub argument_types: Vec<Option<ast::Type>>,
     /// The type of the value the function returns. `None` leaves it to the
     /// function.
     pub result_type: Option<ast::Type>,

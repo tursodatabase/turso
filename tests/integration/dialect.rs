@@ -2337,10 +2337,10 @@ impl Dialect for ChoosesFunctionsDialect {
             size: None,
             array_dimensions: 0,
         };
-        let chosen = |implementation: &str, argument: &str, result: Option<&str>| {
+        let chosen = |implementation: &str, argument: Option<&str>, result: Option<&str>| {
             Ok(FunctionChoice::Chosen(ChosenFunction {
                 implementation: implementation.to_string(),
-                argument_types: vec![type_named(argument)],
+                argument_types: vec![argument.map(type_named)],
                 result_type: result.map(type_named),
             }))
         };
@@ -2349,17 +2349,17 @@ impl Dialect for ChoosesFunctionsDialect {
                 [OperandType::Engine {
                     ty: EngineType::Text,
                     ..
-                }] => chosen("describe_text", "TEXT", Some("TEXT")),
+                }] => chosen("describe_text", None, Some("TEXT")),
                 [OperandType::Engine {
                     ty: EngineType::Integer,
                     ..
                 }]
                 | [OperandType::StringLiteral(_)] => {
-                    chosen("describe_integer", "INTEGER", Some("INTEGER"))
+                    chosen("describe_integer", Some("INTEGER"), Some("INTEGER"))
                 }
                 _ => Ok(FunctionChoice::LeftToTheEngine),
             },
-            "ghost" => chosen("ghost_implementation", "INTEGER", None),
+            "ghost" => chosen("ghost_implementation", Some("INTEGER"), None),
             "forbidden" => Err(LimboError::ParseError("forbidden call".to_string())),
             _ => Ok(FunctionChoice::LeftToTheEngine),
         }
