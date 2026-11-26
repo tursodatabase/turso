@@ -19,6 +19,8 @@ CREATE VIRTUAL TABLE [IF NOT EXISTS] [schema-name.]table-name
 
 A virtual table delegates row storage and retrieval to a module. The module determines what columns the table has, what data it returns, and how queries against it are optimized. Virtual tables can be queried with SELECT just like regular tables, but they cannot be targets of INSERT, UPDATE, or DELETE unless the module implements write support.
 
+An INSERT into a writable virtual table can have a `RETURNING` clause. Its `RETURNING` clause is computed from the values that the INSERT passes to the module, before the module writes the row, as in SQLite. So `rowid` is `-1` unless the INSERT gives one, `*` leaves out hidden columns, and a subquery does not see the new row. UPDATE and DELETE on a virtual table cannot have a `RETURNING` clause.
+
 ### Clauses
 
 | Clause | Description |

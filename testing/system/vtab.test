@@ -135,6 +135,26 @@ do_execsql_test_on_specific_db {:memory:} update-hidden-column {
     select comment from t where key = 'hidden';
 } {"updated comment"}
 
+do_execsql_test_on_specific_db {:memory:} insert-returning-into-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v(key, value) VALUES ('k1', 'v1') RETURNING key, value;
+} {k1|v1}
+
+# RETURNING * leaves out hidden columns, as SELECT * does
+do_execsql_test_on_specific_db {:memory:} insert-returning-star-into-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v(comment, key, value) VALUES ('c1', 'k1', 'v1') RETURNING *;
+} {k1|v1}
+
+# RETURNING runs before the row is written, so the rowid is -1 unless the
+# INSERT gives one, and a subquery does not see the new row
+do_execsql_test_on_specific_db {:memory:} insert-returning-rowid-into-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v(key, value) VALUES ('k1', 'v1') RETURNING rowid, (SELECT count(*) FROM v);
+    INSERT INTO v(rowid, key, value) VALUES (77, 'k2', 'v2') RETURNING rowid, key;
+} {-1|0
+77|k2}
+
 do_execsql_test_in_memory_error_content update-returning-on-vtab {
     CREATE VIRTUAL TABLE v USING kv_store;
     INSERT INTO v VALUES ('k1', 'v1');

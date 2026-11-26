@@ -176,9 +176,9 @@ pub fn process_returning_clause(
                     .expect("RETURNING clause must reference at least one table");
                 let internal_id = table.internal_id;
 
-                // Handle RETURNING * by expanding to all table columns
+                // Handle RETURNING * by expanding to the columns SELECT * shows.
                 // Use the shared internal_id for all columns
-                for (column_index, column) in table.columns().iter().enumerate() {
+                for (column_index, column) in table.columns_for_star() {
                     let column_expr = Expr::Column {
                         database: None,
                         table: internal_id,

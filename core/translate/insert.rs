@@ -1,4 +1,4 @@
-use crate::alloc::TursoFromIterator;
+use crate::alloc::{TursoFromIterator, TursoSliceExt};
 use crate::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo, With,
@@ -326,11 +326,15 @@ pub fn translate_insert(
         program.begin_write_on_database(database_id, schema_cookie)?;
         translate_virtual_table_insert(
             program,
+            resolver,
             virtual_table.clone(),
+            table_name.as_str(),
+            namespace,
             columns,
             body,
+            returning,
+            with_for_returning,
             on_conflict,
-            resolver,
             connection,
         )?;
         return Ok(());
@@ -3512,18 +3516,23 @@ fn emit_preflight_constraint_checks(
     Ok(())
 }
 
-// TODO: comeback here later to apply the same improvements on select
+/// Translates an INSERT into a virtual table. Each row is passed to the module's
+/// xUpdate through `VUpdate`. As in SQLite, RETURNING is computed before the
+/// row is written, the way a BEFORE trigger sees it.
+#[allow(clippy::too_many_arguments)]
 fn translate_virtual_table_insert(
     program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
     virtual_table: Arc<VirtualTable>,
+    table_name: &str,
+    namespace: NamespaceRef,
     columns: Vec<ast::Name>,
     mut body: InsertBody,
+    mut returning: Vec<ResultColumn>,
+    with_for_returning: Option<With>,
     on_conflict: Option<ResolveType>,
-    resolver: &Resolver,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    #[cfg(not(feature = "cli_only"))]
-    let _ = connection;
     let allow_dbpage_write = {
         #[cfg(feature = "cli_only")]
         {
@@ -3547,7 +3556,63 @@ fn translate_virtual_table_insert(
         _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
     };
     let table = Table::Virtual(virtual_table.clone());
-    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
+    let (table_references, result_columns, mut returning_subqueries) = plan_insert_returning(
+        program,
+        resolver,
+        &table,
+        table_name,
+        namespace,
+        &mut returning,
+        &[],
+        with_for_returning,
+        connection,
+    )?;
+    let reads_columns = roles::reads_columns_of(
+        table_references.joined_tables()[0].internal_id,
+        result_columns.iter().map(|column| &column.expr),
+        &returning_subqueries,
+    )?;
+    check_upsert_privileges(&table_references, &[], reads_columns, resolver, connection)?;
+
+    // Ephemeral tables are declared with a B-tree table. This one has the
+    // columns of the virtual table.
+    let ephemeral_table = || -> Result<Arc<BTreeTable>> {
+        Ok(Arc::new(BTreeTable::new(
+            0,
+            virtual_table.name.clone(),
+            crate::alloc::vec![],
+            virtual_table.columns.try_to_vec()?,
+            schema::BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        )))
+    };
+    let returning_buffer = if result_columns.is_empty() {
+        None
+    } else {
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table()?));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: true,
+        });
+        Some(ReturningBufferCtx {
+            cursor_id,
+            num_columns: result_columns.len(),
+        })
+    };
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        resolver,
+        &mut returning_subqueries,
+        &[],
+        Some(&table_references),
+        EvalAt::BeforeLoop,
+        |_| true,
+    )?;
+
+    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table.clone()));
     program.emit_insn(Insn::VOpen { cursor_id });
     if !allow_dbpage_write {
         program.emit_insn(Insn::VBegin { cursor_id });
@@ -3568,8 +3633,67 @@ fn translate_virtual_table_insert(
     let insertion = build_insertion(program, &table, &columns, num_values, true)?;
 
     translate_rows_single(program, &value, &insertion, resolver, false)?;
-    let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
 
+    // Like SQLite, RETURNING reads a copy of the row with column affinity
+    // applied and with -1 as the rowid when none was given, and leaves the
+    // registers passed to VUpdate as they are.
+    if !result_columns.is_empty() {
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: insertion.key_register(),
+            dst_reg: rowid_reg,
+            extra_amount: 0,
+        });
+        let rowid_ready = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: rowid_reg,
+            target_pc: rowid_ready,
+        });
+        program.emit_insn(Insn::Integer {
+            value: -1,
+            dest: rowid_reg,
+        });
+        program.preassign_label_to_next_insn(rowid_ready);
+        program.emit_insn(Insn::MustBeInt {
+            reg: rowid_reg,
+            target_pc: None,
+        });
+
+        let num_columns = insertion.col_mappings.len();
+        let columns_start_reg = program.alloc_registers(num_columns);
+        if let Some(count) = NonZeroUsize::new(num_columns) {
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.first_col_register(),
+                dst_reg: columns_start_reg,
+                extra_amount: count.get() - 1,
+            });
+            program.emit_insn(Insn::Affinity {
+                start_reg: columns_start_reg,
+                count,
+                affinities: insertion
+                    .col_mappings
+                    .iter()
+                    .map(|col_mapping| col_mapping.column.affinity().aff_mask())
+                    .collect(),
+            });
+        }
+
+        emit_insert_returning_row(
+            program,
+            resolver,
+            &table_references,
+            &result_columns,
+            &mut returning_subqueries,
+            columns_start_reg,
+            rowid_reg,
+            returning_buffer.as_ref(),
+            &ColumnLayout::Identity {
+                column_count: num_columns,
+            },
+        )?;
+    }
+
+    let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
     program.emit_insn(Insn::VUpdate {
         cursor_id,
         arg_count: insertion.col_mappings.len() + 2, // +1 for NULL, +1 for rowid
@@ -3578,10 +3702,15 @@ fn translate_virtual_table_insert(
     });
 
     program.emit_insn(Insn::Close { cursor_id });
+    if let Some(buf) = &returning_buffer {
+        emit_returning_scan_back(program, buf);
+    }
 
     let halt_label = program.allocate_label();
     program.preassign_label_to_next_insn(halt_label);
 
+    program.result_columns = result_columns;
+    program.table_references.extend(table_references);
     Ok(())
 }
 
