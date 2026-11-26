@@ -21,6 +21,7 @@ use quickcheck_macros::quickcheck;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::sync::Arc;
+use strum::IntoEnumIterator;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
@@ -4156,4 +4157,569 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+/// What this test checks: after an exact seek, `exists()`, an insert at another key or a change
+/// of direction, `next()` and `prev()` return the rows next to the current row.
+/// Why this matters: the cursor merges B-tree rows (10, 30, 50 here) with MVCC rows (20, 40
+/// here) and keeps one candidate row per source. After these operations the candidates are not
+/// the neighbours of the current row, so a step that uses them skips or repeats rows. Each
+/// scenario also runs with a yield at every cursor yield point, so a step that must seek past
+/// the current row resumes that seek after I/O.
+#[test]
+fn test_cursor_steps_after_repositioning() {
+    use crate::types::SeekOp;
+    use CursorKind::*;
+    use CursorStep::*;
+    const GE_EXACT: SeekOp = SeekOp::GE { eq_only: true };
+    const LE_EXACT: SeekOp = SeekOp::LE { eq_only: true };
+    const GE_RANGE: SeekOp = SeekOp::GE { eq_only: false };
+    const ALL: &[CursorKind] = &[Table, Index, UniqueIndexByPrefix];
+    // The expected string has the rowid of the cursor after each step, or `-` when the cursor
+    // is on no row.
+    #[rustfmt::skip]
+    let scenarios: &[(&str, &[CursorKind], &[CursorStep], &str)] = &[
+        ("exact seek on an MVCC row, then next", ALL,
+            &[Seek(20, GE_EXACT), Next, Next, Next, Next], "20 30 40 50 -"),
+        ("exact seek on an MVCC row, then prev", ALL,
+            &[Seek(40, LE_EXACT), Prev, Prev, Prev, Prev], "40 30 20 10 -"),
+        ("exact seek on a B-tree row, then next", ALL,
+            &[Seek(30, GE_EXACT), Next, Next, Next], "30 40 50 -"),
+        ("exact seek on a B-tree row, then prev", ALL,
+            &[Seek(30, LE_EXACT), Prev, Prev, Prev], "30 20 10 -"),
+        ("exists on an MVCC row, then next", &[Table],
+            &[Exists(20), Next, Next, Next, Next], "20 30 40 50 -"),
+        ("exists on a B-tree row, then prev", &[Table],
+            &[Exists(50), Prev, Prev, Prev, Prev, Prev], "50 40 30 20 10 -"),
+        // rewind() leaves candidates for next(). exists() must drop them.
+        ("rewind, exists, then next", &[Table],
+            &[Rewind, Exists(40), Next, Next], "10 40 50 -"),
+        ("insert at another key, then next", ALL,
+            &[Seek(10, GE_RANGE), Insert(35), Next, Next, Next], "10 35 40 50 -"),
+        ("range seek, next, then prev", ALL,
+            &[Seek(30, GE_RANGE), Next, Prev], "30 40 30"),
+        ("last, prev, then next", ALL,
+            &[Last, Prev, Prev, Next], "50 40 30 40"),
+        ("exact seek miss, insert, then next", ALL,
+            &[Seek(25, GE_EXACT), Prev, Insert(25), Next], "- - 25 30"),
+        ("exact seek miss after all rows, insert, then prev", ALL,
+            &[Seek(60, LE_EXACT), Next, Insert(60), Prev], "- - 60 50"),
+    ];
+    let mut failures = Vec::new();
+    for &(name, kinds, steps, expected) in scenarios {
+        for &kind in kinds {
+            for yields in [false, true] {
+                let actual = run_cursor_steps(kind, steps, yields);
+                if actual != expected {
+                    failures.push(format!(
+                        "{name} ({kind:?}, yields={yields}): got `{actual}`, want `{expected}`"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// What this test checks: a step after a lookup examines a bounded number of raw entries, even
+/// when one source holds many entries that the transaction cannot see.
+/// Why this matters: the cursor merges B-tree rows with MVCC rows. If each source scans on its
+/// own to the first visible row, it walks past the row that wins the merge. An equality probe
+/// in a join then costs time in proportion to the hidden rows, for each probe. The test hides
+/// rows in two ways: uncommitted rows of another transaction (in the MvStore), and B-tree rows
+/// that this transaction deleted (in the B-tree), each past a nearby row of the other source.
+#[test]
+fn test_cursor_steps_examine_bounded_entries() {
+    use crate::types::SeekOp;
+    use CursorKind::*;
+    use CursorStep::*;
+    const GE_EXACT: SeekOp = SeekOp::GE { eq_only: true };
+    const LE_EXACT: SeekOp = SeekOp::LE { eq_only: true };
+    const GE_RANGE: SeekOp = SeekOp::GE { eq_only: false };
+    const LE_RANGE: SeekOp = SeekOp::LE { eq_only: false };
+    // The most raw entries that one lookup and one step may examine, with both sources.
+    const LIMIT: u64 = 6;
+
+    struct Scenario {
+        name: &'static str,
+        /// B-tree rows that stay visible.
+        btree: Vec<i64>,
+        /// MVCC rows of the cursor's transaction that stay visible.
+        mvcc: Vec<i64>,
+        /// B-tree rows that the cursor's transaction deletes.
+        deleted: Vec<i64>,
+        /// MvStore rows of another transaction that did not commit.
+        hidden: Vec<i64>,
+        steps: Vec<CursorStep>,
+        expected: &'static str,
+    }
+    let scenarios = |hidden_count: i64| -> Vec<Scenario> {
+        let far_above = 1000..1000 + hidden_count;
+        let far_below = 1..=hidden_count;
+        vec![
+            Scenario {
+                name: "forwards, exact seek on a B-tree row, hidden MvStore rows above",
+                btree: (1..=10).collect(),
+                mvcc: vec![],
+                deleted: vec![],
+                hidden: far_above.clone().collect(),
+                steps: vec![Seek(5, GE_EXACT), Next, Next],
+                expected: "5 6 7",
+            },
+            Scenario {
+                name: "forwards, range seek on a B-tree row, hidden MvStore rows above",
+                btree: (1..=10).collect(),
+                mvcc: vec![],
+                deleted: vec![],
+                hidden: far_above.clone().collect(),
+                steps: vec![Seek(5, GE_RANGE), Next, Next],
+                expected: "5 6 7",
+            },
+            Scenario {
+                name: "backwards, exact seek on a B-tree row, hidden MvStore rows below",
+                btree: (2001..=2010).collect(),
+                mvcc: vec![],
+                deleted: vec![],
+                hidden: far_below.clone().collect(),
+                steps: vec![Seek(2005, LE_EXACT), Prev, Prev],
+                expected: "2005 2004 2003",
+            },
+            Scenario {
+                name: "backwards, range seek on a B-tree row, hidden MvStore rows below",
+                btree: (2001..=2010).collect(),
+                mvcc: vec![],
+                deleted: vec![],
+                hidden: far_below.clone().collect(),
+                steps: vec![Seek(2005, LE_RANGE), Prev, Prev],
+                expected: "2005 2004 2003",
+            },
+            Scenario {
+                name: "forwards, deleted B-tree rows above an MVCC row",
+                btree: vec![10],
+                mvcc: vec![11],
+                deleted: far_above.clone().collect(),
+                hidden: vec![],
+                steps: vec![Seek(10, GE_EXACT), Next],
+                expected: "10 11",
+            },
+            Scenario {
+                name: "forwards from rewind, deleted B-tree rows above an MVCC row",
+                btree: vec![10],
+                mvcc: vec![11],
+                deleted: far_above.collect(),
+                hidden: vec![],
+                steps: vec![Rewind, Next],
+                expected: "10 11",
+            },
+            Scenario {
+                name: "backwards, deleted B-tree rows below an MVCC row",
+                btree: vec![2000],
+                mvcc: vec![1999],
+                deleted: far_below.clone().collect(),
+                hidden: vec![],
+                steps: vec![Seek(2000, LE_EXACT), Prev],
+                expected: "2000 1999",
+            },
+            Scenario {
+                name: "backwards from last, deleted B-tree rows below an MVCC row",
+                btree: vec![2000],
+                mvcc: vec![1999],
+                deleted: far_below.collect(),
+                hidden: vec![],
+                steps: vec![Last, Prev],
+                expected: "2000 1999",
+            },
+        ]
+    };
+    let mut failures = Vec::new();
+    for hidden_count in [50, 400] {
+        for scenario in scenarios(hidden_count) {
+            for kind in [Table, Index] {
+                let mut btree = scenario.btree.clone();
+                btree.extend(&scenario.deleted);
+                let fixture = CursorTestFixture::with_rows(kind, &btree, &scenario.mvcc);
+                let mut cursor = fixture.cursor();
+                for &id in &scenario.deleted {
+                    apply_cursor_step(&fixture, &mut cursor, Seek(id, GE_EXACT));
+                    apply_cursor_step(&fixture, &mut cursor, Delete);
+                }
+                drop(cursor);
+                let other = fixture.begin_other_tx();
+                other.insert(&fixture, &scenario.hidden);
+
+                let mut cursor = fixture.cursor();
+                let (mvcc_before, btree_before) = fixture.db.mvcc_store.examined_entries();
+                let trace = scenario
+                    .steps
+                    .iter()
+                    .map(|&step| apply_cursor_step(&fixture, &mut cursor, step))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let (mvcc_after, btree_after) = fixture.db.mvcc_store.examined_entries();
+                let (mvcc, btree) = (mvcc_after - mvcc_before, btree_after - btree_before);
+                drop(cursor);
+                other.rollback(&fixture);
+                fixture.rollback();
+
+                let name = scenario.name;
+                if trace != scenario.expected {
+                    failures.push(format!(
+                        "{name} ({kind:?}, {hidden_count} hidden): got `{trace}`, want `{}`",
+                        scenario.expected
+                    ));
+                }
+                if mvcc + btree > LIMIT {
+                    failures.push(format!(
+                        "{name} ({kind:?}, {hidden_count} hidden): examined {mvcc} MvStore \
+                         entries and {btree} B-tree rows, want at most {LIMIT} in all"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The cursor that a [`CursorStep`] scenario runs on.
+#[derive(Clone, Copy, Debug)]
+enum CursorKind {
+    Table,
+    Index,
+    /// A UNIQUE index. Seeks use the indexed column without the rowid, which also names
+    /// one row.
+    UniqueIndexByPrefix,
+}
+
+/// An operation on the cursor. Each value is a rowid. In an index, the key of row `id` is
+/// `(id, id)`.
+#[derive(Clone, Copy, Debug)]
+enum CursorStep {
+    Seek(i64, crate::types::SeekOp),
+    Exists(i64),
+    Insert(i64),
+    Delete,
+    Next,
+    Prev,
+    Rewind,
+    Last,
+}
+
+/// Runs `steps` on a new cursor and returns the rowid after each step, or `-` when the cursor
+/// is on no row.
+fn run_cursor_steps(kind: CursorKind, steps: &[CursorStep], yields: bool) -> String {
+    let fixture = CursorTestFixture::new(kind);
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let trace = with_cursor_yields(conn, yields, || {
+        let mut trace = Vec::new();
+        for &step in steps {
+            trace.push(apply_cursor_step(&fixture, &mut cursor, step));
+        }
+        trace.join(" ")
+    });
+    drop(cursor);
+    fixture.rollback();
+    trace
+}
+
+/// Applies `step` and returns the rowid of the cursor after it, or `-` when the cursor is on
+/// no row.
+fn apply_cursor_step(
+    fixture: &CursorTestFixture,
+    cursor: &mut crate::MvCursor,
+    step: CursorStep,
+) -> String {
+    use crate::types::SeekKey;
+
+    let io = &fixture.db.conn.db.io;
+    match step {
+        CursorStep::Seek(id, op) => {
+            let probe = fixture.probe(id);
+            let key = match &probe {
+                Some(record) => SeekKey::IndexKey(record.as_record_ref()),
+                None => SeekKey::TableRowId(id),
+            };
+            io.block(|| cursor.seek(key.clone(), op)).unwrap();
+        }
+        CursorStep::Exists(id) => {
+            assert!(io.block(|| cursor.exists(&Value::from_i64(id))).unwrap());
+        }
+        CursorStep::Insert(id) => {
+            let record = fixture.record(id);
+            let key = fixture.btree_key(id, &record);
+            io.block(|| cursor.insert(&key)).unwrap();
+        }
+        CursorStep::Delete => io.block(|| cursor.delete()).unwrap(),
+        CursorStep::Next => io.block(|| cursor.next()).unwrap(),
+        CursorStep::Prev => io.block(|| cursor.prev()).unwrap(),
+        CursorStep::Rewind => io.block(|| cursor.rewind()).unwrap(),
+        CursorStep::Last => io.block(|| cursor.last()).unwrap(),
+    }
+    let rowid = io.block(|| cursor.rowid()).unwrap();
+    rowid.map_or_else(|| "-".to_string(), |id| id.to_string())
+}
+
+/// Runs `steps`, with every cursor step yielding once before it finishes when `yields` is
+/// set.
+fn with_cursor_yields<T>(conn: &Arc<Connection>, yields: bool, steps: impl FnOnce() -> T) -> T {
+    if yields {
+        conn.set_yield_injector(Some(Arc::new(YieldAtEveryCursorPoint::default())));
+    }
+    let result = steps();
+    if yields {
+        conn.set_yield_injector(None);
+    }
+    result
+}
+
+/// Yields at every cursor yield point, so each cursor step returns to the caller before it
+/// finishes and must resume from its saved state. A point that just yielded does not yield
+/// again on its next hit: a yield point only carries an ordinal and a count, so it can also
+/// match a hook of another family that runs again before doing any work when its operation
+/// resumes.
+#[derive(Debug, Default)]
+struct YieldAtEveryCursorPoint {
+    last_yield: Mutex<Option<YieldPoint>>,
+}
+
+impl YieldInjector for YieldAtEveryCursorPoint {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if !CursorYieldPoint::iter().any(|p| p.point() == point) {
+            return false;
+        }
+        let mut last_yield = self.last_yield.lock();
+        if *last_yield == Some(point) {
+            *last_yield = None;
+            return false;
+        }
+        *last_yield = Some(point);
+        true
+    }
+}
+
+/// A table or index B-tree with rows 10, 30 and 50, and an open MVCC transaction that has
+/// inserted rows 20 and 40. Every row stores its rowid as its value.
+struct CursorTestFixture {
+    db: MvccTestDb,
+    kind: CursorKind,
+    table_id: MVTableId,
+    root_page: i64,
+    index: Option<crate::schema::Index>,
+    tx_id: TxID,
+}
+
+impl CursorTestFixture {
+    fn new(kind: CursorKind) -> Self {
+        Self::with_rows(kind, &[10, 30, 50], &[20, 40])
+    }
+
+    /// A fixture with the B-tree rows `btree_ids` and the MVCC rows `mvcc_ids`.
+    fn with_rows(kind: CursorKind, btree_ids: &[i64], mvcc_ids: &[i64]) -> Self {
+        use crate::storage::{pager::CreateBTreeFlags, wal::WalAutoActions};
+        use crate::types::{SeekKey, SeekOp};
+
+        let index = match kind {
+            CursorKind::Table => None,
+            CursorKind::Index => Some(cursor_test_index(false)),
+            CursorKind::UniqueIndexByPrefix => Some(cursor_test_index(true)),
+        };
+        let db = MvccTestDb::new();
+        let pager = db.conn.pager.load().clone();
+        let io = &pager.io;
+        pager.begin_read_tx().unwrap();
+        io.block(|| pager.begin_write_tx(WalAutoActions::all_enabled()))
+            .unwrap();
+        let flags = if index.is_some() {
+            CreateBTreeFlags::new_index()
+        } else {
+            CreateBTreeFlags::new_table()
+        };
+        let root_page = io.block(|| pager.btree_create(&flags)).unwrap() as i64;
+        let mut btree = Self::btree_cursor(pager.clone(), root_page, index.as_ref());
+        for &id in btree_ids {
+            let record = Self::record_for(index.is_some(), id);
+            let key = Self::btree_key_for(index.is_some(), id, &record);
+            let seek_key = match &key {
+                BTreeKey::IndexKey(record) => SeekKey::IndexKey(record.clone()),
+                BTreeKey::TableRowId((rowid, _)) => SeekKey::TableRowId(*rowid),
+            };
+            let result = io
+                .block(|| btree.seek(seek_key.clone(), SeekOp::GE { eq_only: true }))
+                .unwrap();
+            if matches!(result, SeekResult::TryAdvance) {
+                io.block(|| btree.next()).unwrap();
+            }
+            io.block(|| btree.insert(&key)).unwrap();
+        }
+        drop(btree);
+        io.block(|| pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true))
+            .unwrap();
+
+        let table_id = new_uncheckpointed_table_id(&db);
+        db.mvcc_store
+            .insert_table_id_to_rootpage(table_id, Some(root_page as u64));
+        pager.begin_read_tx().unwrap();
+        let tx_id = db.mvcc_store.begin_tx(pager).unwrap();
+        let fixture = Self {
+            db,
+            kind,
+            table_id,
+            root_page,
+            index,
+            tx_id,
+        };
+        let mut cursor = fixture.cursor();
+        for &id in mvcc_ids {
+            let record = fixture.record(id);
+            let key = fixture.btree_key(id, &record);
+            fixture.db.db.io.block(|| cursor.insert(&key)).unwrap();
+        }
+        drop(cursor);
+        fixture
+    }
+
+    fn cursor(&self) -> crate::MvCursor {
+        self.cursor_of(&self.db.conn, self.tx_id)
+    }
+
+    /// A cursor on the table or index that reads in transaction `tx_id` of `conn`.
+    fn cursor_of(&self, conn: &Arc<Connection>, tx_id: TxID) -> crate::MvCursor {
+        let cursor_type = match &self.index {
+            Some(index) => {
+                MvccCursorType::Index(Arc::new(IndexInfo::new_from_index(index).unwrap()))
+            }
+            None => MvccCursorType::Table,
+        };
+        let btree = Self::btree_cursor(
+            conn.pager.load().clone(),
+            self.root_page,
+            self.index.as_ref(),
+        );
+        MvccLazyCursor::new(
+            self.db.mvcc_store.clone(),
+            conn,
+            tx_id,
+            i64::from(self.table_id),
+            cursor_type,
+            Box::new(btree),
+        )
+        .unwrap()
+    }
+
+    /// The seek key for row `id` in an index, or `None` in a table.
+    fn probe(&self, id: i64) -> Option<ImmutableRecord> {
+        let values = [Value::from_i64(id), Value::from_i64(id)];
+        let columns = match self.kind {
+            CursorKind::Table => return None,
+            CursorKind::Index => 2,
+            CursorKind::UniqueIndexByPrefix => 1,
+        };
+        Some(ImmutableRecord::from_values(&values[..columns], columns).unwrap())
+    }
+
+    fn record(&self, id: i64) -> ImmutableRecord {
+        Self::record_for(self.index.is_some(), id)
+    }
+
+    fn btree_key<'a>(&self, id: i64, record: &'a ImmutableRecord) -> BTreeKey<'a> {
+        Self::btree_key_for(self.index.is_some(), id, record)
+    }
+
+    /// Begins another transaction, as another connection does.
+    fn begin_other_tx(&self) -> OtherTx {
+        let conn = self
+            .db
+            .db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let pager = conn.pager.load().clone();
+        pager.begin_read_tx().unwrap();
+        let tx_id = self.db.mvcc_store.begin_tx(pager).unwrap();
+        OtherTx { conn, tx_id }
+    }
+
+    fn rollback(&self) {
+        let pager = self.db.conn.pager.load().clone();
+        self.db
+            .mvcc_store
+            .rollback_tx(self.tx_id, pager.clone(), &self.db.conn, crate::MAIN_DB_ID);
+        pager.end_read_tx();
+    }
+
+    fn record_for(index: bool, id: i64) -> ImmutableRecord {
+        let values = if index {
+            [Value::from_i64(id), Value::from_i64(id)]
+        } else {
+            [Value::Null, Value::from_i64(id)]
+        };
+        ImmutableRecord::from_values(&values, values.len()).unwrap()
+    }
+
+    fn btree_key_for(index: bool, id: i64, record: &ImmutableRecord) -> BTreeKey<'_> {
+        if index {
+            BTreeKey::IndexKey(record.as_record_ref())
+        } else {
+            BTreeKey::TableRowId((id, Some(record)))
+        }
+    }
+
+    fn btree_cursor(
+        pager: Arc<Pager>,
+        root_page: i64,
+        index: Option<&crate::schema::Index>,
+    ) -> BTreeCursor {
+        match index {
+            Some(index) => {
+                BTreeCursor::new_index(pager, root_page, index, index.columns.len()).unwrap()
+            }
+            None => BTreeCursor::new(pager, root_page, 2),
+        }
+    }
+}
+
+/// A transaction of another connection, to write rows that the fixture's transaction cannot see.
+struct OtherTx {
+    conn: Arc<Connection>,
+    tx_id: TxID,
+}
+
+impl OtherTx {
+    /// Inserts the rows `ids` and leaves the transaction open.
+    fn insert(&self, fixture: &CursorTestFixture, ids: &[i64]) {
+        let mut cursor = fixture.cursor_of(&self.conn, self.tx_id);
+        for &id in ids {
+            let record = fixture.record(id);
+            let key = fixture.btree_key(id, &record);
+            fixture.db.db.io.block(|| cursor.insert(&key)).unwrap();
+        }
+    }
+
+    fn rollback(&self, fixture: &CursorTestFixture) {
+        let pager = self.conn.pager.load().clone();
+        fixture
+            .db
+            .mvcc_store
+            .rollback_tx(self.tx_id, pager.clone(), &self.conn, crate::MAIN_DB_ID);
+        pager.end_read_tx();
+    }
+}
+
+/// An index on the value column of a [`CursorTestFixture`] table.
+fn cursor_test_index(unique: bool) -> crate::schema::Index {
+    crate::schema::Index {
+        name: "test_index".to_string(),
+        table_name: "test".to_string(),
+        root_page: 0,
+        columns: [IndexColumn::new("v", 1, CollationSeq::BINARY)]
+            .into_iter()
+            .try_collect()
+            .unwrap(),
+        unique,
+        ephemeral: false,
+        has_rowid: true,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+        constraint_name: None,
+    }
 }

@@ -1,5 +1,7 @@
 mod checkpoint;
 mod concurrent_inserts;
+#[cfg(debug_assertions)]
+mod cursor_merge;
 mod database;
 mod group_commit;
 mod hermitage;
