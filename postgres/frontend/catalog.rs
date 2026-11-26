@@ -947,6 +947,44 @@ impl SnapshotRows for PgClassTable {
             ]);
         }
 
+        for rule in view_rules(&schema) {
+            rows.push(vec![
+                Value::from_i64(rule.view_oid),
+                Value::build_text(rule.view.name.clone()),
+                Value::from_i64(namespace_oid(&schema, rule.namespace)),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(relation_owner_oid(&schema, rule.namespace, &rule.view.name)),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_f64(0.0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::build_text("p"),
+                Value::build_text("v"),
+                Value::from_i64(rule.view.columns.len() as i64),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::build_text("n"),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                relation_acl(conn, &schema, rule.namespace, &rule.view.name),
+                Value::Null,
+                Value::Null,
+            ]);
+        }
+
         rows
     }
 }
@@ -2815,7 +2853,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_rewrite",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
+        SnapshotCatalog::<PgRewriteTable>(PhantomData),
     );
     options = options.native_module(
         "pg_foreign_table",
@@ -3545,9 +3583,38 @@ pub(crate) fn relation_dependents(
 /// Fixed PostgreSQL OID of pg_rewrite, which has the rewrite rules of views.
 const PG_REWRITE_OID: i64 = 2618;
 
-/// The `_RETURN` rule of a view, which pg_depend describes. pg_rewrite does
-/// not list the rules while pg_class does not list the views: pg_dump stops
-/// at a rule whose view it cannot find.
+#[derive(Debug)]
+struct PgRewriteTable;
+
+impl SnapshotRows for PgRewriteTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead BOOLEAN, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)";
+    const TABLE_OID: Option<i64> = Some(PG_REWRITE_OID);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 10;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        // FIXME(pg-rewrite): PostgreSQL's _RETURN is an enabled INSTEAD
+        // SELECT rule with no qualification (<>). The action is SQL here;
+        // a PostgreSQL query-tree representation would replace it.
+        view_rules(&conn.current_schema())
+            .into_iter()
+            .map(|rule| {
+                vec![
+                    Value::from_i64(rule.oid),
+                    Value::build_text("_RETURN"),
+                    Value::from_i64(rule.view_oid),
+                    Value::build_text("1"),
+                    Value::build_text("O"),
+                    Value::from_i64(1),
+                    Value::build_text("<>"),
+                    Value::build_text(rule.view.select_stmt.to_string()),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// The `_RETURN` rule of a view, also described by pg_depend.
 struct ViewRule<'a> {
     oid: i64,
     view_oid: i64,

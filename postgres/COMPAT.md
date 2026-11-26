@@ -89,7 +89,7 @@ The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_database`, `pg_roles` (built-in `postgres` superuser and `pg_database_owner`, and roles from `CREATE ROLE`), `pg_auth_members` (memberships from `GRANT role TO role`), `pg_proc`, `pg_am`,
 `pg_policy` (row-level security policies, with `polqual` and `polwithcheck`
 as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Present but
-always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
+always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
 `pg_description` is a stored table. It has the comments that `COMMENT ON`
@@ -100,8 +100,9 @@ relation, a column or a schema deletes its comments. The public schema reports
 for PUBLIC. These are catalog defaults; role management is not implemented.
 `pg_depend` has the rows of each view's `_RETURN` rule: the rule is part of
 the view, and depends on each table and view that the view reads, as whole
-relations and not column by column. The rule is not in `pg_rewrite` and the
-view is not in `pg_class`. DROP reads these rows to find the views that depend
+relations and not column by column. The rule is in `pg_rewrite` and the
+view is in `pg_class` with `relhasrules` set. The rule action is SQL text,
+not a PostgreSQL query tree. DROP reads these rows to find the views that depend
 on what it drops.
 `pg_operator` has the rows of PostgreSQL 18, with PostgreSQL's oids, for the
 operators `=`, `<>`, `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/`, `%`, `&`, `|`,

@@ -263,16 +263,12 @@ expect @tursopg {
 
 # E-20: view in pg_class relkind v
 @setup t_id_view_v
-@compat-gap "syntax:catalog"
 test view-in-pg-class-relkind-v {
     SELECT relname, relkind FROM pg_class WHERE relname IN ('t', 'v') ORDER BY relname;
 }
 expect {
     t|r
     v|v
-}
-expect @tursopg {
-    t|r
 }
 
 # E-21: pg_views

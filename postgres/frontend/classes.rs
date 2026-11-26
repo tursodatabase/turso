@@ -683,6 +683,7 @@ impl Catalog for PostgresCatalog {
                             kind: RelationKind::Index,
                             table: Some(index.table),
                             indexed_table: IndexedTable::Oid(table_oid),
+                            natts: 0,
                         },
                     )?;
                 }
@@ -731,6 +732,13 @@ impl Catalog for PostgresCatalog {
                         program,
                         NewRelation {
                             name: view.written_name.as_str(),
+                            natts: turso_core::schema::view::extract_view_columns(
+                                view.namespace,
+                                view.select,
+                                ctx.schema,
+                            )?
+                            .columns
+                            .len(),
                             ..NewRelation::of_relation(
                                 view.namespace,
                                 view.name,
@@ -875,6 +883,7 @@ struct NewRelation<'a> {
     /// The table whose owner owns the relation, for an index.
     table: Option<&'a str>,
     indexed_table: IndexedTable,
+    natts: usize,
 }
 
 impl<'a> NewRelation<'a> {
@@ -888,6 +897,7 @@ impl<'a> NewRelation<'a> {
             kind,
             table: None,
             indexed_table: IndexedTable::None,
+            natts: if kind == RelationKind::Sequence { 3 } else { 0 },
         }
     }
 }
@@ -939,6 +949,7 @@ fn emit_new_table_rows(
                 kind: RelationKind::Index,
                 table: Some(table.name),
                 indexed_table: IndexedTable::Register(table_oid_reg),
+                natts: 0,
             },
         )?;
         Ok(())
@@ -1846,7 +1857,7 @@ enum ClassValue {
 /// has no row-level security and no policies.
 fn new_class_values(new: &NewRelation<'_>, owner: RoleId) -> Vec<ClassValue> {
     let (name, namespace, kind) = (new.name, new.namespace, new.kind);
-    let (access_method, replica_identity, reltuples, relnatts) = match kind {
+    let (access_method, replica_identity, reltuples, _relnatts) = match kind {
         RelationKind::Table | RelationKind::MaterializedView => (2, "d", 0.0, 0),
         RelationKind::Index => (403, "d", 0.0, 0),
         RelationKind::Sequence => (0, "n", 1.0, 3),
@@ -1876,9 +1887,14 @@ fn new_class_values(new: &NewRelation<'_>, owner: RoleId) -> Vec<ClassValue> {
         "relkind",
         ClassValue::Text(relkind_letter(kind).to_string()),
     );
-    set("relnatts", ClassValue::Int(relnatts));
+    set("relnatts", ClassValue::Int(new.natts as i64));
     set("relchecks", ClassValue::Int(0));
-    set("relhasrules", ClassValue::Int(0));
+    // FIXME(pg-rewrite): PostgreSQL gives views an INSTEAD SELECT _RETURN
+    // rule. A stored rule catalog should supply this flag.
+    set(
+        "relhasrules",
+        ClassValue::Int(i64::from(kind == RelationKind::View)),
+    );
     set("relhastriggers", ClassValue::Int(0));
     set("relhassubclass", ClassValue::Int(0));
     set("relrowsecurity", ClassValue::Int(0));

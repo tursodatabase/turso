@@ -709,7 +709,7 @@ fn every_new_class_row_has_all_the_columns_of_pg_class(db: TempDatabase) {
     let table = "0,0,2,0,0,1,0,0,0,0,0,p,r,0,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
     let index = "0,0,403,0,0,1,0,0,0,0,0,p,i,0,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
     let sequence = "0,0,0,0,0,1,1,0,0,0,0,p,S,3,0,0,0,0,0,1,n,0,0,0,0,NULL,NULL";
-    let view = "0,0,0,0,0,1,0,0,0,0,0,p,v,0,0,0,0,0,0,1,n,0,0,0,0,NULL,NULL";
+    let view = "0,0,0,0,0,1,0,0,0,0,0,p,v,1,0,1,0,0,0,1,n,0,0,0,0,NULL,NULL";
     assert_eq!(stored_pg_class_columns(&conn, "t"), table);
     assert_eq!(stored_pg_class_columns(&conn, "t_x"), index);
     assert_eq!(stored_pg_class_columns(&conn, "t_id_seq"), sequence);
@@ -1180,6 +1180,33 @@ fn quoted_relation_names_survive_catalog_updates(db: TempDatabase) {
     assert_eq!(class_row(pg.inner(), "NewName").unwrap().0, oid);
     pg.inner().force_reparse_schema_without_publish().unwrap();
     assert_eq!(class_row(pg.inner(), "NewName").unwrap().0, oid);
+}
+
+#[turso_macros::test(mvcc)]
+fn views_have_class_rows_and_return_rules(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE t (a int, b text)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+    let rows = pg.prepare("SELECT c.relkind, c.relnatts, c.relhasrules, r.rulename, r.ev_type, r.ev_enabled, r.is_instead FROM pg_class c JOIN pg_rewrite r ON r.ev_class = c.oid WHERE c.relname = 'v'").unwrap().run_collect_rows().unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::build_text("v"),
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::build_text("_RETURN"),
+            Value::build_text("1"),
+            Value::build_text("O"),
+            Value::from_i64(1)
+        ]]
+    );
+    pg.execute("DROP VIEW v").unwrap();
+    assert!(pg
+        .prepare("SELECT * FROM pg_rewrite")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .is_empty());
 }
 
 #[turso_macros::test(mvcc)]
