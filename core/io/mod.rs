@@ -150,6 +150,13 @@ pub trait SharedWalMappedRegion: Send + Sync {
     }
 }
 
+/// A file that IO is done on.
+///
+/// The IO methods take a completion and return it once the IO has started.
+/// When one returns `Err`, the IO did not start and the implementation may
+/// leave the completion unfinished; the caller owns it and must finish it if
+/// anything else can wait on it. [`start_in_group`] does this for
+/// completions in a [`CompletionGroup`].
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
@@ -664,10 +671,9 @@ impl<'a> WriteBatch<'a> {
                     "pwritev wrote {bytes_written} bytes, expected {total_len}"
                 );
             });
-            if let Some(group) = group.as_deref_mut() {
-                group.add(&c);
-            }
-            completions.push(self.file.pwritev(pos, bufs.to_vec(), c)?);
+            completions.push(start_in_group(group.as_deref_mut(), c, |c| {
+                self.file.pwritev(pos, bufs.to_vec(), c)
+            })?);
         }
         Ok(completions)
     }
