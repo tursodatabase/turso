@@ -1128,7 +1128,7 @@ fn add_aggregate_if_not_exists(
 
 /// Maps a normalized function name to the ordered-set [`AggFunc`] it implements, if any.
 /// Ordered-set aggregates are written `f(direct_args) WITHIN GROUP (ORDER BY x)`.
-fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
+pub(crate) fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
     match normalized_name {
         "mode" => Some(AggFunc::Mode),
         "percentile_cont" => Some(AggFunc::PercentileCont),

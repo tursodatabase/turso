@@ -512,6 +512,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         false,
                         &resolver.catalog,
                     )?;
+                    check_function_exists(name.as_str(), 0, resolver)?;
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
@@ -587,6 +588,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     args,
                     filter_over,
                     order_by,
+                    within_group,
                     ..
                 } => {
                     validate_function_tail(
@@ -597,6 +599,15 @@ pub fn bind_and_rewrite_expr<'a>(
                         &resolver.catalog,
                     )?;
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
+                    // Ordered-set aggregates are checked where they are planned.
+                    if within_group.is_empty()
+                        && crate::translate::planner::ordered_set_agg_func(&normalize_ident(
+                            name.as_str(),
+                        ))
+                        .is_none()
+                    {
+                        check_function_exists(name.as_str(), args.len(), resolver)?;
+                    }
                 }
                 // INSERT replaces a DEFAULT in VALUES with the column's default
                 // before binding, so any DEFAULT left is misplaced.
@@ -609,6 +620,16 @@ pub fn bind_and_rewrite_expr<'a>(
         },
     )?;
     check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
+}
+
+/// Like SQLite's name resolution, fails when no function `name` takes `arg_count`
+/// arguments. Checked here rather than only in code generation because some terms
+/// get no code, such as `nosuchfn(a)` in `WHERE 1 OR nosuchfn(a)`.
+fn check_function_exists(name: &str, arg_count: usize, resolver: &Resolver<'_>) -> Result<()> {
+    if resolver.resolve_function(name, arg_count)?.is_none() {
+        crate::bail_parse_error!("no such function: {}", name);
+    }
+    Ok(())
 }
 
 /// Fails when `expr` uses an operator that no function of its operands' types

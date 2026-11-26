@@ -249,6 +249,112 @@ expect error {
     misuse of aggregate: max()
 }
 
+test where_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y WHERE 0 AND nosuchfn(d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test delete_where_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    DELETE FROM y WHERE 1 OR nosuchfn(d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test update_where_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 1 WHERE 1 OR nosuchfn(d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test update_where_checks_function_argument_counts_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 1 WHERE 1 OR abs(1, 2);
+}
+expect error {
+    wrong number of arguments to function abs\(\)
+}
+
+test update_where_checks_coalesce_argument_count_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR coalesce(d);
+}
+expect error {
+    wrong number of arguments to function coalesce\(\)
+}
+
+test update_where_checks_iif_argument_count_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR iif(d);
+}
+expect error {
+    wrong number of arguments to function iif\(\)
+}
+
+test join_on_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR nosuchfn(w.d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test left_join_on_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y LEFT JOIN y AS w ON 0 AND nosuchfn(w.d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test join_on_checks_function_argument_counts_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR abs(1, 2);
+}
+expect error {
+    wrong number of arguments to function abs\(\)
+}
+
+test update_from_join_on_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 3 FROM y AS a JOIN y AS b ON 1 OR nosuchfn(b.d) WHERE a.id = y.id;
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test where_checks_function_names_in_exists_result_columns {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR EXISTS (SELECT nosuchfn(1));
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test result_column_checks_function_names_in_exists_result_columns {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT EXISTS (SELECT nosuchfn(1));
+}
+expect error {
+    no such function: nosuchfn
+}
+
 # SQLite checks a named window only where a function uses it, and a CTE only
 # where a FROM clause reads it.
 @cross-check-integrity
@@ -270,6 +376,16 @@ expect {
 test select_checks_window_used_through_another_window {
     CREATE TABLE y(id INTEGER PRIMARY KEY, d);
     SELECT count(*) OVER w2 FROM y WINDOW w AS (ORDER BY nosuchfn(d)), w2 AS (w);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test where_subquery_checks_used_window {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR (SELECT sum(q) OVER w FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
 }
 expect error {
     no such function: nosuchfn
@@ -463,4 +579,27 @@ expect {
     1|0|0|SEARCH u USING INTEGER PRIMARY KEY (rowid=?)
     2|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
     16|0|0|USE SORTER FOR ORDER BY
+}
+
+@skip-if sqlite "SQLite has no WITHIN GROUP syntax for percentile_disc and percentile_cont"
+test ordered_set_aggregates_in_where_and_order_by {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    INSERT INTO z VALUES (5, 1), (6, 2);
+    SELECT d FROM y WHERE d > (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT d FROM y WHERE d IN (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT d FROM y WHERE EXISTS (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    UPDATE y SET d = 9 WHERE d > (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY d) FROM y ORDER BY percentile_disc(0.5) WITHIN GROUP (ORDER BY d);
+    SELECT d FROM y ORDER BY id, (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+}
+expect {
+    6
+    5
+    5
+    6
+    5
+    5
+    9
 }
