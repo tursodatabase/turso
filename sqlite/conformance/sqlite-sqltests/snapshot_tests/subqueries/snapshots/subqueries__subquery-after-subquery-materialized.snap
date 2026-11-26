@@ -17,9 +17,10 @@ QUERY PLAN
 |--SCAN a
 |  |--SCAN history_txt
 |  `--USE SORTER FOR GROUP BY
+|--MATERIALIZE b
+|  |--SCAN history_txt
+|  `--USE SORTER FOR GROUP BY
 `--SCAN b
-   |--SCAN history_txt
-   `--USE SORTER FOR GROUP BY
 
 BYTECODE
 addr  opcode          p1   p2   p3  p4            p5  comment

@@ -15,5 +15,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN t USING COVERING INDEX xdesc
+|--MATERIALIZE descending
+|  `--SCAN t USING COVERING INDEX xdesc
 `--SCAN descending

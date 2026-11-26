@@ -1,0 +1,25 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH big AS MATERIALIZED (SELECT customer_id FROM orders WHERE total_amount > 100)
+      SELECT name FROM customers
+      WHERE id IN (SELECT customer_id FROM big)
+        AND id + 1 IN (SELECT customer_id FROM big);
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - big
+  - customers
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--LIST SUBQUERY 1
+|  |--MATERIALIZE big
+|  |  `--SCAN orders
+|  `--SCAN big
+|--LIST SUBQUERY 2
+|  `--SCAN big
+`--SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)

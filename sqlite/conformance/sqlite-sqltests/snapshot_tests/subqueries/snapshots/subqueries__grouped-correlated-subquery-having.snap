@@ -19,8 +19,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN grouped_values AS gv USING INDEX idx_grouped_values_grp
+|--MATERIALIZE scalar_subquery_t2
+|  `--SCAN grouped_values AS gv2 USING INDEX idx_grouped_values_grp
 `--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN
-   `--SCAN grouped_values AS gv2 USING INDEX idx_grouped_values_grp
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4            p5  comment

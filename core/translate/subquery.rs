@@ -1539,8 +1539,8 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                         "pre-materializing shared CTE"
                     );
                     let (result_columns_start, cursor_id, shared_table) = program
-                        .with_cte_materialization_eqp(
-                            cte_id,
+                        .with_materialization_eqp(
+                            Some(cte_id),
                             &from_clause_subquery.name,
                             |program| {
                                 emit_materialized_subquery_table(
@@ -1574,16 +1574,15 @@ enum QueryLevel {
 /// Describe how a FROM-clause subquery reference will be executed, for
 /// EXPLAIN QUERY PLAN consumers. Returns None for plain tables.
 fn eqp_subquery_info(
-    program: &ProgramBuilder,
     table_reference: &JoinedTable,
     execution_mode: Option<&FromClauseSubqueryExecutionMode>,
+    reuses_materialized_cte: bool,
 ) -> Option<EqpSubquery> {
     let Table::FromClauseSubquery(from_clause_subquery) = &table_reference.table else {
         return None;
     };
     let cte_id = from_clause_subquery.cte_id();
-    let already_materialized = cte_id.is_some_and(|id| program.get_materialized_cte(id).is_some());
-    let exec = if already_materialized {
+    let exec = if reuses_materialized_cte {
         EqpSubqueryExec::MaterializedReuse
     } else {
         match execution_mode {
@@ -1731,27 +1730,44 @@ fn emit_from_clause_table(
     let coroutine_would_rerun =
         coroutine_would_rerun_for_outer_rows(tables, join_order, table_index);
     let table_reference = &mut tables.joined_tables_mut()[table_index];
-    let execution_mode = match &table_reference.table {
-        Table::FromClauseSubquery(from_clause_subquery) => {
+    let (execution_mode, reuses_materialized_cte) = match &table_reference.table {
+        Table::FromClauseSubquery(from_clause_subquery) => (
             Some(choose_from_clause_subquery_execution_mode(
                 &table_reference.op,
                 from_clause_subquery.as_ref(),
                 from_clause_has_right_or_full_join,
                 coroutine_would_rerun,
-            ))
-        }
-        _ => None,
+            )),
+            from_clause_subquery
+                .cte_id()
+                .is_some_and(|cte_id| program.get_materialized_cte(cte_id).is_some()),
+        ),
+        _ => (None, false),
     };
-    explain_from_clause_table(
-        program,
-        t_ctx,
-        table_reference,
-        execution_mode.as_ref(),
-        outer_table_set.get(table_index),
-        table_index,
-    );
+    // As in SQLite, the MATERIALIZE step that fills a subquery's table comes
+    // before the step that reads the table. A coroutine's body stays below the
+    // step that reads it.
+    let fills_table = !reuses_materialized_cte
+        && matches!(
+            execution_mode,
+            Some(
+                FromClauseSubqueryExecutionMode::MaterializedTable
+                    | FromClauseSubqueryExecutionMode::DirectMaterializedIndex(_)
+            )
+        );
+    if !fills_table {
+        explain_from_clause_table(
+            program,
+            t_ctx,
+            table_reference,
+            execution_mode.as_ref(),
+            reuses_materialized_cte,
+            outer_table_set.get(table_index),
+            table_index,
+        );
+    }
 
-    if let Some(execution_mode) = execution_mode {
+    if let Some(execution_mode) = &execution_mode {
         let JoinedTable {
             table: Table::FromClauseSubquery(from_clause_subquery),
             col_used_mask,
@@ -1764,7 +1780,7 @@ fn emit_from_clause_table(
         };
         let from_clause_subquery = Arc::make_mut(from_clause_subquery);
         if from_clause_subquery.parenthesized_join_columns.is_some() {
-            keep_used_join_group_columns(from_clause_subquery, col_used_mask, &execution_mode);
+            keep_used_join_group_columns(from_clause_subquery, col_used_mask, execution_mode);
         }
         if !reuse_materialized_cte(program, from_clause_subquery, identifier, *internal_id) {
             emit_from_clause_subquery_rows(
@@ -1777,6 +1793,17 @@ fn emit_from_clause_table(
         }
     }
 
+    if fills_table {
+        explain_from_clause_table(
+            program,
+            t_ctx,
+            &tables.joined_tables()[table_index],
+            execution_mode.as_ref(),
+            false,
+            outer_table_set.get(table_index),
+            table_index,
+        );
+    }
     program.pop_current_parent_explain();
     Ok(())
 }
@@ -1790,11 +1817,13 @@ fn explain_from_clause_table(
     t_ctx: &TranslateCtx,
     table_reference: &JoinedTable,
     execution_mode: Option<&FromClauseSubqueryExecutionMode>,
+    reuses_materialized_cte: bool,
     is_outer: bool,
     table_index: usize,
 ) {
     emit_explain!(program, true, {
-        let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode);
+        let eqp_subquery =
+            eqp_subquery_info(table_reference, execution_mode, reuses_materialized_cte);
         let eqp_join = EqpJoin::from_join_info(table_reference.join_info.as_ref(), is_outer);
         if t_ctx
             .materialized_build_inputs
@@ -1921,7 +1950,7 @@ fn emit_from_clause_subquery_rows(
     t_ctx: &mut TranslateCtx,
     from_clause_subquery: &mut FromClauseSubquery,
     internal_id: TableInternalId,
-    execution_mode: FromClauseSubqueryExecutionMode,
+    execution_mode: &FromClauseSubqueryExecutionMode,
 ) -> Result<()> {
     let result_columns_start = match execution_mode {
         FromClauseSubqueryExecutionMode::Coroutine => Some(emit_from_clause_subquery(
@@ -1930,12 +1959,19 @@ fn emit_from_clause_subquery_rows(
             t_ctx,
         )?),
         FromClauseSubqueryExecutionMode::MaterializedTable => {
-            let (result_columns_start, cursor_id, shared_table) = emit_materialized_subquery_table(
-                program,
-                from_clause_subquery.plan.as_mut(),
-                t_ctx,
-                &from_clause_subquery.columns,
-            )?;
+            let (result_columns_start, cursor_id, shared_table) = program
+                .with_materialization_eqp(
+                    from_clause_subquery.cte_id(),
+                    &from_clause_subquery.name,
+                    |program| {
+                        emit_materialized_subquery_table(
+                            program,
+                            from_clause_subquery.plan.as_mut(),
+                            t_ctx,
+                            &from_clause_subquery.columns,
+                        )
+                    },
+                )?;
             from_clause_subquery.materialized_cursor_id = Some(cursor_id);
             if let (Some(cte_id), Some(cte_info)) = (from_clause_subquery.cte_id(), shared_table) {
                 program.register_materialized_cte(cte_id, cte_info);
@@ -1943,13 +1979,19 @@ fn emit_from_clause_subquery_rows(
             Some(result_columns_start)
         }
         FromClauseSubqueryExecutionMode::DirectMaterializedIndex(direct_index) => {
-            emit_indexed_materialized_subquery(
-                program,
-                from_clause_subquery.plan.as_mut(),
-                t_ctx,
-                internal_id,
-                direct_index.index,
-                direct_index.affinity_str,
+            program.with_materialization_eqp(
+                from_clause_subquery.cte_id(),
+                &from_clause_subquery.name,
+                |program| {
+                    emit_indexed_materialized_subquery(
+                        program,
+                        from_clause_subquery.plan.as_mut(),
+                        t_ctx,
+                        internal_id,
+                        direct_index.index.clone(),
+                        direct_index.affinity_str.clone(),
+                    )
+                },
             )?;
             None
         }

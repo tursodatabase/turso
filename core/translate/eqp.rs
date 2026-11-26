@@ -265,6 +265,12 @@ pub enum EqpDetail {
     RightJoin {
         table: EqpTable,
     },
+    /// Fill the in-memory table of a FROM clause subquery or CTE before the
+    /// query reads it. The plan of the subquery's body is below this step.
+    Materialize {
+        cte_id: Option<usize>,
+        name: String,
+    },
     /// Materialize the build side of a hash join into an in-memory table.
     HashBuild {
         table: EqpTable,
@@ -370,6 +376,7 @@ impl Display for EqpDetail {
             Self::IndexMethod { method, .. } => write!(f, "QUERY INDEX METHOD {method}"),
             Self::HashJoin { table, .. } => write!(f, "HASH JOIN {}", table.name_with_alias()),
             Self::RightJoin { table } => write!(f, "RIGHT-JOIN {}", table.identifier()),
+            Self::Materialize { name, .. } => write!(f, "MATERIALIZE {name}"),
             Self::HashBuild { table, .. } => write!(
                 f,
                 "MATERIALIZE hash build input for {}",
@@ -829,6 +836,13 @@ impl EqpDetail {
             Self::RightJoin { table } => {
                 obj.str("type", "right_join");
                 Self::write_table_fields(&mut obj, table, None, None);
+            }
+            Self::Materialize { cte_id, name } => {
+                obj.str("type", "materialize");
+                if let Some(cte_id) = cte_id {
+                    obj.num("cte_id", *cte_id);
+                }
+                obj.str("name", name);
             }
             Self::HashBuild { table, estimate } => {
                 obj.str("type", "hash_build");

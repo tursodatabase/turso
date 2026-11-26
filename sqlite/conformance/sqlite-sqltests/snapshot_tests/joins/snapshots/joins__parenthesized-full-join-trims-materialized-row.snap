@@ -15,11 +15,12 @@ info:
 ---
 QUERY PLAN
 |--SCAN nested_prune_outer
-|--SCAN (join-1)
+|--MATERIALIZE (join-1)
 |  |--SCAN nested_prune_left
 |  |--SCAN nested_prune_right LEFT-JOIN
 |  `--RIGHT-JOIN nested_prune_right
 |     `--SCAN nested_prune_right
+|--SCAN (join-1)
 `--RIGHT-JOIN (join-1)
    `--SCAN (join-1)
 

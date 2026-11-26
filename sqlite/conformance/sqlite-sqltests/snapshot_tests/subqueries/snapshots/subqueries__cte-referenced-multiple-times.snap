@@ -31,7 +31,8 @@ QUERY PLAN
 |--SCALAR SUBQUERY 2
 |  `--SCAN order_totals
 |     `--SCAN orders USING INDEX idx_orders_customer
-|--SCAN orders USING INDEX idx_orders_customer
+|--MATERIALIZE order_totals
+|  `--SCAN orders USING INDEX idx_orders_customer
 |--SCAN customers AS c
 `--SEARCH ot USING INDEX ephemeral_subquery_t5 (customer_id=? AND total>?)
 

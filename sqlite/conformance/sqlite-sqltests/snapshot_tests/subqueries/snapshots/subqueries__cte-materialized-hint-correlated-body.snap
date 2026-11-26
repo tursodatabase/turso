@@ -1,0 +1,24 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH named AS MATERIALIZED (
+          SELECT (SELECT name FROM customers WHERE customers.id = o.customer_id) AS name
+          FROM orders o
+      )
+      SELECT * FROM named;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - customers
+  - named
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--MATERIALIZE named
+|  |--SCAN orders AS o USING COVERING INDEX idx_orders_customer
+|  `--CORRELATED SCALAR SUBQUERY 1
+|     `--SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
+`--SCAN named
