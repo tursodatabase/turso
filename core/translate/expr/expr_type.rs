@@ -9,7 +9,7 @@ use crate::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
-use crate::dialect::{EngineType, OperandType};
+use crate::dialect::{CastSource, EngineType, OperandType, TypeIdentity, TypeRef};
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
@@ -1346,6 +1346,73 @@ fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
         },
     );
     declared
+}
+
+/// The source of a value read from `column`.
+pub(crate) fn cast_source_of_column_type(column: &Column, schema: &Schema) -> CastSource {
+    if column.ty_str.is_empty() {
+        return CastSource::Unnamed;
+    }
+    CastSource::Typed(type_ref_of_name(
+        &column.ty_str,
+        column.array_dimensions(),
+        schema,
+    ))
+}
+
+/// The source of a value that is the result of `expr`, as a dialect sees it.
+/// A parameter has no type of its own, as a string literal has none.
+pub(crate) fn cast_source_of(expr: &ast::Expr, env: &TypeEnv, schema: &Schema) -> CastSource {
+    let ty = type_of(expr, env);
+    let is_parameter = matches!(without_wrappers(expr), ast::Expr::Variable(_));
+    if is_parameter && matches!(ty, ExprType::Builtin(BuiltinType::Any)) {
+        return CastSource::Untyped;
+    }
+    dialect_cast_source(ty, schema)
+}
+
+/// The type of a cast operand as a dialect sees it.
+pub(crate) fn dialect_cast_source(ty: ExprType, schema: &Schema) -> CastSource {
+    let typed = |identity, array_dimensions| {
+        CastSource::Typed(TypeRef {
+            identity,
+            array_dimensions,
+        })
+    };
+    let named = |name: &str| typed(TypeIdentity::Name(name.to_string()), 0);
+    match without_domain(ty, schema) {
+        ExprType::Untyped => CastSource::Untyped,
+        // A value of any kind, such as the result of most functions.
+        ExprType::Builtin(BuiltinType::Any) => CastSource::Unnamed,
+        ExprType::Builtin(BuiltinType::Decimal | BuiltinType::Numeric) => named("NUMERIC"),
+        ExprType::Builtin(BuiltinType::Boolean) => match schema.type_of_conditions() {
+            Some(type_def) => typed(TypeIdentity::Registered(Arc::clone(type_def)), 0),
+            None => named(BuiltinType::Boolean.sqlite_name()),
+        },
+        ExprType::Builtin(builtin) => named(builtin.sqlite_name()),
+        ExprType::Custom { type_def, .. } => typed(TypeIdentity::Registered(type_def), 0),
+        ExprType::Array {
+            element,
+            dimensions,
+        } => match dialect_cast_source(*element, schema) {
+            CastSource::Typed(element) => typed(element.identity, dimensions),
+            other => other,
+        },
+        _ => CastSource::Unnamed,
+    }
+}
+
+/// The type written as `name`, with `array_dimensions` dimensions: the
+/// registered type of that name when the schema has one.
+pub(crate) fn type_ref_of_name(name: &str, array_dimensions: u32, schema: &Schema) -> TypeRef {
+    let identity = match schema.get_type_def_unchecked(name) {
+        Some(type_def) => TypeIdentity::Registered(Arc::clone(type_def)),
+        None => TypeIdentity::Name(name.to_string()),
+    };
+    TypeRef {
+        identity,
+        array_dimensions,
+    }
 }
 
 fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {

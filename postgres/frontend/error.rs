@@ -293,6 +293,9 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
             }
         },
         LimboError::ForeignKeyConstraint(_) => SQLSTATE_FK_VIOLATION,
+        LimboError::Constraint(msg) if msg.starts_with("invalid input for type boolean") => {
+            SQLSTATE_INVALID_TEXT_REPRESENTATION
+        }
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
         LimboError::LexerError(_) => SQLSTATE_SYNTAX_ERROR,
         LimboError::ParseError(msg) => parse_error_sqlstate(msg),
@@ -508,7 +511,7 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 /// The SQLSTATE of a RAISE. The translator and the types of the engine check
 /// values with RAISE, and PostgreSQL gives these checks their own SQLSTATE.
 fn raise_sqlstate(msg: &str) -> &'static str {
-    if msg.starts_with("invalid input value for enum ") {
+    if msg.starts_with("invalid input value for enum ") || msg == "invalid UUID value" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
     } else if msg == "value too long for varchar" {
         SQLSTATE_STRING_DATA_RIGHT_TRUNCATION

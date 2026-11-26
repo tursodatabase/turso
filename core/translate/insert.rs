@@ -7,6 +7,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::security::permission::Object;
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::new_values::{emit_input_conversion, StatementValues};
 use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
@@ -184,6 +185,8 @@ pub struct InsertEmitCtx<'a> {
     /// when a DO UPDATE must fail on such a row (see
     /// [crate::Dialect::upsert_rejects_row_written_by_same_statement]).
     pub written_rowids_cursor_id: Option<usize>,
+    /// The source type of each value of a row, in the order of the values.
+    pub value_sources: Vec<crate::dialect::CastSource>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -240,6 +243,7 @@ impl<'a> InsertEmitCtx<'a> {
             namespace,
             returning_buffer: None,
             written_rowids_cursor_id: None,
+            value_sources: Vec::new(),
         })
     }
 }
@@ -521,6 +525,7 @@ pub fn translate_insert(
         resolver,
         &mut values,
         body,
+        &columns,
         &table_references,
         namespace,
     )?;
@@ -719,18 +724,25 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = insertion.has_generated_columns();
+    let types_checked_first = insertion.has_generated_columns()
+        || resolver.catalog.dialect.converts_values_before_not_null();
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
             !column.is_generated() && !has_custom_type(column)
         })?;
     }
-    emit_column_type_conversion(
+    let value_sources = match ctx.table.is_strict {
+        true => insert_value_sources(&insertion, &ctx.value_sources, resolver),
+        false => Vec::new(),
+    };
+    emit_input_conversion(
         program,
         resolver,
         ctx.table,
         insertion.first_col_register(),
-        insertion.num_non_virtual_cols,
+        &ctx.table.column_layout()?,
+        StatementValues::of_insert(program),
+        &value_sources,
     )?;
     if let Some(type_check_table) = &maybe_type_check_table {
         if !program.flags.writes_stored_values() {
@@ -1179,12 +1191,14 @@ fn emit_new_row_for_before_triggers(
         dst_reg: new_first_col_reg,
         extra_amount: insertion.num_non_virtual_cols - 1,
     });
-    emit_column_type_conversion(
+    emit_input_conversion(
         program,
         resolver,
         table,
         new_first_col_reg,
-        insertion.num_non_virtual_cols,
+        &table.column_layout()?,
+        StatementValues::of_insert(program),
+        &[],
     )?;
 
     let new_registers: Vec<usize> = insertion
@@ -1220,52 +1234,6 @@ fn emit_new_row_for_before_triggers(
         .into_iter()
         .chain(std::iter::once(new_key_reg))
         .collect())
-}
-
-/// Converts the stored columns of a row, in the registers that start at `first_col_reg`, to the
-/// types of their columns: affinity, or the type check of a STRICT table.
-pub(crate) fn emit_column_type_conversion(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table: &Arc<BTreeTable>,
-    first_col_reg: usize,
-    num_non_virtual_cols: usize,
-) -> Result<()> {
-    if table.is_strict {
-        // Stored values are already in the stored form.
-        if !program.flags.writes_stored_values() {
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: first_col_reg,
-                count: num_non_virtual_cols,
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    table,
-                    resolver.schema(),
-                    None,
-                )?,
-            });
-        }
-        return Ok(());
-    }
-    let affinities = table
-        .columns()
-        .iter()
-        .filter(|column| !column.is_virtual_generated())
-        .map(|column| column.affinity());
-    if affinities
-        .clone()
-        .all(|affinity| affinity == Affinity::Blob)
-    {
-        return Ok(());
-    }
-    if let Ok(count) = NonZeroUsize::try_from(num_non_virtual_cols) {
-        program.emit_insn(Insn::Affinity {
-            start_reg: first_col_reg,
-            count,
-            affinities: affinities.map(|affinity| affinity.aff_mask()).collect(),
-        });
-    }
-    Ok(())
 }
 
 /// Emits the RETURNING subqueries of an INSERT against the row whose column
@@ -2477,6 +2445,7 @@ fn init_source_emission<'a>(
     resolver: &Resolver,
     values: &mut Vec<Box<Expr>>,
     body: InsertBody,
+    columns: &[ast::Name],
     table_references: &TableReferences,
     namespace: NamespaceRef,
 ) -> Result<()> {
@@ -2508,13 +2477,32 @@ fn init_source_emission<'a>(
                 )
             } else {
                 // Multiple rows - use coroutine for value population
-                let (yield_reg, num_result_cols) = emit_insert_select_coroutine(
+                let value_columns: Vec<Option<&Column>> =
+                    match ctx.table.is_strict && !program.flags.writes_stored_values() {
+                        true => {
+                            let value_count = match columns.is_empty() {
+                                true => table
+                                    .columns()
+                                    .iter()
+                                    .filter(|c| !c.hidden() && !c.is_generated())
+                                    .count(),
+                                false => columns.len(),
+                            };
+                            (0..value_count)
+                                .map(|position| insert_target_column(table, columns, position))
+                                .collect()
+                        }
+                        false => Vec::new(),
+                    };
+                let (yield_reg, num_result_cols, value_sources) = emit_insert_select_coroutine(
                     program,
                     select,
                     ctx.halt_label,
                     resolver,
                     connection,
+                    &value_columns,
                 )?;
+                ctx.value_sources = value_sources;
                 let cursor_id = program.alloc_cursor_id_keyed(
                     CursorKey::table(table_references.joined_tables()[0].internal_id),
                     CursorType::BTreeTable(ctx.table.clone()),
@@ -2597,6 +2585,15 @@ fn init_source_emission<'a>(
     };
     ctx.num_values = num_values;
     ctx.cursor_id = cursor_id;
+    if ctx.yield_reg_opt.is_none() {
+        let env = crate::translate::expr::expr_type::TypeEnv::new(None, resolver);
+        ctx.value_sources = values
+            .iter()
+            .map(|value| {
+                crate::translate::expr::expr_type::cast_source_of(value, &env, resolver.schema())
+            })
+            .collect();
+    }
     Ok(())
 }
 
@@ -3642,8 +3639,8 @@ fn translate_virtual_table_insert(
         let InsertBody::Select(select, _) = body else {
             unreachable!("only a SELECT or VALUES body inserts multiple rows");
         };
-        let (yield_reg, num_values) =
-            emit_insert_select_coroutine(program, select, halt_label, resolver, connection)?;
+        let (yield_reg, num_values, _) =
+            emit_insert_select_coroutine(program, select, halt_label, resolver, connection, &[])?;
         // As in SQLite, the rows are copied into a temporary table first when
         // the SELECT reads the virtual table that the INSERT writes to.
         let temp_table_ctx = if program.is_table_open(&table) {
@@ -3924,15 +3921,17 @@ fn emit_insert_returning_row(
 }
 
 /// Emits a coroutine that yields the rows of the SELECT, or of the multi-row
-/// VALUES, that an INSERT reads. Returns the coroutine's yield register and
-/// the number of columns in each row.
+/// VALUES, that an INSERT reads. `value_columns` has the column that each
+/// value of a row is written to. Returns the coroutine's yield register, the
+/// number of columns in each row, and the source type of each value of a row.
 fn emit_insert_select_coroutine(
     program: &mut ProgramBuilder,
     select: ast::Select,
     halt_label: BranchOffset,
     resolver: &Resolver,
     connection: &Arc<Connection>,
-) -> Result<(usize, usize)> {
+    value_columns: &[Option<&Column>],
+) -> Result<(usize, usize, Vec<crate::dialect::CastSource>)> {
     let yield_reg = program.alloc_register();
     let jump_on_definition_label = program.allocate_label();
     let start_offset_label = program.allocate_label();
@@ -3947,13 +3946,20 @@ fn emit_insert_select_coroutine(
         yield_reg,
         coroutine_implementation_start: halt_label,
     };
-    let num_result_cols = program.nested(|program| {
-        translate_insert_source_select(select, resolver, program, query_destination, connection)
+    let (num_result_cols, value_sources) = program.nested(|program| {
+        translate_insert_source_select(
+            select,
+            resolver,
+            program,
+            query_destination,
+            connection,
+            value_columns,
+        )
     })?;
 
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(jump_on_definition_label);
-    Ok((yield_reg, num_result_cols))
+    Ok((yield_reg, num_result_cols, value_sources))
 }
 
 /// Copies every row that the coroutine of [emit_insert_select_coroutine] yields
@@ -4863,6 +4869,33 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         program.preassign_label_to_next_insn(skip_fk);
     }
     Ok(())
+}
+
+/// The source of the value of each column of the table in a row that an
+/// INSERT writes. `value_sources` has the sources in the order of the values.
+fn insert_value_sources(
+    insertion: &Insertion,
+    value_sources: &[crate::dialect::CastSource],
+    resolver: &Resolver,
+) -> Vec<crate::dialect::CastSource> {
+    insertion
+        .col_mappings
+        .iter()
+        .map(|mapping| match mapping.value_index {
+            Some(index) => value_sources
+                .get(index)
+                .cloned()
+                .unwrap_or(crate::dialect::CastSource::Unnamed),
+            None => {
+                let default = column_default_expr(mapping.column, true, resolver);
+                crate::translate::expr::expr_type::cast_source_of(
+                    &default,
+                    &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+                    resolver.schema(),
+                )
+            }
+        })
+        .collect()
 }
 
 /// Emit encode expressions for columns with custom types.

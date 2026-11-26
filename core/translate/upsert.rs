@@ -10,6 +10,7 @@ use crate::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::{
     compute_generated_columns, emit_row_from_cursor, sets_custom_type_column,
 };
+use super::emitter::new_values::{emit_input_conversion, StatementValues};
 use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
@@ -24,8 +25,8 @@ use crate::translate::fkeys::{
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{
-    emit_column_type_conversion, emit_remember_written_rowid, emit_returning_subqueries,
-    expr_contains_subquery, format_unique_violation_desc, InsertEmitCtx,
+    emit_remember_written_rowid, emit_returning_subqueries, expr_contains_subquery,
+    format_unique_violation_desc, InsertEmitCtx,
 };
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
@@ -760,6 +761,9 @@ pub fn emit_upsert(
         &layout,
     )?;
     let set_pairs = &collect_set_clauses_for_upsert(table, sets, resolver)?;
+    let converts_values_before_not_null =
+        resolver.catalog.dialect.converts_values_before_not_null();
+    let key_may_be_generated = resolver.catalog.dialect.generates_integer_primary_keys();
     let mut new_rowid_reg: Option<usize> = None;
     for (col_idx, expr) in set_pairs {
         if *col_idx == ROWID_SENTINEL {
@@ -789,25 +793,28 @@ pub fn emit_upsert(
             .cloned();
         let prev_union = program.target_union_type.take();
         program.target_union_type = union_td;
+        let set_value_reg = layout.to_register(new_start, *col_idx);
         let translate_result = translate_expr_no_constant_opt(
             program,
             None,
             expr,
-            layout.to_register(new_start, *col_idx),
+            set_value_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,
         );
         program.target_union_type = prev_union;
         translate_result?;
-        let key_may_be_generated = resolver.catalog.dialect.generates_integer_primary_keys();
-        if col.notnull() && (!col.is_rowid_alias() || !key_may_be_generated) {
-            program.emit_insn(Insn::HaltIfNull {
-                constraint_info: None,
-                target_reg: layout.to_register(new_start, *col_idx),
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
-                on_error: constraint_on_error,
-            });
+        // A key is checked here in every dialect: the rowid is read from this
+        // register right below, and a NULL must fail as a NULL.
+        if !converts_values_before_not_null || col.is_rowid_alias() {
+            emit_set_value_notnull_check(
+                program,
+                table,
+                col,
+                set_value_reg,
+                key_may_be_generated,
+                constraint_on_error,
+            );
         }
         if col.is_rowid_alias() {
             // Must be integer; remember the NEW rowid value
@@ -827,13 +834,41 @@ pub fn emit_upsert(
     }
 
     if let Some(bt) = table.btree() {
-        emit_column_type_conversion(
+        let sources = match bt.is_strict {
+            true => crate::translate::emitter::update::set_value_sources(
+                bt.columns().len(),
+                table_references,
+                set_pairs.iter().map(|(col_idx, expr)| (*col_idx, &**expr)),
+                resolver,
+            ),
+            false => Vec::new(),
+        };
+        emit_input_conversion(
             program,
             resolver,
             &bt,
             new_start,
-            layout.num_non_virtual_cols(),
+            &layout,
+            StatementValues::of_insert(program),
+            &sources,
         )?;
+    }
+    if converts_values_before_not_null {
+        for (col_idx, _) in set_pairs.iter().filter(|(idx, _)| *idx != ROWID_SENTINEL) {
+            let col = &table.columns()[*col_idx];
+            if col.is_rowid_alias() {
+                continue;
+            }
+            let set_value_reg = layout.to_register(new_start, *col_idx);
+            emit_set_value_notnull_check(
+                program,
+                table,
+                col,
+                set_value_reg,
+                key_may_be_generated,
+                constraint_on_error,
+            );
+        }
     }
 
     // Recompute generated columns for the new row after SET clauses have modified base columns.
@@ -1925,6 +1960,25 @@ fn do_update_constraint_on_error(program: &ProgramBuilder) -> Option<ast::Resolv
         None
     } else {
         Some(ast::ResolveType::Abort)
+    }
+}
+
+fn emit_set_value_notnull_check(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    column: &Column,
+    set_value_reg: usize,
+    key_may_be_generated: bool,
+    on_error: Option<ast::ResolveType>,
+) {
+    if column.notnull() && (!column.is_rowid_alias() || !key_may_be_generated) {
+        program.emit_insn(Insn::HaltIfNull {
+            constraint_info: None,
+            target_reg: set_value_reg,
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: String::from(table.get_name()) + "." + column.name.as_ref().unwrap(),
+            on_error,
+        });
     }
 }
 

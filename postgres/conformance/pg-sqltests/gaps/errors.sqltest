@@ -246,25 +246,19 @@ expect error {}
 
 # D-22: invalid int into int column
 @setup t_n
-@compat-gap "type:int4"
 test invalid-int-into-int-column {
     INSERT INTO t VALUES ('abc');
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # D-23: invalid uuid into uuid column
-@compat-gap "type:uuid"
 test invalid-uuid-into-uuid-column {
     CREATE TABLE t (u uuid);
     INSERT INTO t VALUES ('nope');
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate P0001
-expect @tursopg error {}
 
 # D-24: invalid timestamptz into column
 test invalid-timestamptz-into-column {
@@ -341,17 +335,12 @@ test smallint-column-overflow {
 @sqlstate 22003
 expect error {}
 
-# PostgreSQL reads the number as numeric and refuses it for the bigint column.
-# tursopg reads a number above the range of bigint as a float.
-@compat-gap "type:int8"
 test bigint-column-overflow {
     CREATE TABLE t (n bigint);
     INSERT INTO t VALUES (9223372036854775808);
 }
 @sqlstate 22003
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # D-35: undefined table
 test undefined-table {
@@ -422,9 +411,8 @@ test unknown-type-in-cast {
 }
 @sqlstate 42704
 expect error {}
-expect @tursopg {
-    1
-}
+@sqlstate 0A000
+expect @tursopg error {}
 
 # D-45: wrong arg type to function
 @compat-gap "function:lower"

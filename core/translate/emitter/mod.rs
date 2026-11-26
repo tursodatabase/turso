@@ -59,6 +59,7 @@ use std::rc::Rc;
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
+pub(crate) mod new_values;
 pub(crate) mod select;
 pub(crate) mod update;
 

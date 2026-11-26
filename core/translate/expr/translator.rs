@@ -1,4 +1,5 @@
 use super::*;
+use crate::dialect::CastDecision;
 use crate::types::StrictType;
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
@@ -858,13 +859,31 @@ fn translate_cast_expr(
     let ast::Expr::Cast { expr, type_name } = expr else {
         unreachable!("translate_cast_expr expects Expr::Cast");
     };
+    let applied = apply_dialect_cast(
+        referenced_tables,
+        expr,
+        type_name.as_ref(),
+        crate::dialect::CastContext::Explicit,
+        resolver,
+    )?;
+    let operand = match &applied {
+        CastDecision::Applied(operand) => operand,
+        CastDecision::EngineRules => &**expr,
+    };
+    let type_name = type_name.as_ref();
     // A CAST to a custom type gives the value a column of the type reads, after
     // ENCODE and then DECODE, so that operators, functions and comparisons see
     // both alike: `CAST(42 AS cents)` is 42, and `-CAST(1.5 AS numeric(10,2))`
     // runs numeric's `-` on 1.50.
-    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+    translate_expr(
+        program,
+        referenced_tables,
+        operand,
+        target_register,
+        resolver,
+    )?;
 
-    if let Some(tn) = type_name {
+    if let (CastDecision::EngineRules, Some(tn)) = (&applied, type_name) {
         let source = type_of(expr, &TypeEnv::new(referenced_tables, resolver));
         let target = custom_type_cast_chain(tn, resolver.schema())?;
         check_cast_from_text_input_type(&source, target.as_ref(), tn, resolver)?;
@@ -938,6 +957,37 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// What the dialect decides about the CAST of `operand`. A CAST without a
+/// type name is SQLite's, and goes by the rules of the engine.
+pub(crate) fn apply_dialect_cast(
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    type_name: Option<&ast::Type>,
+    context: crate::dialect::CastContext,
+    resolver: &Resolver,
+) -> Result<CastDecision> {
+    let Some(type_name) = type_name else {
+        return Ok(CastDecision::EngineRules);
+    };
+    use super::expr_type::{cast_source_of, type_ref_of_name};
+    let source = || {
+        cast_source_of(
+            operand,
+            &TypeEnv::new(referenced_tables, resolver),
+            resolver.schema(),
+        )
+    };
+    let target = type_ref_of_name(
+        &crate::util::dequote(&type_name.name),
+        type_name.array_dimensions,
+        resolver.schema(),
+    );
+    resolver
+        .catalog
+        .dialect
+        .apply_cast(operand, &source, &target, context)
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose

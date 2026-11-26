@@ -754,15 +754,11 @@ expect {
 expect @tursopg error {}
 
 # B-77: now() text format has offset and micros
-@compat-gap "cast:timestamptz -> text"
 test now-text-format-has-offset-and-micros {
     SELECT now()::text LIKE '____-__-__ __:__:__.%+00';
 }
 expect {
     t
-}
-expect @tursopg {
-    f
 }
 
 # B-78: gen_random_uuid() format

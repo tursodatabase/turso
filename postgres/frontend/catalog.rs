@@ -297,6 +297,25 @@ impl Dialect for PostgresDialect {
         crate::functions::undefined_operator_of(op, &names)
     }
 
+    fn apply_cast(
+        &self,
+        operand: &turso_core::ast::Expr,
+        source: &dyn Fn() -> turso_core::dialect::CastSource,
+        target: &turso_core::dialect::TypeRef,
+        context: turso_core::dialect::CastContext,
+    ) -> Result<turso_core::dialect::CastDecision> {
+        crate::cast_planning::apply_cast(operand, source, target, context)
+    }
+
+    fn check_column_default(
+        &self,
+        column_name: &str,
+        source: &dyn Fn() -> turso_core::dialect::CastSource,
+        column_type: &turso_core::dialect::TypeRef,
+    ) -> Result<()> {
+        crate::cast_planning::check_column_default(column_name, source, column_type)
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }
@@ -470,6 +489,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
+        true
+    }
+
+    fn converts_values_before_not_null(&self) -> bool {
         true
     }
 
@@ -3136,13 +3159,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_cast",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable {
-            create_sql: "CREATE TABLE pg_cast (
-                oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
-                castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
-            )"
-            .to_string(),
-        },
+        SnapshotCatalog::<PgCastTable>(PhantomData),
     );
     options = options.native_module(
         "pg_transform",
@@ -3368,6 +3385,35 @@ impl SnapshotRows for PgOperatorTable {
                     Value::from_i64(NO_FUNCTION),
                     Value::from_i64(NO_FUNCTION),
                     Value::from_i64(NO_FUNCTION),
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgCastTable;
+
+impl SnapshotRows for PgCastTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_cast (
+        oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
+        castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2605);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        crate::casts::cast_rows()
+            .enumerate()
+            .map(|(index, (source, target, context, method))| {
+                vec![
+                    Value::from_i64(crate::casts::FIRST_CAST_OID + index as i64),
+                    Value::from_i64(source.oid()),
+                    Value::from_i64(target.oid()),
+                    Value::from_i64(0),
+                    Value::build_text(context),
+                    Value::build_text(method),
                 ]
             })
             .collect()

@@ -2040,6 +2040,60 @@ mod tests {
         events
     }
 
+    #[test]
+    fn a_text_parameter_with_a_fraction_cast_to_an_integer_fails() {
+        let (mut client, _conn) = copy_test_client();
+        let events = execute_with_text_parameter(&mut client, "SELECT $1::int", "2.5");
+        assert_eq!(
+            error_sqlstate(&events),
+            Some(SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_parameter_with_a_fraction_written_to_an_integer_column_fails() {
+        let (mut client, _conn) = copy_test_client();
+        client
+            .simple_query("CREATE TABLE fraction (n int)")
+            .unwrap();
+        let events =
+            execute_with_text_parameter(&mut client, "INSERT INTO fraction VALUES ($1)", "2.5");
+        assert_eq!(
+            error_sqlstate(&events),
+            Some(SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            "{events:?}"
+        );
+        assert_row_count(&mut client, "fraction", "0");
+    }
+
+    /// Sends Parse, Bind with the one parameter `parameter` in text format,
+    /// Execute and Sync, and returns the events up to ReadyForQuery.
+    fn execute_with_text_parameter(
+        client: &mut PgConn,
+        sql: &str,
+        parameter: &str,
+    ) -> Vec<BackendEvent> {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(b"\0\0\0");
+        client.write_message(b'P', &parse).unwrap();
+        let mut bind = b"\0\0\0\0\0\x01".to_vec();
+        bind.extend_from_slice(&(parameter.len() as u32).to_be_bytes());
+        bind.extend_from_slice(parameter.as_bytes());
+        bind.extend_from_slice(b"\0\0");
+        client.write_message(b'B', &bind).unwrap();
+        client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+        sync_and_read(client)
+    }
+
+    fn error_sqlstate(events: &[BackendEvent]) -> Option<&str> {
+        events.iter().find_map(|event| match event {
+            BackendEvent::ErrorResponse(fields) => fields.get(&b'C').map(String::as_str),
+            _ => None,
+        })
+    }
+
     /// Checks that Execute got 0A000 and no rows, followed by ReadyForQuery
     /// with the transaction status `status`.
     fn assert_refused(events: &[BackendEvent], status: u8) {

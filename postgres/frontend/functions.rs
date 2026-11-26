@@ -412,6 +412,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
         ))?,
+        "pg_cast"(FunctionArity::Exact(3), true) => crate::cast_planning::exec_pg_cast(args)?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
@@ -1845,7 +1846,7 @@ fn write_json_string(text: &str, json: &mut String) {
 /// A float8 in PostgreSQL's text form: the shortest digits that read back as
 /// the same number, in scientific notation when the exponent is below -4 or
 /// 15 or more, as in `1e+20` and `1e-05`.
-fn float8_text(value: f64) -> String {
+pub(crate) fn float8_text(value: f64) -> String {
     if value.is_infinite() {
         return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
@@ -2379,28 +2380,8 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         "int2" | "smallint" => check_integer_input(IntegerType::Int2, input),
         "int4" | "integer" | "int" => check_integer_input(IntegerType::Int4, input),
         "int8" | "bigint" => check_integer_input(IntegerType::Int8, input),
-        "float4" | "real" => match trimmed.parse::<f32>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type real"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type real: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "float8" | "double precision" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type double precision"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type double precision: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
+        "float4" | "real" => float_input_error(input, "real", true),
+        "float8" | "double precision" => float_input_error(input, "double precision", false),
         "numeric" | "decimal" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_nan() || v.is_infinite() => Some((
                 format!("invalid input syntax for type numeric: \"{input}\""),
@@ -2530,6 +2511,31 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         _ => Some((
             format!("type \"{type_name}\" does not exist"),
             "42704".to_string(),
+        )),
+    }
+}
+
+/// The error of text that is not a float8 or float4, or is too large for it.
+/// `inf` and `infinity` are valid, with or without a sign, in any case.
+fn float_input_error(input: &str, type_name: &str, single: bool) -> Option<(String, String)> {
+    let trimmed = input.trim();
+    let is_infinity_word = matches!(
+        trimmed
+            .trim_start_matches(['+', '-'])
+            .to_ascii_lowercase()
+            .as_str(),
+        "inf" | "infinity"
+    );
+    match trimmed.parse::<f64>() {
+        Ok(_) if is_infinity_word => None,
+        Ok(v) if v.is_infinite() || (single && (v as f32).is_infinite()) => Some((
+            format!("value \"{input}\" is out of range for type {type_name}"),
+            "22003".to_string(),
+        )),
+        Ok(_) => None,
+        Err(_) => Some((
+            format!("invalid input syntax for type {type_name}: \"{input}\""),
+            "22P02".to_string(),
         )),
     }
 }

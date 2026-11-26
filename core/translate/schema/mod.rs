@@ -1490,6 +1490,9 @@ pub fn translate_create_table(
     resolver.with_schema(database_id, |schema| {
         table.resolve_types_and_domains(schema)
     })?;
+    for column in table.columns() {
+        check_default_type(column, resolver)?;
+    }
     let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
@@ -1645,6 +1648,33 @@ pub fn translate_create_table(
     });
 
     Ok(())
+}
+
+/// Asks the dialect whether the DEFAULT of `column` can be written to it.
+pub(crate) fn check_default_type(column: &Column, resolver: &Resolver) -> Result<()> {
+    let Some(default) = column.default.as_deref() else {
+        return Ok(());
+    };
+    if column.ty_str.is_empty() {
+        return Ok(());
+    }
+    let source = || {
+        crate::translate::expr::expr_type::cast_source_of(
+            default,
+            &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+            resolver.schema(),
+        )
+    };
+    let column_type = crate::translate::expr::expr_type::type_ref_of_name(
+        &column.ty_str,
+        column.array_dimensions(),
+        resolver.schema(),
+    );
+    resolver.catalog.dialect.check_column_default(
+        column.name.as_deref().unwrap_or_default(),
+        &source,
+        &column_type,
+    )
 }
 
 /// Translates `CREATE SCHEMA name`: a new namespace of the main

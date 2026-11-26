@@ -9,7 +9,7 @@ use crate::ast::ResultColumn;
 use crate::ast::SortOrder;
 use crate::ast::{self, CompoundSelect, Expr};
 use crate::dialect::SortTermMatching;
-use crate::schema::Table;
+use crate::schema::{Column, Table};
 use crate::security::policy::Command;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
@@ -50,33 +50,36 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    translate_select_with_source(
+    let (num_result_cols, _) = translate_select_with_source(
         select,
         resolver,
         program,
         query_destination,
         connection,
-        false,
-    )
+        None,
+    )?;
+    Ok(num_result_cols)
 }
 
 /// [translate_select] for the rows of `INSERT INTO t VALUES (...), (...)`. An
 /// INSERT converts each row to its target column, so a bare VALUES source does
 /// not need one type for the rows of a column, whatever WITH clause it carries.
+/// `value_columns` has the column that each value of a row is written to.
 pub fn translate_insert_source_select(
     select: ast::Select,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
-) -> Result<usize> {
+    value_columns: &[Option<&Column>],
+) -> Result<(usize, Vec<crate::dialect::CastSource>)> {
     translate_select_with_source(
         select,
         resolver,
         program,
         query_destination,
         connection,
-        true,
+        Some(value_columns),
     )
 }
 
@@ -87,9 +90,9 @@ fn translate_select_with_source(
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
-    is_insert_source: bool,
-) -> Result<usize> {
-    let plan = prepare_select_plan_from_arms(
+    insert_value_columns: Option<&[Option<&Column>]>,
+) -> Result<(usize, Vec<crate::dialect::CastSource>)> {
+    let mut plan = prepare_select_plan_from_arms(
         select.body.select,
         select.body.compounds,
         select.with,
@@ -100,14 +103,70 @@ fn translate_select_with_source(
         &[],
         query_destination,
         connection,
-        is_insert_source,
+        insert_value_columns.is_some(),
     )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
             crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
         }
     }
-    emit_select_plan(plan, resolver, program, connection)
+    let sources = match insert_value_columns {
+        Some(value_columns) => insert_value_sources(&mut plan, value_columns, resolver)?,
+        None => Vec::new(),
+    };
+    let num_result_cols = emit_select_plan(plan, resolver, program, connection)?;
+    Ok((num_result_cols, sources))
+}
+
+/// The source type of each value of the rows that `plan` gives an INSERT.
+/// The rows of a VALUES list can differ in type, so each of their values is
+/// converted here to its column in `value_columns`, and has no source type
+/// left.
+fn insert_value_sources(
+    plan: &mut Plan,
+    value_columns: &[Option<&Column>],
+    resolver: &Resolver,
+) -> Result<Vec<crate::dialect::CastSource>> {
+    if let Plan::Select(select) = plan {
+        if !select.values.is_empty() {
+            cast_values_rows_to_columns(select, value_columns, resolver)?;
+            return Ok(vec![
+                crate::dialect::CastSource::Unnamed;
+                select.result_columns.len()
+            ]);
+        }
+    }
+    let (_, types) = crate::translate::plan::query_output_columns(plan, None, resolver)?;
+    Ok(types
+        .into_iter()
+        .map(|ty| crate::translate::expr::expr_type::dialect_cast_source(ty, resolver.schema()))
+        .collect())
+}
+
+fn cast_values_rows_to_columns(
+    select: &mut SelectPlan,
+    value_columns: &[Option<&Column>],
+    resolver: &Resolver,
+) -> Result<()> {
+    let env =
+        crate::translate::expr::expr_type::TypeEnv::new(Some(&select.table_references), resolver);
+    for row in &mut select.values {
+        for (value, column) in row.iter_mut().zip(value_columns) {
+            let Some(column) = column else {
+                continue;
+            };
+            let source = || {
+                crate::translate::expr::expr_type::cast_source_of(value, &env, resolver.schema())
+            };
+            let converted = crate::translate::emitter::new_values::assignment_cast(
+                value, &source, column, resolver,
+            )?;
+            if let Some(converted) = converted {
+                **value = converted;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Optimize and emit bytecode for an already-prepared select plan.

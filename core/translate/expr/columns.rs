@@ -82,7 +82,12 @@ pub(super) fn do_emit_table_column(
                     .expect("a virtual column read in a query belongs to a btree table in it"),
                 SelfTableContext::ForDML { table, .. } => Arc::clone(table),
             };
-            emit_virtual_column_store(program, resolver, column, target_register, &table)?;
+            let source = super::expr_type::cast_source_of(
+                expr,
+                &super::expr_type::TypeEnv::new(referenced_tables, resolver),
+                resolver.schema(),
+            );
+            emit_virtual_column_store(program, resolver, column, target_register, &table, source)?;
             program.emit_column_affinity(target_register, column.affinity());
             if let Some(end) = end_column_emission {
                 program.preassign_label_to_next_insn(end);
@@ -162,6 +167,18 @@ pub(crate) fn emit_encoded_default(
         target_register,
         resolver,
         NoConstantOptReason::RegisterReuse,
+    )?;
+    let source = super::expr_type::cast_source_of(
+        default_expr,
+        &super::expr_type::TypeEnv::new(None, resolver),
+        resolver.schema(),
+    );
+    crate::translate::emitter::new_values::emit_assignment_cast(
+        program,
+        resolver,
+        column,
+        target_register,
+        &|| source.clone(),
     )?;
     emit_custom_type_encode_columns(
         program,

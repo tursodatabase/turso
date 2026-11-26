@@ -75,17 +75,15 @@ fn gap_a_15_int_param_text_int_arithmetic(db: TempDatabase) {
 }
 
 // A-18 (S1): invalid uuid param cast
-// tursopg: an invalid uuid param is accepted.
-// PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
-fn gap_a_18_tursopg_returns_wrong_result_invalid_uuid_param_cast(db: TempDatabase) {
+fn gap_a_18_invalid_uuid_param_cast(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::uuid",
         params: &[P::Text("nope")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "nope");
+    assert_eq!(out, "ERROR 22P02");
 }
 
 // A-29 (S2): numeric $n param
