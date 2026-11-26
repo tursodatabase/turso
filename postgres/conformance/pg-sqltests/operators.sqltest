@@ -552,9 +552,6 @@ expect {
     f|t|t|t
 }
 
-# tursopg does not check an operand that is a subquery, or that reads a
-# column of a subquery or of a catalog table.
-@compat-gap "operator:text = int4"
 @setup operands
 test text-equals-integer-subquery-errors {
     SELECT s = (SELECT 1) FROM operands;
@@ -562,9 +559,6 @@ test text-equals-integer-subquery-errors {
 @sqlstate 42883
 expect error {
     operator does not exist: text = integer
-}
-expect @tursopg {
-    t
 }
 
 # The catalog tables of tursopg declare some columns with another type than
@@ -1194,16 +1188,12 @@ expect @tursopg error {
     cannot compare type oid with type int4
 }
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-equals-scalar-subquery-of-negative-integer {
     SELECT count(*) FROM t WHERE o = (SELECT -1);
 }
 expect {
     1
-}
-expect @tursopg {
-    0
 }
 
 @setup oid_operands

@@ -1530,13 +1530,30 @@ fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
                                 true
                             } else {
                                 subquery_columns_seen.push((*table, *column));
-                                derived_column_reads_only_declared_types(subquery, *column, env)
+                                query_column_reads_only_declared_types(&subquery.plan, *column, env)
                             }
                         }
                         Some((_, table)) => table.is_strict(),
                         None => false,
                     }
                 }
+                ast::Expr::SubqueryResult {
+                    subquery_id,
+                    query_type:
+                        ast::SubqueryType::RowValue {
+                            result_reg_start,
+                            num_regs: 1,
+                            ..
+                        },
+                    ..
+                } => env
+                    .resolver()
+                    .and_then(|resolver| resolver.row_value_subqueries.get(*subquery_id))
+                    .is_some_and(|subquery| {
+                        subquery
+                            .column(*result_reg_start)
+                            .is_some_and(|column| column.reads_only_declared_types)
+                    }),
                 ast::Expr::SubqueryResult { .. }
                 | ast::Expr::Subquery(_)
                 | ast::Expr::Register { .. } => false,
@@ -1548,17 +1565,17 @@ fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
     declared
 }
 
-/// Whether the values of column `column` of the derived table `subquery`, in
-/// each of its SELECTs and each row of a VALUES list, read only declared types.
-fn derived_column_reads_only_declared_types(
-    subquery: &crate::schema::FromClauseSubquery,
+/// Whether the values of column `column` of the query `plan`, in each of its
+/// SELECTs and each row of a VALUES list, read only declared types.
+pub(crate) fn query_column_reads_only_declared_types(
+    plan: &Plan,
     column: usize,
     env: &TypeEnv,
 ) -> bool {
     let Some(resolver) = env.resolver() else {
         return false;
     };
-    let selects: Vec<&SelectPlan> = match subquery.plan.as_ref() {
+    let selects: Vec<&SelectPlan> = match plan {
         Plan::Select(select) => vec![select],
         Plan::CompoundSelect {
             left, right_most, ..
