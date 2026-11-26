@@ -526,6 +526,21 @@ pub trait IO: Clock + Send + Sync {
         false
     }
 
+    /// Whether this backend keeps its files only in process memory with no
+    /// representation an independent reader could open from the host file
+    /// system — the volatile store behind a `:memory:` database
+    /// ([`crate::MemoryIO`]). `VACUUM INTO` builds its destination copy
+    /// through the source database's IO, but a source on such a backend has
+    /// no host file at all, so the copy would never land where a caller that
+    /// reopens the path expects it; the copy is built through the platform IO
+    /// instead, as it already is for a `:memory:` source. A simulator or VFS
+    /// IO that models a durable file system (its files survive a reopen on the
+    /// same instance and feed recovery tests) must keep the default `false`,
+    /// so its `VACUUM INTO` destination stays inside that IO.
+    fn is_in_memory(&self) -> bool {
+        false
+    }
+
     /// Moves the file at `from` to `to`, replacing a file there, in one
     /// step that a crash cannot leave half done, and makes the move
     /// durable. Only when [`IO::supports_rename`] says so.

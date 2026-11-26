@@ -20081,11 +20081,20 @@ fn op_vacuum_into_inner(
                         None,
                     )
                 } else {
-                    let io: Arc<dyn crate::IO> = if source_db.is_in_memory_db() {
-                        Arc::new(crate::io::PlatformIO::new()?)
-                    } else {
-                        source_db.io.clone()
-                    };
+                    // A file-backed copy is built through the source
+                    // database's IO so a source on io_uring, or under a
+                    // simulator or VFS IO, copies through it as well. A
+                    // source that is only in memory — a `:memory:` database,
+                    // or any database on a volatile in-memory IO — has no
+                    // host file, so its copy is built through the platform IO
+                    // instead and lands on disk where the destination path
+                    // names it.
+                    let io: Arc<dyn crate::IO> =
+                        if source_db.is_in_memory_db() || source_db.io.is_in_memory() {
+                            Arc::new(crate::io::PlatformIO::new()?)
+                        } else {
+                            source_db.io.clone()
+                        };
                     let dest_path = if crate::is_memory_like(&target.path) {
                         format!("./{}", target.path)
                     } else {
