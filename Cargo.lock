@@ -7416,6 +7416,7 @@ dependencies = [
  "anyhow",
  "clap",
  "similar",
+ "turso_pg_scanner",
 ]
 
 [[package]]

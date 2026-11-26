@@ -49,6 +49,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use turso_pg_scanner::{LexState, Scanner, Segment, VariableQuoting};
 
 /// Default endpoint when neither `--dsn` nor `PGREGRESS_DSN` is set.
 const DEFAULT_DSN: &str = "postgres://127.0.0.1:5432/regression";
@@ -278,7 +279,7 @@ fn run_script(args: &Args, params: &ConnParams, script: &Path) -> Result<TestRes
 fn run_transcript(params: &ConnParams, name: &str, source: &str) -> Result<String> {
     let mut session = Session::new(PgConn::connect(params, name)?, params.clone(), name);
     let mut out = String::new();
-    let mut scanner = Scanner::default();
+    let mut scanner = ScriptReader::default();
 
     let mut lines = source.split_inclusive('\n');
     while let Some(raw) = lines.next() {
@@ -298,21 +299,12 @@ fn run_transcript(params: &ConnParams, name: &str, source: &str) -> Result<Strin
             out.push_str(line);
             out.push('\n');
         }
-        for item in scanner.feed_line(line, &session.vars)? {
-            match item {
-                Item::Statement(stmt) => {
-                    if !session.active() {
-                        continue;
-                    }
-                    if session.execute(&stmt, &mut out)? == Outcome::CopyIn {
-                        session.feed_copy_data(&mut lines, &mut out)?;
-                    }
-                }
-                Item::MetaCommand(cmd) => {
-                    session.meta_command(&cmd, &mut scanner, &mut lines, &mut out)?
-                }
-            }
-        }
+        let mut transcript = Transcript {
+            session: &mut session,
+            lines: &mut lines,
+            out: &mut out,
+        };
+        run_line(&mut scanner, line, &mut transcript)?;
     }
     // psql executes whatever is left in the query buffer at EOF even without
     // a terminating semicolon.
@@ -324,6 +316,76 @@ fn run_transcript(params: &ConnParams, name: &str, source: &str) -> Result<Strin
         }
     }
     Ok(out)
+}
+
+/// What runs the statements and meta-commands of a script.
+trait Interpreter {
+    /// Whether the current `\if` branch runs.
+    fn active(&self) -> bool;
+    fn vars(&self) -> &HashMap<String, String>;
+    /// Whether a meta-command has ended the script.
+    fn quit(&self) -> bool;
+    /// Runs one statement or meta-command. Returns false when a
+    /// meta-command is unknown or failed.
+    fn run(&mut self, item: Item, scanner: &mut ScriptReader) -> Result<bool>;
+}
+
+/// Reads one line of a script and runs what it ends. As in psql, each
+/// meta-command runs before the text after it is read, and the rest of the
+/// line does not run after a meta-command that is unknown or failed.
+fn run_line(scanner: &mut ScriptReader, line: &str, interp: &mut impl Interpreter) -> Result<()> {
+    let input = format!("{line}\n");
+    let mut from = 0;
+    loop {
+        let (items, resume) = scanner.feed(&input[from..], interp.active(), interp.vars())?;
+        let mut ok = true;
+        for item in items {
+            ok = interp.run(item, scanner)?;
+        }
+        match resume {
+            _ if interp.quit() => return Ok(()),
+            Some(resume) if ok => from += resume,
+            // psql drops the rest of the line, but keeps the newline
+            // between the lines of a statement.
+            Some(_) if from < input.len() - 1 => from = input.len() - 1,
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// A session with the rest of its script and its transcript.
+struct Transcript<'a, L> {
+    session: &'a mut Session,
+    lines: &'a mut L,
+    out: &'a mut String,
+}
+
+impl<'s, L: Iterator<Item = &'s str>> Interpreter for Transcript<'_, L> {
+    fn active(&self) -> bool {
+        self.session.active()
+    }
+
+    fn vars(&self) -> &HashMap<String, String> {
+        &self.session.vars
+    }
+
+    fn quit(&self) -> bool {
+        self.session.quit
+    }
+
+    fn run(&mut self, item: Item, scanner: &mut ScriptReader) -> Result<bool> {
+        match item {
+            Item::Statement(stmt) => {
+                if self.session.execute(&stmt, self.out)? == Outcome::CopyIn {
+                    self.session.feed_copy_data(self.lines, self.out)?;
+                }
+                Ok(true)
+            }
+            Item::MetaCommand(cmd) => self
+                .session
+                .meta_command(&cmd, scanner, self.lines, self.out),
+        }
+    }
 }
 
 /// Rendering state mutable via psql meta-commands.
@@ -354,6 +416,24 @@ struct CondFrame {
     taken: bool,
     /// Whether the surrounding scope was active when `\if` was read.
     parent_active: bool,
+    /// The query buffer and the scanner's state at the start of the current
+    /// branch, which psql goes back to when it leaves a branch that did not
+    /// run.
+    saved: QueryState,
+}
+
+impl CondFrame {
+    /// Ends the current branch. The text that a branch that did not run
+    /// added to the query buffer goes, and so do the parentheses and the
+    /// `BEGIN` it opened, as psql's discard_query_text does. After a branch that ran, the query
+    /// buffer as it is becomes the start of the next branch.
+    fn leave_branch(&mut self, scanner: &mut ScriptReader) {
+        if self.active {
+            self.saved = scanner.query_state();
+        } else {
+            scanner.restore_query_state(self.saved);
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -543,23 +623,25 @@ impl Session {
     /// for the send commands (`\g`, `\gset`, `\gexec`); `lines` provides data
     /// for a `\copy ... from stdin`. Unknown commands render psql's
     /// `invalid command` line and continue, so one emulation gap cannot abort
-    /// a whole script.
+    /// a whole script. Returns false when the command is unknown or failed,
+    /// after which psql drops the rest of the line.
     fn meta_command<'a>(
         &mut self,
         cmd: &str,
-        scanner: &mut Scanner,
+        scanner: &mut ScriptReader,
         lines: &mut impl Iterator<Item = &'a str>,
         out: &mut String,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let rest = cmd.strip_prefix('\\').unwrap_or(cmd);
         let (name, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
 
         // Inside a false branch only the conditional commands execute; psql
         // parses and discards everything else, including \quit.
         if !self.active() && !matches!(name, "if" | "elif" | "else" | "endif") {
-            return Ok(());
+            return Ok(true);
         }
 
+        let mut ok = true;
         match name {
             "if" => {
                 let parent = self.active();
@@ -574,30 +656,41 @@ impl Session {
                     active: parent && value,
                     taken: value,
                     parent_active: parent,
+                    saved: scanner.query_state(),
                 });
             }
             "elif" => {
                 let value = parse_bool(&self.meta_args(rest).join(" ")).unwrap_or(false);
                 match self.cond.last_mut() {
                     Some(f) => {
+                        f.leave_branch(scanner);
                         f.active = f.parent_active && !f.taken && value;
                         f.taken |= value;
                     }
-                    None => out.push_str("\\elif: no matching \\if\n"),
+                    None => {
+                        out.push_str("\\elif: no matching \\if\n");
+                        ok = false;
+                    }
                 }
             }
             "else" => match self.cond.last_mut() {
                 Some(f) => {
+                    f.leave_branch(scanner);
                     f.active = f.parent_active && !f.taken;
                     f.taken = true;
                 }
-                None => out.push_str("\\else: no matching \\if\n"),
-            },
-            "endif" => {
-                if self.cond.pop().is_none() {
-                    out.push_str("\\endif: no matching \\if\n");
+                None => {
+                    out.push_str("\\else: no matching \\if\n");
+                    ok = false;
                 }
-            }
+            },
+            "endif" => match self.cond.pop() {
+                Some(mut f) => f.leave_branch(scanner),
+                None => {
+                    out.push_str("\\endif: no matching \\if\n");
+                    ok = false;
+                }
+            },
             "quit" | "q" => self.quit = true,
             "set" => {
                 let args = self.meta_args(rest);
@@ -647,7 +740,10 @@ impl Session {
                     [option, value] if option == "null" => {
                         self.opts.null_display.clone_from(value);
                     }
-                    _ => out.push_str(&format!("\\pset: unsupported option: {rest}\n")),
+                    _ => {
+                        out.push_str(&format!("\\pset: unsupported option: {rest}\n"));
+                        ok = false;
+                    }
                 }
             }
             "c" | "connect" => {
@@ -696,11 +792,14 @@ impl Session {
             "." => {} // stray copy terminator (COPY failed to start); ignore
             _ if name.starts_with('d') || name == "sv" || name == "sf" => {
                 let args = self.meta_args(rest);
-                describe::run(self, name, &args, out)?;
+                ok = describe::run(self, name, &args, out)?;
             }
-            _ => out.push_str(&format!("invalid command \\{name}\n")),
+            _ => {
+                out.push_str(&format!("invalid command \\{name}\n"));
+                ok = false;
+            }
         }
-        Ok(())
+        Ok(ok)
     }
 
     /// Stores a variable, applying the side effects of psql's special ones.
@@ -897,15 +996,12 @@ fn interpolate_var(chars: &[char], vars: &HashMap<String, String>) -> Option<(St
     if name.is_empty() {
         return None;
     }
-    let value = vars.get(&name)?;
-    let text = match quote {
-        // :'name' — value as an escaped SQL string literal.
-        Some('\'') => format!("'{}'", value.replace('\'', "''")),
-        // :"name" — value as a quoted SQL identifier.
-        Some('"') => format!("\"{}\"", value.replace('"', "\"\"")),
-        _ => value.clone(),
+    let quoting = match quote {
+        Some('\'') => VariableQuoting::Literal,
+        Some(_) => VariableQuoting::Identifier,
+        None => VariableQuoting::None,
     };
-    Some((text, i))
+    Some((variable_value(&name, quoting, vars)?, i))
 }
 
 /// Splits a `\copy` spec into (table-or-query, direction keyword, target,
@@ -969,194 +1065,104 @@ fn split_copy_spec(spec: &str) -> Option<(String, String, String, String)> {
 // Script scanning: psql's input loop
 // ---------------------------------------------------------------------------
 
-/// Lexer state carried across input lines.
-#[derive(Default, Clone, Copy, PartialEq)]
-enum LexState {
-    #[default]
-    Normal,
-    SingleQuote,
-    /// `E'...'` string, where backslash escapes a following quote.
-    EscapeQuote,
-    DoubleQuote,
-    BlockComment(u32),
-}
-
 /// One unit of work produced by the scanner.
 enum Item {
     /// A complete SQL statement to send to the server.
     Statement(String),
-    /// A whole-line psql meta-command (backslash command).
+    /// A psql meta-command (backslash command) with its arguments.
     MetaCommand(String),
 }
 
-/// Splits script input into statements the way psql's scanner does: `--`
-/// comments are stripped (they are never sent to the server, which is why
-/// upstream transcripts report `LINE 1:` for statements preceded by comment
-/// lines), leading whitespace of a fresh statement is skipped, and newlines
-/// inside a statement are preserved so error positions map to the right line.
+/// Splits script input into statements the way psql does, with the
+/// statement scanner that tursopg's shell uses: whitespace and `--`
+/// comments before a statement are skipped (which is why upstream
+/// transcripts report `LINE 1:` for statements preceded by comment lines),
+/// and newlines inside a
+/// statement are preserved so error positions map to the right line.
 #[derive(Default)]
-struct Scanner {
+struct ScriptReader {
     buf: String,
-    state: LexState,
-    dollar_tag: Option<String>,
+    scanner: Scanner,
 }
 
-impl Scanner {
-    /// Feeds one input line (without its newline) and returns the statements
-    /// and meta-commands it completed, in order. `vars` drives psql variable
-    /// interpolation (`:name`, `:'name'`, `:"name"`) outside quotes.
-    fn feed_line(&mut self, line: &str, vars: &HashMap<String, String>) -> Result<Vec<Item>> {
+impl ScriptReader {
+    /// Reads `input`, a line with its newline or the rest of one, up to the
+    /// end of its first meta-command. Returns the statements and the
+    /// meta-command it completed, in order, and the byte where the rest of
+    /// `input` starts, which the caller reads after it runs the
+    /// meta-command, as psql does. `active` says whether the current `\if`
+    /// branch runs: in one that does not, a semicolon stays in the query
+    /// buffer, as in psql, and the branch's text goes when it ends. `vars`
+    /// drives psql variable interpolation (`:name`, `:'name'`, `:"name"`)
+    /// outside quotes.
+    fn feed(
+        &mut self,
+        input: &str,
+        active: bool,
+        vars: &HashMap<String, String>,
+    ) -> Result<(Vec<Item>, Option<usize>)> {
         let mut completed = Vec::new();
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            let next = chars.get(i + 1).copied();
-            match self.state {
-                LexState::Normal => {
-                    if let Some(tag) = self.dollar_tag.clone() {
-                        // Inside $tag$ ... $tag$: look for the closing tag.
-                        if c == '$' && line[byte_at(line, i)..].starts_with(&tag) {
-                            self.buf.push_str(&tag);
-                            i += tag.chars().count();
-                            self.dollar_tag = None;
-                            continue;
-                        }
-                        self.buf.push(c);
-                    } else if c == '-' && next == Some('-') {
-                        break; // line comment: strip to end of line
-                    } else if c == '/' && next == Some('*') {
-                        self.buf.push_str("/*");
-                        self.state = LexState::BlockComment(1);
-                        i += 2;
-                        continue;
-                    } else if c == '\'' {
-                        let escape_string = self.buf.chars().last().is_some_and(|p| {
-                            (p == 'e' || p == 'E')
-                                && !self
-                                    .buf
-                                    .chars()
-                                    .rev()
-                                    .nth(1)
-                                    .is_some_and(|q| q.is_alphanumeric() || q == '_')
-                        });
-                        self.buf.push(c);
-                        self.state = if escape_string {
-                            LexState::EscapeQuote
-                        } else {
-                            LexState::SingleQuote
-                        };
-                    } else if c == '"' {
-                        self.buf.push(c);
-                        self.state = LexState::DoubleQuote;
-                    } else if c == '$' {
-                        // Possible dollar-quote opener: $tag$ where tag is
-                        // empty or an identifier.
-                        if let Some(tag) = scan_dollar_tag(&chars[i..]) {
-                            self.buf.push_str(&tag);
-                            i += tag.chars().count();
-                            self.dollar_tag = Some(tag);
-                            continue;
-                        }
-                        self.buf.push(c);
-                    } else if c == '\\' {
-                        // A backslash outside quotes starts a meta-command
-                        // that runs to end of line; the query buffer stays
-                        // for send commands like `SELECT ... \gset`.
-                        let rest: String = chars[i..].iter().collect();
-                        completed.push(Item::MetaCommand(rest.trim().to_string()));
-                        return Ok(completed);
-                    } else if c == ':' && !self.buf.ends_with(':') {
-                        // psql variable interpolation, skipping `::` casts.
-                        if let Some((text, consumed)) = interpolate_var(&chars[i..], vars) {
-                            self.buf.push_str(&text);
-                            i += consumed;
-                            continue;
-                        }
-                        self.buf.push(c);
-                    } else if c == ';' {
-                        self.buf.push(c);
-                        completed.push(Item::Statement(std::mem::take(&mut self.buf)));
-                    } else if c.is_whitespace() && self.buf.is_empty() {
-                        // psql suppresses whitespace at the start of a statement.
-                    } else {
-                        self.buf.push(c);
-                    }
-                }
-                LexState::SingleQuote => {
-                    self.buf.push(c);
-                    if c == '\'' {
-                        if next == Some('\'') {
-                            self.buf.push('\'');
-                            i += 2;
-                            continue;
-                        }
-                        self.state = LexState::Normal;
-                    }
-                }
-                LexState::EscapeQuote => {
-                    self.buf.push(c);
-                    if c == '\\' {
-                        if let Some(n) = next {
-                            self.buf.push(n);
-                            i += 2;
-                            continue;
-                        }
-                    } else if c == '\'' {
-                        if next == Some('\'') {
-                            self.buf.push('\'');
-                            i += 2;
-                            continue;
-                        }
-                        self.state = LexState::Normal;
-                    }
-                }
-                LexState::DoubleQuote => {
-                    self.buf.push(c);
-                    if c == '"' {
-                        if next == Some('"') {
-                            self.buf.push('"');
-                            i += 2;
-                            continue;
-                        }
-                        self.state = LexState::Normal;
-                    }
-                }
-                LexState::BlockComment(depth) => {
-                    if c == '*' && next == Some('/') {
-                        self.buf.push_str("*/");
-                        i += 2;
-                        self.state = if depth == 1 {
-                            LexState::Normal
-                        } else {
-                            LexState::BlockComment(depth - 1)
-                        };
-                        continue;
-                    }
-                    if c == '/' && next == Some('*') {
-                        self.buf.push_str("/*");
-                        i += 2;
-                        self.state = LexState::BlockComment(depth + 1);
-                        continue;
-                    }
-                    self.buf.push(c);
+        let buf = &mut self.buf;
+        let resume = self.scanner.scan(input, |segment| match segment {
+            Segment::Code(text) => {
+                // psql suppresses whitespace at the start of a statement.
+                let text = if buf.is_empty() {
+                    text.trim_start()
+                } else {
+                    text
+                };
+                buf.push_str(text);
+            }
+            Segment::Quoted(text) => buf.push_str(text),
+            // psql suppresses `--` comments at the start of a statement, but
+            // sends the ones inside it, which the server shows in `LINE n:`.
+            Segment::LineComment(text) => {
+                if !buf.is_empty() {
+                    buf.push_str(text);
                 }
             }
-            i += 1;
-        }
-        if !self.buf.is_empty() {
-            self.buf.push('\n');
-        }
-        Ok(completed)
+            Segment::End => {
+                buf.push(';');
+                if active {
+                    completed.push(Item::Statement(std::mem::take(buf)));
+                }
+            }
+            Segment::Variable {
+                text,
+                name,
+                quoting,
+            } => match variable_value(name, quoting, vars) {
+                Some(value) => buf.push_str(&value),
+                // psql leaves a reference to an undefined variable as written.
+                None => buf.push_str(text),
+            },
+            // A meta-command runs to end of line; the query buffer stays for
+            // send commands like `SELECT ... \gset`.
+            Segment::MetaCommand(command) => {
+                completed.push(Item::MetaCommand(command.trim().to_string()))
+            }
+        });
+        Ok((completed, resume))
     }
 
-    /// Whether the scanner is inside a quoted string (psql_scan_in_quote).
+    /// The query buffer and the scanner's state.
+    fn query_state(&self) -> QueryState {
+        QueryState {
+            len: self.buf.len(),
+            lex: self.scanner.lex_state(),
+        }
+    }
+
+    /// Goes back to the query buffer and the scanner's state of `state`.
+    fn restore_query_state(&mut self, state: QueryState) {
+        self.buf.truncate(state.len);
+        self.scanner.set_lex_state(state.lex);
+    }
+
+    /// Whether the scanner is inside a quoted string or a block comment
+    /// (psql_scan_in_quote).
     fn in_quote(&self) -> bool {
-        self.dollar_tag.is_some()
-            || matches!(
-                self.state,
-                LexState::SingleQuote | LexState::EscapeQuote | LexState::DoubleQuote
-            )
+        self.scanner.in_quote()
     }
 
     /// Returns the unterminated trailing statement at EOF, if any. A buffer
@@ -1169,9 +1175,37 @@ impl Scanner {
     }
 
     /// Takes the current query buffer for a send command (`\g`, `\gset`).
+    /// psql starts the next statement afresh, as psql_scan_reset does.
     fn take_buffer(&mut self) -> String {
+        self.scanner = Scanner::default();
         std::mem::take(&mut self.buf).trim().to_string()
     }
+}
+
+/// The length of the query buffer and the scanner's state at a point of
+/// the script, as psql saves them at `\if`: the depth of parentheses and of
+/// `BEGIN`, and the first keywords of the statement.
+#[derive(Clone, Copy)]
+struct QueryState {
+    len: usize,
+    lex: LexState,
+}
+
+/// The text that a reference to psql variable `name` stands for, quoted as
+/// `quoting` says, or None when the variable is not defined.
+fn variable_value(
+    name: &str,
+    quoting: VariableQuoting,
+    vars: &HashMap<String, String>,
+) -> Option<String> {
+    let value = vars.get(name)?;
+    Some(match quoting {
+        // :'name' — value as an escaped SQL string literal.
+        VariableQuoting::Literal => format!("'{}'", value.replace('\'', "''")),
+        // :"name" — value as a quoted SQL identifier.
+        VariableQuoting::Identifier => format!("\"{}\"", value.replace('"', "\"\"")),
+        VariableQuoting::None => value.clone(),
+    })
 }
 
 /// Whether the text is nothing but block comments and whitespace.
@@ -1201,33 +1235,6 @@ fn is_only_comments(text: &str) -> bool {
         }
     }
     rest.is_empty()
-}
-
-/// Byte offset of the `i`-th character of `s`.
-fn byte_at(s: &str, i: usize) -> usize {
-    s.char_indices()
-        .nth(i)
-        .map(|(b, _)| b)
-        .unwrap_or_else(|| s.len())
-}
-
-/// Scans a dollar-quote delimiter (`$`, optional identifier tag, `$`)
-/// starting at `chars[0] == '$'`. Returns the full delimiter text.
-fn scan_dollar_tag(chars: &[char]) -> Option<String> {
-    debug_assert_eq!(chars[0], '$');
-    let mut tag = String::from("$");
-    for &c in &chars[1..] {
-        if c == '$' {
-            tag.push('$');
-            return Some(tag);
-        }
-        if c.is_alphanumeric() || c == '_' {
-            tag.push(c);
-        } else {
-            return None;
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,14 +1692,25 @@ mod tests {
             .collect()
     }
 
-    fn feed(scanner: &mut Scanner, line: &str, vars: &HashMap<String, String>) -> Vec<Item> {
-        scanner.feed_line(line, vars).unwrap()
+    /// Reads `line` in a branch that runs, as the runner does.
+    fn feed(scanner: &mut ScriptReader, line: &str, vars: &HashMap<String, String>) -> Vec<Item> {
+        let input = format!("{line}\n");
+        let mut items = Vec::new();
+        let mut from = 0;
+        loop {
+            let (more, resume) = scanner.feed(&input[from..], true, vars).unwrap();
+            items.extend(more);
+            match resume {
+                Some(resume) => from += resume,
+                None => return items,
+            }
+        }
     }
 
     #[test]
     fn statement_interpolates_plain_quoted_and_identifier_variables() {
         let vars = vars(&[("filename", "/tmp/agg.data"), ("col", "f1")]);
-        let mut scanner = Scanner::default();
+        let mut scanner = ScriptReader::default();
         let items = feed(&mut scanner, "COPY onek FROM :'filename';", &vars);
         match items.as_slice() {
             [Item::Statement(s)] => assert_eq!(s, "COPY onek FROM '/tmp/agg.data';"),
@@ -1708,7 +1726,7 @@ mod tests {
     #[test]
     fn double_colon_casts_and_unknown_variables_stay_literal() {
         let vars = vars(&[("int", "BOOM")]);
-        let mut scanner = Scanner::default();
+        let mut scanner = ScriptReader::default();
         let items = feed(&mut scanner, "SELECT 1::int, :missing;", &vars);
         match items.as_slice() {
             [Item::Statement(s)] => assert_eq!(s, "SELECT 1::int, :missing;"),
@@ -1719,7 +1737,7 @@ mod tests {
     #[test]
     fn variables_inside_string_literals_are_not_interpolated() {
         let vars = vars(&[("x", "BOOM")]);
-        let mut scanner = Scanner::default();
+        let mut scanner = ScriptReader::default();
         let items = feed(&mut scanner, "SELECT ':x';", &vars);
         match items.as_slice() {
             [Item::Statement(s)] => assert_eq!(s, "SELECT ':x';"),
@@ -1730,7 +1748,7 @@ mod tests {
     #[test]
     fn trailing_gset_becomes_meta_command_and_keeps_the_buffer() {
         let vars = HashMap::new();
-        let mut scanner = Scanner::default();
+        let mut scanner = ScriptReader::default();
         let items = feed(&mut scanner, "SELECT 1 AS x \\gset", &vars);
         match items.as_slice() {
             [Item::MetaCommand(cmd)] => assert_eq!(cmd, "\\gset"),
@@ -1742,7 +1760,7 @@ mod tests {
     #[test]
     fn backslash_inside_quotes_does_not_start_a_meta_command() {
         let vars = HashMap::new();
-        let mut scanner = Scanner::default();
+        let mut scanner = ScriptReader::default();
         let items = feed(&mut scanner, "SELECT E'a\\n', '\\x';", &vars);
         match items.as_slice() {
             [Item::Statement(s)] => assert_eq!(s, "SELECT E'a\\n', '\\x';"),
@@ -1767,14 +1785,291 @@ mod tests {
     }
 
     #[test]
+    fn statements_end_where_psql_ends_them() {
+        let vars = HashMap::new();
+        let statements = |lines: &[&str]| {
+            let mut scanner = ScriptReader::default();
+            lines
+                .iter()
+                .flat_map(|line| feed(&mut scanner, line, &vars))
+                .map(|item| match item {
+                    Item::Statement(s) => s,
+                    Item::MetaCommand(c) => panic!("unexpected meta-command {c}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        // A semicolon inside parentheses does not end the statement.
+        assert_eq!(
+            statements(&[
+                "CREATE RULE r AS ON INSERT TO t DO ALSO (SELECT 1;",
+                "SELECT 2);"
+            ]),
+            ["CREATE RULE r AS ON INSERT TO t DO ALSO (SELECT 1;\nSELECT 2);"]
+        );
+        // Nor does one in a BEGIN ATOMIC body.
+        assert_eq!(
+            statements(&[
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC",
+                "SELECT 1;",
+                "END;",
+            ]),
+            ["CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC\nSELECT 1;\nEND;"]
+        );
+        // `a$b$` is an identifier, not the start of a dollar-quoted string.
+        assert_eq!(
+            statements(&["SELECT 1 AS a$b$;", "SELECT 2;"]),
+            ["SELECT 1 AS a$b$;", "SELECT 2;"]
+        );
+    }
+
+    /// psql drops a `--` comment before a statement and sends one inside
+    /// it, so the server shows the comment in `LINE n:`, as with.out and
+    /// aggregates.out expect. The runner dropped every `--` comment.
+    #[test]
+    fn line_comments_inside_a_statement_are_sent() {
+        let vars = HashMap::new();
+        let mut scanner = ScriptReader::default();
+        let statements = ["-- before", "SELECT nosuchcol -- c", "FROM t; -- after"]
+            .iter()
+            .flat_map(|line| feed(&mut scanner, line, &vars))
+            .map(|item| match item {
+                Item::Statement(s) => s,
+                Item::MetaCommand(c) => panic!("unexpected meta-command {c}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(statements, ["SELECT nosuchcol -- c\nFROM t;"]);
+        assert_eq!(scanner.take_rest(), None);
+    }
+
+    #[test]
+    fn backslash_semicolon_joins_statements_into_one_query() {
+        let vars = HashMap::new();
+        let mut scanner = ScriptReader::default();
+        match feed(&mut scanner, "SELECT 1 \\; SELECT 2;", &vars).as_slice() {
+            [Item::Statement(s)] => assert_eq!(s, "SELECT 1 ; SELECT 2;"),
+            _ => panic!("expected one statement"),
+        }
+    }
+
+    #[test]
+    fn leaving_a_skipped_branch_drops_its_text_and_lexer_state() {
+        let vars = HashMap::new();
+        let mut scanner = ScriptReader::default();
+        // `\if false`
+        let mut frame = CondFrame {
+            active: false,
+            taken: false,
+            parent_active: true,
+            saved: scanner.query_state(),
+        };
+        let line = "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC (";
+        assert!(feed(&mut scanner, line, &vars).is_empty());
+        // `\endif`
+        frame.leave_branch(&mut scanner);
+        match feed(&mut scanner, "SELECT 1;", &vars).as_slice() {
+            [Item::Statement(s)] => assert_eq!(s, "SELECT 1;"),
+            _ => panic!("expected one statement"),
+        }
+    }
+
+    /// In a branch that does not run, psql keeps a semicolon in the query
+    /// buffer, and drops it with the rest of the branch's text when the
+    /// branch ends. So the statement that started before `\if` goes on
+    /// after `\endif`. The runner sent that statement, or dropped it in the
+    /// skipped branch.
+    #[test]
+    fn semicolon_in_a_skipped_branch_does_not_end_the_statement() {
+        let vars = HashMap::new();
+        let mut scanner = ScriptReader::default();
+        assert!(feed(&mut scanner, "SELECT 1 AS a", &vars).is_empty());
+        // `\if false`
+        let mut frame = CondFrame {
+            active: false,
+            taken: false,
+            parent_active: true,
+            saved: scanner.query_state(),
+        };
+        let (items, resume) = scanner.feed(";\n", false, &vars).unwrap();
+        assert!(items.is_empty() && resume.is_none());
+        // `\endif`
+        frame.leave_branch(&mut scanner);
+        match feed(&mut scanner, ";", &vars).as_slice() {
+            [Item::Statement(s)] => assert_eq!(s, "SELECT 1 AS a\n;"),
+            _ => panic!("expected one statement"),
+        }
+    }
+
+    /// psql runs a meta-command before it reads the text after it, and SQL
+    /// can follow a meta-command after `\\`. The runner took the rest of
+    /// the line as the meta-command.
+    #[test]
+    fn sql_after_a_double_backslash_is_read() {
+        let vars = HashMap::new();
+        let mut scanner = ScriptReader::default();
+        let input = "\\x \\\\ SELECT 1 AS a;\n";
+        let (items, resume) = scanner.feed(input, true, &vars).unwrap();
+        match items.as_slice() {
+            [Item::MetaCommand(c)] => assert_eq!(c, "\\x"),
+            _ => panic!("expected one meta-command"),
+        }
+        let resume = resume.expect("SQL follows the meta-command");
+        let (items, resume) = scanner.feed(&input[resume..], true, &vars).unwrap();
+        match items.as_slice() {
+            [Item::Statement(s)] => assert_eq!(s, "SELECT 1 AS a;"),
+            _ => panic!("expected one statement"),
+        }
+        assert_eq!(resume, None);
+    }
+
+    /// Records what a script runs. `\bogus` fails, and every other
+    /// meta-command works.
+    #[derive(Default)]
+    struct Recorder {
+        vars: HashMap<String, String>,
+        ran: Vec<String>,
+    }
+
+    impl Interpreter for Recorder {
+        fn active(&self) -> bool {
+            true
+        }
+
+        fn vars(&self) -> &HashMap<String, String> {
+            &self.vars
+        }
+
+        fn quit(&self) -> bool {
+            false
+        }
+
+        fn run(&mut self, item: Item, _scanner: &mut ScriptReader) -> Result<bool> {
+            Ok(match item {
+                Item::Statement(s) => {
+                    self.ran.push(s);
+                    true
+                }
+                Item::MetaCommand(c) => {
+                    let ok = c != "\\bogus";
+                    self.ran.push(c);
+                    ok
+                }
+            })
+        }
+    }
+
+    /// psql drops the rest of the line after a meta-command that is unknown
+    /// or failed, also after `\\`. The runner read on and ran it.
+    #[test]
+    fn failed_meta_command_drops_the_rest_of_its_line() {
+        let mut scanner = ScriptReader::default();
+        let mut recorder = Recorder::default();
+        for line in [
+            "\\x \\\\ SELECT 1;",
+            "\\bogus \\\\ SELECT 2;",
+            // The arguments of `\bogus` go up to the end of the line.
+            "SELECT 3 \\bogus ; SELECT 4;",
+            ";",
+        ] {
+            run_line(&mut scanner, line, &mut recorder).unwrap();
+        }
+        assert_eq!(
+            recorder.ran,
+            [
+                "\\x",
+                "SELECT 1;",
+                "\\bogus",
+                "\\bogus ; SELECT 4;",
+                "SELECT 3 \n;"
+            ]
+        );
+    }
+
+    /// A statement that goes on after a meta-command keeps its line break,
+    /// as in psql, also after a meta-command that fails. The runner dropped
+    /// the line break.
+    #[test]
+    fn statement_keeps_its_line_break_after_a_meta_command() {
+        let mut scanner = ScriptReader::default();
+        let mut recorder = Recorder::default();
+        for line in [
+            "SELECT 7 AS v\\echo hi",
+            "WHERE true;",
+            "SELECT 8 AS w\\bogus",
+            "WHERE true;",
+        ] {
+            run_line(&mut scanner, line, &mut recorder).unwrap();
+        }
+        assert_eq!(
+            recorder.ran,
+            [
+                "\\echo hi",
+                "SELECT 7 AS v\nWHERE true;",
+                "\\bogus",
+                "SELECT 8 AS w\nWHERE true;"
+            ]
+        );
+    }
+
+    #[test]
+    fn leaving_a_branch_that_ran_keeps_its_text() {
+        let vars = HashMap::new();
+        let mut scanner = ScriptReader::default();
+        // `\if true`
+        let mut frame = CondFrame {
+            active: true,
+            taken: true,
+            parent_active: true,
+            saved: scanner.query_state(),
+        };
+        assert!(feed(&mut scanner, "SELECT (1", &vars).is_empty());
+        // `\endif`
+        frame.leave_branch(&mut scanner);
+        match feed(&mut scanner, ");", &vars).as_slice() {
+            [Item::Statement(s)] => assert_eq!(s, "SELECT (1\n);"),
+            _ => panic!("expected one statement"),
+        }
+    }
+
+    #[test]
+    fn restoring_the_query_state_drops_a_skipped_begin_atomic() {
+        let vars = HashMap::new();
+        let mut scanner = ScriptReader::default();
+        let saved = scanner.query_state();
+        // The text of an `\if false` branch that opens a BEGIN ATOMIC body.
+        let line = "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC";
+        assert!(feed(&mut scanner, line, &vars).is_empty());
+        scanner.restore_query_state(saved);
+        for expected in ["SELECT 1;", "SELECT 2;"] {
+            match feed(&mut scanner, expected, &vars).as_slice() {
+                [Item::Statement(s)] => assert_eq!(s, expected),
+                _ => panic!("expected one statement"),
+            }
+        }
+    }
+
+    #[test]
+    fn restoring_the_query_state_drops_a_skipped_branch() {
+        let vars = HashMap::new();
+        let mut scanner = ScriptReader::default();
+        let saved = scanner.query_state();
+        // The text of an `\if false` branch, with a parenthesis left open.
+        assert!(feed(&mut scanner, "SELECT (1", &vars).is_empty());
+        scanner.restore_query_state(saved);
+        match feed(&mut scanner, "SELECT 2;", &vars).as_slice() {
+            [Item::Statement(s)] => assert_eq!(s, "SELECT 2;"),
+            _ => panic!("expected one statement"),
+        }
+    }
+
+    #[test]
     fn trailing_comment_only_buffer_is_not_sent_at_eof() {
         let vars = HashMap::new();
-        let mut scanner = Scanner::default();
+        let mut scanner = ScriptReader::default();
         feed(&mut scanner, "/* and this is", &vars);
         feed(&mut scanner, "the end of the file */", &vars);
         assert_eq!(scanner.take_rest(), None);
 
-        let mut scanner = Scanner::default();
+        let mut scanner = ScriptReader::default();
         feed(&mut scanner, "SELECT 1 /* trailing */", &vars);
         assert_eq!(
             scanner.take_rest().as_deref(),
