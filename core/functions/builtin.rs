@@ -62,14 +62,37 @@ use crate::function::{AggFunc, Func, MathFunc, ScalarFunc, VectorFunc, WindowFun
 /// surface regardless of the frontend dialect.
 pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
     let func = resolve_builtin_function_name(name, arg_count)?;
-    // Reject scalar calls whose argument count is not in `arities()`.
-    if let Some(Func::Scalar(srf)) = &func {
-        let arities = srf.arities();
-        if !arities.contains(&-1) && !arities.contains(&(arg_count as i32)) {
-            crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-        }
+    // Reject scalar calls whose argument count is not in `arities()` here, as
+    // SQLite does when it resolves the name. An expression that is resolved
+    // but never emitted, such as an ON CONFLICT target term, gets the error too.
+    let arities = match &func {
+        None => return Ok(None),
+        Some(Func::Scalar(f)) => f.arities(),
+        Some(Func::Math(f)) => f.arities(),
+        Some(Func::Vector(f)) => f.arities(),
+        #[cfg(feature = "json")]
+        Some(Func::Json(f)) => f.arities(),
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        Some(Func::Fts(f)) => f.arities(),
+        // resolve_builtin_function_name checks the argument count of
+        // aggregate and window functions, and returns no other kind.
+        Some(Func::Agg(_) | Func::Window(_) | Func::AlterTable(_))
+        | Some(Func::External(_) | Func::Dialect(_)) => return Ok(func),
+    };
+    if !arities.iter().any(|&narg| arity_accepts(narg, arg_count)) {
+        crate::bail_parse_error!("wrong number of arguments to function {}()", name)
     }
     Ok(func)
+}
+
+/// Whether an `arities()` entry accepts `arg_count` arguments. -1 accepts any
+/// count, and -N for N > 1 accepts N - 2 or more, as in SQLite.
+fn arity_accepts(narg: i32, arg_count: usize) -> bool {
+    match narg {
+        -1 => true,
+        narg if narg < -1 => arg_count >= (-narg - 2) as usize,
+        narg => arg_count == narg as usize,
+    }
 }
 
 /// Resolves a built-in function by name without checking the argument count
