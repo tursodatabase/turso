@@ -1985,6 +1985,36 @@ snapshot gencol_select_untyped_virtual_columns {
     SELECT c, d FROM t;
 }
 
+# Virtual columns are not stored in the record, so the record offsets of the
+# columns after v are one less than their schema positions. The EXPLAIN
+# comments of Column and ColumnRange must name the column at the record offset.
+setup gencol_stored_columns_after_virtual {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL, c TEXT, d INT);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_stored_columns_after_virtual
+snapshot gencol_explain_column_after_virtual_names_stored_column {
+    SELECT a, c FROM t;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_stored_columns_after_virtual
+snapshot gencol_explain_column_range_after_virtual_names_stored_columns {
+    SELECT c, d FROM t;
+}
+
+# A WITHOUT ROWID table stores its primary key columns first.
+setup gencol_without_rowid_primary_key_last {
+    CREATE TABLE w(x INT, v AS (x + 1), y INT, z INT PRIMARY KEY) WITHOUT ROWID;
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@setup gencol_without_rowid_primary_key_last
+snapshot gencol_explain_without_rowid_names_stored_columns {
+    SELECT x, y, z FROM w;
+}
+
 # =============================================================================
 # 10. Constraints
 # =============================================================================
