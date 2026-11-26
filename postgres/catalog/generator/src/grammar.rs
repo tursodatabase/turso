@@ -10,6 +10,8 @@ use crate::bki::{Column, Index, Nullness, Token};
 pub(crate) enum Statement<'src> {
     Create {
         name: &'src str,
+        /// The oid of the catalog, its row in `pg_class`.
+        oid: u32,
         columns: Vec<Column>,
     },
     Open(&'src str),
@@ -60,16 +62,18 @@ pub(crate) fn file_parser<'src>(
 ///  )
 /// ```
 ///
-/// The words after the catalog name are its oid and its storage options,
-/// which the generator does not use.
+/// The number after the catalog name is its oid. The words after the oid
+/// are storage options, which the generator does not use.
 fn create_parser<'src>() -> impl Parser<'src, &'src str, Statement<'src>, ParseError<'src>> {
     just("create ")
         .ignore_then(word())
+        .then_ignore(just(' '))
+        .then(text::int(10).from_str::<u32>().unwrapped())
         .then_ignore(none_of('\n').repeated())
         .then_ignore(just("\n (\n"))
         .then(column_parser().then_ignore(just('\n')).repeated().collect())
         .then_ignore(just(" )"))
-        .map(|(name, columns)| Statement::Create { name, columns })
+        .map(|((name, oid), columns)| Statement::Create { name, oid, columns })
 }
 
 /// One line of a column list: `name = type`, then `FORCE NOT NULL` or

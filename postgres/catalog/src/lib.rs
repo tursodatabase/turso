@@ -49,7 +49,7 @@ mod builtin_catalog;
 mod builtin_rows;
 mod text_out;
 
-pub use builtin_catalog::{BuiltinCatalog, BuiltinRows};
+pub use builtin_catalog::{BuiltinCatalog, BuiltinRows, CatalogTable};
 pub use generated::*;
 
 #[cfg(test)]
@@ -241,6 +241,54 @@ mod tests {
             }
         }
         assert_eq!(oid_catalogs, 42);
+    }
+
+    /// A lookup by the key of a row finds that row and no other, in every
+    /// catalog whose rows have a key.
+    #[test]
+    fn a_lookup_by_key_finds_each_row() {
+        let mut keyed = 0;
+        for table in &BUILTIN_CATALOGS {
+            let key_columns = table.rows.key_columns();
+            if key_columns.is_empty() {
+                continue;
+            }
+            keyed += 1;
+            for (index, row) in catalog_rows(table).iter().enumerate() {
+                let key: Vec<i64> = key_columns
+                    .iter()
+                    .map(|&column| row[column].as_int().unwrap())
+                    .collect();
+                assert_eq!(
+                    table.rows.key_range(&key),
+                    index..index + 1,
+                    "{}",
+                    table.name
+                );
+                assert!(
+                    table.rows.key_range(&key[..1]).contains(&index),
+                    "{}",
+                    table.name
+                );
+            }
+        }
+        assert!(keyed > 42, "{keyed} catalogs have a key");
+    }
+
+    #[test]
+    fn a_catalog_table_has_the_sql_and_the_rows_of_its_catalog() {
+        fn check<C: CatalogTable>(builtin: &BuiltinCatalog) {
+            assert_eq!(C::NAME, builtin.name);
+            assert_eq!(C::CREATE_SQL, builtin.create_sql);
+            assert_eq!(C::INDEX_SQL, builtin.index_sql);
+            assert_eq!(C::ROWS.len(), builtin.rows.len());
+        }
+        check::<PgDescription>(&PG_DESCRIPTION_CATALOG);
+        check::<PgCollation>(&PG_COLLATION_CATALOG);
+        assert_eq!(PgDescription::OID, 2609);
+        assert_eq!(<PgCollation as CatalogTable>::OID, 3456);
+        assert_eq!(PgDescription::ROWS.key_columns(), [0, 1, 2]);
+        assert_eq!(PgDescription::ROWS.key_range(&[2200, 2615, 0]).len(), 1);
     }
 
     #[test]

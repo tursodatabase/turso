@@ -162,6 +162,14 @@ pub(crate) enum ColumnKind {
 }
 
 impl ColumnKind {
+    /// Whether a value of the kind is an integer of SQLite.
+    pub(crate) fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::Oid | Self::Xid | Self::Int2 | Self::Int4 | Self::Int8
+        )
+    }
+
     pub(crate) fn of(bki_type: &str) -> Option<Self> {
         Some(match bki_type {
             "oid" | "regproc" => Self::Oid,
@@ -394,7 +402,7 @@ fn finite_float(text: &str) -> Result<f32, String> {
 
 /// The oid in `token`. `-` in a function column means no function, which
 /// PostgreSQL stores as oid 0.
-pub(crate) fn oid_value(token: &Token) -> Result<u32, String> {
+fn oid_value(token: &Token) -> Result<u32, String> {
     match token.text() {
         "-" => Ok(0),
         text => text

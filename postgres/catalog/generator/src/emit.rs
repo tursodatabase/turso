@@ -16,7 +16,7 @@ pub(crate) const HEADER: &str = "\
 use turso_core::Value;
 
 use crate::builtin_rows::{value, Array, CatalogRow, CatalogRows, Vector};
-use crate::builtin_catalog::BuiltinCatalog;
+use crate::builtin_catalog::{CatalogTable, BuiltinRows, BuiltinCatalog};
 use crate::Oid;
 ";
 
@@ -71,6 +71,17 @@ pub(crate) fn emit_catalog(code: &mut String, table: &Table) -> Result<(), Strin
             "The built-in rows of `{name}`, in the order of `{}`.",
             key.name
         ),
+        (None, None) if !table.lookup_key.is_empty() => {
+            let columns: Vec<&str> = table
+                .lookup_key
+                .iter()
+                .map(|&position| table.fields[position].name)
+                .collect();
+            format!(
+                "The built-in rows of `{name}`, in the order of `({})`.",
+                columns.join(", ")
+            )
+        }
         (None, None) => format!("The built-in rows of `{name}`, in the order of `postgres.bki`."),
     };
     let row_count = rows.len();
@@ -156,6 +167,28 @@ fn emit_builtin_catalog(
     } else {
         "None"
     };
+    let key_columns: Vec<String> = table.lookup_key.iter().map(usize::to_string).collect();
+    let key_value = if table.lookup_key.is_empty() {
+        "None".to_string()
+    } else {
+        let arms: Vec<String> = table
+            .lookup_key
+            .iter()
+            .enumerate()
+            .map(|(index, &position)| {
+                format!(
+                    "{index} => i64::from(row.{}),",
+                    table.fields[position].ident()
+                )
+            })
+            .collect();
+        format!(
+            "Some(|row, column| match column {{ {} _ => unreachable!(\"the key has {} columns\") }})",
+            arms.join(" "),
+            table.lookup_key.len()
+        )
+    };
+    let catalog_oid = table.catalog.oid;
     code.push_str(&format!(
         "
 impl CatalogRow for {struct_name} {{
@@ -169,10 +202,19 @@ pub const {table_name}_CATALOG: BuiltinCatalog = BuiltinCatalog {{
     name: \"{name}\",
     create_sql: {struct_name}::CREATE_SQL,
     index_sql: {struct_name}::INDEX_SQL,
-    rows: &CatalogRows::new(&{table_name}, {oid}, {version:#010x}),
+    rows: &CatalogRows::new(&{table_name}, {oid}, &[{key_columns}], {key_value}, {version:#010x}),
 }};
+
+impl CatalogTable for {struct_name} {{
+    const NAME: &'static str = \"{name}\";
+    const OID: Oid = {catalog_oid};
+    const CREATE_SQL: &'static str = {struct_name}::CREATE_SQL;
+    const INDEX_SQL: &'static [&'static str] = {struct_name}::INDEX_SQL;
+    const ROWS: &'static dyn BuiltinRows = {table_name}_CATALOG.rows;
+}}
 ",
         values = values.join(", "),
+        key_columns = key_columns.join(", "),
     ));
     Ok(())
 }
@@ -315,10 +357,28 @@ declare unique index pg_namespace_oid_index 2685 on pg_namespace using btree(oid
         let mut code = String::new();
         emit_catalog(&mut code, &catalogs[0]).unwrap();
         assert!(!code.contains("pub fn by_"), "{code}");
-        // The rows stay in the order of the file.
-        let first = code.find("PgDepend { classid: 9, objid: 1 }").unwrap();
-        let second = code.find("PgDepend { classid: 3, objid: 2 }").unwrap();
+        // The rows are in the order of the unique index, and the built-in
+        // rows know the columns of the index, so that a lookup by them does not scan.
+        let first = code.find("PgDepend { classid: 3, objid: 2 }").unwrap();
+        let second = code.find("PgDepend { classid: 9, objid: 1 }").unwrap();
         assert!(first < second);
+        assert!(code.contains("None, &[0, 1], Some(|row, column|"), "{code}");
+        assert!(code.contains("impl CatalogTable for PgDepend {"), "{code}");
+        assert!(code.contains("const OID: Oid = 2608;"), "{code}");
+    }
+
+    #[test]
+    fn a_catalog_whose_unique_index_is_on_text_keeps_the_order_of_the_file() {
+        let bki = "create pg_ts_dict 3600\n (\n dictname = name ,\n dictowner = oid\n )\n\
+                   open pg_ts_dict\ninsert ( b 1 )\ninsert ( a 2 )\nclose pg_ts_dict\n\
+                   declare unique index pg_ts_dict_name_index 3604 on pg_ts_dict using btree(dictname name_ops)\n";
+        let catalogs = parse(bki).unwrap();
+        let mut code = String::new();
+        emit_catalog(&mut code, &catalogs[0]).unwrap();
+        let first = code.find("dictname: \"b\"").unwrap();
+        let second = code.find("dictname: \"a\"").unwrap();
+        assert!(first < second);
+        assert!(code.contains("None, &[], None,"), "{code}");
     }
 
     #[test]

@@ -25,12 +25,40 @@ pub(crate) struct CatalogRows<R: 'static> {
     /// The oid of a row, when `oid` is the `INTEGER PRIMARY KEY` and the
     /// rows are in the order of their oids.
     oid: Option<fn(&R) -> Oid>,
+    /// The positions of the key columns. The rows are in key order.
+    key_columns: &'static [usize],
+    /// The value of the key column with this number, from 0, of a row.
+    /// None when the key has no columns.
+    key_value: Option<fn(&R, usize) -> i64>,
     version: u32,
 }
 
 impl<R> CatalogRows<R> {
-    pub(crate) const fn new(rows: &'static [R], oid: Option<fn(&R) -> Oid>, version: u32) -> Self {
-        Self { rows, oid, version }
+    pub(crate) const fn new(
+        rows: &'static [R],
+        oid: Option<fn(&R) -> Oid>,
+        key_columns: &'static [usize],
+        key_value: Option<fn(&R, usize) -> i64>,
+        version: u32,
+    ) -> Self {
+        Self {
+            rows,
+            oid,
+            key_columns,
+            key_value,
+            version,
+        }
+    }
+
+    /// How the first key columns of `row` compare with `prefix`.
+    fn compare_key(&self, row: &R, prefix: &[i64]) -> std::cmp::Ordering {
+        let key_value = self.key_value.expect("a lookup by key needs a key");
+        prefix
+            .iter()
+            .enumerate()
+            .map(|(column, value)| key_value(row, column).cmp(value))
+            .find(|order| order.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -63,6 +91,29 @@ impl<R: CatalogRow> BuiltinRows for CatalogRows<R> {
 
     fn version(&self) -> u32 {
         self.version
+    }
+
+    fn key_columns(&self) -> &'static [usize] {
+        self.key_columns
+    }
+
+    fn key_range(&self, prefix: &[i64]) -> std::ops::Range<usize> {
+        assert!(
+            prefix.len() <= self.key_columns.len(),
+            "a key prefix of {} values for a key of {} columns",
+            prefix.len(),
+            self.key_columns.len()
+        );
+        if prefix.is_empty() {
+            return 0..self.rows.len();
+        }
+        let start = self
+            .rows
+            .partition_point(|row| self.compare_key(row, prefix).is_lt());
+        let end = self
+            .rows
+            .partition_point(|row| self.compare_key(row, prefix).is_le());
+        start..end
     }
 }
 
@@ -265,7 +316,13 @@ mod tests {
 
     #[test]
     fn find_searches_the_oid_or_takes_the_position() {
-        let by_oid = CatalogRows::new(&ROWS, Some(|row: &Row| row.0), 7);
+        let by_oid = CatalogRows::new(
+            &ROWS,
+            Some(|row: &Row| row.0),
+            &[0],
+            Some(|row: &Row, _| i64::from(row.0)),
+            7,
+        );
         assert_eq!(by_oid.len(), 3);
         assert_eq!(by_oid.version(), 7);
         assert_eq!(by_oid.find(20), Some(1));
@@ -274,13 +331,18 @@ mod tests {
         assert_eq!(by_oid.find(-20), None);
         assert_eq!(by_oid.find(i64::from(u32::MAX) + 21), None);
 
-        let by_position = CatalogRows::new(&ROWS, None, 7);
+        let by_position = CatalogRows::new(&ROWS, None, &[], None, 7);
         assert_eq!(by_position.find(1), Some(0));
         assert_eq!(by_position.find(3), Some(2));
         assert_eq!(by_position.find(0), None);
         assert_eq!(by_position.find(4), None);
         assert_eq!(by_position.find(-1), None);
         assert_eq!(by_position.find(i64::MIN), None);
+
+        assert_eq!(by_oid.key_range(&[20]), 1..2);
+        assert_eq!(by_oid.key_range(&[25]), 2..2);
+        assert_eq!(by_oid.key_range(&[]), 0..3);
+        assert_eq!(by_position.key_range(&[]), 0..3);
 
         let mut out = Vec::new();
         by_oid.row(2, &mut out);

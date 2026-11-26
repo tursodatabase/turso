@@ -9,6 +9,9 @@ use crate::grammar::{file_parser, Statement};
 
 pub(crate) struct Catalog {
     pub(crate) name: String,
+    /// The oid of the catalog: its row in `pg_class`, and the `tableoid` of
+    /// its rows.
+    pub(crate) oid: u32,
     pub(crate) columns: Vec<Column>,
     pub(crate) rows: Vec<Vec<Token>>,
     /// The indexes of the catalog, in the order of the file.
@@ -85,9 +88,10 @@ pub(crate) fn parse(bki: &str) -> Result<Vec<Catalog>, String> {
     for (statement, span) in statements {
         let at = |message: String| format!("line {}: {message}", line_of(span.start));
         match statement {
-            Statement::Create { name, columns } => {
+            Statement::Create { name, oid, columns } => {
                 catalogs.push(Catalog {
                     name: name.to_string(),
+                    oid,
                     columns,
                     rows: Vec::new(),
                     indexes: Vec::new(),

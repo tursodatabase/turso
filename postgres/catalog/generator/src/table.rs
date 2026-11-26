@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use crate::bki::{Catalog, Token};
-use crate::column::{oid_value, ColumnKind, Field};
+use crate::column::{ColumnKind, Field};
 use crate::sql::TableSql;
 use crate::SqlValue;
 
@@ -39,6 +39,12 @@ pub(crate) struct Table<'a> {
     pub(crate) has_key: bool,
     /// Whether the first column is `oid` and the `INTEGER PRIMARY KEY`.
     pub(crate) oid_is_rowid: bool,
+    /// The positions in `fields` of the columns that identify a row: the
+    /// first column when `has_key`, and else the columns of the first
+    /// unique index whose columns are all integers that are not NULL.
+    /// Empty when no such index exists. The rows are in the order of these
+    /// columns, so that a lookup by a prefix of them is a binary search.
+    pub(crate) lookup_key: Vec<usize>,
     pub(crate) sql: TableSql,
     /// Why the rows of the catalog are left out, if they are.
     pub(crate) left_out: Option<&'static str>,
@@ -76,19 +82,30 @@ impl<'a> Table<'a> {
             Some(_) => Vec::new(),
             None => catalog.rows.iter().map(Vec::as_slice).collect(),
         };
-        if has_key {
+        let lookup_key = if has_key {
+            vec![0]
+        } else {
+            integer_unique_index(catalog, &fields)
+        };
+        if !lookup_key.is_empty() {
             let mut keys = Vec::with_capacity(rows.len());
             for row in &rows {
-                keys.push((oid_value(&row[0]).map_err(in_catalog)?, *row));
+                let key = lookup_key
+                    .iter()
+                    .map(|&position| integer_value(&fields[position], &row[position]))
+                    .collect::<Result<Vec<i64>, String>>()
+                    .map_err(in_catalog)?;
+                keys.push((key, *row));
             }
             // The lookup is a binary search. The sort is stable, so equal
             // keys keep their order until the check below refuses them.
-            keys.sort_by_key(|(key, _)| *key);
-            let distinct: BTreeSet<u32> = keys.iter().map(|(key, _)| *key).collect();
+            keys.sort_by(|a, b| a.0.cmp(&b.0));
+            let distinct: BTreeSet<&[i64]> = keys.iter().map(|(key, _)| key.as_slice()).collect();
             if distinct.len() != keys.len() {
+                let names: Vec<&str> = lookup_key.iter().map(|&p| fields[p].name).collect();
                 return Err(in_catalog(format!(
                     "two rows have the same {}",
-                    fields[0].name
+                    names.join(", ")
                 )));
             }
             rows = keys.into_iter().map(|(_, row)| row).collect();
@@ -98,6 +115,7 @@ impl<'a> Table<'a> {
             fields,
             has_key,
             oid_is_rowid,
+            lookup_key,
             sql,
             left_out,
             rows,
@@ -126,5 +144,37 @@ impl<'a> Table<'a> {
                     .collect()
             })
             .collect()
+    }
+}
+
+/// The positions of the columns of the first unique index of `catalog`
+/// whose columns are all integers that are not NULL, or nothing.
+fn integer_unique_index(catalog: &Catalog, fields: &[Field]) -> Vec<usize> {
+    catalog
+        .indexes
+        .iter()
+        .filter(|index| index.unique)
+        .find_map(|index| {
+            index
+                .columns
+                .iter()
+                .map(|column| {
+                    fields.iter().position(|field| {
+                        field.name == column && !field.nullable && field.kind.is_integer()
+                    })
+                })
+                .collect::<Option<Vec<usize>>>()
+        })
+        .unwrap_or_default()
+}
+
+/// The value of `token` in the integer column of `field`.
+fn integer_value(field: &Field, token: &Token) -> Result<i64, String> {
+    match field.sql_value(token)? {
+        SqlValue::Integer(value) => Ok(value),
+        other => Err(format!(
+            "column {} has {other:?}, not an integer",
+            field.name
+        )),
     }
 }
