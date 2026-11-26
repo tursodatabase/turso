@@ -799,8 +799,6 @@ impl Limbo {
     }
 
     fn reset_line(&mut self) {
-        // Entry is auto added to history
-        // self.rl.add_history_entry(line.to_owned())?;
         self.interrupt_count.store(0, Ordering::Release);
     }
 
@@ -1845,6 +1843,11 @@ impl Limbo {
             let result = rl.readline(&self.prompt)?;
             self.read_state.process(&result);
             let _ = self.input_buff.write_str(result.as_str());
+            // The history file is plaintext, so a statement that can hold an
+            // encryption key, such as `PRAGMA hexkey = '...'`, stays out of it.
+            if !turso_core::may_hold_encryption_key(&self.input_buff) {
+                let _ = rl.add_history_entry(result.as_str());
+            }
         } else {
             let mut reader = std::io::stdin().lock();
             let prev_len = self.input_buff.len();

@@ -70,6 +70,8 @@ INSERT INTO users VALUES (1, 'Alice');
 
 The PRAGMAs can encrypt only a new, empty database that no other connection uses, and only outside a transaction. They return an error and change nothing on a database that already has pages, on an attached database (`PRAGMA aux.hexkey`), and with MVCC (run `PRAGMA journal_mode = 'mvcc'` after them). After the first of the two PRAGMAs, the shell refuses other statements until you set the second one, so a missing key cannot give a plaintext database. Run `PRAGMA page_size` before the two PRAGMAs if you want a page size other than 4096.
 
+The shell does not write lines that contain `hexkey` to its history file.
+
 ### Method 2: Using URI Parameters
 
 Specify encryption parameters directly in the database URI:

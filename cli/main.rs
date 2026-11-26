@@ -31,7 +31,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn rustyline_config() -> Config {
     Config::builder()
         .completion_type(rustyline::CompletionType::List)
-        .auto_add_history(true)
+        // `Limbo::readline` adds the history entries, so that it can leave out
+        // lines that can hold an encryption key.
+        .auto_add_history(false)
         .build()
 }
 
