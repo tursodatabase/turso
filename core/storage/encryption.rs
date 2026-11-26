@@ -476,6 +476,18 @@ impl CipherMode {
         }
     }
 
+    /// Returns an error if the key does not have the size that this cipher needs.
+    pub fn check_key_size(&self, key: &EncryptionKey) -> Result<()> {
+        let required_size = self.required_key_size();
+        if key.len() != required_size {
+            return Err(crate::LimboError::InvalidArgument(format!(
+                "Invalid key size for {self:?}: expected {required_size} bytes, got {}",
+                key.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Returns the nonce size for this cipher mode.
     pub fn nonce_size(&self) -> usize {
         match self {
@@ -580,15 +592,7 @@ pub struct EncryptionContext {
 
 impl EncryptionContext {
     pub fn new(cipher_mode: CipherMode, key: &EncryptionKey, page_size: usize) -> Result<Self> {
-        let required_size = cipher_mode.required_key_size();
-        if key.len() != required_size {
-            return Err(crate::LimboError::InvalidArgument(format!(
-                "Invalid key size for {:?}: expected {} bytes, got {}",
-                cipher_mode,
-                required_size,
-                key.len()
-            )));
-        }
+        cipher_mode.check_key_size(key)?;
 
         let cipher = match cipher_mode {
             CipherMode::Aes128Gcm => Cipher::Aes128Gcm(Box::new(Aes128GcmCipher::new(key)?)),

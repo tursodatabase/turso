@@ -5,9 +5,17 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.io.File;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.SQLException;
+import java.util.Arrays;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import tech.turso.TestUtils;
 import tech.turso.TursoErrorCode;
 import tech.turso.exceptions.TursoException;
@@ -145,5 +153,96 @@ public class TursoDBTest {
           TursoStatement stmtNoEncryption = connNoEncryption.prepare("SELECT * FROM t");
           stmtNoEncryption.execute();
         });
+  }
+
+  @Test
+  void createWithEncryption_should_reject_cipher_without_key(@TempDir Path dir) {
+    String dbPath = dir.resolve("cipher-without-key.db").toString();
+
+    SQLException e =
+        assertThrows(
+            SQLException.class,
+            () ->
+                TursoDB.createWithEncryption(
+                    "jdbc:turso:" + dbPath, dbPath, TursoEncryptionCipher.AEGIS_256, null));
+
+    assertThat(e.getMessage()).contains("encryption key is required");
+    assertThat(new File(dbPath)).doesNotExist();
+  }
+
+  @Test
+  void createWithEncryption_should_reject_key_without_cipher(@TempDir Path dir) {
+    String dbPath = dir.resolve("key-without-cipher.db").toString();
+    String hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+
+    SQLException e =
+        assertThrows(
+            SQLException.class,
+            () -> TursoDB.createWithEncryption("jdbc:turso:" + dbPath, dbPath, null, hexkey));
+
+    assertThat(e.getMessage()).contains("encryption cipher is required");
+    assertThat(new File(dbPath)).doesNotExist();
+  }
+
+  // The native code rejects these keys before it creates the database file.
+  @ParameterizedTest
+  @ValueSource(strings = {"", "   ", "zz", "000102030405060708090a0b0c0d0e0f"})
+  void createWithEncryption_should_reject_cipher_with_invalid_key(
+      String hexkey, @TempDir Path dir) {
+    String dbPath = dir.resolve("cipher-with-invalid-key.db").toString();
+
+    assertThrows(
+        SQLException.class,
+        () ->
+            TursoDB.createWithEncryption(
+                "jdbc:turso:" + dbPath, dbPath, TursoEncryptionCipher.AEGIS_256, hexkey));
+
+    assertThat(new File(dbPath)).doesNotExist();
+  }
+
+  @Test
+  void createWithEncryption_without_cipher_and_key_should_open_plaintext_db(@TempDir Path dir)
+      throws Exception {
+    Path path = dir.resolve("plaintext.db");
+    String dbPath = path.toString();
+
+    TursoDB db = TursoDB.createWithEncryption("jdbc:turso:" + dbPath, dbPath, null, null);
+    TursoConnection conn = new TursoConnection("jdbc:turso:" + dbPath, db);
+    for (String sql : new String[] {"CREATE TABLE t(x TEXT)", "PRAGMA wal_checkpoint(truncate)"}) {
+      try (TursoStatement stmt = conn.prepare(sql)) {
+        stmt.execute();
+      }
+    }
+    conn.close();
+    db.close();
+
+    byte[] header = Arrays.copyOf(Files.readAllBytes(path), 16);
+    assertThat(new String(header, StandardCharsets.US_ASCII)).isEqualTo("SQLite format 3\0");
+  }
+
+  // TursoDB checks the pair before it calls the native open. This test calls the private native
+  // open directly, so that the check in the native code is tested too.
+  @Test
+  void native_open_should_reject_half_of_an_encryption_configuration(@TempDir Path dir)
+      throws Exception {
+    String otherPath = dir.resolve("other.db").toString();
+    String dbPath = dir.resolve("native-half.db").toString();
+    String hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    TursoDB db = TursoDB.create("jdbc:turso:" + otherPath, otherPath);
+    Method open =
+        TursoDB.class.getDeclaredMethod(
+            "openWithEncryptionUtf8", byte[].class, int.class, String.class, String.class);
+    open.setAccessible(true);
+    byte[] path = dbPath.getBytes(StandardCharsets.UTF_8);
+
+    for (String[] pair : new String[][] {{"aegis256", null}, {null, hexkey}}) {
+      InvocationTargetException e =
+          assertThrows(
+              InvocationTargetException.class, () -> open.invoke(db, path, 0, pair[0], pair[1]));
+      assertThat(e.getCause()).isInstanceOf(SQLException.class);
+      assertThat(e.getCause().getMessage()).contains("must both be set");
+      assertThat(new File(dbPath)).doesNotExist();
+    }
+    db.close();
   }
 }

@@ -121,6 +121,11 @@ public class TursoConnection : DbConnection
 
             _turso = TursoBindings.OpenDatabaseWithEncryption(filename, cipher.Value, hexkey);
         }
+        else if (!string.IsNullOrWhiteSpace(hexkey))
+        {
+            // Without a cipher, the key would be ignored and the database opened without encryption.
+            throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
+        }
         else
         {
             _turso = TursoBindings.OpenDatabase(filename);

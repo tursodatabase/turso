@@ -826,7 +826,7 @@ tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=YOUR_
 
 This URI can expose the key through process arguments, shell history, and command-line recording. It is not a protected secret-input channel.
 
-Every open and connection independently authenticates its credentials before shared schema or MVCC state is accessible. Missing keys, wrong keys, and cipher mismatches are rejected. Existing encrypted files retain their format and credentials. Choose an encrypted database's page size in core `OpenOptions::page_size` before opening it; the default for a new database is 4096. Page size and reserved bytes are immutable afterward.
+Every open and connection independently authenticates its credentials before shared schema or MVCC state is accessible. Missing keys, wrong keys, and cipher mismatches are rejected. An unknown cipher, or a key that is not valid hex or does not have the size that the cipher needs, is rejected before the database file is created. Existing encrypted files retain their format and credentials. Choose an encrypted database's page size in core `OpenOptions::page_size` before opening it; the default for a new database is 4096. Page size and reserved bytes are immutable afterward.
 
 Each encrypted attachment requires its own cipher/key URI. Non-NULL `ATTACH ... KEY` values are rejected before opening or creating the target. `KEY NULL` uses the URI credentials. Serialize other opens of a fresh target until ATTACH completes. In-place VACUUM preserves encryption for the main database and rejects encrypted attached databases. VACUUM INTO produces a plaintext destination.
 
