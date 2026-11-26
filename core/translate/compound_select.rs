@@ -439,7 +439,11 @@ fn emit_compound_select(
                     QueryDestination::EphemeralIndex { affinity_str, .. } => affinity_str.clone(),
                     _ => None,
                 };
-                let reused_index = destination_index_for_dedupe(&union_destination, collations);
+                let reused_index = destination_index_for_dedupe(
+                    &union_destination,
+                    collations,
+                    limit_ctx.is_some() || offset_reg.is_some(),
+                );
                 let new_dedupe_index = reused_index.is_none();
                 let dedupe_index = match reused_index {
                     Some(index) => index,
@@ -557,7 +561,11 @@ fn emit_compound_select(
             }
             CompoundOperator::Except => {
                 let except_destination = right_most.query_destination.clone();
-                let reused_index = destination_index_for_dedupe(&except_destination, collations);
+                let reused_index = destination_index_for_dedupe(
+                    &except_destination,
+                    collations,
+                    limit_ctx.is_some() || offset_reg.is_some(),
+                );
                 let new_index = reused_index.is_none();
                 let (cursor_id, index) = match reused_index {
                     Some(index) => index,
@@ -644,11 +652,17 @@ fn emit_compound_select(
 /// Returns the destination's index when the compound can remove duplicates in it
 /// directly: the index of an enclosing UNION or EXCEPT of the same compound, or the
 /// ephemeral index of an IN whose key collations are the compound's. An index that
-/// compares with other collations would merge or keep the wrong rows.
+/// compares with other collations would merge or keep the wrong rows. An operator with a
+/// LIMIT or OFFSET never writes into the destination's index, because it applies them while
+/// it reads its rows from its own index into the destination.
 fn destination_index_for_dedupe(
     destination: &QueryDestination,
     collations: &[CollationSeq],
+    has_limit_or_offset: bool,
 ) -> Option<(usize, Arc<Index>)> {
+    if has_limit_or_offset {
+        return None;
+    }
     match destination {
         QueryDestination::EphemeralIndex {
             cursor_id, index, ..
