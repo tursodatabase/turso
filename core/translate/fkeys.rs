@@ -938,7 +938,17 @@ fn emit_fk_parent_key_probe(
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
     let is_deferred = fk_ref.fk.deferred;
-    let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
+    let restrict_after_statement = matches!(fk_ref.fk.on_update, RefAct::Restrict)
+        && resolver
+            .catalog
+            .dialect
+            .checks_fk_restrict_after_statement();
+    if restrict_after_statement && matches!(pass, ParentProbePass::New) {
+        // Checked after the statement, RESTRICT still fails when another row
+        // takes the old key, as in PostgreSQL. Only NO ACTION accepts it.
+        return Ok(());
+    }
+    let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict) && !restrict_after_statement;
     let skip_probe = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, n_cols, skip_probe);
     if matches!(pass, ParentProbePass::New) {
@@ -1551,7 +1561,11 @@ fn emit_fk_delete_parent_existence_check_single(
             .name
             .eq_ignore_ascii_case(parent_table_name);
 
-    let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict);
+    let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict)
+        && !resolver
+            .catalog
+            .dialect
+            .checks_fk_restrict_after_statement();
 
     // Build parent key in FK's parent-column order
     let parent_cols: &[String] = &fk_ref.parent_cols;
