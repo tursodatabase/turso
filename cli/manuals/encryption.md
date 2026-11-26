@@ -6,7 +6,7 @@ display_name: "encryption at-rest"
 
 ## Overview
 
-Turso supports transparent at-rest encryption to protect your database files from unauthorized access. Database pages, WAL frames, and MVCC logical logs are encrypted and decrypted with the credentials supplied when opening the database.
+Turso supports transparent at-rest encryption to protect your database files from unauthorized access. Database pages, WAL frames, and MVCC logical logs are encrypted and decrypted with the cipher and key that you give when you open the database, or with `PRAGMA cipher` and `PRAGMA hexkey` when you create it.
 
 ## Supported Ciphers
 
@@ -47,7 +47,30 @@ Example output:
 
 ## Creating an Encrypted Database
 
-Encryption must be selected when the database is opened. Supply both the cipher and key before creating a connection; `PRAGMA cipher = ...` and `PRAGMA hexkey = ...` assignments are rejected, including on empty databases.
+Encryption is an experimental feature that must be explicitly enabled with `--experimental-encryption`.
+
+### Method 1: Using PRAGMAs
+
+Open a new database file:
+
+```bash
+tursodb --experimental-encryption database.db
+```
+
+Then, in the SQL shell, set the cipher and the key before any other statement:
+
+```sql
+PRAGMA cipher = 'aegis256';
+PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
+
+-- Now create your tables and insert data
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO users VALUES (1, 'Alice');
+```
+
+The PRAGMAs can encrypt only a new, empty database that no other connection uses, and only outside a transaction. They return an error and change nothing on a database that already has pages, on an attached database (`PRAGMA aux.hexkey`), and with MVCC (run `PRAGMA journal_mode = 'mvcc'` after them). After the first of the two PRAGMAs, the shell refuses other statements until you set the second one, so a missing key cannot give a plaintext database. Run `PRAGMA page_size` before the two PRAGMAs if you want a page size other than 4096.
+
+### Method 2: Using URI Parameters
 
 Specify encryption parameters directly in the database URI:
 

@@ -48,7 +48,7 @@ PRAGMA page_size;
 PRAGMA page_size = 8192;
 ```
 
-Encrypted databases reject page-size assignments, including before their first write. Select the page size in core `OpenOptions::page_size` when opening a new encrypted database.
+Encrypted databases reject page-size assignments, including before their first write. Select the page size in core `OpenOptions::page_size` when opening a new encrypted database, or run `PRAGMA page_size` before [`PRAGMA cipher` and `PRAGMA hexkey`](#hexkey).
 
 ### max_page_count
 
@@ -789,13 +789,16 @@ CDC respects transaction boundaries. Changes are only recorded when a transactio
 
 ### cipher
 
-Reports the immutable encryption cipher for the current connection:
+Sets the cipher of a new, empty database, or reports the cipher of an encrypted database:
 
 ```sql
+PRAGMA cipher = 'aegis256';
+
 PRAGMA cipher;
+-- aegis256
 ```
 
-Encryption must be configured when opening the database. Assignments to `cipher` or `hexkey` are rejected during preparation, including on a new empty database. Enabling the experimental encryption feature without credentials creates a plaintext database that cannot later become encrypted.
+The read form returns no row until the database is encrypted. An assignment works only on a new, empty database, together with [`PRAGMA hexkey`](#hexkey). To encrypt a database when you open it, give the cipher and key in the open options or the database URI. A database that has pages in plaintext cannot become encrypted.
 
 Supported ciphers:
 
@@ -812,21 +815,52 @@ Supported ciphers:
 
 ### hexkey
 
-Reports whether the current connection has an encryption key. It never returns key material:
+Sets the encryption key of a new, empty database as a hexadecimal string, or reports whether the current connection has a key. The read form never returns key material:
 
 ```sql
+PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
+
 PRAGMA hexkey;
+-- encryption key is set for this session
 ```
 
-Supply both cipher and key at open time, for example:
+#### Encrypt a new database with PRAGMAs
+
+Set `cipher` and `hexkey`, in either order, before any other statement:
+
+```sql
+PRAGMA cipher = 'aegis256';
+PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
+
+CREATE TABLE secrets (id INTEGER PRIMARY KEY, data TEXT);
+INSERT INTO secrets VALUES (1, 'sensitive data');
+```
+
+The database becomes encrypted when the second value is set. The assignments work only when all of these conditions are true:
+
+- The database is new and empty. It has no pages yet. A statement that writes gives the database its first page, also `BEGIN IMMEDIATE`, `PRAGMA user_version = ...` and `CREATE TEMP TABLE`, so run the encryption PRAGMAs first.
+- The PRAGMA applies to the main database. An attached database takes its cipher and key from its `ATTACH` URI, so `PRAGMA aux.hexkey = ...` and `PRAGMA temp.hexkey = ...` return an error.
+- No other connection or `ATTACH` uses the database.
+- The connection has no open transaction and no running statement.
+- The connection can write: the database is not open read-only, and `PRAGMA query_only` is off.
+- The database does not use MVCC, the experimental multiprocess WAL, or an external page codec. To use MVCC, run `PRAGMA journal_mode = 'mvcc'` after the two PRAGMAs.
+- Each page keeps at least 480 usable bytes after the bytes that the cipher reserves, as the file format requires. With 512-byte pages, you cannot use the AEGIS-256 ciphers, which reserve 48 bytes.
+
+If a condition is false, the assignment returns an error and changes nothing. The assignment applies when the statement runs, so `EXPLAIN PRAGMA hexkey = ...` and a prepared statement that does not run change nothing.
+
+After the first of the two values is set, the connection refuses all other statements until the second value is set. Thus a missing key cannot cause a plaintext database. If the second assignment fails, for example because the key size does not agree with the cipher, the first value stays and you can set the second value again. To stop the setup, close the connection.
+
+Run `PRAGMA page_size` before the encryption PRAGMAs. After the database is encrypted, its page size and reserved bytes cannot change.
+
+After the PRAGMAs, the encryption applies to the whole database. Every other connection and every open must give the same cipher and key; an open or connection without a key is refused. The language bindings give each new connection the key of their open options, so after the PRAGMAs a binding's database object cannot make another connection: to get more connections, open the database again with the cipher and key. With a connection pool, for example Go's `database/sql`, give the cipher and key in the open options instead of the PRAGMAs. To open an existing encrypted database, give the cipher and key when you open it, for example:
 
 ```shell
 tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=YOUR_HEX_KEY"
 ```
 
-This URI can expose the key through process arguments, shell history, and command-line recording. It is not a protected secret-input channel.
+A key in a URI or a SQL statement can be seen in process arguments, application logs, and shell history. Neither is a protected secret-input channel.
 
-Every open and connection independently authenticates its credentials before shared schema or MVCC state is accessible. Missing keys, wrong keys, and cipher mismatches are rejected. An unknown cipher, or a key that is not valid hex or does not have the size that the cipher needs, is rejected before the database file is created. Existing encrypted files retain their format and credentials. Choose an encrypted database's page size in core `OpenOptions::page_size` before opening it; the default for a new database is 4096. Page size and reserved bytes are immutable afterward.
+Every open and connection independently authenticates its credentials before shared schema or MVCC state is accessible. Missing keys, wrong keys, and cipher mismatches are rejected. An unknown cipher, or a key that is not valid hex or does not have the size that the cipher needs, is rejected before the database file is created. Existing encrypted files retain their format and credentials. Choose an encrypted database's page size in core `OpenOptions::page_size` before opening it, or with `PRAGMA page_size` before the encryption PRAGMAs; the default for a new database is 4096. Page size and reserved bytes are immutable afterward.
 
 Each encrypted attachment requires its own cipher/key URI. Non-NULL `ATTACH ... KEY` values are rejected before opening or creating the target. `KEY NULL` uses the URI credentials. Serialize other opens of a fresh target until ATTACH completes. In-place VACUUM preserves encryption for the main database and rejects encrypted attached databases. VACUUM INTO produces a plaintext destination.
 

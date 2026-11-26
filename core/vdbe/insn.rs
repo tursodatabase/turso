@@ -2434,6 +2434,13 @@ pub enum Insn {
         version: crate::CdcVersion,
         cdc_mode: String,
     },
+    /// Runs `PRAGMA cipher = ...` or `PRAGMA hexkey = ...` on the main
+    /// database. The value applies when the statement runs, not when it is
+    /// prepared, so `EXPLAIN` and a prepared statement that never runs, or
+    /// is prepared again, change nothing.
+    SetEncryption {
+        setting: crate::storage::encryption::EncryptionSetting,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2684,6 +2691,7 @@ impl InsnVariants {
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
+            InsnVariants::SetEncryption => execute::op_set_encryption,
         }
     }
 }
