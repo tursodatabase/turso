@@ -404,6 +404,36 @@ expect {
     invalid input syntax for type date: "zzz"|22007
 }
 
+test pg-input-error-info-integer-beyond-bigint {
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999', 'integer');
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999', 'smallint');
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999999999999999999999999', 'bigint');
+    SELECT message, sql_error_code FROM pg_input_error_info('1x', 'integer');
+    SELECT count(*) FROM pg_input_error_info(' -12 ', 'int4') WHERE message IS NULL;
+}
+expect {
+    value "99999999999999999999" is out of range for type integer|22003
+    value "99999999999999999999" is out of range for type smallint|22003
+    value "99999999999999999999999999999999999999999" is out of range for type bigint|22003
+    invalid input syntax for type integer: "1x"|22P02
+    1
+}
+
+test pg-input-is-valid-integer-prefixes-and-underscores {
+    SELECT pg_input_is_valid('0x_ff', 'int4'), pg_input_is_valid('-0x8000_0000', 'int4'),
+           pg_input_is_valid('0O17', 'int2'), pg_input_is_valid('_1', 'int4'),
+           pg_input_is_valid('1_', 'int4'), pg_input_is_valid('1__0', 'int8'),
+           pg_input_is_valid('0x', 'int4'), pg_input_is_valid('0b2', 'int4'),
+           pg_input_is_valid('-0x8000000000000000', 'int8');
+    SELECT message, sql_error_code FROM pg_input_error_info('0x8000_0000', 'integer');
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999_', 'bigint');
+}
+expect {
+    t|t|t|f|f|f|f|f|t
+    value "0x8000_0000" is out of range for type integer|22003
+    value "99999999999999999999_" is out of range for type bigint|22003
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }
