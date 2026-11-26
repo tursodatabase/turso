@@ -37,7 +37,7 @@ mod builtin;
 mod custom_type;
 
 pub(crate) use builtin::builtin_types;
-pub use custom_type::{Conversion, ConversionFn, Type, UserType};
+pub use custom_type::{Conversion, ConversionFn, TextInput, Type, UserType};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
