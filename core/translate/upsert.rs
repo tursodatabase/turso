@@ -1849,14 +1849,8 @@ fn emit_do_update_subqueries<'a>(
     if exprs.is_empty() {
         return Ok(());
     }
-    // DO UPDATE names the target by its alias when the INSERT gives one, where
-    // RETURNING names it by the table's name.
-    let mut table_references = table_references.clone();
-    let target = &mut table_references.joined_tables_mut()[0];
-    if let Some(alias) = table_alias {
-        target.identifier = normalize_ident(alias);
-        target.has_alias = true;
-    }
+    let mut table_references = upsert_table_references(table_references, table_alias);
+    let target = &table_references.joined_tables()[0];
     // `excluded` is a table of the scope around the target's, as in SQLite, so
     // the target's columns come first for an unqualified name, a table the
     // subquery calls `excluded` hides it, and a subquery that reads it at any
@@ -1948,6 +1942,22 @@ fn emit_do_update_subqueries<'a>(
         restore_returning_row_image_in_cache(resolver, cache_state);
     }
     result
+}
+
+/// The INSERT's table references as an ON CONFLICT clause sees them. The
+/// clause names the table by its alias when the INSERT gives one, where
+/// RETURNING names it by the table's name.
+fn upsert_table_references(
+    table_references: &TableReferences,
+    table_alias: Option<&str>,
+) -> TableReferences {
+    let mut table_references = table_references.clone();
+    if let Some(alias) = table_alias {
+        let target = &mut table_references.joined_tables_mut()[0];
+        target.identifier = normalize_ident(alias);
+        target.has_alias = true;
+    }
+    table_references
 }
 
 /// The resolve type a constraint Halt in the DO UPDATE arm carries. SQLite
