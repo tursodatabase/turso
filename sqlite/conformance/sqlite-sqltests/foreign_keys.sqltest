@@ -5435,6 +5435,70 @@ test fk-self-ref-delete-parent-only-still-fails {
 expect error {
 }
 
+@cross-check-integrity
+test fk-self-ref-update-key-and-reference-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    UPDATE t SET id = id + 10, parent = parent + 10;
+    SELECT id, parent FROM t ORDER BY id;
+}
+expect {
+    11|
+    12|11
+}
+
+@cross-check-integrity
+test fk-self-ref-unique-key-update-key-and-reference-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k TEXT UNIQUE, parent TEXT REFERENCES t(k));
+    INSERT INTO t VALUES ('a', NULL), ('b', 'a');
+    UPDATE t SET k = k || 'x', parent = parent || 'x';
+    SELECT k, parent FROM t ORDER BY k;
+}
+expect {
+    ax|
+    bx|ax
+}
+
+# The child row comes before its parent in rowid order: the parent's later
+# key change gives the child's new value its parent again.
+@cross-check-integrity
+test fk-self-ref-update-child-before-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (5, NULL), (1, 5);
+    UPDATE t SET id = id + 10, parent = parent + 10;
+    SELECT id, parent FROM t ORDER BY id;
+}
+expect {
+    11|15
+    15|
+}
+
+@cross-check-integrity
+test fk-self-ref-unique-key-update-child-before-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k TEXT UNIQUE, parent TEXT REFERENCES t(k));
+    INSERT INTO t VALUES ('b', NULL), ('a', 'b');
+    UPDATE t SET k = k || 'x', parent = parent || 'x';
+    SELECT k, parent FROM t ORDER BY k;
+}
+expect {
+    ax|bx
+    bx|
+}
+
+@cross-check-integrity
+test fk-self-ref-update-child-before-missing-parent-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (5, NULL), (1, 5);
+    UPDATE t SET id = id + 10, parent = parent + 20;
+}
+expect error {
+}
+
 # A later row of a multi-row INSERT replaces an orphan that an earlier row
 # wrote, whatever the FK's actions are.
 @cross-check-integrity
@@ -5505,4 +5569,34 @@ test fk-replace-orphan-row-that-has-children-fails {
 }
 expect {
     1|1
+}
+
+# One row frees a referenced parent key and a later row of the same UPDATE
+# takes it, so no child is left without a parent.
+test fk-update-moves-referenced-key-to-another-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (1);
+    UPDATE p SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 1 END;
+    SELECT id FROM p ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test fk-update-moves-referenced-non-rowid-key-to-another-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INT PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (1);
+    UPDATE p SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 1 END;
+    SELECT id FROM p ORDER BY id;
+}
+expect {
+    1
+    3
 }

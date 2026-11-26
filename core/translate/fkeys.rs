@@ -941,12 +941,20 @@ fn emit_fk_parent_key_probe(
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
     let skip_probe = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, n_cols, skip_probe);
+    if matches!(pass, ParentProbePass::New) {
+        // The NEW pass only cancels counted violations, so with none counted
+        // the child scan is skipped, as in SQLite.
+        program.emit_insn(Insn::FkIfZero {
+            deferred: is_deferred,
+            target_pc: skip_probe,
+        });
+    }
 
     let on_match = |p: &mut ProgramBuilder| -> Result<()> {
-        match (is_deferred, pass) {
+        match pass {
             // OLD key referenced by a child: removing/changing this parent key
             // creates a violation unless a later statement repairs it.
-            (_, ParentProbePass::Old) => {
+            ParentProbePass::Old => {
                 if is_restrict {
                     // RESTRICT: immediate halt
                     emit_fk_restrict_halt(p, None)?;
@@ -956,16 +964,16 @@ fn emit_fk_parent_key_probe(
                 }
             }
 
-            // NEW key referenced by a child: this parent key may repair a
-            // deferred orphan. The decrement is guarded because the aggregate
-            // counter does not know which key originally incremented it.
-            (true, ParentProbePass::New) => {
+            // NEW key referenced by a child: this parent key may repair an
+            // orphan that an earlier row of this statement, or for a deferred
+            // FK an earlier statement, counted. The decrement is guarded
+            // because the aggregate counter does not know which key originally
+            // incremented it.
+            ParentProbePass::New => {
                 let skip = p.allocate_label();
-                emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
+                emit_guarded_fk_decrement(p, skip, is_deferred);
                 p.preassign_label_to_next_insn(skip);
             }
-            // Immediate FK on NEW pass: nothing to cancel; do nothing.
-            (false, ParentProbePass::New) => {}
         }
         Ok(())
     };
