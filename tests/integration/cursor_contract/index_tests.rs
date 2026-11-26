@@ -8,7 +8,7 @@
 
 use super::index_program::{run_index, IObs, IOp::*, IndexRun, Outcome, Row};
 use super::program::ReadMode;
-use super::{DbKind, Layout};
+use super::{known_bug, DbKind, Layout};
 
 const NULL: Option<i64> = None;
 
@@ -75,7 +75,7 @@ const CONFIGS: [(DbKind, Layout); 5] = [
 
 /// The read modes that agree everywhere, as long as the program does not read a cursor that
 /// an `IdxInsert` just wrote, or a null-row cursor, or a cursor with a pending `DeferredSeek`
-/// (see the ignored tests at the end of the file).
+/// (see the `known_bug_*` tests at the end of the file).
 const SAFE_MODES: [ReadMode; 2] = [ReadMode::Column, ReadMode::ColumnRange];
 
 type Ops = [super::index_program::IOp];
@@ -1047,7 +1047,7 @@ fn seek_end_then_idx_insert_at_the_end() {
             rowid: 40,
             use_seek: false,
         },
-        // The cursor position after this insert is `ignored_idx_insert_at_the_end_...`.
+        // The cursor position after this insert is `known_bug_d1_idx_insert_at_the_end_...`.
         Last(0),
         Observe(0),
     ];
@@ -1210,8 +1210,8 @@ fn deferred_seek_then_move_the_index() {
 }
 
 // Everything below is a known gap between an engine and the contract (or between engines).
-// The tests are ignored so that the suite stays green. Run them with `--ignored` to see the
-// failures. Each test asserts what SPEC says.
+// Each `known_bug_*` test asserts what SPEC says. The test passes while the bug is present
+// (the body must panic). When a bug is fixed, remove the `known_bug` wrapper.
 
 const ROW_DATA: &[ReadMode] = &[ReadMode::RowData];
 const ROW_DATA_RAW: &[ReadMode] = &[ReadMode::RowDataRaw];
@@ -1231,188 +1231,215 @@ fn insert_key(a: i64, b: i64, rowid: i64) -> super::index_program::IOp {
 /// the entry after it. MVCC with the entries in the B-tree: `Next` does not jump and the
 /// cursor reads nothing, as if the scan had ended. Same gap as the table test
 /// `insert_then_next_from_new_row`. WAL, ephemeral and MVCC with entries in memory agree.
+///
+/// Fails today because of D1; see SPEC section 5b.
 #[test]
-#[ignore = "D1: MVCC (checkpointed entries) loses the position after IdxInsert"]
-fn idx_insert_then_next_from_new_entry() {
-    let ops = [insert_key(2, 20, 8), Next(0), Observe(0)];
-    let expected = [n(), j(), e(4, 2, 30)];
-    check(
-        ROWS,
-        Opts {
-            modes: SAFE,
-            ..Opts::default()
-        },
-        &ops,
-        &expected,
-    );
-}
-
-/// Same as above, with `Prev`.
-#[test]
-#[ignore = "D1: MVCC (checkpointed entries) loses the position after IdxInsert"]
-fn idx_insert_then_prev_from_new_entry() {
-    let ops = [insert_key(2, 20, 8), Prev(0), Observe(0)];
-    let expected = [n(), j(), e(3, 2, 10)];
-    check(
-        ROWS,
-        Opts {
-            modes: SAFE,
-            ..Opts::default()
-        },
-        &ops,
-        &expected,
-    );
-}
-
-/// D1: `IdxInsert` of a key that is above every key. The cursor must be on the new entry.
-/// WAL and ephemeral: the cursor reads nothing (it looks like it is past the end). MVCC is
-/// fine. An insert in the middle is fine in all engines.
-#[test]
-#[ignore = "D1: WAL and ephemeral: the cursor is not on the entry that IdxInsert appended"]
-fn idx_insert_at_the_end_positions_the_cursor() {
-    let ops = [insert_key(9, 9, 40), Observe(0)];
-    let expected = [n(), e(40, 9, 9)];
-    check(
-        ROWS,
-        Opts {
-            modes: SAFE,
-            ..Opts::default()
-        },
-        &ops,
-        &expected,
-    );
-}
-
-/// The same after `SeekEnd`, the pattern of `CREATE INDEX`.
-#[test]
-#[ignore = "D1: WAL and ephemeral: the cursor is not on the entry that IdxInsert appended"]
-fn idx_insert_after_seek_end_positions_the_cursor() {
-    let ops = [SeekEnd(0), insert_key(9, 9, 40), Observe(0)];
-    let expected = [n(), n(), e(40, 9, 9)];
-    check(
-        ROWS,
-        Opts {
-            modes: SAFE,
-            ..Opts::default()
-        },
-        &ops,
-        &expected,
-    );
-}
-
-/// SPEC 2b: `RowData` reads the same row as `Column`. After an `IdxInsert` in the middle of
-/// the index, `Column` reads the new entry, but `RowData` reads the entry after it (WAL and
-/// ephemeral; MVCC is fine). `RowData` is not guarded, with `RowDataRaw` the result is the same.
-#[test]
-#[ignore = "RowData after IdxInsert reads the next entry (WAL, ephemeral)"]
-fn rowdata_after_idx_insert_reads_the_new_entry() {
-    let ops = [insert_key(1, 15, 7), Observe(0)];
-    let expected = [n(), e(7, 1, 15)];
-    for modes in [ROW_DATA, ROW_DATA_RAW] {
+fn known_bug_d1_idx_insert_then_next_from_new_entry() {
+    known_bug("D1", "differ from the expected observations", || {
+        let ops = [insert_key(2, 20, 8), Next(0), Observe(0)];
+        let expected = [n(), j(), e(4, 2, 30)];
         check(
             ROWS,
             Opts {
-                modes,
+                modes: SAFE,
                 ..Opts::default()
             },
             &ops,
             &expected,
         );
-    }
+    });
+}
+
+/// Same as above, with `Prev`.
+///
+/// Fails today because of D1; see SPEC section 5b.
+#[test]
+fn known_bug_d1_idx_insert_then_prev_from_new_entry() {
+    known_bug("D1", "differ from the expected observations", || {
+        let ops = [insert_key(2, 20, 8), Prev(0), Observe(0)];
+        let expected = [n(), j(), e(3, 2, 10)];
+        check(
+            ROWS,
+            Opts {
+                modes: SAFE,
+                ..Opts::default()
+            },
+            &ops,
+            &expected,
+        );
+    });
+}
+
+/// D1: `IdxInsert` of a key that is above every key. The cursor must be on the new entry.
+/// WAL and ephemeral: the cursor reads nothing (it looks like it is past the end). MVCC is
+/// fine. An insert in the middle is fine in all engines.
+///
+/// Fails today because of D1; see SPEC section 5b.
+#[test]
+fn known_bug_d1_idx_insert_at_the_end_positions_the_cursor() {
+    known_bug("D1", "differ from the expected observations", || {
+        let ops = [insert_key(9, 9, 40), Observe(0)];
+        let expected = [n(), e(40, 9, 9)];
+        check(
+            ROWS,
+            Opts {
+                modes: SAFE,
+                ..Opts::default()
+            },
+            &ops,
+            &expected,
+        );
+    });
+}
+
+/// The same after `SeekEnd`, the pattern of `CREATE INDEX`.
+///
+/// Fails today because of D1; see SPEC section 5b.
+#[test]
+fn known_bug_d1_idx_insert_after_seek_end_positions_the_cursor() {
+    known_bug("D1", "differ from the expected observations", || {
+        let ops = [SeekEnd(0), insert_key(9, 9, 40), Observe(0)];
+        let expected = [n(), n(), e(40, 9, 9)];
+        check(
+            ROWS,
+            Opts {
+                modes: SAFE,
+                ..Opts::default()
+            },
+            &ops,
+            &expected,
+        );
+    });
+}
+
+/// SPEC 2b: `RowData` reads the same row as `Column`. After an `IdxInsert` in the middle of
+/// the index, `Column` reads the new entry, but `RowData` reads the entry after it (WAL and
+/// ephemeral; MVCC is fine). `RowData` is not guarded, with `RowDataRaw` the result is the same.
+///
+/// Fails today because of R1; see SPEC section 5b.
+#[test]
+fn known_bug_r1_rowdata_after_idx_insert_reads_the_new_entry() {
+    known_bug("R1", "differ from the expected observations", || {
+        let ops = [insert_key(1, 15, 7), Observe(0)];
+        let expected = [n(), e(7, 1, 15)];
+        for modes in [ROW_DATA, ROW_DATA_RAW] {
+            check(
+                ROWS,
+                Opts {
+                    modes,
+                    ..Opts::default()
+                },
+                &ops,
+                &expected,
+            );
+        }
+    });
 }
 
 /// SPEC 1: a null-row cursor reads NULL. `RowData` returns the real row in WAL and in
 /// ephemeral, and fails with "cursor has no record" in MVCC.
+///
+/// Fails today because of R1; see SPEC section 5b.
 #[test]
-#[ignore = "RowData ignores the null-row flag (WAL, ephemeral) or fails (MVCC)"]
-fn rowdata_on_null_row_reads_null() {
-    let ops = [Rewind(0), NullRow(0), Observe(0)];
-    let expected = [n(), n(), n()];
-    check(
-        ROWS,
-        Opts {
-            modes: ROW_DATA_RAW,
-            ..Opts::default()
-        },
-        &ops,
-        &expected,
-    );
+fn known_bug_r1_rowdata_on_null_row_reads_null() {
+    known_bug("R1", "differ from the expected observations", || {
+        let ops = [Rewind(0), NullRow(0), Observe(0)];
+        let expected = [n(), n(), n()];
+        check(
+            ROWS,
+            Opts {
+                modes: ROW_DATA_RAW,
+                ..Opts::default()
+            },
+            &ops,
+            &expected,
+        );
+    });
 }
 
 /// SPEC 1: a cursor without an entry reads NULL. `RowData` fails with "cursor has no
 /// record" in every engine. SQLite asserts here, so this is probably by design: the `RowData`
 /// read mode of the harness skips the read with a `ColumnHasField` guard.
+///
+/// Fails today because of R1; see SPEC section 5b.
 #[test]
-#[ignore = "RowData on a cursor without an entry is an error, Column reads NULL"]
-fn rowdata_on_cursor_without_entry_reads_null() {
-    let ops = [
-        Rewind(0),
-        Next(0),
-        Next(0),
-        Next(0),
-        Next(0),
-        Next(0),
-        Next(0),
-        Observe(0),
-    ];
-    let expected = [n(), j(), j(), j(), j(), j(), n(), n()];
-    check(
-        ROWS,
-        Opts {
-            modes: ROW_DATA_RAW,
-            ..Opts::default()
-        },
-        &ops,
-        &expected,
-    );
+fn known_bug_r1_rowdata_on_cursor_without_entry_reads_null() {
+    known_bug("R1", "cursor has no record", || {
+        let ops = [
+            Rewind(0),
+            Next(0),
+            Next(0),
+            Next(0),
+            Next(0),
+            Next(0),
+            Next(0),
+            Observe(0),
+        ];
+        let expected = [n(), j(), j(), j(), j(), j(), n(), n()];
+        check(
+            ROWS,
+            Opts {
+                modes: ROW_DATA_RAW,
+                ..Opts::default()
+            },
+            &ops,
+            &expected,
+        );
+    });
 }
 
 /// G7 neighbour: `ColumnHasField` and `RowData` do not complete a pending `DeferredSeek`.
 /// `Column` does. `ColumnHasField` sees a table cursor without a row and skips the read (WAL,
 /// MVCC); in the ephemeral engine the table cursor has an old position and `RowData` reads
 /// the wrong row.
+///
+/// Fails today because of R1; see SPEC section 5b.
 #[test]
-#[ignore = "ColumnHasField and RowData ignore a pending DeferredSeek"]
-fn deferred_seek_with_has_field_and_row_data() {
-    let ops = [
-        SeekGE(0, p![2, 10]),
-        DeferredSeek { idx: 0, tbl: 0 },
-        TblColumn(0, 1),
-        TblColumn(0, 2),
-    ];
-    let c0 = IObs { c0: Some(2), ..n() };
-    let c1 = IObs {
-        c1: Some(10),
-        ..n()
-    };
-    let expected = [n(), n(), c0, c1];
-    check(
-        ROWS,
-        Opts {
-            ntbl: 1,
-            modes: HAS_FIELD_AND_ROW_DATA,
-            ..Opts::default()
-        },
-        &ops,
-        &expected,
-    );
+fn known_bug_r1_deferred_seek_with_has_field_and_row_data() {
+    known_bug("R1", "differ from the expected observations", || {
+        let ops = [
+            SeekGE(0, p![2, 10]),
+            DeferredSeek { idx: 0, tbl: 0 },
+            TblColumn(0, 1),
+            TblColumn(0, 2),
+        ];
+        let c0 = IObs { c0: Some(2), ..n() };
+        let c1 = IObs {
+            c1: Some(10),
+            ..n()
+        };
+        let expected = [n(), n(), c0, c1];
+        check(
+            ROWS,
+            Opts {
+                ntbl: 1,
+                modes: HAS_FIELD_AND_ROW_DATA,
+                ..Opts::default()
+            },
+            &ops,
+            &expected,
+        );
+    });
 }
 
 /// `OpenDup` does not support index cursors, so an ephemeral index cannot have a peer cursor
 /// (the table variant works). The harness skips ephemeral runs with more than one index cursor.
+///
+/// Fails today because of O1; see SPEC section 5b.
 #[test]
-#[ignore = "OpenDup is not supported for BTreeIndex: no peer cursor on an ephemeral index"]
-fn ephemeral_index_peer_cursor() {
-    let ops = [Rewind(0), Rewind(1), Observe(1)];
-    let cfg = IndexRun {
-        kind: DbKind::Ephemeral,
-        layout: Layout::AllInMemory,
-        rows: ROWS,
-        nidx: 2,
-        ntbl: 0,
-        mode: ReadMode::Column,
-    };
-    let got = run_index(&cfg, &ops);
-    assert_eq!(got.error, None);
-    assert_eq!(got.obs, vec![n(), n(), e(6, NULL, 5)]);
+fn known_bug_o1_ephemeral_index_peer_cursor() {
+    known_bug("O1", "OpenDup is not supported", || {
+        let ops = [Rewind(0), Rewind(1), Observe(1)];
+        let cfg = IndexRun {
+            kind: DbKind::Ephemeral,
+            layout: Layout::AllInMemory,
+            rows: ROWS,
+            nidx: 2,
+            ntbl: 0,
+            mode: ReadMode::Column,
+        };
+        let got = run_index(&cfg, &ops);
+        assert_eq!(got.error, None);
+        assert_eq!(got.obs, vec![n(), n(), e(6, NULL, 5)]);
+    });
 }

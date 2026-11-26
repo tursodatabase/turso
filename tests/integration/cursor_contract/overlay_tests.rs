@@ -6,7 +6,7 @@
 
 use super::index_program::{run_index, with_eq_only_seek_ge, IObs, IOp, IndexRun, Row};
 use super::program::{Obs, ReadMode};
-use super::{run, DbKind, Layout};
+use super::{known_bug, run, DbKind, Layout};
 use IOp::{IdxInsert, Next as INext, Observe, Rewind as IRewind, SeekGE as ISeekGE};
 
 /// The engines under test. The layout is `Checkpointed` for all of them.
@@ -85,57 +85,64 @@ mod table {
     }
 
     /// T1: the overlay hit (row 3 is in both stores). `Next` must go to 4, 5, 7.
-    /// The dual cursor ends the scan after the overlay hit.
+    /// Fails today because of N1; see SPEC section 5b.
     #[test]
-    #[ignore = "N1: MVCC Next after SeekRowid overlay hit finds no row, expected 4,5,7"]
-    fn t1_seek_rowid_overlay_hit_then_next() {
-        let mut ops = overlay_writes();
-        ops.extend([SeekRowid(0, 3), RowId(0)]);
-        ops.extend(steps(3));
-        check("T1", &ops, &[4, 5, 7]);
+    fn known_bug_n1_t1_seek_rowid_overlay_hit_then_next() {
+        known_bug("N1", "T1 Mvcc: expected rowids", || {
+            let mut ops = overlay_writes();
+            ops.extend([SeekRowid(0, 3), RowId(0)]);
+            ops.extend(steps(3));
+            check("T1", &ops, &[4, 5, 7]);
+        });
     }
 
     /// T2: the B-tree hit (row 1 is only in the B-tree). `Next` must go to 3, 4, 5.
-    /// The dual cursor goes to 5 first: it loses the overlay rows.
+    /// Fails today because of N1; see SPEC section 5b.
     #[test]
-    #[ignore = "MVCC Next after SeekRowid B-tree hit skips the overlay rows (5,7,end), expected 3,4,5"]
-    fn t2_seek_rowid_btree_hit_then_next() {
-        let mut ops = overlay_writes();
-        ops.extend([SeekRowid(0, 1), RowId(0)]);
-        ops.extend(steps(3));
-        check("T2", &ops, &[3, 4, 5]);
+    fn known_bug_n1_t2_seek_rowid_btree_hit_then_next() {
+        known_bug("N1", "T2 Mvcc: expected rowids", || {
+            let mut ops = overlay_writes();
+            ops.extend([SeekRowid(0, 1), RowId(0)]);
+            ops.extend(steps(3));
+            check("T2", &ops, &[3, 4, 5]);
+        });
     }
 
     /// T3: `NotExists` is the other opcode of the "hit then Next" contract of SPEC section 2.
-    /// The hit is in the overlay (row 3). Same root cause as T1 (N1 in `mod.rs`).
+    /// The hit is in the overlay (row 3). `Next` must go to 4, 5, 7.
+    /// Fails today because of N1; see SPEC section 5b.
     #[test]
-    #[ignore = "N1: MVCC Next after NotExists overlay hit finds no row, expected 4,5,7"]
-    fn t3_not_exists_overlay_hit_then_next() {
-        let mut ops = overlay_writes();
-        ops.extend([NotExists(0, 3), RowId(0)]);
-        ops.extend(steps(3));
-        check("T3 overlay hit", &ops, &[4, 5, 7]);
+    fn known_bug_n1_t3_not_exists_overlay_hit_then_next() {
+        known_bug("N1", "T3 overlay hit Mvcc: expected rowids", || {
+            let mut ops = overlay_writes();
+            ops.extend([NotExists(0, 3), RowId(0)]);
+            ops.extend(steps(3));
+            check("T3 overlay hit", &ops, &[4, 5, 7]);
+        });
     }
 
-    /// T3, the hit is in the B-tree (row 1). Same root cause as T2.
+    /// T3, the hit is in the B-tree (row 1). `Next` must go to 3, 4, 5.
+    /// Fails today because of N1; see SPEC section 5b.
     #[test]
-    #[ignore = "MVCC Next after NotExists B-tree hit skips the overlay rows, expected 3,4,5"]
-    fn t3_not_exists_btree_hit_then_next() {
-        let mut ops = overlay_writes();
-        ops.extend([NotExists(0, 1), RowId(0)]);
-        ops.extend(steps(3));
-        check("T3 B-tree hit", &ops, &[3, 4, 5]);
+    fn known_bug_n1_t3_not_exists_btree_hit_then_next() {
+        known_bug("N1", "T3 B-tree hit Mvcc: expected rowids", || {
+            let mut ops = overlay_writes();
+            ops.extend([NotExists(0, 1), RowId(0)]);
+            ops.extend(steps(3));
+            check("T3 B-tree hit", &ops, &[3, 4, 5]);
+        });
     }
 
     /// T4: a peer cursor inserts row 9 after the seek. `Next` must see it at the end.
-    /// After the peer write, the dual cursor sees only the overlay rows.
+    /// Fails today because of N1; see SPEC section 5b.
     #[test]
-    #[ignore = "MVCC after a peer write Next sees only overlay rows (4,9,end), expected 4,5,7,9"]
-    fn t4_seek_rowid_hit_peer_write_then_next() {
-        let mut ops = overlay_writes();
-        ops.extend([SeekRowid(0, 3), RowId(0), insert(9, 99)]);
-        ops.extend(steps(4));
-        check("T4", &ops, &[4, 5, 7, 9]);
+    fn known_bug_n1_t4_seek_rowid_hit_peer_write_then_next() {
+        known_bug("N1", "T4 Mvcc: expected rowids", || {
+            let mut ops = overlay_writes();
+            ops.extend([SeekRowid(0, 3), RowId(0), insert(9, 99)]);
+            ops.extend(steps(4));
+            check("T4", &ops, &[4, 5, 7, 9]);
+        });
     }
 }
 
@@ -242,37 +249,40 @@ mod index {
     }
 
     /// I1, the eq-only `SeekGE` that the translator emits in front of an `IdxGT` loop.
-    /// The dual cursor cuts off the overlay key (2,5,1). A range loop stops at the first key above the prefix, so the
-    /// first three entries of the flat view are the ones that matter.
+    /// `Next` must reach the overlay key (2,5,1). A range loop stops at the first key above
+    /// the prefix, so the first three entries of the flat view are the ones that matter.
+    /// Fails today because of OV1; see SPEC section 5b.
     #[test]
-    #[ignore = "MVCC eq-only SeekGE then Next skips the overlay key (2,5,1), expected (1,1,4),(1,2,5),(2,5,1),(3,1,5)"]
-    fn i1_eq_only_seek_ge_prefix_then_next() {
-        check(
-            "I1 eq-only",
-            &cluster_rows(),
-            true,
-            &seek_and_scan(vec![Some(1)]),
-            &FLAT,
-        );
+    fn known_bug_ov1_i1_eq_only_seek_ge_prefix_then_next() {
+        known_bug("OV1", "I1 eq-only Mvcc", || {
+            check(
+                "I1 eq-only",
+                &cluster_rows(),
+                true,
+                &seek_and_scan(vec![Some(1)]),
+                &FLAT,
+            );
+        });
     }
 
     /// I2: the B-tree has only (3,1,5) and the overlay has only (1,2,5). The eq-only seek on
     /// the prefix [1] finds the overlay entry, then `Next` must go to the B-tree entry.
-    /// The dual cursor stops the scan and loses the B-tree key.
+    /// Fails today because of OV1; see SPEC section 5b.
     #[test]
-    #[ignore = "MVCC eq-only SeekGE hit in the overlay then Next ends, expected (3,1,5)"]
-    fn i2_eq_only_seek_ge_overlay_only_then_next() {
-        let rows = vec![(5, Some(3), Some(1))];
-        let ops = [
-            insert_key(1, 2, 5, false),
-            ISeekGE(0, vec![Some(1)]),
-            Observe(0),
-            INext(0),
-            Observe(0),
-        ];
-        check("I2 eq-only", &rows, true, &ops, &[e(1, 2, 5), e(3, 1, 5)]);
-        // The same without eq-only.
-        check("I2 plain", &rows, false, &ops, &[e(1, 2, 5), e(3, 1, 5)]);
+    fn known_bug_ov1_i2_eq_only_seek_ge_overlay_only_then_next() {
+        known_bug("OV1", "I2 eq-only Mvcc", || {
+            let rows = vec![(5, Some(3), Some(1))];
+            let ops = [
+                insert_key(1, 2, 5, false),
+                ISeekGE(0, vec![Some(1)]),
+                Observe(0),
+                INext(0),
+                Observe(0),
+            ];
+            check("I2 eq-only", &rows, true, &ops, &[e(1, 2, 5), e(3, 1, 5)]);
+            // The same without eq-only.
+            check("I2 plain", &rows, false, &ops, &[e(1, 2, 5), e(3, 1, 5)]);
+        });
     }
 
     /// I3 on the key (a, b): `Found` on the prefix [a, b] hits, then `IdxInsert` of
@@ -301,27 +311,31 @@ mod index {
     /// I3, the hit is the overlay entry (1,2,5). WAL (the oracle) puts (1,2,9) before
     /// (1,2,5): the insert goes to the position of the hit and not to the place of its key,
     /// so the tree is out of key order. MVCC gives the right order. The translator only
-    /// uses `use_seek` after a miss, so the model should not allow a hit token for it.
+    /// uses `use_seek` after a miss. The expected order is the key order.
+    /// Fails today because of N11; see SPEC section 5b.
     #[test]
-    #[ignore = "I3: WAL puts the key of IdxInsert use_seek after a Found hit at the position of the hit (out of key order). MVCC is right. The model token rule for a hit is too wide"]
-    fn i3_found_overlay_hit_then_idx_insert_use_seek() {
-        found_hit_then_insert(
-            "I3 overlay hit",
-            1,
-            2,
-            &[e(1, 1, 4), e(1, 2, 5), e(1, 2, 9), e(3, 1, 5)],
-        );
+    fn known_bug_n11_found_overlay_hit_then_idx_insert_use_seek() {
+        known_bug("N11", "I3 overlay hit Wal", || {
+            found_hit_then_insert(
+                "I3 overlay hit",
+                1,
+                2,
+                &[e(1, 1, 4), e(1, 2, 5), e(1, 2, 9), e(3, 1, 5)],
+            );
+        });
     }
 
-    /// I3, the hit is the B-tree entry (1,1,4).
+    /// I3, the hit is the B-tree entry (1,1,4). The new key (1,1,9) must come after it.
+    /// Fails today because of N11; see SPEC section 5b.
     #[test]
-    #[ignore = "I3: WAL: (1,1,9) lands before (1,1,4), see i3_found_overlay_hit_then_idx_insert_use_seek"]
-    fn i3_found_btree_hit_then_idx_insert_use_seek() {
-        found_hit_then_insert(
-            "I3 B-tree hit",
-            1,
-            1,
-            &[e(1, 1, 4), e(1, 1, 9), e(1, 2, 5), e(3, 1, 5)],
-        );
+    fn known_bug_n11_found_btree_hit_then_idx_insert_use_seek() {
+        known_bug("N11", "I3 B-tree hit Wal", || {
+            found_hit_then_insert(
+                "I3 B-tree hit",
+                1,
+                1,
+                &[e(1, 1, 4), e(1, 1, 9), e(1, 2, 5), e(3, 1, 5)],
+            );
+        });
     }
 }

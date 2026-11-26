@@ -13,11 +13,11 @@ Status: draft. Every rule marked **DECISION** needs a human OK.
 | `program.rs`, `index_program.rs`, `mod.rs` | Harness. Builds a VDBE program from a list of table or index operations, runs it on one engine, returns what each operation saw. Engines: WAL, MVCC, ephemeral. Layouts: all in memory, checkpointed. |
 | `model.rs`, `index_model.rs` | Reference model: the contract as a pure Rust function. No database. |
 | `walk.rs`, `index_walk.rs` | Random walks. Generate operations, run them on all engines and on the model, compare, shrink a failure. Known bugs are filtered by name; `NO_FILTER=1` turns the filters off. |
-| `index_tests.rs`, `overlay_tests.rs`, tests in `mod.rs` | Fixed scenarios. A test marked `#[ignore]` pins a bug that is still open. |
+| `index_tests.rs`, `overlay_tests.rs`, tests in `mod.rs` | Fixed scenarios. A test named `known_bug_*` asserts that a bug is still open (section 5b). |
 
-Run: `cargo test -p core_tester --test integration_tests cursor_contract`. Add
-`-- --include-ignored` to see the open bugs fail. Walk parameters: `SEED`, `ITERS`. Long
-walks: `random_walk_long` and `index_random_walk_long`, with `--ignored`.
+Run: `cargo test -p core_tester --test integration_tests cursor_contract`. Walk parameters:
+`SEED`, `ITERS`. Long walks: `random_walk_long` and `index_random_walk_long`, with
+`--ignored`. They are the only ignored tests.
 
 ## 1. Abstract state
 
@@ -165,13 +165,23 @@ table `SeekLE/LT` with a text or blob key does match SQLite (both go to the last
 
 ## 5b. Bugs found by the random walks
 
-Each one is pinned by an `#[ignore]`d test. "WAL" means the B-tree path.
+Each one is pinned by a `known_bug_<id>_*` test. The test runs the contract check inside
+`known_bug(id, expected, body)` (`mod.rs`), which requires that the check still fails. When
+you fix a bug, the test fails with "does not fail any more". Then remove the `known_bug`
+wrapper: the body is a normal regression test. "WAL" means the B-tree path. An id with the
+prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 
 | Id | Engine | Bug |
 |---|---|---|
 | D1 | MVCC, checkpointed | After `Insert`, `Next` and `Prev` lose the position |
+| G4 | MVCC, checkpointed | After an overwrite by `Insert`, `Column` reads the old record |
 | G2 | WAL, MVCC | A peer deletes our row: WAL reads the next row, MVCC reads the deleted row |
 | G3 | WAL | A peer write clears the null-row flag |
+| D4 | WAL, MVCC | `Delete` without a row panics |
+| N3 | WAL | `NewRowid` on a null-row cursor returns 1 |
+| R1 | all | `RowData` and `Column` disagree: on a null row, after `IdxInsert`, on a cursor without an entry, and with a pending `DeferredSeek` |
+| O1 | ephemeral | `OpenDup` rejects index cursors |
+| OV1 | MVCC | Index: an equality-only prefix seek, then `Next`, skips overlay keys or ends early |
 | N1 | MVCC | `SeekRowid` or `NotExists` hit, then `Next`: rows are lost (overlay tests T1 to T4 show the cases) |
 | N2 | WAL | `Count`, then `RowId` or `Column`: overflow panic at `pager.rs:609` |
 | N4 | MVCC, checkpointed | `Delete` of a row written in this run, then `Next` or `Prev`: nothing is found |

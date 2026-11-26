@@ -205,6 +205,31 @@ fn to_obs(row: &[Value], op: Op) -> Result<Obs, String> {
     Ok(obs)
 }
 
+/// Runs `body` and requires that it panics. Use it in a `known_bug_*` test: the body checks
+/// the contract, and it fails today because of the bug `id`. When the bug is fixed, the body
+/// no longer panics, this function fails the test, and the fix must remove the `known_bug`
+/// wrapper so that the body becomes a normal regression test.
+///
+/// `expected` is a part of the panic message. It makes sure that the body fails for the
+/// reason of the bug and not for another reason. An empty `expected` accepts any panic.
+#[cfg(test)]
+pub(crate) fn known_bug(id: &str, expected: &str, body: impl FnOnce()) {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(body)) else {
+        panic!(
+            "known bug {id} does not fail any more: remove the `known_bug` wrapper from this test"
+        );
+    };
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        message.contains(expected),
+        "known bug {id} fails in another way than expected.\nexpected a panic with: {expected:?}\ngot: {message}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,221 +689,252 @@ mod tests {
     }
 
     // Everything below is a known gap between an engine and the contract (or between
-    // WAL and MVCC). The tests are ignored so that the suite stays green. Run them with
-    // `--ignored` to see the failures. Each test asserts what the contract says.
+    // WAL and MVCC). The `known_bug_*` tests assert that the bug is still there: each body
+    // checks what the contract says, and `known_bug` requires that the body fails. When a
+    // fix lands, the test fails and the fix must remove the wrapper.
 
     /// SPEC 1: a null-row cursor reads NULL. `RowData` returns the real row in WAL and in
     /// ephemeral, and fails with "cursor has no record" in MVCC. The index variant is
     /// `rowdata_on_null_row_reads_null` in `index_tests.rs`.
+    ///
+    /// Fails today because of R1; see SPEC section 5b.
     #[test]
-    #[ignore = "RowData ignores the null-row flag (WAL, ephemeral) or fails (MVCC)"]
-    fn row_data_on_null_row_reads_null() {
-        let ops = [Rewind(0), NullRow(0), Column(0, 1)];
-        let expected = [
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-        ];
-        check_modes(ROWS, 1, &ops, &expected, &[ReadMode::RowDataRaw]);
+    fn known_bug_r1_row_data_on_null_row_reads_null() {
+        known_bug("R1", "RowDataRaw differs", || {
+            let ops = [Rewind(0), NullRow(0), Column(0, 1)];
+            let expected = [
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+            ];
+            check_modes(ROWS, 1, &ops, &expected, &[ReadMode::RowDataRaw]);
+        });
     }
 
     /// D1: after `Insert` the cursor is `At k`, so `Next` goes to the following row.
     /// MVCC with the rows in the B-tree: `Next` does not jump and the cursor reads
     /// nothing, as if the scan had ended. WAL and MVCC with rows in memory agree.
+    ///
+    /// Fails today because of D1; see SPEC section 5b.
     #[test]
-    #[ignore = "D1: MVCC (checkpointed rows) loses the position after Insert"]
-    fn insert_then_next_from_new_row() {
-        let ops = [
-            Insert {
-                cur: 0,
-                rowid: 25,
-                value: 1,
-                require_seek: true,
-            },
-            Next(0),
-            RowId(0),
-        ];
-        let expected = [
-            obs(false, None, None),
-            obs(true, None, None),
-            obs(false, Some(30), None),
-        ];
-        check_all(ROWS, 1, &ops, &expected);
+    fn known_bug_d1_insert_then_next_from_new_row() {
+        known_bug("D1", "Checkpointed / Column differs", || {
+            let ops = [
+                Insert {
+                    cur: 0,
+                    rowid: 25,
+                    value: 1,
+                    require_seek: true,
+                },
+                Next(0),
+                RowId(0),
+            ];
+            let expected = [
+                obs(false, None, None),
+                obs(true, None, None),
+                obs(false, Some(30), None),
+            ];
+            check_all(ROWS, 1, &ops, &expected);
+        });
     }
 
     /// Same as above, with `Prev`.
+    ///
+    /// Fails today because of D1; see SPEC section 5b.
     #[test]
-    #[ignore = "D1: MVCC (checkpointed rows) loses the position after Insert"]
-    fn insert_then_prev_from_new_row() {
-        let ops = [
-            Insert {
-                cur: 0,
-                rowid: 25,
-                value: 1,
-                require_seek: true,
-            },
-            Prev(0),
-            RowId(0),
-        ];
-        let expected = [
-            obs(false, None, None),
-            obs(true, None, None),
-            obs(false, Some(20), None),
-        ];
-        check_all(ROWS, 1, &ops, &expected);
+    fn known_bug_d1_insert_then_prev_from_new_row() {
+        known_bug("D1", "Checkpointed / Column differs", || {
+            let ops = [
+                Insert {
+                    cur: 0,
+                    rowid: 25,
+                    value: 1,
+                    require_seek: true,
+                },
+                Prev(0),
+                RowId(0),
+            ];
+            let expected = [
+                obs(false, None, None),
+                obs(true, None, None),
+                obs(false, Some(20), None),
+            ];
+            check_all(ROWS, 1, &ops, &expected);
+        });
     }
 
     /// Same as above, when the cursor was moved by a seek before the `Insert`.
+    ///
+    /// Fails today because of D1; see SPEC section 5b.
     #[test]
-    #[ignore = "D1: MVCC (checkpointed rows) loses the position after Insert"]
-    fn seek_insert_then_next() {
-        let ops = [
-            SeekRowid(0, 20),
-            Insert {
-                cur: 0,
-                rowid: 25,
-                value: 1,
-                require_seek: true,
-            },
-            Next(0),
-            RowId(0),
-        ];
-        let expected = [
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(true, None, None),
-            obs(false, Some(30), None),
-        ];
-        check_all(ROWS, 1, &ops, &expected);
+    fn known_bug_d1_seek_insert_then_next() {
+        known_bug("D1", "Checkpointed / Column differs", || {
+            let ops = [
+                SeekRowid(0, 20),
+                Insert {
+                    cur: 0,
+                    rowid: 25,
+                    value: 1,
+                    require_seek: true,
+                },
+                Next(0),
+                RowId(0),
+            ];
+            let expected = [
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(true, None, None),
+                obs(false, Some(30), None),
+            ];
+            check_all(ROWS, 1, &ops, &expected);
+        });
     }
 
     /// G4: `Insert` that replaces a row. `Column` on the same cursor must read the new
     /// record. MVCC with the row in the B-tree reads the old record (200).
+    ///
+    /// Fails today because of G4; see SPEC section 5b.
     #[test]
-    #[ignore = "G4: MVCC (checkpointed rows) reads the old record after an update by Insert"]
-    fn column_after_update_by_insert() {
-        let ops = [
-            Insert {
-                cur: 0,
-                rowid: 20,
-                value: 222,
-                require_seek: true,
-            },
-            Column(0, 1),
-        ];
-        let expected = [obs(false, None, None), obs(false, None, Some(222))];
-        check_all(ROWS, 1, &ops, &expected);
+    fn known_bug_g4_column_after_update_by_insert() {
+        known_bug("G4", "Checkpointed / Column differs", || {
+            let ops = [
+                Insert {
+                    cur: 0,
+                    rowid: 20,
+                    value: 222,
+                    require_seek: true,
+                },
+                Column(0, 1),
+            ];
+            let expected = [obs(false, None, None), obs(false, None, Some(222))];
+            check_all(ROWS, 1, &ops, &expected);
+        });
     }
 
     /// G4, with a peer cursor that updates the row.
+    ///
+    /// Fails today because of G4; see SPEC section 5b.
     #[test]
-    #[ignore = "G4: MVCC (checkpointed rows) reads the old record after an update by Insert"]
-    fn column_after_update_by_peer() {
-        let ops = [
-            SeekRowid(0, 20),
-            Insert {
-                cur: 1,
-                rowid: 20,
-                value: 999,
-                require_seek: true,
-            },
-            Column(0, 1),
-        ];
-        let expected = [
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, Some(999)),
-        ];
-        check_all(ROWS, 2, &ops, &expected);
+    fn known_bug_g4_column_after_update_by_peer() {
+        known_bug("G4", "Checkpointed / Column differs", || {
+            let ops = [
+                SeekRowid(0, 20),
+                Insert {
+                    cur: 1,
+                    rowid: 20,
+                    value: 999,
+                    require_seek: true,
+                },
+                Column(0, 1),
+            ];
+            let expected = [
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, Some(999)),
+            ];
+            check_all(ROWS, 2, &ops, &expected);
+        });
     }
 
     /// G2 / D5: a peer deletes the row of our cursor, so we read NULL. WAL reads the next
     /// row (30), MVCC reads the deleted row (20).
+    ///
+    /// Fails today because of G2; see SPEC section 5b.
     #[test]
-    #[ignore = "G2: peer delete: WAL reads the next row, MVCC reads the deleted row"]
-    fn peer_delete_then_read() {
-        let ops = [
-            SeekRowid(0, 20),
-            SeekRowid(1, 20),
-            Delete(1),
-            RowId(0),
-            Column(0, 1),
-        ];
-        let expected = [
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-        ];
-        check_all(ROWS, 2, &ops, &expected);
+    fn known_bug_g2_peer_delete_then_read() {
+        known_bug("G2", "Wal / AllInMemory / Column differs", || {
+            let ops = [
+                SeekRowid(0, 20),
+                SeekRowid(1, 20),
+                Delete(1),
+                RowId(0),
+                Column(0, 1),
+            ];
+            let expected = [
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+            ];
+            check_all(ROWS, 2, &ops, &expected);
+        });
     }
 
     /// G2: after the peer deleted our row, `Delete` on our cursor must not delete another
     /// row. WAL deletes the next row (count 1). MVCC does nothing (count 2).
+    ///
+    /// Fails today because of G2; see SPEC section 5b.
     #[test]
-    #[ignore = "G2: WAL deletes the next row after a peer delete"]
-    fn peer_delete_then_delete() {
-        let ops = [
-            SeekRowid(0, 20),
-            SeekRowid(1, 20),
-            Delete(1),
-            Delete(0),
-            Count(0),
-        ];
-        // Rows: 10, 20, 30. The peer removes 20 and our `Delete` must remove nothing.
-        let rows = &ROWS[..3];
-        let expected = [
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, Some(2), None),
-        ];
-        check_all(rows, 2, &ops, &expected);
+    fn known_bug_g2_peer_delete_then_delete() {
+        known_bug("G2", "Wal / AllInMemory / Column differs", || {
+            let ops = [
+                SeekRowid(0, 20),
+                SeekRowid(1, 20),
+                Delete(1),
+                Delete(0),
+                Count(0),
+            ];
+            // Rows: 10, 20, 30. The peer removes 20 and our `Delete` must remove nothing.
+            let rows = &ROWS[..3];
+            let expected = [
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, Some(2), None),
+            ];
+            check_all(rows, 2, &ops, &expected);
+        });
     }
 
     /// G3: a write by a peer must not clear the null-row flag. WAL clears it and reads the
     /// real row. MVCC keeps the flag.
+    ///
+    /// Fails today because of G3; see SPEC section 5b.
     #[test]
-    #[ignore = "G3: WAL clears the null-row flag on a peer write"]
-    fn peer_write_keeps_null_row() {
-        let ops = [
-            Rewind(0),
-            NullRow(0),
-            Insert {
-                cur: 1,
-                rowid: 5,
-                value: 5,
-                require_seek: true,
-            },
-            RowId(0),
-            Column(0, 1),
-        ];
-        let expected = [
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-            obs(false, None, None),
-        ];
-        check_all(ROWS, 2, &ops, &expected);
+    fn known_bug_g3_peer_write_keeps_null_row() {
+        known_bug("G3", "Wal / AllInMemory / Column differs", || {
+            let ops = [
+                Rewind(0),
+                NullRow(0),
+                Insert {
+                    cur: 1,
+                    rowid: 5,
+                    value: 5,
+                    require_seek: true,
+                },
+                RowId(0),
+                Column(0, 1),
+            ];
+            let expected = [
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+                obs(false, None, None),
+            ];
+            check_all(ROWS, 2, &ops, &expected);
+        });
     }
 
     /// D4 / G10: `Delete` without a current row. The contract says Undefined, but
     /// an engine must not panic. WAL asserts `self.current_page >= 0` on an empty cursor.
     /// MVCC panics with "Cannot delete: no current row", also after a scan that ended.
+    ///
+    /// Fails today because of D4; see SPEC section 5b.
     #[test]
-    #[ignore = "D4: Delete without a row panics (WAL on a fresh cursor, MVCC also after the scan ended)"]
-    fn delete_without_row_does_not_panic() {
-        for ops in [
-            vec![Delete(0), Count(0)],
-            vec![Rewind(0), Next(0), Next(0), Next(0), Delete(0), Count(0)],
-        ] {
-            for (kind, layout, got) in run_all(ROWS, 1, &ops) {
-                assert!(got.is_ok(), "{kind:?}/{layout:?} {ops:?}: {got:?}");
+    fn known_bug_d4_delete_without_row_does_not_panic() {
+        known_bug("D4", "self.current_page >= 0", || {
+            for ops in [
+                vec![Delete(0), Count(0)],
+                vec![Rewind(0), Next(0), Next(0), Next(0), Delete(0), Count(0)],
+            ] {
+                for (kind, layout, got) in run_all(ROWS, 1, &ops) {
+                    assert!(got.is_ok(), "{kind:?}/{layout:?} {ops:?}: {got:?}");
+                }
             }
-        }
+        });
     }
 
     // Gaps found by the random walk (`walk.rs`). Each test is the minimal program that the
@@ -897,130 +953,151 @@ mod tests {
 
     /// N1: `Next` after a `SeekRowid` or `NotExists` that hit. SPEC section 2 allows it.
     /// MVCC does not jump and reads nothing, as if the scan had ended.
+    ///
+    /// Fails today because of N1; see SPEC section 5b.
     #[test]
-    #[ignore = "N1: MVCC: Next after SeekRowid/NotExists hit finds no row"]
-    fn next_after_seek_rowid_hit() {
-        agree_all(ROWS, 1, &[SeekRowid(0, 20), Next(0), RowId(0)]);
-        agree_all(ROWS, 1, &[NotExists(0, 20), Next(0), RowId(0)]);
+    fn known_bug_n1_next_after_seek_rowid_hit() {
+        known_bug("N1", "Mismatch", || {
+            agree_all(ROWS, 1, &[SeekRowid(0, 20), Next(0), RowId(0)]);
+            agree_all(ROWS, 1, &[NotExists(0, 20), Next(0), RowId(0)]);
+        });
     }
 
     /// N2: reading a cursor after `Count`. The position is open, but WAL panics with an
     /// arithmetic overflow in `cell_table_leaf_read_header`.
+    ///
+    /// Fails today because of N2; see SPEC section 5b.
     #[test]
-    #[ignore = "N2: WAL: RowId/Column after Count panics (overflow in the pager)"]
-    fn read_after_count_does_not_panic() {
-        for ops in [
-            vec![Rewind(0), Count(0), RowId(0)],
-            vec![Last(0), Count(0), Column(0, 1)],
-        ] {
-            for (kind, layout, got) in run_all(ROWS, 1, &ops) {
-                assert!(got.is_ok(), "{kind:?}/{layout:?} {ops:?}: {got:?}");
+    fn known_bug_n2_read_after_count_does_not_panic() {
+        known_bug("N2", "attempt to multiply with overflow", || {
+            for ops in [
+                vec![Rewind(0), Count(0), RowId(0)],
+                vec![Last(0), Count(0), Column(0, 1)],
+            ] {
+                for (kind, layout, got) in run_all(ROWS, 1, &ops) {
+                    assert!(got.is_ok(), "{kind:?}/{layout:?} {ops:?}: {got:?}");
+                }
             }
-        }
+        });
     }
 
     /// N3: `NewRowid` after `NullRow` (also after `NullRow` and `Count`). SPEC makes it
     /// undefined, but the rowid must still not be one that is in use. WAL returns 1.
+    ///
+    /// Fails today because of N3; see SPEC section 5b.
     #[test]
-    #[ignore = "N3: WAL: NewRowid on a null-row cursor returns 1"]
-    fn new_rowid_after_null_row_is_fresh() {
-        for ops in [
-            vec![NullRow(0), NewRowid(0)],
-            vec![NullRow(0), Count(0), NewRowid(0)],
-        ] {
-            for (kind, layout, got) in run_all(ROWS, 1, &ops) {
-                let got = got.unwrap_or_else(|e| panic!("{kind:?}/{layout:?}: {e}"));
-                let new = got.last().and_then(|o| o.rowid).expect("a rowid");
-                assert!(new > 30, "{kind:?}/{layout:?} {ops:?}: new rowid {new}");
+    fn known_bug_n3_new_rowid_after_null_row_is_fresh() {
+        known_bug("N3", "BadRowid", || {
+            for ops in [
+                vec![NullRow(0), NewRowid(0)],
+                vec![NullRow(0), Count(0), NewRowid(0)],
+            ] {
+                for (kind, layout, got) in run_all(ROWS, 1, &ops) {
+                    let got = got.unwrap_or_else(|e| panic!("{kind:?}/{layout:?}: {e}"));
+                    let new = got.last().and_then(|o| o.rowid).expect("a rowid");
+                    assert!(new > 30, "{kind:?}/{layout:?} {ops:?}: new rowid {new}");
+                }
             }
-        }
+        });
     }
 
     /// N4: `Delete` of a row that an `Insert` wrote in this transaction (a new row or an
     /// update). MVCC with checkpointed rows loses the position: `Next` and `Prev` after the
     /// `Delete` find nothing.
+    ///
+    /// Fails today because of N4; see SPEC section 5b.
     #[test]
-    #[ignore = "N4: MVCC (checkpointed rows): Delete of a row written by Insert loses the position"]
-    fn delete_of_inserted_row_then_move() {
-        let insert = |rowid| Insert {
-            cur: 0,
-            rowid,
-            value: 1,
-            require_seek: true,
-        };
-        agree_all(
-            ROWS,
-            1,
-            &[insert(25), SeekRowid(0, 25), Delete(0), Next(0), RowId(0)],
-        );
-        agree_all(
-            ROWS,
-            1,
-            &[insert(25), SeekRowid(0, 25), Delete(0), Prev(0), RowId(0)],
-        );
-        // An update of a row that is in the B-tree.
-        agree_all(
-            ROWS,
-            1,
-            &[insert(20), SeekRowid(0, 20), Delete(0), Next(0), RowId(0)],
-        );
+    fn known_bug_n4_delete_of_inserted_row_then_move() {
+        known_bug("N4", "Mismatch", || {
+            let insert = |rowid| Insert {
+                cur: 0,
+                rowid,
+                value: 1,
+                require_seek: true,
+            };
+            agree_all(
+                ROWS,
+                1,
+                &[insert(25), SeekRowid(0, 25), Delete(0), Next(0), RowId(0)],
+            );
+            agree_all(
+                ROWS,
+                1,
+                &[insert(25), SeekRowid(0, 25), Delete(0), Prev(0), RowId(0)],
+            );
+            // An update of a row that is in the B-tree.
+            agree_all(
+                ROWS,
+                1,
+                &[insert(20), SeekRowid(0, 20), Delete(0), Next(0), RowId(0)],
+            );
+        });
     }
 
     /// N4, with a row that a peer cursor wrote: `Delete` itself panics ("no current row").
+    ///
+    /// Fails today because of N4; see SPEC section 5b.
     #[test]
-    #[ignore = "N4: MVCC (checkpointed rows): Delete of a row that a peer inserted panics"]
-    fn delete_of_peer_inserted_row() {
-        let ops = [
-            NewRowid(1),
-            NewRowid(0),
-            InsertNew {
-                cur: 0,
-                value: 1,
-                require_seek: true,
-            },
-            SeekRowid(1, 31),
-            Delete(1),
-        ];
-        model::assert_agrees(DbKind::Mvcc, Layout::Checkpointed, ROWS, 2, &ops);
+    fn known_bug_n4_delete_of_peer_inserted_row() {
+        known_bug("N4", "Cannot delete: no current row", || {
+            let ops = [
+                NewRowid(1),
+                NewRowid(0),
+                InsertNew {
+                    cur: 0,
+                    value: 1,
+                    require_seek: true,
+                },
+                SeekRowid(1, 31),
+                Delete(1),
+            ];
+            model::assert_agrees(DbKind::Mvcc, Layout::Checkpointed, ROWS, 2, &ops);
+        });
     }
 
     /// N5: a cursor deletes the last row, a peer inserts a row, then `Prev` on the first
     /// cursor. WAL panics on `self.current_page >= 0`. `Next` is fine.
+    ///
+    /// Fails today because of N5; see SPEC section 5b.
     #[test]
-    #[ignore = "N5: WAL: Prev after Delete emptied the table and a peer inserted panics"]
-    fn prev_after_delete_emptied_table_and_peer_insert() {
-        let rows = [(8, 53)];
-        let ops = [
-            Last(0),
-            Delete(0),
-            Insert {
-                cur: 1,
-                rowid: 16,
-                value: 9,
-                require_seek: true,
-            },
-            Prev(0),
-        ];
-        agree_all(&rows, 2, &ops);
+    fn known_bug_n5_prev_after_delete_emptied_table_and_peer_insert() {
+        known_bug("N5", "self.current_page >= 0", || {
+            let rows = [(8, 53)];
+            let ops = [
+                Last(0),
+                Delete(0),
+                Insert {
+                    cur: 1,
+                    rowid: 16,
+                    value: 9,
+                    require_seek: true,
+                },
+                Prev(0),
+            ];
+            agree_all(&rows, 2, &ops);
+        });
     }
 
     /// N6: the cursor deletes its row, a peer inserts a row, then `Next` or `Prev`. WAL lands
     /// on the wrong row. Per the contract the cursor is in the gap of the deleted key.
+    ///
+    /// Fails today because of N6; see SPEC section 5b.
     #[test]
-    #[ignore = "N6: WAL: Next/Prev after own Delete and a peer insert goes to the wrong row"]
-    fn move_after_delete_and_peer_insert() {
-        let insert = |rowid| Insert {
-            cur: 1,
-            rowid,
-            value: 1,
-            require_seek: true,
-        };
-        // The deleted row was the last one: `Next` must end. A row that the peer inserted
-        // before the gap must not be found.
-        agree_all(ROWS, 2, &[SeekRowid(0, 30), Delete(0), insert(25), Next(0)]);
-        // The peer inserts the deleted key again: `Next` goes past it.
-        agree_all(ROWS, 2, &[SeekRowid(0, 20), Delete(0), insert(20), Next(0)]);
-        // The deleted row was the first one: `Prev` must end.
-        agree_all(ROWS, 2, &[SeekRowid(0, 10), Delete(0), insert(5), Prev(0)]);
+    fn known_bug_n6_move_after_delete_and_peer_insert() {
+        known_bug("N6", "Mismatch", || {
+            let insert = |rowid| Insert {
+                cur: 1,
+                rowid,
+                value: 1,
+                require_seek: true,
+            };
+            // The deleted row was the last one: `Next` must end. A row that the peer inserted
+            // before the gap must not be found.
+            agree_all(ROWS, 2, &[SeekRowid(0, 30), Delete(0), insert(25), Next(0)]);
+            // The peer inserts the deleted key again: `Next` goes past it.
+            agree_all(ROWS, 2, &[SeekRowid(0, 20), Delete(0), insert(20), Next(0)]);
+            // The deleted row was the first one: `Prev` must end.
+            agree_all(ROWS, 2, &[SeekRowid(0, 10), Delete(0), insert(5), Prev(0)]);
+        });
     }
 }

@@ -33,7 +33,7 @@ const CONFIGS: [(DbKind, Layout); 4] = [
 // ---------------------------------------------------------------------------------------
 
 /// A set of generator filters. Each bit avoids the exact pattern of one known engine gap
-/// (see SPEC.md section 5 and the `#[ignore]` tests in `mod.rs`), so that a walk does not
+/// (see SPEC.md section 5 and the `known_bug_*` tests in `mod.rs`), so that a walk does not
 /// find the same bug again and again.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KnownGaps(u32);
