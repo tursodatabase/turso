@@ -39,6 +39,13 @@ impl ModuleImplementation {
             Self::Native(module) => module.innocuous(),
         }
     }
+
+    pub(crate) fn declares_column_type(&self, column: &str) -> bool {
+        match self {
+            Self::C(_) => false,
+            Self::Native(module) => module.declares_column_type(column),
+        }
+    }
 }
 
 pub(crate) fn create_virtual_table(

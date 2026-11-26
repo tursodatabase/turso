@@ -67,6 +67,7 @@ fn pragma_vtabs() -> crate::Result<Vec<Arc<VirtualTable>>> {
                 vtab_id: 0,
                 is_droppable: false,
                 innocuous: true,
+                columns_with_declared_type: Vec::new(),
             }))
         })
         .collect()

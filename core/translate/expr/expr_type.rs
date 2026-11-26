@@ -294,6 +294,16 @@ impl<'a> TypeEnv<'a> {
         ExprType::Unknown
     }
 
+    fn self_table_is_strict(&self) -> bool {
+        match self {
+            Self::Statement { resolver, .. } => {
+                resolver.self_table().is_some_and(|table| table.is_strict)
+            }
+            Self::Table { table, .. } => table.is_strict,
+            Self::TypeBody { .. } => false,
+        }
+    }
+
     fn self_table_column_type(&self, column: usize) -> Option<ExprType> {
         match self {
             Self::Statement { resolver, .. } => {
@@ -682,7 +692,7 @@ fn base_table_column_type(
         }
         return Some(column_type(
             table.get_column_at(column)?,
-            table.is_strict(),
+            table.column_has_declared_type(column),
             env.schema(),
         ));
     }
@@ -1338,29 +1348,118 @@ pub(super) fn dialect_operand_type(expr: &ast::Expr, ty: ExprType, env: &TypeEnv
     }
 }
 
-/// FIXME(registered-types): The catalog tables declare some columns with another type than PostgreSQL (a boolean as INTEGER, a regproc as TEXT), and a subquery column does not say what type it has. So an operand that reads any of them is not checked. Once types are registered, every column and subquery column has its own type and this function goes away.
-/// Whether every value that `expr` reads has a declared type. A column of a
-/// table that is not STRICT, such as a virtual table, may hold any value, and
-/// the type of a subquery's column does not say where its values come from.
+/// FIXME(registered-types): A column of a table that is not STRICT, a virtual table column its module does not vouch for, and a recursive CTE column have no declared type, so an operand that reads one is not checked. Once types are registered, every value has its own type and this function goes away.
+/// Whether every value that `expr` reads has a declared type: a column of a
+/// STRICT table or one that its virtual table declares, a register that holds
+/// such a column or a value cast to a custom type, a column of a subquery that
+/// reads only such values, and the result of a function that always returns
+/// one type.
 fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
     let mut declared = true;
     let _ = super::walk_expr(
         expr,
         &mut |expr: &ast::Expr| -> Result<super::WalkControl> {
             declared &= match expr {
-                ast::Expr::Column { table, .. } => env
-                    .tables()
-                    .and_then(|tables| tables.find_table_by_internal_id(*table))
-                    .is_some_and(|(_, table)| table.is_strict()),
-                ast::Expr::SubqueryResult { .. }
-                | ast::Expr::Subquery(_)
-                | ast::Expr::Register { .. } => false,
+                ast::Expr::Column { table, column, .. } => {
+                    match env
+                        .tables()
+                        .and_then(|tables| tables.find_table_by_internal_id(*table))
+                    {
+                        Some((_, table)) => column_has_declared_type(table, *column, env),
+                        None => table.is_self_table() && env.self_table_is_strict(),
+                    }
+                }
+                ast::Expr::Register {
+                    register,
+                    custom_type,
+                } => {
+                    custom_type.is_some()
+                        || env
+                            .resolver()
+                            .and_then(|resolver| resolver.register_columns.get(register))
+                            .is_some_and(|column| column.has_declared_type)
+                }
+                ast::Expr::SubqueryResult {
+                    subquery_id,
+                    query_type:
+                        ast::SubqueryType::RowValue {
+                            result_reg_start,
+                            num_regs: 1,
+                            ..
+                        },
+                    ..
+                } => env
+                    .resolver()
+                    .and_then(|resolver| resolver.row_value_subqueries.get(*subquery_id))
+                    .and_then(|subquery| {
+                        subquery
+                            .column(*result_reg_start)
+                            .map(|column| column.has_declared_type)
+                    })
+                    .unwrap_or(false),
+                ast::Expr::SubqueryResult { .. } | ast::Expr::Subquery(_) => false,
+                ast::Expr::FunctionCall { name, args, .. }
+                    if has_declared_result_type(name, args, env) =>
+                {
+                    return Ok(super::WalkControl::SkipChildren);
+                }
                 _ => true,
             };
             Ok(super::WalkControl::Continue)
         },
     );
     declared
+}
+
+/// Whether every value that the call `name(args)` returns has one type,
+/// whatever its arguments are.
+fn has_declared_result_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> bool {
+    if let Ok(Some(call)) = choose_function_call(name.as_str(), args, env) {
+        return call.result_type.is_some();
+    }
+    let Ok(Some(func)) = env.resolve_function(name.as_str(), args.len()) else {
+        return false;
+    };
+    matches!(func.result_type(), ResultType::Declared(ty) if !matches!(ty, ReturnType::Array))
+}
+
+/// Whether every value of column `column` of `table` has a declared type: the
+/// table declares its column types, or it is a subquery in FROM whose column
+/// has a declared type.
+fn column_has_declared_type(table: &Table, column: usize, env: &TypeEnv) -> bool {
+    match table {
+        Table::FromClauseSubquery(subquery) => env.resolver().is_some_and(|resolver| {
+            query_column_has_declared_type(&subquery.plan, column, resolver)
+        }),
+        _ => table.column_has_declared_type(column),
+    }
+}
+
+/// Whether column `column` of a query's result reads only declared types in
+/// each of its SELECTs.
+pub(crate) fn query_column_has_declared_type(
+    plan: &Plan,
+    column: usize,
+    resolver: &Resolver,
+) -> bool {
+    let selects: Vec<&SelectPlan> = match plan {
+        Plan::Select(select) => vec![select],
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter()
+            .map(|(select, _)| select)
+            .chain(core::iter::once(right_most.as_ref()))
+            .collect(),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => return false,
+    };
+    selects.into_iter().all(|select| {
+        let env = TypeEnv::new(Some(&select.table_references), resolver);
+        column < select.result_columns.len()
+            && select
+                .column_exprs(column)
+                .all(|expr| reads_only_declared_types(expr, &env))
+    })
 }
 
 /// The source of a value read from `column`.

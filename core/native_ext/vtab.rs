@@ -19,6 +19,12 @@ pub trait VirtualTableModule: Debug + Send + Sync {
     fn innocuous(&self) -> bool {
         false
     }
+    /// Whether the column named `column` of the tables created by this module
+    /// holds only values of its declared type, as a column of a STRICT table
+    /// does.
+    fn declares_column_type(&self, _column: &str) -> bool {
+        false
+    }
 }
 
 pub trait VirtualTable: Debug + Send + Sync {
@@ -68,6 +74,7 @@ pub trait ModuleFactory: Debug + Send + Sync {
     fn schema(&self, args: &[Value]) -> Result<String>;
     fn create(&self, args: &[Value]) -> Result<NativeTable>;
     fn innocuous(&self) -> bool;
+    fn declares_column_type(&self, column: &str) -> bool;
 }
 
 impl<M: VirtualTableModule> ModuleFactory for M {
@@ -83,6 +90,10 @@ impl<M: VirtualTableModule> ModuleFactory for M {
 
     fn innocuous(&self) -> bool {
         VirtualTableModule::innocuous(self)
+    }
+
+    fn declares_column_type(&self, column: &str) -> bool {
+        VirtualTableModule::declares_column_type(self, column)
     }
 }
 
