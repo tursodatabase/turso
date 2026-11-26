@@ -294,7 +294,8 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
                     IPos::Matched(p.clone()),
                     Dir::DNone,
                     false,
-                    ITok::ITKey(p.clone()),
+                    // A hit gives no seek token: an insert with `use_seek` is Undefined (U5).
+                    ITok::ITNone,
                 ),
                 hit_jump,
             )
@@ -1352,7 +1353,7 @@ mod tests {
         // No token: illegal.
         let p = [a(0, IdxInsert(k(some(1), some(3), 5), true))];
         assert_eq!(obs_of_run(1, &p), None);
-        // After a miss, and after a hit: the token is for the columns of the key.
+        // After a miss the token is for the columns of the key.
         let key = k(some(1), some(3), 5);
         let p = [
             a(0, INotFound(some_p(&[1, 3]))),
@@ -1362,15 +1363,13 @@ mod tests {
             obs_of_run(1, &p),
             Some(vec![iunspec(true), kobs(false, &key)])
         );
+        // A hit gives no token (U5).
         let key = k(some(1), some(2), 5);
         let p = [
             a(0, IFound(some_p(&[1, 2]))),
             a(0, IdxInsert(key.clone(), true)),
         ];
-        assert_eq!(
-            obs_of_run(1, &p),
-            Some(vec![iunspec(true), kobs(false, &key)])
-        );
+        assert_eq!(obs_of_run(1, &p), None);
     }
 
     #[test]

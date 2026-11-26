@@ -8,7 +8,7 @@ use super::index_model::IdxDef;
 use super::index_program::{run_index, with_eq_only_seek_ge, IObs, IOp, IndexRun, Row};
 use super::program::{Obs, ReadMode};
 use super::{known_bug, run, DbKind, Layout};
-use IOp::{IdxInsert, Next as INext, Observe, Rewind as IRewind, SeekGE as ISeekGE};
+use IOp::{IdxInsert, Next as INext, Observe, SeekGE as ISeekGE};
 
 /// The engines under test. The layout is `Checkpointed` for all of them.
 const ENGINES: [DbKind; 2] = [DbKind::Wal, DbKind::Mvcc];
@@ -289,60 +289,6 @@ mod index {
             check("I2 eq-only", &rows, true, &ops, &[e(1, 2, 5), e(3, 1, 5)]);
             // The same without eq-only.
             check("I2 plain", &rows, false, &ops, &[e(1, 2, 5), e(3, 1, 5)]);
-        });
-    }
-
-    /// I3 on the key (a, b): `Found` on the prefix [a, b] hits, then `IdxInsert` of
-    /// (a, b, 9) with `use_seek` (SPEC 2b: the token of a hit is the prefix, so this is
-    /// legal). A scan from the start must show the new key in key order. The B-tree has
-    /// (1,1,4) and (3,1,5), the overlay has (1,2,5).
-    #[track_caller]
-    fn found_hit_then_insert(name: &str, a: i64, b: i64, expected: &[Entry]) {
-        let mut ops = vec![
-            insert_key(1, 2, 5, false),
-            IOp::Found(0, vec![v(a), v(b)]),
-            IdxInsert {
-                cur: 0,
-                a: v(a),
-                b: v(b),
-                rowid: 9,
-                use_seek: true,
-            },
-            IRewind(0),
-            Observe(0),
-        ];
-        ops.extend(steps(3));
-        check(name, &cluster_rows(), false, &ops, expected);
-    }
-
-    /// I3, the hit is the overlay entry (1,2,5). WAL (the oracle) puts (1,2,9) before
-    /// (1,2,5): the insert goes to the position of the hit and not to the place of its key,
-    /// so the tree is out of key order. MVCC gives the right order. The translator only
-    /// uses `use_seek` after a miss. The expected order is the key order.
-    /// Fails today because of N11; see SPEC section 5b.
-    #[test]
-    fn known_bug_n11_found_overlay_hit_then_idx_insert_use_seek() {
-        known_bug("N11", "I3 overlay hit Wal", || {
-            found_hit_then_insert(
-                "I3 overlay hit",
-                1,
-                2,
-                &[e(1, 1, 4), e(1, 2, 5), e(1, 2, 9), e(3, 1, 5)],
-            );
-        });
-    }
-
-    /// I3, the hit is the B-tree entry (1,1,4). The new key (1,1,9) must come after it.
-    /// Fails today because of N11; see SPEC section 5b.
-    #[test]
-    fn known_bug_n11_found_btree_hit_then_idx_insert_use_seek() {
-        known_bug("N11", "I3 B-tree hit Wal", || {
-            found_hit_then_insert(
-                "I3 B-tree hit",
-                1,
-                1,
-                &[e(1, 1, 4), e(1, 1, 9), e(1, 2, 5), e(3, 1, 5)],
-            );
         });
     }
 }

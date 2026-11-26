@@ -414,6 +414,22 @@ index_case!(
     [add(0, 7, 7, 70, true)]
 );
 index_case!(
+    known_bug_u5_idx_insert_after_found_hit,
+    "U5",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::Found(0, vec![v(1), v(10)]), add(0, 1, 10, 9, true)]
+);
+index_case!(
+    known_bug_u5_idx_insert_after_not_found_hit,
+    "U5",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::NotFound(0, vec![v(1), v(10)]), add(0, 1, 10, 9, true)]
+);
+index_case!(
     known_bug_u5_idx_insert_after_seek_of_another_key,
     "U5",
     default_idef(),

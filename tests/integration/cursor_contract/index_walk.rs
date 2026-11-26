@@ -87,10 +87,6 @@ impl IdxGaps {
     /// cell index. After peers inserted entries `Next` finds one. The contract says an ended
     /// cursor stays ended.
     pub const N10_WAL_NEXT_AFTER_FAILED_SEEK_ON_EMPTY: IdxGaps = IdxGaps(1 << 10);
-    /// N11: WAL and ephemeral: `IdxInsert` with `use_seek` after a `Found`, `NotFound` or
-    /// `NoConflict` that hit puts the new key before the matched entry, whatever its rowid, so
-    /// the index is out of order. The model allows the insert (model choice).
-    pub const N11_USE_SEEK_INSERT_AFTER_HIT: IdxGaps = IdxGaps(1 << 11);
     /// IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN: MVCC with checkpointed entries: `Delete` of an entry
     /// that an `IdxInsert` of this run wrote loses the position (`Next` and `Prev` after it
     /// give the wrong answer). The index twin of the table gap N4.
@@ -138,7 +134,7 @@ impl IdxGaps {
         }
     }
 
-    pub const NAMES: [(&'static str, IdxGaps); 13] = [
+    pub const NAMES: [(&'static str, IdxGaps); 12] = [
         ("IDX_D1_MVCC_CKPT", IdxGaps::IDX_D1_MVCC_CKPT),
         ("IDX_END_INSERT", IdxGaps::IDX_END_INSERT),
         ("ROWDATA_IDX_INSERT", IdxGaps::ROWDATA_IDX_INSERT),
@@ -150,7 +146,6 @@ impl IdxGaps {
         ),
         ("N9", IdxGaps::N9_WAL_PEER_WRITE_AFTER_OWN_INSERT),
         ("N10", IdxGaps::N10_WAL_NEXT_AFTER_FAILED_SEEK_ON_EMPTY),
-        ("N11", IdxGaps::N11_USE_SEEK_INSERT_AFTER_HIT),
         (
             "IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN",
             IdxGaps::IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN,
@@ -811,7 +806,6 @@ impl Gen {
                 .has(IdxGaps::N10_WAL_NEXT_AFTER_FAILED_SEEK_ON_EMPTY)
                 && wal
                 && self.n10(op))
-            || (self.gaps.has(IdxGaps::N11_USE_SEEK_INSERT_AFTER_HIT) && wal_or_eph && self.n11(op))
             || (self.gaps.has(IdxGaps::IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN)
                 && mvcc_ckpt
                 && self.idx_n4(op))
@@ -886,22 +880,6 @@ impl Gen {
     /// N10: `Next` or `Prev` on a cursor that ended, after a peer write.
     fn n10(&self, op: &IOp) -> bool {
         matches!(*op, IOp::Next(c) | IOp::Prev(c) if self.ended[c] && self.peer_wrote[c])
-    }
-
-    /// N11: `IdxInsert` with `use_seek` on a cursor that sits on a `Found`-style hit.
-    fn n11(&self, op: &IOp) -> bool {
-        let IOp::IdxInsert {
-            cur,
-            a,
-            b,
-            use_seek: true,
-            ..
-        } = op
-        else {
-            return false;
-        };
-        let hit = matches!(self.replay.st.icurs[*cur].icpos, IPos::Matched(_));
-        hit && *a != Val::Null && *b != Val::Null
     }
 
     /// IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN: `Delete` of an entry that an `IdxInsert` of this run
@@ -1409,7 +1387,6 @@ mod tests {
     ];
     const ALL_FOUR: [(DbKind, Layout); 4] = CONFIGS;
     const MVCC_CKPT: [(DbKind, Layout); 1] = [(DbKind::Mvcc, Layout::Checkpointed)];
-    const EPH: [(DbKind, Layout); 1] = [EPHEMERAL];
 
     /// Runs the program on each config and asserts that the engine agrees with the model.
     #[track_caller]
@@ -1574,37 +1551,6 @@ mod tests {
                 Next(0),
             ];
             agree(&WAL, &rows, 2, &ops);
-        });
-    }
-
-    /// N11: `IdxInsert` with `use_seek` after a `NotFound` (or `Found`, `NoConflict`) that hit.
-    /// The cursor is on the matched entry `(2, 7, rowid 8)`. WAL and ephemeral insert the new
-    /// key `(2, 7, rowid 13)` there, before the match, so the index is out of order: a seek on
-    /// `[2]` then finds the new key first (and a later `IdxDelete` can fail with "no matching
-    /// index entry"). With a smaller rowid the position is right by chance. The model allows
-    /// the insert (model choice: a hit also sets the token). If the engines are right,
-    /// that choice must go: only a miss may give the token.
-    ///
-    /// Fails today because of N11; see SPEC section 5b.
-    #[test]
-    fn known_bug_n11_use_seek_insert_after_hit_keeps_order() {
-        known_bug("N11", "Mismatch", || {
-            use IOp::*;
-            let rows = [(8, v(2), v(7))];
-            let ops = [
-                NotFound(0, vec![v(2), v(7)]),
-                IdxInsert {
-                    cur: 0,
-                    a: v(2),
-                    b: v(7),
-                    rowid: 13,
-                    use_seek: true,
-                },
-                SeekGE(0, vec![v(2)]),
-                Observe(0),
-            ];
-            agree(&WAL, &rows, 1, &ops);
-            agree(&EPH, &rows, 1, &ops);
         });
     }
 

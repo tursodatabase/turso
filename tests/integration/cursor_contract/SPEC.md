@@ -166,16 +166,16 @@ engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 | U2 | `Next` or `Prev` from a position that has no direction: after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete` | section 1 |
 | U3 | After `NullRow`: `Next`, `Prev`, `Insert`, `IdxInsert`, `Delete`, `Count`, `NewRowid` | section 2 |
 | U4 | `Delete` with no entry under the cursor: fresh cursor, scan ended, failed seek | D4 |
-| U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key | section 3 |
+| U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key. A `Found` or `NotFound` hit gives no token (SQLite seeks again); a miss does | section 3 |
 | U6 | `IdxGE/GT/LE/LT` on a cursor whose entry was deleted (by itself or by another cursor) | SQLite asserts, `vdbe.c:7112` |
 | U7 | `IdxInsert` of a key that is in the index, `IdxDelete` of a key that is not, and the collation-equal variants of both (section 2c) | section 2c |
 | U8 | A read (`Column`, `RowId`, `IdxRowId`) at a position that is not defined: after `Count`, `SeekEnd`, `NewRowid`, an own `Delete`, `IdxDelete`, a seek that missed, `Found`, `NotFound`, `NoConflict` with a NULL | section 1 |
 
 The goal is that no op sequence has an open result: it has one defined result, or it is in
 this list. The entry that a `Found` hit lands on cannot be seen, because a read or a move
-from it is Undefined. One exception is open: `NewRowid` returns any rowid above every key
-(D6), and the engines differ (WAL returns a new rowid on each call even without an insert;
-MVCC never reuses a rowid). Pinning one rule is an open decision.
+from it is Undefined. `NewRowid` is defined by a predicate (D6): any rowid that is unused and
+above every key. SQLite documents only "not previously used as a key". A column with
+AUTOINCREMENT needs a stricter rule (never below an earlier rowid); it is not modelled.
 
 ## 3. Insert seek contract
 
@@ -255,7 +255,6 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | N6 | WAL | Own delete and a peer insert, then `Next`: wrong row |
 | N9 | WAL | Index: a seek-positioned cursor loses its position on a peer write |
 | N10 | WAL | Index: an ended cursor finds a peer's new entry. It keeps its cell index: a failed seek on an empty index (one peer insert) and a `Next` past the last entry (two peer inserts) both show it |
-| N11 | WAL | Index: `Found` hit, then `IdxInsert` with `use_seek`: the new key goes before the match and the index is out of order. SQLite seeks again. The model still lets a hit set the token; it must not |
 | N12 | WAL | Index: panic on `idx < cell_count` |
 | CL1 | MVCC | Index, NOCASE or RTRIM: `IdxDelete` of `('a', 1)` and `IdxInsert` of `('A', 1)` (equal under the collation, same rowid): a later read of the entry returns the old bytes `'a'`, not `'A'`. SQLite and WAL return the new bytes. Needs no checkpointed row. Reachable from SQL (`UPDATE t SET a='A'`, then a covering index scan): issue 9285 |
 | IDX_N6 | WAL | Index: own `Delete`, then a peer `IdxInsert`, then `Next` or `Prev`: the cursor finds the wrong entry or the end. Shows with the default index; the walk found it only after the text values were added. Not reachable from SQL: only the one-pass `DELETE` calls `Next` after its own delete, and it has no second writer |
@@ -263,7 +262,7 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | U2 | all | Undefined: `Next` or `Prev` after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete`. No engine refuses it |
 | U3 | all | Undefined: `Next`, `Prev`, `Insert`, `IdxInsert`, `Delete`, `Count` or `NewRowid` after `NullRow`. WAL answers a `NewRowid` with 1 (was N3). No engine refuses it |
 | U4 | WAL, MVCC | Undefined: `Delete` without an entry (D4). WAL panics on `current_page >= 0`, MVCC with "Cannot delete: no current row". Neither message says `unsupported` |
-| U5 | all | Undefined: an insert without the seek token of its key. No engine refuses it |
+| U5 | all | Undefined: an insert without the seek token of its key, also after a `Found` or `NotFound` hit (was N11: WAL and ephemeral write the new key at the hit and leave the index out of order). No engine refuses it |
 | U6 | all | Undefined: `IdxGE/GT/LE/LT` after the entry was deleted (was N8; SQLite asserts, `vdbe.c:7112`). The engines compare the next entry or the end |
 | U7 | all | Undefined: `IdxInsert` of an existing key, `IdxDelete` of a missing key, and the collation-equal variants (section 2c). No engine refuses it |
 | U8 | all | Undefined: a read at an undefined position (was N2 and N7: WAL panics with an overflow after `Count`, and reports "Corrupt database" after `SeekEnd`). No engine refuses it |
