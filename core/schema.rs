@@ -316,6 +316,9 @@ pub enum OperatorArg {
     /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
     /// exact number.
     Real,
+    /// A value of the registered type with this name, such as `float8` in a
+    /// signature that `float4` declares.
+    Registered(&'static str),
 }
 
 /// The operators whose function an operand's custom type decides. Comparisons
