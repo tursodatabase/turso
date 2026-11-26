@@ -2952,7 +2952,7 @@ impl RecordCompare {
     ) -> Result<std::cmp::Ordering>
     where
         V: AsValueRef,
-        E: ExactSizeIterator<Item = V>,
+        E: ExactSizeIterator<Item = V> + Clone,
         I: IntoIterator<IntoIter = E, Item = E::Item>,
     {
         let right_values = right_values.into_iter();
@@ -3146,6 +3146,102 @@ where
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_payload_generic()` with `skip=1`
 fn compare_payload_string<V, I>(
+    left_packed: &[u8],
+    right_unpacked: I,
+    index_info: &IndexInfo,
+    tie_breaker: std::cmp::Ordering,
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: ExactSizeIterator<Item = V> + Clone,
+{
+    // A seek on a text key compares a valid TEXT value with BINARY on each
+    // cell that it visits. This case has its own path, without the error
+    // paths of compare_payload_string_slow and the values that they keep.
+    let key_info = &index_info.key_info[0];
+    if key_info.collation == CollationSeq::BINARY {
+        let first = right_unpacked.clone().next();
+        if let Some(ValueRef::Text(rhs_text)) = first.as_ref().map(AsValueRef::as_value_ref) {
+            match compare_first_text_binary(left_packed, rhs_text.as_str().as_bytes()) {
+                None => {}
+                // Equal bytes have equal lengths, so the next field decides.
+                Some(std::cmp::Ordering::Equal) if right_unpacked.len() > 1 => {
+                    return compare_payload_after_first(
+                        left_packed,
+                        right_unpacked,
+                        index_info,
+                        tie_breaker,
+                    );
+                }
+                Some(std::cmp::Ordering::Equal) => return Ok(tie_breaker),
+                Some(comparison) => {
+                    return Ok(match key_info.sort_order {
+                        SortOrder::Asc => comparison,
+                        SortOrder::Desc => comparison.reverse(),
+                    });
+                }
+            }
+        }
+    }
+    compare_payload_string_slow(left_packed, right_unpacked, index_info, tie_breaker)
+}
+
+/// Compares the fields after the first one of `left_packed` and
+/// `right_unpacked`, for a first field that is equal. It is not inlined, so
+/// that [compare_payload_string] keeps a small stack frame.
+#[inline(never)]
+fn compare_payload_after_first<V, I>(
+    left_packed: &[u8],
+    right_unpacked: I,
+    index_info: &IndexInfo,
+    tie_breaker: std::cmp::Ordering,
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: ExactSizeIterator<Item = V>,
+{
+    compare_payload_generic(left_packed, right_unpacked, index_info, 1, tie_breaker)
+}
+
+/// Compares the first column of the record `left_packed` with `rhs` byte by
+/// byte, as the BINARY collation does, when this column is an ASCII TEXT value
+/// that is in the payload. Returns `None` in all other cases, and
+/// [compare_payload_string_slow] then compares the record or returns its error.
+/// Thus this function does not need the code of the full UTF-8 validation and
+/// of the errors, and [compare_payload_string] keeps a small stack frame.
+#[inline(always)]
+fn compare_first_text_binary(left_packed: &[u8], rhs: &[u8]) -> Option<std::cmp::Ordering> {
+    let (header_size, first_serial_type_offset) = read_short_varint(left_packed)?;
+    let (serial_type, _) = read_short_varint(left_packed.get(first_serial_type_offset..)?)?;
+    if serial_type < 13 || serial_type & 1 == 0 {
+        return None;
+    }
+    let start = header_size as usize;
+    let len = ((serial_type - 13) / 2) as usize;
+    let lhs = left_packed.get(start..start + len)?;
+    if !is_ascii(lhs) {
+        return None;
+    }
+    Some(lhs.cmp(rhs))
+}
+
+/// The value and the length of a varint of one or two bytes at the start of
+/// `buf`, as [read_varint] reads it. `None` for a longer varint, and for a
+/// `buf` that is too short.
+#[inline(always)]
+fn read_short_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    match *buf {
+        [b0, ..] if b0 < 0x80 => Some((b0 as u64, 1)),
+        [b0, b1, ..] if b1 < 0x80 => Some(((((b0 & 0x7f) as u64) << 7) | b1 as u64, 2)),
+        _ => None,
+    }
+}
+
+/// [compare_payload_string] for the records that its fast path does not
+/// compare: a first column that is equal to the key or is not a valid TEXT
+/// value, a key that is not TEXT, and the collations other than BINARY.
+#[inline(never)]
+fn compare_payload_string_slow<V, I>(
     left_packed: &[u8],
     right_unpacked: I,
     index_info: &IndexInfo,
@@ -4660,6 +4756,81 @@ mod tests {
             vec![SortOrder::Asc, SortOrder::Asc],
             vec![CollationSeq::BINARY; 2],
         );
+        let desc_index_info = create_index_info(
+            2,
+            vec![SortOrder::Desc, SortOrder::Asc],
+            vec![CollationSeq::BINARY; 2],
+        );
+        // A text of 100 bytes has a serial type of two bytes, and a text of
+        // 9000 bytes has a serial type of three bytes.
+        let long = "x".repeat(100);
+        let shorter = "x".repeat(99);
+        let very_long = "y".repeat(9000);
+
+        let other_cases = vec![
+            (
+                vec![Value::Text(Text::new(long.clone()))],
+                vec![ValueRef::Text(TextRef::new(&shorter, TextSubtype::Text))],
+                &index_info,
+                "long_strings",
+            ),
+            (
+                vec![Value::Text(Text::new(very_long.clone()))],
+                vec![ValueRef::Text(TextRef::new(&shorter, TextSubtype::Text))],
+                &index_info,
+                "very_long_strings",
+            ),
+            (
+                vec![Value::Text(Text::new("h\u{e9}llo"))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
+                &index_info,
+                "non_ascii_strings",
+            ),
+            (
+                vec![Value::Null],
+                vec![ValueRef::Text(TextRef::new("a", TextSubtype::Text))],
+                &index_info,
+                "null_vs_string",
+            ),
+            (
+                vec![Value::from_i64(1)],
+                vec![ValueRef::Text(TextRef::new("a", TextSubtype::Text))],
+                &index_info,
+                "integer_vs_string",
+            ),
+            (
+                vec![Value::Text(Text::new("abc"))],
+                vec![ValueRef::Text(TextRef::new("def", TextSubtype::Text))],
+                &desc_index_info,
+                "desc_less_than_strings",
+            ),
+            (
+                vec![Value::Text(Text::new("xyz")), Value::from_i64(1)],
+                vec![
+                    ValueRef::Text(TextRef::new("abc", TextSubtype::Text)),
+                    ValueRef::from_i64(1),
+                ],
+                &desc_index_info,
+                "desc_greater_than_strings",
+            ),
+            (
+                vec![Value::Text(Text::new("abc")), Value::from_i64(1)],
+                vec![
+                    ValueRef::Text(TextRef::new("abc", TextSubtype::Text)),
+                    ValueRef::from_i64(2),
+                ],
+                &desc_index_info,
+                "desc_equal_strings_integer_different",
+            ),
+        ];
+        for (serialized_values, unpacked_values, index_info, test_name) in other_cases {
+            assert_compare_matches_full_comparison(
+                serialized_values,
+                unpacked_values,
+                index_info,
+                test_name,
+            );
+        }
 
         let test_cases = vec![
             (
@@ -4714,6 +4885,22 @@ mod tests {
                 test_name,
             );
         }
+    }
+
+    /// A first TEXT value that is not valid UTF-8 makes the string
+    /// comparison fail with a corrupt error.
+    #[test]
+    fn test_string_comparison_rejects_invalid_utf8() {
+        let index_info = create_index_info(1, vec![SortOrder::Asc], vec![CollationSeq::BINARY]);
+        // A header of 2 bytes with one TEXT of 2 bytes (serial type 17).
+        let payload = [2u8, 17, 0xff, 0xfe];
+        let key = [ValueRef::Text(TextRef::new("a", TextSubtype::Text))];
+        assert!(matches!(
+            find_compare(key.iter().peekable(), &index_info),
+            RecordCompare::String
+        ));
+        let result = compare_record(&payload, key.iter(), &index_info, std::cmp::Ordering::Equal);
+        assert!(matches!(result, Err(LimboError::Corrupt(_))), "{result:?}");
     }
 
     #[test]
