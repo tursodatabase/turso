@@ -727,6 +727,20 @@ impl DatabaseReplayGenerator {
                     // https://github.com/tursodatabase/turso/issues/9430 . But for now, this is the
                     // best we can do. Note that this change didn't introduce the bug.
                     dropped.push(local_name);
+                } else if is_generated(local_column)
+                    && dropped
+                        .iter()
+                        .any(|name| name.as_str().eq_ignore_ascii_case(remote_name.as_str()))
+                {
+                    // The remote dropped the column `remote_name` and added it
+                    // again at the end, so it added the remote columns from here
+                    // on after that column. A rename to that name would fail,
+                    // because the local column that is dropped still has it. A
+                    // generated column keeps no values, so it is dropped too and
+                    // added again from the remote table. A regular column is not
+                    // dropped, because the remote can have renamed it to the
+                    // dropped name, and a drop would lose its values.
+                    dropped.push(local_name);
                 } else {
                     renamed.push((local_name, remote_name));
                     remote_columns.next();
@@ -997,16 +1011,17 @@ fn generated_column_changed_between_local_and_remote(
         // remote has removed the gencol
         return true;
     };
-    return is_generated(remote_column) && remote_column.to_string() != local_column.to_string();
+    is_generated(remote_column) && remote_column.to_string() != local_column.to_string()
+}
 
-    fn is_generated(column: &turso_core::ast::ColumnDefinition) -> bool {
-        column.constraints.iter().any(|constraint| {
-            matches!(
-                constraint.constraint,
-                turso_core::ast::ColumnConstraint::Generated { .. }
-            )
-        })
-    }
+/// Returns whether `column` is a generated column.
+fn is_generated(column: &turso_core::ast::ColumnDefinition) -> bool {
+    column.constraints.iter().any(|constraint| {
+        matches!(
+            constraint.constraint,
+            turso_core::ast::ColumnConstraint::Generated { .. }
+        )
+    })
 }
 
 fn has_column(columns: &[turso_core::ast::ColumnDefinition], name: &str) -> bool {

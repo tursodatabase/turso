@@ -219,3 +219,24 @@ fn open_new_replica(remote: &Arc<Remote>, checkpoint: Arc<Remote>) -> Result<Rep
         database_opts(),
     )
 }
+
+/// The remote renames a column, and gives its old name to a generated column
+/// that a regular column follows. The replica must rename both columns. It must
+/// not drop the generated column, because then it takes the regular column as
+/// renamed to the old name.
+#[test]
+fn rename_generated_column_to_name_of_renamed_column() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INT, l INT AS (id * 2), m INT)",
+        "INSERT INTO t (id, x, m) VALUES (1, 10, 20)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        "ALTER TABLE t RENAME COLUMN x TO y",
+        "ALTER TABLE t RENAME COLUMN l TO x",
+    ])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
