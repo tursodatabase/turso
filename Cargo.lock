@@ -7375,6 +7375,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_pg_catalog"
+version = "0.9.0-pre.6"
+dependencies = [
+ "turso_core",
+ "turso_pg_catalog_gen",
+]
+
+[[package]]
+name = "turso_pg_catalog_gen"
+version = "0.9.0-pre.6"
+dependencies = [
+ "chumsky",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
+]
+
+[[package]]
 name = "turso_pg_client"
 version = "0.9.0-pre.6"
 dependencies = [
