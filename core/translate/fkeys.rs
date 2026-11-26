@@ -2793,10 +2793,12 @@ pub fn emit_fk_drop_table_check(
             database_id,
             resolver,
             |p| {
+                // A RESTRICT key fails the DROP even when it is deferred,
+                // as it does for DELETE.
                 p.emit_insn(Insn::FkCounter {
                     constraint_info: None,
                     increment_value: 1,
-                    deferred: false,
+                    deferred: fk_ref.fk.deferred && fk_ref.fk.on_delete != RefAct::Restrict,
                 });
                 Ok(())
             },

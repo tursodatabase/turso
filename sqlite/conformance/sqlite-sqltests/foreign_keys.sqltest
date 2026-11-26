@@ -5417,3 +5417,39 @@ test fk-deferred-delete-parent-counts-each-indexed-child {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+# A DEFERRABLE INITIALLY DEFERRED child key lets DROP TABLE remove the parent
+# until COMMIT, so recreating the parent in the same transaction commits.
+test fk-deferred-drop-parent-table-recreated-before-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1, 1);
+    BEGIN;
+    DROP TABLE p;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    INSERT INTO p VALUES(1);
+    COMMIT;
+    SELECT count(*) FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    1
+    1
+}
+
+# ON DELETE RESTRICT fails at once even for a deferred key, so DROP TABLE of
+# the parent fails as DELETE does.
+test fk-deferred-restrict-drop-parent-table-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    BEGIN;
+    DROP TABLE p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
