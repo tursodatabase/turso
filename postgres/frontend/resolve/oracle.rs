@@ -13,6 +13,7 @@ pub(crate) struct OracleCase {
     pub node: Option<String>,
     pub sqlstate: Option<String>,
     pub message: Option<String>,
+    pub detail: Option<String>,
     pub hint: Option<String>,
 }
 
@@ -44,6 +45,7 @@ static CASES: LazyLock<Vec<OracleCase>> = LazyLock::new(|| {
             node: case["node"].as_str().map(str::to_string),
             sqlstate: case["error"]["sqlstate"].as_str().map(str::to_string),
             message: case["error"]["message"].as_str().map(str::to_string),
+            detail: case["error"]["detail"].as_str().map(str::to_string),
             hint: case["error"]["hint"].as_str().map(str::to_string),
         })
         .collect()

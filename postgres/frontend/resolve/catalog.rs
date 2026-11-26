@@ -8,6 +8,7 @@ pub(crate) const INT2VECTOROID: i64 = 22;
 pub(crate) const TEXTOID: i64 = 25;
 pub(crate) const OIDVECTOROID: i64 = 30;
 pub(crate) const UNKNOWNOID: i64 = 705;
+pub(crate) const TEXTARRAYOID: i64 = 1009;
 pub(crate) const RECORDOID: i64 = 2249;
 pub(crate) const ANYOID: i64 = 2276;
 pub(crate) const ANYARRAYOID: i64 = 2277;
@@ -35,6 +36,12 @@ pub(crate) trait Catalog {
 
     fn pg_cast(&self, source: i64, target: i64) -> Option<CastRow>;
 
+    /// The `pg_range` row of a range type.
+    fn pg_range(&self, range_type: i64) -> Option<RangeRow>;
+
+    /// The `pg_range` row of the range type that has this multirange type.
+    fn pg_range_of_multirange(&self, multirange_type: i64) -> Option<RangeRow>;
+
     fn pg_proc(&self, name: &str) -> Vec<ProcRow<'_>>;
 
     fn pg_operator(&self, name: &str) -> Vec<OperatorRow>;
@@ -50,6 +57,8 @@ pub(crate) struct TypeRow {
     pub kind: TypeKind,
     /// `typelem` when the type subscripts as an array, 0 for any other type.
     pub array_element: i64,
+    /// `typarray`: the array type over this type, 0 without one.
+    pub array_type: i64,
 }
 
 /// `pg_type.typtype`.
@@ -76,6 +85,13 @@ pub(crate) enum CastMethod {
     Function(i64),
     InputOutput,
     Binary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RangeRow {
+    pub range_type: i64,
+    pub subtype: i64,
+    pub multirange_type: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +160,54 @@ pub(crate) fn get_element_type(catalog: &dyn Catalog, typid: i64) -> i64 {
     }
 }
 
+pub(crate) fn get_array_type(catalog: &dyn Catalog, typid: i64) -> i64 {
+    match catalog.pg_type(typid) {
+        Some(tp) => tp.array_type,
+        None => INVALID_OID,
+    }
+}
+
+pub(crate) fn type_is_array_domain(catalog: &dyn Catalog, typid: i64) -> Result<bool, Reason> {
+    Ok(get_base_element_type(catalog, typid)? != INVALID_OID)
+}
+
+pub(crate) fn get_base_element_type(catalog: &dyn Catalog, typid: i64) -> Result<i64, Reason> {
+    let Some(typ_tup) = catalog.pg_type(typid) else {
+        return Ok(INVALID_OID);
+    };
+    if typ_tup.kind != TypeKind::Domain {
+        return Ok(typ_tup.array_element);
+    }
+    Err(Reason::Domain)
+}
+
+pub(crate) fn get_range_subtype(catalog: &dyn Catalog, range_oid: i64) -> Result<i64, Reason> {
+    match catalog.pg_range(range_oid) {
+        Some(rngtup) => Ok(rngtup.subtype),
+        None if type_is_range(catalog, range_oid) => Err(Reason::Range),
+        None => Ok(INVALID_OID),
+    }
+}
+
+pub(crate) fn get_range_multirange(catalog: &dyn Catalog, range_oid: i64) -> Result<i64, Reason> {
+    match catalog.pg_range(range_oid) {
+        Some(rngtup) => Ok(rngtup.multirange_type),
+        None if type_is_range(catalog, range_oid) => Err(Reason::Range),
+        None => Ok(INVALID_OID),
+    }
+}
+
+pub(crate) fn get_multirange_range(
+    catalog: &dyn Catalog,
+    multirange_oid: i64,
+) -> Result<i64, Reason> {
+    match catalog.pg_range_of_multirange(multirange_oid) {
+        Some(rngtup) => Ok(rngtup.range_type),
+        None if type_is_multirange(catalog, multirange_oid) => Err(Reason::Range),
+        None => Ok(INVALID_OID),
+    }
+}
+
 pub(crate) fn is_complex(catalog: &dyn Catalog, type_id: i64) -> Result<bool, Reason> {
     let type_tuple = catalog.pg_type(type_id).ok_or(Reason::MissingType)?;
     if type_tuple.kind == TypeKind::Domain {
@@ -164,7 +228,7 @@ pub(crate) fn is_polymorphic_type(typid: i64) -> bool {
     is_polymorphic_type_family1(typid) || is_polymorphic_type_family2(typid)
 }
 
-fn is_polymorphic_type_family1(typid: i64) -> bool {
+pub(crate) fn is_polymorphic_type_family1(typid: i64) -> bool {
     typid == ANYELEMENTOID
         || typid == ANYARRAYOID
         || typid == ANYNONARRAYOID
@@ -192,6 +256,7 @@ pub(crate) mod fixtures {
         types: FxHashMap<i64, FixtureType>,
         types_by_name: FxHashMap<String, i64>,
         casts: FxHashMap<(i64, i64), CastRow>,
+        ranges: Vec<RangeRow>,
         procs: Vec<FixtureProc>,
         operators: Vec<(String, OperatorRow)>,
     }
@@ -223,6 +288,10 @@ pub(crate) mod fixtures {
         casts: rows(include_str!("testdata/pg_cast.json"))
             .iter()
             .map(|row| ((int(row, "castsource"), int(row, "casttarget")), cast(row)))
+            .collect(),
+        ranges: rows(include_str!("testdata/pg_range.json"))
+            .iter()
+            .map(range)
             .collect(),
         procs: rows(include_str!("testdata/pg_proc.json"))
             .iter()
@@ -272,6 +341,20 @@ pub(crate) mod fixtures {
 
         fn pg_cast(&self, source: i64, target: i64) -> Option<CastRow> {
             self.casts.get(&(source, target)).copied()
+        }
+
+        fn pg_range(&self, range_type: i64) -> Option<RangeRow> {
+            self.ranges
+                .iter()
+                .copied()
+                .find(|row| row.range_type == range_type)
+        }
+
+        fn pg_range_of_multirange(&self, multirange_type: i64) -> Option<RangeRow> {
+            self.ranges
+                .iter()
+                .copied()
+                .find(|row| row.multirange_type == multirange_type)
         }
 
         fn pg_proc(&self, name: &str) -> Vec<ProcRow<'_>> {
@@ -334,14 +417,11 @@ pub(crate) mod fixtures {
     }
 
     fn fixture_type(row: &Value) -> FixtureType {
-        let oid = int(row, "oid");
-        let category = letter(row, "typcategory");
-        // The fixtures have no typsubscript. In PostgreSQL 18 these are the types that subscript as an array.
-        let subscripts_as_array = category == 'A' || oid == RECORDARRAYOID;
+        let subscripts_as_array = text(row, "typsubscript") == "array_subscript_handler";
         FixtureType {
             name: text(row, "typname").to_string(),
             row: TypeRow {
-                category,
+                category: letter(row, "typcategory"),
                 is_preferred: row["typispreferred"]
                     .as_bool()
                     .expect("typispreferred is a boolean"),
@@ -360,6 +440,7 @@ pub(crate) mod fixtures {
                 } else {
                     INVALID_OID
                 },
+                array_type: int(row, "typarray"),
             },
         }
     }
@@ -378,6 +459,14 @@ pub(crate) mod fixtures {
                 'b' => CastMethod::Binary,
                 other => panic!("unrecognized castmethod: {other}"),
             },
+        }
+    }
+
+    fn range(row: &Value) -> RangeRow {
+        RangeRow {
+            range_type: int(row, "rngtypid"),
+            subtype: int(row, "rngsubtype"),
+            multirange_type: int(row, "rngmultitypid"),
         }
     }
 
@@ -506,6 +595,77 @@ pub(crate) mod fixtures {
         assert_eq!(get_element_type(catalog, 600), INVALID_OID);
         assert_eq!(get_element_type(catalog, 23), INVALID_OID);
         assert_eq!(get_element_type(catalog, 999_999), INVALID_OID);
+    }
+
+    #[test]
+    fn a_type_has_the_array_type_of_its_typarray() {
+        let catalog = FixtureCatalog::get();
+        assert_eq!(get_array_type(catalog, 23), 1007);
+        assert_eq!(get_array_type(catalog, TEXTOID), TEXTARRAYOID);
+        assert_eq!(get_array_type(catalog, 1007), INVALID_OID);
+        assert_eq!(get_array_type(catalog, ANYELEMENTOID), INVALID_OID);
+        assert_eq!(get_array_type(catalog, 999_999), INVALID_OID);
+        assert_eq!(type_is_array_domain(catalog, 1007), Ok(true));
+        assert_eq!(type_is_array_domain(catalog, 23), Ok(false));
+        assert_eq!(type_is_array_domain(catalog, INVALID_OID), Ok(false));
+    }
+
+    #[test]
+    fn a_range_has_the_subtype_and_the_multirange_of_its_pg_range_row() {
+        let catalog = FixtureCatalog::get();
+        let (int4range, int4multirange, numrange) = (3904, 4451, 3906);
+        assert_eq!(get_range_subtype(catalog, int4range), Ok(23));
+        assert_eq!(get_range_subtype(catalog, numrange), Ok(1700));
+        assert_eq!(get_range_subtype(catalog, 23), Ok(INVALID_OID));
+        assert_eq!(get_range_subtype(catalog, int4multirange), Ok(INVALID_OID));
+        assert_eq!(get_range_subtype(catalog, ANYRANGEOID), Ok(INVALID_OID));
+        assert_eq!(get_range_multirange(catalog, int4range), Ok(int4multirange));
+        assert_eq!(get_range_multirange(catalog, 23), Ok(INVALID_OID));
+        assert_eq!(get_multirange_range(catalog, int4multirange), Ok(int4range));
+        assert_eq!(get_multirange_range(catalog, int4range), Ok(INVALID_OID));
+    }
+
+    #[test]
+    fn a_range_without_a_pg_range_row_is_not_supported() {
+        struct NoRanges;
+        impl Catalog for NoRanges {
+            fn pg_type(&self, oid: i64) -> Option<TypeRow> {
+                FixtureCatalog::get().pg_type(oid)
+            }
+            fn pg_type_oid(&self, name: &str) -> Option<i64> {
+                FixtureCatalog::get().pg_type_oid(name)
+            }
+            fn pg_cast(&self, source: i64, target: i64) -> Option<CastRow> {
+                FixtureCatalog::get().pg_cast(source, target)
+            }
+            fn pg_range(&self, _range_type: i64) -> Option<RangeRow> {
+                None
+            }
+            fn pg_range_of_multirange(&self, _multirange_type: i64) -> Option<RangeRow> {
+                None
+            }
+            fn pg_proc(&self, name: &str) -> Vec<ProcRow<'_>> {
+                FixtureCatalog::get().pg_proc(name)
+            }
+            fn pg_operator(&self, name: &str) -> Vec<OperatorRow> {
+                FixtureCatalog::get().pg_operator(name)
+            }
+            fn format_type_name(&self, oid: i64) -> String {
+                FixtureCatalog::get().format_type_name(oid)
+            }
+        }
+        let (int4range, int4multirange) = (3904, 4451);
+        assert_eq!(get_range_subtype(&NoRanges, int4range), Err(Reason::Range));
+        assert_eq!(get_range_subtype(&NoRanges, 23), Ok(INVALID_OID));
+        assert_eq!(
+            get_range_multirange(&NoRanges, int4range),
+            Err(Reason::Range)
+        );
+        assert_eq!(
+            get_multirange_range(&NoRanges, int4multirange),
+            Err(Reason::Range)
+        );
+        assert_eq!(get_multirange_range(&NoRanges, int4range), Ok(INVALID_OID));
     }
 
     #[test]

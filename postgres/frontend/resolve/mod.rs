@@ -51,12 +51,13 @@ pub(crate) enum Resolution {
 /// Why a call cannot be resolved here and is left to the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
-    Polymorphic,
     Variadic,
     Defaults,
     Domain,
     Composite,
     Array,
+    /// A range or multirange type without a `pg_range` row in the catalog.
+    Range,
     /// The call is a cast written as a function call, such as `text(x)`.
     Cast,
     Aggregate,

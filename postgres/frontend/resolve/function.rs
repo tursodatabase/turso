@@ -2,13 +2,12 @@
 
 use super::candidates::{funcname_get_candidates, FuncCandidate};
 use super::catalog::{
-    get_base_type, get_type_category_preferred, is_complex, is_polymorphic_type,
-    typeid_type_is_composite, Catalog, INTERNALOID, INVALID_OID, RECORDOID, TYPCATEGORY_INVALID,
-    TYPCATEGORY_STRING, UNKNOWNOID,
+    get_base_type, get_type_category_preferred, is_complex, typeid_type_is_composite, Catalog,
+    INTERNALOID, INVALID_OID, RECORDOID, TYPCATEGORY_INVALID, TYPCATEGORY_STRING, UNKNOWNOID,
 };
 use super::coerce::{
-    can_coerce_type, coerce_type, find_coercion_pathway, is_preferred_type, type_category,
-    CoercionPathType,
+    can_coerce_type, coerce_type, enforce_generic_type_consistency, find_coercion_pathway,
+    is_preferred_type, type_category, CoercionPathType,
 };
 use super::error::{function_does_not_exist, function_is_not_unique};
 use super::{ArgCoercion, ArgType, Reason, ResolveError, ResolvedCall};
@@ -86,17 +85,20 @@ pub(crate) fn parse_func_or_column(
     let FuncDetail {
         funcid,
         rettype,
-        true_typeids: declared_arg_types,
+        true_typeids: mut declared_arg_types,
         ..
     } = fdresult;
 
-    if is_polymorphic_type(rettype)
-        || declared_arg_types
-            .iter()
-            .any(|&declared_arg_type| is_polymorphic_type(declared_arg_type))
-    {
-        return Err(Reason::Polymorphic);
-    }
+    let rettype = match enforce_generic_type_consistency(
+        catalog,
+        &actual_arg_types,
+        &mut declared_arg_types,
+        rettype,
+        false,
+    )? {
+        Ok(rettype) => rettype,
+        Err(error) => return Ok(Err(error)),
+    };
 
     if declared_arg_types.contains(&INTERNALOID) || rettype == INTERNALOID {
         return Err(Reason::Internal);
@@ -502,7 +504,7 @@ mod tests {
             .zip(&call.parameter_types)
             .zip(&call.coercions)
             .map(|((&argument, parameter), coercion)| match coercion {
-                ArgCoercion::None if argument == UNKNOWNOID => format!("unknown>{parameter}"),
+                ArgCoercion::None if argument == UNKNOWNOID => format!("unknown>{UNKNOWNOID}"),
                 ArgCoercion::None => "none".to_string(),
                 ArgCoercion::Literal => format!("unknown>{parameter}"),
                 ArgCoercion::Relabel => format!("relabel>{parameter}"),
@@ -524,7 +526,7 @@ mod tests {
                 Some("PostgreSQL does not read it as a cast".to_string())
             }
             (Resolution::Unsupported(_), _, Some("42725" | "42883" | "42809")) => None,
-            (Resolution::Unsupported(Reason::Polymorphic), _, Some("42804")) => None,
+            (Resolution::Unsupported(Reason::Aggregate), None, Some("42804")) => None,
             (Resolution::Unsupported(Reason::Aggregate), Some(_), _) => {
                 (case.kind != "aggregate").then(|| "it is not an aggregate".to_string())
             }
@@ -541,7 +543,7 @@ mod tests {
             (Resolution::Unsupported(Reason::Internal), None, Some("0A000")) if of_internal => None,
             (Resolution::Resolved(_), None, Some("0A000" | "XX000")) if !of_internal => None,
             (Resolution::Error(error), None, Some(sqlstate)) => {
-                let ours = (error.sqlstate(), error.message(), Some(error.hint()));
+                let ours = (error.sqlstate(), error.message(), error.hint());
                 let theirs = (
                     sqlstate,
                     case.message.as_deref().unwrap_or(""),
@@ -582,8 +584,25 @@ mod tests {
             differences.len(),
             &differences[..differences.len().min(40)]
         );
-        assert!(outcomes["resolved"] > 5000, "{outcomes:?}");
-        assert!(outcomes["error 42883"] > 8000, "{outcomes:?}");
+        let expected = [
+            ("error 42704", 10),
+            ("error 42725", 60),
+            ("error 42804", 156),
+            ("error 42883", 11708),
+            ("not supported: Aggregate", 413),
+            ("not supported: Array", 127),
+            ("not supported: Cast", 58),
+            ("not supported: Internal", 1),
+            ("not supported: Variadic", 343),
+            ("resolved", 8105),
+        ];
+        assert_eq!(
+            outcomes,
+            expected
+                .into_iter()
+                .map(|(outcome, count)| (outcome.to_string(), count))
+                .collect()
+        );
     }
 
     #[test]
@@ -637,6 +656,16 @@ mod tests {
     const TIMESTAMPTZ: i64 = 1184;
     const INTERVAL: i64 = 1186;
     const NUMERIC: i64 = 1700;
+    const REGTYPE: i64 = 2206;
+    const INT4_ARRAY: i64 = 1007;
+    const INT8_ARRAY: i64 = 1016;
+    const TEXT_ARRAY: i64 = 1009;
+    const INT4RANGE: i64 = 3904;
+    const ANYOID: i64 = 2276;
+    const ANYARRAYOID: i64 = 2277;
+    const ANYELEMENTOID: i64 = 2283;
+    const ANYRANGEOID: i64 = 3831;
+    const ANYMULTIRANGEOID: i64 = 4537;
 
     fn resolve(name: &str, arguments: &[ArgType]) -> Resolution {
         resolve_function(FixtureCatalog::get(), name, arguments)
@@ -729,7 +758,7 @@ mod tests {
             };
             assert_eq!(
                 (error.sqlstate(), error.message(), error.hint()),
-                ("42883", message, hint)
+                ("42883", message, Some(hint))
             );
         }
     }
@@ -797,7 +826,7 @@ mod tests {
             };
             assert_eq!(
                 (error.sqlstate(), error.message(), error.hint()),
-                ("42725", message, hint)
+                ("42725", message, Some(hint))
             );
         }
     }
@@ -901,12 +930,17 @@ mod tests {
             ("concat", vec![Known(TEXT), Known(TEXT)], Reason::Variadic),
             ("pg_terminate_backend", vec![Known(INT4)], Reason::Defaults),
             (
-                "array_length",
-                vec![Unknown, Known(INT4)],
-                Reason::Polymorphic,
+                "array_append",
+                vec![Known(INT4_ARRAY), Known(INT8)],
+                Reason::Array,
             ),
-            ("count", vec![Known(INT4)], Reason::Polymorphic),
-            ("lower", vec![Known(INT4)], Reason::Polymorphic),
+            (
+                "width_bucket",
+                vec![Known(NUMERIC), Known(INT4_ARRAY)],
+                Reason::Array,
+            ),
+            ("count", vec![Known(INT4)], Reason::Aggregate),
+            ("any_value", vec![Unknown], Reason::Aggregate),
             ("sum", vec![Known(INT4)], Reason::Aggregate),
             ("internal_in", vec![Unknown], Reason::Internal),
             ("abs", vec![Known(RECORDOID)], Reason::Composite),
@@ -916,6 +950,243 @@ mod tests {
             assert_eq!(
                 resolve(name, &arguments),
                 Resolution::Unsupported(reason),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_range_argument_fills_a_polymorphic_range_parameter() {
+        let int4multirange = 4451;
+        let numrange = 3906;
+        assert_eq!(
+            resolve("lower", &[Known(INT4RANGE)]),
+            resolved(3848, &[ANYRANGEOID], &[ArgCoercion::None], INT4)
+        );
+        assert_eq!(
+            resolve("range_merge", &[Known(INT4RANGE), Known(INT4RANGE)]),
+            resolved(
+                4057,
+                &[ANYRANGEOID, ANYRANGEOID],
+                &[ArgCoercion::None, ArgCoercion::None],
+                INT4RANGE
+            )
+        );
+        assert_eq!(
+            resolve("multirange", &[Known(INT4RANGE)]),
+            resolved(4298, &[ANYRANGEOID], &[ArgCoercion::None], int4multirange)
+        );
+        assert_eq!(
+            resolve("range_merge", &[Known(int4multirange)]),
+            resolved(4228, &[ANYMULTIRANGEOID], &[ArgCoercion::None], INT4RANGE)
+        );
+        assert!(matches!(
+            resolve("range_merge", &[Known(INT4RANGE), Known(numrange)]),
+            Resolution::Error(ResolveError::NoMatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_polymorphic_row_that_cannot_take_the_arguments_is_refused() {
+        for (name, arguments, message) in [
+            (
+                "lower",
+                vec![Known(INT4)],
+                "function lower(integer) does not exist",
+            ),
+            (
+                "enum_first",
+                vec![Known(INT4)],
+                "function enum_first(integer) does not exist",
+            ),
+            (
+                "enum_range",
+                vec![Unknown],
+                "function enum_range(unknown) does not exist",
+            ),
+            (
+                "anytextcat",
+                vec![Known(INT4_ARRAY), Known(TEXT)],
+                "function anytextcat(integer[], text) does not exist",
+            ),
+            (
+                "array_ndims",
+                vec![Known(INT4)],
+                "function array_ndims(integer) does not exist",
+            ),
+            (
+                "array_cat",
+                vec![Known(INT4_ARRAY), Known(TEXT_ARRAY)],
+                "function array_cat(integer[], text[]) does not exist",
+            ),
+            (
+                "array_append",
+                vec![Known(INT4_ARRAY), Known(TEXT)],
+                "function array_append(integer[], text) does not exist",
+            ),
+            (
+                "array_larger",
+                vec![Known(INT4_ARRAY), Known(INT8_ARRAY)],
+                "function array_larger(integer[], bigint[]) does not exist",
+            ),
+            (
+                "array_append",
+                vec![Known(ANYARRAYOID), Known(INT4)],
+                "function array_append(anyarray, integer) does not exist",
+            ),
+        ] {
+            let Resolution::Error(error) = resolve(name, &arguments) else {
+                panic!("{message}");
+            };
+            assert_eq!((error.sqlstate(), error.message()), ("42883", message));
+        }
+    }
+
+    #[test]
+    fn a_polymorphic_row_keeps_its_parameter_types_and_takes_its_result_from_the_arguments() {
+        assert_eq!(
+            resolve("array_length", &[Known(INT4_ARRAY), Known(INT4)]),
+            resolved(
+                2176,
+                &[ANYARRAYOID, INT4],
+                &[ArgCoercion::None, ArgCoercion::None],
+                INT4
+            )
+        );
+        assert_eq!(
+            resolve("array_fill", &[Known(INT4), Known(INT4_ARRAY)]),
+            resolved(
+                1193,
+                &[ANYELEMENTOID, INT4_ARRAY],
+                &[ArgCoercion::None, ArgCoercion::None],
+                INT4_ARRAY
+            )
+        );
+        assert_eq!(
+            resolve("unnest", &[Known(INT4_ARRAY)]),
+            resolved(2331, &[ANYARRAYOID], &[ArgCoercion::None], INT4)
+        );
+        assert_eq!(
+            resolve("quote_literal", &[Known(INT4)]),
+            resolved(1285, &[ANYELEMENTOID], &[ArgCoercion::None], TEXT)
+        );
+        assert_eq!(
+            resolve("array_to_string", &[Known(ANYARRAYOID), Known(TEXT)]),
+            resolved(
+                395,
+                &[ANYARRAYOID, TEXT],
+                &[ArgCoercion::None, ArgCoercion::None],
+                TEXT
+            )
+        );
+    }
+
+    #[test]
+    fn a_quoted_literal_of_a_polymorphic_parameter_takes_the_type_the_other_arguments_give() {
+        assert_eq!(
+            resolve("array_larger", &[Known(INT4_ARRAY), Unknown]),
+            resolved(
+                515,
+                &[ANYARRAYOID, INT4_ARRAY],
+                &[ArgCoercion::None, ArgCoercion::Literal],
+                INT4_ARRAY
+            )
+        );
+        assert_eq!(
+            resolve("array_position", &[Known(INT4_ARRAY), Unknown]),
+            resolved(
+                3277,
+                &[INT4_ARRAY, INT4],
+                &[ArgCoercion::None, ArgCoercion::Literal],
+                INT4
+            )
+        );
+        assert_eq!(
+            resolve("array_append", &[Unknown, Known(INT4)]),
+            resolved(
+                378,
+                &[INT4_ARRAY, INT4],
+                &[ArgCoercion::Literal, ArgCoercion::None],
+                INT4_ARRAY
+            )
+        );
+        assert_eq!(
+            resolve("quote_literal", &[Unknown]),
+            resolved(1283, &[TEXT], &[ArgCoercion::Literal], TEXT)
+        );
+    }
+
+    #[test]
+    fn the_arguments_of_anycompatible_parameters_are_cast_to_their_common_type() {
+        assert_eq!(
+            resolve("array_append", &[Known(INT4_ARRAY), Known(INT4)]),
+            resolved(
+                378,
+                &[INT4_ARRAY, INT4],
+                &[ArgCoercion::None, ArgCoercion::None],
+                INT4_ARRAY
+            )
+        );
+        assert_eq!(
+            resolve("array_position", &[Known(INT8_ARRAY), Known(INT4)]),
+            resolved(
+                3277,
+                &[INT8_ARRAY, INT8],
+                &[ArgCoercion::None, ArgCoercion::Function(481)],
+                INT4
+            )
+        );
+        assert_eq!(
+            resolve("width_bucket", &[Known(INT4), Known(INT4_ARRAY)]),
+            resolved(
+                3218,
+                &[INT4, INT4_ARRAY],
+                &[ArgCoercion::None, ArgCoercion::None],
+                INT4
+            )
+        );
+    }
+
+    #[test]
+    fn a_parameter_of_type_any_leaves_its_argument_as_it_is() {
+        for argument in [Known(INT4), Unknown] {
+            assert_eq!(
+                resolve("pg_typeof", &[argument]),
+                resolved(1619, &[ANYOID], &[ArgCoercion::None], REGTYPE)
+            );
+        }
+    }
+
+    #[test]
+    fn a_polymorphic_row_fails_when_its_arguments_do_not_give_the_polymorphic_type() {
+        for (name, arguments, message) in [
+            (
+                "to_json",
+                vec![Unknown],
+                "could not determine polymorphic type because input has type unknown",
+            ),
+            (
+                "array_ndims",
+                vec![Unknown],
+                "could not determine polymorphic type because input has type unknown",
+            ),
+            (
+                "array_length",
+                vec![Unknown, Known(INT4)],
+                "could not determine polymorphic type because input has type unknown",
+            ),
+            (
+                "arraycontains",
+                vec![Known(ANYARRAYOID), Known(ANYARRAYOID)],
+                "cannot determine element type of \"anyarray\" argument",
+            ),
+        ] {
+            let Resolution::Error(error) = resolve(name, &arguments) else {
+                panic!("{name}");
+            };
+            assert_eq!(
+                (error.sqlstate(), error.message(), error.hint()),
+                ("42804", message, None),
                 "{name}"
             );
         }

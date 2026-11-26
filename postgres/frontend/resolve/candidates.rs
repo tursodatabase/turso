@@ -60,7 +60,7 @@ pub(crate) fn funcname_get_candidates(
 mod tests {
     use super::*;
     use crate::resolve::catalog::fixtures::FixtureCatalog;
-    use crate::resolve::catalog::{CastRow, OperatorRow, ProcRow, TypeRow};
+    use crate::resolve::catalog::{CastRow, OperatorRow, ProcRow, RangeRow, TypeRow};
 
     fn oids(candidates: &[FuncCandidate]) -> Vec<i64> {
         let mut oids: Vec<i64> = candidates.iter().map(|candidate| candidate.oid).collect();
@@ -152,6 +152,14 @@ mod tests {
         }
 
         fn pg_cast(&self, _source: i64, _target: i64) -> Option<CastRow> {
+            None
+        }
+
+        fn pg_range(&self, _range_type: i64) -> Option<RangeRow> {
+            None
+        }
+
+        fn pg_range_of_multirange(&self, _multirange_type: i64) -> Option<RangeRow> {
             None
         }
 
