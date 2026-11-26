@@ -732,6 +732,7 @@ impl OpenDbAsyncState {
         self.pager = None;
         self.db = None;
         self.building_db = None;
+        self.encryption_key = None;
         if let HeaderValidationState::Start { init, .. } = &mut self.header_validation_state {
             init.cancel();
         }
@@ -1998,12 +1999,16 @@ impl Database {
                     db.replace_schema(loader.into_schema());
 
                     state.phase = OpenDbAsyncPhase::Done;
-                    return Ok(IOResult::Done(
-                        state
-                            .db
-                            .take()
-                            .expect("db must be initialized in Init phase"),
-                    ));
+                    let db = state
+                        .db
+                        .take()
+                        .expect("db must be initialized in Init phase");
+                    // A caller can keep the state after the open, as the SDK
+                    // kit does. Release the connection, pager and key of the
+                    // open now, like a blocking open that drops its state, so
+                    // the caller does not keep a hidden connection open.
+                    state.clear_open_resources();
+                    return Ok(IOResult::Done(db));
                 }
 
                 OpenDbAsyncPhase::Done => {
@@ -4361,6 +4366,31 @@ mod database_tests {
             assert_eq!(target.pager_state.page_size(), original_size);
             assert_eq!(target.encryption_cipher(), original_cipher);
         }
+    }
+
+    /// A caller that keeps its open state after the open, as the SDK kit
+    /// does, must not keep a connection or a pager of the database.
+    #[test]
+    fn completed_async_open_keeps_no_connection() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let path = ":memory:kept-open-state";
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let options = OpenOptions::new(Arc::new(DialectThatCannotParse))
+            .storage(Arc::new(DatabaseFile::new(file)))
+            .flags(OpenFlags::Create);
+        let mut state = OpenDbAsyncState::new();
+        let db = loop {
+            match Database::open_async(&mut state, io.clone(), path, &options).unwrap() {
+                IOResult::Done(db) => break db,
+                IOResult::IO(completion) => completion.wait(&*io).unwrap(),
+            }
+        };
+        assert_eq!(
+            db.n_connections.load(crate::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(Arc::strong_count(&db.pager_state), 1);
+        drop(state);
     }
 
     #[cfg(feature = "fs")]
