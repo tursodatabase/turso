@@ -60,6 +60,14 @@ pub struct Cursor {
     pub ctok: Tok,
 }
 
+/// A cursor without a position.
+const LOST: Cursor = Cursor {
+    cpos: Pos::Lost,
+    cdir: Dir::DNone,
+    cnull: false,
+    ctok: Tok::TNone,
+};
+
 pub const FRESH_CURSOR: Cursor = Cursor {
     cpos: Pos::Invalid,
     cdir: Dir::DNone,
@@ -204,6 +212,9 @@ pub fn step(st: &State, a: &Action) -> Option<(State, MObs)> {
         MOp::SeekLE(k) => seek(key_le(k, s), Dir::Bwd),
         MOp::SeekLT(k) => seek(key_lt(k, s), Dir::Bwd),
         MOp::SeekRowid(k) | MOp::NotExists(k) => exact(k),
+        // `Next` and `Prev` after `NullRow` find no row (SQLite: `OP_Next` on an invalid
+        // cursor). The position afterwards is none.
+        MOp::Next | MOp::Prev if c.cnull => put(LOST, false),
         MOp::Next => {
             if !c.cnull && c.cdir == Dir::Fwd {
                 match c.cpos {
@@ -922,8 +933,8 @@ mod tests {
     fn example_null_newrowid_and_count_are_illegal() {
         assert!(!legal(1, &[(0, Rewind), (0, NullRow), (0, NewRowid(9))]));
         assert!(!legal(1, &[(0, Rewind), (0, NullRow), (0, Count)]));
-        // `Next`, `Insert` and `Delete` after `NullRow` were illegal before.
-        assert!(!legal(1, &[(0, Rewind), (0, NullRow), (0, Next)]));
+        // `Insert` and `Delete` after `NullRow` are illegal. `Next` finds no row.
+        assert!(legal(1, &[(0, Rewind), (0, NullRow), (0, Next)]));
         assert!(!legal(
             1,
             &[(0, Rewind), (0, NullRow), (0, Insert(2, 1, true))]

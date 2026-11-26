@@ -70,7 +70,7 @@ Rules that hold for all opcodes:
 | `Found`, `NotFound`, `NoConflict` | index | match means some entry has the given prefix. Hit gives `Matched p`: the cursor is on some match, but a read or a move from it is Undefined (U2, U8), so the entry cannot be seen. Miss gives `Seeked key`. `NoConflict` also jumps when the key has a NULL, even if an entry matches |
 | `IdxGE/GT/LE/LT k` | position is `At` | jump if the entry compares `>=`, `>`, `<=`, `<` the prefix `k`. No state change. On a non-`At` position the model returns jump (Turso behaviour; SQLite asserts) |
 | `Column`, `RowId` | none | see section 1. Position unchanged |
-| `NullRow` | none | null-row flag set. Only `Column`, `RowId`, `Rewind`, `Last`, `Seek*`, `NotExists` may follow. `Next`, `Prev`, `Insert`, `Delete` after it are Undefined |
+| `NullRow` | not after a peer write (U9) | null-row flag set. Only `Column`, `RowId`, `Next`, `Prev`, `Rewind`, `Last`, `Seek*`, `NotExists` may follow. `Next` and `Prev` find no row and do not jump (SQLite: `OP_Next` on an invalid cursor, used by LEFT JOIN loops); afterwards the cursor has no position. `Insert`, `Delete` after it are Undefined |
 | `NewRowid` | table | returns `r` with `r` not in the store and `r > max key` (D6). Position after it: no position; a read is Undefined (U8). Only a no-seek `Insert` of `r` may follow |
 | `Insert k v` | see section 3 | store has `k -> v` (overwrite if present). Position: `At k` (**DECISION D1**) |
 | `Delete` | position is `At` | key removed. Position: `Gap(pred, succ)` (**DECISION D2**). `Column`/`RowId` before the next move: Undefined |
@@ -169,7 +169,7 @@ engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 |---|---|---|
 | U1 | `Next` without a forward position, or `Prev` without a backward one (`Rewind` then `Prev`, `Last` then `Next`, `Next` then `Prev`). Also `Prev` after a `SeekRowid` or `NotExists` hit: only `Next` may follow it, and a backward scan starts with `Last`, `SeekLE` or `SeekLT` | D3 |
 | U2 | `Next` or `Prev` from a position that has no direction: after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete` | section 1 |
-| U3 | After `NullRow`: `Next`, `Prev`, `Insert`, `IdxInsert`, `Delete`, `Count`, `NewRowid` | section 2 |
+| U3 | After `NullRow`: `Insert`, `IdxInsert`, `Delete`, `Count`, `NewRowid` (`Next` and `Prev` are legal and find no row) | section 2 |
 | U4 | `Delete` with no entry under the cursor: fresh cursor, scan ended, failed seek | D4 |
 | U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key. A `Found` or `NotFound` hit gives no token (SQLite seeks again); a miss does | section 3 |
 | U6 | `IdxGE/GT/LE/LT` on a cursor whose entry was deleted (by itself or by another cursor) | SQLite asserts, `vdbe.c:7112` |
@@ -254,7 +254,7 @@ unclear, write the test and see, **by design** = contract already accounts for i
 | G11 | `NewRowid` on MVCC does not reuse rowids; `GoNext` leaves a garbage position | mvcc 3.5 | by design (D6) |
 | G12 | MVCC `Clear` errors, `Destroy` is a no-op | opcodes 19 | by design |
 | G13 | `Count` moves MVCC cursor to the end | opcodes 18 | by design (position Undefined) |
-| G14 | `NullRow` does not invalidate the cursor; `Next` after it clears the flag | opcodes 17 | by design (Undefined) |
+| G14 | `NullRow` does not invalidate the cursor; `Next` after it clears the flag | opcodes 17 | by design (`Next` finds no row; a read after it is Undefined) |
 | G15 | `test_cursor_with_btree_and_mvcc_fuzz` was `#[ignore]` ("fails constantly on main"). The cause was the test, not the cursor: its Checkpoint op restarted the database while a connection was still open. Fixed with one line and re-enabled; 39 seeds pass, with checkpoints and restarts | database.rs:4832 | done (no cursor bug found by this fuzzer) |
 
 Two claims from the Turso notes turned out wrong when checked against the SQLite notes:
@@ -287,7 +287,7 @@ ephemeral table) wherever one cursor would write and another would read the same
 | CL1 | MVCC | Index, NOCASE or RTRIM: `IdxDelete` of `('a', 1)` and `IdxInsert` of `('A', 1)` (equal under the collation, same rowid): a later read of the entry returns the old bytes `'a'`, not `'A'`. SQLite and WAL return the new bytes. Needs no checkpointed row. Reachable from SQL (`UPDATE t SET a='A'`, then a covering index scan): issue 9285 |
 | U1 | all | Undefined: `Next` or `Prev` in the wrong direction (D3). No engine refuses it with `unsupported` |
 | U2 | all | Undefined: `Next` or `Prev` after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete`. No engine refuses it |
-| U3 | all | Undefined: `Next`, `Prev`, `Insert`, `IdxInsert`, `Delete`, `Count` or `NewRowid` after `NullRow`. WAL answers a `NewRowid` with 1 (was N3). No engine refuses it |
+| U3 | all | Undefined: `Insert`, `IdxInsert`, `Delete`, `Count` or `NewRowid` after `NullRow`. WAL answers a `NewRowid` with 1 (was N3). No engine refuses it. (`Next` and `Prev` after `NullRow` were U3; the corpus emits them in LEFT JOIN loops, and SQLite allows them) |
 | U4 | WAL, MVCC | Undefined: `Delete` without an entry (D4). WAL panics on `current_page >= 0`, MVCC with "Cannot delete: no current row". Neither message says `unsupported` |
 | U5 | all | Undefined: an insert without the seek token of its key, also after a `Found` or `NotFound` hit (was N11: WAL and ephemeral write the new key at the hit and leave the index out of order). No engine refuses it |
 | U6 | all | Undefined: `IdxGE/GT/LE/LT` after the entry was deleted (was N8; SQLite asserts, `vdbe.c:7112`). The engines compare the next entry or the end |

@@ -18,7 +18,7 @@ pub enum Rule {
     U1,
     /// `Next` or `Prev` from a position that has no direction.
     U2,
-    /// A move or a write after `NullRow`.
+    /// A write, `Count` or `Found` after `NullRow`.
     U3,
     /// `Delete` with no entry under the cursor.
     U4,
@@ -79,7 +79,10 @@ pub enum Pos<K> {
 pub enum Token<K> {
     None,
     /// The last move was an exact seek for `key`. `hit` tells whether an entry matched.
-    Key { key: K, hit: bool },
+    Key {
+        key: K,
+        hit: bool,
+    },
     /// The last move was `SeekEnd` or `NewRowid`: an insert of a key above every key is legal.
     Append,
 }
@@ -178,7 +181,9 @@ impl<K> Op<K> {
             Op::NoConflictNull => "NoConflictNull",
             Op::NewRowid => "NewRowid",
             Op::Insert { use_seek: true, .. } => "InsertUseSeek",
-            Op::Insert { use_seek: false, .. } => "Insert",
+            Op::Insert {
+                use_seek: false, ..
+            } => "Insert",
             Op::InsertNoop => "InsertNoop",
             Op::Delete => "Delete",
             Op::IdxDelete(Some(_)) => "IdxDelete",
@@ -238,7 +243,7 @@ pub fn step<T: Tree>(
     op: &Op<T::Key>,
 ) -> Result<Outcome<T::Key>, Illegal> {
     if c.null_row && !allowed_after_null_row(op) {
-        return illegal(Rule::U3, "a move or a write after NullRow");
+        return illegal(Rule::U3, "a write, Count or Found after NullRow");
     }
     match op {
         Op::Rewind => Ok(land(t.first(), Dir::Fwd)),
@@ -246,6 +251,9 @@ pub fn step<T: Tree>(
         Op::Seek(k, op) => Ok(seek(t, k, *op)),
         Op::Found(k) => Ok(found(t, k)),
         Op::NoConflictNull => Ok(keep(Shape::lost())),
+        // SQLite's `OP_Next` on a cursor after `OP_NullRow` finds no row. The position
+        // afterwards is none.
+        Op::Next | Op::Prev if c.null_row => Ok(keep(Shape::lost())),
         Op::Next => advance(t, c, Dir::Fwd),
         Op::Prev => advance(t, c, Dir::Bwd),
         Op::NewRowid => Ok(keep(Shape::new(Pos::Lost, Dir::None, Token::Append))),
@@ -287,11 +295,12 @@ pub fn step<T: Tree>(
     }
 }
 
-/// SPEC section 2: after `NullRow` only reads, `Rewind`, `Last`, seeks and `NullRow` are legal.
+/// SPEC section 2: after `NullRow` only reads, `Next`, `Prev`, `Rewind`, `Last`, seeks and
+/// `NullRow` are legal.
 fn allowed_after_null_row<K>(op: &Op<K>) -> bool {
     matches!(
         op,
-        Op::Rewind | Op::Last | Op::Seek(..) | Op::Read | Op::NullRow
+        Op::Rewind | Op::Last | Op::Next | Op::Prev | Op::Seek(..) | Op::Read | Op::NullRow
     )
 }
 

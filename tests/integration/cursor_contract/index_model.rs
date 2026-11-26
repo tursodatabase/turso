@@ -343,6 +343,12 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
         IMOp::IdxGT(p) => idx(p, is_gt),
         IMOp::IdxLE(p) => idx(p, is_le),
         IMOp::IdxLT(p) => idx(p, is_lt),
+        // `Next` and `Prev` after `NullRow` find no row (SQLite: `OP_Next` on an invalid
+        // cursor). The position afterwards is none.
+        IMOp::INext | IMOp::IPrev if c.icnull => put(
+            ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone),
+            false,
+        ),
         IMOp::INext => {
             if c.icdir != Dir::Fwd {
                 return None;
@@ -452,6 +458,8 @@ fn ok_after_null(o: &IMOp) -> bool {
         o,
         IMOp::IRewind
             | IMOp::ILast
+            | IMOp::INext
+            | IMOp::IPrev
             | IMOp::ISeekGE(_)
             | IMOp::ISeekGT(_)
             | IMOp::ISeekLE(_)
@@ -1505,10 +1513,10 @@ mod tests {
                 kobs(false, &k2())
             ])
         );
-        // `Next`, `Count` and `Found` are illegal after `NullRow`.
+        // `Next` after `NullRow` finds no row. `Count` and `Found` are illegal.
         assert_eq!(
             obs_of_run(1, &[a(0, IRewind), a(0, INullRow), a(0, INext)]),
-            None
+            Some(vec![kobs(false, &k1()), iend(false), iunspec(false)])
         );
         assert_eq!(
             obs_of_run(1, &[a(0, IRewind), a(0, INullRow), a(0, ICount)]),

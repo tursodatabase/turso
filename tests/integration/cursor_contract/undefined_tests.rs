@@ -291,21 +291,9 @@ index_case!(
 );
 
 // ---------------------------------------------------------------------------------------
-// U3: after `NullRow` only reads and a new position are legal.
+// U3: after `NullRow` only reads, `Next`, `Prev` and a new position are legal.
 // ---------------------------------------------------------------------------------------
 
-table_case!(
-    known_bug_u3_next_after_null_row,
-    "U3",
-    1,
-    [Op::Rewind(0), Op::NullRow(0), Op::Next(0)]
-);
-table_case!(
-    known_bug_u3_prev_after_null_row,
-    "U3",
-    1,
-    [Op::Last(0), Op::NullRow(0), Op::Prev(0)]
-);
 table_case!(
     known_bug_u3_insert_after_null_row,
     "U3",
@@ -329,14 +317,6 @@ table_case!(
     "U3",
     1,
     [Op::NullRow(0), Op::NewRowid(0)]
-);
-index_case!(
-    known_bug_u3_idx_next_after_null_row,
-    "U3",
-    default_idef(),
-    index_rows(),
-    1,
-    [IOp::Rewind(0), IOp::NullRow(0), IOp::Next(0)]
 );
 index_case!(
     known_bug_u3_idx_insert_after_null_row,
