@@ -2413,15 +2413,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_err()
                     {
-                        // Another checkpoint is already running. A blocking mode returns
-                        // Busy, as on the flag-off path and in SQLite. A no-op result would
-                        // be `0|0|0`, the same result as a TRUNCATE that empties the log,
-                        // so the caller could not see that nothing occurred.
-                        if !matches!(self.mode, CheckpointMode::Passive { .. }) {
+                        // Another checkpoint is already running. Only the commit
+                        // auto-checkpoint (PASSIVE, `update_transaction_state` false) does
+                        // no work, because the running checkpoint moves the rows. An
+                        // explicit checkpoint returns Busy, as on the flag-off path. A
+                        // no-op result would be `0|0|0`, the same result as a checkpoint
+                        // that empties the log, so the caller could not see that nothing
+                        // occurred.
+                        let auto_checkpoint = matches!(self.mode, CheckpointMode::Passive { .. })
+                            && !self.update_transaction_state;
+                        if !auto_checkpoint {
                             return Err(crate::LimboError::Busy);
                         }
-                        // A PASSIVE checkpoint (for example an auto-checkpoint) does no
-                        // work. The running checkpoint moves the rows.
                         self.state = CheckpointState::Finalize;
                         return Ok(TransitionResult::Done(CheckpointResult::default()));
                     }
