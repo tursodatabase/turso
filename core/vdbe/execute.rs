@@ -468,7 +468,7 @@ fn check_divisor(
     lhs: usize,
     rhs: usize,
 ) -> Result<(), Box<LimboError>> {
-    if !connection.dialect().errors_on_zero_divisor() {
+    if !connection.dialect_ref().errors_on_zero_divisor() {
         return Ok(());
     }
     if matches!(state.registers[lhs].get_value(), Value::Null) {
@@ -3196,7 +3196,7 @@ pub fn op_union_tag(
     );
 
     let val = state.registers[*src_reg].get_value();
-    let result = match val {
+    let tag_name = match val {
         Value::Blob(blob) if !blob.is_empty() => {
             let tag_index = blob[0] as usize;
             debug_assert!(
@@ -3204,15 +3204,20 @@ pub fn op_union_tag(
                 "union tag index {tag_index} out of range (len={})",
                 tag_names.len()
             );
-            match tag_names.get(tag_index) {
-                Some(name) => Value::build_text(name.clone()),
-                None => Value::Null,
-            }
+            tag_names.get(tag_index)
         }
-        _ => Value::Null,
+        _ => None,
     };
 
-    state.registers[*dest].set_value(result);
+    // A register that holds text keeps its buffer: copy the name into it,
+    // without first copying the name into a String that is then freed.
+    match (tag_name, &mut state.registers[*dest]) {
+        (Some(name), Register::Value(Value::Text(existing))) => {
+            existing.do_extend(&name.as_str())?
+        }
+        (Some(name), register) => register.set_text(Text::new(name.clone()))?,
+        (None, register) => register.set_null(),
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9273,7 +9278,7 @@ pub fn op_agg_inverse(
     };
     let payload = agg.payload_mut();
     let counts_infinite_inputs = matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
-        && connection.dialect().sum_counts_infinite_inputs();
+        && connection.dialect_ref().sum_counts_infinite_inputs();
     inverse_agg_payload(func, arg, payload, counts_infinite_inputs)?;
 
     state.pc += 1;
@@ -9904,7 +9909,7 @@ fn op_agg_step_slow(
         _ => {
             let counts_infinite_inputs =
                 matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
-                    && connection.dialect().sum_counts_infinite_inputs();
+                    && connection.dialect_ref().sum_counts_infinite_inputs();
             let arg2_reg = match func {
                 AggFunc::GroupConcat | AggFunc::StringAgg => Some(*delimiter),
                 #[cfg(feature = "json")]
@@ -10935,7 +10940,7 @@ pub fn op_function(
                 statement_times: Cell::from_mut(&mut state.statement_times),
                 collation: func.collation,
             };
-            let value = connection.dialect().call_scalar(
+            let value = connection.dialect_ref().call_scalar(
                 &context,
                 scalar_func,
                 &state.registers[*start_reg..*start_reg + arg_count],
@@ -11975,40 +11980,46 @@ pub fn op_yield(
         },
         insn
     );
-    if let Value::Numeric(Numeric::Integer(pc)) = state.registers[*yield_reg].get_value() {
-        if state.ended_coroutine.contains(&(*yield_reg as u32)) {
-            state.pc = end_offset.as_offset_int();
-        } else {
-            let pc: u32 = (*pc)
-                .try_into()
-                .unwrap_or_else(|_| panic!("Yield: pc overflow: {pc}"));
-            // swap the program counter with the value in the yield register
-            // this is the mechanism that allows jumping back and forth between the coroutine and the caller
-            state.registers[*yield_reg].set_int((state.pc + 1) as i64);
-            state.pc = pc;
-
-            // Strip JSON subtypes from co-routine output columns so they do not
-            // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
-            // subtype_clear_count > 0 only for coroutine body yields.
-            #[cfg(feature = "json")]
-            if *subtype_clear_count > 0 {
-                use crate::types::TextSubtype;
-                for reg in &mut state.registers
-                    [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
-                {
-                    if let Register::Value(Value::Text(text)) = reg {
-                        if text.subtype == TextSubtype::Json {
-                            text.subtype = TextSubtype::Text;
-                        }
-                    }
-                }
-            }
-        }
-    } else {
+    let next_pc = (state.pc + 1) as i64;
+    let Register::Value(Value::Numeric(Numeric::Integer(pc_slot))) =
+        &mut state.registers[*yield_reg]
+    else {
         unreachable!(
             "yield_reg {} contains non-integer value: {:?}",
             *yield_reg, state.registers[*yield_reg]
         );
+    };
+    // Only EndCoroutine adds to this list, so it is usually empty. The
+    // search of a list sets up a vector loop before it reads the length,
+    // and this opcode runs for each row of a coroutine.
+    if !state.ended_coroutine.is_empty() && state.ended_coroutine.contains(&(*yield_reg as u32)) {
+        state.pc = end_offset.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let pc = *pc_slot;
+    let pc: u32 = pc
+        .try_into()
+        .unwrap_or_else(|_| panic!("Yield: pc overflow: {pc}"));
+    // swap the program counter with the value in the yield register
+    // this is the mechanism that allows jumping back and forth between the coroutine and the caller
+    *pc_slot = next_pc;
+    state.pc = pc;
+
+    // Strip JSON subtypes from co-routine output columns so they do not
+    // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
+    // subtype_clear_count > 0 only for coroutine body yields.
+    #[cfg(feature = "json")]
+    if *subtype_clear_count > 0 {
+        use crate::types::TextSubtype;
+        for reg in &mut state.registers
+            [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
+        {
+            if let Register::Value(Value::Text(text)) = reg {
+                if text.subtype == TextSubtype::Json {
+                    text.subtype = TextSubtype::Text;
+                }
+            }
+        }
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -17013,7 +17024,9 @@ pub fn op_cast(
 ) -> InsnResult {
     load_insn!(Cast { reg, affinity }, insn);
 
-    let value = state.registers[*reg].get_value().clone();
+    // `exec_cast` reads the value through a reference, so the value needs no
+    // clone.
+    let value = state.registers[*reg].get_value();
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
@@ -17021,7 +17034,6 @@ pub fn op_cast(
         Affinity::Integer => value.exec_cast("INTEGER"),
         Affinity::Real => value.exec_cast("REAL"),
     }?;
-
     state.registers[*reg].set_value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

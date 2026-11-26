@@ -427,268 +427,9 @@ impl<'a> Parser<'a> {
         debug_assert!(!self.peekable);
         let mut next = self.consume_lexer_without_whitespaces_or_comments();
 
-        fn get_token(tt: TokenType) -> TokenType {
-            match tt {
-                TK_ID | TK_STRING | TK_JOIN_KW | TK_UNION | TK_EXCEPT | TK_INTERSECT
-                | TK_GENERATED | TK_WITHOUT | TK_COLUMNKW | TK_WINDOW | TK_FILTER | TK_OVER
-                | TK_WITHIN | TK_LATERAL => TK_ID,
-                _ => tt.fallback_id_if_ok(),
-            }
-        }
-
         if let Some(Ok(ref mut tok)) = next {
-            /*
-             ** The following three functions are called immediately after the tokenizer
-             ** reads the keywords WINDOW, OVER and FILTER, respectively, to determine
-             ** whether the token should be treated as a keyword or an SQL identifier.
-             ** This cannot be handled by the usual lemon %fallback method, due to
-             ** the ambiguity in some constructions. e.g.
-             **
-             **   SELECT sum(x) OVER ...
-             **
-             ** In the above, "OVER" might be a keyword, or it might be an alias for the
-             ** sum(x) expression. If a "%fallback ID OVER" directive were added to
-             ** grammar, then SQLite would always treat "OVER" as an alias, making it
-             ** impossible to call a window-function without a FILTER clause.
-             **
-             ** WINDOW is treated as a keyword if:
-             **
-             **   * the following token is an identifier, or a keyword that can fallback
-             **     to being an identifier, and
-             **   * the token after than one is TK_AS.
-             **
-             ** OVER is a keyword if:
-             **
-             **   * the previous token was TK_RP, and
-             **   * the next token is either TK_LP or an identifier.
-             **
-             ** FILTER is a keyword if:
-             **
-             **   * the previous token was TK_RP, and
-             **   * the next token is TK_LP.
-             **
-             ** UNION is a keyword if:
-             **
-             **   * the next token is TK_ALL|TK_SELECT|TK_VALUES.
-             **
-             ** EXCEPT is a keyword if:
-             **
-             **   * the next token is TK_SELECT|TK_VALUES.
-             **
-             ** INTERSECT is a keyword if:
-             **
-             **   * the next token is TK_SELECT|TK_VALUES.
-             **
-             ** COLUMNKW is a keyword if:
-             **
-             **   * the previous token is TK_ADD|TK_RENAME|TK_DROP.
-             **
-             ** GENERATED is a keyword if:
-             **
-             **   * the next token is TK_ALWAYS.
-             **   * the token after than one is TK_AS.
-             **
-             ** WITHOUT is a keyword if:
-             **
-             **   * the previous token is TK_RP|TK_COMMA.
-             **   * the next token is TK_ID.
-             */
-            match tok.token_type {
-                TK_WINDOW => {
-                    let can_be_window = self.try_parse(|p| {
-                        match p.consume_lexer_without_whitespaces_or_comments() {
-                            None => return Ok(false),
-                            Some(tok) => match get_token(tok?.token_type) {
-                                TK_ID => {}
-                                _ => return Ok(false),
-                            },
-                        }
-
-                        match p.consume_lexer_without_whitespaces_or_comments() {
-                            None => Ok(false),
-                            Some(tok) => match tok?.token_type {
-                                TK_AS => Ok(true),
-                                _ => Ok(false),
-                            },
-                        }
-                    })?;
-
-                    if !can_be_window {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_OVER => {
-                    let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
-                    let can_be_over = {
-                        if prev_tt == TK_RP {
-                            self.try_parse(|p| {
-                                match p.consume_lexer_without_whitespaces_or_comments() {
-                                    None => Ok(false),
-                                    Some(tok) => match get_token(tok?.token_type) {
-                                        TK_LP | TK_ID => Ok(true),
-                                        _ => Ok(false),
-                                    },
-                                }
-                            })?
-                        } else {
-                            false
-                        }
-                    };
-
-                    if !can_be_over {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_FILTER => {
-                    let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
-                    let can_be_filter = {
-                        if prev_tt == TK_RP {
-                            self.try_parse(|p| {
-                                match p.consume_lexer_without_whitespaces_or_comments() {
-                                    None => Ok(false),
-                                    Some(tok) => match tok?.token_type {
-                                        TK_LP => Ok(true),
-                                        _ => Ok(false),
-                                    },
-                                }
-                            })?
-                        } else {
-                            false
-                        }
-                    };
-
-                    if !can_be_filter {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_WITHIN => {
-                    // WITHIN is a keyword only in `<aggregate>(...) WITHIN GROUP (...)`:
-                    // the previous token must be `)` and the next token must be GROUP.
-                    let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
-                    let can_be_within = if prev_tt == TK_RP {
-                        self.try_parse(|p| {
-                            match p.consume_lexer_without_whitespaces_or_comments() {
-                                None => Ok(false),
-                                Some(tok) => match tok?.token_type {
-                                    TK_GROUP => Ok(true),
-                                    _ => Ok(false),
-                                },
-                            }
-                        })?
-                    } else {
-                        false
-                    };
-
-                    if !can_be_within {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_LATERAL => {
-                    let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
-                    let starts_from_item = matches!(prev_tt, TK_FROM | TK_COMMA | TK_JOIN);
-                    let precedes_subquery = starts_from_item
-                        && self.try_parse(|p| {
-                            let mut open_parentheses = 0;
-                            loop {
-                                match p.consume_lexer_without_whitespaces_or_comments() {
-                                    None => return Ok(false),
-                                    Some(tok) => match tok?.token_type {
-                                        TK_LP => open_parentheses += 1,
-                                        TK_SELECT | TK_VALUES | TK_WITH => {
-                                            return Ok(open_parentheses > 0)
-                                        }
-                                        _ => return Ok(false),
-                                    },
-                                }
-                            }
-                        })?;
-
-                    if !precedes_subquery {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_UNION => {
-                    let can_be_union = self.try_parse(|p| {
-                        match p.consume_lexer_without_whitespaces_or_comments() {
-                            None => Ok(false),
-                            Some(tok) => match tok?.token_type {
-                                TK_ALL | TK_SELECT | TK_VALUES => Ok(true),
-                                _ => Ok(false),
-                            },
-                        }
-                    })?;
-
-                    if !can_be_union {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_EXCEPT | TK_INTERSECT => {
-                    let can_be_except = self.try_parse(|p| {
-                        match p.consume_lexer_without_whitespaces_or_comments() {
-                            None => Ok(false),
-                            Some(tok) => match tok?.token_type {
-                                TK_SELECT | TK_VALUES => Ok(true),
-                                _ => Ok(false),
-                            },
-                        }
-                    })?;
-
-                    if !can_be_except {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_COLUMNKW => {
-                    let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
-                    let can_be_columnkw =
-                        matches!(prev_tt, TK_ADD | TK_RENAME | TK_DROP | TK_ALTER);
-
-                    if !can_be_columnkw {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_GENERATED => {
-                    let can_be_generated = self.try_parse(|p| {
-                        match p.consume_lexer_without_whitespaces_or_comments() {
-                            None => return Ok(false),
-                            Some(tok) => match tok?.token_type {
-                                TK_ALWAYS => {}
-                                _ => return Ok(false),
-                            },
-                        }
-
-                        match p.consume_lexer_without_whitespaces_or_comments() {
-                            None => Ok(false),
-                            Some(tok) => match tok?.token_type {
-                                TK_AS => Ok(true),
-                                _ => Ok(false),
-                            },
-                        }
-                    })?;
-
-                    if !can_be_generated {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                TK_WITHOUT => {
-                    let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
-                    let can_be_without = match prev_tt {
-                        TK_RP | TK_COMMA => self.try_parse(|p| {
-                            match p.consume_lexer_without_whitespaces_or_comments() {
-                                None => Ok(false),
-                                Some(tok) => match get_token(tok?.token_type) {
-                                    TK_ID => Ok(true),
-                                    _ => Ok(false),
-                                },
-                            }
-                        })?,
-                        _ => false,
-                    };
-
-                    if !can_be_without {
-                        tok.token_type = TK_ID;
-                    }
-                }
-                _ => {}
+            if Self::is_contextual_keyword(tok.token_type) {
+                self.resolve_contextual_keyword(tok)?;
             }
         }
 
@@ -701,6 +442,302 @@ impl<'a> Parser<'a> {
             }
             Some(Err(err)) => Err(err),
         }
+    }
+
+    /// Whether `tt` is a keyword that the parser reads as an identifier in some
+    /// contexts. [`Self::resolve_contextual_keyword`] decides which one applies.
+    #[inline(always)]
+    fn is_contextual_keyword(tt: TokenType) -> bool {
+        matches!(
+            tt,
+            TK_WINDOW
+                | TK_OVER
+                | TK_FILTER
+                | TK_WITHIN
+                | TK_LATERAL
+                | TK_UNION
+                | TK_EXCEPT
+                | TK_INTERSECT
+                | TK_COLUMNKW
+                | TK_GENERATED
+                | TK_WITHOUT
+        )
+    }
+
+    /// Changes `tok`, a keyword that [`Self::is_contextual_keyword`] accepts,
+    /// to `TK_ID` when the tokens around it make it an identifier.
+    ///
+    /// This function is not inlined: [`Self::next_token`] runs for each
+    /// token, and these checks are rare. Inlined, they gave `next_token` a
+    /// stack frame of 712 bytes, and each token went through one more copy.
+    #[inline(never)]
+    fn resolve_contextual_keyword(&mut self, tok: &mut Token<'a>) -> Result<()> {
+        fn get_token(tt: TokenType) -> TokenType {
+            match tt {
+                TK_ID | TK_STRING | TK_JOIN_KW | TK_UNION | TK_EXCEPT | TK_INTERSECT
+                | TK_GENERATED | TK_WITHOUT | TK_COLUMNKW | TK_WINDOW | TK_FILTER | TK_OVER
+                | TK_WITHIN | TK_LATERAL => TK_ID,
+                _ => tt.fallback_id_if_ok(),
+            }
+        }
+
+        /*
+         ** The following three functions are called immediately after the tokenizer
+         ** reads the keywords WINDOW, OVER and FILTER, respectively, to determine
+         ** whether the token should be treated as a keyword or an SQL identifier.
+         ** This cannot be handled by the usual lemon %fallback method, due to
+         ** the ambiguity in some constructions. e.g.
+         **
+         **   SELECT sum(x) OVER ...
+         **
+         ** In the above, "OVER" might be a keyword, or it might be an alias for the
+         ** sum(x) expression. If a "%fallback ID OVER" directive were added to
+         ** grammar, then SQLite would always treat "OVER" as an alias, making it
+         ** impossible to call a window-function without a FILTER clause.
+         **
+         ** WINDOW is treated as a keyword if:
+         **
+         **   * the following token is an identifier, or a keyword that can fallback
+         **     to being an identifier, and
+         **   * the token after than one is TK_AS.
+         **
+         ** OVER is a keyword if:
+         **
+         **   * the previous token was TK_RP, and
+         **   * the next token is either TK_LP or an identifier.
+         **
+         ** FILTER is a keyword if:
+         **
+         **   * the previous token was TK_RP, and
+         **   * the next token is TK_LP.
+         **
+         ** UNION is a keyword if:
+         **
+         **   * the next token is TK_ALL|TK_SELECT|TK_VALUES.
+         **
+         ** EXCEPT is a keyword if:
+         **
+         **   * the next token is TK_SELECT|TK_VALUES.
+         **
+         ** INTERSECT is a keyword if:
+         **
+         **   * the next token is TK_SELECT|TK_VALUES.
+         **
+         ** COLUMNKW is a keyword if:
+         **
+         **   * the previous token is TK_ADD|TK_RENAME|TK_DROP.
+         **
+         ** GENERATED is a keyword if:
+         **
+         **   * the next token is TK_ALWAYS.
+         **   * the token after than one is TK_AS.
+         **
+         ** WITHOUT is a keyword if:
+         **
+         **   * the previous token is TK_RP|TK_COMMA.
+         **   * the next token is TK_ID.
+         */
+        match tok.token_type {
+            TK_WINDOW => {
+                let can_be_window = self.try_parse(|p| {
+                    match p.consume_lexer_without_whitespaces_or_comments() {
+                        None => return Ok(false),
+                        Some(tok) => match get_token(tok?.token_type) {
+                            TK_ID => {}
+                            _ => return Ok(false),
+                        },
+                    }
+
+                    match p.consume_lexer_without_whitespaces_or_comments() {
+                        None => Ok(false),
+                        Some(tok) => match tok?.token_type {
+                            TK_AS => Ok(true),
+                            _ => Ok(false),
+                        },
+                    }
+                })?;
+
+                if !can_be_window {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_OVER => {
+                let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
+                let can_be_over = {
+                    if prev_tt == TK_RP {
+                        self.try_parse(|p| {
+                            match p.consume_lexer_without_whitespaces_or_comments() {
+                                None => Ok(false),
+                                Some(tok) => match get_token(tok?.token_type) {
+                                    TK_LP | TK_ID => Ok(true),
+                                    _ => Ok(false),
+                                },
+                            }
+                        })?
+                    } else {
+                        false
+                    }
+                };
+
+                if !can_be_over {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_FILTER => {
+                let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
+                let can_be_filter = {
+                    if prev_tt == TK_RP {
+                        self.try_parse(|p| {
+                            match p.consume_lexer_without_whitespaces_or_comments() {
+                                None => Ok(false),
+                                Some(tok) => match tok?.token_type {
+                                    TK_LP => Ok(true),
+                                    _ => Ok(false),
+                                },
+                            }
+                        })?
+                    } else {
+                        false
+                    }
+                };
+
+                if !can_be_filter {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_WITHIN => {
+                // WITHIN is a keyword only in `<aggregate>(...) WITHIN GROUP (...)`:
+                // the previous token must be `)` and the next token must be GROUP.
+                let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
+                let can_be_within = if prev_tt == TK_RP {
+                    self.try_parse(
+                        |p| match p.consume_lexer_without_whitespaces_or_comments() {
+                            None => Ok(false),
+                            Some(tok) => match tok?.token_type {
+                                TK_GROUP => Ok(true),
+                                _ => Ok(false),
+                            },
+                        },
+                    )?
+                } else {
+                    false
+                };
+
+                if !can_be_within {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_LATERAL => {
+                let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
+                let starts_from_item = matches!(prev_tt, TK_FROM | TK_COMMA | TK_JOIN);
+                let precedes_subquery = starts_from_item
+                    && self.try_parse(|p| {
+                        let mut open_parentheses = 0;
+                        loop {
+                            match p.consume_lexer_without_whitespaces_or_comments() {
+                                None => return Ok(false),
+                                Some(tok) => match tok?.token_type {
+                                    TK_LP => open_parentheses += 1,
+                                    TK_SELECT | TK_VALUES | TK_WITH => {
+                                        return Ok(open_parentheses > 0)
+                                    }
+                                    _ => return Ok(false),
+                                },
+                            }
+                        }
+                    })?;
+
+                if !precedes_subquery {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_UNION => {
+                let can_be_union =
+                    self.try_parse(
+                        |p| match p.consume_lexer_without_whitespaces_or_comments() {
+                            None => Ok(false),
+                            Some(tok) => match tok?.token_type {
+                                TK_ALL | TK_SELECT | TK_VALUES => Ok(true),
+                                _ => Ok(false),
+                            },
+                        },
+                    )?;
+
+                if !can_be_union {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_EXCEPT | TK_INTERSECT => {
+                let can_be_except =
+                    self.try_parse(
+                        |p| match p.consume_lexer_without_whitespaces_or_comments() {
+                            None => Ok(false),
+                            Some(tok) => match tok?.token_type {
+                                TK_SELECT | TK_VALUES => Ok(true),
+                                _ => Ok(false),
+                            },
+                        },
+                    )?;
+
+                if !can_be_except {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_COLUMNKW => {
+                let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
+                let can_be_columnkw = matches!(prev_tt, TK_ADD | TK_RENAME | TK_DROP | TK_ALTER);
+
+                if !can_be_columnkw {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_GENERATED => {
+                let can_be_generated = self.try_parse(|p| {
+                    match p.consume_lexer_without_whitespaces_or_comments() {
+                        None => return Ok(false),
+                        Some(tok) => match tok?.token_type {
+                            TK_ALWAYS => {}
+                            _ => return Ok(false),
+                        },
+                    }
+
+                    match p.consume_lexer_without_whitespaces_or_comments() {
+                        None => Ok(false),
+                        Some(tok) => match tok?.token_type {
+                            TK_AS => Ok(true),
+                            _ => Ok(false),
+                        },
+                    }
+                })?;
+
+                if !can_be_generated {
+                    tok.token_type = TK_ID;
+                }
+            }
+            TK_WITHOUT => {
+                let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
+                let can_be_without = match prev_tt {
+                    TK_RP | TK_COMMA => self.try_parse(|p| {
+                        match p.consume_lexer_without_whitespaces_or_comments() {
+                            None => Ok(false),
+                            Some(tok) => match get_token(tok?.token_type) {
+                                TK_ID => Ok(true),
+                                _ => Ok(false),
+                            },
+                        }
+                    })?,
+                    _ => false,
+                };
+
+                if !can_be_without {
+                    tok.token_type = TK_ID;
+                }
+            }
+            // `next_token` calls this function only for the keywords that
+            // `is_contextual_keyword` accepts, and each of them has an arm.
+            other => unreachable!("{other:?} is not a contextual keyword"),
+        }
+        Ok(())
     }
 
     #[inline]

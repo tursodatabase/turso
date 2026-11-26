@@ -407,12 +407,7 @@ impl Value {
                 if quotes == 0 {
                     quoted.push_str(text);
                 } else {
-                    for (i, part) in text.split('\'').enumerate() {
-                        if i > 0 {
-                            quoted.push_str("''");
-                        }
-                        quoted.push_str(part);
-                    }
+                    push_doubling_quotes(&mut quoted, text);
                 }
                 quoted.push('\'');
                 Value::build_text(quoted)
@@ -704,7 +699,7 @@ impl Value {
             _ => match ignored_chars {
                 None => match self.cast_text_ref() {
                     Some(text) => {
-                        let input = &text[0..text.find('\0').unwrap_or(text.len())];
+                        let input = sqlite_text_prefix(&text);
                         let mut bytes = crate::alloc::vec![0; input.len() / 2];
                         match hex::decode_to_slice(input, &mut bytes) {
                             Ok(()) => Value::from_blob(bytes),
@@ -1680,6 +1675,27 @@ impl Value {
     }
 }
 
+/// Append `text` to `out`, with each quote doubled.
+///
+/// Not inlined: `exec_quote` calls it only for text that has a quote, and
+/// the loop inlined into `exec_quote` made the quote of other text slower.
+#[inline(never)]
+fn push_doubling_quotes(out: &mut String, text: &str) {
+    // Each part ends with a quote, and the push after it adds the second
+    // quote. A quote is ASCII, so each part ends on a character boundary. On
+    // short text, this loop costs less than `split('\'')`, which searches
+    // for a char.
+    let mut start = 0;
+    for (i, byte) in text.bytes().enumerate() {
+        if byte == b'\'' {
+            out.push_str(&text[start..=i]);
+            out.push('\'');
+            start = i + 1;
+        }
+    }
+    out.push_str(&text[start..]);
+}
+
 /// `bytes` as upper-case hex digits, two for each byte, as `hex::encode_upper`
 /// writes them.
 fn hex_upper(bytes: &[u8]) -> String {
@@ -1689,12 +1705,32 @@ fn hex_upper(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn push_hex_upper(out: &mut String, bytes: &[u8]) {
-    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     for &byte in bytes {
-        out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-        out.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+        // One `push_str` copies both digits. A `push` of each digit as a
+        // `char` tests the length of its UTF-8 form each time.
+        let start = usize::from(byte) * 2;
+        out.push_str(&HEX_PAIRS_UPPER[start..start + 2]);
     }
 }
+
+/// The upper-case hex digits of the 256 byte values, two for each value.
+const HEX_PAIRS_UPPER: &str = "\
+    000102030405060708090A0B0C0D0E0F\
+    101112131415161718191A1B1C1D1E1F\
+    202122232425262728292A2B2C2D2E2F\
+    303132333435363738393A3B3C3D3E3F\
+    404142434445464748494A4B4C4D4E4F\
+    505152535455565758595A5B5C5D5E5F\
+    606162636465666768696A6B6C6D6E6F\
+    707172737475767778797A7B7C7D7E7F\
+    808182838485868788898A8B8C8D8E8F\
+    909192939495969798999A9B9C9D9E9F\
+    A0A1A2A3A4A5A6A7A8A9AAABACADAEAF\
+    B0B1B2B3B4B5B6B7B8B9BABBBCBDBEBF\
+    C0C1C2C3C4C5C6C7C8C9CACBCCCDCECF\
+    D0D1D2D3D4D5D6D7D8D9DADBDCDDDEDF\
+    E0E1E2E3E4E5E6E7E8E9EAEBECEDEEEF\
+    F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF";
 
 /// `text` without the spaces at its start when `left` is true and at its end
 /// when `right` is true, as `trim_start_matches(' ')` and
