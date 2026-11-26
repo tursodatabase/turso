@@ -2280,7 +2280,8 @@ fn format_type_name(type_oid: i64, name: &str, typemod: Option<i64>) -> Result<S
         (1114, None) => "timestamp without time zone".to_string(),
         (1184, Some(typemod)) => format!("timestamp({typemod}) with time zone"),
         (1184, None) => "timestamp with time zone".to_string(),
-        (1186, _) => "interval".to_string(),
+        (1186, Some(typemod)) => format!("interval{}", interval_typmod(typemod)?),
+        (1186, None) => "interval".to_string(),
         (1700, Some(typemod)) if typemod >= 4 => {
             let precision = ((typemod - 4) >> 16) & 0xffff;
             let scale = (((typemod - 4) & 0x7ff) ^ 1024) - 1024;
@@ -2290,6 +2291,47 @@ fn format_type_name(type_oid: i64, name: &str, typemod: Option<i64>) -> Result<S
         (_, Some(typemod)) => format!("{}({typemod})", turso_pg_parser::quote_identifier(name)),
         (_, None) => turso_pg_parser::quote_identifier(name),
     })
+}
+
+/// The modifier of `interval`, as PostgreSQL's intervaltypmodout prints it:
+/// the fields in the high 16 bits of `typemod`, as bits numbered by
+/// datetime.h, and the precision of the seconds in the low 16 bits.
+fn interval_typmod(typemod: i64) -> Result<String> {
+    const MONTH: i64 = 1 << 1;
+    const YEAR: i64 = 1 << 2;
+    const DAY: i64 = 1 << 3;
+    const HOUR: i64 = 1 << 10;
+    const MINUTE: i64 = 1 << 11;
+    const SECOND: i64 = 1 << 12;
+    let fields = match (typemod >> 16) & 0x7fff {
+        YEAR => " year",
+        MONTH => " month",
+        DAY => " day",
+        HOUR => " hour",
+        MINUTE => " minute",
+        SECOND => " second",
+        f if f == YEAR | MONTH => " year to month",
+        f if f == DAY | HOUR => " day to hour",
+        f if f == DAY | HOUR | MINUTE => " day to minute",
+        f if f == DAY | HOUR | MINUTE | SECOND => " day to second",
+        f if f == HOUR | MINUTE => " hour to minute",
+        f if f == HOUR | MINUTE | SECOND => " hour to second",
+        f if f == MINUTE | SECOND => " minute to second",
+        0x7fff => "",
+        _ => {
+            return Err(sqlstate_error(
+                SQLSTATE_INTERNAL_ERROR,
+                format!("invalid INTERVAL typmod: {typemod:#x}"),
+                None,
+            ))
+        }
+    };
+    let precision = typemod & 0xffff;
+    if precision == 0xffff {
+        Ok(fields.to_string())
+    } else {
+        Ok(format!("{fields}({precision})"))
+    }
 }
 
 /// The length modifier of `character` and `character varying`, which store

@@ -1236,6 +1236,22 @@ expect {
     character|bpchar|character(5)|timestamp(3) without time zone|timestamp(0) with time zone|time(2) without time zone|numeric(0,0)|numeric(9,-1)|text(5)|character varying(5)|character varying(5)
 }
 
+test format-type-interval-typmods {
+    SELECT format_type(1186, 2147418115), format_type(1187, 196607), format_type(1186, 458751),
+           format_type(1186, 469827583), format_type(1186, -1), format_type(1186, 2147418112);
+}
+expect {
+    interval(3)|interval month[]|interval year to month|interval hour to second|interval|interval(0)
+}
+
+test format-type-invalid-interval-typmod {
+    SELECT format_type(1186, 5);
+}
+@sqlstate XX000
+expect error {
+    invalid INTERVAL typmod: 0x5
+}
+
 test format-type-text-typmod-with-prefix-and-underscores {
     SELECT format_type(1043, '0x10'), format_type(1043, ' 1_6 '), format_type(1043, '0o20'),
            format_type(1043, '+0B1_0000');
