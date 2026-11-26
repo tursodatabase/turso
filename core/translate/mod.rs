@@ -506,6 +506,7 @@ fn translate_statement(
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {
             if_not_exists,
+            namespace,
             type_name,
             body,
         } => {
@@ -513,6 +514,7 @@ fn translate_statement(
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
             schema::translate_create_type(
+                namespace.as_ref(),
                 &type_name,
                 &body,
                 if_not_exists,
@@ -523,6 +525,7 @@ fn translate_statement(
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
+            namespace,
             domain_name,
             base_type,
             default,
@@ -533,6 +536,7 @@ fn translate_statement(
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
             schema::translate_create_domain(
+                namespace.as_ref(),
                 &domain_name,
                 &base_type,
                 not_null,

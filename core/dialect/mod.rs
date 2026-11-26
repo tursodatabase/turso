@@ -37,7 +37,7 @@ pub use catalog::{
 use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 use crate::{
     function::ScalarFunc,
-    namespace::NamespaceId,
+    namespace::{NamespaceId, NamespaceRef},
     schema::{BTreeTable, Schema, SchemaBuilder, TypeDef},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::Register,
@@ -405,6 +405,24 @@ pub trait Dialect: Send + Sync + 'static {
     /// for tables, views and indexes.
     fn relation_names_unique_across_kinds(&self) -> bool {
         false
+    }
+
+    /// Checks that CREATE TYPE or CREATE DOMAIN can make a type named `name`
+    /// in `namespace`, whose objects `schema` holds. `name` is the name as
+    /// the statement gives it, before case folding. The engine checks the
+    /// names of the other types itself. The default keeps types in no
+    /// namespace and lets types and relations share names.
+    ///
+    /// PostgreSQL keeps types in schemas, and the row type of a table or
+    /// view takes the relation's name.
+    fn check_type_name_against_relations(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceRef,
+        name: &str,
+    ) -> Result<()> {
+        let _ = (schema, namespace, name);
+        Ok(())
     }
 
     /// Where the dialect stores the objects of a database. The default

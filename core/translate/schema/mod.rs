@@ -2794,6 +2794,7 @@ pub(crate) fn relation_name_is_taken(
 }
 
 pub fn translate_create_type(
+    namespace: Option<&ast::Name>,
     type_name: &str,
     body: &ast::CreateTypeBody,
     if_not_exists: bool,
@@ -2811,6 +2812,7 @@ pub fn translate_create_type(
     if is_base_type {
         bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
     }
+    check_type_name_against_relations(namespace, type_name, resolver)?;
 
     // Check if type already exists
     if resolver
@@ -2991,6 +2993,7 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_create_domain(
+    namespace: Option<&ast::Name>,
     domain_name: &str,
     base_type: &str,
     not_null: bool,
@@ -3011,6 +3014,7 @@ pub fn translate_create_domain(
     if is_base_type {
         bail_parse_error!("cannot create domain \"{normalized_name}\": name is a built-in type");
     }
+    check_type_name_against_relations(namespace, domain_name, resolver)?;
 
     // Check if type/domain already exists
     if resolver
@@ -3086,6 +3090,27 @@ pub fn translate_create_domain(
     };
 
     persist_type_definition(normalized_name, sql, resolver, connection, program)
+}
+
+/// Checks with the dialect that a new type named `name` can be created in
+/// the namespace that CREATE puts it in: `namespace` when the statement
+/// names one.
+fn check_type_name_against_relations(
+    namespace: Option<&ast::Name>,
+    name: &str,
+    resolver: &Resolver,
+) -> Result<()> {
+    let namespace = resolver.resolve_namespace_for_create(&ast::QualifiedName {
+        namespace: namespace.cloned(),
+        name: ast::Name::exact(name.to_string()),
+        alias: None,
+    })?;
+    resolver.with_schema(namespace.database_id, |schema| {
+        resolver
+            .catalog
+            .dialect
+            .check_type_name_against_relations(schema, namespace, name)
+    })
 }
 
 /// Refuse a new type or domain whose name an existing type or stored
