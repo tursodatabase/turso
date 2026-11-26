@@ -178,17 +178,22 @@ fn variable_from_parameter_index(
         .ok()
         .and_then(std::num::NonZeroU32::new)
         .expect("trigger parameter index must fit into NonZeroU32");
-    match column {
+    let variable = match column {
         Some((column, custom_type)) => {
             let collation = column_collation(column).map(|collation| collation.name());
-            Expr::Variable(ast::Variable::for_column(
+            ast::Variable::for_column(
                 nz,
                 custom_type.cloned(),
                 collation.as_deref(),
-            ))
+                column.is_rowid_alias(),
+            )
         }
-        None => Expr::Variable(ast::Variable::indexed(nz)),
-    }
+        None => ast::Variable {
+            is_rowid: true,
+            ..ast::Variable::indexed(nz)
+        },
+    };
+    Expr::Variable(variable)
 }
 
 impl TriggerSubprogramContext {

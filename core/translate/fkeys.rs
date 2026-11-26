@@ -2071,6 +2071,8 @@ fn build_fk_match_where_clause(fk_ref: &ResolvedFkRef, ctx: &FkSubprogramContext
                 .expect("fk parameter index must fit into NonZeroU32"),
             None,
             Some(&collation.name()),
+            // As in SQLite, a rowid parent key column has INTEGER affinity.
+            fk_ref.parent_is_rowid[i],
         );
         let cond = Expr::Binary(
             Box::new(Expr::Variable(parent_key)),
