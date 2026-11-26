@@ -71,6 +71,7 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     Ok(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: vec![ty.cast_to.clone(), ty.cast_to.clone()],
+        function: None,
     }))
 }
 
@@ -133,6 +134,7 @@ pub(crate) fn choose_list_operator(
     Ok(Some(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: vec![ty.cast_to.clone(); operands.len()],
+        function: None,
     })))
 }
 

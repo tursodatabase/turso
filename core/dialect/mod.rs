@@ -723,14 +723,25 @@ pub enum OperatorChoice {
     Chosen(ChosenOperator),
 }
 
-/// The operator a dialect chose: which operator it is, and the type it takes for each operand.
+/// The operator a dialect chose: which operator it is, the type it takes for
+/// each operand, and the function that runs it.
 ///
-/// FIXME(registered-types): The engine reads `id` for nothing yet. It can read a string literal as a type but cannot cast any other operand or know the type of the result, which still come from `type_of` and `find_operator_call`. Once types are registered, the operand casts and the result type come from the operator that `id` names.
+/// FIXME(registered-types): The engine reads `id` for nothing yet. It can read a string literal as a type but cannot cast any other operand, so a dialect names a function only when the operands already have the types the function takes. Once every type is registered, the operand casts come from the operator that `id` names too.
 #[derive(Debug, Clone)]
 pub struct ChosenOperator {
     /// The dialect's own identifier of the operator: the oid of its pg_operator row for PostgreSQL.
     pub id: i64,
     pub operands: Vec<ast::Type>,
+    /// `None` when the engine's own rules run the operator.
+    pub function: Option<OperatorFunction>,
+}
+
+/// The function that runs an operator: it takes the operands in order.
+#[derive(Debug, Clone)]
+pub struct OperatorFunction {
+    pub name: String,
+    /// The type of the value the function returns.
+    pub result: ast::Type,
 }
 
 /// What is known about the type of an operand.

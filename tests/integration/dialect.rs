@@ -833,6 +833,7 @@ impl Dialect for NoMinusForTextDialect {
             OperatorChoice::Chosen(ChosenOperator {
                 id: 0,
                 operands: vec![integer; operands.len()],
+                function: None,
             })
         } else {
             OperatorChoice::LeftToTheEngine
@@ -1635,6 +1636,42 @@ fn primary_key_of_a_type_that_can_be_a_rowid_alias_is_the_rowid() {
     conn.close().unwrap();
 }
 
+/// The function that a dialect names for an operator runs it, and the result
+/// has the type the dialect gives.
+#[test]
+fn function_a_dialect_names_for_an_operator_runs_it() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(
+        &io,
+        "dialect-operator-function.db",
+        Arc::new(RustTypesDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (p percent, q percent) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (30, 40)").unwrap();
+    let row = |sql: &str| conn.prepare(sql).unwrap().run_collect_rows().unwrap()[0].clone();
+
+    // `+` of two percents is the larger one. The result is a percent, so the
+    // second `+` is too.
+    assert_eq!(
+        row("SELECT p + q, p + q + p FROM t"),
+        vec![Value::from_i64(40), Value::from_i64(40)]
+    );
+    // The dialect names no function for `-`, and the type has none.
+    let error = conn.prepare("SELECT q - p FROM t").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("operator does not exist: percent - percent"),
+        "{error}"
+    );
+    conn.close().unwrap();
+}
+
 #[test]
 fn a_type_with_an_encode_cannot_be_a_rowid_alias() {
     let Err(error) = turso_core::schema::builtin::schema_builder(true)
@@ -1703,6 +1740,31 @@ impl Dialect for RustTypesDialect {
             .builtin_type(&SiNoBoolean)?
             .builtin_type(&Truth)?
             .builtin_type(&Percent)
+    }
+
+    fn choose_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<OperatorChoice> {
+        let is_percent = |operand: &OperandType| matches!(operand, OperandType::Registered(ty) if ty.name == "percent");
+        let operands = operands();
+        if op != "+" || !operands.iter().all(is_percent) {
+            return Ok(OperatorChoice::LeftToTheEngine);
+        }
+        let percent = turso_core::ast::Type {
+            name: "percent".to_string(),
+            size: None,
+            array_dimensions: 0,
+        };
+        Ok(OperatorChoice::Chosen(ChosenOperator {
+            id: 0,
+            operands: vec![percent.clone(); operands.len()],
+            function: Some(OperatorFunction {
+                name: "max".to_string(),
+                result: percent,
+            }),
+        }))
     }
 }
 
