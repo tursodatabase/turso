@@ -1810,3 +1810,36 @@ test fk-unqualified-reference-in-same-schema {
 expect {
     1
 }
+
+test fk-create-table-referencing-missing-table-rejected {
+    CREATE TABLE fkmt_c (pid int REFERENCES fkmt_nosuch (id));
+}
+expect error {
+    relation "fkmt_nosuch" does not exist
+}
+
+test fk-create-table-referencing-missing-column-rejected {
+    CREATE TABLE fkmc_p (id int PRIMARY KEY);
+    CREATE TABLE fkmc_c (pid int REFERENCES fkmc_p (nosuch));
+}
+expect error {
+    column "nosuch" referenced in foreign key constraint does not exist
+}
+
+test fk-create-table-referencing-non-unique-column-rejected {
+    CREATE TABLE fknu_p (id int PRIMARY KEY, v int);
+    CREATE TABLE fknu_c (pv int REFERENCES fknu_p (v));
+}
+expect error {
+    there is no unique constraint matching given keys for referenced table "fknu_p"
+}
+
+# PostgreSQL finds a unique key with the same columns in any order.
+@skip-if postgres "PostgreSQL accepts a foreign key listing the key columns in another order"
+test fk-create-table-composite-key-in-other-order-rejected {
+    CREATE TABLE fkro_p (a int, b int, PRIMARY KEY (a, b));
+    CREATE TABLE fkro_c (x int, y int, FOREIGN KEY (x, y) REFERENCES fkro_p (b, a));
+}
+expect error {
+    there is no unique constraint matching given keys for referenced table "fkro_p"
+}

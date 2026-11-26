@@ -4813,7 +4813,7 @@ impl Schema {
     /// Resolve a single FK declared on `child` referencing `parent_tbl`.
     /// When `require_unique` is set, a non-rowid parent key must be backed by
     /// a non-partial UNIQUE index on exactly those columns.
-    fn resolve_fk(
+    pub fn resolve_fk(
         &self,
         child_namespace: NamespaceId,
         fk: &Arc<ForeignKey>,

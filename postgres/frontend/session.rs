@@ -27,9 +27,10 @@ use turso_core::{DependentObject, NamespaceId};
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_FOREIGN_KEY,
+    SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_COLUMN,
+    SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_TABLE,
 };
 use turso_pg_parser::translator::{
     check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
@@ -414,7 +415,11 @@ fn prepare_statement_inner(
     let role = tx_role(translated.cmd.stmt());
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
-    if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
+    // CREATE TABLE runs in the deferred path, which checks the foreign keys
+    // of the new table once it exists and rolls the statement back if they
+    // fail.
+    let creates_table = matches!(translated.cmd.stmt(), ast::Stmt::CreateTable { .. });
+    if translated.prereqs.is_empty() && translated.postreqs.is_empty() && !creates_table {
         let stmt = pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
@@ -1021,11 +1026,11 @@ impl DeferredExecution {
                 Execute
             }
             Execute => {
-                let done = self
-                    .work
-                    .as_mut()
-                    .unwrap()
-                    .finish_statement(&mut self.active, inner)?;
+                let done = self.work.as_mut().unwrap().finish_statement(
+                    &self.pg_conn.conn,
+                    &mut self.active,
+                    inner,
+                )?;
                 if !done {
                     return Ok(());
                 }
@@ -1362,11 +1367,21 @@ impl DeferredWork {
 
     fn finish_statement(
         &mut self,
+        conn: &Arc<Connection>,
         active: &mut Option<crate::Statement>,
         inner: &mut Statement,
     ) -> Result<bool> {
         match self {
             Self::Prerequisites(state) => {
+                if let DeferredCommand::Translated(
+                    ast::Cmd::Stmt(ast::Stmt::CreateTable { tbl_name, .. }),
+                    _,
+                ) = &state.commands.current().command
+                {
+                    if !state.target_exists {
+                        check_foreign_keys_of_new_table(conn, tbl_name)?;
+                    }
+                }
                 let done = state.commands.advance();
                 let finished = active.take().unwrap();
                 if done {
@@ -1501,6 +1516,57 @@ impl CopyState {
         self.index = next;
         Ok(false)
     }
+}
+
+/// Rejects a foreign key of new table `tbl_name` whose parent key core
+/// cannot find, as PostgreSQL does when it creates the table. Core would
+/// instead fail every later write to the table with "foreign key mismatch".
+fn check_foreign_keys_of_new_table(
+    conn: &Arc<Connection>,
+    tbl_name: &ast::QualifiedName,
+) -> Result<()> {
+    let schema = conn.current_schema();
+    // A table created in a database attached through the SQLite connection
+    // is not checked, as `reject_removal_of_referenced_table` does not check it.
+    let Some((namespace, child)) = find_main_db_table(conn, tbl_name) else {
+        return Ok(());
+    };
+    for fk in &child.foreign_keys {
+        let Some(parent) = schema.get_btree_table(fk.parent_namespace, &fk.parent_table) else {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_TABLE,
+                format!("relation \"{}\" does not exist", fk.parent_table),
+                None,
+            ));
+        };
+        if let Some(column) = fk
+            .parent_columns
+            .iter()
+            .find(|column| parent.get_column(column).is_none())
+        {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_COLUMN,
+                format!("column \"{column}\" referenced in foreign key constraint does not exist"),
+                None,
+            ));
+        }
+        // Core needs a unique key with the columns in the foreign key's
+        // order, where PostgreSQL takes them in any order.
+        if schema
+            .resolve_fk(namespace, fk, &child, &parent, true)
+            .is_err()
+        {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_FOREIGN_KEY,
+                format!(
+                    "there is no unique constraint matching given keys for referenced table \"{}\"",
+                    fk.parent_table
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn prepare_create_table_target_check(
