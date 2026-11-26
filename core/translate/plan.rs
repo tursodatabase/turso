@@ -3407,7 +3407,28 @@ pub(super) fn query_output_columns(
         .map(|(column_index, result_column)| {
             let name = explicit_columns
                 .and_then(|names| names.get(column_index).cloned())
-                .or_else(|| result_column.name(table_references).map(String::from));
+                .or_else(|| match &result_column.expr {
+                    // A FULL JOIN USING column has no column name of its own,
+                    // so its result header is the SQL text. SQLite names a
+                    // subquery column from `x.a` after the identifier `a`, so
+                    // a qualified text (one that is not the column name) is
+                    // replaced by the column name. An unqualified `A` keeps
+                    // its text.
+                    ast::Expr::MergedColumn(sources) if result_column.alias.is_none() => {
+                        let ast::Expr::Column { table, column, .. } = sources[0].as_ref() else {
+                            unreachable!("merge_columns builds a merged column from columns");
+                        };
+                        let (_, table) = table_references.find_table_by_internal_id(*table)?;
+                        let column_name = table.get_column_at(*column)?.name.as_deref()?;
+                        match result_column.implicit_column_name.as_deref() {
+                            Some(text) if text.eq_ignore_ascii_case(column_name) => {
+                                Some(text.to_string())
+                            }
+                            _ => Some(column_name.to_string()),
+                        }
+                    }
+                    _ => result_column.name(table_references).map(String::from),
+                });
             let affinity = compound_arms
                 .as_ref()
                 .map(|arms| compound_column_affinity(arms, column_index))
