@@ -6872,14 +6872,6 @@ pub fn op_seek(
         Insn::SeekLT { .. } => SeekOp::LT,
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
-    if op.eq_only() {
-        let cursor = state.get_cursor(*cursor_id);
-        let cursor = cursor.as_btree_mut() as &mut dyn Any;
-        if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-            // The loop of this seek ends at the first key past the seek key.
-            mvcc_cursor.keep_eq_bound_for_next_seek();
-        }
-    }
     match seek_internal(
         program,
         state,
@@ -6891,6 +6883,14 @@ pub fn op_seek(
         op,
     ) {
         Ok(SeekInternalResult::Found) => {
+            if op.eq_only() {
+                let cursor = state.get_cursor(*cursor_id);
+                let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                    // The loop of this seek ends at the first key past the seek key.
+                    mvcc_cursor.keep_eq_bound();
+                }
+            }
             state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)

@@ -210,6 +210,44 @@ impl<A: ConcurrentAllocator> Default for DualCursorPeek<A> {
     }
 }
 
+/// Where the heads are relative to the current row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heads {
+    /// The heads are not the entries next to the current row: after a reposition, an insert
+    /// at another key or an existence probe. A step seeks past the current row first.
+    Detached,
+    /// The heads are the entries next to the current row in this direction.
+    Next(IterationDirection),
+    /// As `Next`. Also, the walk that moved the cursor to the current row started at an edge
+    /// (`rewind` or `last`), and the cursor did not move since. So every entry between that
+    /// edge and the current row is hidden.
+    NextFromEdge(IterationDirection),
+}
+
+impl Heads {
+    /// The direction in which the heads are the entries next to the current row.
+    fn dir(self) -> Option<IterationDirection> {
+        match self {
+            Heads::Detached => None,
+            Heads::Next(dir) | Heads::NextFromEdge(dir) => Some(dir),
+        }
+    }
+}
+
+/// The bound of an equality seek.
+#[derive(Debug, Clone)]
+struct EqBound {
+    /// The seek key. The walk returns no row past it, and leaves a source past it
+    /// unpositioned (`CursorPeek::SeekPast`).
+    key: RowKey,
+    /// Whether at most one row has the key. The B-tree, which holds a committed state, then
+    /// has at most one entry with the key.
+    one_row: bool,
+    /// Whether the bound also limits the steps after the seek. See
+    /// [`MvccLazyCursor::keep_eq_bound`].
+    kept: bool,
+}
+
 #[derive(Debug, Clone)]
 enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
     /// The source is not positioned. The walk starts it at the edge it walks from.
@@ -530,29 +568,15 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     count_state: Option<CountState>,
     /// The heads of the merge walk. See [`Self::walk`].
     dual_peek: DualCursorPeek<A>,
-    /// The direction in which the heads are the entries next to `current_pos`, or `None`
-    /// when they are not. A step in another direction seeks past the current row first.
-    heads_dir: Option<IterationDirection>,
-    /// The key of an equality seek. The walk returns no row past it, and leaves a source
-    /// past it unpositioned (`CursorPeek::SeekPast`). It lasts until the seek ends, or until
-    /// the next reposition when `eq_bound_kept` is set.
-    eq_bound: Option<RowKey>,
-    /// Whether at most one row has the key `eq_bound`. The B-tree, which holds a committed
-    /// state, then has at most one entry with the key.
-    eq_bound_one_row: bool,
-    /// Whether `eq_bound` also bounds the steps after the seek. See
-    /// [`Self::keep_eq_bound_for_next_seek`].
-    eq_bound_kept: bool,
-    /// Set by [`Self::keep_eq_bound_for_next_seek`] and taken by the next seek.
-    keep_eq_bound_requested: bool,
+    /// Where the heads are relative to `current_pos`.
+    heads: Heads,
+    /// The bound of the last equality seek. The seek ends with its bound in place, and the
+    /// next step or seek drops it, unless [`Self::keep_eq_bound`] kept it.
+    eq_bound: Option<EqBound>,
     /// The last key of the bounded range of the MvStore iterator, if the range is bounded.
-    /// The MvStore head is `SeekPast` this key when the range ends.
+    /// The MvStore head is `SeekPast` this key when the range ends. The range can last
+    /// longer than `eq_bound`.
     mvcc_range_end: Option<RowKey>,
-    /// The direction of the walk that moved the cursor from an edge (`rewind` or `last`) to
-    /// the current row, if the cursor did not move since.
-    edge_walk: Option<IterationDirection>,
-    /// Whether the walk copies the visible version of a table row into `eq_seek_row`.
-    take_eq_payload: bool,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
     /// [`MvStore::table_rows_epoch`] or [`MvStore::index_rows_epoch`], by cursor
@@ -628,14 +652,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             state: None,
             count_state: None,
             dual_peek: DualCursorPeek::default(),
-            heads_dir: None,
+            heads: Heads::Detached,
             eq_bound: None,
-            eq_bound_kept: false,
-            eq_bound_one_row: false,
-            keep_eq_bound_requested: false,
             mvcc_range_end: None,
-            take_eq_payload: false,
-            edge_walk: None,
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
             work: new_cursor_work_handle(),
@@ -807,14 +826,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         Ok(())
     }
 
-    /// Asks the next seek, if it is an equality seek, to keep its key as the bound of the
-    /// steps after it, until the next reposition. The VDBE asks this for `SeekGE` and
-    /// `SeekLE` with `eq_only`: the loop that follows ends at the first key past the seek key
-    /// (as with `OPFLAG_SEEKEQ` in SQLite). So the cursor does not position a source past the
-    /// key. Other equality seeks, such as the seek of IdxDelete, do not keep the bound,
-    /// because a later step can continue past the key.
-    pub fn keep_eq_bound_for_next_seek(&mut self) {
-        self.keep_eq_bound_requested = true;
+    /// Keeps the bound of the equality seek that just ended for the steps after it, until
+    /// the next reposition. The VDBE calls this after `SeekGE` and `SeekLE` with `eq_only`:
+    /// the loop that follows ends at the first key past the seek key (as with
+    /// `OPFLAG_SEEKEQ` in SQLite). So the cursor does not position a source past the key.
+    /// Other equality seeks, such as the seek of IdxDelete, do not keep the bound, because a
+    /// later step can continue past the key.
+    pub fn keep_eq_bound(&mut self) {
+        if let Some(bound) = &mut self.eq_bound {
+            bound.kept = true;
+        }
     }
 
     /// Allocate the next rowid from the (already initialized) allocator.
@@ -895,6 +916,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             }
             Some(state) => panic!("invalid state for a step: {state:?}"),
             None => {
+                self.drop_eq_bound_unless_kept();
                 match &self.current_pos {
                     CursorPosition::End if dir == IterationDirection::Forwards => {
                         return Ok(IOResult::Done(()));
@@ -903,14 +925,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         return Ok(IOResult::Done(()));
                     }
                     CursorPosition::Loaded { .. }
-                        if self.edge_walk.is_some_and(|edge_dir| edge_dir != dir)
+                        if matches!(self.heads, Heads::NextFromEdge(walk_dir) if walk_dir != dir)
                             && self.mvcc_rows_epoch() == self.mvcc_peek_epoch =>
                     {
                         // The walk to this row started at the edge in `dir` and found every
                         // entry before this row hidden. Nothing changed since, so no row is
                         // past this row in `dir`. NewRowid relies on this: it reads the last
                         // row and then steps past it.
-                        self.edge_walk = None;
+                        if let Heads::NextFromEdge(walk_dir) = self.heads {
+                            self.heads = Heads::Next(walk_dir);
+                        }
                         self.current_pos = match dir {
                             IterationDirection::Forwards => CursorPosition::End,
                             IterationDirection::Backwards => CursorPosition::BeforeFirst,
@@ -918,10 +942,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         return Ok(IOResult::Done(()));
                     }
                     CursorPosition::Loaded { row_id, .. } => {
-                        self.edge_walk = None;
-                        if self.heads_dir != Some(dir) {
+                        if self.heads.dir() != Some(dir) {
                             return self.seek_past_current_row(dir);
                         }
+                        self.heads = Heads::Next(dir);
                         let current = row_id.row_id.clone();
                         self.dual_peek.mvcc_peek.consume(&current);
                         self.dual_peek.btree_peek.consume(&current);
@@ -945,13 +969,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         Ok(IOResult::Done(()))
     }
 
-    /// Ends the equality seek in progress. Its bound stays only if the seek was asked to keep
-    /// it.
-    fn end_eq_bound(&mut self) {
-        if !self.eq_bound_kept {
+    /// Drops the bound of the last equality seek, unless [`Self::keep_eq_bound`] kept it.
+    fn drop_eq_bound_unless_kept(&mut self) {
+        if self.eq_bound.as_ref().is_some_and(|bound| !bound.kept) {
             self.eq_bound = None;
         }
-        self.take_eq_payload = false;
     }
 
     /// Lands on the MvStore head if it matches the equality seek in progress and is visible.
@@ -1020,7 +1042,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         );
         return_if_io!(self.walk(dir));
         self.state = None;
-        self.edge_walk = Some(dir);
+        self.heads = Heads::NextFromEdge(dir);
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -1063,7 +1085,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         IterationDirection::Forwards => CursorPosition::End,
                         IterationDirection::Backwards => CursorPosition::BeforeFirst,
                     };
-                    self.heads_dir = Some(dir);
+                    self.heads = Heads::Next(dir);
                     return Ok(IOResult::Done(()));
                 }
                 (Some(_), None) => Ordering::Less,
@@ -1109,7 +1131,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     }
                     // The B-tree has no other entry with a key that names one row.
                     self.dual_peek.btree_peek = match &self.eq_bound {
-                        Some(bound) if self.eq_bound_one_row => CursorPeek::SeekPast(bound.clone()),
+                        Some(bound) if bound.one_row => CursorPeek::SeekPast(bound.key.clone()),
                         _ => CursorPeek::Stale,
                     };
                     if order.is_eq() {
@@ -1127,7 +1149,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         match &self.eq_bound {
             // For an index, the bound can be a prefix of the key. The comparison of
             // SortableIndexKey compares only the columns that both keys have.
-            Some(bound) if !key.cmp(bound).is_eq() => None,
+            Some(bound) if !key.cmp(&bound.key).is_eq() => None,
             _ => Some(key),
         }
     }
@@ -1147,7 +1169,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             row_id: key.clone(),
         };
         self.db
-            .cursor_view_of_chain(self.snapshot, &row_id, versions, self.take_eq_payload)
+            .cursor_view_of_chain(self.snapshot, &row_id, versions, self.take_eq_payload())
+    }
+
+    /// Whether the walk copies the visible version of a table row into `eq_seek_row`: only
+    /// under the bound of a rowid seek. Passive GC can empty the chain before Column reads it.
+    fn take_eq_payload(&self) -> bool {
+        matches!(
+            self.eq_bound,
+            Some(EqBound {
+                key: RowKey::Int(_),
+                ..
+            })
+        )
     }
 
     /// Whether the B-tree row `key` is visible: no MvStore version hides it.
@@ -1176,7 +1210,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             in_btree,
             versions,
         };
-        self.heads_dir = Some(dir);
+        self.heads = Heads::Next(dir);
     }
 
     /// Positions the MvStore iterator at the first entry from `start` in `dir`, and sets the
@@ -1430,12 +1464,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.dual_peek = DualCursorPeek::default();
         self.table_iterator = None;
         self.index_iterator = None;
-        self.heads_dir = None;
+        self.heads = Heads::Detached;
         self.eq_bound = None;
-        self.eq_bound_kept = false;
-        self.eq_bound_one_row = false;
-        self.edge_walk = None;
-        self.take_eq_payload = false;
         self.mvcc_peek_epoch = self.mvcc_rows_epoch();
         self.eq_seek_row = None;
         // The forward scan is monotonic; a reposition invalidates it.
@@ -1515,8 +1545,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
-        // Each call takes the request, so it cannot reach a later seek.
-        let keep_eq_bound = std::mem::take(&mut self.keep_eq_bound_requested);
+        if self.state.is_none() {
+            self.drop_eq_bound_unless_kept();
+        }
         // gt -> lower_bound bound excluded, we want first row after row_id
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
@@ -1629,11 +1660,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     if op.eq_only() {
                         // An equality seek returns only rows with this key, so the walk
                         // stops at the first entry past it in each source.
-                        self.eq_bound = Some(key.clone());
-                        self.eq_bound_kept = keep_eq_bound;
-                        self.eq_bound_one_row =
-                            seek_key_names_one_row(&seek_key, &self.mv_cursor_type)?;
-                        self.take_eq_payload = matches!(key, RowKey::Int(_));
+                        self.eq_bound = Some(EqBound {
+                            key: key.clone(),
+                            one_row: seek_key_names_one_row(&seek_key, &self.mv_cursor_type)?,
+                            kept: false,
+                        });
                         end = Some(key.clone());
                     }
                     let start = match op {
@@ -1646,11 +1677,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction)) => {
                     if op.eq_only()
-                        && self.eq_bound_one_row
+                        && self.eq_bound.as_ref().is_some_and(|bound| bound.one_row)
                         && self.land_on_visible_mvcc_head(direction)?
                     {
                         self.state = None;
-                        self.end_eq_bound();
                         // A later step positions the B-tree past this row.
                         let key = self.dual_peek.mvcc_peek.raw_key().cloned();
                         self.dual_peek.btree_peek =
@@ -1669,7 +1699,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             }
                             // No B-tree entry has the key, so the B-tree is past it.
                             SeekResult::NotFound if op.eq_only() => {
-                                let key = self.eq_bound.clone();
+                                let key = self.eq_bound.as_ref().map(|bound| bound.key.clone());
                                 self.dual_peek.btree_peek = CursorPeek::SeekPast(
                                     key.expect("an equality seek sets its bound"),
                                 );
@@ -1687,7 +1717,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 Some(MvccLazyCursorState::Seek(SeekState::Walk, direction)) => {
                     return_if_io!(self.walk(direction));
                     self.state = None;
-                    self.end_eq_bound();
                     return Ok(IOResult::Done(match self.current_pos {
                         CursorPosition::Loaded { .. } => SeekResult::Found,
                         _ => SeekResult::NotFound,
@@ -1756,12 +1785,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             _ => false,
         };
 
-        self.edge_walk = None;
-        // An insert at another key moves the cursor away from the heads.
-        if !matches!(&self.current_pos, CursorPosition::Loaded { row_id, .. } if *row_id == row.id)
-        {
-            self.heads_dir = None;
-        }
+        // An insert at another key moves the cursor away from the heads. An insert at the
+        // current key ends the walk from an edge.
+        let on_same_row =
+            matches!(&self.current_pos, CursorPosition::Loaded { row_id, .. } if *row_id == row.id);
+        self.heads = match self.heads {
+            _ if !on_same_row => Heads::Detached,
+            Heads::NextFromEdge(dir) => Heads::Next(dir),
+            heads => heads,
+        };
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
             in_btree: was_btree_resident,
@@ -2090,7 +2122,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn seek_to_last(&mut self) -> IOResultOr<()> {
         return_if_io!(self.seek(SeekKey::TableRowId(i64::MAX), SeekOp::LE { eq_only: false }));
         // The walk of this seek started at the end of the table, as the walk of last() does.
-        self.edge_walk = Some(IterationDirection::Backwards);
+        self.heads = Heads::NextFromEdge(IterationDirection::Backwards);
         Ok(IOResult::Done(()))
     }
 
