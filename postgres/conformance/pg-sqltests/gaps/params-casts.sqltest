@@ -505,16 +505,11 @@ expect {
     -0|Infinity|-Infinity|1e-300
 }
 
-# A float4 expression is typed float8, so its text is in the form of float8.
-@compat-gap "type:float4"
 test float4-cast-to-text-is-in-the-form-of-float4-output {
     SELECT 1e6::float4::text, 1234567::float4::text, 3::float4::text;
 }
 expect {
     1e+06|1.234567e+06|3
-}
-expect @tursopg {
-    1000000|1234567|3
 }
 
 test float4-cast-of-a-value-too-small {
@@ -523,37 +518,32 @@ test float4-cast-of-a-value-too-small {
 @sqlstate 22003
 expect error {}
 
-# The engine's float cannot hold NaN, so a conversion that gives NaN fails.
-# PostgreSQL has NaN.
-@compat-gap "type:float8"
 test cast-nan-to-float8 {
     SELECT 'NaN'::float8;
 }
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float4"
 test cast-nan-to-float4 {
     SELECT 'nan'::real;
 }
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float8"
 test cast-nan-text-to-float8 {
     SELECT 'NaN'::text::float8;
 }
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
+
+test cast-nan-to-an-integer-is-out-of-range {
+    SELECT 'NaN'::float8::int4;
+}
+@sqlstate 22003
+expect error {}
 
 test cast-infinity-to-float8-and-float4 {
     SELECT 'Infinity'::float8::text, '-Infinity'::float8::text, 'inf'::float4::text, '-Infinity'::real::text;
@@ -598,43 +588,26 @@ expect @tursopg {
     1|3|1|2
 }
 
-# A value too small for the type reads as 0.
-@compat-gap "type:float8"
 test float8-input-of-a-value-too-small {
     SELECT '1e-400'::float8;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    0
-}
 
-@compat-gap "type:float8"
 test float8-input-of-a-negative-value-too-small {
     SELECT '-1e-400'::float8::text;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    -0
-}
 
-@compat-gap "type:float8"
 test float8-input-below-the-smallest-float8 {
     SELECT '1e-324'::float8;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    0
-}
 
-@compat-gap "type:float4"
 test float4-input-of-a-value-too-small {
     SELECT '1e-400'::float4;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    0
-}

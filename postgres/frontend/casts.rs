@@ -9,14 +9,14 @@
 //! `CastType`. cast_planning.rs finds the `CastType` of an expression.
 
 use crate::error::sqlstate_error;
-use crate::functions::{built_in_input_error, float8_text};
-use crate::pg_type::{check_oid_range, type_input};
+use crate::functions::{float4_text, float8_text};
+use crate::pg_type::{check_oid_range, convert_float, type_input};
 use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
 use turso_core::{LimboError, Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,14 +314,6 @@ fn out_of_range(target: CastType) -> LimboError {
     sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, message, None)
 }
 
-fn sqlstate_of(code: &str) -> &'static str {
-    if code == SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE {
-        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
-    } else {
-        SQLSTATE_INVALID_TEXT_REPRESENTATION
-    }
-}
-
 fn input_error(text: &str, type_name: &str) -> LimboError {
     sqlstate_error(
         SQLSTATE_INVALID_TEXT_REPRESENTATION,
@@ -331,49 +323,15 @@ fn input_error(text: &str, type_name: &str) -> LimboError {
 }
 
 fn to_float(value: &Value, source: CastType, target: CastType) -> Result<Value> {
+    let single = target == Float4;
     let number = match value {
-        Value::Numeric(Numeric::Integer(n)) => *n as f64,
-        Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-        Value::Text(text) if source == CastType::Numeric => parse_numeric(text.as_str())?,
-        Value::Text(text) => parse_float(text.as_str(), target)?,
+        Value::Numeric(number) => *number,
+        Value::Text(text) if source == CastType::Numeric => {
+            Numeric::Float(turso_core::Double::new(parse_numeric(text.as_str())?))
+        }
         _ => return Ok(value.clone()),
     };
-    // FIXME(pg-catalog): The legacy float casts still reject NaN input. Registered float4 and float8 conversion functions replace this path.
-    if number.is_nan() {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "the value NaN is not supported",
-            None,
-        ));
-    }
-    if target == Float4 {
-        let narrowed = number as f32;
-        if narrowed.is_infinite() && number.is_finite() {
-            return Err(sqlstate_error(
-                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-                "value out of range: overflow",
-                None,
-            ));
-        }
-        if narrowed == 0.0 && number != 0.0 {
-            return Err(sqlstate_error(
-                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-                "value out of range: underflow",
-                None,
-            ));
-        }
-        return Ok(Value::from_f64(shortest_float8(narrowed)));
-    }
-    Ok(Value::from_f64(number))
-}
-
-/// The float8 that prints with the digits of the float4, so 0.1 as a float4
-/// stays 0.1 and is not 0.10000000149011612.
-fn shortest_float8(narrowed: f32) -> f64 {
-    narrowed
-        .to_string()
-        .parse()
-        .unwrap_or_else(|_| f64::from(narrowed))
+    Ok(Value::from_f64(convert_float(number, single)?))
 }
 
 /// A numeric with a type modifier is stored as its text.
@@ -383,21 +341,6 @@ fn parse_numeric(text: &str) -> Result<f64> {
         .map_err(|_| input_error(text, "numeric"))
 }
 
-// FIXME(pg-catalog): A value too small for the type, such as `1e-400`, reads as 0 here, where PostgreSQL fails with 22003. The check belongs in the input function of float8 and float4 once they are registered types.
-fn parse_float(text: &str, target: CastType) -> Result<f64> {
-    let type_name = if target == Float4 {
-        "real"
-    } else {
-        "double precision"
-    };
-    if let Some((message, code)) = built_in_input_error(target.name(), text) {
-        return Err(sqlstate_error(sqlstate_of(&code), message, None));
-    }
-    text.trim()
-        .parse()
-        .map_err(|_| input_error(text, type_name))
-}
-
 fn to_text(value: &Value, source: CastType) -> Result<Value> {
     let text = match (value, source) {
         (Value::Numeric(Numeric::Integer(n)), CastType::Bool) => {
@@ -405,10 +348,8 @@ fn to_text(value: &Value, source: CastType) -> Result<Value> {
         }
         (Value::Numeric(Numeric::Integer(n)), _) => n.to_string(),
         // FIXME(pg-catalog): A numeric without a type modifier is REAL, which is read as float8, so `1.0::numeric::text` is `1` where PostgreSQL gives `1.0`. A registered numeric type that needs no modifier gives the value its own output function.
-        // FIXME(pg-catalog): Core types a float4 expression REAL, which is read as float8, so no float4 value gets here and `1e6::float4::text` is `1000000` where PostgreSQL gives `1e+06`. A registered float4 type gives the value its own output function.
-        (Value::Numeric(Numeric::Float(f)), CastType::Float4 | CastType::Float8) => {
-            float8_text(f64::from(*f))
-        }
+        (Value::Numeric(Numeric::Float(f)), CastType::Float4) => float4_text(f64::from(*f) as f32),
+        (Value::Numeric(Numeric::Float(f)), CastType::Float8) => float8_text(f64::from(*f)),
         (Value::Text(_), CastType::TimestampTz) => match value_text(value, TextType::TimestampTz) {
             Some(text) => text.into_owned(),
             None => return Ok(value.clone()),

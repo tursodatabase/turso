@@ -4935,7 +4935,7 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
-        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts float4 to the wider REAL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
+        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS int4), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" => Some("float8"),

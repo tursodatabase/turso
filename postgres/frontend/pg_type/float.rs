@@ -391,6 +391,19 @@ fn parse_hex_float(text: &str, precision: Precision) -> std::result::Result<f64,
     })
 }
 
+/// Converts a number to the target float width before representing it as
+/// f64. Going through f64 first would round some integers twice for float4.
+pub(crate) fn convert_float(number: Numeric, single: bool) -> Result<f64> {
+    round_numeric(
+        number,
+        if single {
+            Precision::Single
+        } else {
+            Precision::Double
+        },
+    )
+}
+
 fn round_numeric(number: Numeric, precision: Precision) -> Result<f64> {
     match number {
         Numeric::Integer(integer) => Ok(match precision {

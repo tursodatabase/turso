@@ -9,6 +9,7 @@ mod integer;
 mod integer_operators;
 mod oid;
 
+pub(crate) use float::convert_float;
 pub(crate) use float::{
     float4_arithmetic, float4_negate, float8_arithmetic, float8_negate, FloatOp,
 };
