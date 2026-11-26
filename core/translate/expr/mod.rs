@@ -47,6 +47,7 @@ mod columns;
 mod condition;
 mod custom_type_operators;
 mod custom_types;
+mod dialect_functions;
 mod emission;
 pub(crate) mod expr_type;
 pub(crate) mod functions;

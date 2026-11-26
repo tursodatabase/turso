@@ -22,6 +22,7 @@ use turso_core::ConnectOpts;
 use turso_core::Connection;
 use turso_core::Database;
 use turso_core::DatabaseOpts;
+use turso_core::ExternalFunc;
 use turso_core::Func;
 use turso_core::IOResult;
 use turso_core::LimboError;
@@ -2246,4 +2247,234 @@ fn the_catalog_gets_a_new_schema_and_a_dropped_schema() {
         *commands.lock().unwrap(),
         ["create schema app", "drop schema app"]
     );
+}
+
+/// A dialect that is SQLite's but runs `describe` with a function chosen by
+/// the type of its argument.
+struct ChoosesFunctionsDialect;
+
+impl Dialect for ChoosesFunctionsDialect {
+    fn name(&self) -> &'static str {
+        "chooses-functions"
+    }
+
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
+        turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+        turso_core::schema::BTreeTable::from_stored_sql(self, sql, root_page, false)
+    }
+
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+        turso_core::dialect::parse_table_sql_ast(self, sql)
+    }
+
+    fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        turso_core::dialect::table_sql_for_replay(self, sql)
+    }
+
+    fn format_table_sql(
+        &self,
+        _input: &str,
+        tbl_name: &QualifiedName,
+        body: &CreateTableBody,
+    ) -> Result<String> {
+        turso_core::dialect::format_table_sql(tbl_name, body)
+    }
+
+    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
+    }
+
+    fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
+        let function = |name: &str, body: DescribeBody| {
+            ExternalFunc::new_native_scalar(
+                name.to_string(),
+                turso_core::native_ext::FunctionArity::Exact(1),
+                true,
+                body,
+            )
+            .unwrap()
+        };
+        options
+            .extension_function(function("describe_integer", DescribeBody::Integer))
+            .extension_function(function("describe_text", DescribeBody::Text))
+    }
+
+    fn choose_function(
+        &self,
+        name: &str,
+        arguments: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<FunctionChoice> {
+        let type_named = |name: &str| turso_core::ast::Type {
+            name: name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        };
+        let chosen = |implementation: &str, argument: &str, result: Option<&str>| {
+            Ok(FunctionChoice::Chosen(ChosenFunction {
+                implementation: implementation.to_string(),
+                argument_types: vec![type_named(argument)],
+                result_type: result.map(type_named),
+            }))
+        };
+        match name {
+            "describe" => match arguments().as_slice() {
+                [OperandType::Engine {
+                    ty: EngineType::Text,
+                    ..
+                }] => chosen("describe_text", "TEXT", Some("TEXT")),
+                [OperandType::Engine {
+                    ty: EngineType::Integer,
+                    ..
+                }]
+                | [OperandType::StringLiteral(_)] => {
+                    chosen("describe_integer", "INTEGER", Some("INTEGER"))
+                }
+                _ => Ok(FunctionChoice::LeftToTheEngine),
+            },
+            "ghost" => chosen("ghost_implementation", "INTEGER", None),
+            "forbidden" => Err(LimboError::ParseError("forbidden call".to_string())),
+            _ => Ok(FunctionChoice::LeftToTheEngine),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DescribeBody {
+    Integer,
+    Text,
+}
+
+impl turso_core::native_ext::ScalarFunction for DescribeBody {
+    type Call = DescribeCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(DescribeCall(match self {
+            Self::Integer => DescribeBody::Integer,
+            Self::Text => DescribeBody::Text,
+        }))
+    }
+}
+
+struct DescribeCall(DescribeBody);
+
+impl turso_core::native_ext::ScalarCall for DescribeCall {
+    type Output = Value;
+
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
+        let value = args[0].get_value();
+        Ok(IOResult::Done(match (&self.0, value) {
+            (DescribeBody::Integer, Value::Numeric(Numeric::Integer(v))) => {
+                Value::build_text(format!("integer:{}", v + 1))
+            }
+            (DescribeBody::Text, Value::Text(text)) => {
+                Value::build_text(format!("text:{}", text.as_str()))
+            }
+            (DescribeBody::Integer, other) | (DescribeBody::Text, other) => {
+                return Err(Box::new(LimboError::ParseError(format!(
+                    "unexpected argument {other}"
+                ))))
+            }
+        }))
+    }
+}
+
+fn chooses_functions_connection() -> Arc<Connection> {
+    let options = OpenOptions::new(Arc::new(ChoosesFunctionsDialect));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (s TEXT, i INTEGER) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('hi', 7)").unwrap();
+    conn
+}
+
+#[test]
+fn dialect_chooses_the_function_by_the_types_of_the_arguments() {
+    let conn = chooses_functions_connection();
+    let rows = conn
+        .prepare("SELECT describe(s), describe(i), describe('41') FROM t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::build_text("text:hi"),
+            Value::build_text("integer:8"),
+            Value::build_text("integer:42"),
+        ]]
+    );
+    conn.close().unwrap();
+}
+
+#[test]
+fn dialect_names_a_missing_function_it_chose() {
+    let conn = chooses_functions_connection();
+    let error = conn
+        .prepare("SELECT ghost(i) FROM t")
+        .expect_err("the call should fail")
+        .to_string();
+    assert!(
+        error.contains("no such function: ghost_implementation"),
+        "{error}"
+    );
+    conn.close().unwrap();
+}
+
+#[test]
+fn dialect_refuses_a_function_call() {
+    let conn = chooses_functions_connection();
+    let error = conn
+        .prepare("SELECT forbidden(i) FROM t")
+        .expect_err("the call should fail")
+        .to_string();
+    assert!(error.contains("forbidden call"), "{error}");
+    conn.close().unwrap();
+}
+
+#[test]
+fn dialect_leaves_a_function_call_to_the_engine() {
+    let conn = chooses_functions_connection();
+    let rows = conn
+        .prepare("SELECT abs(-7) FROM t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(7)]]);
+    let error = conn
+        .prepare("SELECT describe(1.5) FROM t")
+        .expect_err("the engine has no describe")
+        .to_string();
+    assert!(error.contains("no such function: describe"), "{error}");
+    conn.close().unwrap();
 }

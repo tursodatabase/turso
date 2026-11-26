@@ -8,6 +8,7 @@
 use crate::ast;
 
 use super::custom_type_operators::find_operator_call;
+use super::dialect_functions::choose_function_call;
 use super::get_expr_affinity;
 use crate::dialect::{CastSource, EngineType, OperandType, TypeIdentity, TypeRef};
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
@@ -811,7 +812,7 @@ fn written_type_params(type_name: &ast::Type) -> Vec<Box<ast::Expr>> {
 
 /// The type a function returns. Unlike a CAST target, a custom type needs no
 /// arguments: `numeric_add` returns a numeric of any precision and scale.
-fn call_result_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
+pub(super) fn call_result_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     match schema.get_type_def_unchecked(&type_name.name) {
         Some(type_def) => ExprType::Custom {
             type_def: Arc::clone(type_def),
@@ -1100,6 +1101,16 @@ fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
 }
 
 fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> ExprType {
+    match choose_function_call(name.as_str(), args, env) {
+        Ok(Some(call)) => {
+            return match &call.result_type {
+                Some(ty) => call_result_type(ty, env.schema()),
+                None => result_type(call.func.result_type(), &call.arguments, env),
+            }
+        }
+        Ok(None) => {}
+        Err(_) => return ExprType::Unknown,
+    }
     let Ok(Some(func)) = env.resolve_function(name.as_str(), args.len()) else {
         return ExprType::Builtin(BuiltinType::Any);
     };
@@ -1124,7 +1135,11 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 
 /// The type of a call to a function, from the way its result type follows
 /// from its arguments.
-fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) -> ExprType {
+pub(super) fn result_type(
+    result_type: ResultType,
+    args: &[Box<ast::Expr>],
+    env: &TypeEnv,
+) -> ExprType {
     let any = ExprType::Builtin(BuiltinType::Any);
     // A call with the wrong number of arguments is reported when it is translated.
     let first_argument = || args.first().map(|arg| type_of(arg, env));
