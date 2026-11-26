@@ -203,6 +203,11 @@ opcodes can make the same call (`Found` and an eq-only `SeekGE`). In debug build
 tells the cursor which opcode starts (`CursorTrait::note_opcode`). The calls inside the opcode
 are not checked one by one; the opcode is one step.
 
+A write by one cursor makes the other cursors of the tree `Stale`: only a seek, `Rewind` or
+`Last` is legal on them (U9). The debug aid `TURSO_MODEL_PEER_RESTORE=1` turns U9 off: the
+other cursors keep their position by key, as SQLite's saved cursors do. It lets a run go past
+U9 to show what comes after it.
+
 `NewRowid` gives `max + 1`, or 1 for an empty table (D6). The model accepts it with an append
 token: the next no-seek `Insert` must be above every key.
 

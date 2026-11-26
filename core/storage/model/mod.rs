@@ -18,6 +18,13 @@ pub fn ephemeral_default() -> bool {
     *ON.get_or_init(|| std::env::var("TURSO_MODEL_EPHEMERAL").is_ok_and(|v| v == "1"))
 }
 
+/// Debug aid: `TURSO_MODEL_PEER_RESTORE=1` turns U9 off. A cursor keeps its position by key
+/// after another cursor writes, as SQLite does.
+pub(crate) fn peer_restore() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TURSO_MODEL_PEER_RESTORE").is_ok_and(|v| v == "1"))
+}
+
 /// Counters that show how much of the model a run used. A process that opened a model tree
 /// prints them to stderr when it exits.
 mod stats {

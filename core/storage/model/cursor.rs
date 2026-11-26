@@ -6,7 +6,7 @@
 //! starts. The calls inside that opcode are answered from the tree without a spec step, and
 //! the opcode is one spec step when it ends.
 
-use super::spec::{self, Op, Outcome, Pos, Rule, Shape, Tree, Write};
+use super::spec::{self, Op, Outcome, Pos, Shape, Token, Tree, Write};
 use super::stats;
 use crate::storage::btree::{BTreeKey, CursorOpcode, CursorStep, CursorTrait};
 use crate::storage::pager::Pager;
@@ -67,8 +67,12 @@ enum Pending {
     Found,
     /// `NewRowid`: it reads the last rowid with `seek_to_last`, `rowid` and `next`.
     NewRowid,
-    Insert { use_seek: bool },
-    IdxInsert { use_seek: bool },
+    Insert {
+        use_seek: bool,
+    },
+    IdxInsert {
+        use_seek: bool,
+    },
     IdxDelete,
 }
 
@@ -91,8 +95,6 @@ pub struct ModelCursor {
     root: i64,
     /// The tree version after the last op of this cursor.
     seen: u64,
-    /// The cursor lost its position because another cursor wrote (U9).
-    peer_wrote: bool,
     shape: Shape<Key>,
     pending: Pending,
     /// Where the calls inside a pending opcode put the cursor.
@@ -124,7 +126,6 @@ impl ModelCursor {
             info: self.info.clone(),
             root: self.root,
             seen: version,
-            peer_wrote: false,
             shape: Shape::fresh(),
             pending: Pending::None,
             scratch: None,
@@ -146,7 +147,6 @@ impl ModelCursor {
             info,
             root,
             seen: 0,
-            peer_wrote: false,
             shape: Shape::fresh(),
             pending: Pending::None,
             scratch: None,
@@ -168,13 +168,8 @@ impl ModelCursor {
         let Outcome { shape, hit, write } = match result {
             Ok(outcome) => outcome,
             Err(e) => panic!(
-                "unsupported: {}: {}{} (ephemeral {}, root {}, op {op:?}, shape {:?}, recent ops: {})",
-                if self.peer_wrote { Rule::U9 } else { e.rule },
-                if self.peer_wrote {
-                    "another cursor wrote to the tree, then: "
-                } else {
-                    ""
-                },
+                "unsupported: {}: {} (ephemeral {}, root {}, op {op:?}, shape {:?}, recent ops: {})",
+                e.rule,
                 e.why,
                 if self.info.is_some() { "index" } else { "table" },
                 self.root,
@@ -189,23 +184,39 @@ impl ModelCursor {
         }
         self.shape = shape;
         self.record = None;
-        self.peer_wrote = false;
         hit
     }
 
     /// After a write by another cursor the position is lost (U9), or at the end after a clear.
+    /// With `TURSO_MODEL_PEER_RESTORE=1` the cursor keeps its position by key instead, like
+    /// SQLite's saved cursors, so that a run can go on past U9 and show the sequences after it.
     fn catch_up(&mut self) {
         let tree = self.tree.read();
-        if self.seen != tree.version {
-            self.shape = if tree.cleared_last {
-                Shape::ended()
-            } else {
-                Shape::lost()
-            };
-            self.peer_wrote = !tree.cleared_last;
-            self.seen = tree.version;
-            self.record = None;
+        if self.seen == tree.version {
+            return;
         }
+        self.seen = tree.version;
+        self.record = None;
+        if tree.cleared_last {
+            self.shape = Shape::ended();
+            return;
+        }
+        if super::peer_restore() {
+            let pos = match &self.shape.pos {
+                Pos::At(k) | Pos::Gone(k) if tree.rows.contains(k) => Pos::At(k.clone()),
+                Pos::At(k) | Pos::Gone(k) => Pos::Gone(k.clone()),
+                Pos::Invalid => Pos::Invalid,
+                Pos::Lost => Pos::Lost,
+                _ => Pos::Stale,
+            };
+            self.shape = Shape {
+                pos,
+                token: Token::None,
+                ..self.shape.clone()
+            };
+            return;
+        }
+        self.shape = Shape::stale();
     }
 
     /// The opcode noted before ended without the call that finishes it: an `IdxInsert` that
@@ -321,7 +332,12 @@ impl SharedTree {
 
 /// The compare of the B-tree: a stored record against a key, with the tie-breaker for a key
 /// that is a prefix.
-fn cmp(info: &IndexInfo, stored: &ImmutableRecord, key: &ImmutableRecord, tb: Ordering) -> Ordering {
+fn cmp(
+    info: &IndexInfo,
+    stored: &ImmutableRecord,
+    key: &ImmutableRecord,
+    tb: Ordering,
+) -> Ordering {
     let values = key.get_values().expect("model: a key record is readable");
     compare_record(stored.get_payload(), values.iter(), info, tb)
         .expect("model: a stored record is readable")
@@ -374,7 +390,10 @@ impl Tree for Rows {
 
     fn before(&self, k: &Key) -> Option<Key> {
         match self {
-            Rows::Table(map) => map.range(..rowid_of(k)).next_back().map(|(x, _)| Key::Rowid(*x)),
+            Rows::Table(map) => map
+                .range(..rowid_of(k))
+                .next_back()
+                .map(|(x, _)| Key::Rowid(*x)),
             Rows::Index(info, rows) => {
                 let k = record_of(k);
                 let i = rows.partition_point(|s| cmp(info, s, k, Ordering::Equal).is_lt());
@@ -406,9 +425,7 @@ impl Tree for Rows {
                 let tb = crate::types::get_tie_breaker_from_seek_op(op);
                 let c = |s: &ImmutableRecord| cmp(info, s, key, tb);
                 let i = match op {
-                    SeekOp::GE { .. } | SeekOp::GT => {
-                        Some(rows.partition_point(|s| c(s).is_lt()))
-                    }
+                    SeekOp::GE { .. } | SeekOp::GT => Some(rows.partition_point(|s| c(s).is_lt())),
                     SeekOp::LE { .. } | SeekOp::LT => {
                         rows.partition_point(|s| !c(s).is_gt()).checked_sub(1)
                     }
@@ -427,7 +444,8 @@ impl Tree for Rows {
             Rows::Table(map) => map.contains_key(&rowid_of(k)),
             Rows::Index(info, rows) => {
                 let k = record_of(k);
-                rows.iter().any(|s| cmp(info, s, k, Ordering::Equal).is_eq())
+                rows.iter()
+                    .any(|s| cmp(info, s, k, Ordering::Equal).is_eq())
             }
         }
     }
@@ -649,7 +667,10 @@ impl CursorTrait for ModelCursor {
     }
 
     fn set_has_record(&mut self, _has_record: bool) {
-        panic!("unsupported: set_has_record on a model tree (root {})", self.root)
+        panic!(
+            "unsupported: set_has_record on a model tree (root {})",
+            self.root
+        )
     }
 
     fn index_info(&self) -> Option<&Arc<IndexInfo>> {

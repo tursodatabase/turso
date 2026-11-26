@@ -70,8 +70,11 @@ pub enum Pos<K> {
     Seeked,
     /// This cursor deleted `K`. `Next` and `Prev` go on from the gap; a read is Undefined.
     Gone(K),
-    /// No position: after `Count`, `SeekEnd`, `NewRowid`, `IdxDelete`, or a peer write.
+    /// No position: after `Count`, `SeekEnd`, `NewRowid`, `IdxDelete`.
     Lost,
+    /// Another cursor wrote to the tree. Only a seek, `Rewind` or `Last` places the cursor
+    /// again (U9).
+    Stale,
 }
 
 /// The seek token. It makes an insert without its own seek legal (SPEC section 3).
@@ -106,6 +109,11 @@ impl<K> Shape<K> {
     /// A cursor without a position.
     pub fn lost() -> Self {
         Self::new(Pos::Lost, Dir::None, Token::None)
+    }
+
+    /// A cursor of a tree that another cursor wrote to.
+    pub fn stale() -> Self {
+        Self::new(Pos::Stale, Dir::None, Token::None)
     }
 
     /// A cursor of a tree that was cleared: an ended forward scan.
@@ -242,6 +250,12 @@ pub fn step<T: Tree>(
     c: &Shape<T::Key>,
     op: &Op<T::Key>,
 ) -> Result<Outcome<T::Key>, Illegal> {
+    if matches!(c.pos, Pos::Stale) && !allowed_after_peer_write(op) {
+        return illegal(
+            Rule::U9,
+            "a use of the old position after another cursor wrote",
+        );
+    }
     if c.null_row && !allowed_after_null_row(op) {
         return illegal(Rule::U3, "a write, Count or Found after NullRow");
     }
@@ -274,13 +288,10 @@ pub fn step<T: Tree>(
         },
         Op::IdxDelete(Some(k)) => Ok(write(Shape::lost(), Write::Remove(k.clone()))),
         Op::IdxDelete(None) => Ok(keep(Shape::lost())),
-        Op::NullRow => match c.pos {
-            Pos::Lost => illegal(Rule::U9, "NullRow on a cursor without a position"),
-            _ => Ok(keep(Shape {
-                null_row: true,
-                ..c.clone()
-            })),
-        },
+        Op::NullRow => Ok(keep(Shape {
+            null_row: true,
+            ..c.clone()
+        })),
         Op::Count => Ok(keep(Shape::lost())),
         Op::SeekEnd => Ok(keep(Shape::new(Pos::Lost, Dir::None, Token::Append))),
         Op::Clear => Ok(write(Shape::ended(), Write::Clear)),
@@ -290,9 +301,18 @@ pub fn step<T: Tree>(
             Pos::Matched => illegal(Rule::U8, "a read after a Found-style hit"),
             Pos::Seeked => illegal(Rule::U8, "a read after an exact seek that missed"),
             Pos::Gone(_) => illegal(Rule::U8, "a read after the cursor deleted its entry"),
-            Pos::Lost => illegal(Rule::U8, "a read at a cursor without a position"),
+            Pos::Lost | Pos::Stale => illegal(Rule::U8, "a read at a cursor without a position"),
         },
     }
+}
+
+/// SPEC section 1: after a peer write only a new position, and ops that do not use the old
+/// one, are legal.
+fn allowed_after_peer_write<K>(op: &Op<K>) -> bool {
+    !matches!(
+        op,
+        Op::Next | Op::Prev | Op::Read | Op::Delete | Op::NullRow
+    )
 }
 
 /// SPEC section 2: after `NullRow` only reads, `Next`, `Prev`, `Rewind`, `Last`, seeks and
@@ -396,7 +416,7 @@ fn advance<T: Tree>(t: &T, c: &Shape<T::Key>, d: Dir) -> Result<Outcome<T::Key>,
             };
             Ok(land(next, d))
         }
-        Pos::Matched | Pos::Seeked | Pos::Lost => {
+        Pos::Matched | Pos::Seeked | Pos::Lost | Pos::Stale => {
             illegal(Rule::U2, "Next or Prev from a position with no direction")
         }
     }
