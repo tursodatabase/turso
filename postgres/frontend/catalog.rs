@@ -27,6 +27,9 @@ use turso_core::{
 use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_pg_parser::quote_identifier;
+use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR};
+
+use crate::error::{sql_parse_error, sqlstate_error};
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -126,26 +129,31 @@ impl Dialect for PostgresDialect {
             };
             let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
             if !table.has_rowid {
-                return Err(LimboError::ParseError(format!(
-                    "PostgreSQL does not support WITHOUT ROWID table '{}'",
-                    table.name
-                )));
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "PostgreSQL does not support WITHOUT ROWID table '{}'",
+                        table.name
+                    ),
+                    None,
+                ));
             }
             return Ok(table);
         };
 
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let parse_result = turso_pg_parser::parse(raw_sql).map_err(sql_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(sql_parse_error)?;
         match stmt {
             turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } => {
                 BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
             }
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
+            _ => Err(sqlstate_error(
+                SQLSTATE_INTERNAL_ERROR,
+                "expected CREATE TABLE statement",
+                None,
             )),
         }
     }
@@ -157,16 +165,17 @@ impl Dialect for PostgresDialect {
             return canonical_table_sql_ast(self, sql);
         };
 
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let parse_result = turso_pg_parser::parse(raw_sql).map_err(sql_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(sql_parse_error)?;
         match stmt {
             stmt @ turso_core::ast::Stmt::CreateTable { .. } => Ok(stmt),
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
+            _ => Err(sqlstate_error(
+                SQLSTATE_INTERNAL_ERROR,
+                "expected CREATE TABLE statement",
+                None,
             )),
         }
     }
@@ -465,19 +474,23 @@ impl Dialect for PostgresDialect {
 
     /// FIXME(registered-types): Core types the columns of the new table with the storage types of the engine. A column of a type that converts values is refused here. A copy of a smallint, integer, bigint or varchar(n) column is accepted, because its values stay what they are, but it is a plain column: it loses the range or length check, and a copied key is not described as its type. A CREATE TABLE AS that gives each column the registered type of its expression replaces this.
     fn check_ctas_column_type(&self, column: &str, type_name: Option<&str>) -> Result<()> {
-        let message = match type_name {
-            Some(type_name) => format!(
-                "CREATE TABLE AS with a column of type {type_name} is not supported (column \"{column}\")"
+        let sqlstate = turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED;
+        Err(match type_name {
+            Some(type_name) => crate::error::sqlstate_error_with_hint(
+                sqlstate,
+                format!(
+                    "CREATE TABLE AS with a column of type {type_name} is not supported (column \"{column}\")"
+                ),
+                "Create the table with CREATE TABLE, then fill it with INSERT ... SELECT.",
             ),
-            None => format!(
-                "CREATE TABLE AS with a column whose type cannot be determined is not supported (column \"{column}\")"
+            None => crate::error::sqlstate_error(
+                sqlstate,
+                format!(
+                    "CREATE TABLE AS with a column whose type cannot be determined is not supported (column \"{column}\")"
+                ),
+                None,
             ),
-        };
-        Err(crate::error::sqlstate_error(
-            turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
-            message,
-            None,
-        ))
+        })
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {

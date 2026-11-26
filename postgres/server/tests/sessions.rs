@@ -93,6 +93,38 @@ fn time_zone_other_than_utc_is_refused_at_connection() {
     }
 }
 
+/// A refusal reaches the client with a workaround in the HINT field of the
+/// ErrorResponse, whether the translator or the frontend refused the
+/// statement.
+#[test]
+fn refusal_hint_reaches_the_client() {
+    let server = TestServer::start();
+    let mut client = server.connect();
+    for (sql, hint) in [
+        (
+            // Refused by the translator.
+            "CREATE OR REPLACE VIEW v AS SELECT 1 AS a",
+            "Run DROP VIEW and CREATE VIEW in one transaction.",
+        ),
+        (
+            // Refused by the frontend, after translation.
+            "SELECT date_trunc('month', DATE '2020-02-03')",
+            "Cast the value to timestamptz: date_trunc(unit, d::timestamptz).",
+        ),
+    ] {
+        let fields = error_fields(&mut client, sql);
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("0A000"),
+            "{sql}"
+        );
+        let sent = fields
+            .get(&b'H')
+            .unwrap_or_else(|| panic!("{sql}: no hint"));
+        assert!(sent.starts_with(hint), "{sql}: {sent}");
+    }
+}
+
 /// A computed bytea value is described as bytea, at the top level and when
 /// an outer query reads it from a subquery.
 #[test]
@@ -210,6 +242,16 @@ fn query_error(client: &mut PgConn, sql: &str) -> String {
     for event in client.simple_query(sql).unwrap() {
         if let BackendEvent::ErrorResponse(fields) = event {
             return error_message(&fields).to_string();
+        }
+    }
+    panic!("{sql}: expected an error");
+}
+
+/// Runs `sql`, which must fail, and returns the fields of its ErrorResponse.
+fn error_fields(client: &mut PgConn, sql: &str) -> turso_pg_client::ErrorFields {
+    for event in client.simple_query(sql).unwrap() {
+        if let BackendEvent::ErrorResponse(fields) = event {
+            return fields;
         }
     }
     panic!("{sql}: expected an error");

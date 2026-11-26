@@ -89,6 +89,24 @@ expect error {
     different from the one being created
 }
 
+# tursopg runs the elements of CREATE SCHEMA as separate statements, which it
+# cannot do inside a transaction block.
+@compat-gap "syntax:create-schema"
+test create-schema-with-elements-in-a-transaction {
+    BEGIN;
+    CREATE SCHEMA elements_in_tx CREATE TABLE t (a int);
+    INSERT INTO elements_in_tx.t VALUES (1);
+    COMMIT;
+    SELECT a FROM elements_in_tx.t;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    CREATE SCHEMA with schema elements cannot run inside a transaction block
+}
+
 # Both tests create the same schema: on an in-memory server each must get its
 # own empty schema, not a file left by the other test.
 test create-schema-starts-empty {

@@ -1,6 +1,6 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
-use crate::error::sqlstate_error;
+use crate::error::{sqlstate_error, sqlstate_error_with_hint};
 use crate::pg_type::{split_sign, IntegerType};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
@@ -108,6 +108,13 @@ fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
     let time_type = types[0].as_str();
     match time_type {
         "timestamp" | "timestamptz" => Ok(()),
+        "date" => Err(sqlstate_error_with_hint(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
+            ),
+            "Cast the date to timestamp first: d::timestamp + interval.",
+        )),
         _ => Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             format!(
@@ -132,6 +139,11 @@ fn check_date_trunc_types(types: &[String]) -> Result<()> {
     let time_type = types[1].as_str();
     match time_type {
         "timestamp" | "timestamptz" => Ok(()),
+        "date" => Err(sqlstate_error_with_hint(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("date_trunc is supported only for timestamp and timestamptz, not {time_type}"),
+            "Cast the value to timestamptz: date_trunc(unit, d::timestamptz).",
+        )),
         _ => Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             format!("date_trunc is supported only for timestamp and timestamptz, not {time_type}"),
@@ -214,11 +226,20 @@ fn add_interval(time: NaiveDateTime, months: i64, days: i64, micros: i64) -> Opt
 fn exec_date_trunc(args: &[Register]) -> Result<Value> {
     // Registered with arity 2 or 3; each argument is followed by its type.
     if args.len() == 6 {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "date_trunc with a time zone argument is not supported".to_string(),
-            None,
-        ));
+        let message = "date_trunc with a time zone argument is not supported".to_string();
+        let zone_is_utc = matches!(
+            args[2].get_value(),
+            Value::Text(zone) if zone.as_str().eq_ignore_ascii_case("utc")
+        );
+        return Err(if zone_is_utc {
+            sqlstate_error_with_hint(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                message,
+                "Leave out the time zone argument; the session time zone is UTC.",
+            )
+        } else {
+            sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
+        });
     }
     let (args, types) = args.split_at(args.len() / 2);
     let argument_type = types[1].get_value().to_string();
@@ -2175,13 +2196,9 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
     let escape = args
         .get(1)
         .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
-    match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
-        Ok(regex) => Ok(Some(regex)),
-        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
-            Err(sqlstate_error(sqlstate, message, None))
-        }
-        Err(error) => Err(LimboError::ParseError(error.to_string())),
-    }
+    turso_pg_parser::translator::similar_to_regex(&pattern, &escape)
+        .map(Some)
+        .map_err(crate::error::sql_parse_error)
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {

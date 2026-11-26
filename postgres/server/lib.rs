@@ -219,14 +219,19 @@ impl StartupHandler for UtcOnlyStartupHandler {
                 })
                 .find(|zone| !is_utc(zone));
             if let Some(zone) = non_utc {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                let mut info = ErrorInfo::new(
                     "FATAL".to_owned(),
                     SQLSTATE_FEATURE_NOT_SUPPORTED.to_owned(),
                     format!(
                         "time zone \"{}\" is not supported; tursopg supports only UTC",
                         error_field_value(zone)
                     ),
-                ))));
+                );
+                info.hint = Some(
+                    "Set the TimeZone connection parameter to UTC (in psql, PGTZ=UTC). Times with time zone are then shown in UTC."
+                        .to_owned(),
+                );
+                return Err(PgWireError::UserError(Box::new(info)));
             }
         }
         NoopHandler.on_startup(client, message).await
