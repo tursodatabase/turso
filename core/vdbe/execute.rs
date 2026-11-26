@@ -17102,16 +17102,16 @@ pub fn op_rename_table(
             // An automatic index is named after the table's mangled name, the
             // name its schema row has.
             let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
-            let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
+            let mangled_declared_to = crate::namespace::mangle_name(*namespace, to);
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
-                if let Some(name) = crate::util::renamed_automatic_index_name(
+                if let Some(declared_name) = crate::util::renamed_automatic_index_name(
                     &index.name,
                     &mangled_from,
-                    &mangled_to,
+                    &mangled_declared_to,
                 ) {
-                    index.set_name(name);
+                    index.set_name(declared_name);
                 }
             });
 
@@ -17149,10 +17149,10 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
-                normalized_to.clone_into(&mut btree.declared_name);
+                to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name.clone_from(&normalized_to);
+                to.clone_into(&mut Arc::make_mut(vtab).name);
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }

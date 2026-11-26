@@ -32,16 +32,24 @@ pub(super) fn emit_rename_table_rows(
 
     // The rewrite function normalizes the old name it is given, and a
     // virtual table is in no namespace that changes its stored name.
-    let old_name_argument = if table.is_virtual {
-        table.written_old_name
+    // sqlite_schema keeps the new name as the user wrote it, as SQLite does.
+    let (old_name_argument, declared_new_name) = if table.is_virtual {
+        (table.written_old_name, table.written_new_name.to_string())
     } else {
-        stored_old_name
+        let namespace = NamespaceRef {
+            database_id: ctx.database_id,
+            id: table.namespace,
+        };
+        (
+            stored_old_name,
+            resolver.mangle_name(namespace, table.written_new_name),
+        )
     };
     emit_rewrite_of_every_row(
         program,
         ctx,
         AlterTableFunc::RenameTable,
-        &[old_name_argument.to_string(), stored_new_name.to_string()],
+        &[old_name_argument.to_string(), declared_new_name.clone()],
         table.written_old_name,
     );
     if table.is_virtual {

@@ -320,7 +320,7 @@ pub struct DropView<'a> {
 }
 
 /// A table that gets a new name in the same namespace. The `stored_` names
-/// are the names in the table's schema rows.
+/// are the lowercased names that the table's schema rows are matched by.
 #[derive(Debug, Clone, Copy)]
 pub struct RenameTable<'a> {
     pub namespace: NamespaceId,

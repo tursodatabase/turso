@@ -2663,7 +2663,7 @@ fn translate_rename_virtual_table(
         cursor_id: vtab_cur,
     });
 
-    let new_name_reg = program.emit_string8_new_reg(new_name_norm.clone());
+    let new_name_reg = program.emit_string8_new_reg(new_name.as_str().to_string());
     program.emit_insn(Insn::VRename {
         cursor_id: vtab_cur,
         new_name_reg,
@@ -2701,7 +2701,7 @@ fn translate_rename_virtual_table(
         db: database_id,
         namespace: namespace.id,
         from: old_name.to_owned(),
-        to: new_name_norm,
+        to: new_name.as_str().to_string(),
     });
 
     program.emit_insn(Insn::Close {
