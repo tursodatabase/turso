@@ -594,7 +594,8 @@ pub fn plan_subqueries_from_returning(
 
 /// Compute query plans for subqueries in an UPSERT's DO UPDATE SET values or
 /// WHERE clause, which can reference the row of the target table that
-/// conflicted and the row that failed to insert.
+/// conflicted and the row that failed to insert, or in its conflict target,
+/// which is planned with the DO UPDATE WHERE clause's origin.
 pub fn plan_subqueries_from_upsert_do_update<'a>(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -607,7 +608,7 @@ pub fn plan_subqueries_from_upsert_do_update<'a>(
     let position = match origin {
         SubqueryOrigin::DmlSet => SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlWhere => SubqueryPosition::Where,
-        _ => unreachable!("DO UPDATE has only SET values and a WHERE clause"),
+        _ => unreachable!("an UPSERT has only SET values and WHERE clauses"),
     };
     plan_subqueries_with_outer_query_access(
         program,

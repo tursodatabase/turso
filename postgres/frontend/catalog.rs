@@ -439,6 +439,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn upsert_target_matches_column_set(&self) -> bool {
+        true
+    }
+
     fn rejects_scalar_subquery_with_several_rows(&self) -> bool {
         true
     }

@@ -1957,7 +1957,7 @@ pub(crate) fn resolve_recursive_cte_queue_order(
     resolve_compound_order_by(order_by, &plans, resolver)
 }
 
-fn ordinal(n: usize) -> String {
+pub(crate) fn ordinal(n: usize) -> String {
     let suffix = match (n % 10, n % 100) {
         (1, 11) | (2, 12) | (3, 13) => "th",
         (1, _) => "st",

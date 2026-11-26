@@ -542,6 +542,18 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether an `ON CONFLICT` target matches a unique index when the set of
+    /// target columns is the set of index columns.
+    ///
+    /// PostgreSQL compares the two sets (`infer_arbiter_indexes`), so the
+    /// target `(a)` matches `UNIQUE(a, a)`. SQLite requires as many target
+    /// terms as index columns, and each index column must match a term
+    /// (`sqlite3UpsertAnalyzeTarget`). A term that names the INTEGER PRIMARY
+    /// KEY column names the rowid in SQLite, so it matches no index column.
+    fn upsert_target_matches_column_set(&self) -> bool {
+        false
+    }
+
     /// Whether a subquery used as an expression, such as `x = (SELECT ...)`,
     /// raises an error when it returns more than one row.
     ///

@@ -627,6 +627,47 @@ expect {
     2|2|1
 }
 
+# PostgreSQL matches a conflict target to a unique index with the same set of
+# columns, so a column can be in the target or in the index more than once.
+test table-upsert-target-matches-index-with-same-column-set {
+    CREATE TABLE upsert_set (id int PRIMARY KEY, n int, c text);
+    CREATE UNIQUE INDEX upsert_set_n_n ON upsert_set (n, n);
+    INSERT INTO upsert_set VALUES (1, 5, 'old');
+    INSERT INTO upsert_set VALUES (2, 5, 'z') ON CONFLICT (n) DO UPDATE SET c = 'new';
+    INSERT INTO upsert_set VALUES (3, 5, 'z') ON CONFLICT (n, n) DO UPDATE SET c = upsert_set.c || '2';
+    SELECT id, n, c FROM upsert_set;
+}
+expect {
+    1|5|new2
+}
+
+test table-upsert-target-with-a-column-the-index-lacks-rejected {
+    CREATE TABLE upsert_set (id int PRIMARY KEY, n int, c text);
+    CREATE UNIQUE INDEX upsert_set_n_n ON upsert_set (n, n);
+    INSERT INTO upsert_set VALUES (1, 5, 'old');
+    INSERT INTO upsert_set VALUES (2, 5, 'z') ON CONFLICT (n, id) DO UPDATE SET c = 'new';
+}
+expect error {}
+
+test table-upsert-target-with-the-primary-key-column {
+    CREATE TABLE upsert_pk (id integer PRIMARY KEY, n int, c text);
+    CREATE UNIQUE INDEX upsert_pk_n_id ON upsert_pk (n, id);
+    INSERT INTO upsert_pk VALUES (1, 5, 'old');
+    INSERT INTO upsert_pk VALUES (1, 5, 'z') ON CONFLICT (n, id) DO UPDATE SET c = 'new';
+    SELECT id, n, c FROM upsert_pk;
+}
+expect {
+    1|5|new
+}
+
+test table-upsert-target-where-with-unknown-column-rejected {
+    CREATE TABLE upsert_w (a int UNIQUE, c text);
+    INSERT INTO upsert_w VALUES (1, 'old');
+    INSERT INTO upsert_w VALUES (1, 'z') ON CONFLICT (a) WHERE zz > 0 DO UPDATE SET c = 'new';
+}
+@sqlstate 42703
+expect error {}
+
 test table-named-with-a-bracket-at-the-start {
     CREATE TABLE "[t" (a int);
     INSERT INTO "[t" VALUES (1);

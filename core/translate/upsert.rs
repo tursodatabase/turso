@@ -15,9 +15,7 @@ use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{
-    BTreeTable, Column, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
-};
+use crate::schema::{BTreeTable, Column, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -31,6 +29,7 @@ use crate::translate::insert::{
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::row_security::{emit_row_checks, UpsertRowChecks};
+use crate::translate::select::ordinal;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
@@ -39,16 +38,17 @@ use crate::vdbe::insn::{to_u32, CmpInsFlags, ConstraintInfo};
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
-    schema::{Index, Schema, Table},
+    schema::{Index, Table},
     translate::{
         emitter::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
         },
         expr::{
-            emit_constraint_values_decode, emit_returning_results, emit_table_column,
-            expr_type::column_custom_type_names, process_returning_clause,
-            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
-            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
+            bind_and_rewrite_expr, emit_constraint_values_decode, emit_returning_results,
+            emit_table_column, expr_type::column_custom_type_names, process_returning_clause,
+            resolve_scalar_function_call, restore_returning_row_image_in_cache,
+            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
+            unwrap_parens, walk_expr_mut, BindingBehavior, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{
@@ -60,7 +60,7 @@ use crate::{
             plan_subqueries_from_upsert_do_update,
         },
     },
-    util::{exprs_are_equivalent, normalize_ident},
+    util::{exprs_are_equivalent_as_written, normalize_ident, walk_expr_with_subqueries},
     vdbe::{
         builder::{DmlColumnContext, DmlRowForm, ProgramBuilder},
         insn::{IdxInsertFlags, InsertFlags, Insn},
@@ -98,83 +98,6 @@ use crate::{CaptureDataChangesExt, Connection};
 ** list of indexes attached to a table puts all OE_Replace indexes last
 ** in the list.  See sqlite3CreateIndex() for where that happens.
 */
-
-/// A ConflictTarget is extracted from each ON CONFLICT target,
-// e.g. INSERT INTO x(a) ON CONFLICT  *(a COLLATE nocase)*
-#[derive(Debug, Clone)]
-pub struct ConflictTarget {
-    /// The normalized column name in question
-    col_name: String,
-    /// Possible collation name, normalized to lowercase
-    collate: Option<String>,
-}
-
-// Extract `(column, optional_collate)` from an ON CONFLICT target Expr.
-// Accepts: Id, Qualified, DoublyQualified, Parenthesized, Collate
-fn extract_conflict_target(e: &ast::Expr) -> Option<ConflictTarget> {
-    match e {
-        ast::Expr::Collate(inner, collation) => {
-            let mut conflict_target = extract_conflict_target(inner.as_ref())?;
-            let collation_str = collation.as_str();
-            conflict_target.collate = Some(collation_str.to_ascii_lowercase());
-            Some(conflict_target)
-        }
-        ast::Expr::Parenthesized(v) if v.len() == 1 => extract_conflict_target(&v[0]),
-
-        ast::Expr::Id(name) => Some(ConflictTarget {
-            col_name: normalize_ident(name.as_str()),
-            collate: None,
-        }),
-        // t.a or db.t.a: accept ident or quoted in the column position
-        ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-            let cname = col.as_str();
-            Some(ConflictTarget {
-                col_name: normalize_ident(cname),
-                collate: None,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// For an ON CONFLICT target that is an expression (not a simple column),
-/// extract the inner expression and an optional COLLATE annotation.
-/// E.g. `lower(val) COLLATE nocase` -> (lower(val), Some("nocase"))
-fn extract_target_expr(e: &ast::Expr) -> (&ast::Expr, Option<String>) {
-    match e {
-        ast::Expr::Collate(inner, c) => {
-            let (expr, _) = extract_target_expr(inner.as_ref());
-            (expr, Some(c.as_str().to_ascii_lowercase()))
-        }
-        ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_expr(&v[0]),
-        _ => (e, None),
-    }
-}
-
-fn index_column_collation_name(idx_col: &IndexColumn) -> String {
-    idx_col.collation.to_string().to_ascii_lowercase()
-}
-
-/// Match ON CONFLICT target to the PRIMARY KEY/rowid alias.
-pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
-    let Some(t) = upsert.index.as_ref() else {
-        // omitted target matches everything, CatchAll handled elsewhere
-        return false;
-    };
-    if t.targets.len() != 1 {
-        return false;
-    }
-    // Only treat as PK if the PK is the rowid alias (INTEGER PRIMARY KEY)
-    let pk = table.columns().iter().find(|c| c.is_rowid_alias());
-    if let Some(pkcol) = pk {
-        extract_conflict_target(&t.targets[0].expr).is_some_and(|tk| {
-            tk.col_name
-                .eq_ignore_ascii_case(pkcol.name.as_ref().unwrap_or(&String::new()))
-        })
-    } else {
-        false
-    }
-}
 
 /// Returns array of chaned column indicies and whether rowid was changed.
 fn collect_changed_cols(
@@ -274,159 +197,6 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     });
 }
 
-fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
-    let table_name = normalize_ident(table.get_name());
-
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                ast::Expr::Id(name) => {
-                    if let Some((column, col)) =
-                        table.get_column_by_name(&normalize_ident(name.as_str()))
-                    {
-                        *e = ast::Expr::Column {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                            column,
-                            is_rowid_alias: col.is_rowid_alias(),
-                        };
-                    } else if ROWID_STRS
-                        .iter()
-                        .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str()))
-                    {
-                        *e = ast::Expr::RowId {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                        };
-                    }
-                }
-                ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col)
-                    if normalize_ident(ns.as_str()).eq_ignore_ascii_case(&table_name) =>
-                {
-                    if let Some((column, table_col)) =
-                        table.get_column_by_name(&normalize_ident(col.as_str()))
-                    {
-                        *e = ast::Expr::Column {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                            column,
-                            is_rowid_alias: table_col.is_rowid_alias(),
-                        };
-                    } else if ROWID_STRS
-                        .iter()
-                        .any(|rowid| rowid.eq_ignore_ascii_case(col.as_str()))
-                    {
-                        *e = ast::Expr::RowId {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                        };
-                    }
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    );
-}
-
-fn partial_index_where_clauses_match(
-    target_where: &ast::Expr,
-    index_where: &ast::Expr,
-    table: &Table,
-) -> bool {
-    let mut target_where = target_where.clone();
-    let mut index_where = index_where.clone();
-    // TODO: ideally we would have a binding step where we wouldn't need to do these ad-hoc bindings just to compare exprs
-    bind_partial_index_where_expr(&mut target_where, table);
-    bind_partial_index_where_expr(&mut index_where, table);
-    exprs_are_equivalent(&target_where, &index_where)
-}
-
-/// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
-/// exact coverage (same column multiset). If the target specifies a COLLATED
-/// column, the collation must match the index column's effective collation.
-/// If the target omits collation, any index collation is accepted.
-/// Partial indexes require a matching conflict-target WHERE clause.
-pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bool {
-    let Some(target) = upsert.index.as_ref() else {
-        return true;
-    };
-
-    let partial_index_predicate_matches = match (&index.where_clause, &target.where_clause) {
-        (Some(index_where), Some(target_where)) => {
-            partial_index_where_clauses_match(target_where.as_ref(), index_where.as_ref(), table)
-        }
-        (Some(_), None) => false,
-        (None, _) => true,
-    };
-
-    if !index.unique
-        || !partial_index_predicate_matches
-        || target.targets.len() != index.columns.len()
-    {
-        return false;
-    }
-
-    // Track which index columns have been matched (consumed).
-    let mut matched = ColumnMask::default();
-
-    for te in &target.targets {
-        let mut found = None;
-
-        if let Some(conflict_target) = extract_conflict_target(&te.expr) {
-            // Simple column reference target: match by name and collation.
-            let tname = &conflict_target.col_name;
-            for (i, ic) in index.columns.iter().enumerate() {
-                if matched.get(i) || ic.pos_in_table == EXPR_INDEX_SENTINEL {
-                    continue;
-                }
-                let iname = normalize_ident(&ic.name);
-                let icoll = index_column_collation_name(ic);
-                if tname.eq_ignore_ascii_case(&iname)
-                    && match conflict_target.collate.as_ref() {
-                        Some(c) => c.eq_ignore_ascii_case(&icoll),
-                        None => true, // unspecified collation -> accept any
-                    }
-                {
-                    found = Some(i);
-                    break;
-                }
-            }
-        } else {
-            // Expression target (e.g. lower(val)): match against expression index
-            // columns using semantic equivalence.
-            let (target_expr, target_collate) = extract_target_expr(&te.expr);
-            for (i, ic) in index.columns.iter().enumerate() {
-                if matched.get(i) || ic.pos_in_table != EXPR_INDEX_SENTINEL {
-                    continue;
-                }
-                if let Some(idx_expr) = &ic.expr {
-                    if exprs_are_equivalent(target_expr, idx_expr) {
-                        // If target specifies a collation, it must match the index column's.
-                        if let Some(ref tc) = target_collate {
-                            let icoll = index_column_collation_name(ic);
-                            if !tc.eq_ignore_ascii_case(&icoll) {
-                                continue;
-                            }
-                        }
-                        found = Some(i);
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(i) = found {
-            matched.set(i).expect("TODO: alloc error");
-        } else {
-            return false;
-        }
-    }
-    // All target columns matched exactly once, and all index columns consumed
-    matched.count() == index.columns.len()
-}
-
 #[derive(Clone, Debug)]
 pub enum ResolvedUpsertTarget {
     // ON CONFLICT DO
@@ -437,11 +207,19 @@ pub enum ResolvedUpsertTarget {
     Index(Arc<Index>),
 }
 
+/// Resolves the ON CONFLICT target of `upsert` to the constraint it names, as
+/// `sqlite3UpsertAnalyzeTarget` does. `table_references` names the INSERT's
+/// table by the table's name. `clause_number` is the 1-based number of the
+/// clause when the INSERT has more than one ON CONFLICT clause, which the
+/// error message names.
 pub fn resolve_upsert_target(
-    schema: &Schema,
-    namespace: NamespaceId,
-    table: &Table,
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    table_references: &TableReferences,
+    table_alias: Option<&str>,
     upsert: &Upsert,
+    clause_number: Option<usize>,
 ) -> crate::Result<ResolvedUpsertTarget> {
     // Omitted target, catch-all
     let Some(target) = upsert.index.as_ref() else {
@@ -450,21 +228,284 @@ pub fn resolve_upsert_target(
     // SQLite rejects explicit NULLS FIRST/LAST in conflict targets
     // (sqlite3UpsertAnalyzeTarget -> sqlite3HasExplicitNulls).
     crate::translate::index::reject_explicit_nulls(&target.targets)?;
+    let (terms, target_where) = bind_upsert_target(
+        program,
+        resolver,
+        connection,
+        table_references,
+        table_alias,
+        target,
+    )?;
 
-    // Targeted: must match PK, only if PK is a rowid alias
-    if upsert_matches_rowid_alias(upsert, table) {
-        return Ok(ResolvedUpsertTarget::PrimaryKey);
+    // One term that names the rowid, or the INTEGER PRIMARY KEY column that is
+    // an alias for it, names the rowid's constraint.
+    if let [term] = terms.as_slice() {
+        if matches!(
+            unwrap_parens(term)?,
+            ast::Expr::RowId { .. }
+                | ast::Expr::Column {
+                    is_rowid_alias: true,
+                    ..
+                }
+        ) {
+            return Ok(ResolvedUpsertTarget::PrimaryKey);
+        }
     }
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
-    for idx in schema.get_indices(namespace, table.get_name()) {
-        if idx.unique && upsert_matches_index(upsert, idx, table) {
-            return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
+    let joined_table = &table_references.joined_tables()[0];
+    let namespace = joined_table.namespace;
+    let indices: Vec<Arc<Index>> = resolver.with_schema(namespace.database_id, |schema| {
+        schema
+            .get_indices(namespace.id, joined_table.table.get_name())
+            .filter(|idx| idx.unique)
+            .cloned()
+            .collect()
+    });
+    for index in indices {
+        if upsert_matches_index(
+            &terms,
+            target_where.as_ref(),
+            &index,
+            table_references,
+            resolver,
+        )? {
+            return Ok(ResolvedUpsertTarget::Index(index));
         }
     }
     crate::bail_parse_error!(
-        "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+        "{}ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+        clause_number.map_or(String::new(), |n| format!("{} ", ordinal(n)))
     );
+}
+
+/// Resolves the names in an ON CONFLICT target and in its WHERE clause, as
+/// SQLite does before it matches the target to an index, and returns the
+/// bound terms and the bound WHERE clause. A name or a function that SQLite
+/// rejects is an error even in a term that no index column matches.
+fn bind_upsert_target(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    table_references: &TableReferences,
+    table_alias: Option<&str>,
+    target: &ast::UpsertIndex,
+) -> crate::Result<(Vec<ast::Expr>, Option<ast::Expr>)> {
+    let mut table_references = upsert_table_references(table_references, table_alias);
+    let mut exprs: Vec<ast::Expr> = target
+        .targets
+        .iter()
+        .map(|term| term.expr.as_ref())
+        .chain(target.where_clause.as_deref())
+        .cloned()
+        .collect();
+    for expr in &mut exprs {
+        // Planning a subquery resolves its column names, but its function
+        // calls are resolved only when it is emitted, and the subqueries of a
+        // target are never emitted.
+        walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+            let (name, args_count) = match e {
+                ast::Expr::FunctionCall { name, args, .. } => (name, args.len()),
+                ast::Expr::FunctionCallStar { name, .. } => (name, 0),
+                _ => return Ok(WalkControl::Continue),
+            };
+            if resolver
+                .resolve_function(name.as_str(), args_count)?
+                .is_none()
+            {
+                bail_parse_error!("no such function: {}", name.as_str());
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        plan_subqueries_from_upsert_do_update(
+            program,
+            &mut Vec::new(),
+            &mut table_references,
+            std::iter::once(&mut *expr),
+            SubqueryOrigin::DmlWhere,
+            resolver,
+            connection,
+        )?;
+        bind_and_rewrite_expr(
+            expr,
+            Some(&mut table_references),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::FunctionCall {
+                    name,
+                    args,
+                    filter_over,
+                    ..
+                } => {
+                    resolve_scalar_function_call(name, args.len(), filter_over, resolver)?;
+                }
+                ast::Expr::FunctionCallStar { name, filter_over } => {
+                    resolve_scalar_function_call(name, 0, filter_over, resolver)?;
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    let target_where = target
+        .where_clause
+        .as_ref()
+        .and_then(|_| exprs.pop())
+        .map(rowid_alias_as_rowid)
+        .transpose()?;
+    Ok((exprs, target_where))
+}
+
+/// Whether the bound terms and WHERE clause of an ON CONFLICT target match a
+/// UNIQUE index. Each index column must match a term, in any order, and two
+/// index columns can match the same term, so the target `(a, b)` matches
+/// `UNIQUE(a, a)`. `Dialect::upsert_target_matches_column_set` says which
+/// other rule holds. A partial index requires a target WHERE clause that is
+/// the same as the index's.
+fn upsert_matches_index(
+    terms: &[ast::Expr],
+    target_where: Option<&ast::Expr>,
+    index: &Index,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> crate::Result<bool> {
+    // The index stores its expressions as CREATE INDEX wrote them. Bound to
+    // the same table, they compare with the bound target.
+    let bind_index_expr = |expr: &ast::Expr| -> crate::Result<ast::Expr> {
+        let mut expr = expr.clone();
+        bind_and_rewrite_expr(
+            &mut expr,
+            Some(&mut table_references.clone()),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        rowid_alias_as_rowid(expr)
+    };
+    let partial_index_predicate_matches = match (&index.where_clause, target_where) {
+        (Some(index_where), Some(target_where)) => {
+            exprs_are_equivalent_as_written(target_where, &bind_index_expr(index_where)?)
+        }
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    if !partial_index_predicate_matches {
+        return Ok(false);
+    }
+
+    let index_exprs = index
+        .columns
+        .iter()
+        .map(|ic| ic.expression().map(bind_index_expr).transpose())
+        .collect::<crate::Result<Vec<_>>>()?;
+    let column_set = resolver.catalog.dialect.upsert_target_matches_column_set();
+    // matches[t][i]: whether term t matches index column i.
+    let matches = terms
+        .iter()
+        .map(|term| {
+            (0..index.columns.len())
+                .map(|i| {
+                    target_term_matches_index_column(
+                        term,
+                        &index.columns[i],
+                        index_exprs[i].as_ref(),
+                        column_set,
+                    )
+                })
+                .collect::<crate::Result<Vec<_>>>()
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let every_column_matches = (0..index.columns.len()).all(|i| matches.iter().any(|term| term[i]));
+    Ok(every_column_matches
+        && if column_set {
+            matches.iter().all(|term| term.iter().any(|&m| m))
+        } else {
+            terms.len() == index.columns.len()
+        })
+}
+
+/// Whether a bound term of an ON CONFLICT target matches a column of a UNIQUE
+/// index. `index_expr` is the bound expression of an expression column. Unless
+/// `rowid_alias_is_column`, the INTEGER PRIMARY KEY column in a term is the
+/// rowid, as in SQLite, and matches no index column.
+fn target_term_matches_index_column(
+    term: &ast::Expr,
+    index_column: &IndexColumn,
+    index_expr: Option<&ast::Expr>,
+    rowid_alias_is_column: bool,
+) -> crate::Result<bool> {
+    // SQLite compares the term with the index column wrapped in one COLLATE
+    // operator of the column's collation (sqlite3ExprCompare). So a COLLATE at
+    // the top of the term must name that collation, and below it the term must
+    // be the column as written. A term without COLLATE matches a column of any
+    // collation.
+    let (term, term_has_collate) = match unwrap_parens(term)? {
+        ast::Expr::Collate(inner, name) => {
+            if !name
+                .as_str()
+                .eq_ignore_ascii_case(&index_column.collation.to_string())
+            {
+                return Ok(false);
+            }
+            (unwrap_parens(inner)?, true)
+        }
+        term => (term, false),
+    };
+    match index_expr {
+        // SQLite wraps an index expression in a COLLATE operator only when it
+        // has no COLLATE at its top, and the term goes through the same one
+        // COLLATE operator. A term without COLLATE skips each COLLATE at the
+        // top of the index expression.
+        Some(index_expr) => {
+            let mut index_expr = unwrap_parens(index_expr)?;
+            while let ast::Expr::Collate(inner, _) = index_expr {
+                index_expr = unwrap_parens(inner)?;
+                if term_has_collate {
+                    break;
+                }
+            }
+            Ok(exprs_are_equivalent_as_written(
+                &rowid_alias_as_rowid(term.clone())?,
+                index_expr,
+            ))
+        }
+        None => Ok(matches!(
+            term,
+            ast::Expr::Column { column, is_rowid_alias, .. }
+                if *column == index_column.pos_in_table
+                    && (rowid_alias_is_column || !is_rowid_alias)
+        )),
+    }
+}
+
+/// Returns the bound `expr` with each reference to the INTEGER PRIMARY KEY
+/// column replaced by the rowid. In an expression SQLite resolves both names to
+/// the rowid, so `b + 0` and `rowid + 0` compare equal when `b` is the INTEGER
+/// PRIMARY KEY.
+fn rowid_alias_as_rowid(mut expr: ast::Expr) -> crate::Result<ast::Expr> {
+    walk_expr_mut(
+        &mut expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            if let ast::Expr::Column {
+                database,
+                table,
+                is_rowid_alias: true,
+                ..
+            } = e
+            {
+                *e = ast::Expr::RowId {
+                    database: *database,
+                    table: *table,
+                };
+            }
+            Ok(WalkControl::Continue)
+        },
+    )?;
+    Ok(expr)
 }
 
 #[allow(clippy::too_many_arguments)]
