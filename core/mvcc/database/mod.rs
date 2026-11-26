@@ -39,7 +39,7 @@ use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
-use crate::vdbe::metrics::CursorWorkCounters;
+use crate::vdbe::metrics::CursorWorkRef;
 use crate::Completion;
 use crate::File;
 use crate::IOExt;
@@ -6035,7 +6035,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         mv_store_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         snapshot: MvccReadSnapshot,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_table_in_direction",
@@ -6071,7 +6071,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
         snapshot: MvccReadSnapshot,
         index_id: MVTableId,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_index_in_direction",
@@ -6309,7 +6309,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         snapshot: MvccReadSnapshot,
         index_id: MVTableId,
         mut rows: I,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Option<(RowID, RowVersions<A>)>
     where
         I: Iterator<Item = IndexRowEntry<'a, A>>,
@@ -6331,7 +6331,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         mut rows: I,
         table_id: MVTableId,
         take_payload: bool,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)>
     where
         I: Iterator<Item = TableRowEntry<'a, A>>,
@@ -6360,7 +6360,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         direction: IterationDirection,
         snapshot: MvccReadSnapshot,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
         work.mvcc_seek();
         let table_id = start.table_id;
@@ -6413,7 +6413,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         direction: IterationDirection,
         snapshot: MvccReadSnapshot,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Result<Option<(RowID, RowVersions<A>)>> {
         work.mvcc_seek();
         let index_rows = self.get_or_create_index_rows(index_id)?;
@@ -9211,12 +9211,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    pub fn get_last_table_rowid(
+    pub(crate) fn get_last_table_rowid(
         &self,
         table_id: MVTableId,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         tx_id: TxID,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Option<RowKey> {
         work.mvcc_seek();
         let tx = self
@@ -9283,12 +9283,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Some(entry.key().row_id.clone())
     }
 
-    pub fn get_last_index_rowid(
+    pub(crate) fn get_last_index_rowid(
         &self,
         index_id: MVTableId,
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Result<Option<RowKey>> {
         work.mvcc_seek();
         let index = self.get_or_create_index_rows(index_id)?;

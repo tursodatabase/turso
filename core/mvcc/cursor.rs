@@ -18,9 +18,7 @@ use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
     SeekResult, Value, ValueRef,
 };
-use crate::vdbe::metrics::{
-    cursor_work, new_cursor_work_handle, CursorWorkCounters, CursorWorkHandle,
-};
+use crate::vdbe::metrics::{cursor_work, new_cursor_work_handle, CursorWorkHandle, CursorWorkRef};
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
@@ -458,7 +456,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
     /// bit is deliberately not resolved here. See [`IndexShadowScanState::Peeked`].
     fn advance(
         mut iter: MvccIterator<'static, Arc<SortableIndexKey>, A>,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> IndexShadowScanState<A> {
         work.mvcc_entry_examined();
         match iter.next() {
@@ -480,7 +478,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
         table_id: MVTableId,
         tx_id: u64,
         key: &Arc<SortableIndexKey>,
-        work: &CursorWorkCounters,
+        work: CursorWorkRef<'_>,
     ) -> Result<bool> {
         // Read the epoch before (re)seeding. If a key insert races past this
         // load, the next shadow check observes the mismatch and reseeds.

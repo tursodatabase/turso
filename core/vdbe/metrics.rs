@@ -50,10 +50,10 @@ impl CursorWork {
 }
 
 /// The live [`CursorWork`] counters of one statement. The statement shares them with
-/// each MVCC cursor that it opens.
+/// each MVCC cursor that it opens. Code reads and changes them through a
+/// [`CursorWorkRef`].
 ///
-/// The counters exist in debug builds only. In release builds the type is empty, each
-/// increment compiles to nothing, and [`Self::get`] returns zeros.
+/// The counters exist in debug builds only. In release builds the type is empty.
 ///
 /// Only the thread that steps the statement changes the counters, so an increment is a
 /// load and a store, not an atomic read-modify-write. The atomics only make the type
@@ -96,20 +96,51 @@ pub(crate) fn new_cursor_work_handle() -> CursorWorkHandle {
 
 /// The counters that `handle` refers to.
 #[inline(always)]
-pub(crate) fn cursor_work(handle: &CursorWorkHandle) -> &CursorWorkCounters {
+pub(crate) fn cursor_work(handle: &CursorWorkHandle) -> CursorWorkRef<'_> {
     #[cfg(debug_assertions)]
     {
-        handle
+        CursorWorkRef::new(handle)
     }
     #[cfg(not(debug_assertions))]
     {
         let CursorWorkHandle = handle;
-        static NO_COUNTERS: CursorWorkCounters = CursorWorkCounters {};
-        &NO_COUNTERS
+        CursorWorkRef::new(&CursorWorkCounters {})
     }
 }
 
-impl CursorWorkCounters {
+/// A reference to [`CursorWorkCounters`] that functions take by value.
+///
+/// In release builds it is a zero-size type. The Rust calling convention passes no
+/// zero-size argument, so a function that takes it gets no extra argument, inlined or
+/// not, and each increment compiles to nothing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CursorWorkRef<'a> {
+    #[cfg(debug_assertions)]
+    counters: &'a CursorWorkCounters,
+    #[cfg(not(debug_assertions))]
+    counters: std::marker::PhantomData<&'a CursorWorkCounters>,
+}
+
+// A release build passes no argument for a `CursorWorkRef` only if it has zero size.
+#[cfg(not(debug_assertions))]
+const _: () = assert!(std::mem::size_of::<CursorWorkRef<'static>>() == 0);
+
+impl<'a> CursorWorkRef<'a> {
+    #[inline(always)]
+    pub(crate) fn new(counters: &'a CursorWorkCounters) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            Self { counters }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let CursorWorkCounters {} = counters;
+            Self {
+                counters: std::marker::PhantomData,
+            }
+        }
+    }
+
     #[cfg(debug_assertions)]
     #[inline]
     fn bump(counter: &AtomicU64) {
@@ -120,45 +151,46 @@ impl CursorWorkCounters {
     }
 
     #[inline(always)]
-    pub(crate) fn mvcc_entry_examined(&self) {
+    pub(crate) fn mvcc_entry_examined(self) {
         #[cfg(debug_assertions)]
-        Self::bump(&self.mvcc_entries_examined);
+        Self::bump(&self.counters.mvcc_entries_examined);
     }
 
     #[inline(always)]
-    pub(crate) fn btree_row_examined(&self) {
+    pub(crate) fn btree_row_examined(self) {
         #[cfg(debug_assertions)]
-        Self::bump(&self.btree_rows_examined);
+        Self::bump(&self.counters.btree_rows_examined);
     }
 
     #[inline(always)]
-    pub(crate) fn mvcc_seek(&self) {
+    pub(crate) fn mvcc_seek(self) {
         #[cfg(debug_assertions)]
-        Self::bump(&self.mvcc_seeks);
+        Self::bump(&self.counters.mvcc_seeks);
     }
 
     #[inline(always)]
-    pub(crate) fn btree_seek(&self) {
+    pub(crate) fn btree_seek(self) {
         #[cfg(debug_assertions)]
-        Self::bump(&self.btree_seeks);
+        Self::bump(&self.counters.btree_seeks);
     }
 
     #[inline(always)]
-    pub(crate) fn visibility_check(&self) {
+    pub(crate) fn visibility_check(self) {
         #[cfg(debug_assertions)]
-        Self::bump(&self.visibility_checks);
+        Self::bump(&self.counters.visibility_checks);
     }
 
     /// The counts. All zero in release builds.
-    pub fn get(&self) -> CursorWork {
+    pub(crate) fn get(self) -> CursorWork {
         #[cfg(debug_assertions)]
         {
+            let c = self.counters;
             CursorWork {
-                mvcc_entries_examined: self.mvcc_entries_examined.load(Ordering::Relaxed),
-                btree_rows_examined: self.btree_rows_examined.load(Ordering::Relaxed),
-                mvcc_seeks: self.mvcc_seeks.load(Ordering::Relaxed),
-                btree_seeks: self.btree_seeks.load(Ordering::Relaxed),
-                visibility_checks: self.visibility_checks.load(Ordering::Relaxed),
+                mvcc_entries_examined: c.mvcc_entries_examined.load(Ordering::Relaxed),
+                btree_rows_examined: c.btree_rows_examined.load(Ordering::Relaxed),
+                mvcc_seeks: c.mvcc_seeks.load(Ordering::Relaxed),
+                btree_seeks: c.btree_seeks.load(Ordering::Relaxed),
+                visibility_checks: c.visibility_checks.load(Ordering::Relaxed),
             }
         }
         #[cfg(not(debug_assertions))]
@@ -167,33 +199,33 @@ impl CursorWorkCounters {
         }
     }
 
-    pub(crate) fn is_zero(&self) -> bool {
+    pub(crate) fn is_zero(self) -> bool {
         self.get() == CursorWork::default()
     }
 
-    pub(crate) fn reset(&self) {
+    pub(crate) fn reset(self) {
         #[cfg(debug_assertions)]
         for counter in [
-            &self.mvcc_entries_examined,
-            &self.btree_rows_examined,
-            &self.mvcc_seeks,
-            &self.btree_seeks,
-            &self.visibility_checks,
+            &self.counters.mvcc_entries_examined,
+            &self.counters.btree_rows_examined,
+            &self.counters.mvcc_seeks,
+            &self.counters.btree_seeks,
+            &self.counters.visibility_checks,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
     }
 
     /// Sets one counter to zero. Ignores a counter that is not cursor work.
-    pub(crate) fn reset_counter(&self, counter: crate::statement::StatementStatusCounter) {
+    pub(crate) fn reset_counter(self, counter: crate::statement::StatementStatusCounter) {
         use crate::statement::StatementStatusCounter as C;
         #[cfg(debug_assertions)]
         let counter = match counter {
-            C::MvccEntriesExamined => &self.mvcc_entries_examined,
-            C::BtreeRowsExamined => &self.btree_rows_examined,
-            C::MvccSeeks => &self.mvcc_seeks,
-            C::BtreeSeeks => &self.btree_seeks,
-            C::VisibilityChecks => &self.visibility_checks,
+            C::MvccEntriesExamined => &self.counters.mvcc_entries_examined,
+            C::BtreeRowsExamined => &self.counters.btree_rows_examined,
+            C::MvccSeeks => &self.counters.mvcc_seeks,
+            C::BtreeSeeks => &self.counters.btree_seeks,
+            C::VisibilityChecks => &self.counters.visibility_checks,
             C::FullscanStep
             | C::Sort
             | C::VmStep

@@ -1634,7 +1634,9 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
             table_id,
             reader_id,
             &idx_key(10),
-            &crate::vdbe::metrics::CursorWorkCounters::default(),
+            crate::vdbe::metrics::CursorWorkRef::new(
+                &crate::vdbe::metrics::CursorWorkCounters::default()
+            ),
         )
         .unwrap());
     // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
@@ -1645,7 +1647,9 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
             table_id,
             reader_id,
             &idx_key(30),
-            &crate::vdbe::metrics::CursorWorkCounters::default(),
+            crate::vdbe::metrics::CursorWorkRef::new(
+                &crate::vdbe::metrics::CursorWorkCounters::default()
+            ),
         )
         .unwrap());
 
