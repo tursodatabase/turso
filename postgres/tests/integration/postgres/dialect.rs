@@ -4607,3 +4607,46 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
         ]
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_oid_param_is_read_as_oid(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (o oid)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4294967295)").unwrap();
+
+    let count = |sql: &str, value: Value| {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(std::num::NonZero::new(1).unwrap(), value)
+            .unwrap();
+        stmt.run_collect_rows()
+    };
+    let one = vec![vec![Value::from_i64(1)]];
+    let none = vec![vec![Value::from_i64(0)]];
+    for sql in [
+        "SELECT count(*) FROM t WHERE o = $1",
+        "SELECT count(*) FROM t WHERE $1 = o",
+        "SELECT count(*) FROM t WHERE o IN ($1)",
+    ] {
+        for value in [
+            Value::from_i64(-1),
+            Value::from_i64(4294967295),
+            Value::from_text("-1".to_owned()),
+            Value::from_text("4294967295".to_owned()),
+        ] {
+            assert_eq!(
+                count(sql, value.clone()).unwrap(),
+                one,
+                "{sql} with {value:?}"
+            );
+        }
+    }
+    assert_eq!(
+        count("SELECT count(*) FROM t WHERE o > $1", Value::from_i64(-1)).unwrap(),
+        none
+    );
+    assert!(count(
+        "SELECT count(*) FROM t WHERE o = $1",
+        Value::from_i64(4294967296)
+    )
+    .is_err());
+}

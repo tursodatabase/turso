@@ -834,3 +834,515 @@ expect error {
 expect @tursopg {
     f
 }
+
+# An oid has comparisons and no arithmetic. An integer converts to oid, and
+# an oid converts to no other type, so an integer next to an oid is read as
+# an oid.
+
+setup oid_operands {
+    CREATE TABLE oid_operands (
+        o oid, o2 oid, i integer, i2 smallint, i8 bigint, n numeric,
+        f double precision, s text
+    );
+    INSERT INTO oid_operands VALUES (3000000000, 5, 5, 5, 5, 5.5, 5.5, '5');
+}
+
+@setup oid_operands
+test oid-compares-with-oid {
+    SELECT o = o, o <> o2, o < o2, o > o2, o <= o2, o >= o2 FROM oid_operands;
+}
+expect {
+    t|t|f|t|f|t
+}
+
+@setup oid_operands
+test oid-compares-with-integers {
+    SELECT o2 = i, i = o2, o > i, o2 < 6 FROM oid_operands;
+}
+expect {
+    t|t|t|t
+}
+
+@setup oid_operands
+test oid-compares-with-smallint {
+    SELECT o2 = i2, i2 <> o2 FROM oid_operands;
+}
+expect {
+    t|f
+}
+
+@setup oid_operands
+test oid-compares-with-bigint {
+    SELECT o2 <= i8, i8 >= o2 FROM oid_operands;
+}
+expect {
+    t|t
+}
+
+test oid-compares-with-negative-integer {
+    SELECT 4294967295::oid = -1, -1 = 4294967295::oid, 4294967295::oid > -1, -1 >= 4294967295::oid,
+        4294967291::oid = (-5)::int2, 2147483648::oid < (-2147483647)::int4;
+}
+expect {
+    t|t|f|t|t|t
+}
+
+test oid-in-list-with-negative-integer {
+    SELECT 4294967295::oid IN (-1, 5), 4294967295::oid NOT IN (-1, 5), 4294967295::oid BETWEEN -2 AND -1;
+}
+expect {
+    t|f|t
+}
+
+test oid-compares-with-negative-bigint-errors {
+    SELECT 4294967295::oid = (-1)::int8;
+}
+@sqlstate 22003
+expect error {
+    OID out of range
+}
+
+# FIXME(registered-types): the comparisons below that tursopg refuses have no
+# single place that every comparison goes through, so the integer next to an
+# oid is cast only where the engine builds the comparison from two expressions.
+
+setup oid_paths {
+    CREATE TABLE t (o oid, i int4);
+    INSERT INTO t VALUES (4294967295, -1);
+    CREATE TABLE t2 (o int4);
+    INSERT INTO t2 VALUES (-1);
+}
+
+@setup oid_paths
+test oid-is-distinct-from-negative-integer {
+    SELECT count(*) FROM t WHERE o IS DISTINCT FROM -1;
+}
+expect {
+    0
+}
+
+@setup oid_paths
+test oid-is-not-distinct-from-integer-column {
+    SELECT count(*) FROM t WHERE o IS NOT DISTINCT FROM i;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-between-negative-integers {
+    SELECT count(*) FROM t WHERE o BETWEEN -1 AND -1;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-case-base-with-negative-integer {
+    SELECT CASE o WHEN -1 THEN 1 ELSE 0 END FROM t;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-nullif-with-negative-integer {
+    SELECT count(*) FROM t WHERE NULLIF(o, -1) IS NULL;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-joins-on-integer-column {
+    SELECT count(*) FROM t JOIN t2 ON t.o = t2.o;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-row-equals-row-with-negative-integer {
+    SELECT count(*) FROM t WHERE (o, 1) = (-1, 1);
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-row-in-list-with-negative-integer {
+    SELECT count(*) FROM t WHERE (o, 1) IN ((-1, 1));
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-row-in-list-of-two-rows {
+    SELECT count(*) FROM t WHERE (o, 1) IN ((5, 1), (-1, 1));
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-equals-any-of-integers {
+    SELECT count(*) FROM t WHERE o = ANY (ARRAY[-1]);
+}
+expect {
+    1
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-in-subquery-of-integer-column {
+    SELECT count(*) FROM t WHERE o IN (SELECT i FROM t);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-integer-column-in-subquery-of-oid {
+    SELECT count(*) FROM t WHERE i IN (SELECT o FROM t);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type int4 with type oid
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-in-subquery-of-integer-literal {
+    SELECT count(*) FROM t WHERE o IN (SELECT -1);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type integer
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-in-values-of-integer-literal {
+    SELECT count(*) FROM t WHERE o IN (VALUES (-1));
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type integer
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-row-in-values-of-integer-literal {
+    SELECT count(*) FROM t WHERE (o, 1) IN (VALUES (-1, 1));
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type integer
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-row-in-subquery-of-integer-column {
+    SELECT count(*) FROM t WHERE (o, 1) IN (SELECT i, 1 FROM t);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-equals-scalar-subquery-of-integer-column {
+    SELECT count(*) FROM t WHERE o = (SELECT i FROM t);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-delete-where-in-subquery-of-integer-column {
+    DELETE FROM t WHERE o IN (SELECT i FROM t); SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-joins-using-integer-column {
+    SELECT count(*) FROM t JOIN t2 USING (o);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-natural-joins-integer-column {
+    SELECT count(*) FROM t NATURAL JOIN t2;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-coalesce-with-integer-column {
+    SELECT count(*) FROM t WHERE COALESCE(o, i) = -1;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-union-with-integer-column {
+    SELECT count(*) FROM (SELECT o FROM t UNION SELECT i FROM t) s;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-intersect-with-integer-column {
+    SELECT count(*) FROM (SELECT o FROM t INTERSECT SELECT i FROM t) s;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-except-with-integer-column {
+    SELECT count(*) FROM (SELECT o FROM t EXCEPT SELECT i FROM t) s;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-equals-scalar-subquery-of-negative-integer {
+    SELECT count(*) FROM t WHERE o = (SELECT -1);
+}
+expect {
+    1
+}
+expect @tursopg {
+    0
+}
+
+@setup oid_operands
+test oid-compares-with-text-read-as-oid {
+    SELECT o2 = '5', ' 5' = o2, o > '4294967295' FROM oid_operands;
+}
+expect {
+    t|t|f
+}
+
+@setup oid_operands
+test oid-compares-with-hex-text {
+    SELECT '0x5' = o2 FROM oid_operands;
+}
+expect {
+    t
+}
+
+@setup oid_operands
+test oid-in-list-with-hex-text {
+    SELECT o2 IN ('0x5', 1) FROM oid_operands;
+}
+expect {
+    t
+}
+
+@setup oid_operands
+test oid-compares-with-text-that-is-not-an-oid {
+    SELECT o2 = 'five' FROM oid_operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "five"
+}
+
+@setup oid_operands
+test oid-compares-with-text-above-the-largest-oid {
+    SELECT o2 = '4294967296' FROM oid_operands;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+@setup oid_operands
+test oid-in-list-and-between {
+    SELECT o2 IN (1, 5), o2 NOT IN (1, 2), o2 BETWEEN 1 AND 6, o > 2147483647
+    FROM oid_operands;
+}
+expect {
+    t|t|t|t
+}
+
+@setup oid_operands
+test oid-plus-integer-errors {
+    SELECT o + i FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+@setup oid_operands
+test integer-minus-oid-errors {
+    SELECT i - o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer - oid
+}
+
+@setup oid_operands
+test oid-times-bigint-errors {
+    SELECT o * i8 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \* bigint
+}
+
+@setup oid_operands
+test oid-plus-oid-errors {
+    SELECT o + o2 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ oid
+}
+
+@setup oid_operands
+test oid-plus-literal-errors {
+    SELECT o + 1 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+@setup oid_operands
+test negative-oid-errors {
+    SELECT -o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: - oid
+}
+
+@setup oid_operands
+test oid-bit-and-integer-errors {
+    SELECT o & i FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid & integer
+}
+
+@setup oid_operands
+test oid-equals-numeric-errors {
+    SELECT o = n FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid = numeric
+}
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: oid = double precision
+}
+
+@setup oid_operands
+test double-precision-less-than-oid-errors {
+    SELECT f < o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: double precision < oid
+}
+
+@setup oid_operands
+test oid-equals-text-errors {
+    SELECT o = s FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid = text
+}
+
+test oid-cast-plus-integer-errors {
+    SELECT 1::oid + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+test oid-cast-compares-with-integer {
+    SELECT 1::oid = 1, 3000000000::oid > 5, 5 < 3000000000::oid;
+}
+expect {
+    t|t|t
+}

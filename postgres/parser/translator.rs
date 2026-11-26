@@ -3809,22 +3809,22 @@ impl PostgreSQLTranslator {
                     Ok(BoolTestType::IsTrue) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::Is,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::True)),
                     )),
                     Ok(BoolTestType::IsNotTrue) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::IsNot,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::True)),
                     )),
                     Ok(BoolTestType::IsFalse) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::Is,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::False)),
                     )),
                     Ok(BoolTestType::IsNotFalse) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::IsNot,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::False)),
                     )),
                     Ok(BoolTestType::IsUnknown) => Ok(ast::Expr::IsNull(Box::new(expr))),
                     Ok(BoolTestType::IsNotUnknown) => Ok(ast::Expr::NotNull(Box::new(expr))),
@@ -7546,7 +7546,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "XML" | "TSVECTOR" | "TSQUERY" => "TEXT".into(),
         "MONEY" => "REAL".into(),
         "BIT" | "VARBIT" => "TEXT".into(),
-        "OID" | "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
+        "OID" => "oid".into(),
+        "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
@@ -8153,6 +8154,7 @@ fn pg_type_name_to_ast_type(
         ("DOUBLE PRECISION" | "FLOAT8", false) => "float8",
         ("TEXT", false) => "text",
         ("UUID", false) => "uuid",
+        ("OID", false) => "oid",
         ("SERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE", _) => "INTEGER",
         ("BIGSERIAL", _) => "BIGINT",
         (
@@ -12745,7 +12747,7 @@ mod tests {
                 let w = where_clause.as_ref().unwrap();
                 assert!(
                     matches!(&**w, ast::Expr::Binary(_, ast::Operator::Is, _)),
-                    "IS TRUE should map to IS 1, got: {w:?}"
+                    "IS TRUE should map to IS TRUE, got: {w:?}"
                 );
             }
         }

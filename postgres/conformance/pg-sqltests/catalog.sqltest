@@ -689,6 +689,22 @@ expect {
     2977|>=|11|10|b|f|f|2950|2950|16|2976|2974
 }
 
+test pg-operator-lists-the-comparisons-of-oid {
+    SELECT oid, oprname, oprkind, oprcanmerge, oprcanhash, oprleft, oprright,
+           oprresult, oprcom, oprnegate
+    FROM pg_operator
+    WHERE oprleft = 26 OR oprright = 26
+    ORDER BY oid;
+}
+expect {
+    607|=|b|t|t|26|26|16|607|608
+    608|<>|b|f|f|26|26|16|608|607
+    609|<|b|f|f|26|26|16|610|612
+    610|>|b|f|f|26|26|16|609|611
+    611|<=|b|f|f|26|26|16|612|610
+    612|>=|b|f|f|26|26|16|611|609
+}
+
 test pg-operator-joins-pg-type-on-the-operand-types {
     SET search_path TO '';
     SELECT o.tableoid, o.oprname, l.typname, r.typname, t.typname
@@ -724,7 +740,7 @@ expect {
     799
 }
 expect @tursopg {
-    216
+    222
 }
 
 # pg_proc of tursopg does not have the functions of PostgreSQL under their

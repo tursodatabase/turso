@@ -6,10 +6,12 @@
 mod boolean;
 mod integer;
 mod integer_operators;
+mod oid;
 
 pub(crate) use integer::split_sign;
 pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
+pub(crate) use oid::parse_oid;
 
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
@@ -24,7 +26,8 @@ pub(crate) fn register_builtin_types(builder: SchemaBuilder) -> Result<SchemaBui
         .builtin_type(&boolean::Boolean)?
         .builtin_type(&IntegerType::Int2)?
         .builtin_type(&IntegerType::Int4)?
-        .builtin_type(&IntegerType::Int8)
+        .builtin_type(&IntegerType::Int8)?
+        .builtin_type(&oid::Oid)
 }
 
 // FIXME(pg-catalog): three places that do not know about each other say what
