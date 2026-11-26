@@ -47,15 +47,11 @@ expect {
     5
 }
 
-@compat-gap "cast:int2 -> numeric"
 test cast-int2-to-numeric {
     SELECT (5::int2)::numeric;
 }
 expect {
     5
-}
-expect @tursopg {
-    5.0
 }
 
 test cast-int2-to-text {
@@ -118,15 +114,11 @@ expect {
     7
 }
 
-@compat-gap "cast:int4 -> numeric"
 test cast-int4-to-numeric {
     SELECT (7)::numeric;
 }
 expect {
     7
-}
-expect @tursopg {
-    7.0
 }
 
 test cast-int4-to-text {
@@ -190,15 +182,11 @@ expect {
     9
 }
 
-@compat-gap "cast:int8 -> numeric"
 test cast-int8-to-numeric {
     SELECT (9::int8)::numeric;
 }
 expect {
     9
-}
-expect @tursopg {
-    9.0
 }
 
 test cast-int8-to-text {
@@ -462,15 +450,11 @@ expect {
     1
 }
 
-@compat-gap "cast:text -> numeric"
 test cast-text-to-numeric {
     SELECT ('1'::text)::numeric;
 }
 expect {
     1
-}
-expect @tursopg {
-    1.0
 }
 
 test cast-text-to-text {
@@ -530,15 +514,11 @@ test cast-bool-to-float8 {
 @sqlstate 42846
 expect error {}
 
-@compat-gap "cast:bool -> numeric"
 test cast-bool-to-numeric {
     SELECT (true)::numeric;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    1.0
-}
 
 test cast-bool-to-text {
     SELECT (true)::text;
@@ -1413,7 +1393,6 @@ expect {
     5
 }
 
-@compat-gap "cast:int2 -> numeric"
 test assign-int2-to-numeric-column {
     CREATE TABLE t (c numeric);
     INSERT INTO t VALUES (5::int2);
@@ -1421,9 +1400,6 @@ test assign-int2-to-numeric-column {
 }
 expect {
     5
-}
-expect @tursopg {
-    5.0
 }
 
 test assign-int2-to-text-column {
@@ -1504,7 +1480,6 @@ expect {
     7
 }
 
-@compat-gap "cast:int4 -> numeric"
 test assign-int4-to-numeric-column {
     CREATE TABLE t (c numeric);
     INSERT INTO t VALUES (7);
@@ -1512,9 +1487,6 @@ test assign-int4-to-numeric-column {
 }
 expect {
     7
-}
-expect @tursopg {
-    7.0
 }
 
 test assign-int4-to-text-column {
@@ -1595,7 +1567,6 @@ expect {
     9
 }
 
-@compat-gap "cast:int8 -> numeric"
 test assign-int8-to-numeric-column {
     CREATE TABLE t (c numeric);
     INSERT INTO t VALUES (9::int8);
@@ -1603,9 +1574,6 @@ test assign-int8-to-numeric-column {
 }
 expect {
     9
-}
-expect @tursopg {
-    9.0
 }
 
 test assign-int8-to-text-column {

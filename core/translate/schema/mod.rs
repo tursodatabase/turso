@@ -883,14 +883,15 @@ pub(crate) fn check_column_type(
         );
     };
     // A column gives one modifier for each type parameter besides `value`, as
-    // in `p(10)`, and none for a type without such parameters.
+    // in `p(10)`, or none when the type may leave them out.
     let expected = td.user_params().count();
     let provided = match &col_type.size {
         Some(ast::TypeSize::TypeSize(_, _)) => 2,
         Some(ast::TypeSize::MaxSize(_)) => 1,
         None => 0,
     };
-    if provided != expected {
+    let may_omit_arguments = provided == 0 && td.params_may_be_omitted;
+    if provided != expected && !may_omit_arguments {
         bail_parse_error!(
             "type \"{}\" requires {} parameter(s), got {}",
             type_name,
@@ -3268,6 +3269,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         is_type_of_conditions: _,
         casts_to_numbers_and_booleans: _,
         can_be_rowid_alias: _,
+        params_may_be_omitted: _,
         sql: _,
         domain_checks,
         kind,

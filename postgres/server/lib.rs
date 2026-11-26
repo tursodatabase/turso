@@ -11,8 +11,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, IntegerType, PgConnection,
-    StatementResultKind, TransactionState,
+    check_pg_numeric, parse_pg_bool, split_statements, sql_parse_error, sqlstate_error,
+    IntegerType, PgConnection, StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
@@ -1014,7 +1014,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
     }
 }
 
-/// FIXME(pg-catalog): This hand-codes the input function (typinput in pg_type) of each declared parameter type, and differs from it: it reads numeric as a float. A call to the typinput function of the declared type replaces this.
+/// FIXME(pg-catalog): This hand-codes the input function (typinput in pg_type) of each declared parameter type. A call to the typinput function of the declared type replaces this.
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
@@ -1028,7 +1028,11 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         Type::INT2 => integer_parameter(IntegerType::Int2, text),
         Type::INT4 => integer_parameter(IntegerType::Int4, text),
         Type::INT8 => integer_parameter(IntegerType::Int8, text),
-        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
+        Type::NUMERIC => match check_pg_numeric(text) {
+            Ok(()) => Ok(Value::from_text(text.to_owned())),
+            Err(error) => Err(pg_error(error.into())),
+        },
+        Type::FLOAT4 | Type::FLOAT8 => {
             let f: f64 = text.parse().map_err(|e| {
                 PgWireError::UserError(Box::new(error_info(&format!(
                     "invalid float parameter: {e}"
@@ -1784,6 +1788,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn numeric_parameter_keeps_its_digits_in_a_numeric_column() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE w (n numeric, m numeric(5,2))")
+            .unwrap();
+        let mut portal = Portal::<String>::default();
+        portal.statement = Arc::new(StoredStatement::new(
+            String::new(),
+            String::new(),
+            vec![Some(Type::NUMERIC), Some(Type::NUMERIC)],
+        ));
+        portal.parameters = vec![
+            Some(b"123456789012345678901234567890.123".to_vec().into()),
+            Some(b"1.005".to_vec().into()),
+        ];
+        let mut stmt = conn.prepare("INSERT INTO w VALUES ($1, $2)").unwrap();
+        bind_portal_parameters(&mut stmt, &portal).unwrap();
+        stmt.run_collect_rows().unwrap();
+        let rows = conn
+            .prepare("SELECT n::text, m::text FROM w")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [[
+                Value::from_text("123456789012345678901234567890.123"),
+                Value::from_text("1.01")
+            ]]
+        );
+    }
+
     /// A parameter sent without a type has type unknown, which PostgreSQL
     /// reads as text input, whatever the text looks like.
     #[test]
@@ -2367,9 +2403,27 @@ mod tests {
 
         let val = pg_bytes_to_value(b"-0.5", &Type::FLOAT4).unwrap();
         assert_eq!(val, Value::from_f64(-0.5));
+    }
 
-        let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC).unwrap();
-        assert_eq!(val, Value::from_f64(1.23));
+    #[test]
+    fn test_pg_bytes_to_value_numeric_keeps_the_digits_as_text() {
+        for text in [
+            "1.23",
+            "123456789012345678901234567890.123",
+            " 1e3 ",
+            "-0.50",
+        ] {
+            let val = pg_bytes_to_value(text.as_bytes(), &Type::NUMERIC).unwrap();
+            assert_eq!(val, Value::from_text(text.to_owned()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_numeric_invalid() {
+        let Err(error) = pg_bytes_to_value(b"abc", &Type::NUMERIC) else {
+            panic!("no error");
+        };
+        assert_eq!(sqlstate(error), SQLSTATE_INVALID_TEXT_REPRESENTATION);
     }
 
     #[test]

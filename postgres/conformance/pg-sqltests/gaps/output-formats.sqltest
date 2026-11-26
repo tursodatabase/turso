@@ -420,7 +420,7 @@ test numeric-nan-raw-value-inside-json-build-object {
 expect {
     NaN|{"v" : "NaN"}
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {}
 
 # C-32: double precision 'Infinity': raw value, inside json_build_object

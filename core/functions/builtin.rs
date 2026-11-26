@@ -15,8 +15,9 @@ use crate::info;
 use crate::json;
 use crate::namespace::{mangle_name, NamespaceId};
 use crate::numeric::decimal::{
-    bigdecimal_to_blob, blob_to_bigdecimal, check_numeric_limits, format_numeric,
-    numeric_from_value, validate_precision_scale, MAX_FRACTION_DIGITS,
+    blob_to_numeric_value, check_numeric_limits, format_numeric, format_numeric_value,
+    negate_special, numeric_from_value, numeric_value_to_blob, special_arithmetic,
+    validate_precision_scale, NumericOp, NumericValue, MAX_FRACTION_DIGITS,
 };
 use crate::numeric::Numeric;
 use crate::stats::StatAccum;
@@ -1113,8 +1114,21 @@ pub fn call_builtin_scalar(
             Ok(match (lhs_val, rhs_val) {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
                 _ => {
-                    let a = numeric_from_value(lhs_val)?;
-                    let b = numeric_from_value(rhs_val)?;
+                    let (a, b) = match (numeric_from_value(lhs_val)?, numeric_from_value(rhs_val)?)
+                    {
+                        (NumericValue::Finite(a), NumericValue::Finite(b)) => (a, b),
+                        (a, b) => {
+                            let op = match func {
+                                ScalarFunc::NumericAdd => NumericOp::Add,
+                                ScalarFunc::NumericSub => NumericOp::Sub,
+                                ScalarFunc::NumericMul => NumericOp::Mul,
+                                ScalarFunc::NumericDiv => NumericOp::Div,
+                                _ => NumericOp::Mod,
+                            };
+                            let result = special_arithmetic(op, &a, &b)?;
+                            return Ok(Value::build_text(format_numeric_value(&result)));
+                        }
+                    };
                     let (a_scale, b_scale) =
                         (a.fractional_digit_count(), b.fractional_digit_count());
                     let res = match func {
@@ -1126,7 +1140,7 @@ pub fn call_builtin_scalar(
                         ),
                         ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                             if b.is_zero() {
-                                return Err(LimboError::Constraint("division by zero".to_string()));
+                                return Err(LimboError::DivisionByZero);
                             }
                             if matches!(func, ScalarFunc::NumericDiv) {
                                 a / b
@@ -1145,7 +1159,10 @@ pub fn call_builtin_scalar(
             check_arg_count(args, 1)?;
             Ok(match args[0].get_value() {
                 Value::Null => Value::Null,
-                val => Value::build_text(format_numeric(&-numeric_from_value(val)?)),
+                val => match numeric_from_value(val)? {
+                    NumericValue::Finite(number) => Value::build_text(format_numeric(&-number)),
+                    special => Value::build_text(format_numeric_value(&negate_special(&special))),
+                },
             })
         }
         ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
@@ -1305,27 +1322,23 @@ pub(crate) fn exec_validate_ipaddr(value: &Value) -> crate::Result<Value> {
 }
 
 /// The stored form of the number `value` as a numeric.
-pub(crate) fn exec_numeric_encode(value: &Value) -> crate::Result<Value> {
+pub fn exec_numeric_encode(value: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
         other => {
-            let bd = numeric_from_value(other)?;
-            Value::from_blob(bigdecimal_to_blob(&bd))
+            let number = numeric_from_value(other)?;
+            Value::from_blob(numeric_value_to_blob(&number))
         }
     })
 }
 
 /// The stored numeric `value` rounded to `scale`, or an error when it has
 /// more digits than `precision` allows.
-pub(crate) fn exec_numeric_fit(
-    value: &Value,
-    precision: &Value,
-    scale: &Value,
-) -> crate::Result<Value> {
+pub fn exec_numeric_fit(value: &Value, precision: &Value, scale: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
         Value::Blob(stored) => {
-            let bd = blob_to_bigdecimal(stored)?;
+            let number = blob_to_numeric_value(stored)?;
             let (
                 Value::Numeric(Numeric::Integer(precision)),
                 Value::Numeric(Numeric::Integer(scale)),
@@ -1335,8 +1348,18 @@ pub(crate) fn exec_numeric_fit(
                     "numeric_fit: precision and scale must be integers".to_string(),
                 ));
             };
-            let fitted = validate_precision_scale(&bd, *precision, *scale)?;
-            Value::from_blob(bigdecimal_to_blob(&fitted))
+            match number {
+                NumericValue::Finite(bd) => {
+                    let fitted = validate_precision_scale(&bd, *precision, *scale)?;
+                    Value::from_blob(numeric_value_to_blob(&NumericValue::Finite(fitted)))
+                }
+                NumericValue::NaN => Value::from_blob(stored.clone()),
+                NumericValue::Infinity | NumericValue::NegativeInfinity => {
+                    return Err(LimboError::Constraint(format!(
+                        "numeric field overflow: a field with precision {precision}, scale {scale} cannot hold an infinite value"
+                    )));
+                }
+            }
         }
         other => {
             return Err(LimboError::InternalError(format!(
@@ -1348,10 +1371,10 @@ pub(crate) fn exec_numeric_fit(
 }
 
 /// The text of the stored numeric `value`.
-pub(crate) fn exec_numeric_decode(value: &Value) -> crate::Result<Value> {
+pub fn exec_numeric_decode(value: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
-        Value::Blob(b) => Value::build_text(format_numeric(&blob_to_bigdecimal(b)?)),
+        Value::Blob(b) => Value::build_text(format_numeric_value(&blob_to_numeric_value(b)?)),
         other => {
             return Err(LimboError::Constraint(format!(
                 "numeric_decode: expected blob, got \"{other}\""

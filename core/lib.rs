@@ -100,6 +100,7 @@ pub use function::MathFunc;
 pub use function::{ExternalFunc, Func, ScalarFunc};
 /// The ENCODE of the built-in date and time types, also used by the PostgreSQL
 /// frontend to check input in `pg_input_is_valid`.
+pub use functions::builtin::{exec_numeric_decode, exec_numeric_encode, exec_numeric_fit};
 pub use functions::datetime_input::exec_temporal_encode;
 /// The printf engine backing the SQL printf()/format() functions, also used
 /// by the C API's sqlite3_mprintf/sqlite3_snprintf so both share one
@@ -185,7 +186,7 @@ pub use io::{
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{
-    decimal::{format_numeric_text, Decimal},
+    decimal::{format_numeric_text, round_numeric_text, Decimal, RoundedNumeric},
     nonnan::NonNan,
     Numeric,
 };

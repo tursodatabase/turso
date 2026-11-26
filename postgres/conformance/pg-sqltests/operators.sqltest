@@ -433,7 +433,6 @@ expect {
     f
 }
 
-@compat-gap "type:numeric"
 @setup operands
 test string-literal-with-more-digits-than-a-double-next-to-a-numeric-column-errors {
     CREATE TABLE doubles (n numeric);
@@ -442,10 +441,6 @@ test string-literal-with-more-digits-than-a-double-next-to-a-numeric-column-erro
 }
 expect {
     f
-}
-@sqlstate 0A000
-expect @tursopg error {
-    has more digits than a double keeps
 }
 
 @setup operands

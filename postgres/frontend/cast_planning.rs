@@ -204,7 +204,6 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
         "boolean" => Bool,
         "timestamp" => Timestamp,
         "timestamptz" => TimestampTz,
-        // FIXME(pg-catalog): numeric is registered only with a type modifier. Without one it is REAL, which `is_lowered_type_name` leaves to the engine. A numeric type that needs no modifier lets every numeric go through CASTS.
         "numeric" => Numeric,
         // FIXME(pg-catalog): varchar with a length is cast as text, and its length is checked when the value is stored. A pg_cast row for varchar, with the length coercion function, replaces this.
         "varchar" => Text,
@@ -272,7 +271,7 @@ const ENGINE_RULE_TYPES: &[&str] = &[
     "regcollation",
 ];
 
-/// FIXME(pg-catalog): These are SQLite type names that the translator writes for PostgreSQL types `named_cast_type` cannot tell apart: an INTEGER column is an oid or a reg type, a CAST to INTEGER is a cast to one of those or to a serial type, a CAST to REAL is a cast to numeric, decimal or money, and BLOB is bytea. The engine casts them as it did before. Registered oid, numeric and bytea types, whose names reach the cast, replace this.
+/// FIXME(pg-catalog): These are SQLite type names that the translator writes for PostgreSQL types `named_cast_type` cannot tell apart: an INTEGER column is an oid or a reg type, a CAST to INTEGER is a cast to one of those or to a serial type, a CAST to REAL is a cast to money or to an array of numbers, and BLOB is bytea. The engine casts them as it did before. Registered oid, money and bytea types, whose names reach the cast, replace this.
 /// Whether the lowercase `name`, written at `place`, is a SQLite type name
 /// that stands for a PostgreSQL type whose casts the engine decides.
 fn is_lowered_type_name(name: &str, place: NamePlace) -> bool {

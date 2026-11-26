@@ -1,0 +1,274 @@
+# The numeric type keeps exact decimals, rounds to the scale that is written, and fails with PostgreSQL's errors.
+
+@database :memory:
+
+test numeric-column-rounds-half-away-from-zero {
+    CREATE TABLE t (n numeric(10,2));
+    INSERT INTO t VALUES ('1.005'), ('2.675'), ('-1.005');
+    SELECT n FROM t;
+}
+expect {
+    1.01
+    2.68
+    -1.01
+}
+
+test numeric-column-rejects-text-that-is-not-a-number {
+    CREATE TABLE t (n numeric(5,2));
+    INSERT INTO t VALUES ('abc');
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-p-s-overflow {
+    CREATE TABLE t (n numeric(5,2));
+    INSERT INTO t VALUES (12345.678);
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-column-without-precision-keeps-each-value-as-written {
+    CREATE TABLE t (n numeric);
+    INSERT INTO t VALUES ('123456789012345678901234567890.123'), ('1.50'), ('1e3'), (2);
+    SELECT n FROM t;
+}
+expect {
+    123456789012345678901234567890.123
+    1.50
+    1000
+    2
+}
+
+test numeric-big-precision {
+    SELECT '123456789012345678901234567890.123'::numeric;
+}
+expect {
+    123456789012345678901234567890.123
+}
+
+test numeric-exponent-input {
+    SELECT '1e3'::numeric, '1.50'::numeric;
+}
+expect {
+    1000|1.50
+}
+
+test numeric-10-2-rounding-half-away-from-zero {
+    SELECT '1.005'::numeric(10,2), '2.675'::numeric(10,2), '-1.005'::numeric(10,2);
+}
+expect {
+    1.01|2.68|-1.01
+}
+
+test numeric-10-0-rounding {
+    SELECT '2.5'::numeric(10,0), '3.5'::numeric(10,0);
+}
+expect {
+    3|4
+}
+
+test numeric-cast-with-a-precision-only-has-scale-zero {
+    SELECT '2.5'::numeric(10), '3.5'::numeric(10);
+}
+expect {
+    3|4
+}
+
+test numeric-overflow-on-typmod {
+    SELECT '123456.1'::numeric(5,2);
+}
+@sqlstate 22003
+expect error {}
+
+test invalid-numeric {
+    SELECT 'abc'::numeric;
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-addition-is-exact {
+    SELECT 0.1::numeric + 0.2::numeric;
+}
+expect {
+    0.3
+}
+
+test jsonb-casts-to-numeric {
+    CREATE TABLE j (f jsonb);
+    INSERT INTO j VALUES ('1.5');
+    SELECT f::numeric FROM j;
+}
+expect {
+    1.5
+}
+
+test numeric-division-by-zero-is-an-error {
+    SELECT '1.50'::numeric / '0'::numeric;
+}
+@sqlstate 22012
+expect error {}
+
+test numeric-remainder-with-zero-is-an-error {
+    SELECT 5::numeric(5,0) % '0'::numeric;
+}
+@sqlstate 22012
+expect error {}
+
+test numeric-reads-nan-and-infinity {
+    SELECT 'NaN'::numeric, ' nan '::numeric, 'Infinity'::numeric, '-inf'::numeric, '+Infinity'::numeric, 'INF'::numeric;
+}
+expect {
+    NaN|NaN|Infinity|-Infinity|Infinity|Infinity
+}
+
+test numeric-rejects-signed-nan {
+    SELECT '+nan'::numeric;
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-rejects-text-that-only-starts-like-infinity {
+    SELECT 'infinit'::numeric;
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-column-stores-nan-and-infinity {
+    CREATE TABLE t (n numeric);
+    INSERT INTO t VALUES ('NaN'), ('Infinity'), ('-Infinity');
+    SELECT n FROM t;
+}
+expect {
+    NaN
+    Infinity
+    -Infinity
+}
+
+test numeric-orders-nan-after-infinity {
+    CREATE TABLE t (n numeric);
+    INSERT INTO t VALUES ('NaN'), (1), ('Infinity'), ('-Infinity'), (0), ('NaN');
+    SELECT n FROM t ORDER BY n;
+}
+expect {
+    -Infinity
+    0
+    1
+    Infinity
+    NaN
+    NaN
+}
+
+test numeric-distinct-treats-nan-as-one-value {
+    CREATE TABLE t (n numeric);
+    INSERT INTO t VALUES ('NaN'), ('nan'), ('Infinity'), ('inf');
+    SELECT n FROM t GROUP BY n ORDER BY n;
+}
+expect {
+    Infinity
+    NaN
+}
+
+test numeric-nan-equals-nan-and-is-greater-than-everything {
+    SELECT 'NaN'::numeric = 'NaN'::numeric, 'NaN'::numeric > 'Infinity'::numeric, 'NaN'::numeric = 1, 'Infinity'::numeric > '1e300'::numeric;
+}
+expect {
+    t|t|f|t
+}
+
+test numeric-with-precision-takes-nan {
+    SELECT 'NaN'::numeric(5,2);
+}
+expect {
+    NaN
+}
+
+test numeric-with-precision-rejects-infinity {
+    SELECT 'Infinity'::numeric(5,2);
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-column-with-precision-rejects-infinity {
+    CREATE TABLE t (n numeric(5,2));
+    INSERT INTO t VALUES ('-Infinity');
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-addition-and-subtraction-with-nan-and-infinity {
+    SELECT 'NaN'::numeric + 1, 'Infinity'::numeric + '-Infinity'::numeric, 'Infinity'::numeric + 1, 1 - 'Infinity'::numeric, 'Infinity'::numeric - 'Infinity'::numeric, 'Infinity'::numeric - '-Infinity'::numeric;
+}
+expect {
+    NaN|NaN|Infinity|-Infinity|NaN|Infinity
+}
+
+test numeric-multiplication-with-nan-and-infinity {
+    SELECT 'Infinity'::numeric * 0, 'Infinity'::numeric * -2, 'NaN'::numeric * 0, '-Infinity'::numeric * '-Infinity'::numeric;
+}
+expect {
+    NaN|-Infinity|NaN|Infinity
+}
+
+test numeric-division-with-nan-and-infinity {
+    SELECT 1 / 'Infinity'::numeric, 'Infinity'::numeric / 'Infinity'::numeric, 'Infinity'::numeric / -2, '1.50'::numeric / 'Infinity'::numeric, 'NaN'::numeric / 0;
+}
+expect {
+    0|NaN|-Infinity|0|NaN
+}
+
+test numeric-infinity-divided-by-zero-is-an-error {
+    SELECT 'Infinity'::numeric / 0;
+}
+@sqlstate 22012
+expect error {}
+
+test numeric-remainder-with-nan-and-infinity {
+    SELECT 'Infinity'::numeric % 2, 5 % 'Infinity'::numeric, -5 % 'Infinity'::numeric, '5.50'::numeric % '-Infinity'::numeric, 'NaN'::numeric % 0, 'Infinity'::numeric % 'Infinity'::numeric;
+}
+expect {
+    NaN|5|-5|5.50|NaN|NaN
+}
+
+test numeric-infinity-remainder-zero-is-an-error {
+    SELECT 'Infinity'::numeric % 0;
+}
+@sqlstate 22012
+expect error {}
+
+test numeric-negation-of-nan-and-infinity {
+    SELECT -'NaN'::numeric, -'Infinity'::numeric, -'-Infinity'::numeric;
+}
+expect {
+    NaN|-Infinity|Infinity
+}
+
+test numeric-nan-cast-to-integer {
+    SELECT 'NaN'::numeric::int;
+}
+@sqlstate 0A000
+expect error {
+    cannot convert NaN to integer
+}
+
+test numeric-infinity-cast-to-integer {
+    SELECT '-Infinity'::numeric::bigint;
+}
+@sqlstate 0A000
+expect error {
+    cannot convert infinity to bigint
+}
+
+test numeric-cast-to-integer-rounds-half-away-from-zero {
+    SELECT 2.5::numeric::int, (-2.5)::numeric::int, '9223372036854775807.4'::numeric::bigint;
+}
+expect {
+    3|-3|9223372036854775807
+}
+
+test numeric-cast-to-integer-out-of-range {
+    SELECT '9223372036854775807.5'::numeric::bigint;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}

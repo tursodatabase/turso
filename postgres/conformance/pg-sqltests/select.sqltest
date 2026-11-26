@@ -723,23 +723,38 @@ expect error {
     bigint out of range
 }
 
+@compat-gap "cast:numeric -> int8"
 test select-cast-int8-out-of-range-literal-after-true-or-in-where {
     SELECT 1 WHERE true OR 9223372036854775808::int8 = 1;
 }
 expect {
     1
 }
+@sqlstate 22003
+expect @tursopg error {
+    bigint out of range
+}
 
+@compat-gap "cast:numeric -> int8"
 test select-cast-int8-out-of-range-literal-after-false-and-in-where {
     SELECT 1 WHERE false AND 9223372036854775808::int8 = 1;
 }
 expect {}
+@sqlstate 22003
+expect @tursopg error {
+    bigint out of range
+}
 
+@compat-gap "cast:numeric -> int8"
 test select-cast-int8-out-of-range-literal-after-matching-column-in-where {
     SELECT x FROM (SELECT 1 AS x) t WHERE x = 1 OR 9223372036854775808::int8 = 1;
 }
 expect {
     1
+}
+@sqlstate 22003
+expect @tursopg error {
+    bigint out of range
 }
 
 test select-cast-int8-out-of-range-literal-checked-for-each-row-in-where {

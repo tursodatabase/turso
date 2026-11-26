@@ -117,6 +117,14 @@ pub trait Type: Debug + Send + Sync {
         None
     }
 
+    /// Whether a column or a CAST may name the type without its parameters,
+    /// as `numeric` for `numeric(p, s)`. The type is then unlimited and its
+    /// COERCE does not run. Otherwise a column must give every parameter and
+    /// a CAST without them is SQLite's CAST.
+    fn params_may_be_omitted(&self) -> bool {
+        false
+    }
+
     /// Whether a comparison and the other conditions (`NOT`, `AND`, `OR`,
     /// `IN`, `BETWEEN`, `IS NULL`, `LIKE`, `EXISTS`) give a value of this
     /// type. Their value is the integer 1 or 0 or NULL, so the type must

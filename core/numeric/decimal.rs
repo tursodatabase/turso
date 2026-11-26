@@ -9,6 +9,13 @@ use crate::{LimboError, Numeric, Value, ValueBlob, ValueRef};
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
 const FLAG_NEGATIVE: u8 = 0x01;
+/// A blob of this version holds NaN or an infinity: `[version][kind]`. Older
+/// versions of Turso reject it as an unsupported version instead of reading
+/// it as a number.
+const SPECIAL_BLOB_VERSION: u8 = 0x02;
+const SPECIAL_NAN: u8 = 1;
+const SPECIAL_INFINITY: u8 = 2;
+const SPECIAL_NEGATIVE_INFINITY: u8 = 3;
 const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 
 /// PostgreSQL's limits on a numeric value: the most digits it may have before
@@ -16,22 +23,73 @@ const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 const MAX_INTEGER_DIGITS: i64 = 131_072;
 pub(crate) const MAX_FRACTION_DIGITS: i64 = 16_383;
 
+/// A value of the numeric type: a finite decimal, NaN, or an infinity. Like
+/// PostgreSQL, NaN equals itself and sorts after every other value.
+#[derive(Debug, Clone)]
+pub enum NumericValue {
+    Finite(BigDecimal),
+    NaN,
+    Infinity,
+    NegativeInfinity,
+}
+
+/// The arithmetic operators of the numeric type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
 /// The text that PostgreSQL's numeric type writes for the number `text`, such
 /// as `0.002` for `2e-3` and `100` for `1e2`. It reads `text` as
 /// [`numeric_from_value`] does, so it fails for text that is not a number and
 /// for a value with more digits than numeric allows.
 pub fn format_numeric_text(text: &str) -> crate::Result<String> {
-    numeric_from_value(&Value::build_text(text.to_string())).map(|value| format_numeric(&value))
+    numeric_from_value(&Value::build_text(text.to_string()))
+        .map(|value| format_numeric_value(&value))
 }
 
-/// The numeric value of `val`: an integer, a real, or text such as `1.5` or
-/// `1e5`. Every numeric function reads its arguments with this, so they all
+/// The whole number nearest to a numeric value, with halves rounded away from
+/// zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundedNumeric {
+    Integer(i64),
+    OutOfRange,
+    NaN,
+    Infinity,
+    NegativeInfinity,
+}
+
+/// The whole number nearest to the numeric `text`, read as
+/// [`numeric_from_value`] reads it.
+pub fn round_numeric_text(text: &str) -> crate::Result<RoundedNumeric> {
+    use bigdecimal::{RoundingMode, ToPrimitive};
+    Ok(match numeric_from_text(text)? {
+        NumericValue::NaN => RoundedNumeric::NaN,
+        NumericValue::Infinity => RoundedNumeric::Infinity,
+        NumericValue::NegativeInfinity => RoundedNumeric::NegativeInfinity,
+        NumericValue::Finite(number) => number
+            .with_scale_round(0, RoundingMode::HalfUp)
+            .to_i64()
+            .map_or(RoundedNumeric::OutOfRange, RoundedNumeric::Integer),
+    })
+}
+
+/// The numeric value of `val`: an integer, a real, or text such as `1.5`,
+/// `1e5`, `NaN` or `-Infinity`. Every numeric function reads its arguments with this, so they all
 /// accept the same values within the same limits. A blob is not a number, even
 /// one that holds a stored numeric: `n + x` with a blob in `x` is an error.
-pub fn numeric_from_value(val: &Value) -> crate::Result<BigDecimal> {
+pub fn numeric_from_value(val: &Value) -> crate::Result<NumericValue> {
     match val {
-        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
-        Value::Numeric(Numeric::Float(f)) => numeric_from_text(&f.to_string()),
+        Value::Numeric(Numeric::Integer(i)) => Ok(NumericValue::Finite(BigDecimal::from(*i))),
+        Value::Numeric(Numeric::Float(f)) => Ok(match f64::from(*f) {
+            f if f == f64::INFINITY => NumericValue::Infinity,
+            f if f == f64::NEG_INFINITY => NumericValue::NegativeInfinity,
+            f => numeric_from_text(&f.to_string())?,
+        }),
         Value::Text(t) => numeric_from_text(t.as_str()),
         Value::Blob(_) => Err(LimboError::Constraint(
             "invalid input syntax for type numeric: a blob is not a number".to_string(),
@@ -49,12 +107,12 @@ pub fn numeric_from_value(val: &Value) -> crate::Result<BigDecimal> {
 /// A frontend uses it to compare numbers that are not in a numeric column,
 /// such as the numbers in a JSON document, by the rules of the numeric type.
 #[derive(Debug, Clone)]
-pub struct Decimal(BigDecimal);
+pub struct Decimal(NumericValue);
 
 impl std::str::FromStr for Decimal {
     type Err = LimboError;
 
-    /// Reads decimal text such as `-1.50` or `1e2`. Text that is not a
+    /// Reads decimal text such as `-1.50`, `1e2` or `NaN`. Text that is not a
     /// number, or that has more digits than PostgreSQL allows, is an error.
     fn from_str(text: &str) -> crate::Result<Self> {
         numeric_from_text(text).map(Self)
@@ -77,21 +135,45 @@ impl PartialOrd for Decimal {
 
 impl Ord for Decimal {
     fn cmp(&self, other: &Self) -> Ordering {
-        compare_numbers(&self.0, &other.0)
+        compare_values(&self.0, &other.0)
     }
 }
 
-/// The numeric value of decimal text, such as `1.5` or `1e5`, within the
-/// limits of PostgreSQL.
-fn numeric_from_text(text: &str) -> crate::Result<BigDecimal> {
+/// The numeric value of decimal text, such as `1.5`, `1e5`, `NaN` or
+/// `-Infinity`, within the limits of PostgreSQL.
+fn numeric_from_text(text: &str) -> crate::Result<NumericValue> {
+    if let Some(special) = parse_special(text) {
+        return Ok(special);
+    }
     let value = parse_numeric(text)?;
     check_numeric_limits(&value)?;
     // `0e5` parses as zero with scale -5. Zero has no digits, so its exponent
     // is dropped, as PostgreSQL does.
     if value.is_zero() && value.fractional_digit_count() < 0 {
-        return Ok(value.with_scale(0));
+        return Ok(NumericValue::Finite(value.with_scale(0)));
     }
-    Ok(value)
+    Ok(NumericValue::Finite(value))
+}
+
+/// `NaN`, `Infinity` or `inf`, in any case, with a sign on the infinity and
+/// whitespace around the word, as PostgreSQL reads them.
+fn parse_special(text: &str) -> Option<NumericValue> {
+    let word = text.trim_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    if word.eq_ignore_ascii_case("nan") {
+        return Some(NumericValue::NaN);
+    }
+    let (negative, unsigned) = match word.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, word.strip_prefix('+').unwrap_or(word)),
+    };
+    if !(unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity")) {
+        return None;
+    }
+    Some(if negative {
+        NumericValue::NegativeInfinity
+    } else {
+        NumericValue::Infinity
+    })
 }
 
 fn parse_numeric(text: &str) -> crate::Result<BigDecimal> {
@@ -150,8 +232,8 @@ fn numeric_overflow() -> LimboError {
 /// The numeric type's order. Indexes and sorts use it, so unlike the numeric
 /// functions it never fails: every value has a place. NULL comes first, then
 /// numbers by value (integers, reals, numeric text and stored numeric blobs,
-/// with -infinity and +infinity at the ends), then any other text by bytes,
-/// then any other blob by bytes. Numbers that differ only in trailing zeros,
+/// with -infinity and +infinity at the ends and NaN after them), then any
+/// other text by bytes, then any other blob by bytes. Numbers that differ only in trailing zeros,
 /// such as 1.5 and 1.50, are equal.
 pub fn numeric_compare(left: ValueRef, right: ValueRef) -> Ordering {
     compare_sort_keys(NumericSortKey::of(left), NumericSortKey::of(right))
@@ -170,7 +252,7 @@ pub fn numeric_compare_operands(left: ValueRef, right: ValueRef) -> crate::Resul
 
 fn compare_sort_keys(left: NumericSortKey, right: NumericSortKey) -> Ordering {
     match (left, right) {
-        (NumericSortKey::Number(l), NumericSortKey::Number(r)) => compare_numbers(&l, &r),
+        (NumericSortKey::Number(l), NumericSortKey::Number(r)) => compare_values(&l, &r),
         (NumericSortKey::Text(l), NumericSortKey::Text(r)) => l.cmp(r),
         (NumericSortKey::Blob(l), NumericSortKey::Blob(r)) => l.cmp(r),
         (l, r) => l.rank().cmp(&r.rank()),
@@ -182,23 +264,21 @@ pub fn numeric_hash<H: Hasher>(value: ValueRef, state: &mut H) {
     let key = NumericSortKey::of(value);
     key.rank().hash(state);
     match key {
-        NumericSortKey::Number(number) => {
+        NumericSortKey::Number(NumericValue::Finite(number)) => {
             let (digits, scale) = number.normalized().into_bigint_and_exponent();
             digits.hash(state);
             scale.hash(state);
         }
         NumericSortKey::Text(text) => text.hash(state),
         NumericSortKey::Blob(blob) => blob.hash(state),
-        NumericSortKey::Null | NumericSortKey::NegativeInfinity | NumericSortKey::Infinity => {}
+        NumericSortKey::Null | NumericSortKey::Number(_) => {}
     }
 }
 
 /// Where a value falls in the numeric type's order.
 enum NumericSortKey<'a> {
     Null,
-    NegativeInfinity,
-    Number(BigDecimal),
-    Infinity,
+    Number(NumericValue),
     Text(&'a str),
     Blob(&'a [u8]),
 }
@@ -207,28 +287,30 @@ impl<'a> NumericSortKey<'a> {
     fn of(value: ValueRef<'a>) -> Self {
         match value {
             ValueRef::Null => Self::Null,
-            ValueRef::Numeric(Numeric::Integer(i)) => Self::Number(BigDecimal::from(i)),
+            ValueRef::Numeric(Numeric::Integer(i)) => {
+                Self::Number(NumericValue::Finite(BigDecimal::from(i)))
+            }
             ValueRef::Numeric(Numeric::Float(f)) => {
                 let f = f64::from(f);
                 if f == f64::INFINITY {
-                    Self::Infinity
+                    Self::Number(NumericValue::Infinity)
                 } else if f == f64::NEG_INFINITY {
-                    Self::NegativeInfinity
+                    Self::Number(NumericValue::NegativeInfinity)
                 } else {
                     // Every finite real is within the limits once written out.
-                    Self::Number(
+                    Self::Number(NumericValue::Finite(
                         parse_numeric(&f.to_string()).expect("a finite real is a valid numeric"),
-                    )
+                    ))
                 }
             }
             ValueRef::Text(text) => {
                 let text = text.as_str();
-                match parse_numeric(text) {
-                    Ok(number) if check_numeric_limits(&number).is_ok() => Self::Number(number),
-                    _ => Self::Text(text),
+                match numeric_from_text(text) {
+                    Ok(number) => Self::Number(number),
+                    Err(_) => Self::Text(text),
                 }
             }
-            ValueRef::Blob(blob) => match blob_to_bigdecimal(blob) {
+            ValueRef::Blob(blob) => match blob_to_numeric_value(blob) {
                 Ok(number) => Self::Number(number),
                 Err(_) => Self::Blob(blob),
             },
@@ -239,11 +321,11 @@ impl<'a> NumericSortKey<'a> {
     fn check_is_number(&self) -> crate::Result<()> {
         match self {
             Self::Text(text) => {
-                parse_numeric(text).and_then(|number| check_numeric_limits(&number))?;
+                numeric_from_text(text)?;
                 unreachable!("a text that reads as a numeric within the limits is a number")
             }
             Self::Blob(blob) => {
-                blob_to_bigdecimal(blob)?;
+                blob_to_numeric_value(blob)?;
                 unreachable!("a blob that reads as a numeric is a number")
             }
             _ => Ok(()),
@@ -253,12 +335,29 @@ impl<'a> NumericSortKey<'a> {
     fn rank(&self) -> u8 {
         match self {
             Self::Null => 0,
-            Self::NegativeInfinity => 1,
-            Self::Number(_) => 2,
-            Self::Infinity => 3,
-            Self::Text(_) => 4,
-            Self::Blob(_) => 5,
+            Self::Number(NumericValue::NegativeInfinity) => 1,
+            Self::Number(NumericValue::Finite(_)) => 2,
+            Self::Number(NumericValue::Infinity) => 3,
+            Self::Number(NumericValue::NaN) => 4,
+            Self::Text(_) => 5,
+            Self::Blob(_) => 6,
         }
+    }
+}
+
+/// Orders values as PostgreSQL does: negative infinity, the finite numbers,
+/// infinity, and NaN last. NaN equals NaN.
+fn compare_values(left: &NumericValue, right: &NumericValue) -> Ordering {
+    use NumericValue::{Finite, Infinity, NaN, NegativeInfinity};
+    let rank = |value: &NumericValue| match value {
+        NegativeInfinity => 0,
+        Finite(_) => 1,
+        Infinity => 2,
+        NaN => 3,
+    };
+    match (left, right) {
+        (Finite(l), Finite(r)) => compare_numbers(l, r),
+        (l, r) => rank(l).cmp(&rank(r)),
     }
 }
 
@@ -335,7 +434,37 @@ pub fn bigdecimal_to_blob(val: &BigDecimal) -> ValueBlob {
     buf
 }
 
-/// Deserialize a BigDecimal from our portable blob format.
+/// The blob of a numeric value. NaN and the infinities have their own
+/// version, which has no digits.
+pub fn numeric_value_to_blob(value: &NumericValue) -> ValueBlob {
+    let kind = match value {
+        NumericValue::Finite(number) => return bigdecimal_to_blob(number),
+        NumericValue::NaN => SPECIAL_NAN,
+        NumericValue::Infinity => SPECIAL_INFINITY,
+        NumericValue::NegativeInfinity => SPECIAL_NEGATIVE_INFINITY,
+    };
+    let mut buf = <ValueBlob as TursoVecExt<u8>>::with_capacity(2);
+    buf.push(SPECIAL_BLOB_VERSION);
+    buf.push(kind);
+    buf
+}
+
+/// The numeric value that a stored blob holds.
+pub fn blob_to_numeric_value(blob: &[u8]) -> crate::Result<NumericValue> {
+    if blob.first() != Some(&SPECIAL_BLOB_VERSION) {
+        return blob_to_bigdecimal(blob).map(NumericValue::Finite);
+    }
+    match blob {
+        [_, SPECIAL_NAN] => Ok(NumericValue::NaN),
+        [_, SPECIAL_INFINITY] => Ok(NumericValue::Infinity),
+        [_, SPECIAL_NEGATIVE_INFINITY] => Ok(NumericValue::NegativeInfinity),
+        _ => Err(LimboError::Constraint(
+            "invalid numeric blob: unknown special value".to_string(),
+        )),
+    }
+}
+
+/// Deserialize a finite BigDecimal from our portable blob format.
 pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     // Minimum size: version(1) + flags(1) + scale(8) + num_limbs(4) = 14
     if blob.len() < 14 {
@@ -405,6 +534,89 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     let sign = if limbs.is_empty() { Sign::NoSign } else { sign };
     let bigint = BigInt::new(sign, limbs);
     Ok(BigDecimal::new(bigint, scale))
+}
+
+/// `left op right` when `left` or `right` is NaN or an infinity, with the
+/// results of PostgreSQL. NaN with anything is NaN. An infinity minus the same
+/// infinity, or times zero, is NaN. A finite number divided by an infinity is
+/// zero, and its remainder is the number. An infinity divided by zero, or its
+/// remainder, is a division by zero.
+pub fn special_arithmetic(
+    op: NumericOp,
+    left: &NumericValue,
+    right: &NumericValue,
+) -> crate::Result<NumericValue> {
+    use NumericValue::{Finite, Infinity, NaN, NegativeInfinity};
+    let division_by_zero = || LimboError::DivisionByZero;
+    let infinity_with_sign = |negative: bool| {
+        if negative {
+            NegativeInfinity
+        } else {
+            Infinity
+        }
+    };
+    // The sign of a value that is not NaN: true when it is below zero.
+    let is_negative = |value: &NumericValue| match value {
+        NegativeInfinity => true,
+        Finite(number) => number.sign() == Sign::Minus,
+        Infinity | NaN => false,
+    };
+    let is_zero = |value: &NumericValue| matches!(value, Finite(number) if number.is_zero());
+    let is_infinite = |value: &NumericValue| matches!(value, Infinity | NegativeInfinity);
+
+    if matches!(left, NaN) || matches!(right, NaN) {
+        return Ok(NaN);
+    }
+    Ok(match op {
+        NumericOp::Add | NumericOp::Sub => {
+            let right_negative = is_negative(right) != (op == NumericOp::Sub);
+            match (is_infinite(left), is_infinite(right)) {
+                (true, true) if is_negative(left) != right_negative => NaN,
+                (true, _) => infinity_with_sign(is_negative(left)),
+                _ => infinity_with_sign(right_negative),
+            }
+        }
+        NumericOp::Mul => {
+            if is_zero(left) || is_zero(right) {
+                NaN
+            } else {
+                infinity_with_sign(is_negative(left) != is_negative(right))
+            }
+        }
+        NumericOp::Div => match (is_infinite(left), is_infinite(right)) {
+            (true, true) => NaN,
+            (true, false) if is_zero(right) => return Err(division_by_zero()),
+            (true, false) => infinity_with_sign(is_negative(left) != is_negative(right)),
+            _ => Finite(BigDecimal::from(0)),
+        },
+        NumericOp::Mod => match (is_infinite(left), is_infinite(right)) {
+            (true, true) => NaN,
+            (true, false) if is_zero(right) => return Err(division_by_zero()),
+            (true, false) => NaN,
+            _ => left.clone(),
+        },
+    })
+}
+
+/// `-value` for NaN and the infinities.
+pub fn negate_special(value: &NumericValue) -> NumericValue {
+    match value {
+        NumericValue::NaN => NumericValue::NaN,
+        NumericValue::Infinity => NumericValue::NegativeInfinity,
+        NumericValue::NegativeInfinity => NumericValue::Infinity,
+        NumericValue::Finite(number) => NumericValue::Finite(-number),
+    }
+}
+
+/// The text of a numeric value: `NaN`, `Infinity`, `-Infinity`, or the digits
+/// of a finite number as `format_numeric` writes them.
+pub fn format_numeric_value(value: &NumericValue) -> String {
+    match value {
+        NumericValue::Finite(number) => format_numeric(number),
+        NumericValue::NaN => "NaN".to_string(),
+        NumericValue::Infinity => "Infinity".to_string(),
+        NumericValue::NegativeInfinity => "-Infinity".to_string(),
+    }
 }
 
 /// Format a BigDecimal as a string, preserving trailing zeros for the scale.
@@ -497,6 +709,117 @@ mod tests {
     use super::*;
     use crate::types::AsValueRef;
     use std::str::FromStr;
+
+    #[test]
+    fn rounding_to_a_whole_number_takes_halves_away_from_zero() {
+        let round = |text: &str| round_numeric_text(text).unwrap();
+        assert_eq!(round("2.5"), RoundedNumeric::Integer(3));
+        assert_eq!(round("-2.5"), RoundedNumeric::Integer(-3));
+        assert_eq!(round("2.4999"), RoundedNumeric::Integer(2));
+        assert_eq!(round("1e2"), RoundedNumeric::Integer(100));
+        assert_eq!(
+            round("9223372036854775807.4"),
+            RoundedNumeric::Integer(i64::MAX)
+        );
+        assert_eq!(round("9223372036854775807.5"), RoundedNumeric::OutOfRange);
+        assert_eq!(round("-9223372036854775808.5"), RoundedNumeric::OutOfRange);
+        assert_eq!(round("NaN"), RoundedNumeric::NaN);
+        assert_eq!(round("Infinity"), RoundedNumeric::Infinity);
+        assert_eq!(round("-Infinity"), RoundedNumeric::NegativeInfinity);
+        assert!(round_numeric_text("abc").is_err());
+    }
+
+    #[test]
+    fn special_values_are_read_as_postgres_reads_them() {
+        let read = |text: &str| numeric_from_text(text);
+        assert!(matches!(read("NaN"), Ok(NumericValue::NaN)));
+        assert!(matches!(read(" nan\t"), Ok(NumericValue::NaN)));
+        assert!(matches!(read("Infinity"), Ok(NumericValue::Infinity)));
+        assert!(matches!(read("+inf"), Ok(NumericValue::Infinity)));
+        assert!(matches!(
+            read(" -INFINITY "),
+            Ok(NumericValue::NegativeInfinity)
+        ));
+        for text in ["+nan", "-nan", "na", "infinit", "inff", "-", ""] {
+            assert!(read(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn special_values_round_trip_through_the_blob() {
+        for (value, text) in [
+            (NumericValue::NaN, "NaN"),
+            (NumericValue::Infinity, "Infinity"),
+            (NumericValue::NegativeInfinity, "-Infinity"),
+        ] {
+            let blob = numeric_value_to_blob(&value);
+            assert_eq!(blob[0], SPECIAL_BLOB_VERSION);
+            assert_eq!(
+                format_numeric_value(&blob_to_numeric_value(&blob).unwrap()),
+                text
+            );
+        }
+        assert!(blob_to_numeric_value(&[SPECIAL_BLOB_VERSION, 9]).is_err());
+        assert!(blob_to_numeric_value(&[SPECIAL_BLOB_VERSION]).is_err());
+        let finite = bigdecimal_to_blob(&BigDecimal::from_str("1.50").unwrap());
+        assert_eq!(finite[0], NUMERIC_BLOB_VERSION);
+    }
+
+    #[test]
+    fn arithmetic_on_special_values_gives_the_results_of_postgres() {
+        let value = |text: &str| numeric_from_text(text).unwrap();
+        let run = |op, left: &str, right: &str| {
+            special_arithmetic(op, &value(left), &value(right)).map(|v| format_numeric_value(&v))
+        };
+        use NumericOp::{Add, Div, Mod, Mul, Sub};
+        for (op, left, right, expected) in [
+            (Add, "NaN", "1", "NaN"),
+            (Add, "Infinity", "-Infinity", "NaN"),
+            (Add, "Infinity", "1", "Infinity"),
+            (Add, "1", "-Infinity", "-Infinity"),
+            (Sub, "Infinity", "Infinity", "NaN"),
+            (Sub, "Infinity", "-Infinity", "Infinity"),
+            (Sub, "1", "Infinity", "-Infinity"),
+            (Mul, "Infinity", "0", "NaN"),
+            (Mul, "Infinity", "-2", "-Infinity"),
+            (Mul, "-Infinity", "-Infinity", "Infinity"),
+            (Div, "NaN", "0", "NaN"),
+            (Div, "Infinity", "Infinity", "NaN"),
+            (Div, "Infinity", "-2", "-Infinity"),
+            (Div, "1.50", "Infinity", "0"),
+            (Mod, "Infinity", "2", "NaN"),
+            (Mod, "5.50", "-Infinity", "5.50"),
+            (Mod, "NaN", "0", "NaN"),
+            (Mod, "Infinity", "Infinity", "NaN"),
+        ] {
+            assert_eq!(
+                run(op, left, right).unwrap(),
+                expected,
+                "{left} {op:?} {right}"
+            );
+        }
+        assert!(run(Div, "Infinity", "0").is_err());
+        assert!(run(Mod, "Infinity", "0").is_err());
+    }
+
+    #[test]
+    fn special_values_order_as_postgres_orders_them() {
+        let decimal = |text: &str| Decimal::from_str(text).unwrap();
+        let ascending = [
+            "-Infinity",
+            "-1e1000",
+            "0",
+            "1.5",
+            "1e1000",
+            "Infinity",
+            "NaN",
+        ];
+        for pair in ascending.windows(2) {
+            assert!(decimal(pair[0]) < decimal(pair[1]), "{pair:?}");
+        }
+        assert_eq!(decimal("NaN"), decimal(" nan "));
+        assert_eq!(decimal("inf"), decimal("Infinity"));
+    }
 
     #[test]
     fn decimals_compare_by_value() {

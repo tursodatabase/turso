@@ -324,7 +324,7 @@ pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<"
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
 /// SQLite's binary operator `op` on a value of the type and an operand `other`.
-pub(crate) fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
+pub fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
     use OperatorArg::Value;
     [[Value, other], [other, Value]].map(|args| OperatorSignature {
         op,
@@ -475,6 +475,10 @@ pub struct TypeDef {
     /// table (see `Type::can_be_rowid_alias`). False for a domain, a user
     /// type and a STRUCT or UNION.
     pub can_be_rowid_alias: bool,
+    /// Whether a column or a CAST may leave out the parameters of the type
+    /// (see `Type::params_may_be_omitted`). False for a domain, user type and
+    /// STRUCT or UNION.
+    pub params_may_be_omitted: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -810,6 +814,7 @@ impl TypeDef {
                     is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
                     can_be_rowid_alias: false,
+                    params_may_be_omitted: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -848,6 +853,7 @@ impl TypeDef {
                     is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
                     can_be_rowid_alias: false,
+                    params_may_be_omitted: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -880,6 +886,7 @@ impl TypeDef {
             is_type_of_conditions: ty.is_type_of_conditions(),
             casts_to_numbers_and_booleans: ty.casts_to_numbers_and_booleans(),
             can_be_rowid_alias: ty.can_be_rowid_alias(),
+            params_may_be_omitted: ty.params_may_be_omitted(),
             sql,
             domain_checks: std::vec::Vec::new(),
             kind: TypeDefKind::Custom {
@@ -919,6 +926,7 @@ impl TypeDef {
             is_type_of_conditions: false,
             casts_to_numbers_and_booleans: false,
             can_be_rowid_alias: false,
+            params_may_be_omitted: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
