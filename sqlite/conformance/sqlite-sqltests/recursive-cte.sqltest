@@ -394,6 +394,75 @@ expect {
     5
 }
 
+setup org-tree {
+    CREATE TABLE org(name TEXT PRIMARY KEY, boss TEXT);
+    INSERT INTO org
+      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
+      SELECT 'n' || i, CASE WHEN i > 1 THEN 'n' || (i / 2) END FROM c;
+}
+
+# The recursive step runs once for each queue row, so the planner must build an
+# automatic index on org.boss once instead of scanning org in every step.
+@setup org-tree
+snapshot-eqp recursive-cte-step-searches-automatic-index {
+    WITH RECURSIVE under(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT org.name FROM org JOIN under ON org.boss = under.n
+    )
+    SELECT count(*) FROM under;
+}
+
+@setup org-tree
+test recursive-cte-step-automatic-index-tree-walk {
+    WITH RECURSIVE under(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT org.name FROM org JOIN under ON org.boss = under.n
+    )
+    SELECT count(*) FROM under;
+}
+expect {
+    5000
+}
+
+setup edge-node {
+    CREATE TABLE edge(src INTEGER, dst INTEGER);
+    CREATE TABLE node(id INTEGER, next INTEGER);
+    INSERT INTO edge VALUES (1,10), (1,20), (2,30), (3,40);
+    INSERT INTO node VALUES (10,2), (20,3), (30,4), (40,5);
+}
+
+# Both tables that the recursive step joins get an automatic index.
+@setup edge-node
+snapshot-eqp recursive-cte-step-joins-two-tables-without-index {
+    WITH RECURSIVE walk(n) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT node.next
+          FROM walk JOIN edge ON edge.src = walk.n JOIN node ON node.id = edge.dst
+    )
+    SELECT count(*) FROM walk;
+}
+
+@setup edge-node
+test recursive-cte-step-joins-two-tables-without-index-results {
+    WITH RECURSIVE walk(n) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT node.next
+          FROM walk JOIN edge ON edge.src = walk.n JOIN node ON node.id = edge.dst
+    )
+    SELECT n FROM walk ORDER BY n;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
 @cross-check-integrity
 test recursive-cte-step-uses-scalar-subquery {
     CREATE TABLE config(delta INTEGER);
