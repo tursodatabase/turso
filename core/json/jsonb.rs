@@ -1500,6 +1500,11 @@ impl Jsonb {
         }
     }
 
+    /// Writes the JSON text of the string element with the payload at
+    /// `cursor` to `string`. The function is inlined into its callers, which
+    /// call it for each key and each string value: a call saved and restored
+    /// six registers each time.
+    #[inline(always)]
     fn serialize_string(
         &self,
         string: &mut String,
