@@ -1841,6 +1841,11 @@ impl Jsonb {
         cursor
     }
 
+    /// Parses the JSON value at `pos` and returns the position after it. The
+    /// function is inlined into its callers: deserialize_obj and
+    /// deserialize_array call it for each element, and a call saved and
+    /// restored six registers each time.
+    #[inline(always)]
     fn deserialize_value(
         &mut self,
         input: &[u8],
