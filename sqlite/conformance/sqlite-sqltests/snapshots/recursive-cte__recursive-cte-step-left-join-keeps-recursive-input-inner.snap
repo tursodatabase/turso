@@ -1,0 +1,26 @@
+---
+source: recursive-cte.sqltest
+expression: |-
+  WITH RECURSIVE under(n) AS (
+          VALUES('n1')
+          UNION ALL
+          SELECT org.name FROM org LEFT JOIN under ON org.boss = under.n
+          WHERE org.k = 0
+      )
+      SELECT count(*) FROM under;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - org
+  - org.boss
+  - under
+  setup_blocks:
+  - org-tree-filtered
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN under
+   |--SETUP
+   `--RECURSIVE STEP
+      |--SCAN org
+      `--SCAN under LEFT-JOIN

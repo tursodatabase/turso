@@ -17,7 +17,7 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::translate::plan::BitSet;
 use crate::{
-    schema::Schema,
+    schema::{Schema, Table},
     stats::AnalyzeStats,
     translate::{
         emitter::Resolver,
@@ -1415,9 +1415,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // the search does not use is never written.
     access_methods_arena.reserve(4 << num_tables);
 
+    let required_lhs_by_table = required_lhs_by_table(joined_tables)?;
+
     // Compute naive left-to-right plan to use as pruning threshold
     let naive_plan = compute_naive_left_deep_plan(
         joined_tables,
+        &required_lhs_by_table,
         initial_input_cardinality,
         planning_context,
         base_table_rows,
@@ -1541,7 +1544,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
     let (left_join_illegal_map, required_lhs_by_table) = {
-        let required_lhs_by_table = required_lhs_by_table(joined_tables)?;
         if required_lhs_by_table.iter().all(TableMask::is_empty) {
             (None, None)
         } else {
@@ -2038,6 +2040,33 @@ fn required_lhs_by_table(joined_tables: &[JoinedTable]) -> Result<Vec<TableMask>
             required_lhs.set(k)?;
         }
     }
+    // The recursive step of a CTE runs once for each queue row, and its recursive
+    // input holds only that row. A table read before the recursive input is read
+    // again in every step, which the cost model, seeing one execution of the loop,
+    // does not count. Reading the recursive input first lets every other table use
+    // the join terms on it, so it goes first unless an outer join requires a table
+    // before it.
+    if let Some(recursive) = joined_tables
+        .iter()
+        .position(|t| matches!(t.table, Table::RecursiveCteInput(_)))
+    {
+        let mut recursive_lhs = required_lhs_by_table[recursive].try_clone()?;
+        loop {
+            let mut closure = recursive_lhs.try_clone()?;
+            for lhs in recursive_lhs.iter() {
+                closure.union_with(&required_lhs_by_table[lhs])?;
+            }
+            if closure == recursive_lhs {
+                break;
+            }
+            recursive_lhs = closure;
+        }
+        for (j, required_lhs) in required_lhs_by_table.iter_mut().enumerate() {
+            if j != recursive && !recursive_lhs.get(j) {
+                required_lhs.set(recursive)?;
+            }
+        }
+    }
     Ok(required_lhs_by_table)
 }
 
@@ -2300,11 +2329,13 @@ fn get_best_seek_score(
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
-/// in the SQL query. This is used as an upper bound for any other plans -- we can give up enumerating
+/// in the SQL query, except that a table moves after the tables `required_lhs_by_table` puts
+/// before it. This is used as an upper bound for any other plans -- we can give up enumerating
 /// permutations if they exceed this cost during enumeration.
 #[allow(clippy::too_many_arguments)]
 fn compute_naive_left_deep_plan<'a, 'w>(
     joined_tables: &[JoinedTable],
+    required_lhs_by_table: &[TableMask],
     initial_input_cardinality: f64,
     planning_context: JoinPlanningContext<'_>,
     base_table_rows: &[RowCountEstimate],
@@ -2324,22 +2355,33 @@ fn compute_naive_left_deep_plan<'a, 'w>(
     let n = joined_tables.len();
     turso_assert_greater_than!(n, 0);
 
-    let join_order = joined_tables
-        .iter()
-        .enumerate()
-        .map(|(i, t)| JoinOrderMember {
+    // Each step places the first table in SQL order whose required tables are all placed.
+    let mut join_order = Vec::with_capacity(n);
+    let mut placed = TableMask::default();
+    while join_order.len() < n {
+        let i = (0..n)
+            .find(|&i| {
+                !placed.get(i)
+                    && required_lhs_by_table[i]
+                        .iter()
+                        .all(|required| placed.get(required))
+            })
+            .expect("the join order constraints have no cycle");
+        placed.set(i)?;
+        let t = &joined_tables[i];
+        join_order.push(JoinOrderMember {
             table_id: t.internal_id,
             original_idx: i,
             is_outer: t.join_info.as_ref().is_some_and(|j| j.is_outer()),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
 
     // Start with first table
     let mut best_plan = join_lhs_and_rhs(
         None,
         initial_input_cardinality,
-        &joined_tables[0],
-        &constraints[0],
+        &joined_tables[join_order[0].original_idx],
+        &constraints[join_order[0].original_idx],
         constraints,
         base_table_rows,
         &join_order[..1],
@@ -2362,13 +2404,14 @@ fn compute_naive_left_deep_plan<'a, 'w>(
         return Ok(None);
     }
 
-    // Add remaining tables one at a time from left to right
+    // Add remaining tables one at a time in that order
     for i in 1..n {
+        let table_idx = join_order[i].original_idx;
         best_plan = join_lhs_and_rhs(
             best_plan.as_ref(),
             initial_input_cardinality,
-            &joined_tables[i],
-            &constraints[i],
+            &joined_tables[table_idx],
+            &constraints[table_idx],
             constraints,
             base_table_rows,
             &join_order[..=i],

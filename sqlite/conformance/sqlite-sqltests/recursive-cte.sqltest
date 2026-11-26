@@ -463,6 +463,103 @@ expect {
     5
 }
 
+setup org-tree-filtered {
+    CREATE TABLE org(name TEXT, boss TEXT, k INTEGER);
+    CREATE TABLE indexed_org(name TEXT, boss TEXT, k INTEGER);
+    CREATE INDEX indexed_org_boss ON indexed_org(boss);
+    INSERT INTO org
+      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000)
+      SELECT 'n' || i, CASE WHEN i > 1 THEN 'n' || (i / 2) END, i % 3 FROM c;
+    INSERT INTO indexed_org SELECT * FROM org;
+}
+
+# A filter on the joined table that the planner estimates to match few rows
+# must not move that table before the recursive input: the table would be
+# scanned again in every step, without the join term on the recursive input.
+@setup org-tree-filtered
+snapshot-eqp recursive-cte-step-with-in-list-searches-index {
+    WITH RECURSIVE under(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT indexed_org.name FROM indexed_org JOIN under ON indexed_org.boss = under.n
+        WHERE indexed_org.k IN (0, 1, 2)
+    )
+    SELECT count(*) FROM under;
+}
+
+@setup org-tree-filtered
+snapshot-eqp recursive-cte-step-with-or-filter-searches-index {
+    WITH RECURSIVE under(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT indexed_org.name FROM indexed_org JOIN under ON indexed_org.boss = under.n
+        WHERE indexed_org.k = 0 OR indexed_org.k = 1 OR indexed_org.k = 2
+    )
+    SELECT count(*) FROM under;
+}
+
+@setup org-tree-filtered
+snapshot-eqp recursive-cte-step-with-in-list-searches-automatic-index {
+    WITH RECURSIVE under(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT org.name FROM org JOIN under ON org.boss = under.n
+        WHERE org.k IN (0, 1, 2)
+    )
+    SELECT count(*) FROM under;
+}
+
+@setup org-tree-filtered
+snapshot-eqp recursive-cte-step-with-in-subquery-searches-automatic-index {
+    WITH RECURSIVE under(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT org.name FROM org JOIN under ON org.boss = under.n
+        WHERE org.k IN (SELECT 0 UNION SELECT 1 UNION SELECT 2)
+    )
+    SELECT count(*) FROM under;
+}
+
+@setup org-tree-filtered
+test recursive-cte-step-with-filters-tree-walk {
+    WITH RECURSIVE
+      a(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT indexed_org.name FROM indexed_org JOIN a ON indexed_org.boss = a.n
+        WHERE indexed_org.k IN (0, 1, 2)
+      ),
+      b(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT org.name FROM org JOIN b ON org.boss = b.n
+        WHERE org.k = 0 OR org.k = 1 OR org.k = 2
+      ),
+      c(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT org.name FROM org JOIN c ON org.boss = c.n
+        WHERE org.k IN (SELECT 0 UNION SELECT 1)
+      )
+    SELECT (SELECT count(*) FROM a), (SELECT count(*) FROM b), (SELECT count(*) FROM c);
+}
+expect {
+    3000|3000|232
+}
+
+# An outer join that has the recursive input on its right side keeps the
+# other table first.
+@setup org-tree-filtered
+snapshot-eqp recursive-cte-step-left-join-keeps-recursive-input-inner {
+    WITH RECURSIVE under(n) AS (
+        VALUES('n1')
+        UNION ALL
+        SELECT org.name FROM org LEFT JOIN under ON org.boss = under.n
+        WHERE org.k = 0
+    )
+    SELECT count(*) FROM under;
+}
+
 @cross-check-integrity
 test recursive-cte-step-uses-scalar-subquery {
     CREATE TABLE config(delta INTEGER);
