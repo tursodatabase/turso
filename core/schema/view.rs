@@ -438,27 +438,44 @@ fn view_star_column(
             .filter_map(|source| source.join_info.as_ref()),
         column_name,
     ) {
-        return resolve_view_column(sources, column_name)
+        return resolve_view_column(sources, None, column_name)
             .expect("source_column itself has this name");
     }
     view_output_column(source_column)
 }
 
-/// Resolve metadata for an unqualified view column with the same rules as
-/// query binding; see [unqualified_column_sources]. A merged FULL JOIN USING
-/// column takes its declared type and collation from its first source.
+/// Resolve metadata for a view column with the same rules as query binding;
+/// see [unqualified_column_sources]. With a qualifier, only the sources with
+/// that name are searched, because FROM items that repeat an alias are
+/// merged by USING the same way as unqualified names. A merged FULL JOIN
+/// USING column takes its declared type and collation from its first source.
 ///
 /// SQLite accepts a view whose column name is ambiguous, so this uses the
 /// first copy instead of failing.
-fn resolve_view_column(sources: &[ViewSource], column_name: &str) -> Option<ViewColumn> {
+fn resolve_view_column(
+    sources: &[ViewSource],
+    qualifier: Option<&str>,
+    column_name: &str,
+) -> Option<ViewColumn> {
     let found = unqualified_column_sources(
         sources,
         column_name,
         |source| source.join_info.as_ref(),
-        |source| match source.columns.iter().position(|column| {
-            view_column_name(column)
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(column_name))
-        }) {
+        |source| match source
+            .columns
+            .iter()
+            .position(|column| {
+                view_column_name(column)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(column_name))
+            })
+            .filter(|_| {
+                qualifier.is_none_or(|qualifier| {
+                    source
+                        .qualifiers
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(qualifier))
+                })
+            }) {
             Some(column_index) => ColumnLookup::Found(column_index),
             None => ColumnLookup::Missing,
         },
@@ -647,23 +664,10 @@ fn view_referenced_column(expr: &ast::Expr, sources: &[ViewSource]) -> Option<Vi
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
             view_referenced_column(&exprs[0], sources)
         }
-        ast::Expr::Id(column_name) => resolve_view_column(sources, column_name.as_str()),
-        ast::Expr::Qualified(qualifier, column_name) => sources
-            .iter()
-            .find(|source| {
-                source
-                    .qualifiers
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
-            })
-            .and_then(|source| {
-                source.columns.iter().find(|column| {
-                    view_column_name(column).is_some_and(|candidate| {
-                        candidate.eq_ignore_ascii_case(column_name.as_str())
-                    })
-                })
-            })
-            .map(view_output_column),
+        ast::Expr::Id(column_name) => resolve_view_column(sources, None, column_name.as_str()),
+        ast::Expr::Qualified(qualifier, column_name) => {
+            resolve_view_column(sources, Some(qualifier.as_str()), column_name.as_str())
+        }
         _ => None,
     }
 }

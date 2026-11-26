@@ -114,3 +114,21 @@ expect {
     6
     6
 }
+
+# A view's column metadata binds x.a with the same rule as a query.
+test view-column-type-with-repeated-alias-follows-join-type {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, d INT);
+    CREATE VIEW v_left AS SELECT x.a FROM t AS x LEFT JOIN u AS x USING(a);
+    CREATE VIEW v_right AS SELECT x.a, x.d FROM t AS x RIGHT JOIN u AS x USING(a);
+    CREATE VIEW v_full AS SELECT x.a AS a FROM t AS x FULL JOIN u AS x USING(a);
+    SELECT name, type FROM pragma_table_info('v_left');
+    SELECT name, type FROM pragma_table_info('v_right');
+    SELECT name, type FROM pragma_table_info('v_full');
+}
+expect {
+    a|INTEGER
+    a|TEXT
+    d|INT
+    a|
+}
