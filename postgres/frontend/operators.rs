@@ -5,7 +5,7 @@ use crate::casts::{resolve, wraps_negative_integers, CastType};
 use crate::catalog::{pg_type_category, pg_type_name, pg_type_oid};
 use crate::error::sqlstate_error;
 use crate::functions::{format_type, undefined_operator_of, validate_pg_input};
-use crate::pg_type::{IntegerOperator, IntegerType};
+use crate::pg_type::{built_in_type, IntegerOperator, IntegerType};
 use turso_core::ast;
 use turso_core::dialect::{
     CastContext, ChosenOperator, EngineType, OperandType, OperatorChoice, OperatorFunction,
@@ -281,7 +281,7 @@ fn common_type(types: &[Option<i64>]) -> Option<i64> {
         if pg_type_category(ty) != pg_type_category(current) {
             return None;
         }
-        if !PREFERRED_TYPES.contains(&current)
+        if !built_in_type(current).is_some_and(|ty| ty.is_preferred)
             && casts_implicitly(current, ty)
             && !casts_implicitly(ty, current)
         {
@@ -300,7 +300,7 @@ fn casts_implicitly(from: i64, to: i64) -> bool {
     IMPLICIT_CASTS.contains(&(from, to))
 }
 
-/// FIXME(pg-catalog): This hand-codes the rows of pg_cast with castcontext 'i' between the types of `CHECKED_TYPES`, and `PREFERRED_TYPES` the pg_type rows with typispreferred. A lookup in pg_cast and pg_type replaces both, and `fits`, which takes the implicit casts to be every cast within a typcategory, uses the same lookup.
+/// FIXME(pg-catalog): This hand-codes the rows of pg_cast with castcontext 'i' between the types of `CHECKED_TYPES`. A lookup in pg_cast replaces it, and `fits`, which takes the implicit casts to be every cast within a typcategory, uses the same lookup.
 const IMPLICIT_CASTS: [(i64, i64); 20] = [
     (DATE, TIMESTAMP),
     (DATE, TIMESTAMPTZ),
@@ -323,8 +323,6 @@ const IMPLICIT_CASTS: [(i64, i64); 20] = [
     (TEXT, VARCHAR),
     (VARCHAR, TEXT),
 ];
-
-const PREFERRED_TYPES: [i64; 4] = [BOOL, TEXT, FLOAT8, TIMESTAMPTZ];
 
 /// The operand types whose operators are decided by core's operator signatures
 /// for the arithmetic and bit operators, and the prefix `-` and `~`. Core has

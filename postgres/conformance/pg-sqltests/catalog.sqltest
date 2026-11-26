@@ -1216,6 +1216,94 @@ expect {
     _text|1009|25
 }
 
+# The pg_type rows of the built-in types of tursopg and of their arrays have
+# the values of PostgreSQL 18.
+test pg-type-rows-of-built-in-types {
+    SELECT oid, typname, typtype, typcategory, typispreferred, typlen, typbyval, typalign, typstorage,
+        typarray, typdelim, typelem
+    FROM pg_type
+    WHERE typnamespace = 11 AND ltrim(typname, '_') IN (
+        'bool', 'bytea', 'int8', 'int2', 'int4', 'text', 'oid', 'json', 'cidr', 'float4',
+        'float8', 'macaddr', 'inet', 'varchar', 'numeric', 'uuid', 'jsonb'
+    )
+    ORDER BY oid;
+}
+expect {
+    16|bool|b|B|t|1|t|c|p|1000|,|0
+    17|bytea|b|U|f|-1|f|i|x|1001|,|0
+    20|int8|b|N|f|8|t|d|p|1016|,|0
+    21|int2|b|N|f|2|t|s|p|1005|,|0
+    23|int4|b|N|f|4|t|i|p|1007|,|0
+    25|text|b|S|t|-1|f|i|x|1009|,|0
+    26|oid|b|N|t|4|t|i|p|1028|,|0
+    114|json|b|U|f|-1|f|i|x|199|,|0
+    199|_json|b|A|f|-1|f|i|x|0|,|114
+    650|cidr|b|I|f|-1|f|i|m|651|,|0
+    651|_cidr|b|A|f|-1|f|i|x|0|,|650
+    700|float4|b|N|f|4|t|i|p|1021|,|0
+    701|float8|b|N|t|8|t|d|p|1022|,|0
+    829|macaddr|b|U|f|6|f|i|p|1040|,|0
+    869|inet|b|I|t|-1|f|i|m|1041|,|0
+    1000|_bool|b|A|f|-1|f|i|x|0|,|16
+    1001|_bytea|b|A|f|-1|f|i|x|0|,|17
+    1005|_int2|b|A|f|-1|f|i|x|0|,|21
+    1007|_int4|b|A|f|-1|f|i|x|0|,|23
+    1009|_text|b|A|f|-1|f|i|x|0|,|25
+    1015|_varchar|b|A|f|-1|f|i|x|0|,|1043
+    1016|_int8|b|A|f|-1|f|d|x|0|,|20
+    1021|_float4|b|A|f|-1|f|i|x|0|,|700
+    1022|_float8|b|A|f|-1|f|d|x|0|,|701
+    1028|_oid|b|A|f|-1|f|i|x|0|,|26
+    1040|_macaddr|b|A|f|-1|f|i|x|0|,|829
+    1041|_inet|b|A|f|-1|f|i|x|0|,|869
+    1043|varchar|b|S|f|-1|f|i|x|1015|,|0
+    1231|_numeric|b|A|f|-1|f|i|x|0|,|1700
+    1700|numeric|b|N|f|-1|f|i|m|1231|,|0
+    2950|uuid|b|U|f|16|f|c|p|2951|,|0
+    2951|_uuid|b|A|f|-1|f|i|x|0|,|2950
+    3802|jsonb|b|U|f|-1|f|i|x|3807|,|0
+    3807|_jsonb|b|A|f|-1|f|i|x|0|,|3802
+}
+
+# tursopg has date, timestamp and timestamptz but not their arrays, so the
+# three types have no array row and their typarray is 0.
+@compat-gap "type:arrays of date, timestamp and timestamptz"
+test pg-type-rows-of-date-and-timestamp-types {
+    SELECT oid, typname, typtype, typcategory, typispreferred, typlen, typbyval, typalign, typstorage,
+        typarray, typdelim, typelem
+    FROM pg_type
+    WHERE typnamespace = 11 AND ltrim(typname, '_') IN ('date', 'timestamp', 'timestamptz')
+    ORDER BY oid;
+}
+expect {
+    1082|date|b|D|f|4|t|i|p|1182|,|0
+    1114|timestamp|b|D|f|8|t|d|p|1115|,|0
+    1115|_timestamp|b|A|f|-1|f|d|x|0|,|1114
+    1182|_date|b|A|f|-1|f|i|x|0|,|1082
+    1184|timestamptz|b|D|t|8|t|d|p|1185|,|0
+    1185|_timestamptz|b|A|f|-1|f|d|x|0|,|1184
+}
+expect @tursopg {
+    1082|date|b|D|f|4|t|i|p|0|,|0
+    1114|timestamp|b|D|f|8|t|d|p|0|,|0
+    1184|timestamptz|b|D|t|8|t|d|p|0|,|0
+}
+
+# A type that tursopg does not support has no row, so pg_type says which
+# types tursopg has.
+@compat-gap "type:pg_type rows of types tursopg does not support"
+test pg-type-has-no-row-for-a-type-tursopg-does-not-support {
+    SELECT count(*) FROM pg_type
+    WHERE typname IN ('time', '_time', 'interval', 'timetz', 'point', 'box', 'xml', 'money', 'tsvector', 'jsonpath');
+}
+expect {
+    10
+}
+expect @tursopg {
+    0
+}
+
+
 test pg-indexes-lists-index-definitions {
     CREATE TABLE items (id INT, name TEXT, price INT);
     CREATE INDEX items_name_idx ON items (name);
