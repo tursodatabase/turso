@@ -720,7 +720,34 @@ impl CursorStep {
     }
 }
 
+/// An opcode that is about to call a cursor. Some facts of the cursor contract belong to the
+/// opcode and not to the cursor calls: `Found` and an eq-only `SeekGE` make the same `seek`
+/// call. Debug builds tell the cursor with [CursorTrait::note_opcode].
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorOpcode {
+    /// `Found` or `NotFound`.
+    Found,
+    /// `NoConflict`. With a NULL in the key it jumps and does not seek.
+    NoConflict {
+        has_null: bool,
+    },
+    NewRowid,
+    /// `Insert`. Without `REQUIRE_SEEK` it does not seek.
+    Insert {
+        require_seek: bool,
+    },
+    /// `IdxInsert`. With `USE_SEEK` it does not seek.
+    IdxInsert {
+        use_seek: bool,
+    },
+    IdxDelete,
+}
+
 pub trait CursorTrait: Any + Send + Sync {
+    /// Tells the cursor which opcode makes the next calls. Debug builds only.
+    #[cfg(debug_assertions)]
+    fn note_opcode(&mut self, _op: CursorOpcode) {}
     /// Move cursor to last entry.
     fn last(&mut self) -> IOResultOr<()>;
     /// Move cursor to next entry.
