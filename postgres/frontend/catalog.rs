@@ -427,11 +427,7 @@ impl Dialect for PostgresDialect {
         name: &str,
     ) -> Result<()> {
         if !holds_user_types(schema, namespace) {
-            return Err(crate::error::sqlstate_error(
-                turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
-                "creating a type in a schema other than public is not supported",
-                None,
-            ));
+            return Err(crate::error::type_outside_public());
         }
         // The engine looks relations up by the lower-case name. The row type
         // has the name in the letter case that CREATE gave it.

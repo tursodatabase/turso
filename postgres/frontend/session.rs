@@ -1859,10 +1859,11 @@ pub(crate) fn database_of(conn: &Connection, namespace: &Qualifier) -> String {
         .expect("the database of a namespace has a name")
 }
 
-/// The first schema of `search_path` that exists, which is what PostgreSQL's
-/// current_schema() returns. None when no schema of `search_path` exists.
-/// The default search_path, "$user", public, gives public, since there is no
-/// schema named after a user.
+/// The first schema of the engine's search order, where the engine creates
+/// a relation named without a schema and looks for it first. That is the
+/// first schema of `search_path` that exists, apart from `"$user"`, which
+/// [`set_search_path`] does not give to the engine, and `pg_catalog` and
+/// `pg_temp`, which are not engine schemas. None when no such schema exists.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     conn.search_order()
         .into_iter()
@@ -2303,11 +2304,7 @@ fn reset_all_settings(conn: &Connection) -> Result<()> {
 fn reject_type_outside_public(conn: &Connection) -> Result<()> {
     match type_creation_schema(conn)? {
         Some(schema) if schema == "public" => Ok(()),
-        Some(_) => Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "creating a type in a schema other than public is not supported",
-            None,
-        )),
+        Some(_) => Err(crate::error::type_outside_public()),
         None => Err(sqlstate_error(
             SQLSTATE_INVALID_SCHEMA_NAME,
             "no schema has been selected to create in",
@@ -2317,7 +2314,10 @@ fn reject_type_outside_public(conn: &Connection) -> Result<()> {
 }
 
 /// The schema that PostgreSQL creates a type named without a schema in:
-/// the first schema of `search_path` that exists. `"$user"` is the schema
+/// the first schema of `search_path` that exists. It is not
+/// [`current_schema`], because the engine's search order leaves out
+/// `"$user"`, `pg_catalog` and `pg_temp`, and a type that PostgreSQL would
+/// create in one of them must be refused. `"$user"` is the schema
 /// named after the current role. PostgreSQL skips that schema when the role
 /// may not use it, but tursopg has no privileges on schemas, so it is always
 /// taken. `pg_temp` is the session's temporary schema, which PostgreSQL
@@ -2362,8 +2362,13 @@ fn discard_all(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// `$user` stands for a schema named after the session user, which does
-/// not exist, so it is not a name that core looks up.
+/// FIXME(pg-search-path): This hand-codes a search order without `"$user"`,
+/// because the engine's search path is a fixed list of names and `"$user"`
+/// stands for the schema named after the current role, which SET ROLE
+/// changes. PostgreSQL also looks in that schema when it exists. A search
+/// order that the engine works out again when the current role changes
+/// replaces this, and [`current_schema`] and [`type_creation_schema`] then
+/// give the same schema.
 pub(crate) fn set_search_path(
     conn: &Connection,
     value: Option<&str>,

@@ -136,6 +136,12 @@ pub fn type_already_exists(name: &str, hint: Option<&str>) -> LimboError {
     }))
 }
 
+/// The error of a CREATE TYPE or CREATE DOMAIN that would make a type in a
+/// schema other than public, where tursopg keeps every user type.
+pub fn type_outside_public() -> LimboError {
+    not_supported("creating a type in a schema other than public")
+}
+
 /// The engine error for SQL that `turso_pg_parser` refuses, which keeps the
 /// SQLSTATE and the HINT that the parser gave it.
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
