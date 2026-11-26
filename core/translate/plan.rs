@@ -1850,6 +1850,8 @@ pub enum ColumnLookup {
 /// ```
 ///
 /// Query binding and view metadata both use this, so their results agree.
+/// Query binding also uses it for a qualified name when several FROM items
+/// have that alias.
 pub fn unqualified_column_sources<'a, S>(
     sources: &'a [S],
     column_name: &str,

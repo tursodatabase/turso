@@ -6,7 +6,7 @@ use crate::schema::{
 use crate::translate::catalog::CatalogContext;
 use crate::translate::plan::{
     is_schema_table, merge_columns, resolve_unqualified_column_except, unqualified_column_sources,
-    ColumnLookup, OuterQueryReference, ResolvedColumn,
+    ColumnLookup, JoinInfo, OuterQueryReference, ResolvedColumn,
 };
 
 /// The precedence of binding identifiers to columns.
@@ -28,10 +28,7 @@ pub enum BindingBehavior {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum QualifiedMatch {
     /// `<id>` named a real column on the candidate table.
-    Column {
-        col_idx: usize,
-        is_rowid_alias: bool,
-    },
+    Column { col_idx: usize },
     /// `<id>` named the rowid (`rowid`/`oid`/`_rowid_`) of a btree.
     /// There is no column index — the result must become an
     /// `Expr::RowId`, not an `Expr::Column`.
@@ -61,11 +58,7 @@ pub(super) fn resolve_qualified_on_ref(
             .as_ref()
             .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
     }) {
-        let col = table.columns().get(col_idx).unwrap();
-        return Ok(Some(QualifiedMatch::Column {
-            col_idx,
-            is_rowid_alias: col.is_rowid_alias(),
-        }));
+        return Ok(Some(QualifiedMatch::Column { col_idx }));
     }
 
     match table {
@@ -102,14 +95,16 @@ enum QualifiedTableMatch {
 }
 
 /// The result of searching the current scope and its parent scopes.
-#[derive(Clone, Copy)]
 enum QualifiedNameMatch {
     /// No visible query scope contains the requested table.
     NoTable,
     /// A visible table exists, but its column does not exist.
     NoColumn,
-    /// One visible column matches the requested name.
-    Found(TableInternalId, QualifiedMatch),
+    /// The requested column. A FULL JOIN USING can merge several table
+    /// columns into its value.
+    Column(ResolvedColumn),
+    /// The rowid of the requested table.
+    RowId(TableInternalId),
     /// More than one visible column matches the requested name.
     Ambiguous,
 }
@@ -338,8 +333,8 @@ pub fn bind_and_rewrite_expr_except<'a>(
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
                     match qualified_match {
-                        QualifiedNameMatch::Found(table_id, column) => {
-                            bind_qualified_name(expr, referenced_tables, table_id, column)
+                        QualifiedNameMatch::Column(..) | QualifiedNameMatch::RowId(..) => {
+                            bind_qualified_name(expr, referenced_tables, qualified_match)
                         }
                         QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
                             "ambiguous column name: {}.{}",
@@ -399,8 +394,9 @@ pub fn bind_and_rewrite_expr_except<'a>(
                             &normalized_col_name,
                             excluded,
                         )? {
-                            QualifiedNameMatch::Found(table_id, column) => {
-                                bind_qualified_name(expr, referenced_tables, table_id, column);
+                            qualified_match @ (QualifiedNameMatch::Column(..)
+                            | QualifiedNameMatch::RowId(..)) => {
+                                bind_qualified_name(expr, referenced_tables, qualified_match);
                                 return Ok(WalkControl::Continue);
                             }
                             QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
@@ -810,113 +806,71 @@ fn resolve_qualified_name(
         .catalog
         .dialect
         .qualified_column_uses_nearest_table_only();
-    let mut table_found = false;
-    let mut found = None;
+    let mut candidates = Vec::new();
     for joined_table in table_references.joined_tables() {
         if excluded.contains(&joined_table.internal_id) {
             continue;
         }
-        let candidate = match_qualified_name_in_table(
-            &joined_table.table,
-            joined_table.internal_id,
-            qualifier_names_table(
+        candidates.push(QualifiedCandidate {
+            table_id: joined_table.internal_id,
+            table: &joined_table.table,
+            join_info: joined_table.join_info.as_ref(),
+            table_match: match_qualified_name_in_table(
                 &joined_table.table,
-                &joined_table.identifier,
-                joined_table.has_alias,
-                joined_table.namespace.database_id,
+                joined_table.internal_id,
+                qualifier_names_table(
+                    &joined_table.table,
+                    &joined_table.identifier,
+                    joined_table.has_alias,
+                    joined_table.namespace.database_id,
+                    table_name,
+                    namespace.is_some(),
+                ),
+                database_id_to_match(&joined_table.table, joined_table.namespace, namespace),
                 table_name,
-                namespace.is_some(),
-            ),
-            database_id_to_match(&joined_table.table, joined_table.namespace, namespace),
-            table_name,
-            column_name,
-        )?;
-        match candidate {
-            QualifiedTableMatch::NoTable => continue,
-            QualifiedTableMatch::NoColumn => table_found = true,
-            QualifiedTableMatch::Ambiguous => return Ok(QualifiedNameMatch::Ambiguous),
-            QualifiedTableMatch::Found(column) => {
-                table_found = true;
-                if found.is_some() {
-                    let duplicate_is_merged = matches!(column, QualifiedMatch::Column { .. })
-                        && joined_table
-                            .join_info
-                            .as_ref()
-                            .is_some_and(|join| join.merges_column(column_name));
-                    if !duplicate_is_merged {
-                        return Ok(QualifiedNameMatch::Ambiguous);
-                    }
-                } else {
-                    found = Some((joined_table.internal_id, column));
-                }
-            }
-        }
+                column_name,
+            )?,
+        });
     }
-    if let Some((table_id, column)) = found {
-        return Ok(QualifiedNameMatch::Found(table_id, column));
-    }
-    if table_found && use_nearest_table_only {
-        return Ok(QualifiedNameMatch::NoColumn);
+    let mut table_found = false;
+    match resolve_qualified_name_in_scope(&candidates, column_name) {
+        QualifiedNameMatch::NoTable => {}
+        QualifiedNameMatch::NoColumn if !use_nearest_table_only => table_found = true,
+        scope_match => return Ok(scope_match),
     }
 
-    let mut nearest_scope = None;
-    let mut ambiguous = false;
-    for outer_ref in table_references.outer_query_refs() {
-        if outer_ref.cte_definition_only {
-            continue;
+    for scope in outer_query_scopes(table_references) {
+        let mut candidates = Vec::new();
+        for outer_ref in scope {
+            candidates.push(QualifiedCandidate {
+                table_id: outer_ref.internal_id,
+                table: &outer_ref.table,
+                join_info: outer_ref.join_info.as_ref(),
+                table_match: match_qualified_name_in_table(
+                    &outer_ref.table,
+                    outer_ref.internal_id,
+                    qualifier_names_table(
+                        &outer_ref.table,
+                        &outer_ref.identifier,
+                        outer_ref.has_alias,
+                        outer_ref.namespace.database_id,
+                        table_name,
+                        namespace.is_some(),
+                    ),
+                    database_id_to_match(&outer_ref.table, outer_ref.namespace, namespace),
+                    table_name,
+                    column_name,
+                )?,
+            });
         }
-        if nearest_scope.is_some_and(|scope| outer_ref.scope_depth > scope) {
-            continue;
-        }
-        let candidate = match_qualified_name_in_table(
-            &outer_ref.table,
-            outer_ref.internal_id,
-            qualifier_names_table(
-                &outer_ref.table,
-                &outer_ref.identifier,
-                outer_ref.has_alias,
-                outer_ref.namespace.database_id,
-                table_name,
-                namespace.is_some(),
-            ),
-            database_id_to_match(&outer_ref.table, outer_ref.namespace, namespace),
-            table_name,
-            column_name,
-        )?;
-        if matches!(candidate, QualifiedTableMatch::NoColumn) && !use_nearest_table_only {
-            table_found = true;
-            continue;
-        }
-        if matches!(candidate, QualifiedTableMatch::NoTable) {
-            continue;
-        }
-        if nearest_scope.is_none_or(|scope| outer_ref.scope_depth < scope) {
-            nearest_scope = Some(outer_ref.scope_depth);
-            found = None;
-            ambiguous = false;
-        }
-        match candidate {
-            QualifiedTableMatch::Ambiguous => ambiguous = true,
-            QualifiedTableMatch::Found(column) if found.is_some() => {
-                let duplicate_is_merged = matches!(
-                    column,
-                    QualifiedMatch::Column { col_idx, .. }
-                        if outer_ref_merges_column(outer_ref, col_idx)
-                );
-                ambiguous |= !duplicate_is_merged;
-            }
-            QualifiedTableMatch::Found(column) => {
-                found = Some((outer_ref.internal_id, column));
-            }
-            QualifiedTableMatch::NoTable | QualifiedTableMatch::NoColumn => {}
+        match resolve_qualified_name_in_scope(&candidates, column_name) {
+            QualifiedNameMatch::NoTable => {}
+            QualifiedNameMatch::NoColumn if !use_nearest_table_only => table_found = true,
+            scope_match => return Ok(scope_match),
         }
     }
 
-    if ambiguous {
-        Ok(QualifiedNameMatch::Ambiguous)
-    } else if let Some((table_id, column)) = found {
-        Ok(QualifiedNameMatch::Found(table_id, column))
-    } else if table_found || nearest_scope.is_some() {
+    if table_found {
         Ok(QualifiedNameMatch::NoColumn)
     } else {
         Ok(QualifiedNameMatch::NoTable)
@@ -946,6 +900,75 @@ fn outer_query_scopes(table_references: &TableReferences) -> Vec<Vec<&OuterQuery
                 .collect()
         })
         .collect()
+}
+
+/// One FROM item of a query scope, matched against a qualified name.
+struct QualifiedCandidate<'a> {
+    table_id: TableInternalId,
+    table: &'a Table,
+    join_info: Option<&'a JoinInfo>,
+    table_match: QualifiedTableMatch,
+}
+
+/// Bind a qualified name to the FROM items of one query scope.
+///
+/// Several FROM items can have the same alias. A column that a USING or
+/// NATURAL join merges then follows the rules for unqualified names (see
+/// [unqualified_column_sources]), as in SQLite's `lookupName()`:
+///
+/// ```sql
+/// SELECT x.a FROM t AS x RIGHT JOIN u AS x USING(a);  -- u.a
+/// SELECT x.a FROM t AS x FULL JOIN u AS x USING(a);   -- coalesce(t.a, u.a)
+/// ```
+///
+/// A rowid matches only when no FROM item has a column with this name.
+fn resolve_qualified_name_in_scope(
+    candidates: &[QualifiedCandidate<'_>],
+    column_name: &str,
+) -> QualifiedNameMatch {
+    let found = unqualified_column_sources(
+        candidates,
+        column_name,
+        |candidate| candidate.join_info,
+        |candidate| match candidate.table_match {
+            QualifiedTableMatch::Found(QualifiedMatch::Column { col_idx }) => {
+                ColumnLookup::Found(col_idx)
+            }
+            QualifiedTableMatch::Ambiguous => ColumnLookup::Ambiguous,
+            QualifiedTableMatch::Found(QualifiedMatch::RowId)
+            | QualifiedTableMatch::NoColumn
+            | QualifiedTableMatch::NoTable => ColumnLookup::Missing,
+        },
+    );
+    if found.ambiguous {
+        return QualifiedNameMatch::Ambiguous;
+    }
+    if !found.sources.is_empty() {
+        return QualifiedNameMatch::Column(merge_columns(found.sources.into_iter().map(
+            |(candidate_index, column_index)| {
+                let candidate = &candidates[candidate_index];
+                (candidate.table_id, candidate.table, column_index)
+            },
+        )));
+    }
+    let mut rowid_tables = candidates.iter().filter(|candidate| {
+        matches!(
+            candidate.table_match,
+            QualifiedTableMatch::Found(QualifiedMatch::RowId)
+        )
+    });
+    match (rowid_tables.next(), rowid_tables.next()) {
+        (Some(candidate), None) => QualifiedNameMatch::RowId(candidate.table_id),
+        (Some(_), Some(_)) => QualifiedNameMatch::Ambiguous,
+        (None, _)
+            if candidates.iter().any(|candidate| {
+                !matches!(candidate.table_match, QualifiedTableMatch::NoTable)
+            }) =>
+        {
+            QualifiedNameMatch::NoColumn
+        }
+        (None, _) => QualifiedNameMatch::NoTable,
+    }
 }
 
 /// Whether `<tbl>` in `<tbl>.<col>` names the FROM item `table_reference_name`.
@@ -995,17 +1018,6 @@ fn database_id_to_match(
     }
 }
 
-/// Whether the join that added this outer table merged the column with USING.
-fn outer_ref_merges_column(outer_ref: &OuterQueryReference, column_index: usize) -> bool {
-    let Some(join_info) = outer_ref.join_info.as_ref() else {
-        return false;
-    };
-    outer_ref.table.columns()[column_index]
-        .name
-        .as_deref()
-        .is_some_and(|name| join_info.merges_column(name))
-}
-
 /// Match a qualified name against one table reference.
 ///
 /// SQLite lets an outer query refer to tables inside a parenthesized join.
@@ -1033,7 +1045,6 @@ fn match_qualified_name_in_table(
         if let Some(col_idx) = column {
             return Ok(QualifiedTableMatch::Found(QualifiedMatch::Column {
                 col_idx,
-                is_rowid_alias: table.columns()[col_idx].is_rowid_alias(),
             }));
         }
         if table_found && !qualifier_names_table {
@@ -1077,30 +1088,28 @@ fn pick_parenthesized_join_column<'a>(
 fn bind_qualified_name(
     expr: &mut Expr,
     table_references: &mut TableReferences,
-    table_id: TableInternalId,
-    column: QualifiedMatch,
+    qualified_match: QualifiedNameMatch,
 ) {
-    match column {
-        QualifiedMatch::Column {
-            col_idx,
-            is_rowid_alias,
-        } => {
-            *expr = Expr::Column {
-                database: None,
-                table: table_id,
-                column: col_idx,
-                is_rowid_alias,
-            };
+    match qualified_match {
+        QualifiedNameMatch::Column(resolved_column) => {
+            *expr = resolved_column.expr;
             tracing::debug!("rewritten to column");
-            table_references.mark_column_used(table_id, col_idx);
+            for (table_id, column_index) in resolved_column.source_columns {
+                table_references.mark_column_used(table_id, column_index);
+            }
         }
-        QualifiedMatch::RowId => {
+        QualifiedNameMatch::RowId(table_id) => {
             *expr = Expr::RowId {
                 database: None,
                 table: table_id,
             };
             tracing::debug!("rewritten to rowid");
             table_references.mark_rowid_referenced(table_id);
+        }
+        QualifiedNameMatch::NoTable
+        | QualifiedNameMatch::NoColumn
+        | QualifiedNameMatch::Ambiguous => {
+            unreachable!("bind_qualified_name needs a column or a rowid")
         }
     }
 }
