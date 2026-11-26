@@ -194,6 +194,18 @@ pub trait Dialect: Send + Sync + 'static {
         BTreeTable::from_stored_sql(self, sql, root_page, false)
     }
 
+    /// Resolves a stored view's columns while reading its schema row.
+    /// A dialect that needs later metadata can leave them empty and resolve
+    /// them in its catalog load steps.
+    fn load_view_columns(
+        &self,
+        namespace: NamespaceId,
+        select: &ast::Select,
+        schema: &Schema,
+    ) -> Result<crate::schema::view::ViewColumnSchema> {
+        crate::schema::view::extract_view_columns(namespace, select, schema)
+    }
+
     /// Decode a storage-backed table's persisted SQL into its `CREATE TABLE`
     /// AST.
     ///

@@ -4588,9 +4588,8 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema = crate::schema::view::extract_view_columns(
-                                namespace, &select, self,
-                            )?;
+                            let mut view_column_schema =
+                                dialect.load_view_columns(namespace, &select, self)?;
                             view_column_schema.rename_columns(&column_names);
                             let view = View::new(
                                 view_name,

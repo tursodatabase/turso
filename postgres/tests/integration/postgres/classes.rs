@@ -11,7 +11,7 @@ use turso_core::{Connection, Numeric, SessionRole, Value};
 /// ordered by oid.
 fn class_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, String, i64)> {
     let rows = conn
-        .prepare_engine_schema_statement("SELECT oid, relname, relnamespace, relkind, relowner FROM __turso_internal_classes WHERE oid >= 16384 ORDER BY oid")
+        .prepare_engine_schema_statement("SELECT oid, relname, relenginenamespace, relkind, CASE WHEN relowner=10 THEN 0 ELSE relowner-16384 END FROM __turso_internal_classes WHERE oid >= 16384 ORDER BY oid")
         .unwrap()
         .run_collect_rows()
         .unwrap();
@@ -637,7 +637,7 @@ fn relacl(conn: &turso_pg::Connection, relname: &str) -> Option<String> {
 fn stored_relacl(conn: &Arc<Connection>, relname: &str) -> Option<String> {
     let rows = conn
         .prepare(format!(
-            "SELECT relacl FROM __turso_internal_classes WHERE relname = '{relname}'"
+            "SELECT relprivileges FROM __turso_internal_classes WHERE relname = '{relname}'"
         ))
         .unwrap()
         .run_collect_rows()
@@ -1273,6 +1273,134 @@ fn catalog_class_rows_match_the_exposed_attributes(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn pg_class_scans_the_stored_rows(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let rows = pg
+        .prepare("SELECT oid, relnamespace FROM pg_class WHERE relname='pg_class'")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1259), Value::from_i64(11)]]);
+    pg.execute("CREATE TABLE visible (a int)").unwrap();
+    pg.execute("BEGIN").unwrap();
+    pg.execute("ALTER TABLE visible ADD COLUMN b text").unwrap();
+    let read = || {
+        pg.prepare("SELECT relnatts FROM pg_class WHERE relname='visible'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+    };
+    assert_eq!(read(), vec![vec![Value::from_i64(2)]]);
+    pg.execute("ROLLBACK").unwrap();
+    assert_eq!(read(), vec![vec![Value::from_i64(1)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn random_ddl_keeps_stored_classes_in_agreement_with_schema(db: TempDatabase) {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7919);
+    let pg = db.connect_postgres();
+    for step in 0..24 {
+        pg.execute("BEGIN").unwrap();
+        let primary = if rng.random_bool(0.5) {
+            "PRIMARY KEY"
+        } else {
+            ""
+        };
+        pg.execute(format!(
+            "CREATE TABLE t{step} (id int {primary}, x int UNIQUE CHECK (x > 0))"
+        ))
+        .unwrap();
+        pg.execute(format!("CREATE VIEW v{step} AS SELECT id FROM t{step}"))
+            .unwrap();
+        pg.execute(format!("CREATE SEQUENCE s{step}")).unwrap();
+        pg.execute(format!("CREATE INDEX ix{step} ON t{step} (x)"))
+            .unwrap();
+        if rng.random_bool(0.5) {
+            pg.execute(format!("DROP INDEX ix{step}")).unwrap();
+        }
+        pg.execute(format!("ALTER TABLE t{step} ADD COLUMN added text"))
+            .unwrap();
+        if rng.random_bool(0.5) {
+            pg.execute(format!("ALTER TABLE t{step} DROP COLUMN added"))
+                .unwrap();
+        }
+        pg.execute(format!("ALTER TABLE t{step} RENAME TO renamed{step}"))
+            .unwrap();
+        let mismatches = pg.prepare("SELECT c.relname FROM pg_class c LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 GROUP BY c.oid,c.relname,c.relnatts HAVING count(a.attnum)<>c.relnatts").unwrap().run_collect_rows().unwrap();
+        assert!(mismatches.is_empty(), "step {step}: {mismatches:?}");
+        pg.execute(if rng.random_bool(0.5) {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        })
+        .unwrap();
+        // Reload checks both identities and derived counts against Schema.
+        pg.inner().force_reparse_schema_without_publish().unwrap();
+    }
+}
+
+#[test]
+fn a_stored_class_without_a_relation_fails_schema_load() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE orphan (x int)").unwrap();
+    pg.inner()
+        .prepare_engine_schema_statement("DROP TABLE public.orphan")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    let error = pg
+        .inner()
+        .force_reparse_schema_without_publish()
+        .unwrap_err();
+    assert!(
+        matches!(error, turso_core::LimboError::Corrupt(_)),
+        "{error}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn changing_table_owner_updates_every_stored_index(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE ROLE new_owner").unwrap();
+    pg.execute("CREATE TABLE owned (id integer PRIMARY KEY, x integer UNIQUE)")
+        .unwrap();
+    pg.execute("CREATE INDEX owned_ix ON owned(x)").unwrap();
+    pg.execute("ALTER TABLE owned OWNER TO new_owner").unwrap();
+    let rows = class_rows(pg.inner());
+    let owner = class_row(pg.inner(), "owned").unwrap().4;
+    assert_ne!(owner, 0);
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|row| row.4 == owner), "{rows:?}");
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    assert_eq!(class_rows(pg.inner()), rows);
+}
+
+#[test]
+fn a_missing_rowid_primary_key_class_fails_schema_load() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE t (id int PRIMARY KEY, x int UNIQUE)")
+        .unwrap();
+    pg.inner()
+        .prepare_engine_schema_statement(
+            "DELETE FROM __turso_internal_classes WHERE relname='t_pkey'",
+        )
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    let error = pg
+        .inner()
+        .force_reparse_schema_without_publish()
+        .unwrap_err();
+    assert!(
+        matches!(error, turso_core::LimboError::Corrupt(_)),
+        "{error}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn user_tables_with_catalog_names_have_attributes(db: TempDatabase) {
     let pg = db.connect_postgres();
     pg.execute("CREATE TABLE public.pg_class (id int PRIMARY KEY, x text)")
@@ -1300,6 +1428,100 @@ fn user_tables_with_catalog_names_have_attributes(db: TempDatabase) {
                 Value::from_i64(1)
             ],
         ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn changing_a_star_views_width_is_rejected_before_writing(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE source (a int)").unwrap();
+    pg.execute("CREATE VIEW star_view AS SELECT * FROM source")
+        .unwrap();
+    let error = pg
+        .execute("ALTER TABLE source ADD COLUMN b int")
+        .unwrap_err();
+    assert_eq!(error.sqlstate, "0A000");
+    assert_eq!(
+        error.message,
+        "cannot alter table \"source\" because it would change the number of columns returned by view \"star_view\""
+    );
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("Drop view \"star_view\", alter table \"source\", and then recreate the view.")
+    );
+    assert_eq!(
+        pg.prepare("SELECT relnatts FROM pg_class WHERE relname IN ('source', 'star_view')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(1)]]
+    );
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    pg.execute("DROP VIEW star_view").unwrap();
+    pg.execute("ALTER TABLE source ADD COLUMN b int").unwrap();
+    pg.execute("CREATE VIEW star_view AS SELECT * FROM source")
+        .unwrap();
+    assert_eq!(
+        pg.prepare("SELECT * FROM star_view").unwrap().num_columns(),
+        2
+    );
+    pg.execute("CREATE VIEW dependent_view AS SELECT * FROM star_view")
+        .unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    assert_eq!(
+        pg.prepare("SELECT a, b FROM dependent_view")
+            .unwrap()
+            .num_columns(),
+        2
+    );
+    assert_eq!(
+        pg.prepare(
+            "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relname = 'dependent_view' AND a.attnum > 0 ORDER BY a.attnum"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::build_text("a")], vec![Value::build_text("b")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn joined_view_columns_survive_schema_load(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE SCHEMA other").unwrap();
+    pg.execute("CREATE TABLE t (a int, b int)").unwrap();
+    pg.execute("CREATE TABLE other.u (a int, c int)").unwrap();
+    pg.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    pg.execute("INSERT INTO other.u VALUES (1, 3)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT * FROM t JOIN other.u USING (a)")
+        .unwrap();
+    pg.execute("CREATE VIEW dependent AS SELECT * FROM v")
+        .unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    assert_eq!(
+        pg.prepare("SELECT * FROM dependent")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(2),
+            Value::from_i64(3)
+        ]]
+    );
+    assert_eq!(
+        pg.prepare("SELECT relnatts FROM pg_class WHERE relname IN ('v', 'dependent')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(3)], vec![Value::from_i64(3)]]
     );
 }
 

@@ -158,6 +158,24 @@ impl Dialect for PostgresDialect {
         }
     }
 
+    fn load_view_columns(
+        &self,
+        namespace: NamespaceId,
+        select: &ast::Select,
+        schema: &Schema,
+    ) -> Result<turso_core::schema::view::ViewColumnSchema> {
+        // Stored queries qualify their sources by schema name. Resolving a
+        // JOIN USING before those names are loaded mistakes its columns for
+        // missing columns. The catalog loader resolves views after this step.
+        if !schema.namespace_names_loaded() {
+            return Ok(turso_core::schema::view::ViewColumnSchema {
+                tables: Vec::new(),
+                columns: Vec::new(),
+            });
+        }
+        turso_core::schema::view::extract_view_columns(namespace, select, schema)
+    }
+
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_core::ast::Stmt> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
@@ -626,6 +644,9 @@ pub(crate) const PUBLIC_NAMESPACE_OID: i64 = 2200;
 const FIRST_USER_SCHEMA_OID: i64 = 16384;
 
 pub(crate) fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
+    if namespace.is_root() {
+        return 11;
+    }
     if schema.namespace_name(namespace) == Some("public") {
         return PUBLIC_NAMESPACE_OID;
     }
@@ -692,28 +713,6 @@ fn stored_relation_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> O
             .get_by_name(namespace, name)?
             .oid,
     )
-}
-
-/// The `pg_class.relowner` oid of relation `name`: its stored owner.
-fn relation_owner_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> i64 {
-    match crate::classes::relation_owner(schema, namespace, name) {
-        Some(owner) => role_oid(owner),
-        None => SUPERUSER_OID,
-    }
-}
-
-/// The `pg_class.relacl` of relation `name`: its stored access control list
-/// with the roles named, NULL until a `GRANT` touches it.
-fn relation_acl(conn: &Connection, schema: &Schema, namespace: NamespaceId, name: &str) -> Value {
-    match crate::classes::relation_acl(schema, namespace, name) {
-        Some(acl) => {
-            let roles = connection_roles(conn);
-            Value::build_text(acl.display_text(&|oid| {
-                role_name_by_oid(&roles, oid).unwrap_or_else(|| oid.to_string())
-            }))
-        }
-        None => Value::Null,
-    }
 }
 
 /// The name of the role that owns relation `name`, for the owner columns of
@@ -821,7 +820,7 @@ pub(crate) fn builtin_catalog_columns(
 }
 
 /// Virtual table implementation for pg_catalog.pg_class
-/// Maps SQLite's sqlite_master to PostgreSQL's pg_class system table
+/// Reads the class rows cached with the schema snapshot.
 #[derive(Debug)]
 struct PgClassTable;
 
@@ -840,6 +839,7 @@ impl SnapshotRows for PgClassTable {
             relpages INTEGER,
             reltuples REAL,
             relallvisible INTEGER,
+            relallfrozen INTEGER,
             reltoastrelid INTEGER,
             relhasindex BOOLEAN,
             relisshared BOOLEAN,
@@ -870,180 +870,8 @@ impl SnapshotRows for PgClassTable {
     const ESTIMATED_ROWS: u32 = 100;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        let schema = conn.current_schema();
-        let mut rows = Vec::new();
-
-        let tables = user_tables_with_oids(&schema);
-        let indexes = catalog_indexes(&schema);
-        let relkind = crate::classes::relkind_letter(RelationKind::Table);
-
-        for (namespace, name, table, table_oid) in tables.iter() {
-            let btree = match table.as_ref() {
-                Table::BTree(bt) => bt,
-                _ => continue,
-            };
-            let table_oid = *table_oid;
-            let relnatts = btree.columns().len() as i64;
-            let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
-            let relchecks = btree.check_constraints.len() as i64;
-            let relrowsecurity =
-                i64::from(crate::classes::table_rls_enabled(&schema, *namespace, name));
-
-            rows.push(vec![
-                Value::from_i64(table_oid),                                     // oid
-                Value::Text(btree.declared_name.clone().into()),                // relname
-                Value::from_i64(namespace_oid(&schema, *namespace)),            // relnamespace
-                Value::from_i64(0),                                             // reltype
-                Value::from_i64(0),                                             // reloftype
-                Value::from_i64(relation_owner_oid(&schema, *namespace, name)), // relowner
-                Value::from_i64(2),                                             // relam (heap)
-                Value::from_i64(0),                                             // relfilenode
-                Value::from_i64(0),                                             // reltablespace
-                Value::from_i64(1),                                             // relpages
-                Value::from_f64(0.0),                                           // reltuples
-                Value::from_i64(0),                                             // relallvisible
-                Value::from_i64(0),                                             // reltoastrelid
-                Value::from_i64(relhasindex),                                   // relhasindex
-                Value::from_i64(0),                                             // relisshared
-                Value::Text("p".into()),         // relpersistence (permanent)
-                Value::build_text(relkind),      // relkind (regular table)
-                Value::from_i64(relnatts),       // relnatts
-                Value::from_i64(relchecks),      // relchecks
-                Value::from_i64(0),              // relhasrules
-                Value::from_i64(0),              // relhastriggers
-                Value::from_i64(0),              // relhassubclass
-                Value::from_i64(relrowsecurity), // relrowsecurity
-                Value::from_i64(0),              // relforcerowsecurity
-                Value::from_i64(1),              // relispopulated
-                Value::Text("d".into()),         // relreplident
-                Value::from_i64(0),              // relispartition
-                Value::from_i64(0),              // relrewrite
-                Value::from_i64(0),              // relfrozenxid
-                Value::from_i64(0),              // relminmxid
-                relation_acl(conn, &schema, *namespace, name), // relacl
-                Value::Null,                     // reloptions
-                Value::Null,                     // relpartbound
-            ]);
-        }
-
-        // Add index rows (relkind='i')
-        let relkind = crate::classes::relkind_letter(RelationKind::Index);
-        for index in indexes {
-            let indnatts = index.columns.len() as i64;
-            rows.push(vec![
-                Value::from_i64(index.oid),                               // oid
-                Value::Text(index.name.into()),                           // relname
-                Value::from_i64(namespace_oid(&schema, index.namespace)), // relnamespace
-                Value::from_i64(0),                                       // reltype
-                Value::from_i64(0),                                       // reloftype
-                Value::from_i64(index.owner_oid),                         // relowner
-                Value::from_i64(403),                                     // relam (btree)
-                Value::from_i64(0),                                       // relfilenode
-                Value::from_i64(0),                                       // reltablespace
-                Value::from_i64(1),                                       // relpages
-                Value::from_f64(0.0),                                     // reltuples
-                Value::from_i64(0),                                       // relallvisible
-                Value::from_i64(0),                                       // reltoastrelid
-                Value::from_i64(0),                                       // relhasindex
-                Value::from_i64(0),                                       // relisshared
-                Value::Text("p".into()),                                  // relpersistence
-                Value::build_text(relkind),                               // relkind (index)
-                Value::from_i64(indnatts),                                // relnatts
-                Value::from_i64(0),                                       // relchecks
-                Value::from_i64(0),                                       // relhasrules
-                Value::from_i64(0),                                       // relhastriggers
-                Value::from_i64(0),                                       // relhassubclass
-                Value::from_i64(0),                                       // relrowsecurity
-                Value::from_i64(0),                                       // relforcerowsecurity
-                Value::from_i64(1),                                       // relispopulated
-                Value::Text("d".into()),                                  // relreplident
-                Value::from_i64(0),                                       // relispartition
-                Value::from_i64(0),                                       // relrewrite
-                Value::from_i64(0),                                       // relfrozenxid
-                Value::from_i64(0),                                       // relminmxid
-                Value::Null,                                              // relacl
-                Value::Null,                                              // reloptions
-                Value::Null,                                              // relpartbound
-            ]);
-        }
-        let relkind = crate::classes::relkind_letter(RelationKind::Sequence);
-        for (oid, namespace, sequence) in sequence_catalog_entries(&schema) {
-            rows.push(vec![
-                Value::from_i64(oid),
-                Value::build_text(sequence.name.clone()),
-                Value::from_i64(namespace_oid(&schema, namespace)),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(relation_owner_oid(&schema, namespace, &sequence.name)),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::from_f64(1.0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::build_text("p"),
-                Value::build_text(relkind),
-                Value::from_i64(3),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::build_text("n"),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                relation_acl(conn, &schema, namespace, &sequence.name),
-                Value::Null,
-                Value::Null,
-            ]);
-        }
-
-        for rule in view_rules(&schema) {
-            rows.push(vec![
-                Value::from_i64(rule.view_oid),
-                Value::build_text(rule.view.name.clone()),
-                Value::from_i64(namespace_oid(&schema, rule.namespace)),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(relation_owner_oid(&schema, rule.namespace, &rule.view.name)),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::from_f64(0.0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::build_text("p"),
-                Value::build_text("v"),
-                Value::from_i64(rule.view.columns.len() as i64),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::build_text("n"),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                relation_acl(conn, &schema, rule.namespace, &rule.view.name),
-                Value::Null,
-                Value::Null,
-            ]);
-        }
-
-        rows
+        crate::classes::class_catalog(&conn.current_schema())
+            .map_or_else(Vec::new, |catalog| catalog.stored_rows())
     }
 }
 
@@ -3873,10 +3701,10 @@ impl ObjectAddress {
 
 impl RelationRow {
     // Zero-based positions in PgClassTable's SQL column order.
-    const OID_COLUMN: usize = 0;
-    const NAMESPACE_OID_COLUMN: usize = 2;
-    const ACCESS_METHOD_OID_COLUMN: usize = 6;
-    const KIND_COLUMN: usize = 16;
+    const OID_COLUMN: usize = crate::classes::column_position("oid");
+    const NAMESPACE_OID_COLUMN: usize = crate::classes::column_position("relnamespace");
+    const ACCESS_METHOD_OID_COLUMN: usize = crate::classes::column_position("relam");
+    const KIND_COLUMN: usize = crate::classes::column_position("relkind");
 
     fn from_row(row: &[Value]) -> Self {
         Self {
@@ -4799,7 +4627,6 @@ struct CatalogIndex {
     namespace: NamespaceId,
     table_name: String,
     name: String,
-    owner_oid: i64,
     columns: Vec<CatalogIndexColumn>,
     unique: bool,
     primary: bool,
@@ -4820,7 +4647,6 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
             continue;
         };
         for class in classes.indexes_of(table_oid) {
-            let owner_oid = role_oid(class.relowner);
             let Some(engine_name) = &class.engine_name else {
                 let (position, column) = btree
                     .get_rowid_alias_column()
@@ -4831,7 +4657,6 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                     namespace,
                     table_name: btree.declared_name.clone(),
                     name: class.relname.clone(),
-                    owner_oid,
                     columns: vec![CatalogIndexColumn {
                         name: column.name.clone().expect("primary key columns have names"),
                         position,
@@ -4866,7 +4691,6 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                 namespace,
                 table_name: btree.declared_name.clone(),
                 name: class.relname.clone(),
-                owner_oid,
                 columns: index
                     .columns
                     .iter()
@@ -5854,7 +5678,7 @@ mod tests {
 
         // Test 1: Filter by relkind = 'r'
         let mut stmt = conn
-            .prepare("SELECT COUNT(*) FROM pg_class WHERE relkind = 'r'")
+            .prepare("SELECT COUNT(*) FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200")
             .unwrap();
         match stmt.step().unwrap() {
             StepResult::Row => {

@@ -95,7 +95,10 @@ impl LoadStep for SchemaStateRows {
     fn end_of_rows(&mut self, load: &mut SchemaLoad) -> turso_core::Result<()> {
         let TableRows { table, rows } = self.reading.as_ref().expect("rows belong to a statement");
         match table {
-            Table::Classes => self.classes = ClassCatalog::build(load.schema(), rows)?,
+            Table::Classes => {
+                resolve_view_columns(load.schema_mut()?)?;
+                self.classes = ClassCatalog::build(load.schema(), rows)?;
+            }
             Table::Roles => self.roles = RoleCatalog::new(rows, &[])?,
             Table::Memberships => self.roles.set_memberships(rows)?,
         }
@@ -111,6 +114,51 @@ impl SchemaStateRows {
         }));
         Ok(())
     }
+}
+
+/// Resolves view columns after namespace names and all source relations are loaded.
+fn resolve_view_columns(schema: &mut Schema) -> turso_core::Result<()> {
+    // sqlite_schema is read before namespace names, so a qualified source can
+    // be unresolved when a view is first loaded. Resolve sources before their
+    // dependent views so SELECT * copies the complete column list.
+    let mut pending: Vec<_> = schema
+        .namespace_ids()
+        .flat_map(|namespace| {
+            schema
+                .views(namespace)
+                .map(move |(name, view)| (namespace, name.to_string(), view.clone()))
+        })
+        .collect();
+    while !pending.is_empty() {
+        let Some(index) = pending.iter().position(|(namespace, _, view)| {
+            schema
+                .referenced_tables_of(*namespace, &view.select_stmt)
+                .iter()
+                .all(|(source_namespace, source_name)| {
+                    !pending.iter().any(|(namespace, name, _)| {
+                        namespace == source_namespace && name == source_name
+                    })
+                })
+        }) else {
+            return Err(LimboError::Corrupt(
+                "views contain a circular dependency".into(),
+            ));
+        };
+        let (namespace, name, view) = pending.remove(index);
+        let mut columns =
+            turso_core::schema::view::extract_view_columns(namespace, &view.select_stmt, schema)?
+                .flat_columns()?;
+        for (column, name) in columns.iter_mut().zip(view.explicit_columns.iter()) {
+            column.name = Some(name.clone());
+        }
+        Arc::make_mut(
+            schema
+                .view_mut(namespace, &name)
+                .expect("the view is loaded"),
+        )
+        .columns = columns;
+    }
+    Ok(())
 }
 
 /// Changes the frontend's schema state in `schema` with `change`, so that
