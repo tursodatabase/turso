@@ -169,7 +169,7 @@ fn read_as_chosen_types(
 /// What the dialect is told about `expr`: its type, `null` when it is NULL,
 /// and no type when it is a hidden column, which the engine compares with the
 /// argument itself.
-fn operand_type(expr: &ast::Expr, env: &TypeEnv, null: OperandType) -> OperandType {
+pub(crate) fn operand_type(expr: &ast::Expr, env: &TypeEnv, null: OperandType) -> OperandType {
     if is_hidden_column(expr, env) {
         return OperandType::Unnamed;
     }

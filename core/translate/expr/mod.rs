@@ -105,7 +105,7 @@ pub use columns::{emit_stored_column, emit_table_column};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{
     check_custom_operator, check_in_subquery_operator, custom_operator_call,
-    emit_operator_call_on_registers, read_literal_operands,
+    emit_operator_call_on_registers, operand_type, read_literal_operands,
 };
 pub(crate) use custom_types::read_untyped_operand_as;
 pub(crate) use custom_types::{

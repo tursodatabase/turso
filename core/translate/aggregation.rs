@@ -16,6 +16,9 @@ use crate::{
 };
 
 use super::{
+    dialect_aggregate::{
+        chosen_aggregate, emit_chosen_aggregate_final, emit_chosen_aggregate_step,
+    },
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
@@ -453,6 +456,16 @@ pub fn emit_aggregate_step(
     resolver: &Resolver,
     minmax_keeps_best_reg: Option<usize>,
 ) -> Result<usize> {
+    if let Some(chosen) = chosen_aggregate(tables, aggregate, resolver)? {
+        return emit_chosen_aggregate_step(
+            program,
+            tables,
+            source,
+            target_register,
+            resolver,
+            &chosen,
+        );
+    }
     let Some(cursor_id) = aggregate.order_cursor else {
         return translate_aggregation_step(
             program,
@@ -510,6 +523,9 @@ pub fn emit_aggregate_final(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    if let Some(chosen) = chosen_aggregate(tables, aggregate, resolver)? {
+        return emit_chosen_aggregate_final(program, target_register, resolver, &chosen);
+    }
     if let Some(cursor_id) = aggregate.order_cursor {
         let key_count = aggregate.order_by().len();
         let column_count = key_count + 1 + 2 * aggregate.args.len();
