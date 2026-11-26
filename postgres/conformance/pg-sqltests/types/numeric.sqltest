@@ -101,3 +101,15 @@ test jsonb-casts-to-numeric {
 expect {
     1.5
 }
+
+test numeric-division-by-zero-is-an-error {
+    SELECT '1.50'::numeric / '0'::numeric;
+}
+@sqlstate 22012
+expect error {}
+
+test numeric-remainder-with-zero-is-an-error {
+    SELECT 5::numeric(5,0) % '0'::numeric;
+}
+@sqlstate 22012
+expect error {}
