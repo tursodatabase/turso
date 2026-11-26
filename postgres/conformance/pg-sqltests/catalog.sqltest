@@ -813,7 +813,7 @@ expect @tursopg error {cannot delete from pg_catalog table "pg_operator"}
 test pg-proc-lists-the-functions-of-the-frontend {
     SELECT oid, proname, pronamespace, proowner, prolang, procost::int, prorows::int, provariadic,
            prokind, prosecdef, proleakproof, proisstrict, proretset, provolatile, proparallel,
-           pronargs, pronargdefaults, prorettype, proargtypes::text
+           pronargs, pronargdefaults, prorettype, proargtypes::text, prosrc
     FROM pg_proc
     WHERE proname IN ('abs', 'avg', 'count', 'format_type', 'max', 'min', 'now', 'pg_get_constraintdef',
                       'pg_is_in_recovery', 'quote_ident', 'stddev', 'string_agg', 'sum')
@@ -822,64 +822,64 @@ test pg-proc-lists-the-functions-of-the-frontend {
     ORDER BY oid;
 }
 expect {
-    1081|format_type|11|10|12|1|0|0|f|f|f|f|f|s|s|2|0|25|26 23
-    1282|quote_ident|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|25|25
-    1299|now|11|10|12|1|0|0|f|f|f|t|f|s|s|0|0|1184|
-    1387|pg_get_constraintdef|11|10|12|1|0|0|f|f|f|t|f|s|s|1|0|25|26
-    1394|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|700|700
-    1395|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|701|701
-    1396|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|20|20
-    1397|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|23|23
-    1398|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|21|21
-    1705|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|1700|1700
-    2100|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20
-    2101|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|23
-    2102|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|21
-    2103|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
-    2104|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|700
-    2105|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
-    2107|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20
-    2108|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|23
-    2109|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|21
-    2110|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700
-    2111|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
-    2114|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
-    2115|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|20
-    2116|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|23|23
-    2117|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|21|21
-    2118|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|26|26
-    2119|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700
-    2120|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
-    2122|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1082|1082
-    2126|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1114|1114
-    2127|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1184|1184
-    2129|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|25|25
-    2130|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
-    2131|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|20
-    2132|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|23|23
-    2133|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|21|21
-    2134|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|26|26
-    2135|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700
-    2136|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
-    2138|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1082|1082
-    2142|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1114|1114
-    2143|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1184|1184
-    2145|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|25|25
-    2146|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
-    2147|count|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|2276
-    2154|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20
-    2155|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|23
-    2156|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|21
-    2157|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|700
-    2158|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
-    2159|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
-    2508|pg_get_constraintdef|11|10|12|1|0|0|f|f|f|t|f|s|s|2|0|25|26 16
-    2803|count|11|10|12|1|0|0|a|f|f|f|f|i|s|0|0|20|
-    3538|string_agg|11|10|12|1|0|0|a|f|f|f|f|i|s|2|0|25|25 25
-    3545|string_agg|11|10|12|1|0|0|a|f|f|f|f|i|s|2|0|17|17 17
-    3810|pg_is_in_recovery|11|10|12|1|0|0|f|f|f|t|f|v|s|0|0|16|
-    6395|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17
-    6396|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17
+    1081|format_type|11|10|12|1|0|0|f|f|f|f|f|s|s|2|0|25|26 23|format_type
+    1282|quote_ident|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|25|25|quote_ident
+    1299|now|11|10|12|1|0|0|f|f|f|t|f|s|s|0|0|1184||now
+    1387|pg_get_constraintdef|11|10|12|1|0|0|f|f|f|t|f|s|s|1|0|25|26|pg_get_constraintdef
+    1394|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|700|700|float4abs
+    1395|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|701|701|float8abs
+    1396|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|20|20|int8abs
+    1397|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|23|23|int4abs
+    1398|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|21|21|int2abs
+    1705|abs|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|1700|1700|numeric_abs
+    2100|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20|aggregate_dummy
+    2101|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|23|aggregate_dummy
+    2102|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|21|aggregate_dummy
+    2103|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700|aggregate_dummy
+    2104|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|700|aggregate_dummy
+    2105|avg|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701|aggregate_dummy
+    2107|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20|aggregate_dummy
+    2108|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|23|aggregate_dummy
+    2109|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|21|aggregate_dummy
+    2110|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700|aggregate_dummy
+    2111|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701|aggregate_dummy
+    2114|sum|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700|aggregate_dummy
+    2115|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|20|aggregate_dummy
+    2116|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|23|23|aggregate_dummy
+    2117|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|21|21|aggregate_dummy
+    2118|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|26|26|aggregate_dummy
+    2119|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700|aggregate_dummy
+    2120|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701|aggregate_dummy
+    2122|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1082|1082|aggregate_dummy
+    2126|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1114|1114|aggregate_dummy
+    2127|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1184|1184|aggregate_dummy
+    2129|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|25|25|aggregate_dummy
+    2130|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700|aggregate_dummy
+    2131|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|20|aggregate_dummy
+    2132|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|23|23|aggregate_dummy
+    2133|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|21|21|aggregate_dummy
+    2134|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|26|26|aggregate_dummy
+    2135|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|700|700|aggregate_dummy
+    2136|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701|aggregate_dummy
+    2138|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1082|1082|aggregate_dummy
+    2142|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1114|1114|aggregate_dummy
+    2143|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1184|1184|aggregate_dummy
+    2145|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|25|25|aggregate_dummy
+    2146|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700|aggregate_dummy
+    2147|count|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|20|2276|aggregate_dummy
+    2154|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|20|aggregate_dummy
+    2155|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|23|aggregate_dummy
+    2156|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|21|aggregate_dummy
+    2157|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|700|aggregate_dummy
+    2158|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701|aggregate_dummy
+    2159|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700|aggregate_dummy
+    2508|pg_get_constraintdef|11|10|12|1|0|0|f|f|f|t|f|s|s|2|0|25|26 16|pg_get_constraintdef_ext
+    2803|count|11|10|12|1|0|0|a|f|f|f|f|i|s|0|0|20||aggregate_dummy
+    3538|string_agg|11|10|12|1|0|0|a|f|f|f|f|i|s|2|0|25|25 25|aggregate_dummy
+    3545|string_agg|11|10|12|1|0|0|a|f|f|f|f|i|s|2|0|17|17 17|aggregate_dummy
+    3810|pg_is_in_recovery|11|10|12|1|0|0|f|f|f|t|f|v|s|0|0|16||pg_is_in_recovery
+    6395|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17|aggregate_dummy
+    6396|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17|aggregate_dummy
 }
 
 test pg-object-opclass-is-read-only {

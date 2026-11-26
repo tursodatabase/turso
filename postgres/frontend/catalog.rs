@@ -1471,7 +1471,7 @@ impl SnapshotRows for PgProcTable {
                     Value::Null,
                     Value::Null,
                     Value::Null,
-                    Value::Null,
+                    Value::build_text(proc.source),
                     Value::Null,
                     Value::Null,
                     Value::Null,
