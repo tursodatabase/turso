@@ -726,6 +726,31 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(CastDecision::EngineRules)
     }
 
+    /// Converts arguments to the declared parameter types of a scalar
+    /// function. SQLite applies its ordinary casts; other dialects can
+    /// restrict implicit conversions and use their type input functions.
+    fn coerce_function_arguments(
+        &self,
+        _name: &str,
+        arguments: &[&ast::Expr],
+        _sources: &[CastSource],
+        targets: &[TypeRef],
+    ) -> Result<Vec<ast::Expr>> {
+        assert_eq!(arguments.len(), targets.len());
+        Ok(arguments
+            .iter()
+            .zip(targets)
+            .map(|(argument, target)| ast::Expr::Cast {
+                expr: Box::new((*argument).clone()),
+                type_name: Some(ast::Type {
+                    name: target.name().to_string(),
+                    size: None,
+                    array_dimensions: target.array_dimensions,
+                }),
+            })
+            .collect())
+    }
+
     /// Whether a statement converts the new values of a row to the types of
     /// their columns before it checks NOT NULL.
     ///

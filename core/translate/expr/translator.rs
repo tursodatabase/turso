@@ -1167,6 +1167,21 @@ fn translate_function_call_expr(
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
         Func::External(_) | Func::Dialect(_) => {
+            let converted = if let Func::External(external) = &func_ctx.func {
+                if external.func.parameter_types().is_some() {
+                    let env = TypeEnv::new(referenced_tables, resolver);
+                    let sources: Vec<_> = args
+                        .iter()
+                        .map(|arg| super::expr_type::cast_source_of(arg, &env, resolver.schema()))
+                        .collect();
+                    let arguments: Vec<_> = args.iter().map(|arg| arg.as_ref()).collect();
+                    coerce_function_arguments(&func_ctx.func, &arguments, &sources, resolver)?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let argument_types: Vec<String> = match &func_ctx.func {
                 Func::External(external) if external.func.receives_argument_types() => {
                     let env = TypeEnv::new(referenced_tables, resolver);
@@ -1190,7 +1205,10 @@ fn translate_function_call_expr(
             let total_count = args_count + argument_types.len();
             let regs = program.alloc_registers(total_count);
             for (i, arg_expr) in args.iter().enumerate() {
-                translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
+                let argument = converted
+                    .as_ref()
+                    .map_or(arg_expr.as_ref(), |args| &args[i]);
+                translate_expr(program, referenced_tables, argument, regs + i, resolver)?;
             }
             for (i, type_name) in argument_types.into_iter().enumerate() {
                 program.emit_insn(Insn::String8 {
@@ -3684,4 +3702,29 @@ fn translate_merged_column(
     }
     program.preassign_label_to_next_insn(end_label);
     Ok(target_register)
+}
+
+/// Applies a function's declared parameter types before values reach its
+/// implementation. Operators call this too, including window range bounds.
+pub(super) fn coerce_function_arguments(
+    func: &Func,
+    args: &[&ast::Expr],
+    sources: &[crate::dialect::CastSource],
+    resolver: &Resolver,
+) -> Result<Option<Vec<ast::Expr>>> {
+    let Func::External(external) = func else {
+        return Ok(None);
+    };
+    let Some(parameters) = external.func.parameter_types() else {
+        return Ok(None);
+    };
+    let targets: Vec<_> = parameters
+        .iter()
+        .map(|name| super::expr_type::type_ref_of_name(name, 0, resolver.schema()))
+        .collect();
+    resolver
+        .catalog
+        .dialect
+        .coerce_function_arguments(&external.name, args, sources, &targets)
+        .map(Some)
 }

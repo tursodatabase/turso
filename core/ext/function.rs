@@ -31,11 +31,31 @@ impl ExternalFunc {
                 deterministic,
                 return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 receives_argument_types: false,
+                parameter_types: None,
                 check_argument_types: None,
                 returns_argument_type: None,
                 function: Arc::new(function),
             },
         })
+    }
+
+    /// Declares the parameter types of a fixed-arity function. The planner
+    /// asks the dialect to convert arguments before invoking the function.
+    pub fn with_parameter_types(mut self, types: &'static [&'static str]) -> Self {
+        let ExtFunc::NativeScalar {
+            arity,
+            parameter_types,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native scalar function can declare parameter types");
+        };
+        assert!(
+            matches!(arity, FunctionArity::Exact(n) if *n == types.len()),
+            "one parameter type per argument of a fixed-arity function"
+        );
+        *parameter_types = Some(types);
+        self
     }
 
     /// Makes each call also get the type name of each argument, such as
