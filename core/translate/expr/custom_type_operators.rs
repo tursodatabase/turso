@@ -538,7 +538,7 @@ pub(super) fn find_operator_call(
             }
         });
     };
-    call_for(signature, ty, env)
+    call_for(signature, ty, &operands, env)
 }
 
 /// The call of the function that the dialect names for `op` on `operands`,
@@ -581,6 +581,7 @@ fn call_the_dialect_chose(
         )));
     }
     Ok(Some(OperatorCall {
+        sources: function_argument_sources(&func, operands, env),
         func,
         encode: vec![None; operands.len()],
         result: function.result,
@@ -781,6 +782,7 @@ fn has_sqlite_operator(type_def: &TypeDef, signature: &OperatorSignature) -> boo
 fn call_for(
     signature: &OperatorSignature,
     ty: &ColumnCustomType,
+    operands: &[Operand],
     env: &TypeEnv,
 ) -> Result<Option<OperatorCall>> {
     let Some(func) = &signature.func else {
@@ -823,6 +825,7 @@ fn call_for(
         array_dimensions: 0,
     };
     Ok(Some(OperatorCall {
+        sources: function_argument_sources(&function, operands, env),
         func: function,
         encode,
         result,
@@ -831,6 +834,7 @@ fn call_for(
 
 pub(crate) struct OperatorCall {
     func: Func,
+    sources: Option<Vec<crate::dialect::CastSource>>,
     /// For each operand, the type to encode it to before the call.
     encode: Vec<Option<Arc<TypeDef>>>,
     /// The type the function returns.
@@ -850,6 +854,15 @@ pub(super) fn emit_operator_call(
         ast::Expr::Binary(lhs, _, rhs) => vec![lhs, rhs],
         ast::Expr::Unary(_, operand) => vec![operand],
         _ => unreachable!("a custom type's function only runs operators"),
+    };
+    let converted = if let Some(sources) = &call.sources {
+        super::translator::coerce_function_arguments(&call.func, &operands, sources, resolver)?
+    } else {
+        None
+    };
+    let operands: Vec<&ast::Expr> = match &converted {
+        Some(arguments) => arguments.iter().collect(),
+        None => operands,
     };
     assert_eq!(
         operands.len(),
@@ -891,14 +904,45 @@ pub(crate) fn emit_operator_call_on_registers(
         call.encode.len(),
         "one argument per operand"
     );
+    let converted = if let Some(sources) = &call.sources {
+        let arguments: Vec<_> = operand_regs
+            .iter()
+            .map(|reg| ast::Expr::register(*reg))
+            .collect();
+        super::translator::coerce_function_arguments(
+            &call.func,
+            &arguments.iter().collect::<Vec<_>>(),
+            sources,
+            resolver,
+        )?
+    } else {
+        None
+    };
     let start_reg = program.alloc_registers(operand_regs.len());
     for (i, (&operand_reg, encode)) in operand_regs.iter().zip(&call.encode).enumerate() {
+        let value_reg = if let Some(arguments) = &converted {
+            let value_reg = if encode.is_some() {
+                program.alloc_register()
+            } else {
+                start_reg + i
+            };
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                &arguments[i],
+                value_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            value_reg
+        } else {
+            operand_reg
+        };
         match encode {
-            Some(to) => {
-                emit_encode(program, to, operand_reg, start_reg + i, resolver)?;
-            }
+            Some(to) => emit_encode(program, to, value_reg, start_reg + i, resolver)?,
+            None if converted.is_some() => {}
             None => program.emit_insn(Insn::Copy {
-                src_reg: operand_reg,
+                src_reg: value_reg,
                 dst_reg: start_reg + i,
                 extra_amount: 0,
             }),
@@ -952,5 +996,32 @@ fn emit_encode(
         resolved.storage_class()?,
         dest_reg,
         resolver,
+    )
+}
+
+/// Keeps source types for parameter coercion when an operator's values are
+/// later read from registers, as in window RANGE bounds.
+fn function_argument_sources(
+    function: &Func,
+    operands: &[Operand],
+    env: &TypeEnv,
+) -> Option<Vec<crate::dialect::CastSource>> {
+    let Func::External(external) = function else {
+        return None;
+    };
+    external.func.parameter_types()?;
+    Some(
+        operands
+            .iter()
+            .map(|operand| {
+                if matches!(operand.expr, ast::Expr::Variable(_))
+                    && matches!(operand.expr_type, ExprType::Builtin(BuiltinType::Any))
+                {
+                    crate::dialect::CastSource::Untyped
+                } else {
+                    super::expr_type::dialect_cast_source(operand.expr_type.clone(), env.schema())
+                }
+            })
+            .collect(),
     )
 }
