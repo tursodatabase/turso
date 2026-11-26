@@ -444,6 +444,15 @@ impl Arena {
             // temporary heap buffers via the caller.
             return None;
         }
+        // When the cache holds more pages than the arena has slots, each page
+        // read asks a full arena for a slot. `alloc_one` then reads all the
+        // words of the bitmap before it fails, and the count of allocated
+        // slots gives the same result without the scan. While another thread
+        // frees a slot, the count can be one too high. The caller then uses a
+        // temporary buffer, as it does when the arena is full.
+        if arena.allocated_slots.load(Ordering::Acquire) >= arena.free_slots.n_slots() as usize {
+            return None;
+        }
         let first_idx = arena.free_slots.alloc_one()?;
         arena.allocated_slots.fetch_add(1, Ordering::AcqRel);
         let offset = first_idx as usize * arena.slot_size;
@@ -1869,5 +1878,30 @@ mod tests {
             }
         }
         panic!("no mapping in /proc/self/smaps holds {addr:#x}");
+    }
+}
+
+#[cfg(test)]
+mod arena_slot_tests {
+    use super::*;
+    use crate::io::MemoryIO;
+
+    /// A full arena gives no slot, so the pool gives temporary buffers, and a
+    /// slot that is freed can be taken again.
+    #[test]
+    fn full_arena_gives_a_slot_again_after_a_free() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        pool.finalize_with_page_size(4096).unwrap();
+        let slots = BufferPool::TEST_ARENA_SIZE / 4096;
+
+        let mut pages: Vec<Buffer> = (0..slots).map(|_| pool.get_page()).collect();
+        assert!(pages.iter().all(Buffer::is_pooled));
+        assert!(!pool.get_page().is_pooled());
+
+        pages.pop();
+        let page = pool.get_page();
+        assert!(page.is_pooled());
+        assert!(!pool.get_page().is_pooled());
     }
 }
