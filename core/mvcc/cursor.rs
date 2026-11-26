@@ -954,6 +954,31 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.take_eq_payload = false;
     }
 
+    /// Lands on the MvStore head if it matches the equality seek in progress and is visible.
+    /// Call it only when the seek key matches at most one row: the B-tree then has no other
+    /// visible match, so the seek does not read the B-tree.
+    fn land_on_visible_mvcc_head(&mut self, dir: IterationDirection) -> Result<bool> {
+        let Some(key) = self.walkable_key(&self.dual_peek.mvcc_peek).cloned() else {
+            return Ok(false);
+        };
+        let row = match self.view_mvcc_head()? {
+            ChainView::Visible(row) => row,
+            // The B-tree check of the same key does not need this chain, so the walk need
+            // not check it again.
+            ChainView::Hidden => {
+                self.dual_peek.mvcc_peek = CursorPeek::Stale;
+                return Ok(false);
+            }
+            ChainView::BtreeCovers => return Ok(false),
+        };
+        if row.is_some() {
+            self.eq_seek_row = row;
+        }
+        let versions = self.dual_peek.mvcc_peek.versions();
+        self.land(key, false, versions, dir);
+        Ok(true)
+    }
+
     /// Moves to the first visible row past the current row in `dir`, with a seek of both
     /// sources. A step does this when the heads are not the entries next to the current
     /// row: after an insert, an existence probe, an equality seek that missed the B-tree,
@@ -1620,6 +1645,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     inject_io_yield!(self, CursorYieldPoint::SeekStart);
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction)) => {
+                    if op.eq_only()
+                        && self.eq_bound_one_row
+                        && self.land_on_visible_mvcc_head(direction)?
+                    {
+                        self.state = None;
+                        self.end_eq_bound();
+                        // A later step positions the B-tree past this row.
+                        let key = self.dual_peek.mvcc_peek.raw_key().cloned();
+                        self.dual_peek.btree_peek =
+                            CursorPeek::SeekPast(key.expect("the seek landed on the MvStore head"));
+                        return Ok(IOResult::Done(SeekResult::Found));
+                    }
                     if self.is_btree_allocated() {
                         let seek_result =
                             return_if_io!(self.btree_cursor.seek(seek_key.clone(), op));

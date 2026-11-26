@@ -1505,7 +1505,7 @@ const HIDDEN_AT_EDGE: &[&str] = &[
 /// with `MVCC_COST_REPORT=1` to print the current totals.
 const WORK_CEILINGS: &[(&str, [u64; 5])] = &[
     ("CountAll", [12025, 4314, 72, 42, 13428]),
-    ("DeleteThroughIndex", [4695, 0, 4704, 4032, 4032]),
+    ("DeleteThroughIndex", [4695, 0, 4704, 0, 4032]),
     ("EqualityLoop", [1392, 1104, 1008, 672, 2016]),
     ("FullIndexScanAsc", [12025, 4314, 72, 42, 13428]),
     ("FullIndexScanDesc", [9114, 4314, 42, 42, 13428]),
@@ -1513,10 +1513,10 @@ const WORK_CEILINGS: &[(&str, [u64; 5])] = &[
     ("FullScanDesc", [7914, 4314, 42, 42, 11028]),
     ("InsertAutoRowid", [2442, 629, 4074, 4074, 3042]),
     ("InsertUnique", [0, 0, 4704, 4704, 672]),
-    ("IntegrityCheck", [87891, 38333, 23258, 24337, 110453]),
+    ("IntegrityCheck", [87891, 37704, 20752, 8076, 110453]),
     ("JoinNonUnique", [903, 1680, 1050, 714, 2016]),
-    ("JoinRowid", [375, 1008, 714, 714, 1344]),
-    ("JoinUnique", [711, 1680, 1386, 1386, 2016]),
+    ("JoinRowid", [375, 1008, 714, 378, 1344]),
+    ("JoinUnique", [711, 1680, 1386, 714, 2016]),
     ("LimitIndexAsc", [4247, 1228, 67, 42, 4242]),
     ("LimitIndexDesc", [2435, 629, 42, 42, 3042]),
     ("LimitRowidDesc", [2435, 629, 42, 42, 3042]),
@@ -1528,35 +1528,35 @@ const WORK_CEILINGS: &[(&str, [u64; 5])] = &[
     ("PointNocase", [864, 1008, 1008, 672, 1344]),
     ("PointNonUnique", [864, 1008, 1008, 672, 1344]),
     ("PointNullPrefix", [864, 1008, 1008, 672, 1344]),
-    ("PointRowid", [336, 336, 672, 672, 672]),
-    ("PointUnique", [672, 1008, 1344, 1344, 1344]),
+    ("PointRowid", [336, 336, 672, 336, 672]),
+    ("PointUnique", [672, 1008, 1344, 672, 1344]),
     ("RangeDescIndexAsc", [705, 699, 42, 42, 1386]),
     ("RangeDescIndexDesc", [717, 699, 63, 42, 1386]),
     ("RangeIndexAsc", [717, 699, 63, 42, 1386]),
     ("RangeIndexDesc", [705, 699, 42, 42, 1386]),
     ("RangeRowidAsc", [705, 699, 42, 42, 1386]),
     ("RangeRowidDesc", [705, 699, 42, 42, 1386]),
-    ("UpdateIndexKey", [3351, 0, 4704, 4032, 2688]),
-    ("UpdateThroughIndex", [672, 1008, 1344, 1344, 1344]),
-    ("pull/FullRowUpsert", [13935, 15600, 19200, 18800, 38735]),
-    ("pull/RecordedPull", [13949, 15752, 19248, 17648, 29299]),
-    ("pull/UpdateChangedColumns", [3200, 2000, 3600, 3600, 4800]),
+    ("UpdateIndexKey", [3351, 0, 4704, 1344, 2688]),
+    ("UpdateThroughIndex", [672, 1008, 1344, 672, 1344]),
+    ("pull/FullRowUpsert", [13935, 14000, 19200, 16800, 38735]),
+    ("pull/RecordedPull", [13949, 13752, 19248, 15240, 29299]),
+    ("pull/UpdateChangedColumns", [3200, 1600, 3600, 2800, 4800]),
     ("replay/Delete", [5577, 7200, 7200, 6000, 12189]),
     (
         "replay/DeleteThenInsert",
-        [12456, 10788, 14388, 11988, 23247],
+        [12645, 10788, 14388, 11988, 23247],
     ),
-    ("replay/InsertOrReplace", [9681, 6206, 13188, 13188, 22093]),
+    ("replay/InsertOrReplace", [10881, 6206, 13188, 13188, 22093]),
     ("replay/UpdateIndexed", [3688, 7612, 10788, 9588, 10512]),
     (
         "replay/UpdateSameIndexValue",
-        [12753, 9600, 9600, 8400, 23544],
+        [14547, 9600, 9600, 8400, 23544],
     ),
     ("replay/UpdateUnindexed", [378, 4800, 3600, 3600, 3978]),
-    ("replay/Upsert", [11988, 7612, 11988, 11988, 29612]),
+    ("replay/Upsert", [13188, 7612, 11988, 11988, 29612]),
     (
         "replay/UpsertSameIndexValue",
-        [10800, 9600, 10800, 10800, 33588],
+        [12594, 9600, 10800, 10800, 33588],
     ),
 ];
 
@@ -1708,12 +1708,35 @@ fn test_mvcc_query_cost_scaling() {
                         &mut report,
                         &mut totals,
                     );
+                    if source == ProbeSource::MvStore && READS_ONE_MVSTORE_ROW.contains(&query) {
+                        for work in [&small[i], &large[i]] {
+                            // A join may rewind its outer table once.
+                            if work.btree_seeks > 1 {
+                                failures.push(format!(
+                                    "{name}: seeks the B-tree {} times, but the MvStore holds \
+                                     the only row of each probe",
+                                    work.btree_seeks
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
     }
     finish(&report, &failures, &totals);
 }
+
+/// Queries whose probes each match at most one row (a rowid or a UNIQUE key). When the
+/// MvStore holds a visible row with that key, the B-tree cannot hold another visible match,
+/// so the probe must not seek the B-tree. The `Next` of a UNIQUE index loop does not seek it
+/// either: the loop keeps the bound of its seek.
+const READS_ONE_MVSTORE_ROW: [Query; 4] = [
+    Query::PointRowid,
+    Query::PointUnique,
+    Query::JoinRowid,
+    Query::JoinUnique,
+];
 
 #[test]
 fn test_mvcc_replay_cost_scaling() {
