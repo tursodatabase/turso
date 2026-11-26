@@ -1510,18 +1510,33 @@ pub(super) fn dialect_operand_type(expr: &ast::Expr, ty: ExprType, env: &TypeEnv
 
 /// FIXME(registered-types): The catalog tables declare some columns with another type than PostgreSQL (a boolean as INTEGER, a regproc as TEXT), and a subquery column does not say what type it has. So an operand that reads any of them is not checked. Once types are registered, every column and subquery column has its own type and this function goes away.
 /// Whether every value that `expr` reads has a declared type. A column of a
-/// table that is not STRICT, such as a virtual table, may hold any value, and
-/// the type of a subquery's column does not say where its values come from.
+/// table that is not STRICT, such as a virtual table, may hold any value. A
+/// column of a subquery has a declared type when the values of the subquery's
+/// result column do.
 fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
     let mut declared = true;
+    let mut subquery_columns_seen: Vec<(ast::TableInternalId, usize)> = Vec::new();
     let _ = super::walk_expr(
         expr,
         &mut |expr: &ast::Expr| -> Result<super::WalkControl> {
             declared &= match expr {
-                ast::Expr::Column { table, .. } => env
-                    .tables()
-                    .and_then(|tables| tables.find_table_by_internal_id(*table))
-                    .is_some_and(|(_, table)| table.is_strict()),
+                ast::Expr::Column { table, column, .. } => {
+                    match env
+                        .tables()
+                        .and_then(|tables| tables.find_table_by_internal_id(*table))
+                    {
+                        Some((_, Table::FromClauseSubquery(subquery))) => {
+                            if subquery_columns_seen.contains(&(*table, *column)) {
+                                true
+                            } else {
+                                subquery_columns_seen.push((*table, *column));
+                                derived_column_reads_only_declared_types(subquery, *column, env)
+                            }
+                        }
+                        Some((_, table)) => table.is_strict(),
+                        None => false,
+                    }
+                }
                 ast::Expr::SubqueryResult { .. }
                 | ast::Expr::Subquery(_)
                 | ast::Expr::Register { .. } => false,
@@ -1531,6 +1546,36 @@ fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
         },
     );
     declared
+}
+
+/// Whether the values of column `column` of the derived table `subquery`, in
+/// each of its SELECTs and each row of a VALUES list, read only declared types.
+fn derived_column_reads_only_declared_types(
+    subquery: &crate::schema::FromClauseSubquery,
+    column: usize,
+    env: &TypeEnv,
+) -> bool {
+    let Some(resolver) = env.resolver() else {
+        return false;
+    };
+    let selects: Vec<&SelectPlan> = match subquery.plan.as_ref() {
+        Plan::Select(select) => vec![select],
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter()
+            .map(|(select, _)| select)
+            .chain(core::iter::once(right_most.as_ref()))
+            .collect(),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => return false,
+    };
+    selects.into_iter().all(|select| {
+        let env = TypeEnv::new(Some(&select.table_references), resolver);
+        column < select.result_columns.len()
+            && select
+                .column_exprs(column)
+                .all(|expr| reads_only_declared_types(expr, &env))
+    })
 }
 
 /// The source of a value read from `column`.
