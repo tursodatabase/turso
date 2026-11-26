@@ -915,17 +915,24 @@ expect @tursopg error {
     no such function: extract
 }
 
-# date_trunc(text, timestamp) returns a timestamp. tursopg supports only
-# timestamptz arguments.
-@compat-gap "function:date_trunc"
+# date_trunc(text, timestamp) returns a timestamp.
 test date-trunc-timestamp {
     SELECT date_trunc('hour', '2026-10-08 12:34:56'::timestamp)::text;
 }
 expect {
     2026-10-08 12:00:00
 }
-@sqlstate 0A000
-expect @tursopg error {}
+
+# date_trunc of a domain over timestamp returns the base type, timestamp.
+test date-trunc-domain-over-timestamp {
+    CREATE DOMAIN trunc_ts AS timestamp;
+    CREATE TABLE trunc_domain_events (at trunc_ts);
+    INSERT INTO trunc_domain_events VALUES ('2026-10-08 12:34:56');
+    SELECT date_trunc('day', at) FROM trunc_domain_events;
+}
+expect {
+    2026-10-08 00:00:00
+}
 
 # B-93: nullif / greatest / least
 test nullif-greatest-least {

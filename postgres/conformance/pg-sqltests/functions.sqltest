@@ -3071,6 +3071,32 @@ expect {
     1
 }
 
+# date_trunc of a timestamp column returns a timestamp, which prints without
+# an offset.
+test date-trunc-timestamp-group-by-day {
+    CREATE TABLE trunc_timestamp_events (at timestamp);
+    INSERT INTO trunc_timestamp_events VALUES ('2026-10-08 01:00:00'), ('2026-10-08 23:59:59.999999'),
+        ('2026-10-09 00:00:00'), (NULL);
+    SELECT date_trunc('day', at), count(*) FROM trunc_timestamp_events GROUP BY 1 ORDER BY 1 NULLS LAST;
+}
+expect {
+    2026-10-08 00:00:00|2
+    2026-10-09 00:00:00|1
+    |1
+}
+
+# date_trunc of a domain over timestamptz resolves the domain as its base type,
+# including in a CHECK constraint.
+test date-trunc-domain-over-timestamptz {
+    CREATE DOMAIN dtz AS timestamptz;
+    CREATE TABLE trunc_dtz (b dtz, CHECK (date_trunc('day', b) IS NOT NULL));
+    INSERT INTO trunc_dtz VALUES ('2020-03-04 05:06:07+00');
+    SELECT date_trunc('day', b) FROM trunc_dtz;
+}
+expect {
+    2020-03-04 00:00:00+00
+}
+
 # date_trunc accepts the unit spellings of PostgreSQL's interval unit table,
 # in any letter case. A name longer than 10 characters matches on its first 10.
 test date-trunc-unit-aliases {

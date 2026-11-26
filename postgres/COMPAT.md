@@ -175,12 +175,14 @@ may be cast to a number: `'1'::jsonb::int`, `::bigint`, `::numeric`, `::float8`.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.
-`date_trunc(text, timestamptz)` for the units microseconds, milliseconds,
-second, minute, hour, day, week, month, quarter, year, decade, century and
-millennium, with every spelling in PostgreSQL's units table. An unknown unit fails
+`date_trunc(text, timestamp)` and `date_trunc(text, timestamptz)` for the units
+microseconds, milliseconds, second, minute, hour, day, week, month, quarter,
+year, decade, century and millennium, with every spelling in PostgreSQL's units
+table; the result has the type of the second argument, or its base type for a
+domain over timestamp or timestamptz. An unknown unit fails
 with 22023. The units `timezone`, `timezone_h` and `timezone_m`, the
-three-argument form with a time zone, and other argument types, such as
-timestamp, fail with 0A000.
+three-argument form with a time zone, and other argument types, such as date,
+fail with 0A000.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`

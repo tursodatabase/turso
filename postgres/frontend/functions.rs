@@ -70,7 +70,9 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
                 true,
                 |_, args| exec_date_trunc(args),
             )
-            .receiving_argument_types(),
+            .receiving_argument_types()
+            .checking_argument_types(check_date_trunc_types)
+            .returning_argument_type(1),
         )
         // FIXME(pg-interval): PostgreSQL has no function of this name. It exists
         // because tursopg has no interval type: the translator rewrites
@@ -86,18 +88,13 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types()
             .checking_argument_types(check_timestamp_plus_interval_types)
-            // FIXME(pg-catalog): The check refuses a domain on the left because
-            // the result would get the domain's type, where pg_operator gives
-            // the base type (timestamp or timestamptz). A pg_operator lookup
-            // replaces this.
-            .returning_first_argument_type(),
+            .returning_argument_type(0),
         )
 }
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
-/// timestamptz. `types` are the argument type names, with domain names kept;
-/// the first is the left side, so a domain over timestamp or timestamptz is
-/// refused. Every other type gets 0A000, including the ones that have no operator
+/// timestamptz. `types` are the argument type names, with a domain replaced by
+/// its base type; the first is the left side. Every other type gets 0A000, including the ones that have no operator
 /// in PostgreSQL (which gives 42883), because the type name does not say
 /// whether PostgreSQL has one. The translator turns `-` into `+` of the
 /// negated interval, so the message always says `+`.
@@ -114,6 +111,28 @@ fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
             format!(
                 "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
             ),
+            None,
+        )),
+    }
+}
+
+/// Refuses date_trunc when its second argument is not timestamp or
+/// timestamptz. `types` are the argument type names, with a domain replaced by
+/// its base type, as PostgreSQL resolves it.
+// FIXME(pg-catalog): HACK. This is a hand-written overload rule: the second
+// argument of date_trunc is timestamp or timestamptz, and the result has that
+// type (see `returning_argument_type(1)` where date_trunc is registered). It
+// stands in for the pg_proc rows date_trunc(text, timestamp) returns timestamp
+// and date_trunc(text, timestamptz) returns timestamptz. It refuses with 0A000
+// arguments that PostgreSQL accepts, such as a date, which PostgreSQL casts to
+// timestamptz. A pg_proc lookup replaces it.
+fn check_date_trunc_types(types: &[String]) -> Result<()> {
+    let time_type = types[1].as_str();
+    match time_type {
+        "timestamp" | "timestamptz" => Ok(()),
+        _ => Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("date_trunc is supported only for timestamp and timestamptz, not {time_type}"),
             None,
         )),
     }
@@ -186,10 +205,11 @@ fn add_interval(time: NaiveDateTime, months: i64, days: i64, micros: i64) -> Opt
         .checked_add_signed(Duration::microseconds(micros))
 }
 
-/// date_trunc(field, timestamptz). The declared return type is timestamptz,
-/// so any other argument type fails with 0A000 instead of returning a
-/// timestamptz for a timestamp or date argument.
-fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
+/// date_trunc(field, timestamp) and date_trunc(field, timestamptz). The result
+/// has the type of the second argument, which `check_date_trunc_types` limits
+/// to timestamp and timestamptz when the statement is compiled. Only UTC is
+/// supported, so timestamptz is truncated like timestamp.
+fn exec_date_trunc(args: &[Register]) -> Result<Value> {
     // Registered with arity 2 or 3; each argument is followed by its type.
     if args.len() == 6 {
         return Err(sqlstate_error(
@@ -200,25 +220,24 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
     }
     let (args, types) = args.split_at(args.len() / 2);
     let argument_type = types[1].get_value().to_string();
-    if argument_type != "timestamptz" {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            format!("date_trunc is supported only for timestamptz, not {argument_type}"),
-            None,
-        ));
-    }
+    // The name PostgreSQL uses for the type in its messages.
+    let type_name = match argument_type.as_str() {
+        "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        other => unreachable!("check_date_trunc_types refuses date_trunc of {other}"),
+    };
     let not_supported = |what: String| sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, what, None);
     let field = match args[0].get_value() {
         Value::Text(field) => field,
         // A SQL NULL unit gives NULL. A typed NULL such as NULL::int is
         // indistinguishable from it here, because the argument types are
         // not available for a NULL value.
-        Value::Null => return Ok(None),
+        Value::Null => return Ok(Value::Null),
         other => {
             return Err(sqlstate_error(
                 SQLSTATE_UNDEFINED_FUNCTION,
                 format!(
-                    "function date_trunc({}, timestamp with time zone) does not exist",
+                    "function date_trunc({}, {type_name}) does not exist",
                     types[0].get_value()
                 ),
                 Some(format!("Got a unit argument that is not text: {other}")),
@@ -226,12 +245,12 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
         }
     };
     let Value::Text(value) = args[1].get_value() else {
-        return Ok(None);
+        return Ok(Value::Null);
     };
     let time =
         NaiveDateTime::parse_from_str(value.as_str(), "%Y-%m-%d %H:%M:%S%.f").map_err(|_| {
             not_supported(format!(
-                "date_trunc is not supported for the timestamptz value \"{}\"",
+                "date_trunc is not supported for the {argument_type} value \"{}\"",
                 value.as_str()
             ))
         })?;
@@ -239,13 +258,13 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
     let parsed = DatetimeUnit::parse(field.as_str());
     if parsed == Some(DatetimeUnit::TimeZone) {
         return Err(not_supported(format!(
-            "unit \"{lowered_field}\" not supported for type timestamp with time zone"
+            "unit \"{lowered_field}\" not supported for type {type_name}"
         )));
     }
     let Some(unit) = parsed else {
         return Err(sqlstate_error(
             SQLSTATE_INVALID_PARAMETER_VALUE,
-            format!("unit \"{lowered_field}\" not recognized for type timestamp with time zone"),
+            format!("unit \"{lowered_field}\" not recognized for type {type_name}"),
             None,
         ));
     };
@@ -256,7 +275,7 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
             value.as_str()
         ))
     })?;
-    Ok(Some(Timestamptz(timestamp_text(truncated))))
+    Ok(Value::build_text(timestamp_text(truncated)))
 }
 
 /// `time` truncated to `unit`, as PostgreSQL's date_trunc does it, or None

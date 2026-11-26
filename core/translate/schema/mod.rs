@@ -464,6 +464,11 @@ fn resolve_func_return_type(
         }
         ResultType::Declared(ReturnType::Array) => Ok(CheckExprType::Any),
         ResultType::FirstArgument => Ok(first_argument()?.unwrap_or(CheckExprType::Any)),
+        ResultType::Argument(index) => Ok(args
+            .get(index)
+            .map(|arg| type_of(arg))
+            .transpose()?
+            .unwrap_or(CheckExprType::Any)),
         ResultType::OneOfTheArguments => common_check_type(args.iter().map(|arg| type_of(arg))),
         ResultType::OneOfTheIifValues => {
             common_check_type(iif_values(args).map(|arg| type_of(arg)))

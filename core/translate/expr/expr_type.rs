@@ -1125,6 +1125,14 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
     match result_type {
         ResultType::Declared(return_type) => declared_return_type(return_type, args, env),
         ResultType::FirstArgument => first_argument().unwrap_or(any),
+        // PostgreSQL resolves a domain argument as its base type.
+        ResultType::Argument(index) => args.get(index).map_or(any, |arg| {
+            let ty = type_of(arg, env);
+            match env.resolver() {
+                Some(resolver) => without_domain(ty, resolver.schema()),
+                None => ty,
+            }
+        }),
         ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheFirstAndThirdArguments => {
