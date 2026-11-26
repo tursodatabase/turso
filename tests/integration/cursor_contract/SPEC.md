@@ -241,6 +241,12 @@ you fix a bug, the test fails with "does not fail any more". Then remove the `kn
 wrapper: the body is a normal regression test. "WAL" means the B-tree path. An id with the
 prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 
+SQL reachability: only CL1 is reproduced from SQL (issue 9285). For D1, G4, N1, N4, OV1, R1
+and O1 about 100 hand-written statements and 2,100 random transactions (with and without
+a checkpoint, compared with sqlite3 3.51.0) gave no difference. G4 is tracked in issue 8197,
+which says that no ordinary SQL reaches it. The translator uses two-pass plans (an
+ephemeral table) wherever one cursor would write and another would read the same tree.
+
 | Id | Engine | Bug |
 |---|---|---|
 | D1 | MVCC, checkpointed | After `Insert`, `Next` and `Prev` lose the position |
