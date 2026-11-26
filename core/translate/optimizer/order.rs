@@ -2,6 +2,7 @@ use crate::ast::{self, SortOrder, TableInternalId};
 use crate::schema::{impl_effective_nulls_order, Column, Table};
 use crate::translate::expr_context::ExprContext;
 use crate::turso_assert_greater_than_or_equal;
+use crate::vdbe::affinity::Affinity;
 use crate::Result;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
@@ -865,8 +866,9 @@ impl OrderConsumption {
 ///
 /// This is shared by both candidate scoring and final ORDER BY / GROUP BY
 /// elimination so they use the same column-matching, collation, custom-type,
-/// and hidden-rowid-suffix rules. Index columns that an equality in the seek
-/// key fixes are skipped.
+/// fixed-column and hidden-rowid-suffix rules. Index columns that an equality
+/// in the seek key fixes are skipped. `constraints` are all the WHERE terms of
+/// the table, see [order_term_fixed_by_equality].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn btree_access_order_consumed(
     table_ref: &JoinedTable,
@@ -879,9 +881,9 @@ pub(super) fn btree_access_order_consumed(
     schema: &Schema,
 ) -> OrderConsumption {
     let target_columns = &order_target.columns[start_col..];
-    let Some(first_target_col) = target_columns.first() else {
+    if target_columns.is_empty() {
         return OrderConsumption::NONE;
-    };
+    }
 
     let rowid_alias_col = table_ref
         .table
@@ -892,29 +894,43 @@ pub(super) fn btree_access_order_consumed(
     match index {
         None => {
             // Without an index, only rowid order is available.
-            if first_target_col.table_id != table_ref.internal_id {
-                return OrderConsumption::NONE;
-            }
-            match first_target_col.target {
-                ColumnTarget::RowId => {}
-                ColumnTarget::Column(col_no) => {
-                    let Some(rowid_alias_col) = rowid_alias_col else {
-                        return OrderConsumption::NONE;
-                    };
-                    if col_no != rowid_alias_col {
-                        return OrderConsumption::NONE;
-                    }
-                }
-                ColumnTarget::Expr(_) => return OrderConsumption::NONE,
-            }
-            let correct_order = if iter_dir == IterationDirection::Forwards {
-                first_target_col.order == SortOrder::Asc
-            } else {
-                first_target_col.order == SortOrder::Desc
+            let skip_fixed = |col_idx| {
+                skip_fixed_order_terms(
+                    target_columns,
+                    col_idx,
+                    table_ref,
+                    constraints,
+                    rowid_alias_col,
+                    schema,
+                )
             };
+            let rowid_col_idx = skip_fixed(0);
+            let Some(rowid_target_col) = target_columns.get(rowid_col_idx) else {
+                return OrderConsumption {
+                    consumed: rowid_col_idx,
+                    includes_rowid: false,
+                };
+            };
+            let is_rowid = rowid_target_col.table_id == table_ref.internal_id
+                && match rowid_target_col.target {
+                    ColumnTarget::RowId => true,
+                    ColumnTarget::Column(col_no) => rowid_alias_col == Some(col_no),
+                    ColumnTarget::Expr(_) => false,
+                };
+            let correct_order = if iter_dir == IterationDirection::Forwards {
+                rowid_target_col.order == SortOrder::Asc
+            } else {
+                rowid_target_col.order == SortOrder::Desc
+            };
+            if !(is_rowid && correct_order) {
+                return OrderConsumption {
+                    consumed: rowid_col_idx,
+                    includes_rowid: false,
+                };
+            }
             OrderConsumption {
-                consumed: usize::from(correct_order),
-                includes_rowid: correct_order,
+                consumed: skip_fixed(rowid_col_idx + 1),
+                includes_rowid: true,
             }
         }
         Some(index) => index_columns_order_consumed(
@@ -1025,11 +1041,24 @@ fn index_columns_order_consumed<'a>(
         ColumnTarget::Column(col_no) => rowid_alias_col == Some(col_no),
         ColumnTarget::Expr(_) => false,
     };
-    while col_idx < target_columns.len() {
+    let skip_fixed = |col_idx| {
+        skip_fixed_order_terms(
+            target_columns,
+            col_idx,
+            table_ref,
+            constraints,
+            rowid_alias_col,
+            schema,
+        )
+    };
+    loop {
+        col_idx = skip_fixed(col_idx);
+        let Some(target_col) = target_columns.get(col_idx) else {
+            break;
+        };
         let Some((idx_pos, idx_col)) = index_columns.next() else {
             break;
         };
-        let target_col = &target_columns[col_idx];
         if target_col.table_id != table_ref.internal_id {
             break;
         }
@@ -1095,7 +1124,7 @@ fn index_columns_order_consumed<'a>(
             && target_is_rowid(target_col)
             && correct_order
         {
-            col_idx += 1;
+            col_idx = skip_fixed(col_idx + 1);
             includes_rowid = true;
         }
     }
@@ -1104,6 +1133,84 @@ fn index_columns_order_consumed<'a>(
         consumed: col_idx,
         includes_rowid,
     }
+}
+
+/// Return the position of the first order term at or after `col_idx` that
+/// [order_term_fixed_by_equality] does not skip.
+fn skip_fixed_order_terms(
+    target_columns: &[ColumnOrder],
+    mut col_idx: usize,
+    table_ref: &JoinedTable,
+    constraints: &[Constraint],
+    rowid_alias_col: Option<usize>,
+    schema: &Schema,
+) -> usize {
+    while target_columns.get(col_idx).is_some_and(|target_col| {
+        target_col.table_id == table_ref.internal_id
+            && order_term_fixed_by_equality(
+                target_col,
+                table_ref,
+                constraints,
+                rowid_alias_col,
+                schema,
+            )
+    }) {
+        col_idx += 1;
+    }
+    col_idx
+}
+
+/// Return true when a WHERE term `col = value` or `col IS value` of the order
+/// term's table gives the order term one value in every row, so the access
+/// path need not supply an order for it. SQLite's `wherePathSatisfiesOrderBy`
+/// skips these terms in any position of the ORDER BY or GROUP BY.
+///
+/// The value must read no table of this query and must not call a function
+/// such as `random()`, which the loop would evaluate again for each row. The
+/// term must compare with the order term's collation: values equal under one
+/// collation can differ under another. The comparison must not convert the
+/// column's values (the rule of `sqlite3IndexAffinityOk`): in a column with
+/// no affinity, `y = CAST(2 AS INT)` matches 2, 2.0 and '2', and ORDER BY
+/// sorts the text '2' after the numbers. The column's type must not be lossy
+/// (see [Schema::column_is_lossy]): `=` compares the values its DECODE
+/// returns, while ORDER BY sorts the stored values, so rows that `v = 2`
+/// matches can hold the different stored values '2' and '2.0'.
+fn order_term_fixed_by_equality(
+    target_col: &ColumnOrder,
+    table_ref: &JoinedTable,
+    constraints: &[Constraint],
+    rowid_alias_col: Option<usize>,
+    schema: &Schema,
+) -> bool {
+    if let ColumnTarget::Column(col_no) = target_col.target {
+        let column = &table_ref.table.columns()[col_no];
+        if schema.column_is_lossy(column, table_ref.table.is_strict()) {
+            return false;
+        }
+    }
+    constraints.iter().any(|constraint| {
+        let constrains_target = match target_col.target {
+            ColumnTarget::Column(col_no) => constraint.table_col_pos == Some(col_no),
+            ColumnTarget::RowId => {
+                constraint.is_rowid
+                    || rowid_alias_col.is_some_and(|alias| constraint.table_col_pos == Some(alias))
+            }
+            ColumnTarget::Expr(_) => false,
+        };
+        let column_affinity = match constraint.table_col_pos {
+            Some(col_no) => table_ref.table.columns()[col_no].comparison_affinity(),
+            None => Affinity::Integer,
+        };
+        constrains_target
+            && matches!(
+                constraint.operator.as_ast_operator(),
+                Some(ast::Operator::Equals | ast::Operator::Is)
+            )
+            && constraint.lhs_mask.is_empty()
+            && !constraint.constraining_expr_changes_within_statement
+            && constraint.collation == Some(target_col.collation)
+            && constraint.satisfies_index_affinity(column_affinity)
+    })
 }
 
 fn target_can_be_null(target_col: &ColumnOrder, table_ref: &JoinedTable) -> bool {

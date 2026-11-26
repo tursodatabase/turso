@@ -505,3 +505,287 @@ expect {
     2
     3
 }
+
+# A WHERE term `col = constant` or `col IS NULL` gives the column one value in
+# every row, so an ORDER BY or GROUP BY term on it needs no sort even when the
+# term is not an index seek key.
+setup fixed_by_where_equality {
+    CREATE TABLE plain(x, y);
+    INSERT INTO plain VALUES (3, 2), (1, 2), (2, NULL), (5, 1), (4, 2), (6, NULL);
+    CREATE TABLE ev(id INTEGER PRIMARY KEY, a INT, b INT, c INT);
+    CREATE INDEX ev_abc ON ev(a, b, c);
+    INSERT INTO ev VALUES (1, 3, 2, 1), (2, 1, 2, 5), (3, 2, 1, 1), (4, 0, 2, 4), (5, 2, 2, 0), (6, NULL, 2, NULL), (7, 3, NULL, 1);
+}
+
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_fixed_column_without_index_no_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM plain WHERE y = 2 ORDER BY y;
+}
+expect {
+    1|0|0|SCAN plain
+}
+
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_fixed_non_leading_index_column_no_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM ev WHERE b = 2 ORDER BY b;
+}
+expect {
+    1|0|0|SCAN ev
+}
+
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_fixed_column_then_rowid_no_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM ev WHERE b = 2 ORDER BY b, id;
+}
+expect {
+    1|0|0|SCAN ev
+}
+
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_fixed_column_after_index_column_no_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM ev WHERE b = 2 ORDER BY a, b DESC;
+}
+expect {
+    1|0|0|SCAN ev USING COVERING INDEX ev_abc
+}
+
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_fixed_column_limit_no_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM ev WHERE b = 2 ORDER BY b LIMIT 10;
+}
+expect {
+    1|0|0|SCAN ev
+}
+
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_column_is_null_then_rowid_desc_no_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM plain WHERE y IS NULL ORDER BY y, rowid DESC;
+}
+expect {
+    1|0|0|SCAN plain
+}
+
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test groupby_fixed_column_no_sorter {
+    EXPLAIN QUERY PLAN SELECT y, count(*) FROM plain WHERE y = 2 GROUP BY y;
+}
+expect {
+    1|0|0|SCAN plain
+}
+
+# random() runs again for each row, so the rows can have different values of y.
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_column_equal_to_random_uses_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM plain WHERE y = abs(random()) % 2 ORDER BY y;
+}
+expect {
+    1|0|0|SCAN plain
+    15|0|0|USE SORTER FOR ORDER BY
+}
+
+# Under NOCASE, y = 'a' matches 'a' and 'A', which BINARY orders apart.
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_fixed_column_other_collation_uses_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM plain WHERE y = 'a' COLLATE nocase ORDER BY y;
+}
+expect {
+    1|0|0|SCAN plain
+    12|0|0|USE SORTER FOR ORDER BY
+}
+
+# The LEFT JOIN emits NULL for p2.y when no row matches, so p2.y has two values.
+@setup fixed_by_where_equality
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_left_join_on_equality_uses_sorter {
+    EXPLAIN QUERY PLAN SELECT * FROM plain p1 LEFT JOIN plain p2 ON p2.y = 2 ORDER BY p2.y;
+}
+expect {
+    1|0|0|SCAN plain AS p1
+    2|0|0|SEARCH p2 USING COVERING INDEX ephemeral_plain_t2 (y=?) LEFT-JOIN
+    37|0|0|USE SORTER FOR ORDER BY
+}
+
+@setup fixed_by_where_equality
+test orderby_fixed_column_then_rowid_desc_rows {
+    SELECT id FROM ev WHERE b = 2 ORDER BY b, id DESC;
+}
+expect {
+    6
+    5
+    4
+    2
+    1
+}
+
+@setup fixed_by_where_equality
+test orderby_fixed_column_after_index_column_rows {
+    SELECT id, a FROM ev WHERE b = 2 ORDER BY a, b DESC;
+}
+expect {
+    6|
+    4|0
+    2|1
+    5|2
+    1|3
+}
+
+@setup fixed_by_where_equality
+test orderby_fixed_column_between_index_columns_rows {
+    SELECT a, c FROM ev WHERE b = 2 ORDER BY a DESC, b, c;
+}
+expect {
+    3|1
+    2|0
+    1|5
+    0|4
+    |
+}
+
+@setup fixed_by_where_equality
+test orderby_column_is_null_then_rowid_desc_rows {
+    SELECT x FROM plain WHERE y IS NULL ORDER BY y, rowid DESC;
+}
+expect {
+    6
+    2
+}
+
+@setup fixed_by_where_equality
+test orderby_fixed_column_other_collation_rows {
+    INSERT INTO plain VALUES (8, 'a'), (7, 'A'), (9, 'a');
+    SELECT x, y FROM plain WHERE y = 'a' COLLATE nocase ORDER BY y, x;
+}
+expect {
+    7|A
+    8|a
+    9|a
+}
+
+@setup fixed_by_where_equality
+test groupby_fixed_column_rows {
+    SELECT y, count(*), min(x), max(x) FROM plain WHERE y = 2 GROUP BY y;
+}
+expect {
+    2|3|1|4
+}
+
+# y has no affinity and CAST(2 AS INT) has INTEGER affinity, so the comparison
+# converts the text '2' to a number and matches 2, '2' and 2.0. ORDER BY,
+# GROUP BY and DISTINCT order the text '2' apart from the numbers.
+setup fixed_by_where_equality_with_affinity {
+    CREATE TABLE v(id INTEGER PRIMARY KEY, y);
+    INSERT INTO v VALUES (1, 2), (2, '2'), (3, 2.0), (4, 3);
+    CREATE TABLE k(n INTEGER);
+    INSERT INTO k VALUES (2);
+    CREATE TABLE vt(id INTEGER PRIMARY KEY, y TEXT);
+    INSERT INTO vt VALUES (1, '2.0'), (2, '2'), (3, '2.00'), (4, '3');
+}
+
+@setup fixed_by_where_equality_with_affinity
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_fixed_column_converted_by_affinity_uses_sorter {
+    EXPLAIN QUERY PLAN SELECT id FROM v WHERE y = CAST(2 AS INT) ORDER BY y, id;
+}
+expect {
+    1|0|0|SCAN v
+    12|0|0|USE SORTER FOR ORDER BY
+}
+
+@setup fixed_by_where_equality_with_affinity
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_fixed_column_compared_without_conversion_no_sorter {
+    EXPLAIN QUERY PLAN SELECT id FROM vt WHERE y = 2 ORDER BY y, id;
+}
+expect {
+    1|0|0|SCAN vt
+}
+
+@setup fixed_by_where_equality_with_affinity
+@skip-if sqlite "sqlite 3.50.4 skips the sort and returns rows in rowid order"
+test orderby_fixed_column_converted_by_affinity_rows {
+    SELECT id FROM v WHERE y = (SELECT n FROM k) ORDER BY y, id;
+}
+expect {
+    1
+    3
+    2
+}
+
+@setup fixed_by_where_equality_with_affinity
+@skip-if sqlite "sqlite 3.50.4 skips the sort and returns rows in rowid order"
+test orderby_text_column_converted_by_affinity_rows {
+    SELECT id FROM vt WHERE y = CAST(2 AS INT) ORDER BY y, id;
+}
+expect {
+    2
+    1
+    3
+}
+
+@setup fixed_by_where_equality_with_affinity
+@skip-if sqlite "sqlite 3.50.4 skips the sort and does not group equal values together"
+test groupby_fixed_column_converted_by_affinity_rows {
+    SELECT y, count(*) FROM v WHERE y = (SELECT n FROM k) GROUP BY y;
+}
+expect {
+    2|2
+    2|1
+}
+
+@setup fixed_by_where_equality_with_affinity
+@skip-if sqlite "sqlite 3.50.4 skips the sort and does not group equal values together"
+test distinct_fixed_column_converted_by_affinity_rows {
+    SELECT DISTINCT y FROM v WHERE y = (SELECT n FROM k);
+}
+expect {
+    2
+    2
+}
+
+# `=` compares the values a DECODE returns and ORDER BY sorts the stored
+# values. v = 2 matches the stored '2.0' and '2', so it does not give v one
+# value, and ORDER BY v puts '2' first as it does without the WHERE term.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test orderby_column_fixed_by_equality_of_decoded_values_rows {
+    CREATE TYPE tnum BASE text ENCODE CAST(value AS text) DECODE CAST(value AS real) OPERATOR '<';
+    CREATE TABLE m(id INTEGER PRIMARY KEY, v tnum) STRICT;
+    INSERT INTO m VALUES (1, '2.0'), (2, '2'), (3, '3');
+    SELECT id FROM m ORDER BY v, id;
+    SELECT id FROM m WHERE v = 2 ORDER BY v, id;
+    SELECT id FROM m WHERE v IS 2 ORDER BY v, id;
+    SELECT id FROM m WHERE v = 2 ORDER BY v DESC, id;
+}
+expect {
+    2
+    1
+    3
+    2
+    1
+    2
+    1
+    1
+    2
+}
+
+# A type whose DECODE is `value` compares its stored values, so v = 'b' gives v
+# one value and ORDER BY v needs no sort.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test orderby_column_fixed_by_equality_of_stored_values_no_sorter {
+    CREATE TYPE tsame BASE text DECODE value OPERATOR '<';
+    CREATE TABLE s(id INTEGER PRIMARY KEY, v tsame) STRICT;
+    EXPLAIN QUERY PLAN SELECT id FROM s WHERE v = 'b' ORDER BY v, id;
+}
+expect {
+    1|0|0|SCAN s
+}
