@@ -258,6 +258,7 @@ pub fn prepare_delete_plan(
         &mut table_references,
         None,
         &mut where_predicates,
+        false,
         resolver,
     )?;
     row_security::filter_rows(

@@ -21,8 +21,9 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
-    collect_subquery_table_refs_in_expr, collect_subquery_table_refs_in_window_clause, parse_from,
-    parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    collect_subquery_table_refs_in_expr, collect_subquery_table_refs_in_window_clause,
+    first_aggregate_without_over_clause, parse_from, parse_limit, parse_where,
+    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::row_security;
@@ -598,6 +599,8 @@ fn prepare_one_select_plan(
                     &mut plan.table_references,
                     Some(&plan.result_columns),
                     &mut plan.where_clause,
+                    group_by.is_some()
+                        || result_columns_contain_aggregate(&plan.result_columns, resolver)?,
                     resolver,
                 )?;
             }
@@ -1031,42 +1034,6 @@ fn result_columns_contain_aggregate(
         }
     }
     Ok(false)
-}
-
-fn first_aggregate_without_over_clause<'a>(
-    expr: &'a ast::Expr,
-    resolver: &Resolver,
-) -> Result<Option<&'a str>> {
-    let mut found = None;
-    walk_expr(expr, &mut |e: &'a ast::Expr| -> Result<WalkControl> {
-        let (name, args_count, filter_over) = match e {
-            ast::Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } => (name, args.len(), filter_over),
-            ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
-            _ => return Ok(WalkControl::Continue),
-        };
-        if found.is_some() || filter_over.over_clause.is_some() {
-            return Ok(WalkControl::Continue);
-        }
-        let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count)
-        {
-            Ok(Some(crate::function::Func::Agg(_))) => true,
-            _ => resolver
-                .catalog
-                .symbol_table
-                .resolve_function(name.as_str(), args_count)
-                .is_some_and(|f| f.func.is_aggregate()),
-        };
-        if is_aggregate {
-            found = Some(name.as_str());
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
 }
 
 /// Validate that all expressions in the plan return the correct number of values;

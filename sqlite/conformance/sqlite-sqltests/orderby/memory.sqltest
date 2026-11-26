@@ -249,6 +249,30 @@ expect error {
     misuse of aggregate: max()
 }
 
+test where_rejects_aggregate_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y WHERE 0 AND max(d);
+}
+expect error {
+    misuse of aggregate function max\(\)
+}
+
+test delete_where_rejects_aggregate_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    DELETE FROM y WHERE 0 AND max(d);
+}
+expect error {
+    misuse of aggregate function max\(\)
+}
+
+test update_where_rejects_aggregate_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    UPDATE y SET d = 1 WHERE 0 AND count(*);
+}
+expect error {
+    misuse of aggregate function count\(\)
+}
+
 test where_checks_function_names_in_term_without_code {
     CREATE TABLE y(id INTEGER PRIMARY KEY, d);
     SELECT d FROM y WHERE 0 AND nosuchfn(d);
@@ -329,6 +353,15 @@ expect error {
     wrong number of arguments to function abs\(\)
 }
 
+test join_on_rejects_aggregate_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 0 AND max(w.d);
+}
+expect error {
+    misuse of aggregate function max\(\)
+}
+
 test update_from_join_on_checks_function_names_in_term_without_code {
     CREATE TABLE y(id INTEGER PRIMARY KEY, d);
     INSERT INTO y VALUES (1, 5);
@@ -336,6 +369,70 @@ test update_from_join_on_checks_function_names_in_term_without_code {
 }
 expect error {
     no such function: nosuchfn
+}
+
+test where_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR row_number() OVER ();
+}
+expect error {
+    misuse of window function row_number\(\)
+}
+
+test update_where_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 1 WHERE 1 OR sum(d) OVER ();
+}
+expect error {
+    misuse of window function sum\(\)
+}
+
+test join_on_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR sum(w.d) OVER ();
+}
+expect error {
+    misuse of window function sum\(\)
+}
+
+test where_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR lag(d);
+}
+expect error {
+    misuse of window function lag\(\)
+}
+
+test update_where_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR row_number();
+}
+expect error {
+    misuse of window function row_number\(\)
+}
+
+test join_on_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR ntile(2);
+}
+expect error {
+    misuse of window function ntile\(\)
+}
+
+@cross-check-integrity
+test where_subquery_allows_window_function {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR (SELECT sum(d) OVER ());
+}
+expect {
+    5
 }
 
 test where_checks_function_names_in_exists_result_columns {

@@ -29,7 +29,7 @@ use crate::translate::expr::expr_type::{
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
-use crate::translate::planner::ROWID_STRS;
+use crate::translate::planner::{window_function_name, ROWID_STRS};
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::sequence::bind_sequence_names;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
@@ -102,30 +102,24 @@ pub(crate) fn validate_check_expr(
                     !order_by.is_empty(),
                     resolver,
                 )?;
-                if filter_over.over_clause.is_some() {
-                    bail_parse_error!("misuse of window function {}()", name.as_str());
+                if let Some(name) = window_function_name(e, resolver)? {
+                    bail_parse_error!("misuse of window function {}()", name);
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
-                    if matches!(func, Func::Window(..)) {
-                        bail_parse_error!("misuse of window function {}()", name.as_str());
-                    }
                 } else {
                     bail_parse_error!("no such function: {}", name.as_str());
                 }
             }
-            ast::Expr::FunctionCallStar { name, filter_over } => {
-                if filter_over.over_clause.is_some() {
-                    bail_parse_error!("misuse of window function {}()", name.as_str());
+            ast::Expr::FunctionCallStar { name, .. } => {
+                if let Some(name) = window_function_name(e, resolver)? {
+                    bail_parse_error!("misuse of window function {}()", name);
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
-                    }
-                    if matches!(func, Func::Window(..)) {
-                        bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
                 } else {
                     bail_parse_error!("no such function: {}", name.as_str());
