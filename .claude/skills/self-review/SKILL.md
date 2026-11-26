@@ -1,0 +1,83 @@
+---
+name: self-review
+description: How to prepare a pull request and review it yourself before you publish it. Use when you start a fix, before you open or push a PR, or when asked to "review my PR" or "self-review". Covers comparing with SQLite and PostgreSQL, the test that fails without the fix, the risk check, and having a second session try to break the change.
+---
+# Self-review
+
+Most review rounds on a PR find the same things: a rule fixed in one path but not in the others, a test that passes without the fix, a wrong answer that SQLite or PostgreSQL would not give, a helper that already exists. Find these yourself first. Then the first review has nothing new to say.
+
+## Light or full pass
+
+Do the full pass if the change touches type rules, conversions, comparisons, storage, the planner, MVCC, or a public API, or if it adds more than about 300 lines that are not tests (`git diff --stat origin/main...`).
+
+For all other changes (an error message, a narrow fix inside one function, a doc), do steps 0, 1, 2 and 5.
+
+Steps 3 and 4 run once, on the final diff. Fix what they find in one batch; do not repeat them after each fix.
+
+## 0. Set up SQLite and PostgreSQL to compare with
+
+```bash
+scripts/oracles.sh            # sqlite3 at our version, PostgreSQL in Docker
+scripts/oracles.sh --sources  # also clone both sources into ~/.cache/turso-oracles
+```
+
+Run the `export` lines it prints: `PATH`, so `scripts/diff.sh` uses our sqlite3 version, and `PG_DSN` for PostgreSQL. Without Docker, set `PG_DSN` to any PostgreSQL server of the version in `postgres/version`. `scripts/oracles.sh --stop` removes the container.
+
+## 1. Before the fix
+
+- Reproduce the bug on `main` (for a `main` build next to your branch: `git worktree add ../turso-main origin/main`):
+  - SQLite frontend: `scripts/diff.sh "SQL"` runs the SQL in `sqlite3` and `tursodb` and prints PASS, or FAIL with a diff.
+  - PostgreSQL frontend: `psql "$PG_DSN" -c "SQL"` and `cargo run -q -p tursopg -- :memory: "SQL"`.
+- Do not trust your memory of what SQLite or PostgreSQL does. Run it. A different error message is not always a bug. A different result is.
+- Read their source for the behaviour (`--sources` above; SQLite: `src/`, PostgreSQL: `src/backend/`). Find how it stores and converts the value. Do the same, not a different way that gives the same output on your example.
+- If neither SQLite, PostgreSQL nor current Turso behaviour decides the answer, stop and ask a maintainer. Do not pick it inside a fix.
+
+## 2. The fix and its test
+
+- Fix the bug for every input, not only the reported query. Find every input that breaks the same rule: other statement types (INSERT, UPDATE, DELETE, UPSERT), other query shapes (joins, subqueries, ORDER BY, GROUP BY, indexes, views, triggers), and the other callers of each function you change (`rg` for them).
+- Fix the other defects in the same feature (the same function, cast or statement) in the same PR if the risk is low.
+- If one rule is checked in many places, move it to the one place that should decide it. A check that every new caller must remember will be missed.
+- Before you write a helper, type or constant, search for code that already does the job, by what it does, not only by name. Reuse it or extend it. Delete the code you replace.
+- Keep the scope to the bug. PostgreSQL-only behaviour goes in `postgres/`, not in `core`. A fix for a rare case must not change code that every query runs through.
+- If a value is already wrong when it reaches your code, fix the code that produces it, not the code that reads it.
+- Write the test with the fix. Then prove that it fails without the fix: revert only the non-test change, run the test, see it fail, restore the change, see it pass. Use `.sqltest` files where you can (the `testing` skill says how to run them). A test that passes on `main` does not test this change.
+- The test uses the reported input, or a smaller input that still fails the same way.
+
+## 3. Risk check (full pass only)
+
+For each area, ask if the change can reach it. If yes, run the check.
+
+| Area | Check |
+|------|-------|
+| On-disk format | Does a database file change shape? Open a file made by a `main` build with your build, and the other way. The results match and `PRAGMA integrity_check` passes. |
+| Durability, crash recovery | Does the change touch WAL, checkpoint, fsync or the pager? Run the simulator (the `debugging` skill) with several seeds. |
+| Concurrency, MVCC, locks | Run the concurrent tests for the code (the `mvcc` and `transaction-correctness` skills). Try two connections that interleave. |
+| Public API, bindings | Did a signature, an error or a default change? Search the bindings for each caller. |
+| SQLite or PostgreSQL compatibility | Compare with them on the reported input and on its neighbours: NULL, empty, boundary values, signs, affinity, very large values. |
+| Speed of common queries | Does the change add work to code every query runs? Benchmark before and after. |
+
+## 4. Try to break it, in a second session (full pass only)
+
+You know why the change is right, so you will not see where it is wrong. Give the job to a new Claude Code session, a subagent, or a colleague who has not seen your reasoning. Give it only:
+
+- the diff (`git diff origin/main...HEAD`) and the PR description
+- a worktree with your branch, and one with `origin/main`
+- the commands from step 0 and 1, with your `PATH` and `PG_DSN` values
+
+Do not give it your notes, your plan or your explanation. Tell it:
+
+> Find inputs on which the branch gives a wrong result. Do not review style or run the test suite. Say what must be true for the change to be right. List the other ways to reach the same code. Run each one on the branch, on `origin/main`, and on SQLite or PostgreSQL. Shrink each failure to the smallest input, then say which kinds of input fail. Stop any run that takes longer than 60 seconds. Report a failure only with the commands you ran.
+
+Read what it reports. A failure that `main` also has, in the same feature or in code you changed, belongs in this PR. A failure far from the change goes in a new issue that names its cause, not only its symptom.
+
+## 5. Before you push
+
+- Read `git diff --stat`. Delete what the fix does not need.
+- Ask of the diff:
+  - What one fact makes this change right? Show it with a command or cite `file:line`.
+  - Does any comment say what the code does, instead of why? Delete it or fix it.
+  - Does a skip, a catch-all or a default value hide a case the change knows is wrong?
+- Run what CI runs for the crates you changed, with the same flags (`.github/workflows/`): `cargo fmt`, clippy, and the tests near your change. Once, on the final tree.
+- In the PR description:
+  - on a full pass, which risk areas from step 3 you checked, and which you could not and why;
+  - the weakest part of the change in one sentence: the input you are least sure of, the risk you could not check, or the choice a reviewer might dispute. A reviewer who is told where to look finds more, and sooner.

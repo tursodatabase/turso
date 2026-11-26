@@ -84,6 +84,8 @@ progress so that another run can continue it.
 
 Topic guides are in `.claude/skills/<name>/SKILL.md`: testing, debugging, async-io-model,
 transaction-correctness, mvcc, yield-injections, cdc, differential-fuzzer, memory-benchmark.
+Before you open a PR, run the `self-review` skill: it compares the change with SQLite and
+PostgreSQL (`scripts/oracles.sh` sets them up) and lists the risks to check.
 
 In PR descriptions, explain what the bug was in the past tense, and the solution in the present tense.
 If you identified the bug while working on a project other than Turso, please name it. When addressing
