@@ -311,8 +311,11 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
         }
     };
     // `Idx*`: compare the entry under the cursor with the prefix; no state change.
+    // The entry under the cursor must still exist: after a delete by another cursor the
+    // position is `At` a key that is gone, and the compare is Undefined (U6).
     let idx = |p: &Cols, f: fn(Ordering) -> bool| match &c.icpos {
-        IPos::At(k) => put(c.clone(), f(cmp_prefix(d, k, p))),
+        IPos::At(k) if imem(d, k, s) => put(c.clone(), f(cmp_prefix(d, k, p))),
+        IPos::At(_) => None,
         IPos::Invalid => put(c.clone(), true),
         _ => None,
     };

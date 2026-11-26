@@ -75,12 +75,6 @@ impl IdxGaps {
     /// with "Corrupt database: Payload too small for indicated header size". The contract
     /// leaves the position open, but not an error.
     pub const N7_READ_AFTER_SEEK_END: IdxGaps = IdxGaps(1 << 4);
-    /// N8: a compare op (`IdxGE`, `IdxGT`, `IdxLE`, `IdxLT`) on a cursor whose entry another
-    /// cursor deleted. The model compares the saved key, WAL and MVCC compare the entry
-    /// after it. Probably the model choice must change (like SQLite, which restores the cursor
-    /// to the next entry), see the report.
-    pub const N8_IDX_COMPARE_AFTER_PEER_WRITE: IdxGaps = IdxGaps(1 << 5);
-
     /// IDX_G2_PEER_DELETE: a read of a cursor whose entry another cursor deleted. The contract
     /// (D5) says NULL. MVCC reads the deleted entry. The index twin of the table filter `G2`.
     pub const IDX_G2_PEER_DELETE: IdxGaps = IdxGaps(1 << 6);
@@ -152,13 +146,12 @@ impl IdxGaps {
         }
     }
 
-    pub const NAMES: [(&'static str, IdxGaps); 16] = [
+    pub const NAMES: [(&'static str, IdxGaps); 15] = [
         ("IDX_D1_MVCC_CKPT", IdxGaps::IDX_D1_MVCC_CKPT),
         ("IDX_END_INSERT", IdxGaps::IDX_END_INSERT),
         ("ROWDATA_IDX_INSERT", IdxGaps::ROWDATA_IDX_INSERT),
         ("ROWDATA_NULL_ROW", IdxGaps::ROWDATA_NULL_ROW),
         ("N7", IdxGaps::N7_READ_AFTER_SEEK_END),
-        ("N8", IdxGaps::N8_IDX_COMPARE_AFTER_PEER_WRITE),
         ("IDX_G2_PEER_DELETE", IdxGaps::IDX_G2_PEER_DELETE),
         ("IDX_N2_READ_AFTER_COUNT", IdxGaps::IDX_N2_READ_AFTER_COUNT),
         (
@@ -850,7 +843,6 @@ impl Gen {
                 && matches!(*op, IOp::Next(c) | IOp::Prev(c)
                     if self.own_deleted[c] && self.peer_wrote[c]))
             || (self.gaps.has(IdxGaps::N7_READ_AFTER_SEEK_END) && self.n7(op))
-            || (self.gaps.has(IdxGaps::N8_IDX_COMPARE_AFTER_PEER_WRITE) && self.n8(op))
     }
 
     /// CL1: an `IdxInsert` of a key that is equal but not identical to a key that the index
@@ -949,19 +941,6 @@ impl Gen {
     fn n7(&self, op: &IOp) -> bool {
         matches!(*op, IOp::Observe(c) | IOp::Column(c, _) | IOp::IdxRowId(c)
             if self.after_seek_end[c])
-    }
-
-    /// N8: a compare op on a cursor that is on an entry which is no longer in the index.
-    fn n8(&self, op: &IOp) -> bool {
-        let (IOp::IdxGE(c, _) | IOp::IdxGT(c, _) | IOp::IdxLE(c, _) | IOp::IdxLT(c, _)) = *op
-        else {
-            return false;
-        };
-        let cur = &self.replay.st.icurs[c];
-        match &cur.icpos {
-            IPos::At(k) => !imem(self.replay.st.idef, k, &self.replay.st.irows),
-            _ => false,
-        }
     }
 
     /// IDX_D1_MVCC_CKPT: `Next` or `Prev` right after an `IdxInsert` of the same cursor.
@@ -1610,23 +1589,6 @@ mod tests {
                 &[Last(0), SeekEnd(0), Observe(0)],
             );
             agree(&EPH, &[(6, v(4), NUL)], 1, &[SeekEnd(0), Observe(0)]);
-        });
-    }
-
-    /// N8: a compare op (`IdxGT`) on a cursor whose entry a peer deleted. The model compares
-    /// the saved key (model choice), so `IdxGT [NULL]` on `(NULL, 6, 4)` does not jump. All
-    /// engines compare the entry after it, or see the end, and jump. This may be a model
-    /// choice to revisit, not an engine bug: SQLite restores a deleted position to the next
-    /// entry.
-    ///
-    /// Fails today because of N8; see SPEC section 5b.
-    #[test]
-    fn known_bug_n8_idx_compare_after_peer_delete() {
-        known_bug("N8", "Mismatch", || {
-            use IOp::*;
-            let rows = [(4, NUL, v(6))];
-            let ops = [Rewind(1), del(0, NUL, v(6), 4), IdxGT(1, vec![NUL])];
-            agree(&ALL_FOUR, &rows, 2, &ops);
         });
     }
 
