@@ -188,12 +188,13 @@ fn record_chosen_types(
     let OperatorChoice::Chosen(chosen) = choice else {
         return;
     };
-    for (&slot, ty) in slots.iter().zip(chosen.operands) {
+    for (index, (&slot, ty)) in slots.iter().zip(chosen.operands).enumerate() {
         let is_string_literal = matches!(
             without_wrappers(operands[slot]),
             ast::Expr::Literal(ast::Literal::String(_))
         );
-        if is_string_literal && types[slot].is_none() {
+        let is_cast = chosen.cast_operands.get(index).copied().unwrap_or(false);
+        if (is_string_literal || is_cast) && types[slot].is_none() {
             types[slot] = Some(ty);
         }
     }

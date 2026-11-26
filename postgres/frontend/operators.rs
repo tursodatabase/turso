@@ -75,6 +75,7 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     Ok(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: vec![ty.cast_to.clone(), ty.cast_to.clone()],
+        cast_operands: vec![],
         function: integer_operator_function(op, &[ty, ty]),
     }))
 }
@@ -102,6 +103,7 @@ fn integer_operator_choice(op: &str, types: &[Option<Checked>]) -> OperatorChoic
     OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: types.iter().map(|ty| ty.cast_to.clone()).collect(),
+        cast_operands: vec![],
         function: Some(function),
     })
 }
@@ -197,6 +199,7 @@ pub(crate) fn choose_list_operator(
     Ok(Some(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: vec![ty.cast_to.clone(); operands.len()],
+        cast_operands: vec![],
         function: None,
     })))
 }

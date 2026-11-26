@@ -833,6 +833,7 @@ impl Dialect for NoMinusForTextDialect {
             OperatorChoice::Chosen(ChosenOperator {
                 id: 0,
                 operands: vec![integer; operands.len()],
+                cast_operands: vec![],
                 function: None,
             })
         } else {
@@ -1760,6 +1761,7 @@ impl Dialect for RustTypesDialect {
         Ok(OperatorChoice::Chosen(ChosenOperator {
             id: 0,
             operands: vec![percent.clone(); operands.len()],
+            cast_operands: vec![],
             function: Some(OperatorFunction {
                 name: "max".to_string(),
                 result: percent,
