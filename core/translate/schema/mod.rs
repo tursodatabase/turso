@@ -2816,6 +2816,8 @@ pub fn translate_create_type(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    // The SQLite parser gives the name token with its quotes.
+    let type_name = &crate::util::dequote(type_name);
     let normalized_name = normalize_ident(type_name);
 
     // Reject names that shadow SQLite base types
@@ -3019,6 +3021,8 @@ pub fn translate_create_domain(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    // The SQLite parser gives the name token with its quotes.
+    let domain_name = &crate::util::dequote(domain_name);
     let normalized_name = normalize_ident(domain_name);
 
     // Reject names that shadow SQLite base types
@@ -3088,7 +3092,10 @@ pub fn translate_create_domain(
 
     // Build the CREATE DOMAIN SQL for persistence
     let sql = {
-        let mut s = format!("CREATE DOMAIN {domain_name} AS {base_type}");
+        let mut s = format!(
+            "CREATE DOMAIN {} AS {base_type}",
+            crate::util::quote_identifier(domain_name)
+        );
         if let Some(ref def) = default {
             s.push_str(&format!(" DEFAULT {def}"));
         }

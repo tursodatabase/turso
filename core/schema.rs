@@ -2504,7 +2504,13 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def = TypeDef::from_create_type(&type_name, &body, sql.to_string())?;
+                // The parser keeps the quotes of the name token, and a type's
+                // name is the name without them.
+                let type_def = TypeDef::from_create_type(
+                    &crate::util::dequote(&type_name),
+                    &body,
+                    sql.to_string(),
+                )?;
                 self.type_registry
                     .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
@@ -2517,7 +2523,7 @@ impl Schema {
                 ..
             }))) => {
                 let type_def = TypeDef::from_domain(
-                    &domain_name,
+                    &crate::util::dequote(&domain_name),
                     &base_type,
                     not_null,
                     &constraints,

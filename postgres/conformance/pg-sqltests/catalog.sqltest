@@ -2867,6 +2867,47 @@ expect {
     Zz_Ty_Case
 }
 
+# The name of a type that needs quotes is stored without them.
+test a-table-named-like-a-type-whose-name-has-a-space {
+    CREATE TYPE "zz ty space" AS ENUM ('a');
+    CREATE TABLE "zz ty space" (a int);
+}
+@sqlstate 42710
+expect error {
+    type "zz ty space" already exists
+}
+
+test a-view-named-like-a-domain-whose-name-is-a-keyword {
+    CREATE DOMAIN "order" AS int;
+    CREATE VIEW "order" AS SELECT 1 AS a;
+}
+@sqlstate 42710
+expect error {
+    type "order" already exists
+}
+
+test a-type-named-like-a-type-whose-name-has-a-space {
+    CREATE TYPE "zz dup space" AS ENUM ('a');
+    CREATE TYPE "zz dup space" AS ENUM ('b');
+}
+@sqlstate 42710
+expect error {
+    type "?zz dup space"? already exists
+}
+
+test a-quoted-type-name-has-no-quotes-in-pg-type {
+    CREATE TYPE "Zz Ty Space" AS ENUM ('a');
+    CREATE TYPE "select" AS ENUM ('a');
+    CREATE DOMAIN "Zz Dom Space" AS int;
+    SELECT typname FROM pg_type
+    WHERE lower(typname) IN ('zz ty space', 'select', 'zz dom space') ORDER BY lower(typname);
+}
+expect {
+    select
+    Zz Dom Space
+    Zz Ty Space
+}
+
 # A table keeps the letter case of the name that RENAME TO gives it.
 test a-renamed-table-keeps-the-letter-case-of-its-new-name {
     CREATE TABLE zz_rn_case_old (a int);
