@@ -932,6 +932,47 @@ expect {
     6341|random|f|f|t|f|v|r|1|0|0|1700 1700|1700|numeric_random
 }
 
+# The rows of pg_proc for the string functions match PostgreSQL 18.
+test pg-proc-string-rows-match-postgresql {
+    SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
+           proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
+           prorettype, prosrc
+    FROM pg_proc
+    WHERE oid IN (
+        849, 868, 870, 871, 873, 874, 875, 876, 877, 881, 882, 883, 884, 885, 936, 937, 1283, 1317,
+        1369, 1374, 1381, 1621, 1622, 2073, 2087, 3062
+    )
+    ORDER BY oid;
+}
+expect {
+    849|position|f|f|t|f|i|s|1|0|0|25 25|23|textpos
+    868|strpos|f|f|t|f|i|s|1|0|0|25 25|23|textpos
+    870|lower|f|f|t|f|i|s|1|0|0|25|25|lower
+    871|upper|f|f|t|f|i|s|1|0|0|25|25|upper
+    873|lpad|f|f|t|f|i|s|1|0|0|25 23 25|25|lpad
+    874|rpad|f|f|t|f|i|s|1|0|0|25 23 25|25|rpad
+    875|ltrim|f|f|t|f|i|s|1|0|0|25 25|25|ltrim
+    876|rtrim|f|f|t|f|i|s|1|0|0|25 25|25|rtrim
+    877|substr|f|f|t|f|i|s|1|0|0|25 23 23|25|text_substr
+    881|ltrim|f|f|t|f|i|s|1|0|0|25|25|ltrim1
+    882|rtrim|f|f|t|f|i|s|1|0|0|25|25|rtrim1
+    883|substr|f|f|t|f|i|s|1|0|0|25 23|25|text_substr_no_len
+    884|btrim|f|f|t|f|i|s|1|0|0|25 25|25|btrim
+    885|btrim|f|f|t|f|i|s|1|0|0|25|25|btrim1
+    936|substring|f|f|t|f|i|s|1|0|0|25 23 23|25|text_substr
+    937|substring|f|f|t|f|i|s|1|0|0|25 23|25|text_substr_no_len
+    1283|quote_literal|f|f|t|f|i|s|1|0|0|25|25|quote_literal
+    1317|length|f|f|t|f|i|s|1|0|0|25|23|textlen
+    1369|character_length|f|f|t|f|i|s|1|0|0|25|23|textlen
+    1374|octet_length|f|f|t|f|i|s|1|0|0|25|23|textoctetlen
+    1381|char_length|f|f|t|f|i|s|1|0|0|25|23|textlen
+    1621|chr|f|f|t|f|i|s|1|0|0|23|25|chr
+    1622|repeat|f|f|t|f|i|s|1|0|0|25 23|25|repeat
+    2073|substring|f|f|t|f|i|s|1|0|0|25 25|25|textregexsubstr
+    2087|replace|f|f|t|f|i|s|1|0|0|25 25 25|25|replace_text
+    3062|reverse|f|f|t|f|i|s|1|0|0|25|25|text_reverse
+}
+
 test pg-object-opclass-is-read-only {
     CREATE ROLE reader_of_object_opclass_is_read_only_role;
     SET ROLE reader_of_object_opclass_is_read_only_role;

@@ -44,6 +44,9 @@ FAMILIES = [
     ("seed", {"oids": SEED_OIDS}),
     ("math", {"names": """abs ceil ceiling degrees exp floor ln log mod pi power radians random
         round sign sqrt trunc""".split(), "bytea": "all"}),
+    ("string", {"names": """btrim char_length character_length chr length lower lpad ltrim
+        octet_length position quote_ident quote_literal repeat replace reverse rpad rtrim
+        strpos substr substring upper""".split(), "bytea": "without"}),
 ]
 
 
