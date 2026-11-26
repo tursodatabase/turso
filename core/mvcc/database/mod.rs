@@ -160,8 +160,6 @@ type IndexRowsEntry<'a, A = TursoAllocator> =
     Entry<'a, MVTableId, IndexRowsMap<A>, BasicComparator, A>;
 type TableRowIterator<'a, A = TursoAllocator> =
     Box<dyn Iterator<Item = TableRowEntry<'a, A>> + Send + Sync + 'a>;
-type IndexRowIterator<'a, A = TursoAllocator> =
-    Box<dyn Iterator<Item = IndexRowEntry<'a, A>> + Send + Sync + 'a>;
 
 /// Per-index map of sortable keys to their version chains, stored as the
 /// values of [`MvStore::index_rows`].
@@ -409,6 +407,17 @@ impl Ord for SortableIndexKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.compare(other).expect("Failed to compare IndexKeys")
     }
+}
+
+/// What a cursor sees in one MvStore chain. See [`MvStore::cursor_view_of_chain`].
+pub(crate) enum ChainView {
+    /// A version is visible. It holds a copy of the row when the caller asked for one.
+    Visible(Option<Row>),
+    /// No version is visible.
+    Hidden,
+    /// The B-tree row at the same key is the row to read: the chain only buffers a
+    /// version that the B-tree already holds.
+    BtreeCovers,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -6030,54 +6039,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    pub(crate) fn advance_cursor_and_get_row_id_for_table(
-        &self,
-        table_id: MVTableId,
-        mv_store_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
-        snapshot: MvccReadSnapshot,
-        work: CursorWorkRef<'_>,
-    ) -> Option<(RowID, RowVersions<A>)> {
-        let mv_store_iterator = mv_store_iterator.as_mut().expect(
-            "mv_store_iterator must be initialized when calling get_row_id_for_table_in_direction",
-        );
-
-        loop {
-            // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
-            // to loop either until we find a row that is not deleted or until we reach the end of the table.
-            let next_row = mv_store_iterator.next();
-            let row = next_row?;
-            if row.key().table_id != table_id {
-                // In case of table rows, we store the rows of all tables in a single map,
-                // so we must stop iteration if we reach a row that is on a different table.
-                // In the case of indexes we have a separate map per table so this is not
-                // relevant.
-                return None;
-            }
-
-            // We found a row, let's check if it's visible to the transaction.
-            work.visibility_check();
-            if let Some((row_id, versions, _)) =
-                self.find_last_visible_version(snapshot, &row, false)
-            {
-                return Some((row_id, versions));
-            }
-            // If this row is not visible, continue to the next row
-        }
-    }
-
-    pub(crate) fn advance_cursor_and_get_row_id_for_index(
-        &self,
-        mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-        snapshot: MvccReadSnapshot,
-        index_id: MVTableId,
-        work: CursorWorkRef<'_>,
-    ) -> Option<(RowID, RowVersions<A>)> {
-        let mv_store_iterator = mv_store_iterator.as_mut().expect(
-            "mv_store_iterator must be initialized when calling get_row_id_for_index_in_direction",
-        );
-        self.find_next_visible_index_row(snapshot, index_id, mv_store_iterator, work)
-    }
-
     /// Whether a SkipMap chain must still participate in MVCC merge/shadow for `tx`.
     ///
     /// False only for a sole materialized current inside the published durable
@@ -6287,40 +6248,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Some((row.key().clone(), versions_arc.clone(), payload))
     }
 
-    fn find_last_visible_index_version(
+    /// What a cursor with `snapshot` sees in the MvStore chain `versions` of the row `row_id`.
+    /// For a table row, `take_payload` copies the visible version under the chain lock,
+    /// because passive GC can empty the chain before the cursor reads the row.
+    pub(crate) fn cursor_view_of_chain(
         &self,
         snapshot: MvccReadSnapshot,
-        index_id: MVTableId,
-        row: IndexRowEntry<'_, A>,
-    ) -> Option<(RowID, RowVersions<A>)> {
-        let versions_arc = row.value();
+        row_id: &RowID,
+        versions: &RowVersions<A>,
+        take_payload: bool,
+    ) -> Result<ChainView> {
+        let versions = versions.read();
+        if matches!(row_id.row_id, RowKey::Int(_))
+            && self.btree_covers_chain_for_snapshot(snapshot, row_id.table_id, &versions)
         {
-            let versions = versions_arc.read();
-            self.find_visible_version(snapshot, &versions)
-                .expect("transaction should exist while its cursor is active")?;
+            return Ok(ChainView::BtreeCovers);
         }
-        let row_id = RowID::new(index_id, RowKey::Record(row.key().clone()));
-        Some((row_id, versions_arc.clone()))
-    }
-
-    fn find_next_visible_index_row<'a, I>(
-        &self,
-        snapshot: MvccReadSnapshot,
-        index_id: MVTableId,
-        mut rows: I,
-        work: CursorWorkRef<'_>,
-    ) -> Option<(RowID, RowVersions<A>)>
-    where
-        I: Iterator<Item = IndexRowEntry<'a, A>>,
-    {
-        loop {
-            let row = rows.next()?;
-            work.visibility_check();
-            if let Some(visible_row) = self.find_last_visible_index_version(snapshot, index_id, row)
-            {
-                return Some(visible_row);
-            }
-        }
+        Ok(match self.find_visible_version(snapshot, &versions)? {
+            Some(version) => ChainView::Visible(take_payload.then(|| version.row(row_id))),
+            None => ChainView::Hidden,
+        })
     }
 
     fn find_next_visible_table_row<'a, I>(
@@ -6400,63 +6347,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .expect("table_iterator was assigned above if it was None");
 
         self.find_next_visible_table_row(snapshot, mv_store_iterator, table_id, take_payload, work)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn seek_index(
-        &self,
-        index_id: MVTableId,
-        start: SortableIndexKey,
-        inclusive: bool,
-        eq_only: bool,
-        direction: IterationDirection,
-        snapshot: MvccReadSnapshot,
-        index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-        work: CursorWorkRef<'_>,
-    ) -> Result<Option<(RowID, RowVersions<A>)>> {
-        let index_rows = self.get_or_create_index_rows(index_id)?;
-        let index_rows = index_rows.value();
-        let range = if eq_only {
-            // An eq-only seek (point lookup, NoConflict, unique-constraint probe,
-            // index delete) only cares about entries whose key matches `start`.
-            // Bound BOTH ends of the range to the probe key so the skiplist walk
-            // stops at the matching cluster instead of scanning forward over every
-            // invisible neighbor until it happens to find the next visible row.
-            //
-            // `SortableIndexKey` ordering compares only the probe's columns (see
-            // `SortableIndexKey::compare`, which clamps to `min(num_cols)`), so
-            // `start..=start` captures all entries sharing the probed prefix
-            // regardless of their trailing rowid — exactly the set an eq-only seek
-            // may match. Without this bound a single seek costs O(pending invisible
-            // versions), which compounds into quadratic work when each row of a
-            // concurrent batch insert pays it. The cursor's position after the seek
-            // is still set by `PickWinner` from the merged MVCC/B-tree peeks, so
-            // returning early here does not change where the cursor lands.
-            (Bound::Included(start.clone()), Bound::Included(start))
-        } else {
-            let start = if inclusive {
-                Bound::Included(start)
-            } else {
-                Bound::Excluded(start)
-            };
-            create_seek_range(start, direction)
-        };
-        let iter_box = match direction {
-            IterationDirection::Forwards => {
-                Box::new(index_rows.range(range)) as IndexRowIterator<'_, A>
-            }
-            IterationDirection::Backwards => {
-                Box::new(index_rows.range(range).rev()) as IndexRowIterator<'_, A>
-            }
-        };
-        *index_iterator = Some(counted_mvcc_iterator(
-            static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A),
-            work,
-        ));
-        let mv_store_iterator = index_iterator
-            .as_mut()
-            .expect("index_iterator was assigned above if it was None");
-        Ok(self.find_next_visible_index_row(snapshot, index_id, mv_store_iterator, work))
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
@@ -9212,62 +9102,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    pub(crate) fn get_last_table_rowid(
-        &self,
-        table_id: MVTableId,
-        table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
-        tx_id: TxID,
-        work: CursorWorkRef<'_>,
-    ) -> Option<RowKey> {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-        let max_rowid = RowID {
-            table_id,
-            row_id: RowKey::Int(i64::MAX),
-        };
-        let range = create_seek_range(Bound::Included(max_rowid), IterationDirection::Backwards);
-        let iter_box = Box::new(self.rows.range(range).rev());
-        *table_iterator = Some(counted_mvcc_iterator(
-            static_iterator_hack!(iter_box, RowID, A),
-            work,
-        ));
-        let iter = table_iterator
-            .as_mut()
-            .expect("table_iterator was assigned above");
-        loop {
-            let entry = iter.next()?;
-            // Rowid is not part of the table, therefore we already reached the end of the table.
-            // NOTE: Shouldn't range already prevent this?
-            tracing::trace!(
-                "get_last_table_rowid: entry.key().table_id={}, table_id={}, row_id={}",
-                entry.key().table_id,
-                table_id,
-                entry.key().row_id
-            );
-            if entry.key().table_id != table_id {
-                tracing::trace!("get_last_table_rowid: reached end of table");
-                return None;
-            }
-            work.visibility_check();
-            if let Some(_visible_row) =
-                self.find_last_visible_version(MvccReadSnapshot::from(tx), &entry, false)
-            {
-                tracing::trace!(
-                    "get_last_table_rowid: found visible row: {:?}",
-                    _visible_row
-                );
-                // There is a visible version for this rowid, so we return it
-                return Some(RowKey::Int(match &entry.key().row_id {
-                    RowKey::Int(i) => *i,
-                    _ => panic!("Expected RowKey::Int for table rowid"),
-                }));
-            }
-        }
-    }
-
     pub fn get_last_table_rowid_without_visibility_check(
         &self,
         table_id: MVTableId,
@@ -9283,33 +9117,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return None;
         }
         Some(entry.key().row_id.clone())
-    }
-
-    pub(crate) fn get_last_index_rowid(
-        &self,
-        index_id: MVTableId,
-        tx_id: TxID,
-        index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-        work: CursorWorkRef<'_>,
-    ) -> Result<Option<RowKey>> {
-        let index = self.get_or_create_index_rows(index_id)?;
-        let index = index.value();
-        let iter_box = Box::new(index.iter().rev());
-        *index_iterator = Some(counted_mvcc_iterator(
-            static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A),
-            work,
-        ));
-        let iter = index_iterator
-            .as_mut()
-            .expect("index_iterator was assigned above");
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let snapshot = MvccReadSnapshot::from(tx.value());
-        Ok(self
-            .find_next_visible_index_row(snapshot, index_id, iter, work)
-            .map(|(row, _versions)| row.row_id))
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
@@ -10613,6 +10420,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub fn checkpoint_threshold(&self) -> i64 {
         self.storage.checkpoint_threshold()
+    }
+
+    /// Returns an error if the transaction `tx_id` ended. A statement can still read after
+    /// its transaction ends, for example after a failed INSERT OR ROLLBACK.
+    pub(crate) fn check_tx_exists(&self, tx_id: TxID) -> Result<()> {
+        if self.txs.get(&tx_id).is_none() {
+            return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
+        }
+        Ok(())
     }
 
     /// Whether the logical log has reached the checkpoint threshold, so that the next commit

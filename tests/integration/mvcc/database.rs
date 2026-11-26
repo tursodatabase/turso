@@ -13958,3 +13958,31 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
         "DML-only portable frame should resolve user table after cross-connection checkpoint"
     );
 }
+
+/// The uniqueness check of `PRAGMA integrity_check` looks up each index entry (`Found`) and
+/// steps to the next entry (`Next`). Here the next entry of (-6, 13, 250) is (-4, 14, 17) in
+/// the MvStore, and the B-tree holds (-2, 1, 314). The step ended the bounded MvStore range
+/// of the lookup, and the cursor compared the heads before it positioned the MvStore again.
+/// So it skipped (-4, 14, 17) and returned (-2, 1, 314) twice: once after each lookup, which
+/// the check reported as a non-unique entry.
+#[test]
+fn integrity_check_steps_to_mvstore_entry_after_index_lookup() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER, u INTEGER)",
+        "CREATE UNIQUE INDEX t_u ON t(u)",
+        "INSERT INTO t VALUES (313, 'v1', -8, 1)",
+        "INSERT OR REPLACE INTO t(v, k, u) VALUES ('v3', -2, 1)",
+        "CREATE UNIQUE INDEX t_ku ON t(k, u)",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        "INSERT INTO t VALUES (250, 'v13', -6, 13)",
+        "INSERT INTO t VALUES (17, 'v14', -4, 14)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::from_text("ok".to_string())]]
+    );
+}
