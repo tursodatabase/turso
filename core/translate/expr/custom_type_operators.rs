@@ -753,6 +753,10 @@ fn accepts_operand(
             is_plain_value(signature, operand) && !operand.is_real && !operand.is_blob
         }
         OperatorArg::Real => is_plain_value(signature, operand) && operand.is_real,
+        OperatorArg::Registered(name) => operand
+            .value_type
+            .as_ref()
+            .is_some_and(|t| t.type_def.name.eq_ignore_ascii_case(name)),
     }
 }
 
