@@ -52,8 +52,7 @@ const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 /// The first synthetic constraint oid. Constraints are not relations and
 /// have no stored oid, so theirs are positional; they start far above the
-/// catalog's relation oids and below the synthetic oids of rowid-key
-/// indexes, [`ROWID_PK_INDEX_OID_OFFSET`], so they meet neither.
+/// catalog's relation oids, so they never meet one.
 const CONSTRAINT_OID_START: i64 = 1 << 30;
 
 #[derive(Debug)]
@@ -2252,11 +2251,6 @@ impl SnapshotRows for PgConstraintTable {
                     ConstraintKind::Unique
                 };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let conname = if primary {
-                    primary_key_constraint_name(btree)
-                } else {
-                    unique_constraint_name(btree, us)
-                };
 
                 // Build conkey: space-separated 1-based attnums
                 let conkey: String = col_names
@@ -2274,14 +2268,12 @@ impl SnapshotRows for PgConstraintTable {
                     .iter()
                     .map(|name| btree.get_column(name).expect("constraint columns exist").0)
                     .collect();
-                let conindid = indexes
+                let index = indexes
                     .iter()
                     .find(|index| {
                         index.table_oid == table_oid
                             && index.unique
-                            && index
-                                .name
-                                .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                            && index.for_constraint
                             && index.where_clause.is_none()
                             && index
                                 .columns
@@ -2294,8 +2286,9 @@ impl SnapshotRows for PgConstraintTable {
                                 .map(|column| column.position)
                                 .eq(positions.iter().copied())
                     })
-                    .expect("unique constraints have a catalog index")
-                    .oid;
+                    .expect("unique constraints have a catalog index");
+                let conindid = index.oid;
+                let conname = index.name.clone();
 
                 let contype: &'static str = contype.into();
                 rows.push(vec![
@@ -3583,8 +3576,7 @@ fn view_rules(schema: &Schema) -> Vec<ViewRule<'_>> {
 }
 
 /// What is added to the oid of a view to make the oid of its `_RETURN` rule.
-/// The oids of relations stay below `CONSTRAINT_OID_START`, and the oids
-/// from `ROWID_PK_INDEX_OID_OFFSET` up to this offset are those of indexes.
+/// The oids of relations stay below `CONSTRAINT_OID_START`.
 const VIEW_RULE_OID_OFFSET: i64 = 3 << 30;
 
 fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
@@ -4579,6 +4571,8 @@ struct CatalogIndex {
     columns: Vec<CatalogIndexColumn>,
     unique: bool,
     primary: bool,
+    /// Whether the index belongs to a PRIMARY KEY or UNIQUE constraint.
+    for_constraint: bool,
     where_clause: Option<String>,
 }
 
@@ -4589,7 +4583,9 @@ struct CatalogIndex {
 const ROWID_PK_INDEX_OID_OFFSET: i64 = 1 << 31;
 
 fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
-    let tables = user_tables_with_oids(schema);
+    let Some(classes) = crate::classes::class_catalog(schema) else {
+        return Vec::new();
+    };
     // A relation name is unique within its schema.
     let mut relation_names: HashSet<(NamespaceId, String)> = schema
         .namespace_ids()
@@ -4605,7 +4601,7 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
         })
         .collect();
     let mut indexes = Vec::new();
-    for (namespace, table_name, table, table_oid) in tables {
+    for (namespace, table_name, table, table_oid) in user_tables_with_oids(schema) {
         let Table::BTree(btree) = table.as_ref() else {
             continue;
         };
@@ -4630,13 +4626,20 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                 }],
                 unique: true,
                 primary: true,
+                for_constraint: true,
                 where_clause: None,
             });
         }
-        for index in schema
-            .get_indices(namespace, table_name)
-            .filter(|index| !index.ephemeral)
-        {
+        for class in classes.indexes_of(table_oid) {
+            let owner_oid = role_oid(class.relowner);
+            let engine_name = class
+                .engine_name
+                .as_ref()
+                .expect("physical indexes have an engine name");
+            let index = schema
+                .get_indices(namespace, table_name)
+                .find(|index| index.name.eq_ignore_ascii_case(engine_name))
+                .expect("every index class row has an index in the schema");
             let primary = btree.get_rowid_alias_column().is_none()
                 && index
                     .name
@@ -4649,15 +4652,12 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                         btree.get_column(name).expect("primary key columns exist").0
                     }));
             indexes.push(CatalogIndex {
-                oid: stored_relation_oid(schema, namespace, &index.name).unwrap_or(0),
+                oid: class.oid,
                 table_oid,
                 namespace,
                 table_name: btree.declared_name.clone(),
-                name: index.name.clone(),
-                owner_oid: match crate::classes::relation_owner(schema, namespace, &index.name) {
-                    Some(owner) => role_oid(owner),
-                    None => table_owner_oid,
-                },
+                name: class.relname.clone(),
+                owner_oid,
                 columns: index
                     .columns
                     .iter()
@@ -4677,6 +4677,9 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                     .collect(),
                 unique: index.unique,
                 primary,
+                for_constraint: index
+                    .name
+                    .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX),
                 where_clause: index.where_clause.as_ref().map(ToString::to_string),
             });
         }
@@ -4721,7 +4724,7 @@ fn unique_constraint_name(table: &BTreeTable, set: &UniqueSet) -> String {
     })
 }
 
-fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
+pub(crate) fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
     table.get_rowid_alias_column().is_none()
         && set.columns.len() == table.primary_key_columns.len()
         && set
@@ -4769,41 +4772,6 @@ mod tests {
                 "{cmd:?}"
             );
         }
-    }
-
-    #[test]
-    fn primary_key_index_prefixes_colliding_names() {
-        let mut schema = Schema::new();
-        let public = NamespaceId::new(1);
-        schema.add_namespace(public, "public");
-        for name in [
-            "t",
-            "__turso_internal_pk_index_t",
-            "___turso_internal_pk_index_t",
-        ] {
-            let columns = if name == "t" {
-                "id INTEGER PRIMARY KEY"
-            } else {
-                "value TEXT"
-            };
-            schema
-                .add_btree_table(
-                    public,
-                    Arc::new(
-                        BTreeTable::from_stored_sql(
-                            &PostgresDialect,
-                            &format!("CREATE TABLE {name} ({columns})"),
-                            2,
-                            false,
-                        )
-                        .unwrap(),
-                    ),
-                )
-                .unwrap();
-        }
-        let indexes = catalog_indexes(&schema);
-        assert_eq!(indexes.len(), 1);
-        assert_eq!(indexes[0].name, "____turso_internal_pk_index_t");
     }
 
     #[test]

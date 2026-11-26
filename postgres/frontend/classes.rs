@@ -33,15 +33,16 @@ use std::sync::Arc;
 use turso_core::ast;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
-    is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
+    is_user_relation_name, BTreeTable, RelationKind, Schema, UniqueSet, SQLITE_SEQUENCE_TABLE_NAME,
 };
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin, CmpInsFlags, CollationSeq,
-    Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, LoadStep, NewOwner, Numeric,
-    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
+    Connection, CreateTable, CursorType, DropColumn, InsertFlags, Insn, LimboError, LoadStep,
+    NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog,
+    Value,
 };
 
 use turso_core::MAIN_DB_ID;
@@ -76,9 +77,12 @@ pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 /// serial column owns the relation, 0 when no relation owns it, and
 /// `relownedbycolumn` is the name of that column, NULL when no relation owns
 /// it: what PostgreSQL records in `pg_depend` as an automatic dependency,
-/// kept here until there is a `pg_depend`. `relenginename` holds the engine
-/// lookup name, while `relname` preserves the spelling written in SQL.
-/// `relpolicies` holds the table's
+/// kept here until there is a `pg_depend`. `relenginename` is the name the
+/// engine's schema gives the relation, with ASCII letters folded to lowercase.
+/// It also differs for the index of a PRIMARY KEY or UNIQUE constraint, named after
+/// the constraint, and NULL for the primary key of a rowid table, which has
+/// no object in the schema. `relindrelid` is the oid of the table of an
+/// index, 0 for any other relation. `relpolicies` holds the table's
 /// row-level security policies in the form [`policies`] describes, NULL when
 /// it has none. `relacl` is the access control list in the text form of
 /// PostgreSQL's `aclitem[]`, NULL until the first `GRANT`, when the owner has
@@ -120,9 +124,10 @@ const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     relownedby INTEGER NOT NULL, \
     relpolicies TEXT, \
     relownedbycolumn TEXT, \
-    relenginename TEXT)";
+    relenginename TEXT, \
+    relindrelid INTEGER NOT NULL)";
 
-const CLASS_COLUMNS: [&str; 37] = [
+const CLASS_COLUMNS: [&str; 38] = [
     "oid",
     "relname",
     "relnamespace",
@@ -160,6 +165,7 @@ const CLASS_COLUMNS: [&str; 37] = [
     "relpolicies",
     "relownedbycolumn",
     "relenginename",
+    "relindrelid",
 ];
 
 const CLASS_COLUMN_COUNT: usize = CLASS_COLUMNS.len();
@@ -173,6 +179,7 @@ const COLUMN_RELOWNEDBY: usize = column_position("relownedby");
 const COLUMN_RELPOLICIES: usize = column_position("relpolicies");
 const COLUMN_RELOWNEDBYCOLUMN: usize = column_position("relownedbycolumn");
 const COLUMN_RELENGINENAME: usize = column_position("relenginename");
+const COLUMN_RELINDRELID: usize = column_position("relindrelid");
 
 const fn column_position(name: &str) -> usize {
     let mut position = 0;
@@ -282,8 +289,11 @@ pub(crate) struct RelationClass {
     /// The name of the column that owns this sequence, None when no relation
     /// owns it.
     pub(crate) relownedbycolumn: Option<String>,
-    /// The name used to find the relation in the engine schema.
+    /// The name the engine's schema gives the relation, None for the primary
+    /// key index of a rowid table, which the schema does not have.
     pub(crate) engine_name: Option<String>,
+    /// The oid of the table of an index, 0 for any other relation.
+    pub(crate) relindrelid: i64,
     /// The privileges `GRANT` gave, None before the first `GRANT`.
     pub(crate) relacl: Option<Acl>,
     /// Whether the table has row-level security.
@@ -373,6 +383,14 @@ impl ClassCatalog {
             .contains_key(&(namespace, name.to_string()))
     }
 
+    /// The rows of the indexes of the table with oid `table_oid`, ordered by
+    /// oid.
+    pub(crate) fn indexes_of(&self, table_oid: i64) -> impl Iterator<Item = &RelationClass> {
+        self.by_oid.values().filter(move |class| {
+            class.relkind == RelationKind::Index && class.relindrelid == table_oid
+        })
+    }
+
     /// The relations the table with oid `table_oid` owns: the sequences of
     /// its serial columns.
     fn owned_by(&self, table_oid: i64) -> impl Iterator<Item = &RelationClass> {
@@ -439,7 +457,7 @@ impl ClassCatalog {
 }
 
 fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
-    let [oid, relname, relnamespace, relkind, relowner, relownedby, relacl, relrowsecurity, relpolicies, relownedbycolumn, relenginename] =
+    let [oid, relname, relnamespace, relkind, relowner, relownedby, relacl, relrowsecurity, relpolicies, relownedbycolumn, relenginename, relindrelid] =
         row
     else {
         return Err(corrupt_row(row));
@@ -452,6 +470,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
         relowner,
         relownedby,
         relrowsecurity,
+        relindrelid,
     ) {
         (
             Value::Numeric(Numeric::Integer(oid)),
@@ -461,10 +480,12 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
             Value::Numeric(Numeric::Integer(relowner)),
             Value::Numeric(Numeric::Integer(relownedby)),
             Value::Numeric(Numeric::Integer(relrowsecurity @ (0 | 1))),
+            Value::Numeric(Numeric::Integer(relindrelid)),
         ) if *oid >= FIRST_NORMAL_OBJECT_ID
             && u32::try_from(*relnamespace).is_ok()
             && *relowner >= 0
-            && *relownedby >= 0 =>
+            && *relownedby >= 0
+            && *relindrelid >= 0 =>
         {
             let Some(relkind) = relation_kind_of_letter(relkind.as_str()) else {
                 return Err(corrupt_row(row));
@@ -489,6 +510,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                 _ => return Err(corrupt_row(row)),
             };
             let engine_name = match relenginename {
+                Value::Null => None,
                 Value::Text(text) => Some(text.as_str().to_string()),
                 _ => return Err(corrupt_row(row)),
             };
@@ -496,6 +518,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                 oid: *oid,
                 relname: relname.as_str().to_string(),
                 engine_name,
+                relindrelid: *relindrelid,
                 relnamespace: NamespaceId::new(*relnamespace as u32),
                 relkind,
                 relowner: RoleId::from_stored(*relowner),
@@ -526,7 +549,8 @@ pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
     Some(format!(
         "SELECT oid, relname, relnamespace, relkind, relowner, relownedby, relacl, \
-         relrowsecurity, relpolicies, relownedbycolumn, relenginename FROM {CLASSES_TABLE_NAME}"
+         relrowsecurity, relpolicies, relownedbycolumn, relenginename, relindrelid \
+         FROM {CLASSES_TABLE_NAME}"
     ))
 }
 
@@ -644,35 +668,22 @@ impl Catalog for PostgresCatalog {
         match cmd {
             CatalogCmd::CreateTable(table) => {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
-                    rows.new_relation(
-                        program,
-                        table.namespace,
-                        table.name,
-                        table.written_name.as_str(),
-                        RelationKind::Table,
-                        None,
-                    )?;
-                    for index in table.automatic_indexes {
-                        rows.new_relation(
-                            program,
-                            table.namespace,
-                            &index.name,
-                            &index.name,
-                            RelationKind::Index,
-                            Some(table.name),
-                        )?;
-                    }
+                    emit_new_table_rows(program, &rows, table)?;
                 }
             }
             CatalogCmd::CreateIndex(index) => {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
+                    let table_oid = rows.oid_of(index.namespace, index.table);
                     rows.new_relation(
                         program,
-                        index.namespace,
-                        index.name,
-                        index.written_name.as_str(),
-                        RelationKind::Index,
-                        Some(index.table),
+                        NewRelation {
+                            namespace: index.namespace,
+                            name: index.written_name.as_str(),
+                            engine_name: Some(index.name),
+                            kind: RelationKind::Index,
+                            table: Some(index.table),
+                            indexed_table: IndexedTable::Oid(table_oid),
+                        },
                     )?;
                 }
             }
@@ -685,11 +696,11 @@ impl Catalog for PostgresCatalog {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
                     rows.new_relation(
                         program,
-                        sequence.namespace,
-                        sequence.name,
-                        sequence.name,
-                        RelationKind::Sequence,
-                        None,
+                        NewRelation::of_relation(
+                            sequence.namespace,
+                            sequence.name,
+                            RelationKind::Sequence,
+                        ),
                     )?;
                 }
             }
@@ -716,11 +727,14 @@ impl Catalog for PostgresCatalog {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
                     rows.new_relation(
                         program,
-                        view.namespace,
-                        view.name,
-                        view.written_name.as_str(),
-                        RelationKind::View,
-                        None,
+                        NewRelation {
+                            name: view.written_name.as_str(),
+                            ..NewRelation::of_relation(
+                                view.namespace,
+                                view.name,
+                                RelationKind::View,
+                            )
+                        },
                     )?;
                 }
             }
@@ -728,11 +742,14 @@ impl Catalog for PostgresCatalog {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
                     rows.new_relation(
                         program,
-                        view.namespace,
-                        view.name,
-                        view.written_name.as_str(),
-                        RelationKind::MaterializedView,
-                        None,
+                        NewRelation {
+                            name: view.written_name.as_str(),
+                            ..NewRelation::of_relation(
+                                view.namespace,
+                                view.name,
+                                RelationKind::MaterializedView,
+                            )
+                        },
                     )?;
                 }
             }
@@ -753,9 +770,9 @@ impl Catalog for PostgresCatalog {
                         table.namespace,
                         table.old_name,
                         table.written_new_name,
-                    );
+                    )?;
                     for (old_name, new_name) in table.renamed_automatic_indexes() {
-                        rows.renamed_relation(program, table.namespace, old_name, &new_name);
+                        rows.renamed_engine_name(program, table.namespace, old_name, &new_name);
                     }
                 }
             }
@@ -844,6 +861,170 @@ impl Catalog for PostgresCatalog {
     }
 }
 
+/// What a statement tells [`ClassRowWriter::new_relation`] about a new
+/// relation.
+struct NewRelation<'a> {
+    namespace: NamespaceId,
+    /// The PostgreSQL name.
+    name: &'a str,
+    /// The name of the object in the schema, None when there is none.
+    engine_name: Option<&'a str>,
+    kind: RelationKind,
+    /// The table whose owner owns the relation, for an index.
+    table: Option<&'a str>,
+    indexed_table: IndexedTable,
+}
+
+impl<'a> NewRelation<'a> {
+    /// A relation that is not an index, named the same in PostgreSQL and in
+    /// the schema.
+    fn of_relation(namespace: NamespaceId, name: &'a str, kind: RelationKind) -> Self {
+        Self {
+            namespace,
+            name,
+            engine_name: Some(name),
+            kind,
+            table: None,
+            indexed_table: IndexedTable::None,
+        }
+    }
+}
+
+/// Where the oid of an index's table comes from.
+#[derive(Clone, Copy)]
+enum IndexedTable {
+    /// The relation is not an index.
+    None,
+    Oid(i64),
+    /// The register of a table that the same statement creates.
+    Register(usize),
+}
+
+/// Inserts the class rows of a table and of the indexes of its PRIMARY KEY
+/// and UNIQUE constraints. PostgreSQL names such an index after its
+/// constraint, and the schema names it `sqlite_autoindex_<table>_<n>`. The
+/// primary key of a rowid table has no object in the schema.
+fn emit_new_table_rows(
+    program: &mut ProgramBuilder,
+    rows: &ClassRowWriter<'_>,
+    table: &CreateTable<'_>,
+) -> turso_core::Result<()> {
+    let Some(table_oid_reg) = rows.new_relation(
+        program,
+        NewRelation {
+            name: table.written_name.as_str(),
+            ..NewRelation::of_relation(table.namespace, table.name, RelationKind::Table)
+        },
+    )?
+    else {
+        return Ok(());
+    };
+    let btree = table.table;
+    let mut automatic_indexes = table.automatic_indexes.iter();
+    let mut chosen_names = Vec::new();
+    let mut new_index = |program: &mut ProgramBuilder,
+                         key: ConstraintKey<'_>,
+                         engine_name: Option<&str>|
+     -> turso_core::Result<()> {
+        let name = constraint_index_name(rows.schema, table, key, &chosen_names)?;
+        chosen_names.push(name.clone());
+        rows.new_relation(
+            program,
+            NewRelation {
+                namespace: table.namespace,
+                name: &name,
+                engine_name,
+                kind: RelationKind::Index,
+                table: Some(table.name),
+                indexed_table: IndexedTable::Register(table_oid_reg),
+            },
+        )?;
+        Ok(())
+    };
+    for set in &btree.unique_sets {
+        if btree.get_rowid_alias_column().is_some() && set.is_primary_key {
+            continue;
+        }
+        let index = automatic_indexes
+            .next()
+            .expect("every constraint index of a table has an automatic index");
+        let key = if crate::catalog::unique_set_is_primary_key(btree, set) {
+            ConstraintKey::PrimaryKey
+        } else {
+            ConstraintKey::Unique(set)
+        };
+        new_index(program, key, Some(&index.name))?;
+    }
+    Ok(())
+}
+
+/// A PRIMARY KEY or UNIQUE constraint of a table.
+#[derive(Clone, Copy)]
+enum ConstraintKey<'a> {
+    PrimaryKey,
+    Unique(&'a UniqueSet),
+}
+
+/// The name PostgreSQL gives the index of a constraint: the constraint's
+/// name when the statement wrote one, otherwise `<table>_pkey` or
+/// `<table>_<columns>_key`, followed by the first number that makes it
+/// unused in the namespace.
+fn constraint_index_name(
+    schema: &Schema,
+    table: &CreateTable<'_>,
+    key: ConstraintKey<'_>,
+    chosen_names: &[String],
+) -> turso_core::Result<String> {
+    let table_name = table.written_name.as_str();
+    let (written, columns, label) = match key {
+        ConstraintKey::PrimaryKey => (
+            table.table.primary_key_constraint_name.clone(),
+            None,
+            "pkey",
+        ),
+        ConstraintKey::Unique(set) => {
+            let columns: Vec<&str> = set
+                .columns
+                .iter()
+                .map(|c| {
+                    table
+                        .table
+                        .get_column(&c.name)
+                        .expect("constraint columns exist")
+                        .1
+                        .name
+                        .as_deref()
+                        .expect("table columns have names")
+                })
+                .collect();
+            (set.constraint_name.clone(), Some(columns.join("_")), "key")
+        }
+    };
+    let is_taken = |name: &str| {
+        chosen_names.iter().any(|chosen| chosen == name)
+            || class_catalog(schema)
+                .is_some_and(|catalog| catalog.name_is_taken(table.namespace, name))
+    };
+    if let Some(name) = written {
+        if !matches!(key, ConstraintKey::PrimaryKey) || name != format!("{table_name}_pkey") {
+            return Ok(name);
+        }
+    }
+    let mut name = match &columns {
+        Some(columns) => format!("{table_name}_{columns}_{label}"),
+        None => format!("{table_name}_{label}"),
+    };
+    let mut number = 0;
+    while is_taken(&name) {
+        number += 1;
+        name = match &columns {
+            Some(columns) => format!("{table_name}_{columns}_{label}{number}"),
+            None => format!("{table_name}_{label}{number}"),
+        };
+    }
+    Ok(name)
+}
+
 /// Deletes the comment of the column that `column.table` no longer has, and
 /// moves the comments of the later columns to the numbers those columns now
 /// have.
@@ -926,43 +1107,42 @@ impl<'a> ClassRowWriter<'a> {
         }))
     }
 
-    /// Inserts the class row of a relation that the statement creates.
+    /// Inserts the class row of a relation that the statement creates, and
+    /// returns the register that holds its oid, or None for an engine
+    /// relation, which has no row. `name` is the relation's PostgreSQL name
+    /// and `engine_name` the name its object has in the schema.
     /// `table` is the table of an index, in the same namespace: its owner
     /// owns the index. Anything else is owned by the current role, which is
     /// what PostgreSQL's `GetUserId()` gives after `SET ROLE`.
     fn new_relation(
         &self,
         program: &mut ProgramBuilder,
-        namespace: NamespaceId,
-        name: &str,
-        written_name: &str,
-        kind: RelationKind,
-        table: Option<&str>,
-    ) -> turso_core::Result<()> {
+        new: NewRelation<'_>,
+    ) -> turso_core::Result<Option<usize>> {
         // Relation names are unique per schema across kinds.
-        if is_user_relation_name(kind, name)
+        if is_user_relation_name(new.kind, new.name)
             && class_catalog(self.schema)
-                .is_some_and(|catalog| catalog.name_is_taken(namespace, written_name))
+                .is_some_and(|catalog| catalog.name_is_taken(new.namespace, new.name))
         {
             return Err(sqlstate_error(
                 SQLSTATE_DUPLICATE_TABLE,
-                format!("relation \"{name}\" already exists"),
+                format!("relation \"{}\" already exists", new.name),
                 None,
             ));
         }
-        let owner = table
-            .and_then(|table| relation_owner(self.schema, namespace, table))
+        let owner = new
+            .table
+            .and_then(|table| relation_owner(self.schema, new.namespace, table))
             .unwrap_or_else(|| self.connection.current_role());
-        emit_class_row_insert(
-            program,
-            &self.cursors,
-            namespace,
-            written_name,
-            name,
-            kind,
-            owner,
-        );
-        Ok(())
+        Ok(emit_class_row_insert(program, &self.cursors, new, owner))
+    }
+
+    /// The oid of the class row of the relation that the schema calls
+    /// `name`, 0 when it has none.
+    fn oid_of(&self, namespace: NamespaceId, name: &str) -> i64 {
+        class_catalog(self.schema)
+            .and_then(|catalog| catalog.get_by_name(namespace, name))
+            .map_or(0, |class| class.oid)
     }
 
     /// Deletes the class row of a relation that the statement drops.
@@ -984,11 +1164,34 @@ impl<'a> ClassRowWriter<'a> {
         namespace: NamespaceId,
         old_name: &str,
         new_name: &str,
-    ) {
+    ) -> turso_core::Result<()> {
         let has_row = class_catalog(self.schema)
             .is_some_and(|catalog| catalog.get_by_name(namespace, old_name).is_some());
         if has_row {
             emit_class_row_rename(program, &self.cursors, namespace, old_name, new_name);
+        }
+        Ok(())
+    }
+
+    /// Stores the new name that the schema gives the index of a constraint
+    /// when its table is renamed. PostgreSQL keeps the index's own name.
+    fn renamed_engine_name(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        let has_row = class_catalog(self.schema)
+            .is_some_and(|catalog| catalog.get_by_name(namespace, old_name).is_some());
+        if has_row {
+            emit_class_row_rename_engine_name(
+                program,
+                &self.cursors,
+                namespace,
+                old_name,
+                new_name,
+            );
         }
     }
 
@@ -1540,29 +1743,24 @@ fn open_class_table_for_writing(
     }))
 }
 
-/// Inserts the class row of relation `name` of `namespace` under the next
-/// oid, owned by `owner`. Engine relations get no row.
+/// Inserts the class row of a new relation under the next oid, owned by
+/// `owner`, and returns the register of the oid. Engine relations get no
+/// row, and no register.
 fn emit_class_row_insert(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
-    namespace: NamespaceId,
-    name: &str,
-    engine_name: &str,
-    kind: RelationKind,
+    new: NewRelation<'_>,
     owner: RoleId,
-) {
-    if !is_user_relation_name(kind, name) {
-        return;
+) -> Option<usize> {
+    if !is_user_relation_name(new.kind, new.engine_name.unwrap_or(new.name)) {
+        return None;
     }
     let oid_reg = emit_allocate_oid(program, cursors);
 
-    emit_class_name_index_insert(program, cursors, namespace, name, oid_reg);
+    emit_class_name_index_insert(program, cursors, new.namespace, new.name, oid_reg);
 
     let first_column_reg = program.alloc_registers(CLASS_COLUMN_COUNT);
-    for (column, value) in new_class_values(name, engine_name, namespace, kind, owner)
-        .into_iter()
-        .enumerate()
-    {
+    for (column, value) in new_class_values(&new, owner).into_iter().enumerate() {
         emit_class_value(program, value, first_column_reg + column);
     }
     let record_reg = program.alloc_register();
@@ -1584,12 +1782,18 @@ fn emit_class_row_insert(
     });
 
     ClassCreated {
-        namespace,
-        name: name.to_string(),
-        engine_name: Some(engine_name.to_string()),
-        kind,
+        namespace: new.namespace,
+        name: new.name.to_string(),
+        engine_name: new.engine_name.map(str::to_string),
+        kind: new.kind,
     }
-    .emit(program, oid_reg, first_column_reg + COLUMN_RELOWNER);
+    .emit(
+        program,
+        oid_reg,
+        first_column_reg + COLUMN_RELOWNER,
+        first_column_reg + COLUMN_RELINDRELID,
+    );
+    Some(oid_reg)
 }
 
 /// A value written into a column of a new class row.
@@ -1599,19 +1803,15 @@ enum ClassValue {
     Int(i64),
     Real(f64),
     Text(String),
+    Register(usize),
 }
 
 /// The columns of a new class row, in table order. The oid is the rowid, so
 /// the record keeps NULL for it, as SQLite does for an INTEGER PRIMARY KEY
 /// column. No GRANT has touched a new relation, so `relacl` is NULL, and it
 /// has no row-level security and no policies.
-fn new_class_values(
-    name: &str,
-    engine_name: &str,
-    namespace: NamespaceId,
-    kind: RelationKind,
-    owner: RoleId,
-) -> Vec<ClassValue> {
+fn new_class_values(new: &NewRelation<'_>, owner: RoleId) -> Vec<ClassValue> {
+    let (name, namespace, kind) = (new.name, new.namespace, new.kind);
     let (access_method, replica_identity, reltuples, relnatts) = match kind {
         RelationKind::Table | RelationKind::MaterializedView => (2, "d", 0.0, 0),
         RelationKind::Index => (403, "d", 0.0, 0),
@@ -1659,7 +1859,19 @@ fn new_class_values(
     set("relfrozenxid", ClassValue::Int(0));
     set("relminmxid", ClassValue::Int(0));
     set("relownedby", ClassValue::Int(0));
-    set("relenginename", ClassValue::Text(engine_name.to_string()));
+    set(
+        "relenginename",
+        new.engine_name
+            .map_or(ClassValue::Null, |name| ClassValue::Text(name.to_string())),
+    );
+    set(
+        "relindrelid",
+        match new.indexed_table {
+            IndexedTable::None => ClassValue::Int(0),
+            IndexedTable::Oid(oid) => ClassValue::Int(oid),
+            IndexedTable::Register(register) => ClassValue::Register(register),
+        },
+    );
     values
 }
 
@@ -1672,6 +1884,11 @@ fn emit_class_value(program: &mut ProgramBuilder, value: ClassValue, dest: usize
         ClassValue::Int(value) => program.emit_insn(Insn::Integer { value, dest }),
         ClassValue::Real(value) => program.emit_insn(Insn::Real { value, dest }),
         ClassValue::Text(value) => program.emit_insn(Insn::String8 { value, dest }),
+        ClassValue::Register(src_reg) => program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest,
+            extra_amount: 0,
+        }),
     }
 }
 
@@ -1754,7 +1971,8 @@ fn emit_class_row_set_owned_by(
     });
 }
 
-/// Deletes the class row of relation `name` of `namespace`.
+/// Deletes the class row of the relation that the schema calls `name` in
+/// `namespace`.
 fn emit_class_row_delete(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -1784,7 +2002,7 @@ fn emit_class_row_delete(
 }
 
 /// Renames the class row of relation `old_name` of `namespace` to
-/// `new_name`, keeping its oid and owner.
+/// `new_name`, in PostgreSQL and in the schema, keeping its oid and owner.
 fn emit_class_row_rename(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -1818,6 +2036,34 @@ fn emit_class_row_rename(
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
     ClassRenamed {
+        namespace,
+        old_name: old_name.to_string(),
+        new_name: new_name.to_string(),
+    }
+    .emit(program);
+}
+
+/// Changes the name that the schema gives the relation `old_name` of
+/// `namespace` to `new_name`. The relation keeps its PostgreSQL name.
+fn emit_class_row_rename_engine_name(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    old_name: &str,
+    new_name: &str,
+) {
+    emit_find_class_row(program, cursors, namespace, old_name, |program, row| {
+        let record_reg = emit_class_record(
+            program,
+            row,
+            vec![(
+                COLUMN_RELENGINENAME,
+                ClassRecordColumn::Literal(new_name.to_string()),
+            )],
+        );
+        emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
+    });
+    ClassEngineNameChanged {
         namespace,
         old_name: old_name.to_string(),
         new_name: new_name.to_string(),
@@ -1998,22 +2244,29 @@ struct ClassCreated {
 }
 
 impl ClassCreated {
-    /// `oid_reg` holds the oid the row was stored under and `owner_reg` its
-    /// `relowner`.
-    fn emit(self, program: &mut ProgramBuilder, oid_reg: usize, owner_reg: usize) {
-        emit_catalog_apply(program, self, vec![oid_reg, owner_reg]);
+    /// `oid_reg` holds the oid the row was stored under, `owner_reg` its
+    /// `relowner` and `indexed_table_reg` its `relindrelid`.
+    fn emit(
+        self,
+        program: &mut ProgramBuilder,
+        oid_reg: usize,
+        owner_reg: usize,
+        indexed_table_reg: usize,
+    ) {
+        emit_catalog_apply(program, self, vec![oid_reg, owner_reg, indexed_table_reg]);
     }
 
     fn apply_to(&self, classes: &mut ClassCatalog, values: &[Value]) -> turso_core::Result<()> {
-        let [oid, owner] = values else {
+        let [oid, owner, indexed_table] = values else {
             return Err(LimboError::InternalError(
-                "a created relation carries its oid and owner".to_string(),
+                "a created relation carries its oid, owner and indexed table".to_string(),
             ));
         };
         classes.add(RelationClass {
             oid: read_back_integer(oid)?,
             relname: self.name.clone(),
             engine_name: self.engine_name.clone(),
+            relindrelid: read_back_integer(indexed_table)?,
             relnamespace: self.namespace,
             relkind: self.kind,
             relowner: RoleId::from_stored(read_back_integer(owner)?),
@@ -2045,7 +2298,7 @@ impl ClassDropped {
     }
 }
 
-/// A class row whose `relname` the statement changed.
+/// A class row whose `relname` and engine name the statement changed.
 #[derive(Debug)]
 struct ClassRenamed {
     namespace: NamespaceId,
@@ -2062,6 +2315,29 @@ impl ClassRenamed {
         if let Some(mut class) = classes.remove(self.namespace, &self.old_name) {
             class.relname.clone_from(&self.new_name);
             class.engine_name = Some(self.new_name.to_ascii_lowercase());
+            classes.add(class);
+        }
+        Ok(())
+    }
+}
+
+/// A class row whose engine name the statement changed, and whose `relname`
+/// stays.
+#[derive(Debug)]
+struct ClassEngineNameChanged {
+    namespace: NamespaceId,
+    old_name: String,
+    new_name: String,
+}
+
+impl ClassEngineNameChanged {
+    fn emit(self, program: &mut ProgramBuilder) {
+        emit_catalog_apply(program, self, vec![]);
+    }
+
+    fn apply_to(&self, classes: &mut ClassCatalog, _values: &[Value]) -> turso_core::Result<()> {
+        if let Some(mut class) = classes.remove(self.namespace, &self.old_name) {
+            class.engine_name = Some(self.new_name.clone());
             classes.add(class);
         }
         Ok(())
@@ -2245,6 +2521,7 @@ apply_to_class_catalog!(
     ClassCreated,
     ClassDropped,
     ClassRenamed,
+    ClassEngineNameChanged,
     OwnerColumnSet,
     OwnerColumnRenamed,
     OwnerSet,
@@ -2520,7 +2797,8 @@ fn emit_class_name_index_insert(
     );
 }
 
-/// Removes `(namespace, name, rowid)` from the name index.
+/// Removes `(namespace, name, rowid)` from the name index, with the name in
+/// register `name_reg`.
 fn emit_class_name_index_delete(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -2585,7 +2863,7 @@ mod tests {
     }
 
     #[test]
-    fn class_created_refuses_values_that_are_not_an_oid_and_an_owner() {
+    fn class_created_refuses_values_that_are_not_an_oid_an_owner_and_a_table() {
         let created = ClassCreated {
             namespace: NamespaceId::ROOT,
             name: "t".to_string(),
@@ -2597,7 +2875,11 @@ mod tests {
         let missing_owner = created.apply_to(&mut classes, &[Value::from_i64(TABLE_OID)]);
         let text_oid = created.apply_to(
             &mut classes,
-            &[Value::build_text("t"), Value::from_i64(ALICE)],
+            &[
+                Value::build_text("t"),
+                Value::from_i64(ALICE),
+                Value::from_i64(0),
+            ],
         );
 
         assert!(matches!(missing_owner, Err(LimboError::InternalError(_))));
@@ -2804,7 +3086,11 @@ mod tests {
             }
             .apply_to(
                 &mut classes,
-                &[Value::from_i64(oid), Value::from_i64(ALICE)],
+                &[
+                    Value::from_i64(oid),
+                    Value::from_i64(ALICE),
+                    Value::from_i64(0),
+                ],
             )
             .unwrap();
         }

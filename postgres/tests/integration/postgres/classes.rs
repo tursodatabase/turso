@@ -218,7 +218,7 @@ fn a_new_database_has_the_classes_table_and_ddl_maintains_it() {
     assert_eq!(t_kind, "r");
     assert_eq!(t_owner, 0, "owned by the bootstrap superuser");
     let autoindex = rows.iter().find(|row| row.3 == "i").unwrap();
-    assert!(autoindex.1.starts_with("sqlite_autoindex_"), "{rows:?}");
+    assert_eq!(autoindex.1, "t_name_key");
     assert_eq!(autoindex.0, 16385);
 
     pg.execute("CREATE INDEX t_name ON t (name)").unwrap();
@@ -247,6 +247,22 @@ fn a_new_database_has_the_classes_table_and_ddl_maintains_it() {
         vec![],
         "indexes are dropped with their table"
     );
+}
+
+#[turso_macros::test(mvcc)]
+fn the_index_of_a_constraint_is_named_after_the_constraint(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (a TEXT PRIMARY KEY, b INT, c INT, UNIQUE (b, c), UNIQUE (c))")
+        .unwrap();
+
+    let names: Vec<String> = class_rows(&conn).into_iter().map(|row| row.1).collect();
+    assert!(names.contains(&"t_pkey".to_string()), "{names:?}");
+    assert!(names.contains(&"t_b_c_key".to_string()), "{names:?}");
+    assert!(names.contains(&"t_c_key".to_string()), "{names:?}");
+    assert!(names
+        .iter()
+        .all(|name| !name.starts_with("sqlite_autoindex")));
 }
 
 #[test]
@@ -297,13 +313,16 @@ fn a_rename_keeps_the_oid_and_owner() {
     assert_eq!(class_row(&conn, "t"), None);
     let (u_oid, ..) = class_row(&conn, "u").unwrap();
     assert_eq!(u_oid, t_oid);
-    // The automatic index was renamed with its table, keeping its oid.
+    // PostgreSQL keeps the name of the index of a constraint when its table
+    // is renamed, and the index keeps working under the schema's new name.
     let autoindex_after = class_rows(&conn)
         .into_iter()
         .find(|row| row.3 == "i")
         .unwrap();
-    assert_eq!(autoindex_after.0, autoindex_before.0);
-    assert!(autoindex_after.1.contains("_u_"), "{autoindex_after:?}");
+    assert_eq!(autoindex_after, autoindex_before);
+    pg.execute("INSERT INTO u VALUES ('a')").unwrap();
+    pg.execute("DROP TABLE u").unwrap();
+    assert_eq!(class_rows(&conn), vec![]);
 }
 
 #[test]

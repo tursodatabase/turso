@@ -1048,17 +1048,12 @@ expect {
 expect @tursopg error {}
 
 # E-100: pg_indexes names of PRIMARY KEY and UNIQUE indexes
-# The primary key index name has the same cause as E-29.
-@compat-gap "syntax:catalog"
 test pg-indexes-names-of-primary-key-and-unique-indexes {
     CREATE TABLE u (id text PRIMARY KEY, e text UNIQUE);
     SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('u_e_key', 'u_pkey');
 }
 expect {
     2
-}
-expect @tursopg {
-    0
 }
 
 # E-101: conkey of a two-column UNIQUE constraint as text
