@@ -8,6 +8,8 @@ mod index_program;
 mod index_tests;
 mod index_walk;
 mod model;
+#[cfg(test)]
+mod overlay_tests;
 mod program;
 mod walk;
 
