@@ -1899,3 +1899,32 @@ fn test_mvcc_pull_cost_scaling() {
     }
     finish(&report, &failures);
 }
+
+/// The counters count each MvStore iterator once when it is made and each entry that it
+/// returns once, whichever cursor operation uses it.
+#[test]
+fn test_cursor_work_counts_mvstore_iterators_exactly() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+    run(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)");
+    run(&conn, "CREATE INDEX t_k ON t(k)");
+    run(
+        &conn,
+        "INSERT INTO t SELECT value, value FROM generate_series(1, 34)",
+    );
+    // The rows of all tables share one map, so a table scan also reads the first entry
+    // of the next table, to see that its own table ended. An index has a map of its own.
+    for (sql, entries) in [
+        ("SELECT id FROM t", 34..=35),
+        ("SELECT k FROM t ORDER BY k", 34..=34),
+    ] {
+        let (rows, work) = run_measured(&conn, sql, &[]);
+        assert_eq!(rows.len(), 34);
+        assert_eq!(work.mvcc_seeks, 1, "`{sql}`: {work:?}");
+        assert!(
+            entries.contains(&work.mvcc_entries_examined),
+            "`{sql}`: {work:?}"
+        );
+    }
+}

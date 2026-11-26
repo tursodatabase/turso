@@ -106,8 +106,7 @@ pub(crate) fn cursor_work(handle: &CursorWorkHandle) -> CursorWorkRef<'_> {
     }
     #[cfg(not(debug_assertions))]
     {
-        let CursorWorkHandle = handle;
-        CursorWorkRef::new(&CursorWorkCounters {})
+        CursorWorkRef::new(handle)
     }
 }
 
@@ -119,9 +118,9 @@ pub(crate) fn cursor_work(handle: &CursorWorkHandle) -> CursorWorkRef<'_> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CursorWorkRef<'a> {
     #[cfg(debug_assertions)]
-    counters: &'a CursorWorkCounters,
+    counters: &'a CursorWorkHandle,
     #[cfg(not(debug_assertions))]
-    counters: std::marker::PhantomData<&'a CursorWorkCounters>,
+    counters: std::marker::PhantomData<&'a CursorWorkHandle>,
 }
 
 // A release build passes no argument for a `CursorWorkRef` only if it has zero size.
@@ -130,18 +129,25 @@ const _: () = assert!(std::mem::size_of::<CursorWorkRef<'static>>() == 0);
 
 impl<'a> CursorWorkRef<'a> {
     #[inline(always)]
-    pub(crate) fn new(counters: &'a CursorWorkCounters) -> Self {
+    pub(crate) fn new(counters: &'a CursorWorkHandle) -> Self {
         #[cfg(debug_assertions)]
         {
             Self { counters }
         }
         #[cfg(not(debug_assertions))]
         {
-            let CursorWorkCounters {} = counters;
+            let CursorWorkHandle = counters;
             Self {
                 counters: std::marker::PhantomData,
             }
         }
+    }
+
+    /// An owned handle to the same counters, for an object that outlives this reference,
+    /// such as an MvStore iterator that counts its own entries.
+    #[cfg(debug_assertions)]
+    pub(crate) fn handle(self) -> CursorWorkHandle {
+        self.counters.clone()
     }
 
     #[cfg(debug_assertions)]
@@ -153,9 +159,9 @@ impl<'a> CursorWorkRef<'a> {
         );
     }
 
-    #[inline(always)]
+    /// Counted by the iterator of [`crate::mvcc::cursor::counted_mvcc_iterator`].
+    #[cfg(debug_assertions)]
     pub(crate) fn mvcc_entry_examined(self) {
-        #[cfg(debug_assertions)]
         Self::bump(&self.counters.mvcc_entries_examined);
     }
 

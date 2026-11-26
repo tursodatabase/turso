@@ -4,7 +4,7 @@ use crate::alloc::{
 };
 use crate::ast::SortOrder;
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::cursor::{counted_mvcc_iterator, static_iterator_hack, MvccIterator};
 use crate::mvcc::sqlite_schema_row::{types_table_root_page, SqliteSchemaRow};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -6046,7 +6046,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // to loop either until we find a row that is not deleted or until we reach the end of the table.
             let next_row = mv_store_iterator.next();
             let row = next_row?;
-            work.mvcc_entry_examined();
             if row.key().table_id != table_id {
                 // In case of table rows, we store the rows of all tables in a single map,
                 // so we must stop iteration if we reach a row that is on a different table.
@@ -6316,7 +6315,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     {
         loop {
             let row = rows.next()?;
-            work.mvcc_entry_examined();
             work.visibility_check();
             if let Some(visible_row) = self.find_last_visible_index_version(snapshot, index_id, row)
             {
@@ -6338,7 +6336,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     {
         loop {
             let row = rows.next()?;
-            work.mvcc_entry_examined();
             if row.key().table_id != table_id {
                 return None;
             }
@@ -6362,7 +6359,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         work: CursorWorkRef<'_>,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
-        work.mvcc_seek();
         let table_id = start.table_id;
         let iter_box = {
             let range = if eq_only {
@@ -6394,7 +6390,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
         };
-        *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+        *table_iterator = Some(counted_mvcc_iterator(
+            static_iterator_hack!(iter_box, RowID, A),
+            work,
+        ));
 
         let mv_store_iterator = table_iterator
             .as_mut()
@@ -6415,7 +6414,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
         work: CursorWorkRef<'_>,
     ) -> Result<Option<(RowID, RowVersions<A>)>> {
-        work.mvcc_seek();
         let index_rows = self.get_or_create_index_rows(index_id)?;
         let index_rows = index_rows.value();
         let range = if eq_only {
@@ -6451,7 +6449,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 Box::new(index_rows.range(range).rev()) as IndexRowIterator<'_, A>
             }
         };
-        *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
+        *index_iterator = Some(counted_mvcc_iterator(
+            static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A),
+            work,
+        ));
         let mv_store_iterator = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above if it was None");
@@ -9218,7 +9219,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
         work: CursorWorkRef<'_>,
     ) -> Option<RowKey> {
-        work.mvcc_seek();
         let tx = self
             .txs
             .get(&tx_id)
@@ -9230,13 +9230,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         };
         let range = create_seek_range(Bound::Included(max_rowid), IterationDirection::Backwards);
         let iter_box = Box::new(self.rows.range(range).rev());
-        *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+        *table_iterator = Some(counted_mvcc_iterator(
+            static_iterator_hack!(iter_box, RowID, A),
+            work,
+        ));
         let iter = table_iterator
             .as_mut()
             .expect("table_iterator was assigned above");
         loop {
             let entry = iter.next()?;
-            work.mvcc_entry_examined();
             // Rowid is not part of the table, therefore we already reached the end of the table.
             // NOTE: Shouldn't range already prevent this?
             tracing::trace!(
@@ -9290,11 +9292,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
         work: CursorWorkRef<'_>,
     ) -> Result<Option<RowKey>> {
-        work.mvcc_seek();
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         let iter_box = Box::new(index.iter().rev());
-        *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
+        *index_iterator = Some(counted_mvcc_iterator(
+            static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A),
+            work,
+        ));
         let iter = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above");

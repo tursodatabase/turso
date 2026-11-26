@@ -1635,7 +1635,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
             reader_id,
             &idx_key(10),
             crate::vdbe::metrics::CursorWorkRef::new(
-                &crate::vdbe::metrics::CursorWorkCounters::default()
+                &crate::vdbe::metrics::new_cursor_work_handle()
             ),
         )
         .unwrap());
@@ -1648,7 +1648,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
             reader_id,
             &idx_key(30),
             crate::vdbe::metrics::CursorWorkRef::new(
-                &crate::vdbe::metrics::CursorWorkCounters::default()
+                &crate::vdbe::metrics::new_cursor_work_handle()
             ),
         )
         .unwrap());

@@ -405,6 +405,48 @@ macro_rules! static_iterator_hack {
 
 pub(crate) use static_iterator_hack;
 
+/// Counts the work of an MvStore iterator that a cursor uses: one seek when it is made,
+/// and one examined entry for each entry that it returns. All MvStore iterators of
+/// cursors go through this function, so the counts do not depend on each call site.
+/// In release builds it returns `iter` unchanged.
+pub(crate) fn counted_mvcc_iterator<T: 'static, A: ConcurrentAllocator>(
+    iter: MvccIterator<'static, T, A>,
+    work: CursorWorkRef<'_>,
+) -> MvccIterator<'static, T, A> {
+    work.mvcc_seek();
+    #[cfg(debug_assertions)]
+    {
+        Box::new(CountedMvccIterator {
+            inner: iter,
+            work: work.handle(),
+        })
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        iter
+    }
+}
+
+/// See [`counted_mvcc_iterator`].
+#[cfg(debug_assertions)]
+struct CountedMvccIterator<I> {
+    inner: I,
+    work: CursorWorkHandle,
+}
+
+#[cfg(debug_assertions)]
+impl<I: Iterator> Iterator for CountedMvccIterator<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        let item = self.inner.next();
+        if item.is_some() {
+            cursor_work(&self.work).mvcc_entry_examined();
+        }
+        item
+    }
+}
+
 /// Forward scan over `index_rows`, co-advanced with the B-tree cursor so the
 /// per-row "is this B-tree row shadowed by MVCC?" check is an amortized-O(1)
 /// merge step instead of an `index_rows.get()` (O(log N)) per scanned row.
@@ -456,9 +498,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
     /// bit is deliberately not resolved here. See [`IndexShadowScanState::Peeked`].
     fn advance(
         mut iter: MvccIterator<'static, Arc<SortableIndexKey>, A>,
-        work: CursorWorkRef<'_>,
     ) -> IndexShadowScanState<A> {
-        work.mvcc_entry_examined();
         match iter.next() {
             Some(entry) => IndexShadowScanState::Peeked {
                 key: entry.key().clone(),
@@ -489,7 +529,6 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
         }
         if matches!(self.state, IndexShadowScanState::Uninitialized) {
             // Scoped so the skiplist guard drops before later `db` borrows.
-            work.mvcc_seek();
             let iter = {
                 // Avoid allocating skiplist here with `try_get_or_insert_with`
                 let index_rows = db.index_rows.get(&table_id);
@@ -507,9 +546,12 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
                     }
                     None => Box::new(std::iter::empty()),
                 };
-                static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A)
+                counted_mvcc_iterator(
+                    static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A),
+                    work,
+                )
             };
-            self.state = Self::advance(iter, work);
+            self.state = Self::advance(iter);
         }
         loop {
             match &self.state {
@@ -538,7 +580,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
             else {
                 unreachable!("Less arm matched Peeked")
             };
-            self.state = Self::advance(iter, work);
+            self.state = Self::advance(iter);
         }
     }
 }
@@ -1358,7 +1400,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         if self.table_iterator.is_some() || self.index_iterator.is_some() {
             return Ok(()); // Already initialized
         }
-        cursor_work(&self.work).mvcc_seek();
         match &self.mv_cursor_type {
             MvccCursorType::Table => {
                 let start_rowid = RowID {
@@ -1368,7 +1409,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 let range =
                     create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
                 let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+                self.table_iterator = Some(counted_mvcc_iterator(
+                    static_iterator_hack!(iter_box, RowID, A),
+                    cursor_work(&self.work),
+                ));
             }
             MvccCursorType::Index(_) => {
                 let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
@@ -1376,8 +1420,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 let iter_box: Box<
                     dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
                 > = Box::new(index_rows.iter());
-                self.index_iterator =
-                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
+                self.index_iterator = Some(counted_mvcc_iterator(
+                    static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A),
+                    cursor_work(&self.work),
+                ));
             }
         }
         Ok(())
@@ -2351,7 +2397,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     std::ops::Bound::Unbounded,
                 );
                 let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+                self.table_iterator = Some(counted_mvcc_iterator(
+                    static_iterator_hack!(iter_box, RowID, A),
+                    cursor_work(&self.work),
+                ));
             }
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning
@@ -2360,8 +2409,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let iter_box: Box<
                     dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
                 > = Box::new(index_rows.iter());
-                self.index_iterator =
-                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
+                self.index_iterator = Some(counted_mvcc_iterator(
+                    static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A),
+                    cursor_work(&self.work),
+                ));
             }
         }
 
