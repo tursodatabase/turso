@@ -8,7 +8,7 @@
 # - sqlite3 is the version in sqlite/version. It goes to .sqlite3/ in this
 #   checkout (scripts/install-sqlite3.sh). scripts/diff.sh uses the sqlite3 on PATH.
 # - PostgreSQL is the version in postgres/version, in a Docker container that
-#   listens on 127.0.0.1:54329. The script reuses the container if it runs.
+#   listens on 127.0.0.1:54329. If the container is already running, the script reuses it.
 # - Sources go to ${TURSO_ORACLE_CACHE:-~/.cache/turso-oracles}, at the same versions.
 #
 # It is safe to run again. It needs no sudo.
@@ -92,7 +92,7 @@ clone_tag() { # clone_tag URL TAG DIR
 setup_sources() {
     rm -rf "$CACHE"/*.tmp
     clone_tag https://github.com/sqlite/sqlite.git "version-$SQLITE_VERSION" "$CACHE/sqlite-$SQLITE_VERSION"
-    # The server tells the exact release, for example 18.1, so the source matches it.
+    # Clone the source at the running server's exact release, so the two match.
     local full tag
     full="$(docker exec "$CONTAINER" postgres --version 2>/dev/null | awk '{print $3}' || true)"
     if [[ -n "$full" ]]; then
