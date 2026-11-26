@@ -1285,6 +1285,18 @@ pub fn emit_fk_child_update_counters(
             });
         }
 
+        // The parent table still holds this row's OLD image, which the
+        // rewrite removes, so the lookup below must not count it as the
+        // parent. SQLite does the lookup after deleting the old record.
+        let old_rowid_reg = is_self_ref.then(|| {
+            let reg = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: child_cursor_id,
+                dest: reg,
+            });
+            reg
+        });
+
         // A child NEW-key check normally probes the parent table before this
         // row has been written. For a self-reference, the parent it needs may
         // be this same row's NEW key, which is not in the table yet:
@@ -1366,6 +1378,15 @@ pub fn emit_fk_child_update_counters(
                     collation: CollationSeq::for_internal_values(),
                 });
             }
+            if let Some(old_rowid_reg) = old_rowid_reg {
+                program.emit_insn(Insn::Eq {
+                    lhs: tmp,
+                    rhs: old_rowid_reg,
+                    target_pc: violation,
+                    flags: CmpInsFlags::default(),
+                    collation: CollationSeq::for_internal_values(),
+                });
+            }
 
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
@@ -1438,38 +1459,45 @@ pub fn emit_fk_child_update_counters(
                 start
             };
 
-            // FOUND: ok; NOT FOUND: violation path
-            index_probe(
-                program,
-                icur,
-                probe,
-                ncols,
-                |_p| Ok(()),
-                |p| {
-                    let constraint_info = if fk_ref.fk.deferred {
-                        None
-                    } else {
-                        let regs = fk_ref
-                            .fk
-                            .child_columns
-                            .iter()
-                            .map(|name| {
-                                let (pos, col) = child_tbl.get_column(name).unwrap();
-                                if col.is_rowid_alias() {
-                                    new_rowid_reg
-                                } else {
-                                    layout.to_register(new_start_reg, pos)
-                                }
-                            })
-                            .collect();
-                        Some(Box::new(fk_constraint_info(
-                            p, resolver, child_tbl, &fk_ref.fk, regs,
-                        )?))
-                    };
-                    emit_fk_violation(p, &fk_ref.fk, constraint_info)?;
+            let emit_violation = |p: &mut ProgramBuilder| -> Result<()> {
+                let constraint_info = if fk_ref.fk.deferred {
+                    None
+                } else {
+                    let regs = fk_ref
+                        .fk
+                        .child_columns
+                        .iter()
+                        .map(|name| {
+                            let (pos, col) = child_tbl.get_column(name).unwrap();
+                            if col.is_rowid_alias() {
+                                new_rowid_reg
+                            } else {
+                                layout.to_register(new_start_reg, pos)
+                            }
+                        })
+                        .collect();
+                    Some(Box::new(fk_constraint_info(
+                        p, resolver, child_tbl, &fk_ref.fk, regs,
+                    )?))
+                };
+                emit_fk_violation(p, &fk_ref.fk, constraint_info)
+            };
+
+            if old_rowid_reg.is_some() {
+                // FOUND another row: ok; NOT FOUND: violation path
+                let found = program.allocate_label();
+                index_scan_match_any(program, icur, probe, ncols, old_rowid_reg, |p| {
+                    p.emit_insn(Insn::Goto { target_pc: found });
                     Ok(())
-                },
-            )?;
+                })?;
+                emit_violation(program)?;
+                program.emit_insn(Insn::Goto { target_pc: fk_ok });
+                program.preassign_label_to_next_insn(found);
+                program.emit_insn(Insn::Close { cursor_id: icur });
+            } else {
+                // FOUND: ok; NOT FOUND: violation path
+                index_probe(program, icur, probe, ncols, |_p| Ok(()), emit_violation)?;
+            }
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
         }
 

@@ -5784,3 +5784,48 @@ expect {
     11|15
     15|
 }
+
+# Row 2 moves to id 107 and takes parent 2. Its old image is the only row
+# with id 2, and the update removes it, so row 107 is left without a parent.
+test fk-self-ref-update-new-parent-is-own-old-key-rowid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s (id INTEGER PRIMARY KEY, parent INT REFERENCES s(id));
+    INSERT INTO s VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE s SET id = CASE WHEN id = 2 THEN 107 ELSE id END, parent = parent + 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-self-ref-update-new-parent-is-own-old-key-unique-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s (id INT PRIMARY KEY, parent INT REFERENCES s(id));
+    INSERT INTO s VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE s SET id = CASE WHEN id = 2 THEN 107 ELSE id END, parent = parent + 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-self-ref-update-new-parent-is-own-old-key-deferred {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s (id INT PRIMARY KEY, parent INT REFERENCES s(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO s VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE s SET id = CASE WHEN id = 2 THEN 107 ELSE id END, parent = parent + 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# With ON UPDATE CASCADE the action rewrites the row's reference to its old
+# key into its new key, so the row ends up referencing itself.
+test fk-self-ref-update-new-parent-is-own-old-key-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s (id INTEGER PRIMARY KEY, parent INT REFERENCES s(id) ON UPDATE CASCADE);
+    INSERT INTO s VALUES (1, NULL);
+    UPDATE s SET id = 91, parent = 1;
+    SELECT id, parent FROM s;
+}
+expect {
+    91|91
+}
