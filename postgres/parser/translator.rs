@@ -6769,6 +6769,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_transform"
             | "pg_language"
             | "pg_operator"
+            | "pg_aggregate"
             | "pg_opclass"
             | "pg_opfamily"
             | "pg_ts_parser"

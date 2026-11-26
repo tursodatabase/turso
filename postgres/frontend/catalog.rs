@@ -292,6 +292,14 @@ impl Dialect for PostgresDialect {
         crate::operators::choose_list_operator(op, &operands())
     }
 
+    fn choose_aggregate(
+        &self,
+        name: &str,
+        arguments: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Result<turso_core::dialect::AggregateChoice> {
+        crate::aggregates::choose_aggregate(name, arguments)
+    }
+
     fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
         let names: Vec<&str> = operand_types.iter().map(String::as_str).collect();
         crate::functions::undefined_operator_of(op, &names)
@@ -3165,6 +3173,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgOperatorTable>(PhantomData),
     );
+    options = options.native_module(
+        "pg_aggregate",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgAggregateTable>(PhantomData),
+    );
     for (name, create_sql) in [
         (
             "pg_opclass",
@@ -3368,6 +3381,60 @@ impl SnapshotRows for PgOperatorTable {
                     Value::from_i64(NO_FUNCTION),
                     Value::from_i64(NO_FUNCTION),
                     Value::from_i64(NO_FUNCTION),
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgAggregateTable;
+
+impl SnapshotRows for PgAggregateTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_aggregate (
+        aggfnoid INTEGER, aggkind TEXT, aggnumdirectargs INTEGER, aggtransfn INTEGER,
+        aggfinalfn INTEGER, aggcombinefn INTEGER, aggserialfn INTEGER, aggdeserialfn INTEGER,
+        aggmtransfn INTEGER, aggminvtransfn INTEGER, aggmfinalfn INTEGER,
+        aggfinalextra BOOLEAN, aggmfinalextra BOOLEAN, aggfinalmodify TEXT,
+        aggmfinalmodify TEXT, aggsortop INTEGER, aggtranstype INTEGER, aggtransspace INTEGER,
+        aggmtranstype INTEGER, aggmtransspace INTEGER, agginitval TEXT, aggminitval TEXT,
+        tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2600);
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 10;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        crate::aggregates::AGGREGATES
+            .iter()
+            .map(|aggregate| {
+                vec![
+                    Value::from_i64(aggregate.oid),
+                    Value::build_text(aggregate.kind),
+                    Value::from_i64(aggregate.direct_args),
+                    Value::from_i64(aggregate.state_function),
+                    Value::from_i64(aggregate.final_function),
+                    Value::from_i64(aggregate.combine_function),
+                    Value::from_i64(aggregate.serialize_function),
+                    Value::from_i64(aggregate.deserialize_function),
+                    Value::from_i64(aggregate.moving_state_function),
+                    Value::from_i64(aggregate.moving_inverse_function),
+                    Value::from_i64(aggregate.moving_final_function),
+                    Value::from_i64(i64::from(aggregate.final_extra)),
+                    Value::from_i64(i64::from(aggregate.moving_final_extra)),
+                    Value::build_text(aggregate.final_modify),
+                    Value::build_text(aggregate.moving_final_modify),
+                    Value::from_i64(aggregate.sort_operator),
+                    Value::from_i64(aggregate.state_type),
+                    Value::from_i64(aggregate.state_space),
+                    Value::from_i64(aggregate.moving_state_type),
+                    Value::from_i64(aggregate.moving_state_space),
+                    aggregate
+                        .initial_value
+                        .map_or(Value::Null, Value::build_text),
+                    aggregate
+                        .moving_initial_value
+                        .map_or(Value::Null, Value::build_text),
                 ]
             })
             .collect()

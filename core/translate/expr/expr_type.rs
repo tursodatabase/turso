@@ -1272,6 +1272,17 @@ pub(crate) fn common_type<'e>(
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
 
+/// What a dialect is told about each argument of an aggregate call.
+pub(crate) fn aggregate_operand_types(arguments: &[ast::Expr], env: &TypeEnv) -> Vec<OperandType> {
+    arguments
+        .iter()
+        .map(|argument| match type_of(argument, env) {
+            ExprType::Null => OperandType::Untyped,
+            ty => dialect_operand_type(argument, ty, env),
+        })
+        .collect()
+}
+
 /// The type of the operand `expr`, whose type is `ty`, as a dialect sees it.
 /// A plain type is only named for a value whose type is declared (see
 /// [reads_only_declared_types]).

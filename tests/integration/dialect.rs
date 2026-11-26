@@ -6,6 +6,11 @@ use turso_core::ast::Stmt;
 use turso_core::dialect::*;
 use turso_core::function::ScalarFunc;
 use turso_core::io::PlatformIO;
+use turso_core::native_ext::Aggregate;
+use turso_core::native_ext::AggregateFunction;
+use turso_core::native_ext::FunctionArity;
+use turso_core::native_ext::ScalarCall;
+use turso_core::native_ext::ScalarFunction;
 use turso_core::native_ext::VirtualTable;
 use turso_core::native_ext::VirtualTableCursor;
 use turso_core::native_ext::VirtualTableModule;
@@ -2244,4 +2249,260 @@ fn the_catalog_gets_a_new_schema_and_a_dropped_schema() {
         *commands.lock().unwrap(),
         ["create schema app", "drop schema app"]
     );
+}
+
+struct AggregateDialect;
+
+impl Dialect for AggregateDialect {
+    fn name(&self) -> &'static str {
+        "aggregate"
+    }
+
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
+        turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+        turso_core::schema::BTreeTable::from_stored_sql(self, sql, root_page, false)
+    }
+
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+        turso_core::dialect::parse_table_sql_ast(self, sql)
+    }
+
+    fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        turso_core::dialect::table_sql_for_replay(self, sql)
+    }
+
+    fn format_table_sql(
+        &self,
+        _input: &str,
+        tbl_name: &QualifiedName,
+        body: &CreateTableBody,
+    ) -> Result<String> {
+        turso_core::dialect::format_table_sql(tbl_name, body)
+    }
+
+    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
+    }
+
+    fn choose_aggregate(
+        &self,
+        name: &str,
+        _arguments: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<AggregateChoice> {
+        let function = |name: &str, is_strict: bool| ChosenFunction {
+            name: name.to_string(),
+            is_strict,
+        };
+        let chosen = match name {
+            "biggest" => ChosenAggregate {
+                state_function: function("larger", true),
+                final_function: None,
+                initial_value: None,
+            },
+            "total" => ChosenAggregate {
+                state_function: function("plus", true),
+                final_function: None,
+                initial_value: Some(Value::from_i64(0)),
+            },
+            "total_twice" => ChosenAggregate {
+                state_function: function("plus", true),
+                final_function: Some(function("twice", true)),
+                initial_value: Some(Value::from_i64(0)),
+            },
+            "last_one" => ChosenAggregate {
+                state_function: function("second", false),
+                final_function: None,
+                initial_value: None,
+            },
+            _ => return Ok(AggregateChoice::LeftToTheEngine),
+        };
+        Ok(AggregateChoice::Chosen(chosen))
+    }
+}
+
+#[test]
+fn dialect_runs_an_aggregate_as_the_functions_it_chooses() {
+    let options = OpenOptions::new(Arc::new(AggregateDialect))
+        .extension_function(integer_function("larger", 2, |args| {
+            match (args[0], args[1]) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            }
+        }))
+        .extension_function(integer_function("plus", 2, |args| {
+            match (args[0], args[1]) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            }
+        }))
+        .extension_function(integer_function("twice", 1, |args| args[0].map(|a| a * 2)))
+        .extension_function(integer_function("second", 2, |args| args[1]))
+        .extension_function(not_chosen_aggregate("biggest"))
+        .extension_function(not_chosen_aggregate("total"))
+        .extension_function(not_chosen_aggregate("total_twice"))
+        .extension_function(not_chosen_aggregate("last_one"));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (g INTEGER, x INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 5), (1, 3), (2, NULL), (2, NULL), (3, 7), (3, NULL)")
+        .unwrap();
+
+    let rows =
+        |sql: &str| -> Vec<Vec<Value>> { conn.prepare(sql).unwrap().run_collect_rows().unwrap() };
+    let int = Value::from_i64;
+    let pair = |a: Value, b: Value| vec![a, b];
+
+    assert_eq!(
+        rows("SELECT g, biggest(x) FROM t GROUP BY g ORDER BY g"),
+        vec![
+            pair(int(1), int(5)),
+            pair(int(2), Value::Null),
+            pair(int(3), int(7))
+        ],
+        "a strict state function without an initial value starts from the first non-NULL argument"
+    );
+    assert_eq!(
+        rows("SELECT g, total(x) FROM t GROUP BY g ORDER BY g"),
+        vec![
+            pair(int(1), int(8)),
+            pair(int(2), int(0)),
+            pair(int(3), int(7))
+        ],
+        "a group with only NULL arguments gives the initial value"
+    );
+    assert_eq!(
+        rows("SELECT total(x) FROM t WHERE g = 99"),
+        vec![vec![int(0)]],
+        "no rows give the initial value"
+    );
+    assert_eq!(
+        rows("SELECT g, total_twice(x) FROM t GROUP BY g ORDER BY g"),
+        vec![
+            pair(int(1), int(16)),
+            pair(int(2), int(0)),
+            pair(int(3), int(14))
+        ],
+        "the final function is called on the state"
+    );
+    assert_eq!(
+        rows("SELECT last_one(x) FROM t WHERE g = 1"),
+        vec![vec![int(3)]],
+        "a state function that is not strict is called on every row"
+    );
+    assert_eq!(
+        rows("SELECT last_one(x) FROM t"),
+        vec![vec![Value::Null]],
+        "a state function that is not strict is also called with a NULL argument"
+    );
+    assert_eq!(
+        rows("SELECT biggest(x) FILTER (WHERE g <> 1), total(DISTINCT x) FROM t"),
+        vec![pair(int(7), int(15))],
+        "FILTER and DISTINCT apply to the rows that the state function sees"
+    );
+    assert_eq!(
+        rows("SELECT sum(x), count(x) FROM t"),
+        vec![pair(int(15), int(3))],
+        "an aggregate that the dialect does not choose is the engine's"
+    );
+}
+
+struct IntegerFunction(fn(&[Option<i64>]) -> Option<i64>);
+
+impl std::fmt::Debug for IntegerFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IntegerFunction")
+    }
+}
+
+impl ScalarFunction for IntegerFunction {
+    type Call = IntegerCall;
+
+    fn create_call(&self) -> Result<IntegerCall> {
+        Ok(IntegerCall(self.0))
+    }
+}
+
+struct IntegerCall(fn(&[Option<i64>]) -> Option<i64>);
+
+impl ScalarCall for IntegerCall {
+    type Output = Value;
+
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
+        let args: Vec<Option<i64>> = args.iter().map(|arg| arg.get_value().as_int()).collect();
+        Ok(IOResult::Done(match (self.0)(&args) {
+            Some(value) => Value::from_i64(value),
+            None => Value::Null,
+        }))
+    }
+}
+
+fn integer_function(
+    name: &str,
+    arg_count: usize,
+    function: fn(&[Option<i64>]) -> Option<i64>,
+) -> turso_core::function::ExternalFunc {
+    turso_core::function::ExternalFunc::new_native_scalar(
+        name.to_string(),
+        FunctionArity::Exact(arg_count),
+        true,
+        IntegerFunction(function),
+    )
+    .unwrap()
+}
+
+#[derive(Debug)]
+struct NotChosen;
+
+impl AggregateFunction for NotChosen {
+    type Accumulator = NotChosen;
+
+    fn create_accumulator(&self) -> Result<NotChosen> {
+        Ok(NotChosen)
+    }
+}
+
+impl Aggregate for NotChosen {
+    fn step(&mut self, _args: &[Value]) -> IOResultOr<()> {
+        panic!("the dialect chooses this aggregate, so the engine never steps it")
+    }
+
+    fn finalize(&mut self) -> IOResultOr<Value> {
+        panic!("the dialect chooses this aggregate, so the engine never finalizes it")
+    }
+}
+
+fn not_chosen_aggregate(name: &str) -> turso_core::function::ExternalFunc {
+    turso_core::function::ExternalFunc::new_native_aggregate(name.to_string(), 1, NotChosen)
+        .unwrap()
 }

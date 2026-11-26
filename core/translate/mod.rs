@@ -14,6 +14,7 @@ pub(crate) mod catalog;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
+pub(crate) mod dialect_aggregate;
 pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;

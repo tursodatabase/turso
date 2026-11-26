@@ -696,6 +696,17 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Chooses the aggregate `name` for arguments of the given types. `arguments`
+    /// gives the types, and is only called by a dialect that needs them. An
+    /// error refuses the call.
+    fn choose_aggregate(
+        &self,
+        _name: &str,
+        _arguments: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<AggregateChoice> {
+        Ok(AggregateChoice::LeftToTheEngine)
+    }
+
     /// The error for an operator that no function runs for operands of these
     /// types, such as `date * 2`. `operand_types` has one name for a prefix
     /// operator and two for the others.
@@ -711,6 +722,38 @@ pub fn undefined_operator_message(op: &str, operand_types: &[String]) -> String 
         [left, right] => format!("operator does not exist: {left} {op} {right}"),
         _ => unreachable!("an operator has one or two operands"),
     }
+}
+
+/// What a dialect decided for an aggregate call.
+#[derive(Debug, Clone)]
+pub enum AggregateChoice {
+    /// The engine's own aggregate runs. SQLite always gives this.
+    LeftToTheEngine,
+    /// Functions of the dialect run the aggregate.
+    Chosen(ChosenAggregate),
+}
+
+/// An aggregate that runs as functions. The state starts as `initial_value`.
+/// Each row replaces it with `state_function(state, arguments...)`, and
+/// `final_function(state)` gives the result, or the state itself when there is
+/// no final function.
+#[derive(Debug, Clone)]
+pub struct ChosenAggregate {
+    pub state_function: ChosenFunction,
+    pub final_function: Option<ChosenFunction>,
+    /// `None` starts the state as NULL.
+    pub initial_value: Option<Value>,
+}
+
+/// A function that a chosen aggregate calls, by the name it is registered with.
+///
+/// A strict function is not called when an argument is NULL. A strict state
+/// function that starts from NULL takes the first non-NULL argument as the
+/// state, and a strict final function gives NULL for a NULL state.
+#[derive(Debug, Clone)]
+pub struct ChosenFunction {
+    pub name: String,
+    pub is_strict: bool,
 }
 
 /// What a dialect decided for an operator.
