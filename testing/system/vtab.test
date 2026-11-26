@@ -155,6 +155,11 @@ do_execsql_test_on_specific_db {:memory:} insert-returning-rowid-into-vtab {
 } {-1|0
 77|k2}
 
+do_execsql_test_in_memory_error_content insert-non-integer-rowid-into-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v(rowid, key, value) VALUES (1.5, 'k1', 'v1');
+} {datatype mismatch}
+
 do_execsql_test_on_specific_db {:memory:} insert-multiple-rows-into-vtab {
     CREATE VIRTUAL TABLE v USING kv_store;
     INSERT INTO v(key, value) VALUES ('k1', 'v1'), ('k2', 'v2'), ('k3', 'v3') RETURNING key;

@@ -3750,6 +3750,19 @@ fn translate_virtual_table_insert(
         )?;
     }
 
+    // As in SQLite, a rowid given by the INSERT must be an integer; NULL lets
+    // the module choose one.
+    let rowid_is_null = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: insertion.key_register(),
+        target_pc: rowid_is_null,
+    });
+    program.emit_insn(Insn::MustBeInt {
+        reg: insertion.key_register(),
+        target_pc: None,
+    });
+    program.preassign_label_to_next_insn(rowid_is_null);
+
     let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
     program.emit_insn(Insn::VUpdate {
         cursor_id,
