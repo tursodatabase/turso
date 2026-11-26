@@ -174,7 +174,10 @@ struct Fields {
 
 impl Fields {
     fn read(input: &str, ty: TemporalType) -> Result<Self> {
-        match input.trim().to_ascii_lowercase().as_str() {
+        // PostgreSQL skips only the ASCII spaces that C's isspace() accepts, so a
+        // special word with a no-break space around it is not that word.
+        let word = input.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+        match word.to_ascii_lowercase().as_str() {
             "allballs" if ty == TemporalType::Time => {
                 return Ok(Self {
                     time: Some(0),
