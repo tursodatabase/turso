@@ -294,6 +294,14 @@ impl Dialect for PostgresDialect {
         crate::operators::choose_operator(op, &operands())
     }
 
+    fn choose_function(
+        &self,
+        name: &str,
+        arguments: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Result<turso_core::dialect::FunctionChoice> {
+        crate::function_choice::choose_function(name, &arguments())
+    }
+
     fn choose_list_operator(
         &self,
         op: &str,

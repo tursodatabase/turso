@@ -12,7 +12,9 @@ mod operator;
 #[cfg(test)]
 mod oracle;
 
-use catalog::Catalog;
+pub(crate) use catalog::{
+    CastMethod, CastRow, Catalog, OperatorRow, ProcRow, RangeRow, TypeKind, TypeRow,
+};
 pub(crate) use error::ResolveError;
 
 /// The type of one argument of a call.

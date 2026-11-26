@@ -10,6 +10,7 @@ mod copy;
 mod deparse;
 mod descriptions;
 mod error;
+mod function_choice;
 mod functions;
 mod open;
 mod operators;
@@ -17,8 +18,10 @@ mod options;
 mod pg_type;
 mod policies;
 mod procs;
-#[cfg(test)]
+// FIXME(pg-catalog): The operator half of the resolver has no caller until operators use it.
+#[cfg_attr(not(test), allow(dead_code))]
 mod resolve;
+mod resolve_catalog;
 mod roles;
 mod schema_init;
 mod schema_state;
