@@ -325,6 +325,31 @@ expect {
     2|b
 }
 
+test mvcc-autoincrement-mixed-case-table-name-kept-in-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE "MiXeD Name" (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO "MiXeD Name"(v) VALUES ('a');
+    INSERT INTO "MiXeD Name"(v) VALUES ('b');
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    MiXeD Name|2
+}
+
+# Older versions stored the lowercased name. That row must be replaced, not kept next to the new one.
+test mvcc-autoincrement-replaces-lowercase-sequence-row {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE "MiXeD Name" (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO sqlite_sequence VALUES ('mixed name', 0);
+    INSERT INTO "MiXeD Name"(v) VALUES ('a');
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    MiXeD Name|1
+}
+
 # Older versions matched names ignoring case. With no row named exactly as the
 # table, a row whose name differs only in case is the table's row and is replaced.
 test mvcc-autoincrement-replaces-sequence-row-that-differs-in-case-when-no-exact-row {

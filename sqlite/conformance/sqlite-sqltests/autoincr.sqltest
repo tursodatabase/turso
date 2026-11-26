@@ -212,6 +212,23 @@ expect {
     1
 }
 
+# https://github.com/tursodatabase/turso/issues/5809
+# sqlite_sequence stores the table name with the case used in CREATE TABLE.
+@cross-check-integrity
+test autoinc-mixed-case-table-name-kept-in-sequence {
+    CREATE TABLE "MiXeD Name"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO "MiXeD Name"(v) VALUES('x');
+    UPDATE sqlite_sequence SET seq=100 WHERE name='MiXeD Name';
+    INSERT INTO "MiXeD Name"(v) VALUES('y');
+    SELECT id,v FROM "MiXeD Name" ORDER BY id;
+    SELECT name,seq FROM sqlite_sequence;
+}
+expect {
+    1|x
+    101|y
+    MiXeD Name|101
+}
+
 # When a row has the table's exact name, a row whose name differs only in case
 # belongs to no table: INSERT does not use it and DROP TABLE does not delete it.
 @cross-check-integrity
@@ -276,6 +293,21 @@ expect {
     u|3
 }
 
+# Renaming a mixed-case AUTOINCREMENT table stores the new name as written.
+@cross-check-integrity
+test autoinc-rename-mixed-case-table-updates-sequence-entry {
+    CREATE TABLE "MiXeD"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO "MiXeD"(v) VALUES('x');
+    ALTER TABLE mixed RENAME TO "NeW Name";
+    SELECT name,seq FROM sqlite_sequence;
+    INSERT INTO "new name"(v) VALUES('y');
+    SELECT name,seq FROM sqlite_sequence;
+}
+expect {
+    NeW Name|1
+    NeW Name|2
+}
+
 # A row whose name differs from the table's only in case belongs to no table.
 @cross-check-integrity
 test autoinc-rename-keeps-sequence-row-that-differs-in-case {
@@ -288,6 +320,18 @@ test autoinc-rename-keeps-sequence-row-that-differs-in-case {
 expect {
     u|1
     T|7
+}
+
+# Older versions of Turso stored the lowercased table name. RENAME must still find that row.
+@skip-if sqlite "SQLite never wrote lowercased names"
+test autoinc-rename-updates-lowercased-sequence-row {
+    CREATE TABLE "MiXeD"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO sqlite_sequence VALUES('mixed', 7);
+    ALTER TABLE mixed RENAME TO u;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    u|7
 }
 
 # Test: Renaming an AUTOINCREMENT table updates sqlite_sequence in place.
@@ -743,4 +787,17 @@ test autoinc-rename-plain-table-keeps-row-differing-in-case {
 }
 expect {
 	T|7
+}
+
+@cross-check-integrity
+test autoinc-rename-plain-table-renames-row-of-its-exact-name {
+	CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT);
+	CREATE TABLE "Tt"(x);
+	INSERT INTO sqlite_sequence VALUES('tt', 8), ('Tt', 7);
+	ALTER TABLE tt RENAME TO u;
+	SELECT name, seq FROM sqlite_sequence ORDER BY seq;
+}
+expect {
+	u|7
+	tt|8
 }

@@ -753,7 +753,7 @@ pub(crate) fn emit_backing_table_compaction(
 }
 
 /// Emit bytecode that mirrors a sequence watermark into the
-/// `sqlite_sequence` row keyed by `autoinc_table_name`. Used by
+/// `sqlite_sequence` row of the table stored as `autoinc_table_name`. Used by
 /// nextval / advance_past / setval for `_autoincrement_*` sequences,
 /// so that SQLite-compatibility readers of `sqlite_sequence` always
 /// see the current high-water mark without waiting for a checkpoint.
@@ -1034,10 +1034,27 @@ pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
     seq_name: &str,
     value_reg: usize,
 ) -> Result<()> {
-    let Some(table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
+    let Some(mangled_table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
         return Ok(());
     };
-    emit_sqlite_sequence_sync(program, resolver, database_id, table_name, value_reg)?;
+    let table_name_as_written = resolver
+        .with_schema(database_id, |s| {
+            let (namespace, table_name) = s.demangle_name(mangled_table_name);
+            s.get_btree_table(namespace, table_name)
+                .map(|table| crate::namespace::mangle_name(namespace, &table.declared_name))
+        })
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing AUTOINCREMENT table \"{mangled_table_name}\" for sequence \"{seq_name}\""
+            ))
+        })?;
+    emit_sqlite_sequence_sync(
+        program,
+        resolver,
+        database_id,
+        &table_name_as_written,
+        value_reg,
+    )?;
     Ok(())
 }
 

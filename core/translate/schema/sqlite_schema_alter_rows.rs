@@ -3,7 +3,7 @@
 
 use crate::dialect::{AddColumn, AlterColumn, CmdContext, DropColumn, RenameColumn, RenameTable};
 use crate::function::{AlterTableFunc, Func, FuncCtx};
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
 use crate::translate::alter::database_uses_mvcc;
@@ -38,11 +38,17 @@ pub(super) fn emit_rename_table_rows(
     } else {
         stored_old_name
     };
+    // The rewrite function stores the new name as written in the SQL text.
+    let new_name_argument = if table.is_virtual {
+        stored_new_name.to_string()
+    } else {
+        mangle_name(table.namespace, table.written_new_name)
+    };
     emit_rewrite_of_every_row(
         program,
         ctx,
         AlterTableFunc::RenameTable,
-        &[old_name_argument.to_string(), stored_new_name.to_string()],
+        &[old_name_argument.to_string(), new_name_argument.clone()],
         table.written_old_name,
     );
     if table.is_virtual {
@@ -60,8 +66,8 @@ pub(super) fn emit_rename_table_rows(
         ctx.connection,
         ctx.database_id,
         &renamed_table,
-        stored_old_name,
-        stored_new_name,
+        &mangle_name(table.namespace, &renamed_table.declared_name),
+        &new_name_argument,
     );
     let has_autoincrement_backing_table = resolver.with_schema(ctx.database_id, |s| {
         s.get_sequence(

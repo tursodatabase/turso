@@ -2323,10 +2323,11 @@ pub fn translate_drop_table(
     let seq_table = resolver.with_schema(database_id, |s| {
         s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
     });
-    if let (Some(_), Some(seq_table)) = (autoincrement_table, seq_table) {
+    if let (Some(dropped_table), Some(seq_table)) = (autoincrement_table, seq_table) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
-        let dropped_table_name_reg = program.emit_string8_new_reg(mangled_name.clone());
+        let dropped_table_name_reg = program
+            .emit_string8_new_reg(resolver.mangle_name(namespace, &dropped_table.declared_name));
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
