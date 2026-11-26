@@ -34,8 +34,8 @@ use crate::{
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
         expr::{
-            choose_and_check_operators, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
-            WalkControl,
+            cast_in_subquery_operands, choose_and_check_operators, get_expr_affinity,
+            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
@@ -1136,6 +1136,12 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let mut plan = plan;
+                cast_in_subquery_operands(
+                    &mut lhs,
+                    &TypeEnv::new(Some(referenced_tables), resolver),
+                    &mut plan,
+                    resolver,
+                )?;
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
