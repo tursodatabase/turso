@@ -2601,7 +2601,10 @@ impl Database {
         }
     }
 
-    pub(crate) fn encryption_cipher(&self) -> CipherMode {
+    /// The cipher of the database, or `CipherMode::None` when it is not
+    /// encrypted. The open options set it, or `PRAGMA cipher` and
+    /// `PRAGMA hexkey` on a new, empty database. It does not change after that.
+    pub fn encryption_cipher(&self) -> CipherMode {
         self.pager_state.encryption_cipher()
     }
 

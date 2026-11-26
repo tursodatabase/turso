@@ -18,8 +18,8 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
-    DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
+    storage::database::DatabaseFile, types::AsValueRef, CipherMode, ConnectOpts, Connection,
+    Database, DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
     OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
     PageLocation, QueryMode, Statement, StepResult, IO,
 };
@@ -1107,6 +1107,44 @@ impl TursoDatabase {
             )?
         };
 
+        Ok(TursoConnection::new(&self.config, connection))
+    }
+
+    /// Creates a database connection with the key of `encryption`, not the
+    /// key of the open options. Each connection to an encrypted database must
+    /// give the key, so use this after `PRAGMA cipher` and `PRAGMA hexkey`
+    /// encrypted a database that was opened without encryption options.
+    /// The cipher must be the cipher of the database.
+    pub fn connect_with_encryption(
+        &self,
+        encryption: &EncryptionOpts,
+    ) -> Result<Arc<TursoConnection>, TursoError> {
+        let inner_db = self.db.lock().unwrap();
+        let Some(db) = inner_db.as_ref() else {
+            return Err(TursoError::Misuse(
+                "database must be opened first".to_string(),
+            ));
+        };
+        if self.config.page_codec.is_some() {
+            return Err(TursoError::Misuse(
+                "built-in encryption cannot be combined with an external page codec".to_string(),
+            ));
+        }
+        let cipher = CipherMode::try_from(encryption.cipher.as_str())?;
+        let key = EncryptionKey::from_hex_string(&encryption.hexkey)?;
+        // Core checks the key but takes the cipher from the database, so a
+        // cipher that is not the database's would be ignored. Refuse it, as an
+        // open with such encryption options does. A plaintext database is
+        // refused by core.
+        let current = db.encryption_cipher();
+        if current != CipherMode::None && current != cipher {
+            return Err(LimboError::InvalidArgument(
+                "encryption cipher does not match the database".to_string(),
+            )
+            .into());
+        }
+        let connection =
+            db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key)))?;
         Ok(TursoConnection::new(&self.config, connection))
     }
 
@@ -2853,6 +2891,80 @@ mod tests {
                     "Opening encrypted database without key should fail"
                 );
             }
+        }
+
+        fn open_without_key(path: &str) -> Arc<TursoDatabase> {
+            let db = TursoDatabase::new(TursoDatabaseConfig {
+                path: path.to_string(),
+                experimental_features: Some("encryption".to_string()),
+                async_io: false,
+                encryption: None,
+                vfs: IoBackend::Default,
+                io: None,
+                db_file: None,
+                page_codec: None,
+                open_flags: OpenFlags::default(),
+            });
+            assert!(!db.open().unwrap().is_io());
+            db
+        }
+
+        fn run(conn: &crate::rsapi::TursoConnection, sql: &str) {
+            conn.prepare_single(sql).unwrap().execute(None).unwrap();
+        }
+
+        /// A database opened without encryption options gets its key from the
+        /// encryption PRAGMAs, so `connect` has no key for a second connection.
+        /// `connect_with_encryption` gives one.
+        #[test]
+        fn test_connect_with_encryption_after_pragmas() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let db = open_without_key(temp_file.path().to_str().unwrap());
+            let conn = db.connect().unwrap();
+            run(&conn, &format!("PRAGMA cipher = '{TEST_CIPHER}'"));
+            run(&conn, &format!("PRAGMA hexkey = '{TEST_HEXKEY}'"));
+            run(&conn, "CREATE TABLE test (value TEXT)");
+            run(&conn, "INSERT INTO test VALUES ('secret_data')");
+
+            assert!(db.connect().is_err());
+            let wrong_key = crate::rsapi::EncryptionOpts {
+                cipher: TEST_CIPHER.to_string(),
+                hexkey: WRONG_HEXKEY.to_string(),
+            };
+            assert!(db.connect_with_encryption(&wrong_key).is_err());
+            let wrong_cipher = crate::rsapi::EncryptionOpts {
+                cipher: "aegis256".to_string(),
+                hexkey: TEST_HEXKEY.to_string(),
+            };
+            let error = db.connect_with_encryption(&wrong_cipher).err().unwrap();
+            assert!(
+                format!("{error:?}").contains("cipher does not match"),
+                "{error:?}"
+            );
+
+            let second = db
+                .connect_with_encryption(&create_encryption_opts())
+                .unwrap();
+            let mut stmt = second.prepare_single("SELECT value FROM test").unwrap();
+            assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+            assert_eq!(stmt.row_value(0).unwrap().to_text(), Some("secret_data"));
+        }
+
+        /// A plaintext database refuses a connection with a key.
+        #[test]
+        fn test_connect_with_encryption_on_plaintext_database() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let db = open_without_key(temp_file.path().to_str().unwrap());
+            let conn = db.connect().unwrap();
+            run(&conn, "CREATE TABLE test (value TEXT)");
+            let error = db
+                .connect_with_encryption(&create_encryption_opts())
+                .err()
+                .unwrap();
+            assert!(
+                format!("{error:?}").contains("opened without encryption"),
+                "{error:?}"
+            );
         }
     }
 
