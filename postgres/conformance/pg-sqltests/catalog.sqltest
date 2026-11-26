@@ -1035,6 +1035,45 @@ expect {
     6203|extract|f|f|t|f|s|s|1|0|0|25 1184|1700|extract_timestamptz
 }
 
+# The rows of pg_proc for the catalog functions match PostgreSQL 18.
+test pg-proc-catalog-rows-match-postgresql {
+    SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
+           proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
+           prorettype, prosrc
+    FROM pg_proc
+    WHERE oid IN (
+        89, 745, 746, 861, 1402, 1403, 1597, 1642, 1643, 1662, 2026, 2077, 2078, 2079, 2080, 2081, 2162,
+        2165, 2507, 2730, 3294, 3432, 6174, 6210
+    )
+    ORDER BY oid;
+}
+expect {
+    89|version|f|f|t|f|s|s|1|0|0||25|pgsql_version
+    745|current_user|f|f|t|f|s|s|1|0|0||19|current_user
+    746|session_user|f|f|t|f|s|s|1|0|0||19|session_user
+    861|current_database|f|f|t|f|s|s|1|0|0||19|current_database
+    1402|current_schema|f|f|t|f|s|u|1|0|0||19|current_schema
+    1403|current_schemas|f|f|t|f|s|u|1|0|0|16|1003|current_schemas
+    1597|pg_encoding_to_char|f|f|t|f|s|s|1|0|0|23|19|PG_encoding_to_char
+    1642|pg_get_userbyid|f|f|t|f|s|s|1|0|0|26|19|pg_get_userbyid
+    1643|pg_get_indexdef|f|f|t|f|s|s|1|0|0|26|25|pg_get_indexdef
+    1662|pg_get_triggerdef|f|f|t|f|s|s|1|0|0|26|25|pg_get_triggerdef
+    2026|pg_backend_pid|f|f|t|f|s|r|1|0|0||23|pg_backend_pid
+    2077|current_setting|f|f|t|f|s|s|1|0|0|25|25|show_config_by_name
+    2078|set_config|f|f|f|f|v|u|1|0|0|25 25 16|25|set_config_by_name
+    2079|pg_table_is_visible|f|f|t|f|s|s|10|0|0|26|16|pg_table_is_visible
+    2080|pg_type_is_visible|f|f|t|f|s|s|10|0|0|26|16|pg_type_is_visible
+    2081|pg_function_is_visible|f|f|t|f|s|s|10|0|0|26|16|pg_function_is_visible
+    2162|pg_get_function_arguments|f|f|t|f|s|s|1|0|0|26|25|pg_get_function_arguments
+    2165|pg_get_function_result|f|f|t|f|s|s|1|0|0|26|25|pg_get_function_result
+    2507|pg_get_indexdef|f|f|t|f|s|s|1|0|0|26 23 16|25|pg_get_indexdef_ext
+    2730|pg_get_triggerdef|f|f|t|f|s|s|1|0|0|26 16|25|pg_get_triggerdef_ext
+    3294|current_setting|f|f|t|f|s|s|1|0|0|25 16|25|show_config_by_name_missing_ok
+    3432|gen_random_uuid|f|f|t|f|v|s|1|0|0||2950|gen_random_uuid
+    6174|pg_get_statisticsobjdef_columns|f|f|t|f|s|s|1|0|0|26|25|pg_get_statisticsobjdef_columns
+    6210|pg_input_is_valid|f|f|t|f|s|s|1|0|0|25 25|16|pg_input_is_valid
+}
+
 test pg-object-opclass-is-read-only {
     CREATE ROLE reader_of_object_opclass_is_read_only_role;
     SET ROLE reader_of_object_opclass_is_read_only_role;

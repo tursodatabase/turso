@@ -52,6 +52,13 @@ FAMILIES = [
     ("datetime", {"names": """clock_timestamp date_part date_trunc extract now
         statement_timestamp to_char to_timestamp transaction_timestamp""".split(),
         "bytea": "all"}),
+    ("catalog", {"names": """acldefault col_description current_database current_schema
+        current_schemas current_setting current_user format_type gen_random_uuid
+        obj_description pg_backend_pid pg_encoding_to_char pg_function_is_visible
+        pg_get_constraintdef pg_get_expr pg_get_function_arguments pg_get_function_result
+        pg_get_indexdef pg_get_statisticsobjdef_columns pg_get_triggerdef pg_get_userbyid
+        pg_input_is_valid pg_is_in_recovery pg_relation_is_publishable pg_table_is_visible
+        pg_type_is_visible session_user set_config version""".split(), "bytea": "all"}),
 ]
 
 
