@@ -186,7 +186,7 @@ pub use io::{
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{
-    decimal::{format_numeric_text, Decimal},
+    decimal::{format_numeric_text, round_numeric_text, Decimal, RoundedNumeric},
     nonnan::NonNan,
     Numeric,
 };

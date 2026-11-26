@@ -52,6 +52,32 @@ pub fn format_numeric_text(text: &str) -> crate::Result<String> {
         .map(|value| format_numeric_value(&value))
 }
 
+/// The whole number nearest to a numeric value, with halves rounded away from
+/// zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundedNumeric {
+    Integer(i64),
+    OutOfRange,
+    NaN,
+    Infinity,
+    NegativeInfinity,
+}
+
+/// The whole number nearest to the numeric `text`, read as
+/// [`numeric_from_value`] reads it.
+pub fn round_numeric_text(text: &str) -> crate::Result<RoundedNumeric> {
+    use bigdecimal::{RoundingMode, ToPrimitive};
+    Ok(match numeric_from_text(text)? {
+        NumericValue::NaN => RoundedNumeric::NaN,
+        NumericValue::Infinity => RoundedNumeric::Infinity,
+        NumericValue::NegativeInfinity => RoundedNumeric::NegativeInfinity,
+        NumericValue::Finite(number) => number
+            .with_scale_round(0, RoundingMode::HalfUp)
+            .to_i64()
+            .map_or(RoundedNumeric::OutOfRange, RoundedNumeric::Integer),
+    })
+}
+
 /// The numeric value of `val`: an integer, a real, or text such as `1.5`,
 /// `1e5`, `NaN` or `-Infinity`. Every numeric function reads its arguments with this, so they all
 /// accept the same values within the same limits. A blob is not a number, even
@@ -683,6 +709,25 @@ mod tests {
     use super::*;
     use crate::types::AsValueRef;
     use std::str::FromStr;
+
+    #[test]
+    fn rounding_to_a_whole_number_takes_halves_away_from_zero() {
+        let round = |text: &str| round_numeric_text(text).unwrap();
+        assert_eq!(round("2.5"), RoundedNumeric::Integer(3));
+        assert_eq!(round("-2.5"), RoundedNumeric::Integer(-3));
+        assert_eq!(round("2.4999"), RoundedNumeric::Integer(2));
+        assert_eq!(round("1e2"), RoundedNumeric::Integer(100));
+        assert_eq!(
+            round("9223372036854775807.4"),
+            RoundedNumeric::Integer(i64::MAX)
+        );
+        assert_eq!(round("9223372036854775807.5"), RoundedNumeric::OutOfRange);
+        assert_eq!(round("-9223372036854775808.5"), RoundedNumeric::OutOfRange);
+        assert_eq!(round("NaN"), RoundedNumeric::NaN);
+        assert_eq!(round("Infinity"), RoundedNumeric::Infinity);
+        assert_eq!(round("-Infinity"), RoundedNumeric::NegativeInfinity);
+        assert!(round_numeric_text("abc").is_err());
+    }
 
     #[test]
     fn special_values_are_read_as_postgres_reads_them() {

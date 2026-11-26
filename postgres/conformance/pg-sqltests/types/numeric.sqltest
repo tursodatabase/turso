@@ -241,3 +241,34 @@ test numeric-negation-of-nan-and-infinity {
 expect {
     NaN|-Infinity|Infinity
 }
+
+test numeric-nan-cast-to-integer {
+    SELECT 'NaN'::numeric::int;
+}
+@sqlstate 0A000
+expect error {
+    cannot convert NaN to integer
+}
+
+test numeric-infinity-cast-to-integer {
+    SELECT '-Infinity'::numeric::bigint;
+}
+@sqlstate 0A000
+expect error {
+    cannot convert infinity to bigint
+}
+
+test numeric-cast-to-integer-rounds-half-away-from-zero {
+    SELECT 2.5::numeric::int, (-2.5)::numeric::int, '9223372036854775807.4'::numeric::bigint;
+}
+expect {
+    3|-3|9223372036854775807
+}
+
+test numeric-cast-to-integer-out-of-range {
+    SELECT '9223372036854775807.5'::numeric::bigint;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}

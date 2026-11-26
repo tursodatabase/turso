@@ -13,7 +13,7 @@ use crate::functions::{float8_text, parse_pg_bool, validate_pg_input};
 use crate::pg_type::IntegerType;
 use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
-use turso_core::{LimboError, Numeric, Result, Value};
+use turso_core::{round_numeric_text, LimboError, Numeric, Result, RoundedNumeric, Value};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -207,9 +207,7 @@ pub(crate) fn convert(value: &Value, source: CastType, target: CastType) -> Resu
 
 fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value> {
     let number = match (value, source) {
-        (Value::Text(text), CastType::Numeric) => {
-            float_to_i64(parse_numeric(text.as_str())?.round(), target)?
-        }
+        (Value::Text(text), CastType::Numeric) => numeric_to_i64(text.as_str(), target)?,
         (Value::Text(text), _) => {
             return parse_integer(text.as_str(), target).map(Value::from_i64);
         }
@@ -248,6 +246,29 @@ fn float_to_i64(rounded: f64, target: CastType) -> Result<i64> {
         return Err(out_of_range(target));
     }
     Ok(rounded as i64)
+}
+
+fn numeric_to_i64(text: &str, target: CastType) -> Result<i64> {
+    let target_name = match target {
+        Int2 => "smallint",
+        Int4 => "integer",
+        _ => "bigint",
+    };
+    let not_supported = |what: &str| {
+        sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("cannot convert {what} to {target_name}"),
+            None,
+        )
+    };
+    match round_numeric_text(text).map_err(|_| input_error(text, "numeric"))? {
+        RoundedNumeric::Integer(number) => Ok(number),
+        RoundedNumeric::OutOfRange => Err(out_of_range(target)),
+        RoundedNumeric::NaN => Err(not_supported("NaN")),
+        RoundedNumeric::Infinity | RoundedNumeric::NegativeInfinity => {
+            Err(not_supported("infinity"))
+        }
+    }
 }
 
 fn check_integer_range(number: i64, target: CastType) -> Result<()> {
@@ -343,7 +364,7 @@ fn shortest_float8(narrowed: f32) -> f64 {
         .unwrap_or_else(|_| f64::from(narrowed))
 }
 
-/// A numeric with a type modifier is stored as its text.
+/// The float that is nearest to the text of a numeric.
 fn parse_numeric(text: &str) -> Result<f64> {
     text.trim()
         .parse()
@@ -371,7 +392,6 @@ fn to_text(value: &Value, source: CastType) -> Result<Value> {
             if *n == 0 { "false" } else { "true" }.to_string()
         }
         (Value::Numeric(Numeric::Integer(n)), _) => n.to_string(),
-        // FIXME(pg-catalog): A numeric without a type modifier is REAL, which is read as float8, so `1.0::numeric::text` is `1` where PostgreSQL gives `1.0`. A registered numeric type that needs no modifier gives the value its own output function.
         // FIXME(pg-catalog): Core types a float4 expression REAL, which is read as float8, so no float4 value gets here and `1e6::float4::text` is `1000000` where PostgreSQL gives `1e+06`. A registered float4 type gives the value its own output function.
         (Value::Numeric(Numeric::Float(f)), CastType::Float4 | CastType::Float8) => {
             float8_text(f64::from(*f))

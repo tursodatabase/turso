@@ -898,18 +898,8 @@ expect @tursopg {
     3.3000000000000003
 }
 
-# NaN and infinity in a numeric are read as 0 by the casts and functions that
-# convert the numeric to a plain number first.
-@compat-gap "cast:numeric -> int4"
-test numeric-nan-cast-to-integer {
-    SELECT 'NaN'::numeric::int;
-}
-@sqlstate 0A000
-expect error {}
-expect @tursopg {
-    0
-}
-
+# NaN and infinity in a numeric are read as 0 by the functions that convert the
+# numeric to a plain number first.
 @compat-gap "cast:numeric -> float8"
 test numeric-nan-and-infinity-cast-to-double-precision {
     SELECT 'NaN'::numeric::float8, 'Infinity'::numeric::float8;
@@ -917,8 +907,9 @@ test numeric-nan-and-infinity-cast-to-double-precision {
 expect {
     NaN|Infinity
 }
-expect @tursopg {
-    0|0
+@sqlstate 0A000
+expect @tursopg error {
+    the value NaN is not supported
 }
 
 @compat-gap "function:sum"
