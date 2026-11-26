@@ -717,10 +717,12 @@ impl Catalog for PostgresCatalog {
                 // The class rows that go away with the table: its own and
                 // those of its indexes.
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    let table_oid = rows.oid_of(table.namespace, table.name);
                     rows.dropped_relation(program, table.namespace, table.name);
                     for index in table.indexes {
                         rows.dropped_relation(program, table.namespace, index);
                     }
+                    rows.dropped_rowid_primary_key_index(program, table.namespace, table_oid);
                 }
             }
             CatalogCmd::CreateView(view) => {
@@ -941,6 +943,9 @@ fn emit_new_table_rows(
         )?;
         Ok(())
     };
+    if btree.get_rowid_alias_column().is_some() {
+        new_index(program, ConstraintKey::PrimaryKey, None)?;
+    }
     for set in &btree.unique_sets {
         if btree.get_rowid_alias_column().is_some() && set.is_primary_key {
             continue;
@@ -1155,6 +1160,25 @@ impl<'a> ClassRowWriter<'a> {
         };
         emit_delete_comments(program, self.schema, class.oid, Dropped::Relation);
         emit_class_row_delete(program, &self.cursors, namespace, name)
+    }
+
+    /// Deletes the class row of the primary key index of the rowid table
+    /// with oid `table_oid`, which the schema has no object for.
+    fn dropped_rowid_primary_key_index(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        table_oid: i64,
+    ) {
+        let Some(class) = class_catalog(self.schema).and_then(|catalog| {
+            catalog
+                .indexes_of(table_oid)
+                .find(|class| class.engine_name.is_none())
+        }) else {
+            return;
+        };
+        emit_delete_comments(program, self.schema, class.oid, Dropped::Relation);
+        emit_class_row_delete_rowid_primary_key_index(program, &self.cursors, namespace, table_oid);
     }
 
     /// Stores the new name of a relation. Its row keeps its oid and owner.
@@ -1980,25 +2004,51 @@ fn emit_class_row_delete(
     name: &str,
 ) {
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
-        emit_class_name_index_delete(
-            program,
-            cursors,
-            namespace,
-            row.first_column_reg + COLUMN_RELNAME,
-            row.rowid_reg,
-        );
-        // Marked as part of an update so that changes() does not count it.
-        program.emit_insn(Insn::Delete {
-            cursor_id: cursors.table_cursor_id,
-            table_name: CLASSES_TABLE_NAME.to_string(),
-            is_part_of_update: true,
-        });
+        emit_class_row_delete_found(program, cursors, namespace, row);
     });
-    ClassDropped {
+    ClassDropped::EngineName {
         namespace,
         name: name.to_string(),
     }
     .emit(program);
+}
+
+/// Deletes the class row of the primary key index of the rowid table with
+/// oid `table_oid`.
+fn emit_class_row_delete_rowid_primary_key_index(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    table_oid: i64,
+) {
+    emit_find_class_row_by(
+        program,
+        cursors,
+        ClassKey::RowidPrimaryKeyIndexOf(table_oid),
+        |program, row| emit_class_row_delete_found(program, cursors, namespace, row),
+    );
+    ClassDropped::RowidPrimaryKeyIndexOf { table_oid }.emit(program);
+}
+
+fn emit_class_row_delete_found(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    row: &FoundClassRow,
+) {
+    emit_class_name_index_delete(
+        program,
+        cursors,
+        namespace,
+        row.first_column_reg + COLUMN_RELNAME,
+        row.rowid_reg,
+    );
+    // Marked as part of an update so that changes() does not count it.
+    program.emit_insn(Insn::Delete {
+        cursor_id: cursors.table_cursor_id,
+        table_name: CLASSES_TABLE_NAME.to_string(),
+        is_part_of_update: true,
+    });
 }
 
 /// Renames the class row of relation `old_name` of `namespace` to
@@ -2282,9 +2332,14 @@ impl ClassCreated {
 
 /// A class row that the statement deleted.
 #[derive(Debug)]
-struct ClassDropped {
-    namespace: NamespaceId,
-    name: String,
+enum ClassDropped {
+    EngineName {
+        namespace: NamespaceId,
+        name: String,
+    },
+    RowidPrimaryKeyIndexOf {
+        table_oid: i64,
+    },
 }
 
 impl ClassDropped {
@@ -2293,7 +2348,20 @@ impl ClassDropped {
     }
 
     fn apply_to(&self, classes: &mut ClassCatalog, _values: &[Value]) -> turso_core::Result<()> {
-        classes.remove(self.namespace, &self.name);
+        match self {
+            Self::EngineName { namespace, name } => {
+                classes.remove(*namespace, name);
+            }
+            Self::RowidPrimaryKeyIndexOf { table_oid } => {
+                let oid = classes
+                    .indexes_of(*table_oid)
+                    .find(|class| class.engine_name.is_none())
+                    .map(|class| class.oid);
+                if let Some(oid) = oid {
+                    classes.remove_by_oid(oid);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -2592,9 +2660,10 @@ struct FoundClassRow {
     first_column_reg: usize,
 }
 
-/// Scans the classes table for the row of relation `name` of `namespace` and
-/// runs `found` with the cursor on it. Emits nothing after the scan when the
-/// row does not exist, so a relation without a row is tolerated.
+/// Scans the classes table for the row of the relation that the schema calls
+/// `name` in `namespace` and runs `found` with the cursor on it. Emits nothing
+/// after the scan when the row does not exist, so a relation without a row is
+/// tolerated.
 fn emit_find_class_row(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -2602,40 +2671,91 @@ fn emit_find_class_row(
     name: &str,
     found: impl FnOnce(&mut ProgramBuilder, &FoundClassRow),
 ) {
-    let name_reg = program.emit_string8_new_reg(name.to_string());
-    let namespace_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        value: i64::from(namespace.as_u32()),
-        dest: namespace_reg,
-    });
+    emit_find_class_row_by(
+        program,
+        cursors,
+        ClassKey::EngineName(namespace, name),
+        found,
+    );
+}
 
+/// How a scan of the classes table recognizes its row.
+#[derive(Clone, Copy)]
+enum ClassKey<'a> {
+    /// The relation that the schema calls this in the namespace.
+    EngineName(NamespaceId, &'a str),
+    /// The primary key index of the rowid table with this oid, which has no
+    /// name in the schema.
+    RowidPrimaryKeyIndexOf(i64),
+}
+
+fn emit_find_class_row_by(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    key: ClassKey<'_>,
+    found: impl FnOnce(&mut ProgramBuilder, &FoundClassRow),
+) {
+    let loop_start = program.allocate_label();
     let loop_end = program.allocate_label();
     let done = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: cursors.table_cursor_id,
-        pc_if_empty: loop_end,
-    });
-    let loop_start = program.allocate_label();
-    program.preassign_label_to_next_insn(loop_start);
-
     let next = program.allocate_label();
     let column_reg = program.alloc_register();
-    program.emit_column_or_rowid(cursors.table_cursor_id, COLUMN_RELNAMESPACE, column_reg);
-    program.emit_insn(Insn::Ne {
-        lhs: column_reg,
-        rhs: namespace_reg,
-        target_pc: next,
-        flags: CmpInsFlags::default().jump_if_null(),
-        collation: CollationSeq::for_internal_values(),
-    });
-    program.emit_column_or_rowid(cursors.table_cursor_id, COLUMN_RELENGINENAME, column_reg);
-    program.emit_insn(Insn::Ne {
-        lhs: column_reg,
-        rhs: name_reg,
-        target_pc: next,
-        flags: CmpInsFlags::default().jump_if_null(),
-        collation: CollationSeq::NOCASE,
-    });
+    match key {
+        ClassKey::EngineName(namespace, name) => {
+            let name_reg = program.emit_string8_new_reg(name.to_string());
+            let namespace_reg = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: i64::from(namespace.as_u32()),
+                dest: namespace_reg,
+            });
+            program.emit_insn(Insn::Rewind {
+                cursor_id: cursors.table_cursor_id,
+                pc_if_empty: loop_end,
+            });
+            program.preassign_label_to_next_insn(loop_start);
+            program.emit_column_or_rowid(cursors.table_cursor_id, COLUMN_RELNAMESPACE, column_reg);
+            program.emit_insn(Insn::Ne {
+                lhs: column_reg,
+                rhs: namespace_reg,
+                target_pc: next,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: CollationSeq::for_internal_values(),
+            });
+            program.emit_column_or_rowid(cursors.table_cursor_id, COLUMN_RELENGINENAME, column_reg);
+            program.emit_insn(Insn::Ne {
+                lhs: column_reg,
+                rhs: name_reg,
+                target_pc: next,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: CollationSeq::NOCASE,
+            });
+        }
+        ClassKey::RowidPrimaryKeyIndexOf(table_oid) => {
+            let table_oid_reg = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: table_oid,
+                dest: table_oid_reg,
+            });
+            program.emit_insn(Insn::Rewind {
+                cursor_id: cursors.table_cursor_id,
+                pc_if_empty: loop_end,
+            });
+            program.preassign_label_to_next_insn(loop_start);
+            program.emit_column_or_rowid(cursors.table_cursor_id, COLUMN_RELINDRELID, column_reg);
+            program.emit_insn(Insn::Ne {
+                lhs: column_reg,
+                rhs: table_oid_reg,
+                target_pc: next,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: CollationSeq::for_internal_values(),
+            });
+            program.emit_column_or_rowid(cursors.table_cursor_id, COLUMN_RELENGINENAME, column_reg);
+            program.emit_insn(Insn::NotNull {
+                reg: column_reg,
+                target_pc: next,
+            });
+        }
+    }
 
     let row = FoundClassRow {
         rowid_reg: program.alloc_register(),
@@ -2909,7 +3029,7 @@ mod tests {
     fn class_dropped_removes_the_row() {
         let mut classes = table_and_sequence();
 
-        ClassDropped {
+        ClassDropped::EngineName {
             namespace: NamespaceId::ROOT,
             name: "t".to_string(),
         }

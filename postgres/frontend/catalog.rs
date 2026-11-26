@@ -2199,7 +2199,7 @@ impl SnapshotRows for PgConstraintTable {
                     .iter()
                     .find(|index| index.table_oid == table_oid && index.primary)
                     .expect("rowid primary keys have a catalog index");
-                let conname = primary_key_constraint_name(btree);
+                let conname = index.name.clone();
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -4576,66 +4576,43 @@ struct CatalogIndex {
     where_clause: Option<String>,
 }
 
-/// The `pg_index` entry of a rowid-alias primary key describes no stored
-/// index, so it has no class row and no allocated oid. Its oid is the
-/// table's plus this offset, which keeps it outside the range that oids are
-/// allocated from and stable across DDL.
-const ROWID_PK_INDEX_OID_OFFSET: i64 = 1 << 31;
-
+/// The indexes of the user tables, from their class rows, in the order of
+/// the tables. An index is named as its class row names it.
 fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
     let Some(classes) = crate::classes::class_catalog(schema) else {
         return Vec::new();
     };
-    // A relation name is unique within its schema.
-    let mut relation_names: HashSet<(NamespaceId, String)> = schema
-        .namespace_ids()
-        .flat_map(|namespace| {
-            schema
-                .table_names(namespace)
-                .map(str::to_owned)
-                .chain(schema.views(namespace).map(|(name, _)| name.to_owned()))
-                .chain(schema.indexes(namespace).map(|index| index.name.clone()))
-                .chain(schema.sequences_by_name(namespace).keys().cloned())
-                .map(move |name| (namespace, name))
-                .collect::<Vec<_>>()
-        })
-        .collect();
     let mut indexes = Vec::new();
     for (namespace, table_name, table, table_oid) in user_tables_with_oids(schema) {
         let Table::BTree(btree) = table.as_ref() else {
             continue;
         };
-        let table_owner_oid = relation_owner_oid(schema, namespace, table_name);
-        if let Some((position, column)) = btree.get_rowid_alias_column() {
-            let mut name = format!("__turso_internal_pk_index_{table_name}");
-            while !relation_names.insert((namespace, name.clone())) {
-                name.insert(0, '_');
-            }
-            indexes.push(CatalogIndex {
-                oid: table_oid + ROWID_PK_INDEX_OID_OFFSET,
-                table_oid,
-                namespace,
-                table_name: btree.declared_name.clone(),
-                name,
-                owner_oid: table_owner_oid,
-                columns: vec![CatalogIndexColumn {
-                    name: column.name.clone().expect("primary key columns have names"),
-                    position,
-                    expression: None,
-                    order: SortOrder::Asc,
-                }],
-                unique: true,
-                primary: true,
-                for_constraint: true,
-                where_clause: None,
-            });
-        }
         for class in classes.indexes_of(table_oid) {
             let owner_oid = role_oid(class.relowner);
-            let engine_name = class
-                .engine_name
-                .as_ref()
-                .expect("physical indexes have an engine name");
+            let Some(engine_name) = &class.engine_name else {
+                let (position, column) = btree
+                    .get_rowid_alias_column()
+                    .expect("an index without a schema object belongs to a rowid table");
+                indexes.push(CatalogIndex {
+                    oid: class.oid,
+                    table_oid,
+                    namespace,
+                    table_name: btree.declared_name.clone(),
+                    name: class.relname.clone(),
+                    owner_oid,
+                    columns: vec![CatalogIndexColumn {
+                        name: column.name.clone().expect("primary key columns have names"),
+                        position,
+                        expression: None,
+                        order: SortOrder::Asc,
+                    }],
+                    unique: true,
+                    primary: true,
+                    for_constraint: true,
+                    where_clause: None,
+                });
+                continue;
+            };
             let index = schema
                 .get_indices(namespace, table_name)
                 .find(|index| index.name.eq_ignore_ascii_case(engine_name))

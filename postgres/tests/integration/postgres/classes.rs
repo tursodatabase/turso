@@ -47,7 +47,7 @@ fn postgres_async_open_initializes_the_postgres_catalog() {
     pg.execute("CREATE TABLE b (value text)").unwrap();
     assert_catalog_columns(&pg, "public");
     let rows = class_rows(pg.inner());
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3, "{rows:?}");
     assert!(rows.iter().all(|row| row.0 >= 16384));
     assert_ne!(rows[0].0, rows[1].0);
 }
@@ -209,22 +209,21 @@ fn a_new_database_has_the_classes_table_and_ddl_maintains_it() {
     pg.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
         .unwrap();
     let rows = class_rows(&conn);
-    // The table and the automatic index of its UNIQUE constraint; the rowid
-    // alias primary key has no backing index.
-    assert_eq!(rows.len(), 2, "{rows:?}");
+    // The table, the index of its primary key, and the index of its UNIQUE
+    // constraint, named as PostgreSQL names them.
+    assert_eq!(rows.len(), 3, "{rows:?}");
     let (t_oid, _, t_namespace, t_kind, t_owner) = class_row(&conn, "t").unwrap();
     assert_eq!(t_oid, 16384);
     assert_eq!(t_namespace, 1, "public is namespace 1");
     assert_eq!(t_kind, "r");
     assert_eq!(t_owner, 0, "owned by the bootstrap superuser");
-    let autoindex = rows.iter().find(|row| row.3 == "i").unwrap();
-    assert_eq!(autoindex.1, "t_name_key");
-    assert_eq!(autoindex.0, 16385);
+    assert_eq!(class_row(&conn, "t_pkey").unwrap().0, 16385);
+    assert_eq!(class_row(&conn, "t_name_key").unwrap().0, 16386);
 
     pg.execute("CREATE INDEX t_name ON t (name)").unwrap();
     assert_eq!(
         class_row(&conn, "t_name").unwrap(),
-        (16386, "t_name".to_string(), 1, "i".to_string(), 0)
+        (16387, "t_name".to_string(), 1, "i".to_string(), 0)
     );
 
     pg.execute("CREATE VIEW v AS SELECT id FROM t").unwrap();
@@ -255,14 +254,56 @@ fn the_index_of_a_constraint_is_named_after_the_constraint(db: TempDatabase) {
     let conn = db.connect_limbo();
     pg.execute("CREATE TABLE t (a TEXT PRIMARY KEY, b INT, c INT, UNIQUE (b, c), UNIQUE (c))")
         .unwrap();
+    pg.execute("CREATE TABLE named (id INTEGER CONSTRAINT my_key PRIMARY KEY)")
+        .unwrap();
 
     let names: Vec<String> = class_rows(&conn).into_iter().map(|row| row.1).collect();
     assert!(names.contains(&"t_pkey".to_string()), "{names:?}");
     assert!(names.contains(&"t_b_c_key".to_string()), "{names:?}");
     assert!(names.contains(&"t_c_key".to_string()), "{names:?}");
+    assert!(names.contains(&"my_key".to_string()), "{names:?}");
     assert!(names
         .iter()
         .all(|name| !name.starts_with("sqlite_autoindex")));
+}
+
+#[turso_macros::test(mvcc)]
+fn a_table_with_an_integer_primary_key_has_a_row_for_the_index_of_its_key(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INT)")
+        .unwrap();
+    let (table_oid, ..) = class_row(&conn, "t").unwrap();
+    let (index_oid, _, _, kind, _) = class_row(&conn, "t_pkey").unwrap();
+    assert_eq!(kind, "i");
+    assert!(index_oid > table_oid);
+
+    pg.execute("ALTER TABLE t RENAME TO u").unwrap();
+    assert!(
+        class_row(&conn, "t_pkey").is_some(),
+        "{:?}",
+        class_rows(&conn)
+    );
+
+    pg.execute("DROP TABLE u").unwrap();
+    assert_eq!(class_rows(&conn), vec![]);
+}
+
+#[turso_macros::test(mvcc)]
+fn a_constraint_index_takes_the_next_free_name_when_its_name_is_used(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t_pkey (x INT)").unwrap();
+    pg.execute("CREATE INDEX t_pkey1 ON t_pkey (x)").unwrap();
+    pg.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    assert!(
+        class_row(&conn, "t_pkey2").is_some(),
+        "{:?}",
+        class_rows(&conn)
+    );
+    assert!(class_row(&conn, "t_pkey").unwrap().3 == "r");
 }
 
 #[test]
@@ -1019,6 +1060,25 @@ fn schema_is_read_again_while_a_role_is_set() {
     conn.inner().force_reparse_schema_without_publish().unwrap();
 
     conn.execute("SELECT x FROM t").unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn quoted_relation_names_survive_catalog_updates(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE \"MiXeD\" (id int PRIMARY KEY, x text, \"CoDe\" text UNIQUE)")
+        .unwrap();
+    pg.execute("CREATE INDEX \"IxX\" ON \"MiXeD\"(x)").unwrap();
+    pg.execute("CREATE VIEW \"ViEw\" AS SELECT x FROM \"MiXeD\"")
+        .unwrap();
+    let oid = class_row(pg.inner(), "MiXeD").unwrap().0;
+    for name in ["MiXeD_pkey", "MiXeD_CoDe_key", "IxX", "ViEw"] {
+        assert!(class_row(pg.inner(), name).is_some(), "missing {name}");
+    }
+    pg.execute("ALTER TABLE \"MiXeD\" RENAME TO \"NewName\"")
+        .unwrap();
+    assert_eq!(class_row(pg.inner(), "NewName").unwrap().0, oid);
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    assert_eq!(class_row(pg.inner(), "NewName").unwrap().0, oid);
 }
 
 #[turso_macros::test(mvcc)]

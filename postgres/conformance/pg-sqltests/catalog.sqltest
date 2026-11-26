@@ -1724,7 +1724,6 @@ expect {
     kept_seq
 }
 
-@compat-gap "syntax:catalog"
 test pg-primary-key-dump-catalogs {
     CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
     CREATE SEQUENCE after_indexes;
@@ -1747,12 +1746,6 @@ expect {
     1
 }
 
-expect @tursopg {
-    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX __turso_internal_pk_index_items ON public.items USING btree (id)
-    1
-    1
-}
-
 test pg-primary-key-with-other-unique-constraint {
     CREATE TABLE keys (a TEXT UNIQUE, b TEXT, c TEXT, PRIMARY KEY (b, c));
     SELECT c.contype, i.indkey, CASE WHEN i.indisprimary THEN 1 ELSE 0 END,
@@ -1766,7 +1759,6 @@ expect {
     u|1|0|UNIQUE (a)
 }
 
-@compat-gap "syntax:catalog"
 test pg-primary-key-named-and-quoted {
     CREATE TABLE "quoted table" (payload TEXT, "key column" INTEGER CONSTRAINT "custom key" PRIMARY KEY);
     SELECT c.conname, i.indkey, pg_get_constraintdef(c.oid), pg_get_indexdef(c.conindid)
@@ -1778,11 +1770,6 @@ test pg-primary-key-named-and-quoted {
 expect {
     custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
     custom key|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
-}
-
-expect @tursopg {
-    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
-    __turso_internal_pk_index_quoted table|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
 }
 
 test pg-primary-key-after-identical-unique {
@@ -1799,7 +1786,6 @@ expect {
     t|t_pkey|p|PRIMARY KEY (a)|1
 }
 
-@compat-gap "syntax:catalog"
 test pg-primary-key-index-name-collisions {
     CREATE TABLE t_pkey(x INTEGER);
     CREATE INDEX t_pkey1 ON t_pkey(x);
@@ -1820,11 +1806,6 @@ expect {
     t_pkey3|t_pkey3|CREATE UNIQUE INDEX t_pkey3 ON public.t USING btree (id)
     1
     t_pkey3|t_pkey3
-}
-expect @tursopg {
-    t_pkey|__turso_internal_pk_index_t|CREATE UNIQUE INDEX __turso_internal_pk_index_t ON public.t USING btree (id)
-    1
-    t_pkey|__turso_internal_pk_index_t
 }
 
 test pg-attribute-not-null-dump {

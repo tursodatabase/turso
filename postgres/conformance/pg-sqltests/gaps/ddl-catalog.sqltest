@@ -373,7 +373,6 @@ expect @tursopg {
 
 # E-29: serial internal tables visible
 @setup t_id_serial
-@compat-gap "syntax:catalog"
 test serial-internal-tables-visible {
     SELECT relname, relkind FROM pg_class WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') ORDER BY relname;
 }
@@ -381,11 +380,6 @@ expect {
     t|r
     t_id_seq|S
     t_pkey|i
-}
-expect @tursopg {
-    __turso_internal_pk_index_t|i
-    t|r
-    t_id_seq|S
 }
 
 # E-30: format_type with typmod
