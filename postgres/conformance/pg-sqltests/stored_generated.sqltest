@@ -55,6 +55,23 @@ expect {
     5|10
 }
 
+test stored-generated-column-insert-default-in-several-rows {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (b, a) VALUES (DEFAULT, 5), (DEFAULT, 6);
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    5|10
+    6|12
+}
+
+test stored-generated-column-insert-default-and-explicit-value {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a, b) VALUES (5, DEFAULT), (6, 99);
+}
+@sqlstate 428C9
+expect error {}
+
 test stored-generated-column-insert-default-values {
     CREATE TABLE t (a int DEFAULT 4, b int GENERATED ALWAYS AS (a * 2) STORED);
     INSERT INTO t DEFAULT VALUES;

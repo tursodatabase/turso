@@ -3994,6 +3994,23 @@ expect error {
     cannot INSERT into generated column
 }
 
+# SQLite reports the first wrong column of the list.
+test gencol_error_insert_missing_column_before_generated {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(zz, b) VALUES(5, 10);
+}
+expect error {
+    table t1 has no column named zz
+}
+
+test gencol_error_insert_generated_before_missing_column {
+    CREATE TABLE t1(a INTEGER, b AS (a*2));
+    INSERT INTO t1(b, zz) VALUES(5, 10);
+}
+expect error {
+    cannot INSERT into generated column
+}
+
 # --- PRIMARY KEY / DEFAULT on generated columns ---
 
 test gencol_error_primary_key_virtual {

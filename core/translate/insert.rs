@@ -351,9 +351,12 @@ pub fn translate_insert(
         );
     };
 
-    if !overriding_system_value && !connection.writes_stored_values() {
-        ensure_no_always_identity_values(&table, &columns, &body)?;
-    }
+    ensure_insert_values_allowed(
+        &table,
+        &columns,
+        &body,
+        overriding_system_value || connection.writes_stored_values(),
+    )?;
     let BoundInsertResult {
         mut values,
         mut upsert_actions,
@@ -2161,23 +2164,35 @@ pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
     found_subquery
 }
 
-/// Returns an error if the INSERT writes a value other than DEFAULT to a
-/// `GENERATED ALWAYS AS IDENTITY` column.
-fn ensure_no_always_identity_values(
+/// Returns an error if the INSERT writes a value other than DEFAULT to a column
+/// that takes only DEFAULT. See [Column::ensure_insert_value_allowed].
+fn ensure_insert_values_allowed(
     table: &Table,
     columns: &[ast::Name],
     body: &InsertBody,
+    override_identity: bool,
 ) -> Result<()> {
-    if !table
-        .columns()
-        .iter()
-        .any(|column| column.identity == Some(ast::IdentityKind::Always))
-    {
+    if table.columns().iter().all(|column| {
+        column
+            .ensure_insert_value_allowed(override_identity)
+            .is_ok()
+    }) {
         return Ok(());
     }
     let InsertBody::Select(select, _) = body else {
         return Ok(());
     };
+    // build_insertion reports a name in the column list that is not a column. Check
+    // only the columns in front of the first such name, so that the error is for the
+    // first wrong column of the list, as in SQLite.
+    let checked_count = columns
+        .iter()
+        .position(|name| {
+            let name = normalize_ident(name.as_str());
+            table.get_column_by_name(&name).is_none()
+                && !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&name))
+        })
+        .unwrap_or(usize::MAX);
     let selects = std::iter::once(&select.body.select).chain(
         select
             .body
@@ -2189,9 +2204,9 @@ fn ensure_no_always_identity_values(
         match one_select {
             OneSelect::Values(rows) => {
                 for row in rows {
-                    for (position, value) in row.iter().enumerate() {
+                    for (position, value) in row.iter().enumerate().take(checked_count) {
                         if !matches!(value.as_ref(), Expr::Default) {
-                            ensure_value_allowed_at(table, columns, position)?;
+                            ensure_value_allowed_at(table, columns, position, override_identity)?;
                         }
                     }
                 }
@@ -2202,8 +2217,8 @@ fn ensure_no_always_identity_values(
                 } else {
                     columns.len()
                 };
-                for position in 0..value_count {
-                    ensure_value_allowed_at(table, columns, position)?;
+                for position in 0..value_count.min(checked_count) {
+                    ensure_value_allowed_at(table, columns, position, override_identity)?;
                 }
             }
         }
@@ -2211,9 +2226,14 @@ fn ensure_no_always_identity_values(
     Ok(())
 }
 
-fn ensure_value_allowed_at(table: &Table, columns: &[ast::Name], position: usize) -> Result<()> {
+fn ensure_value_allowed_at(
+    table: &Table,
+    columns: &[ast::Name],
+    position: usize,
+    override_identity: bool,
+) -> Result<()> {
     match insert_target_column(table, columns, position) {
-        Some(column) => column.ensure_insert_value_allowed(),
+        Some(column) => column.ensure_insert_value_allowed(override_identity),
         None => Ok(()),
     }
 }
@@ -2824,9 +2844,11 @@ fn build_insertion<'a>(
         for (value_index, column_name) in columns.iter().enumerate() {
             let column_name = normalize_ident(column_name.as_str());
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
-                // Generated columns cannot be written to directly
-                col_in_table.ensure_not_generated("INSERT into", &column_name)?;
-                // Named column
+                // A generated column is computed from its expression.
+                // ensure_insert_values_allowed checked that its values are DEFAULT.
+                if col_in_table.is_generated() {
+                    continue;
+                }
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
                         column: col_in_table,

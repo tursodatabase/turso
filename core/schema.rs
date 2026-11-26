@@ -8580,13 +8580,14 @@ impl Column {
         Ok(())
     }
 
-    /// Returns an error if this is a `GENERATED ALWAYS AS IDENTITY` column.
-    pub fn ensure_insert_value_allowed(&self) -> Result<()> {
-        if self.identity == Some(ast::IdentityKind::Always) {
-            bail_parse_error!(
-                "cannot insert a non-DEFAULT value into column \"{}\"",
-                self.name.as_deref().unwrap_or_default()
-            );
+    /// Returns an error if an INSERT cannot write a value other than DEFAULT to this
+    /// column: a generated column, or a `GENERATED ALWAYS AS IDENTITY` column when
+    /// `override_identity` is not set.
+    pub fn ensure_insert_value_allowed(&self, override_identity: bool) -> Result<()> {
+        let name = self.name.as_deref().unwrap_or_default();
+        self.ensure_not_generated("INSERT into", name)?;
+        if !override_identity && self.identity == Some(ast::IdentityKind::Always) {
+            bail_parse_error!("cannot insert a non-DEFAULT value into column \"{}\"", name);
         }
         Ok(())
     }
