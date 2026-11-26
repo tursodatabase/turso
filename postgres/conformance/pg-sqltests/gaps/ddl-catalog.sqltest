@@ -481,8 +481,6 @@ expect {
 }
 
 # E-38: cross-schema FK rejects orphan
-# Fails while foreign keys are off, see D-01.
-@compat-gap "syntax:foreign-key"
 test cross-schema-fk-rejects-orphan {
     CREATE SCHEMA IF NOT EXISTS auth;
     CREATE TABLE auth.users (id uuid PRIMARY KEY);
@@ -491,8 +489,6 @@ test cross-schema-fk-rejects-orphan {
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
 # E-39: FK in pg_constraint confrelid/conkey/confkey
 @compat-gap "syntax:catalog"

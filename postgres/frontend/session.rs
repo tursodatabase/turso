@@ -168,6 +168,7 @@ impl PgConnection {
         let conn = db.connect_with_hooks(opts, Arc::new(PgSessionState::default()))?;
         refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
+        conn.set_foreign_keys_enabled(true);
         Ok(Self {
             inner: Arc::new(PgConnectionInner {
                 conn,

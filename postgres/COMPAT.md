@@ -464,6 +464,7 @@ that pair, so Turso accepts a comparison that PostgreSQL rejects.
 | CREATE STATISTICS - "OR" and "IN/ANY" statistics | ❌ Not supported | |
 | Cross datatype hashing support | ❌ Not supported | |
 | Distributed checkpointing | ❌ Not supported | |
+| Foreign key error naming the constraint when a statement leaves a row without its parent | ❌ Not supported | A violation found at the end of a statement (a DELETE or UPDATE of a parent row, or a row loaded before its parent) reports SQLSTATE 23503 with the message "FOREIGN KEY constraint failed" |
 | Foreign keys marked as NOT VALID | ❌ Not supported | NOT VALID rejected on every constraint; so are MATCH FULL/PARTIAL and ON DELETE SET NULL/DEFAULT (columns) |
 | Frozen page map | ❌ Not supported | |
 | Full text search | ❌ Not supported | tsvector/tsquery degrade to TEXT |

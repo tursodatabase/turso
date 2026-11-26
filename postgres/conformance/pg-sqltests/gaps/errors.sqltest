@@ -29,42 +29,29 @@ setup t_id {
 # D-01: FK not enforced by default
 # D-02 had the same SQL. This test covers it.
 @setup parent_id_child_id_pid_with_rows
-@compat-gap "syntax:foreign-key"
 test fk-not-enforced-by-default {
     INSERT INTO child VALUES (2, 99);
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
 # D-03: FK violation on update child
-# Fails while foreign keys are off, see D-01.
 @setup parent_id_child_id_pid_with_rows
-@compat-gap "syntax:foreign-key"
 test fk-violation-on-update-child {
     UPDATE child SET pid = 99 WHERE id = 1;
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
 # D-04: FK violation on delete parent
-# Fails while foreign keys are off, see D-01.
 @setup parent_id_child_id_pid_with_rows
-@compat-gap "syntax:foreign-key"
 test fk-violation-on-delete-parent {
     DELETE FROM parent WHERE id = 1;
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
 # D-05: ON DELETE CASCADE
-# Fails while foreign keys are off, see D-01.
-@compat-gap "syntax:foreign-key"
 test on-delete-cascade {
     CREATE TABLE parent (id int PRIMARY KEY);
     CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON DELETE CASCADE);
@@ -76,13 +63,8 @@ test on-delete-cascade {
 expect {
     0
 }
-expect @tursopg {
-    1
-}
 
 # D-06: ON DELETE SET NULL
-# Fails while foreign keys are off, see D-01.
-@compat-gap "syntax:foreign-key"
 test on-delete-set-null {
     CREATE TABLE parent (id int PRIMARY KEY);
     CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON DELETE SET NULL);
@@ -94,13 +76,8 @@ test on-delete-set-null {
 expect {
     1|
 }
-expect @tursopg {
-    1|1
-}
 
 # D-07: ON UPDATE CASCADE
-# Fails while foreign keys are off, see D-01.
-@compat-gap "syntax:foreign-key"
 test on-update-cascade {
     CREATE TABLE parent (id int PRIMARY KEY);
     CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON UPDATE CASCADE);
@@ -112,13 +89,8 @@ test on-update-cascade {
 expect {
     2
 }
-expect @tursopg {
-    1
-}
 
 # D-08: FK to non-PK unique column
-# Fails while foreign keys are off, see D-01.
-@compat-gap "syntax:foreign-key"
 test fk-to-non-pk-unique-column {
     CREATE TABLE parent (id int PRIMARY KEY, code text UNIQUE);
     CREATE TABLE child (id int PRIMARY KEY, code text REFERENCES parent(code));
@@ -127,8 +99,6 @@ test fk-to-non-pk-unique-column {
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
 # D-09: PK duplicate
 test pk-duplicate {

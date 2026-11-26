@@ -1549,3 +1549,142 @@ test integer-primary-key-refuses-an-upsert-to-null {
 }
 @sqlstate 23502
 expect error {}
+
+test fk-orphan-insert-rejected {
+    CREATE TABLE fko_p (id int PRIMARY KEY);
+    CREATE TABLE fko_c (pid int REFERENCES fko_p (id));
+    INSERT INTO fko_p VALUES (1);
+    INSERT INTO fko_c VALUES (2);
+}
+expect error {
+    violates foreign key constraint
+}
+
+test fk-on-delete-cascade {
+    CREATE TABLE fkc_p (id int PRIMARY KEY);
+    CREATE TABLE fkc_c (pid int REFERENCES fkc_p (id) ON DELETE CASCADE);
+    INSERT INTO fkc_p VALUES (1), (2);
+    INSERT INTO fkc_c VALUES (1), (2);
+    DELETE FROM fkc_p WHERE id = 1;
+    SELECT pid FROM fkc_c;
+}
+expect {
+    2
+}
+
+test fk-self-referencing-update-child-before-parent {
+    CREATE TABLE fkcb_t (id int PRIMARY KEY, parent int REFERENCES fkcb_t (id));
+    INSERT INTO fkcb_t VALUES (5, NULL), (1, 5);
+    UPDATE fkcb_t SET id = id + 10, parent = parent + 10;
+    SELECT id, coalesce(parent, 0) FROM fkcb_t ORDER BY id;
+}
+expect {
+    11|15
+    15|0
+}
+
+# Row 2 moves to id 107 and takes parent 2, a key that no row has once the
+# statement ends.
+test fk-self-referencing-update-new-parent-is-own-old-key {
+    CREATE TABLE fkok_t (id int PRIMARY KEY, parent int REFERENCES fkok_t (id));
+    INSERT INTO fkok_t VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE fkok_t SET id = CASE WHEN id = 2 THEN 107 ELSE id END, parent = parent + 1;
+}
+expect error {
+}
+
+# PostgreSQL checks RESTRICT against the rows the statement leaves.
+test fk-restrict-self-referencing-delete-and-update {
+    CREATE TABLE fkrd_t (id int PRIMARY KEY, parent int REFERENCES fkrd_t (id) ON DELETE RESTRICT);
+    INSERT INTO fkrd_t VALUES (1, NULL), (2, 1);
+    DELETE FROM fkrd_t;
+    SELECT count(*) FROM fkrd_t;
+    CREATE TABLE fkru_t (id int PRIMARY KEY, parent int REFERENCES fkru_t (id) ON UPDATE RESTRICT);
+    INSERT INTO fkru_t VALUES (1, NULL), (2, 1);
+    UPDATE fkru_t SET id = id + 10, parent = parent + 10;
+    SELECT id, coalesce(parent, 0) FROM fkru_t ORDER BY id;
+}
+expect {
+    0
+    11|0
+    12|11
+}
+
+# One row frees a referenced key and a later row takes it, so no child is
+# left without a parent when the statement ends.
+test fk-update-moves-referenced-key-to-another-row {
+    CREATE TABLE fkm_p (id int PRIMARY KEY);
+    CREATE TABLE fkm_c (pid int REFERENCES fkm_p (id));
+    INSERT INTO fkm_p VALUES (1), (2);
+    INSERT INTO fkm_c VALUES (1);
+    UPDATE fkm_p SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 1 END;
+    SELECT id FROM fkm_p ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+# RESTRICT, unlike NO ACTION, fails even when another row takes the old key.
+test fk-restrict-update-key-taken-by-another-row-rejected {
+    CREATE TABLE fkrk_p (id int PRIMARY KEY);
+    CREATE TABLE fkrk_c (pid int REFERENCES fkrk_p (id) ON UPDATE RESTRICT);
+    INSERT INTO fkrk_p VALUES (1), (2);
+    INSERT INTO fkrk_c VALUES (1);
+    UPDATE fkrk_p SET id = id - 1;
+}
+expect error {
+}
+
+test fk-self-referencing-update-key-and-reference-with-action {
+    CREATE TABLE fksn_t (k int PRIMARY KEY, f int REFERENCES fksn_t (k) ON UPDATE SET NULL);
+    INSERT INTO fksn_t VALUES (5, NULL), (1, 5);
+    UPDATE fksn_t SET k = k + 10, f = f + 10;
+    SELECT k, coalesce(f, 0) FROM fksn_t ORDER BY k;
+    CREATE TABLE fkuc_t (k int PRIMARY KEY, f int REFERENCES fkuc_t (k) ON UPDATE CASCADE);
+    INSERT INTO fkuc_t VALUES (5, NULL), (1, 5);
+    UPDATE fkuc_t SET k = k + 10, f = f + 10;
+    SELECT k, coalesce(f, 0) FROM fkuc_t ORDER BY k;
+}
+expect {
+    11|15
+    15|0
+    11|15
+    15|0
+}
+
+test fk-restrict-delete-referenced-parent-rejected {
+    CREATE TABLE fkrp_p (id int PRIMARY KEY);
+    CREATE TABLE fkrp_c (pid int REFERENCES fkrp_p (id) ON DELETE RESTRICT);
+    INSERT INTO fkrp_p VALUES (1);
+    INSERT INTO fkrp_c VALUES (1);
+    DELETE FROM fkrp_p;
+}
+expect error {
+}
+
+test fk-unqualified-reference-found-in-other-schema {
+    CREATE SCHEMA fkss;
+    CREATE TABLE fkss_p (id int PRIMARY KEY);
+    SET search_path = fkss, public;
+    CREATE TABLE fkss_c (pid int REFERENCES fkss_p (id));
+    INSERT INTO fkss_p VALUES (1);
+    INSERT INTO fkss_c VALUES (1);
+    INSERT INTO fkss_c VALUES (2);
+}
+expect error {
+    violates foreign key constraint
+}
+
+test fk-unqualified-reference-in-same-schema {
+    CREATE SCHEMA fksq;
+    SET search_path = fksq, public;
+    CREATE TABLE fksq_p (id int PRIMARY KEY);
+    CREATE TABLE fksq_c (pid int REFERENCES fksq_p (id));
+    INSERT INTO fksq_p VALUES (1);
+    INSERT INTO fksq_c VALUES (1);
+    SELECT count(*) FROM fksq_c;
+}
+expect {
+    1
+}
