@@ -2024,6 +2024,14 @@ snapshot gencol_explain_delete_returning_names_returning_columns {
     DELETE FROM t RETURNING c, a;
 }
 
+# INSERT ... SELECT from the target table first copies the SELECT's rows into an
+# ephemeral table, in the order of the insert's column list.
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_stored_columns_after_virtual
+snapshot gencol_explain_insert_select_temp_table_names_insert_columns {
+    INSERT INTO t(d, c) SELECT a, c FROM t;
+}
+
 # A WITHOUT ROWID table stores its primary key columns first.
 setup gencol_without_rowid_primary_key_last {
     CREATE TABLE w(x INT, v AS (x + 1), y INT, z INT PRIMARY KEY) WITHOUT ROWID;
@@ -2039,6 +2047,12 @@ snapshot gencol_explain_without_rowid_names_stored_columns {
 @setup gencol_without_rowid_primary_key_last
 snapshot gencol_explain_without_rowid_returning_names_returning_columns {
     INSERT INTO w(x, y, z) VALUES (1, 2, 3) RETURNING z, v, x;
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@setup gencol_without_rowid_primary_key_last
+snapshot gencol_explain_without_rowid_insert_select_names_insert_columns {
+    INSERT INTO w(z, y, x) SELECT z + 10, y, x FROM w;
 }
 
 # =============================================================================
