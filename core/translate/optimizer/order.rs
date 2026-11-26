@@ -11,7 +11,7 @@ use crate::{
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::{
-            usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
+            usable_constraints_for_lhs_mask, Constraint, RangeConstraintRef, TableConstraints,
         },
         plan::{
             GroupBy, IterationDirection, JoinInfo, JoinedTable, Operation, Plan, Scan,
@@ -358,6 +358,7 @@ pub fn plan_satisfies_order_target(
                         table_ref,
                         *iter_dir,
                         &constraint_refs,
+                        &table_constraints[*table_index].constraints,
                         order_target,
                         target_col_idx,
                         schema,
@@ -368,6 +369,7 @@ pub fn plan_satisfies_order_target(
                         *iter_dir,
                         index_opt.as_deref(),
                         constraint_refs,
+                        &table_constraints[*table_index].constraints,
                         order_target,
                         target_col_idx,
                         schema,
@@ -383,6 +385,7 @@ pub fn plan_satisfies_order_target(
                 *iter_dir,
                 Some(index.as_ref()),
                 constraint_refs,
+                &table_constraints[*table_index].constraints,
                 order_target,
                 target_col_idx,
                 schema,
@@ -706,6 +709,7 @@ fn finalized_scan_subquery_order_consumed(
                 effective_iter_dir,
                 index.as_deref(),
                 &[],
+                &[],
                 &OrderTarget {
                     columns: mapped_target,
                     purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
@@ -863,11 +867,13 @@ impl OrderConsumption {
 /// elimination so they use the same column-matching, collation, custom-type,
 /// and hidden-rowid-suffix rules. Index columns that an equality in the seek
 /// key fixes are skipped.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn btree_access_order_consumed(
     table_ref: &JoinedTable,
     iter_dir: IterationDirection,
     index: Option<&Index>,
     constraint_refs: &[RangeConstraintRef],
+    constraints: &[Constraint],
     order_target: &OrderTarget,
     start_col: usize,
     schema: &Schema,
@@ -915,6 +921,7 @@ pub(super) fn btree_access_order_consumed(
             table_ref,
             iter_dir,
             constraint_refs,
+            constraints,
             order_target,
             target_columns,
             schema,
@@ -937,6 +944,7 @@ fn temporary_index_order_consumed(
     table_ref: &JoinedTable,
     iter_dir: IterationDirection,
     constraint_refs: &[RangeConstraintRef],
+    constraints: &[Constraint],
     order_target: &OrderTarget,
     start_col: usize,
     schema: &Schema,
@@ -982,6 +990,7 @@ fn temporary_index_order_consumed(
         table_ref,
         iter_dir,
         constraint_refs,
+        constraints,
         order_target,
         target_columns,
         schema,
@@ -998,6 +1007,7 @@ fn index_columns_order_consumed<'a>(
     table_ref: &JoinedTable,
     iter_dir: IterationDirection,
     constraint_refs: &[RangeConstraintRef],
+    constraints: &[Constraint],
     order_target: &OrderTarget,
     target_columns: &[ColumnOrder],
     schema: &Schema,
