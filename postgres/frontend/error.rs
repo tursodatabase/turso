@@ -69,6 +69,16 @@ pub fn sqlstate_error(
     }))
 }
 
+/// PostgreSQL's `feature_not_supported` error, reading "`what` is not
+/// supported".
+pub fn not_supported(what: impl std::fmt::Display) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!("{what} is not supported"),
+        None,
+    )
+}
+
 /// Like `sqlstate_error`, with the HINT `hint`: how to get the same result in
 /// a way that tursopg supports.
 pub fn sqlstate_error_with_hint(
@@ -443,15 +453,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         && msg.ends_with("\" does not exist")
     {
         SQLSTATE_UNDEFINED_TABLE
-    } else if msg.starts_with("role \"") && msg.ends_with("\" does not exist") {
-        SQLSTATE_UNDEFINED_OBJECT
     } else if msg.starts_with('"')
         && (msg.contains("\" is not a") || msg.ends_with("\" is an index"))
     {
         SQLSTATE_WRONG_OBJECT_TYPE
-    } else if msg.starts_with("cannot change owner of sequence \"")
-        || msg.starts_with("cannot change ownership of identity sequence")
-    {
+    } else if msg.starts_with("cannot change ownership of identity sequence") {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg.starts_with("column \"") && msg.ends_with("\" does not exist") {
         SQLSTATE_UNDEFINED_COLUMN
@@ -465,9 +471,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg == "sequence must have same owner as table it is linked to" {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
-    } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
-        || msg == "no schema has been selected to create in"
-    {
+    } else if msg == "no schema has been selected to create in" {
         SQLSTATE_INVALID_SCHEMA_NAME
     } else if msg.contains("query_only mode") {
         SQLSTATE_READ_ONLY_SQL_TRANSACTION
@@ -747,7 +751,7 @@ mod tests {
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
             (
-                "cannot change owner of sequence \"s\"",
+                "cannot change ownership of identity sequence",
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
             ),
             (
@@ -808,7 +812,6 @@ mod tests {
                 SQLSTATE_GENERATED_ALWAYS,
             ),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
-            ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
             (
                 "no schema has been selected to create in",
                 SQLSTATE_INVALID_SCHEMA_NAME,

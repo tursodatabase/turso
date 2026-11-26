@@ -27,6 +27,9 @@ use turso_core::{
 use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_pg_parser::quote_identifier;
+use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR};
+
+use crate::error::{sql_parse_error, sqlstate_error};
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -126,26 +129,31 @@ impl Dialect for PostgresDialect {
             };
             let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
             if !table.has_rowid {
-                return Err(LimboError::ParseError(format!(
-                    "PostgreSQL does not support WITHOUT ROWID table '{}'",
-                    table.name
-                )));
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "PostgreSQL does not support WITHOUT ROWID table '{}'",
+                        table.name
+                    ),
+                    None,
+                ));
             }
             return Ok(table);
         };
 
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let parse_result = turso_pg_parser::parse(raw_sql).map_err(sql_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(sql_parse_error)?;
         match stmt {
             turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } => {
                 BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
             }
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
+            _ => Err(sqlstate_error(
+                SQLSTATE_INTERNAL_ERROR,
+                "expected CREATE TABLE statement",
+                None,
             )),
         }
     }
@@ -157,16 +165,17 @@ impl Dialect for PostgresDialect {
             return canonical_table_sql_ast(self, sql);
         };
 
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let parse_result = turso_pg_parser::parse(raw_sql).map_err(sql_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(sql_parse_error)?;
         match stmt {
             stmt @ turso_core::ast::Stmt::CreateTable { .. } => Ok(stmt),
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
+            _ => Err(sqlstate_error(
+                SQLSTATE_INTERNAL_ERROR,
+                "expected CREATE TABLE statement",
+                None,
             )),
         }
     }

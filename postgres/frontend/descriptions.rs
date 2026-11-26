@@ -23,8 +23,8 @@ use turso_core::{
     RegisterOrLiteral, Result, MAIN_DB_ID,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     is_catalog_table_name, PgCommentObject, PgCommentOnStmt, PG_CLASS_OID, PG_NAMESPACE_OID,
@@ -32,7 +32,7 @@ use turso_pg_parser::translator::{
 
 use crate::catalog::{key_constraint_names, namespace_oid, PUBLIC_NAMESPACE_OID};
 use crate::classes::{class_catalog, RelationClass};
-use crate::error::sqlstate_error;
+use crate::error::{not_supported, sqlstate_error};
 use crate::roles::schema_roles;
 use crate::schema_init::TableInit;
 use crate::session::relation_lookup_namespaces;
@@ -167,14 +167,10 @@ fn described_object(conn: &Arc<Connection>, object: &PgCommentObject) -> Result<
                 _ => None,
             };
             let Some(stored_table) = stored_table else {
-                return Err(sqlstate_error(
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    format!(
-                        "COMMENT ON COLUMN of {} is not supported",
-                        class.relkind.with_article()
-                    ),
-                    None,
-                ));
+                return Err(not_supported(format!(
+                    "COMMENT ON COLUMN of {}",
+                    class.relkind.with_article()
+                )));
             };
             let Some((position, _)) = stored_table.get_column(column) else {
                 return Err(sqlstate_error(
@@ -197,17 +193,9 @@ fn described_object(conn: &Arc<Connection>, object: &PgCommentObject) -> Result<
                 .filter(|namespace| !namespace.is_database())
             else {
                 if crate::catalog::namespace_exists(conn, &folded_name) {
-                    return Err(sqlstate_error(
-                        SQLSTATE_FEATURE_NOT_SUPPORTED,
-                        format!("COMMENT ON SCHEMA {name} is not supported"),
-                        None,
-                    ));
+                    return Err(not_supported(format!("COMMENT ON SCHEMA {name}")));
                 }
-                return Err(sqlstate_error(
-                    SQLSTATE_INVALID_SCHEMA_NAME,
-                    format!("schema \"{name}\" does not exist"),
-                    None,
-                ));
+                return Err(crate::session::undefined_schema(name));
             };
             if !conn.current_role_is_superuser() {
                 return Err(sqlstate_error(
@@ -222,11 +210,7 @@ fn described_object(conn: &Arc<Connection>, object: &PgCommentObject) -> Result<
                 objsubid: 0,
             })
         }
-        PgCommentObject::Unsupported(kind) => Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            format!("COMMENT ON {kind} is not supported"),
-            None,
-        )),
+        PgCommentObject::Unsupported(kind) => Err(not_supported(format!("COMMENT ON {kind}"))),
     }
 }
 
@@ -240,11 +224,7 @@ fn find_relation<'a>(
 ) -> Result<(NamespaceId, &'a RelationClass)> {
     if let Some(schema_name) = schema_name {
         if !crate::catalog::namespace_exists(conn, &schema_name.to_lowercase()) {
-            return Err(sqlstate_error(
-                SQLSTATE_INVALID_SCHEMA_NAME,
-                format!("schema \"{schema_name}\" does not exist"),
-                None,
-            ));
+            return Err(crate::session::undefined_schema(schema_name));
         }
     }
     let classes = class_catalog(schema);
@@ -259,18 +239,10 @@ fn find_relation<'a>(
         .find_map(|namespace| Some((*namespace, classes?.get_by_name(*namespace, &folded_name)?)))
         .ok_or_else(|| {
             if is_catalog_relation(schema_name, name) {
-                return sqlstate_error(
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    "COMMENT ON a system catalog relation is not supported".to_string(),
-                    None,
-                );
+                return not_supported("COMMENT ON a system catalog relation");
             }
             if is_constraint_index(schema, &namespaces, &folded_name) {
-                return sqlstate_error(
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    "COMMENT ON the index of a constraint is not supported".to_string(),
-                    None,
-                );
+                return not_supported("COMMENT ON the index of a constraint");
             }
             let name = match schema_name {
                 Some(schema_name) => format!("{schema_name}.{name}"),
