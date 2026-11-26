@@ -2344,17 +2344,20 @@ impl Pager {
         let buffer = {
             let page_id = page.get().id() as u32;
             let contents = page.get_contents();
-            let buffer = self.buffer_pool.allocate(page_size + 4);
             let contents_buffer = contents.as_ptr();
             turso_assert!(
                 contents_buffer.len() == page_size,
                 "contents buffer length should be equal to page size"
             );
 
-            buffer.as_mut_slice()[0..4].copy_from_slice(&page_id.to_be_bytes());
-            buffer.as_mut_slice()[4..4 + page_size].copy_from_slice(contents_buffer);
-
-            Arc::new(buffer)
+            // The record is larger than a slot of the buffer pool, so
+            // `BufferPool::allocate` gave a heap buffer of zeros, and the two
+            // copies then wrote over all of it. The record is built from the
+            // copies instead.
+            let mut record = Vec::with_capacity(page_size + 4);
+            record.extend_from_slice(&page_id.to_be_bytes());
+            record.extend_from_slice(contents_buffer);
+            Arc::new(Buffer::new(record))
         };
 
         let savepoints = self.savepoints.clone();
