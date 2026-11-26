@@ -971,11 +971,17 @@ fn measure_replay(
 //
 // The workload of `sync/engine/tests/mvcc_logical_pull/pull_scaling.rs` (PR #12102): a
 // table with large rows and five indexes, and a remote transaction that sets
-// `version = version + 1, c0 = c0 + 1` on the rows in key order. The pull replays each
-// change as a full-row upsert, so it deletes and inserts again the entries of the four
-// indexes whose values do not change, and the new `c0` of a row is the old `c0` of the
-// next row. A pull can follow an earlier pull of the same rows that is still in the
-// MvStore or that a checkpoint moved to the B-tree.
+// `version = version + 1, c0 = c0 + 1` on the rows in key order, so the new `c0` of a
+// row is the old `c0` of the next row. A pull can follow an earlier pull of the same rows
+// that is still in the MvStore or that a checkpoint moved to the B-tree.
+//
+// `PullChange::RecordedPull` runs the statements that a replica ran in `pull()` of that
+// test, recorded with a trace of each statement and its parameters: in one
+// `BEGIN IMMEDIATE` transaction, the sync bookkeeping, a `DELETE .. WHERE "id" IS ?` of
+// each changed row in key order, then an `INSERT .. ON CONFLICT("id") DO UPDATE` of each
+// row in key order (the rows were deleted, so each is a plain insert into all indexes),
+// and an update of `turso_sync_last_change_id`. The reads of `turso_cdc` are left out:
+// the table does not exist here and they do not touch `items`.
 
 /// The number of rows of the base table of a pull of `n` changes. It grows with `n`, so a
 /// change whose cost grows with the size of the table makes the pull quadratic too.
@@ -1003,6 +1009,9 @@ enum PullChange {
     /// `UPDATE items SET version = ?, c0 = ? WHERE id = ?`: the change record lists the
     /// changed columns.
     UpdateChangedColumns,
+    /// The statement sequence that the sync engine ran in a recorded pull. See the
+    /// comment at the start of this section.
+    RecordedPull,
 }
 
 /// What happened to the same rows before the measured pull.
@@ -1043,6 +1052,26 @@ const PULL_CELLS: &[(PullTable, PullChange, PriorPull)] = &[
         PriorPull::Committed,
     ),
     (
+        PullTable::Indexed,
+        PullChange::RecordedPull,
+        PriorPull::None,
+    ),
+    (
+        PullTable::Indexed,
+        PullChange::RecordedPull,
+        PriorPull::Committed,
+    ),
+    (
+        PullTable::Indexed,
+        PullChange::RecordedPull,
+        PriorPull::Checkpointed,
+    ),
+    (
+        PullTable::IndexedGenerated,
+        PullChange::RecordedPull,
+        PriorPull::None,
+    ),
+    (
         PullTable::IndexedGenerated,
         PullChange::FullRowUpsert,
         PriorPull::None,
@@ -1078,6 +1107,11 @@ fn build_pull_base(table: PullTable, n: usize) -> (MvccTestDbNoConn, Arc<Connect
     for c in 0..5 {
         run(&conn, &format!("CREATE INDEX items_{c} ON items (c{c})"));
     }
+    run(
+        &conn,
+        "CREATE TABLE IF NOT EXISTS turso_sync_last_change_id \
+         (client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)",
+    );
     let rows = (1..=pull_base(n))
         .map(|id| pull_row(id, 0))
         .collect::<Vec<_>>();
@@ -1133,7 +1167,71 @@ fn replay_pull(conn: &Arc<Connection>, change: PullChange, keys: &[i64], pulls: 
                 .map(|&id| vec![int(pulls), int(id + pulls), int(id)])
                 .collect::<Vec<_>>(),
         ),
+        PullChange::RecordedPull => return recorded_pull(conn, keys, pulls),
     };
+    work
+}
+
+/// Runs the statements of a recorded pull of the rows `keys`, inside the caller's
+/// transaction, and returns the cursor work of all of them.
+fn recorded_pull(conn: &Arc<Connection>, keys: &[i64], pulls: i64) -> CursorWork {
+    let mut work = CursorWork::default();
+    let mut step = |sql: &str, params: Vec<Vec<Value>>| {
+        let (_, w) = run_measured(conn, sql, &params);
+        work.merge(&w);
+    };
+    let client = || Value::from_text("client".to_string());
+    step(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?",
+        vec![vec![Value::from_text("turso_cdc".to_string())]],
+    );
+    step(
+        "SELECT cid, name, type, pk FROM pragma_table_info('items')",
+        vec![],
+    );
+    step("PRAGMA main.table_info='items'", vec![]);
+    step(
+        "DELETE FROM \"items\" WHERE \"id\" IS ?",
+        keys.iter().map(|&id| vec![int(id)]).collect(),
+    );
+    step(
+        "SELECT cid, name, type, pk FROM pragma_table_info('items')",
+        vec![],
+    );
+    step("PRAGMA main.table_info='items'", vec![]);
+    let columns = PULL_COLUMNS
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>();
+    let updates = columns
+        .iter()
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    step(
+        &format!(
+            "INSERT INTO \"items\"({}) VALUES ({}) ON CONFLICT(\"id\") DO UPDATE SET {updates}",
+            columns.join(", "),
+            vec!["?"; columns.len()].join(",")
+        ),
+        keys.iter().map(|&id| pull_row(id, pulls)).collect(),
+    );
+    step(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?",
+        vec![vec![Value::from_text(
+            "turso_sync_last_change_id".to_string(),
+        )]],
+    );
+    step(
+        "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?",
+        vec![vec![client()]],
+    );
+    step(
+        "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, ?, ?) \
+         ON CONFLICT(client_id) DO UPDATE SET pull_gen = excluded.pull_gen, \
+         change_id = excluded.change_id",
+        vec![vec![client(), int(pulls), int(pulls)]],
+    );
     work
 }
 
@@ -1327,8 +1425,14 @@ const KNOWN_SUPER_LINEAR: &[(&str, &[&str])] = &[
          walks all the hidden B-tree entries after the key: the entries of the rows that \
          it deleted before (DeleteThenInsert), or the entries of the rows that an earlier \
          pull rewrote and no checkpoint moved to the B-tree yet (pull prior-Committed, in \
-         the four indexes whose values do not change).",
+         the four indexes whose values do not change). A real sync pull replays updates \
+         as all the deletes, then all the inserts (RecordedPull), so it does this in all \
+         the indexes at each change.",
         &[
+            "pull/Indexed/RecordedPull/KeyOrder/prior-None",
+            "pull/Indexed/RecordedPull/KeyOrder/prior-Committed",
+            "pull/Indexed/RecordedPull/KeyOrder/prior-Checkpointed",
+            "pull/IndexedGenerated/RecordedPull/KeyOrder/prior-None",
             "replay/Rowid/NonUnique/DeleteThenInsert/KeyOrder",
             "replay/Rowid/Unique/DeleteThenInsert/KeyOrder",
             "replay/Rowid/NullableUnique/DeleteThenInsert/KeyOrder",
