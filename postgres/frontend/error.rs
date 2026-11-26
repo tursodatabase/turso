@@ -370,6 +370,14 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
         SQLSTATE_DUPLICATE_OBJECT
+    } else if msg.starts_with("no such type: ") || msg.starts_with("no such domain: ") {
+        // DROP TYPE or DROP DOMAIN of a type that does not exist.
+        SQLSTATE_UNDEFINED_OBJECT
+    } else if msg.ends_with(" is a type, not a domain. Use DROP TYPE instead") {
+        // The engine says this for DROP DOMAIN of an enum or another type that
+        // is not a domain. The type name comes first, so this is checked before
+        // the rules that look for a phrase anywhere in the message.
+        SQLSTATE_WRONG_OBJECT_TYPE
     } else if msg.contains("no such table")
         || msg.starts_with("no such view")
         || msg.contains("table not found")
@@ -660,6 +668,9 @@ mod tests {
             ("no such view: v", SQLSTATE_UNDEFINED_TABLE),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
+            ("no such type: t", SQLSTATE_UNDEFINED_OBJECT),
+            ("no such domain: d", SQLSTATE_UNDEFINED_OBJECT),
+            ("no such type: no such table", SQLSTATE_UNDEFINED_OBJECT),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
             ("role \"r\" already exists", SQLSTATE_DUPLICATE_OBJECT),
@@ -703,6 +714,14 @@ mod tests {
             ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
+            (
+                "mood is a type, not a domain. Use DROP TYPE instead",
+                SQLSTATE_WRONG_OBJECT_TYPE,
+            ),
+            (
+                "no such table is a type, not a domain. Use DROP TYPE instead",
+                SQLSTATE_WRONG_OBJECT_TYPE,
+            ),
             (
                 "cannot change owner of sequence \"s\"",
                 SQLSTATE_FEATURE_NOT_SUPPORTED,

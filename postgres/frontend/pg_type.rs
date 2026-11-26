@@ -20,8 +20,9 @@ pub(crate) fn register_builtin_types(builder: SchemaBuilder) -> Result<SchemaBui
 // FIXME(pg-catalog): three places that do not know about each other say what
 // a type name is, in place of a pg_type catalog:
 //
-// - the built-in lists of turso_pg_parser (`BASE_TYPES`, `PSEUDO_TYPES` and
-//   `POLYMORPHIC_TYPES` in create_function.rs),
+// - the built-in lists of turso_pg_parser (`BASE_TYPES`,
+//   `BASE_TYPES_WITHOUT_ARRAYS`, `PSEUDO_TYPES` and `POLYMORPHIC_TYPES` in
+//   create_function.rs),
 // - the custom type registry (`get_type_def_unchecked`),
 // - the relations of a schema (`relation_kind`), which give the row types.
 //
