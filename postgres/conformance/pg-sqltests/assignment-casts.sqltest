@@ -471,7 +471,6 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-@compat-gap "type:numeric"
 test insert-nan-into-a-numeric-column {
     CREATE TABLE t (x numeric);
     INSERT INTO t VALUES ('NaN');
@@ -480,8 +479,6 @@ test insert-nan-into-a-numeric-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 @compat-gap "type:float8"
 test insert-many-rows-with-nan-into-a-float8-column {

@@ -132,6 +132,7 @@ fn numeric_error(error: LimboError) -> LimboError {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
     } else if message.starts_with("value overflows numeric format")
         || message.starts_with("numeric value out of range")
+        || message.starts_with("numeric field overflow")
     {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else {

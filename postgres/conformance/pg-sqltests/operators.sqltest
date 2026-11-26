@@ -574,7 +574,6 @@ expect {
 
 # A string literal that PostgreSQL reads as NaN, an infinity or a huge
 # numeric next to a number is a value, not an error.
-@compat-gap "type:numeric"
 @setup operands
 test nan-literal-next-to-numbers-is-not-an-error {
     SELECT n = 'NaN', f = 'NaN', f = 'Infinity', f = '-Infinity', 1.5 = 'NaN', 1.5 = 'Infinity', n = '1e400' FROM operands;
@@ -582,8 +581,6 @@ test nan-literal-next-to-numbers-is-not-an-error {
 expect {
     f|f|f|f|f|f|f
 }
-@sqlstate 23000
-expect @tursopg error {}
 
 @setup operands
 test hex-and-underscore-literals-next-to-an-integer-are-not-an-error {

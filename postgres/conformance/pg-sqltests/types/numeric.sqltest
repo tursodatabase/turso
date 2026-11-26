@@ -113,3 +113,84 @@ test numeric-remainder-with-zero-is-an-error {
 }
 @sqlstate 22012
 expect error {}
+
+test numeric-reads-nan-and-infinity {
+    SELECT 'NaN'::numeric, ' nan '::numeric, 'Infinity'::numeric, '-inf'::numeric, '+Infinity'::numeric, 'INF'::numeric;
+}
+expect {
+    NaN|NaN|Infinity|-Infinity|Infinity|Infinity
+}
+
+test numeric-rejects-signed-nan {
+    SELECT '+nan'::numeric;
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-rejects-text-that-only-starts-like-infinity {
+    SELECT 'infinit'::numeric;
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-column-stores-nan-and-infinity {
+    CREATE TABLE t (n numeric);
+    INSERT INTO t VALUES ('NaN'), ('Infinity'), ('-Infinity');
+    SELECT n FROM t;
+}
+expect {
+    NaN
+    Infinity
+    -Infinity
+}
+
+test numeric-orders-nan-after-infinity {
+    CREATE TABLE t (n numeric);
+    INSERT INTO t VALUES ('NaN'), (1), ('Infinity'), ('-Infinity'), (0), ('NaN');
+    SELECT n FROM t ORDER BY n;
+}
+expect {
+    -Infinity
+    0
+    1
+    Infinity
+    NaN
+    NaN
+}
+
+test numeric-distinct-treats-nan-as-one-value {
+    CREATE TABLE t (n numeric);
+    INSERT INTO t VALUES ('NaN'), ('nan'), ('Infinity'), ('inf');
+    SELECT n FROM t GROUP BY n ORDER BY n;
+}
+expect {
+    Infinity
+    NaN
+}
+
+test numeric-nan-equals-nan-and-is-greater-than-everything {
+    SELECT 'NaN'::numeric = 'NaN'::numeric, 'NaN'::numeric > 'Infinity'::numeric, 'NaN'::numeric = 1, 'Infinity'::numeric > '1e300'::numeric;
+}
+expect {
+    t|t|f|t
+}
+
+test numeric-with-precision-takes-nan {
+    SELECT 'NaN'::numeric(5,2);
+}
+expect {
+    NaN
+}
+
+test numeric-with-precision-rejects-infinity {
+    SELECT 'Infinity'::numeric(5,2);
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-column-with-precision-rejects-infinity {
+    CREATE TABLE t (n numeric(5,2));
+    INSERT INTO t VALUES ('-Infinity');
+}
+@sqlstate 22003
+expect error {}

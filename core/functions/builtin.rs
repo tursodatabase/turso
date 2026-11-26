@@ -15,8 +15,9 @@ use crate::info;
 use crate::json;
 use crate::namespace::{mangle_name, NamespaceId};
 use crate::numeric::decimal::{
-    bigdecimal_to_blob, blob_to_bigdecimal, check_numeric_limits, format_numeric,
-    numeric_from_value, validate_precision_scale, MAX_FRACTION_DIGITS,
+    blob_to_numeric_value, check_numeric_limits, format_numeric, format_numeric_value,
+    numeric_from_value, numeric_value_to_blob, validate_precision_scale, NumericValue,
+    MAX_FRACTION_DIGITS,
 };
 use crate::numeric::Numeric;
 use crate::stats::StatAccum;
@@ -1113,8 +1114,11 @@ pub fn call_builtin_scalar(
             Ok(match (lhs_val, rhs_val) {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
                 _ => {
-                    let a = numeric_from_value(lhs_val)?;
-                    let b = numeric_from_value(rhs_val)?;
+                    let (NumericValue::Finite(a), NumericValue::Finite(b)) =
+                        (numeric_from_value(lhs_val)?, numeric_from_value(rhs_val)?)
+                    else {
+                        return Err(unsupported_special_arithmetic());
+                    };
                     let (a_scale, b_scale) =
                         (a.fractional_digit_count(), b.fractional_digit_count());
                     let res = match func {
@@ -1145,7 +1149,10 @@ pub fn call_builtin_scalar(
             check_arg_count(args, 1)?;
             Ok(match args[0].get_value() {
                 Value::Null => Value::Null,
-                val => Value::build_text(format_numeric(&-numeric_from_value(val)?)),
+                val => match numeric_from_value(val)? {
+                    NumericValue::Finite(number) => Value::build_text(format_numeric(&-number)),
+                    _ => return Err(unsupported_special_arithmetic()),
+                },
             })
         }
         ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
@@ -1304,13 +1311,17 @@ pub(crate) fn exec_validate_ipaddr(value: &Value) -> crate::Result<Value> {
     })
 }
 
+fn unsupported_special_arithmetic() -> LimboError {
+    LimboError::Constraint("arithmetic on NaN or infinity is not supported".to_string())
+}
+
 /// The stored form of the number `value` as a numeric.
 pub fn exec_numeric_encode(value: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
         other => {
-            let bd = numeric_from_value(other)?;
-            Value::from_blob(bigdecimal_to_blob(&bd))
+            let number = numeric_from_value(other)?;
+            Value::from_blob(numeric_value_to_blob(&number))
         }
     })
 }
@@ -1321,7 +1332,7 @@ pub fn exec_numeric_fit(value: &Value, precision: &Value, scale: &Value) -> crat
     Ok(match value {
         Value::Null => Value::Null,
         Value::Blob(stored) => {
-            let bd = blob_to_bigdecimal(stored)?;
+            let number = blob_to_numeric_value(stored)?;
             let (
                 Value::Numeric(Numeric::Integer(precision)),
                 Value::Numeric(Numeric::Integer(scale)),
@@ -1331,8 +1342,18 @@ pub fn exec_numeric_fit(value: &Value, precision: &Value, scale: &Value) -> crat
                     "numeric_fit: precision and scale must be integers".to_string(),
                 ));
             };
-            let fitted = validate_precision_scale(&bd, *precision, *scale)?;
-            Value::from_blob(bigdecimal_to_blob(&fitted))
+            match number {
+                NumericValue::Finite(bd) => {
+                    let fitted = validate_precision_scale(&bd, *precision, *scale)?;
+                    Value::from_blob(numeric_value_to_blob(&NumericValue::Finite(fitted)))
+                }
+                NumericValue::NaN => Value::from_blob(stored.clone()),
+                NumericValue::Infinity | NumericValue::NegativeInfinity => {
+                    return Err(LimboError::Constraint(format!(
+                        "numeric field overflow: a field with precision {precision}, scale {scale} cannot hold an infinite value"
+                    )));
+                }
+            }
         }
         other => {
             return Err(LimboError::InternalError(format!(
@@ -1347,7 +1368,7 @@ pub fn exec_numeric_fit(value: &Value, precision: &Value, scale: &Value) -> crat
 pub fn exec_numeric_decode(value: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
-        Value::Blob(b) => Value::build_text(format_numeric(&blob_to_bigdecimal(b)?)),
+        Value::Blob(b) => Value::build_text(format_numeric_value(&blob_to_numeric_value(b)?)),
         other => {
             return Err(LimboError::Constraint(format!(
                 "numeric_decode: expected blob, got \"{other}\""

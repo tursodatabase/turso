@@ -898,6 +898,57 @@ expect @tursopg {
     3.3000000000000003
 }
 
+# NaN and infinity in a numeric are read as 0 by the casts and functions that
+# convert the numeric to a plain number first.
+@compat-gap "cast:numeric -> int4"
+test numeric-nan-cast-to-integer {
+    SELECT 'NaN'::numeric::int;
+}
+@sqlstate 0A000
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "cast:numeric -> float8"
+test numeric-nan-and-infinity-cast-to-double-precision {
+    SELECT 'NaN'::numeric::float8, 'Infinity'::numeric::float8;
+}
+expect {
+    NaN|Infinity
+}
+expect @tursopg {
+    0|0
+}
+
+@compat-gap "function:sum"
+test sum-numeric-with-nan {
+    CREATE TABLE v (x numeric);
+    INSERT INTO v VALUES ('NaN'), (1);
+    SELECT sum(x) FROM v;
+}
+expect {
+    NaN
+}
+expect @tursopg {
+    1.0
+}
+
+@compat-gap "function:round"
+test round-and-abs-of-nan-and-infinity {
+    CREATE TABLE v (x numeric);
+    INSERT INTO v VALUES ('NaN'), ('Infinity');
+    SELECT round(x), abs(x) FROM v ORDER BY x;
+}
+expect {
+    Infinity|Infinity
+    NaN|NaN
+}
+expect @tursopg {
+    0|0
+    0|0
+}
+
 # B-92: date_trunc / extract
 @compat-gap "function:extract"
 test date-trunc-extract {

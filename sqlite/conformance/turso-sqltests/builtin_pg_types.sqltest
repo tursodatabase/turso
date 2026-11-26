@@ -700,3 +700,56 @@ test timestamp-compare-with-other-text-with-and-without-index {
 expect {
     1|1|1|1
 }
+
+@requires strict "uses STRICT tables"
+test numeric-stores-nan {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 'NaN'), (2, ' nan '), (3, 1.5);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|NaN
+    2|NaN
+    3|1.50
+}
+
+@requires strict "uses STRICT tables"
+test numeric-orders-nan-after-every-number {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('NaN'), (2), (-3), ('NaN'), (0);
+    SELECT val FROM t1 ORDER BY val;
+}
+expect {
+    -3.00
+    0.00
+    2.00
+    NaN
+    NaN
+}
+
+@requires strict "uses STRICT tables"
+test numeric-group-by-treats-nan-as-one-value {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('NaN'), ('nan'), (1);
+    SELECT val, count(*) FROM t1 GROUP BY val ORDER BY val;
+}
+expect {
+    1.00|1
+    NaN|2
+}
+
+@requires strict "uses STRICT tables"
+test numeric-with-precision-rejects-infinity {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('Infinity');
+}
+expect error {
+    cannot hold an infinite value
+}
+
+test numeric-cast-reads-nan {
+    SELECT CAST('NaN' AS numeric(10,2));
+}
+expect {
+    NaN
+}
