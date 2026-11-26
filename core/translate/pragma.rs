@@ -229,6 +229,17 @@ fn emit_table_list_rows_for_schema(
     }
 }
 
+/// Returns true for `PRAGMA cipher` and `PRAGMA hexkey`, with or without a value.
+pub(crate) fn is_encryption_pragma(stmt: &ast::Stmt) -> bool {
+    let ast::Stmt::Pragma { name, .. } = stmt else {
+        return false;
+    };
+    matches!(
+        parse_pragma_name(name.name.as_str()),
+        Some(PragmaName::EncryptionKey | PragmaName::EncryptionCipher)
+    )
+}
+
 /// SQLite matches PRAGMA names without regard to case.
 fn parse_pragma_name(name: &str) -> Option<PragmaName> {
     if let Ok(pragma) = PragmaName::from_str(name) {

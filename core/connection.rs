@@ -2104,6 +2104,8 @@ impl Connection {
     /// Start WAL session by initiating read+write transaction for this connection
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
+        // WAL frames are written without SQL, so this API needs its own check.
+        self.check_encryption_setup_complete(false)?;
         let pager = self.pager.load();
         pager.begin_read_tx()?;
         // Sync-engine drives WAL maintenance explicitly: any auto-restart of
