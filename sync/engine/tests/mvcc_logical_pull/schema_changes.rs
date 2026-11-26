@@ -210,6 +210,91 @@ fn new_replica_replays_generated_columns_re_added_around_regular_column() -> Res
     Ok(())
 }
 
+const TABLE_WITH_GENERATED_COLUMN_AND_INDEXED_USER: &[&str] = &[
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, k TEXT AS (lower(a)), u TEXT AS (k || '!'))",
+    "CREATE INDEX t_u ON t (u)",
+    "INSERT INTO t (id, a) VALUES (1, 'Aa')",
+];
+
+/// Changes the expression of `k`. Core refuses to drop `k` while `u` uses it,
+/// so the remote drops the index of `u` and `u` first, and adds them again
+/// last, with the same definitions.
+const REDEFINE_GENERATED_COLUMN_AND_ITS_INDEXED_USER: &[&str] = &[
+    "DROP INDEX t_u",
+    "ALTER TABLE t DROP COLUMN u",
+    "ALTER TABLE t DROP COLUMN k",
+    "ALTER TABLE t ADD COLUMN k TEXT AS (upper(a))",
+    "ALTER TABLE t ADD COLUMN u TEXT AS (k || '!')",
+    "CREATE INDEX t_u ON t (u)",
+];
+
+/// The remote changes a generated column that an indexed generated column
+/// uses. The replica keeps `u`, which did not change, but it must drop `u`
+/// before it drops `k`, and add it again.
+#[test]
+fn redefine_generated_column_and_its_indexed_user_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(TABLE_WITH_GENERATED_COLUMN_AND_INDEXED_USER)?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(REDEFINE_GENERATED_COLUMN_AND_ITS_INDEXED_USER)?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+
+    // A pull matches the values of a remote row with the columns by position.
+    // This insert shows that the replica has the column order of the server.
+    remote.execute_transaction(&["INSERT INTO t (id, a) VALUES (2, 'Bb')"])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+/// As `redefine_generated_column_and_its_indexed_user_in_one_transaction`, for
+/// a new replica that starts from a checkpoint of the server before the change
+/// and replays the change from the log.
+#[test]
+fn new_replica_replays_redefined_generated_column_and_its_indexed_user() -> Result<()> {
+    let checkpoint = Remote::new(TABLE_WITH_GENERATED_COLUMN_AND_INDEXED_USER)?;
+    let remote = Remote::new(TABLE_WITH_GENERATED_COLUMN_AND_INDEXED_USER)?;
+    // A bootstrap checkpoints the remote, so its log holds only the change.
+    remote.bootstrap_replica()?;
+    remote.execute_transaction(REDEFINE_GENERATED_COLUMN_AND_ITS_INDEXED_USER)?;
+
+    let replica = open_new_replica(&remote, checkpoint)?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+/// The remote drops a column and its generated helper column, and gives the
+/// indexed generated column that used the helper a new expression. It drops
+/// the index and that column first, and adds them again last. The replica
+/// keeps that column by its name, so it must drop it before the helper, and
+/// add it again.
+#[test]
+fn drop_column_and_its_helper_and_redefine_their_indexed_user_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, k TEXT AS (lower(a)), b TEXT, l TEXT AS (lower(b)), u TEXT AS (k || '!'))",
+        "CREATE INDEX t_u ON t (u)",
+        "INSERT INTO t (id, a, b) VALUES (1, 'Aa', 'Bb')",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        "DROP INDEX t_u",
+        "ALTER TABLE t DROP COLUMN u",
+        "ALTER TABLE t DROP COLUMN k",
+        "ALTER TABLE t DROP COLUMN a",
+        "ALTER TABLE t ADD COLUMN u TEXT AS (l || '!')",
+        "CREATE INDEX t_u ON t (u)",
+    ])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+
+    remote.execute_transaction(&["INSERT INTO t (id, b) VALUES (2, 'Cc')"])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
 /// Opens a new replica that starts from `checkpoint`, a database with the state
 /// of the server at its last checkpoint, and replays the log of `remote`.
 fn open_new_replica(remote: &Arc<Remote>, checkpoint: Arc<Remote>) -> Result<Replica> {

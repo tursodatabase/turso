@@ -4088,6 +4088,29 @@ mod tests {
         assert_eq!(redefine_in_one_refresh, expected);
     }
 
+    /// A CREATE TABLE replay onto an existing table changes the generated
+    /// column `next`, which `twice` uses. Both are the last columns, so the
+    /// replay drops `twice` first and adds both again in the same order.
+    #[test]
+    pub fn test_create_table_replay_redefines_generated_column_that_another_uses() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, next INT AS (a + 1), twice INT AS (next * 2))",
+                "INSERT INTO t (id, a) VALUES (1, 10)",
+            ],
+            vec![DatabaseTapeOperation::SchemaReplay(
+                DatabaseSchemaReplay::Create {
+                    sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, next INT AS (a + 2), twice INT AS (next * 2))"
+                        .to_string(),
+                },
+            )],
+            "SELECT * FROM t",
+        )
+        .unwrap();
+        let int = turso_core::Value::from_i64;
+        assert_eq!(rows, vec![vec![int(1), int(10), int(12), int(24)]]);
+    }
+
     #[test]
     pub fn test_schema_refresh_drops_removed_generated_column() {
         let rows = replay_on_table_with_generated_columns(
