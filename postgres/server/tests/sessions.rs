@@ -93,6 +93,41 @@ fn time_zone_other_than_utc_is_refused_at_connection() {
     }
 }
 
+/// A computed bytea value is described as bytea, at the top level and when
+/// an outer query reads it from a subquery.
+#[test]
+fn computed_bytea_is_described_as_bytea() {
+    const BYTEA_OID: u32 = 17;
+    let server = TestServer::start();
+    let mut client = server.connect();
+    query(
+        &mut client,
+        "CREATE TABLE t1 (id int PRIMARY KEY, v varchar(5))",
+    );
+    assert_eq!(
+        column_type_oids(&mut client, "SELECT v::bytea AS x FROM t1"),
+        vec![BYTEA_OID]
+    );
+    assert_eq!(
+        column_type_oids(
+            &mut client,
+            "SELECT x FROM (SELECT v::bytea AS x FROM t1) s"
+        ),
+        vec![BYTEA_OID]
+    );
+    assert_eq!(
+        column_type_oids(&mut client, "SELECT v::bytea || v::bytea AS x FROM t1"),
+        vec![BYTEA_OID]
+    );
+    assert_eq!(
+        column_type_oids(
+            &mut client,
+            "SELECT x FROM (SELECT v::bytea || v::bytea AS x FROM t1) s"
+        ),
+        vec![BYTEA_OID]
+    );
+}
+
 struct TestServer {
     port: u16,
     _dir: TempDir,
@@ -178,4 +213,20 @@ fn query_error(client: &mut PgConn, sql: &str) -> String {
         }
     }
     panic!("{sql}: expected an error");
+}
+
+/// Runs `sql` and returns the type OIDs of its RowDescription.
+fn column_type_oids(client: &mut PgConn, sql: &str) -> Vec<u32> {
+    for event in client.simple_query(sql).unwrap() {
+        match event {
+            BackendEvent::RowDescription(columns) => {
+                return columns.iter().map(|column| column.type_oid).collect();
+            }
+            BackendEvent::ErrorResponse(fields) => {
+                panic!("{sql}: {}", error_message(&fields));
+            }
+            _ => {}
+        }
+    }
+    panic!("{sql}: no RowDescription");
 }
