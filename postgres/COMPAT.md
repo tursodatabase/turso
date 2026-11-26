@@ -284,7 +284,17 @@ the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
 than `value`), unless the two already have one order in common, as `numeric`
 and `bigint` do. A domain compares as the type it is declared on, so two
 domains over one type compare as that type. So a `date`, a `timestamp` and a
-`timestamptz` fail with one another.
+`timestamptz` fail with one another, with one hard-coded exception: a `timestamp`
+compares with a `timestamptz` (`=`, `<`, IN, joins, index seeks) because both
+store the same UTC text and the session time zone is always UTC; it stops being
+correct once another time zone exists. So tursopg refuses a connection that asks
+for another time zone, in the `TimeZone` startup parameter or in `options`
+(`-c TimeZone=x`, `--TimeZone=x`), with 0A000. It accepts only names for UTC,
+such as `UTC`, `Etc/UTC`, `GMT` and `+00`. Like PostgreSQL, tursopg refuses the
+comparison in a generated column, an index expression and a partial index WHERE
+(42P17, because PostgreSQL's comparison functions of the two types are not
+IMMUTABLE); a CHECK constraint and a DEFAULT allow it. A CASE, coalesce, UNION,
+`JOIN ... USING` or NATURAL JOIN of the two is still refused.
 The error is `cannot compare type x with type y` with SQLSTATE 0A000. A pair
 that `pg_operator` has no comparison for, such as a `timestamptz` with a
 `varchar(n)`, fails with 42883 before this check, as in PostgreSQL. It covers `=`, `<`,

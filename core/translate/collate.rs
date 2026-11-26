@@ -552,7 +552,15 @@ pub fn in_subquery_collation(
         type_of(lhs, &lhs_context.type_env()),
         query_column_type(query, column, resolver),
     ];
-    check_comparable(&types[0], &types[1], resolver.schema())?;
+    check_comparable(
+        &types[0],
+        &types[1],
+        resolver.schema(),
+        resolver
+            .catalog
+            .dialect
+            .compares_timestamp_with_timestamptz(),
+    )?;
     check_in_subquery_operator(
         lhs,
         &lhs_context.type_env(),
@@ -985,7 +993,7 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
     )))
 }
 
-/// FIXME(pg-catalog): This decides from the stored forms of two types whether they compare, in place of looking up a pg_operator entry for the pair, so it refuses comparisons that PostgreSQL runs: pg_operator has `=` and `<` for timestamp with timestamptz and for date with either. A lookup in pg_operator, with pg_cast for implicit coercion, replaces this.
+/// FIXME(pg-catalog): This decides from the stored forms of two types whether they compare, in place of looking up a pg_operator entry for the pair, so it refuses comparisons that PostgreSQL runs: pg_operator has `=` and `<` for date with timestamp and with timestamptz (timestamp with timestamptz is the one pair allowed by [timestamp_compared_with_timestamptz]). A lookup in pg_operator, with pg_cast for implicit coercion, replaces this.
 /// The one decision that two values of different custom types do not compare.
 /// A domain compares as the type it is declared on, so two domains over one
 /// type, or a domain and its base, compare as that type does. After that,
@@ -1000,10 +1008,17 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
 /// index seek, a hash join key or an ephemeral index key is refused like the
 /// one compiled as written. A custom type compared with a built-in type or an
 /// untyped literal is not checked here.
-fn check_comparable(a: &ExprType, b: &ExprType, schema: &Schema) -> Result<()> {
+fn check_comparable(
+    a: &ExprType,
+    b: &ExprType,
+    schema: &Schema,
+    allow_timestamp_with_timestamptz: bool,
+) -> Result<()> {
     // Two arrays compare element by element, so their elements must compare.
+    // PostgreSQL has no array operator for timestamp[] with timestamptz[], so
+    // that pair stays refused.
     if let (ExprType::Array { element: x, .. }, ExprType::Array { element: y, .. }) = (a, b) {
-        return check_comparable(x, y, schema).map_err(|_| cannot_compare(a, b));
+        return check_comparable(x, y, schema, false).map_err(|_| cannot_compare(a, b));
     }
     let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) = (a, b)
     else {
@@ -1012,6 +1027,9 @@ fn check_comparable(a: &ExprType, b: &ExprType, schema: &Schema) -> Result<()> {
     let (Some(x), Some(y)) = (schema.without_domains(x)?, schema.without_domains(y)?) else {
         return Ok(());
     };
+    if allow_timestamp_with_timestamptz && timestamp_compared_with_timestamptz(&x, &y) {
+        return Ok(());
+    }
     if same_type_def(&x, &y) || !(x.changes_stored_value() || y.changes_stored_value()) {
         return Ok(());
     }
@@ -1021,6 +1039,81 @@ fn check_comparable(a: &ExprType, b: &ExprType, schema: &Schema) -> Result<()> {
         return Ok(());
     }
     Err(cannot_compare(a, b))
+}
+
+/// FIXME(pg-catalog): HACK. This hand-written pair stands in for pg_operator's
+/// comparison operators of timestamp with timestamptz and for pg_cast's
+/// implicit cast of timestamp to timestamptz. It is correct ONLY because both
+/// types store the same UTC text and the session time zone is always UTC, so
+/// the stored texts compare as PostgreSQL's values do. It becomes WRONG as
+/// soon as a session time zone other than UTC exists (a SET TIME ZONE, or a
+/// TimeZone setting): then a timestamp must be read in that zone before it is
+/// compared. It covers comparisons of the two scalar types only ([check_comparable] with
+/// `allow_timestamp_with_timestamptz`; arrays of them stay refused): a CASE, coalesce or UNION of the two stays refused, since
+/// PostgreSQL's result is a timestamptz, which we would print without `+00`.
+/// Delete it when pg_operator and pg_cast are vendored.
+fn timestamp_compared_with_timestamptz(x: &TypeDef, y: &TypeDef) -> bool {
+    let is = |ty: &TypeDef, name: &str| ty.name.eq_ignore_ascii_case(name);
+    (is(x, "timestamp") && is(y, "timestamptz")) || (is(x, "timestamptz") && is(y, "timestamp"))
+}
+
+/// The errors of [refuse_timestamp_timestamptz_comparison_in_schema_expr], as
+/// PostgreSQL words them. The PostgreSQL frontend reports them as 42P17.
+///
+/// FIXME(pg-catalog): HACK. Delete together with [timestamp_compared_with_timestamptz].
+pub const GENERATION_EXPRESSION_NOT_IMMUTABLE: &str = "generation expression is not immutable";
+pub const INDEX_EXPRESSION_NOT_IMMUTABLE: &str =
+    "functions in index expression must be marked IMMUTABLE";
+pub const INDEX_PREDICATE_NOT_IMMUTABLE: &str =
+    "functions in index predicate must be marked IMMUTABLE";
+
+/// Fails when `expr`, an expression stored in the schema (a generated column,
+/// an index expression or a partial index WHERE), compares a timestamp with a
+/// timestamptz, with `message` as the error. PostgreSQL refuses that there,
+/// because its comparison functions of the two types are STABLE and a schema
+/// expression must be IMMUTABLE. CHECK and DEFAULT expressions are not checked,
+/// since PostgreSQL allows them. Does nothing when the dialect does not allow the
+/// comparison, as it is refused everywhere then.
+///
+/// FIXME(pg-catalog): HACK. This stands in for pg_proc.provolatile of the
+/// comparison functions of timestamp with timestamptz. Delete it together with
+/// [timestamp_compared_with_timestamptz].
+///
+/// FIXME: Turso has no single place where a schema expression is type-checked
+/// at DDL time, so each DDL statement that stores one (CREATE TABLE, ALTER TABLE ADD
+/// COLUMN, CREATE INDEX) calls this on its own.
+/// It must not be called when the schema loads: databases that have such an
+/// expression must keep opening.
+pub(crate) fn refuse_timestamp_timestamptz_comparison_in_schema_expr(
+    expr: &Expr,
+    table: &crate::schema::BTreeTable,
+    resolver: &Resolver,
+    message: &str,
+) -> Result<()> {
+    if !resolver
+        .catalog
+        .dialect
+        .compares_timestamp_with_timestamptz()
+    {
+        return Ok(());
+    }
+    // The comparisons of `expr` are checked as the translator checks them
+    // (CASE operands, row values, BETWEEN, IN), once with the comparison of a
+    // timestamp with a timestamptz refused and once as the dialect allows it.
+    // It is the mixed comparison that is refused when the first fails and
+    // the second passes. Other errors are the translator's to report.
+    let mut expr = expr.clone();
+    crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
+    let refusing = ExprContext::over_schema_table(table, resolver, true);
+    let allowing = ExprContext::over_schema_table(table, resolver, false);
+    crate::translate::expr::walk_expr(&expr, &mut |e: &Expr| {
+        if check_expr_collation(e, &refusing).is_err() && check_expr_collation(e, &allowing).is_ok()
+        {
+            return Err(LimboError::ParseError(message.to_string()));
+        }
+        Ok(crate::translate::expr::WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /// [check_comparable] for the types of `lhs` and `rhs`.
@@ -1034,6 +1127,7 @@ fn check_comparable_exprs(
         &type_of(lhs, &lhs_context.type_env()),
         &type_of(rhs, &rhs_context.type_env()),
         lhs_context.schema(),
+        lhs_context.compares_timestamp_with_timestamptz(),
     )
 }
 
@@ -1045,9 +1139,14 @@ fn check_in_list_comparable(
 ) -> Result<()> {
     let env = context.type_env();
     let lhs_type = type_of(lhs, &env);
-    items
-        .iter()
-        .try_for_each(|item| check_comparable(&lhs_type, &type_of(item, &env), context.schema()))
+    items.iter().try_for_each(|item| {
+        check_comparable(
+            &lhs_type,
+            &type_of(item, &env),
+            context.schema(),
+            context.compares_timestamp_with_timestamptz(),
+        )
+    })
 }
 
 /// [check_comparable] for every pair of `exprs`, which are compared with each
@@ -1101,7 +1200,7 @@ fn check_comparable_types<'s>(types: impl Iterator<Item = (ExprType, &'s Schema)
             continue;
         }
         for other in &seen {
-            check_comparable(other, &ty, schema)?;
+            check_comparable(other, &ty, schema, false)?;
         }
         seen.push(ty);
     }

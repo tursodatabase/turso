@@ -1472,6 +1472,19 @@ pub fn translate_create_table(
         0,
         resolver.catalog.dialect.supports_namespaces(),
     )?;
+    // FIXME(pg-catalog): HACK. See refuse_timestamp_timestamptz_comparison_in_schema_expr.
+    for column in table.columns() {
+        if let crate::schema::GeneratedType::Virtual { expr, .. }
+        | crate::schema::GeneratedType::Stored { expr, .. } = column.generated_type()
+        {
+            crate::translate::collate::refuse_timestamp_timestamptz_comparison_in_schema_expr(
+                expr,
+                &table,
+                resolver,
+                crate::translate::collate::GENERATION_EXPRESSION_NOT_IMMUTABLE,
+            )?;
+        }
+    }
     let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other

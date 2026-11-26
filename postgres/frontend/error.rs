@@ -382,6 +382,13 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("cannot cast type ") {
         SQLSTATE_CANNOT_COERCE
+    } else if msg == turso_core::GENERATION_EXPRESSION_NOT_IMMUTABLE
+        || msg == turso_core::INDEX_EXPRESSION_NOT_IMMUTABLE
+        || msg == turso_core::INDEX_PREDICATE_NOT_IMMUTABLE
+    {
+        // FIXME(pg-catalog): HACK. Raised for a timestamp compared with a timestamptz in a
+        // schema expression; delete together with timestamp_compared_with_timestamptz.
+        SQLSTATE_INVALID_OBJECT_DEFINITION
     } else if msg.starts_with("cannot compare type ") {
         // tursopg refuses comparisons that PostgreSQL may run, and it does not know
         // which ones. PostgreSQL itself reports 42883 for some of these, so this

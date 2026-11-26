@@ -732,6 +732,22 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
+# The timestamp with timestamptz comparison reads the timestamp in the
+# session time zone. When SET TIME ZONE works, this test fails if the
+# comparison still treats the timestamp as UTC.
+@compat-gap "syntax:set"
+test set-timezone-compare-timestamp-with-timestamptz {
+    CREATE TABLE t (ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 12:00:00', '2026-01-31 10:00:00+00');
+    SET TIME ZONE 'Europe/Helsinki';
+    SELECT count(*) FROM t WHERE ts = tz;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 @compat-gap "function:set_config"
 test set-config-timezone {
     CREATE TABLE t (ts timestamptz);

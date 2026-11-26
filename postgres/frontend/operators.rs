@@ -408,7 +408,7 @@ fn check_operator(op: &str, types: &[Option<i64>]) -> Result<()> {
     Err(undefined_operator_of(op, &names))
 }
 
-/// FIXME(pg-catalog): `OPERATORS` has no rows for interval, time, bytea, json, jsonb, inet, arrays and enums, and for a comparison of two different types among date, timestamp and timestamptz (which tursopg refuses with 0A000), so an operand of those types is not checked. Once pg_operator has all 799 rows, every operand is checked and a type with no row is an error.
+/// FIXME(pg-catalog): `OPERATORS` has no rows for interval, time, bytea, json, jsonb, inet, arrays and enums, and for a comparison of date with timestamp or timestamptz (which tursopg refuses with 0A000), so an operand of those types is not checked. Once pg_operator has all 799 rows, every operand is checked and a type with no row is an error.
 /// The types whose operators are decided by the rows of `OPERATORS`. Varchar
 /// has no rows of its own: it takes the operators of text.
 const CHECKED_TYPES: [i64; 13] = [

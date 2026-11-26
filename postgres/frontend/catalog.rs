@@ -64,6 +64,10 @@ impl Dialect for PostgresDialect {
         error
     }
 
+    fn compares_timestamp_with_timestamptz(&self) -> bool {
+        true
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<turso_core::ast::Cmd>, usize)> {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot

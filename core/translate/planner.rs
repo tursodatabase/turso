@@ -19,6 +19,8 @@ use crate::ast::{
     TableInternalId, With,
 };
 use crate::security::permission::Object;
+use crate::translate::collate::check_comparable_results;
+use crate::translate::expr_context::ExprContext;
 use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
@@ -3716,15 +3718,24 @@ fn plan_join_constraint(
                             distinct_name.as_str()
                         );
                     };
+                    let right_column_expr = Expr::Column {
+                        database: None,
+                        table: right_table.internal_id,
+                        column: right_col_idx,
+                        is_rowid_alias: right_col.is_rowid_alias(),
+                    };
+
+                    // USING makes one merged column whose type PostgreSQL derives
+                    // from both sides, so the pair must pass the result check even
+                    // where a comparison of it is allowed.
+                    check_comparable_results(
+                        [&left_column.expr, &right_column_expr].into_iter(),
+                        &ExprContext::new(Some(&*table_references), resolver),
+                    )?;
                     let expr = Expr::Binary(
                         Box::new(left_column.expr),
                         ast::Operator::Equals,
-                        Box::new(Expr::Column {
-                            database: None,
-                            table: right_table.internal_id,
-                            column: right_col_idx,
-                            is_rowid_alias: right_col.is_rowid_alias(),
-                        }),
+                        Box::new(right_column_expr),
                     );
 
                     for (left_table_id, left_col_idx) in left_column.source_columns {
