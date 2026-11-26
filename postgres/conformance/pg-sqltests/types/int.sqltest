@@ -195,6 +195,13 @@ expect {
     20|2
 }
 
+@setup t_n
+test int4-column-overflow {
+    INSERT INTO t VALUES (2147483648);
+}
+@sqlstate 22003
+expect error {}
+
 # A primary key and an index of each integer type.
 
 test smallint-primary-key-finds-and-orders-its-rows {
@@ -618,6 +625,43 @@ expect {
     {1,2,3}
 }
 
+test int4-overflow-literal-cast {
+    SELECT '2147483648'::int4;
+}
+@sqlstate 22003
+expect error {}
+
+test int2-overflow-literal-cast {
+    SELECT '40000'::smallint;
+}
+@sqlstate 22003
+expect error {}
+
+test invalid-int-literal-cast {
+    SELECT 'abc'::integer;
+}
+@sqlstate 22P02
+expect error {}
+
+test decimal-text-cast-to-int4-is-invalid {
+    SELECT '1.5'::integer;
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-int-rounds-half-away-from-zero {
+    SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
+}
+expect {
+    2|3|-3
+}
+
+test invalid-int-literal {
+    SELECT '{1,x}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
 # Arithmetic on the integer types.
 
 setup ints {
@@ -802,6 +846,18 @@ test integer-arithmetic-of-null-is-null {
 expect {
     t|t|t
 }
+
+test int8-overflow-arithmetic {
+    SELECT 9223372036854775807::bigint + 1;
+}
+@sqlstate 22003
+expect error {}
+
+test int4-overflow-arithmetic {
+    SELECT 2147483647::int4 + 1;
+}
+@sqlstate 22003
+expect error {}
 
 test pg-input-is-valid-reads-integers-as-the-types-do {
     SELECT pg_input_is_valid('0x10', 'integer'), pg_input_is_valid(' 7 ', 'bigint'),

@@ -19,56 +19,6 @@ setup t_b {
     CREATE TABLE t (b boolean);
 }
 
-# A-07: int4 overflow literal cast
-test int4-overflow-literal-cast {
-    SELECT '2147483648'::int4;
-}
-@sqlstate 22003
-expect error {}
-
-# A-08: int2 overflow literal cast
-test int2-overflow-literal-cast {
-    SELECT '40000'::smallint;
-}
-@sqlstate 22003
-expect error {}
-
-# A-09: int8 overflow arithmetic
-test int8-overflow-arithmetic {
-    SELECT 9223372036854775807::bigint + 1;
-}
-@sqlstate 22003
-expect error {}
-
-# A-10: int4 overflow arithmetic
-test int4-overflow-arithmetic {
-    SELECT 2147483647::int4 + 1;
-}
-@sqlstate 22003
-expect error {}
-
-# A-11: invalid int literal cast
-test invalid-int-literal-cast {
-    SELECT 'abc'::integer;
-}
-@sqlstate 22P02
-expect error {}
-
-# A-13: '1.5'::int (text) is invalid
-test decimal-text-cast-to-int4-is-invalid {
-    SELECT '1.5'::integer;
-}
-@sqlstate 22P02
-expect error {}
-
-# A-14: numeric->int rounds half away from zero
-test numeric-int-rounds-half-away-from-zero {
-    SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
-}
-expect {
-    2|3|-3
-}
-
 # PostgreSQL rounds a float8 to the nearest even integer when it is halfway
 # between two. tursopg rounds it away from zero, as it rounds a numeric.
 @compat-gap "cast:float8 -> int4"
@@ -382,13 +332,6 @@ test int-literal-cast-output {
 expect {
     {1,2,3}
 }
-
-# A-52: invalid int[] literal
-test invalid-int-literal {
-    SELECT '{1,x}'::int[];
-}
-@sqlstate 22P02
-expect error {}
 
 # A-58: ARRAY[] constructor output
 test array-constructor-output {

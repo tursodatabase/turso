@@ -333,14 +333,6 @@ expect error {}
 @sqlstate 23000
 expect @tursopg error {}
 
-# D-33: int4 column overflow
-@setup t_n
-test int4-column-overflow {
-    INSERT INTO t VALUES (2147483648);
-}
-@sqlstate 22003
-expect error {}
-
 # D-34: smallint column overflow
 test smallint-column-overflow {
     CREATE TABLE t (n smallint);
