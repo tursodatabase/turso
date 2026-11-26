@@ -5435,6 +5435,22 @@ test fk-self-ref-delete-parent-only-still-fails {
 expect error {
 }
 
+# Deleting a child by ON DELETE CASCADE cancels only the count of that
+# child, not the violation of a grandchild left without its parent.
+@cross-check-integrity
+test fk-cascade-delete-keeps-grandchild-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE d (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE);
+    CREATE TABLE g (did REFERENCES d(id));
+    INSERT INTO p VALUES (1);
+    INSERT INTO d VALUES (10, 1);
+    INSERT INTO g VALUES (10);
+    DELETE FROM p;
+}
+expect error {
+}
+
 @cross-check-integrity
 test fk-self-ref-update-key-and-reference-in-one-statement {
     PRAGMA foreign_keys=ON;
@@ -5514,6 +5530,53 @@ expect {
     1|1
 }
 
+@cross-check-integrity
+test fk-upsert-later-row-repairs-orphan-on-update-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON UPDATE CASCADE);
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (1, 99), (1, 1) ON CONFLICT(id) DO UPDATE SET pid = 1;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|1
+}
+
+# A deferred ON DELETE SET NULL does not cancel another deferred violation.
+@cross-check-integrity
+test fk-deferred-set-null-keeps-other-deferred-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE d (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE g (did REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO d VALUES (10, 1);
+    BEGIN;
+    INSERT INTO g VALUES (77);
+    DELETE FROM p WHERE id = 1;
+    COMMIT;
+}
+expect error {
+}
+
+# A deferred ON DELETE CASCADE does not cancel another deferred violation.
+@cross-check-integrity
+test fk-deferred-cascade-keeps-other-deferred-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE d (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE g (did REFERENCES d(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1);
+    INSERT INTO d VALUES (10, 1);
+    BEGIN;
+    INSERT INTO g VALUES (77);
+    DELETE FROM p;
+    COMMIT;
+}
+expect error {
+}
+
 # A row without a parent, written while foreign keys were off, is deleted
 # while another row references it. Removing the row's own orphan key must not
 # cancel the violation its removal causes as a parent.
@@ -5571,6 +5634,44 @@ expect {
     1|1
 }
 
+# A trigger fired inside a foreign key action program writes a row of the
+# action's child table that the action did not touch. Its write still repairs
+# a deferred violation of that foreign key.
+test fk-trigger-in-cascade-delete-repairs-deferred-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER tr AFTER DELETE ON c WHEN old.id = 10 BEGIN DELETE FROM c WHERE id = 20; END;
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (10, 1);
+    BEGIN;
+    INSERT INTO c VALUES (20, 99);
+    DELETE FROM p WHERE id = 1;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+test fk-trigger-in-set-null-repairs-deferred-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER tr AFTER UPDATE ON c WHEN old.id = 10 BEGIN UPDATE c SET pid = NULL WHERE id = 20; END;
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (10, 1);
+    BEGIN;
+    INSERT INTO c VALUES (20, 99);
+    DELETE FROM p WHERE id = 1;
+    COMMIT;
+    SELECT id, pid IS NULL FROM c ORDER BY id;
+}
+expect {
+    10|1
+    20|1
+}
+
 # One row frees a referenced parent key and a later row of the same UPDATE
 # takes it, so no child is left without a parent.
 test fk-update-moves-referenced-key-to-another-row {
@@ -5599,4 +5700,87 @@ test fk-update-moves-referenced-non-rowid-key-to-another-row {
 expect {
     1
     3
+}
+
+# The CASCADE of one foreign key deletes the child row, which cancels the
+# violation that another immediate foreign key of that row counted when the
+# parent was deleted. The action program shares the statement's count.
+test fk-cascade-cancels-violation-of-other-immediate-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (f REFERENCES p(id) ON DELETE CASCADE, g REFERENCES p(id));
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (1, 1), (2, 2);
+    DELETE FROM p WHERE id = 1;
+    SELECT f, g FROM c;
+}
+expect {
+    2|2
+}
+
+test fk-cascade-keeps-violation-of-row-it-does-not-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (f REFERENCES p(id) ON DELETE CASCADE, g REFERENCES p(id));
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (2, 1);
+    DELETE FROM p WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Each CASCADE FK of the child row counts it, and deleting the row cancels
+# both counts. The row of o left without its parent keeps its count.
+test fk-two-cascade-fks-of-one-row-keep-violation-of-other-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (f REFERENCES p(id) ON DELETE CASCADE, g REFERENCES p(id) ON DELETE CASCADE);
+    CREATE TABLE o (x REFERENCES p(id));
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (1, 1);
+    INSERT INTO o VALUES (1);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Row 2's SET DEFAULT points it at the missing key 7. Deleting row 2 later
+# in the statement cancels that count.
+test fk-self-ref-set-default-delete-all-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k INTEGER PRIMARY KEY, f REFERENCES t(k) ON DELETE SET DEFAULT DEFAULT 7);
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# Row 1 takes parent 15 before row 5 moves there. Moving row 5 cancels that
+# count, and its ON UPDATE action finds no child of key 5 left.
+test fk-self-ref-update-key-and-reference-with-set-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k INTEGER PRIMARY KEY, f REFERENCES t(k) ON UPDATE SET NULL);
+    INSERT INTO t VALUES (5, NULL), (1, 5);
+    UPDATE t SET k = k + 10, f = f + 10;
+    SELECT k, f FROM t ORDER BY k;
+}
+expect {
+    11|15
+    15|
+}
+
+test fk-self-ref-update-key-and-reference-with-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k INTEGER PRIMARY KEY, f REFERENCES t(k) ON UPDATE CASCADE);
+    INSERT INTO t VALUES (5, NULL), (1, 5);
+    UPDATE t SET k = k + 10, f = f + 10;
+    SELECT k, f FROM t ORDER BY k;
+}
+expect {
+    11|15
+    15|
 }

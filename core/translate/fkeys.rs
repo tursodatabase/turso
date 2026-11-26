@@ -1597,9 +1597,9 @@ fn emit_fk_delete_parent_existence_check_single(
 
 /// Parent-side FK counter checks for UPDATE.
 ///
-/// CASCADE/SET NULL/SET DEFAULT actions are handled later by
-/// `fire_fk_update_actions`; this function only emits counter-based checks
-/// for NO ACTION / RESTRICT foreign keys.
+/// Every foreign key is counted, as in SQLite. The CASCADE/SET NULL/SET DEFAULT
+/// actions that `fire_fk_update_actions` runs later cancel the counts of the
+/// child rows they change.
 ///
 /// Returns deferred NEW-key probes when `new_key_probe_mode` is `AfterReplace`,
 /// so the caller can run them only after the REPLACE write has established the
@@ -1621,10 +1621,7 @@ pub fn emit_fk_update_parent_actions(
     resolver: &Resolver,
 ) -> Result<Vec<DeferredNewKeyProbePlan>> {
     let mut deferred_new_key_plans = Vec::new();
-    let check_fks: Vec<_> = affected_parent_fks
-        .iter()
-        .filter(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict))
-        .collect();
+    let check_fks: Vec<_> = affected_parent_fks.iter().collect();
     if check_fks.is_empty() {
         return Ok(deferred_new_key_plans);
     }
@@ -2387,6 +2384,19 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                     )?;
                 }
                 RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
+                    // Counted like NO ACTION, as in SQLite: the action's change
+                    // to each child row cancels its count, and a child row the
+                    // action leaves without a parent keeps it.
+                    emit_fk_delete_parent_existence_check_single(
+                        program,
+                        &fk_ref,
+                        &parent_bt,
+                        parent_table_name,
+                        parent_cursor_id,
+                        parent_rowid_reg,
+                        database_id,
+                        resolver,
+                    )?;
                     // Decode encoded values so they match the subprogram's decoded column reads
                     decode_fk_key_registers(
                         program,
