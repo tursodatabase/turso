@@ -1115,6 +1115,55 @@ fn constraint_names_cannot_collide_with_relations_in_the_same_statement(db: Temp
 }
 
 #[turso_macros::test(mvcc)]
+fn generated_constraint_index_names_fit_postgres_identifiers(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.inner().pragma_update("foreign_keys", "ON").unwrap();
+    pg.execute("CREATE TABLE abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij (x int PRIMARY KEY)")
+        .unwrap();
+    pg.execute(
+        "CREATE TABLE abcdefghijabcdefghijabcdefghij (abcdefghijabcdefghijabcdefghij int UNIQUE)",
+    )
+    .unwrap();
+    for name in [
+        "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefgh_pkey",
+        "abcdefghijabcdefghijabcdefghi_abcdefghijabcdefghijabcdefghi_key",
+    ] {
+        assert!(class_row(pg.inner(), name).is_some(), "missing {name}");
+    }
+    for (table, expected) in [
+        ("a".repeat(60), format!("{}_pkey", "a".repeat(58))),
+        (
+            format!("{}b", "a".repeat(59)),
+            format!("{}_pkey1", "a".repeat(57)),
+        ),
+        ("é".repeat(30), format!("{}_pkey", "é".repeat(29))),
+        (
+            format!("{}b", "é".repeat(29)),
+            format!("{}_pkey1", "é".repeat(28)),
+        ),
+    ] {
+        pg.execute(format!("CREATE TABLE \"{table}\" (x text PRIMARY KEY)"))
+            .unwrap();
+        assert!(
+            class_row(pg.inner(), &expected).is_some(),
+            "missing {expected}"
+        );
+        assert!(expected.len() <= 63);
+    }
+    pg.execute(format!(
+        "CREATE TABLE refs (a text REFERENCES \"{}\"(x), b text REFERENCES \"{}\"(x))",
+        "a".repeat(60),
+        "é".repeat(30)
+    ))
+    .unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    let error = pg
+        .execute("INSERT INTO refs VALUES ('missing', 'missing')")
+        .unwrap_err();
+    assert_eq!(error.sqlstate, "23503");
+}
+
+#[turso_macros::test(mvcc)]
 fn quoted_relation_names_survive_catalog_updates(db: TempDatabase) {
     let pg = db.connect_postgres();
     pg.execute("CREATE TABLE \"MiXeD\" (id int PRIMARY KEY, x text, \"CoDe\" text UNIQUE)")

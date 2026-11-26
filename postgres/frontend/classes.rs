@@ -980,6 +980,8 @@ fn constraint_index_name(
     key: ConstraintKey<'_>,
     chosen_names: &[String],
 ) -> turso_core::Result<String> {
+    use turso_pg_parser::translator::make_object_name;
+
     let table_name = table.written_name.as_str();
     let (written, columns, label) = match key {
         ConstraintKey::PrimaryKey => (
@@ -1020,17 +1022,11 @@ fn constraint_index_name(
         }
         return Ok(name);
     }
-    let mut name = match &columns {
-        Some(columns) => format!("{table_name}_{columns}_{label}"),
-        None => format!("{table_name}_{label}"),
-    };
+    let mut name = make_object_name(table_name, columns.as_deref(), label);
     let mut number = 0;
     while is_taken(&name) {
         number += 1;
-        name = match &columns {
-            Some(columns) => format!("{table_name}_{columns}_{label}{number}"),
-            None => format!("{table_name}_{label}{number}"),
-        };
+        name = make_object_name(table_name, columns.as_deref(), &format!("{label}{number}"));
     }
     Ok(name)
 }
