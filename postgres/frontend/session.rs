@@ -909,27 +909,40 @@ impl DeferredExecution {
             }
             CommandContext::DropSchema { schema } => {
                 let schema = schema.clone();
-                let foreign_keys_enabled = conn.foreign_keys_enabled();
-                if foreign_keys_enabled {
-                    conn.set_foreign_keys_enabled(false);
-                }
                 conn.set_namespace_being_dropped(
                     conn.qualifier(&schema).map(|namespace| namespace.target.id),
                 );
-                let result = self.run_phase_inner(inner);
+                let result = self.run_phase_without_foreign_keys(&conn, inner);
                 conn.set_namespace_being_dropped(None);
-                if foreign_keys_enabled {
-                    conn.set_foreign_keys_enabled(true);
-                }
                 result.map_err(|error| unsupported_cascade_to_other_schemas(&schema, error))
             }
             CommandContext::Cascade => self
-                .run_phase_inner(inner)
+                .run_phase_without_foreign_keys(&conn, inner)
                 .map_err(unsupported_cascade_to_other_objects),
             CommandContext::DropSeveral => self
-                .run_phase_inner(inner)
+                .run_phase_without_foreign_keys(&conn, inner)
                 .map_err(crate::error::several_dropped_objects_have_dependents),
         }
+    }
+
+    /// Runs a statement of a DROP of a schema or of several relations with
+    /// foreign keys not enforced. The DROP has already checked that no table
+    /// it keeps references a table it drops, and the tables it drops may
+    /// reference each other in any order.
+    fn run_phase_without_foreign_keys(
+        &mut self,
+        conn: &Connection,
+        inner: &mut Statement,
+    ) -> Result<IOResult<()>> {
+        let foreign_keys_enabled = conn.foreign_keys_enabled();
+        if foreign_keys_enabled {
+            conn.set_foreign_keys_enabled(false);
+        }
+        let result = self.run_phase_inner(inner);
+        if foreign_keys_enabled {
+            conn.set_foreign_keys_enabled(true);
+        }
+        result
     }
 
     fn run_phase_inner(&mut self, inner: &mut Statement) -> Result<IOResult<()>> {
@@ -1857,6 +1870,11 @@ fn reject_removal_of_referenced_table(
     tbl_name: &ast::QualifiedName,
     truncate: bool,
 ) -> Result<()> {
+    // A DROP of a schema or of several relations runs its DROP TABLEs with
+    // foreign keys not enforced, after checking the references itself.
+    if !conn.foreign_keys_enabled() {
+        return Ok(());
+    }
     let schema_name = tbl_name.namespace.as_ref().map(|name| name.as_str());
     let table = tbl_name.name.as_str();
     let Some((namespace, _)) = find_main_db_table(conn, tbl_name) else {
@@ -2762,9 +2780,9 @@ fn drop_relations_commands(
     }
     let relations: Vec<Relation> = targets.iter().map(|(target, _)| target.clone()).collect();
     let dropped = in_drop_order(&schema, &relations, stmt.cascade);
-    if stmt.cascade {
-        if let Some((table, referenced)) = foreign_key_from_outside(&schema, &dropped) {
-            return Err(sqlstate_error(
+    if let Some((table, referenced)) = foreign_key_from_outside(&schema, &dropped) {
+        return Err(if stmt.cascade {
+            sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!(
                     "DROP ... CASCADE is not supported when a foreign key of a table that is \
@@ -2772,8 +2790,14 @@ fn drop_relations_commands(
                      {referenced}"
                 ),
                 None,
-            ));
-        }
+            )
+        } else {
+            sqlstate_error(
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop desired object(s) because other objects depend on them",
+                Some(format!("table {table} references table {referenced}")),
+            )
+        });
     }
     for relation in dropped {
         let target_sql = targets

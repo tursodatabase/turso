@@ -1492,6 +1492,31 @@ expect error {
     because other objects depend on them
 }
 
+test drop-several-tables-with-a-parent-before-the-child-that-references-it {
+    CREATE TABLE dm_fk_parent (id int PRIMARY KEY);
+    CREATE TABLE dm_fk_child (pid int REFERENCES dm_fk_parent (id) ON DELETE CASCADE);
+    INSERT INTO dm_fk_parent VALUES (1);
+    INSERT INTO dm_fk_child VALUES (1);
+    DROP TABLE dm_fk_parent, dm_fk_child;
+    SELECT count(*) FROM pg_class WHERE relname IN ('dm_fk_parent', 'dm_fk_child');
+}
+expect {
+    0
+}
+
+test drop-several-tables-refuses-when-a-table-outside-them-references-one {
+    CREATE TABLE dm_fk_referenced (id int PRIMARY KEY);
+    CREATE TABLE dm_fk_other (a int);
+    CREATE TABLE dm_fk_referencing (pid int REFERENCES dm_fk_referenced (id));
+    INSERT INTO dm_fk_referenced VALUES (1);
+    INSERT INTO dm_fk_referencing VALUES (1);
+    DROP TABLE dm_fk_other, dm_fk_referenced;
+}
+@sqlstate 2BP01
+expect error {
+    because other objects depend on them
+}
+
 test drop-several-tables-with-quoted-names-cascade {
     CREATE TABLE "Dm Mixed" (a int);
     CREATE VIEW "Dm View" AS SELECT a FROM "Dm Mixed";
