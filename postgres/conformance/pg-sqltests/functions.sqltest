@@ -378,7 +378,6 @@ expect {
 test pg-input-is-valid-reads-date-and-time-as-the-types-do {
     SELECT CASE WHEN pg_input_is_valid('Jan 5 2024', 'date') THEN 'valid' ELSE 'invalid' END;
     SELECT CASE WHEN pg_input_is_valid('2024-02-30', 'date') THEN 'valid' ELSE 'invalid' END;
-    SELECT CASE WHEN pg_input_is_valid('9:30', 'time') THEN 'valid' ELSE 'invalid' END;
     SELECT CASE WHEN pg_input_is_valid('2024-01-05T10:00+02', 'timestamptz') THEN 'valid' ELSE 'invalid' END;
     SELECT CASE WHEN pg_input_is_valid('zzz', 'timestamp') THEN 'valid' ELSE 'invalid' END;
 }
@@ -386,8 +385,33 @@ expect {
     valid
     invalid
     valid
-    valid
     invalid
+}
+
+# tursopg has no time type: pg_type has no row for it. A type of PostgreSQL
+# that tursopg does not have is refused as not supported.
+@compat-gap "type:time"
+test pg-input-is-valid-reads-time {
+    SELECT pg_input_is_valid('9:30', 'time');
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+@compat-gap "type:interval"
+test pg-input-is-valid-reads-interval {
+    SELECT pg_input_is_valid('1 day', 'pg_catalog.interval'), pg_input_is_valid('{1 day}', '_interval');
+}
+expect {
+    t|t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "pg_catalog.interval" is not supported
 }
 
 test pg-input-error-info-date-out-of-range {
@@ -402,6 +426,109 @@ test pg-input-error-info-date-bad-syntax {
 }
 expect {
     invalid input syntax for type date: "zzz"|22007
+}
+
+# The type name of pg_input_is_valid and pg_input_error_info is read as a
+# statement reads a type name: the grammar turns the SQL spellings into the
+# name of the pg_type row, and the name is looked up.
+
+test pg-input-type-name-in-each-sql-spelling {
+    SELECT pg_input_is_valid('1', 'INTEGER'), pg_input_is_valid('1', 'int'), pg_input_is_valid('1', 'int4'),
+        pg_input_is_valid('1', 'pg_catalog.int4'), pg_input_is_valid('1', '"int4"'),
+        pg_input_is_valid('1', 'double precision'), pg_input_is_valid('t', 'boolean'),
+        pg_input_is_valid('ab', 'character varying(4)'), pg_input_is_valid('abcde', 'varchar(4)');
+}
+expect {
+    t|t|t|t|t|t|t|t|f
+}
+
+test pg-input-type-name-null-is-null {
+    SELECT pg_input_is_valid('1', NULL) IS NULL;
+}
+expect {
+    t
+}
+
+test pg-input-is-valid-refuses-a-type-that-does-not-exist {
+    SELECT pg_input_is_valid('1', 'nosuchtype');
+}
+@sqlstate 42704
+expect error {
+    type "nosuchtype" does not exist
+}
+
+test pg-input-error-info-refuses-a-type-that-does-not-exist {
+    SELECT * FROM pg_input_error_info('x', 'nosuchtype');
+}
+@sqlstate 42704
+expect error {
+    type "nosuchtype" does not exist
+}
+
+# tinyint is a type name of SQLite and not of PostgreSQL.
+test pg-input-error-info-refuses-tinyint {
+    SELECT * FROM pg_input_error_info('x', 'tinyint');
+}
+@sqlstate 42704
+expect error {
+    type "tinyint" does not exist
+}
+
+# integer is a word of the grammar. Quoted, it is the name of no type.
+test pg-input-is-valid-refuses-a-quoted-sql-spelling {
+    SELECT pg_input_is_valid('1', '"integer"');
+}
+@sqlstate 42704
+expect error {
+    type "integer" does not exist
+}
+
+test pg-input-is-valid-refuses-a-quoted-name-in-capitals {
+    SELECT pg_input_is_valid('1', '"INT4"');
+}
+@sqlstate 42704
+expect error {
+    type "INT4" does not exist
+}
+
+test pg-input-is-valid-names-the-schema-of-a-type-that-does-not-exist {
+    SELECT pg_input_is_valid('1', 'pg_catalog.nosuchtype');
+}
+@sqlstate 42704
+expect error {
+    type "pg_catalog.nosuchtype" does not exist
+}
+
+# The built-in types are in pg_catalog.
+test pg-input-is-valid-refuses-a-built-in-type-in-another-schema {
+    SELECT pg_input_is_valid('1', 'public.int4');
+}
+@sqlstate 42704
+expect error {
+    type "public.int4" does not exist
+}
+
+test pg-input-is-valid-refuses-text-after-the-type-name {
+    SELECT pg_input_is_valid('1', 'int4 x');
+}
+@sqlstate 42601
+expect error {}
+
+test pg-input-is-valid-refuses-an-empty-type-name {
+    SELECT pg_input_is_valid('1', '');
+}
+@sqlstate 42601
+expect error {
+    invalid type name ""
+}
+
+test pg-input-error-info-of-an-integer {
+    SELECT message, sql_error_code FROM pg_input_error_info('x', 'integer');
+    SELECT message IS NULL, sql_error_code IS NULL FROM pg_input_error_info('1', 'integer');
+}
+expect {
+    invalid input syntax for type integer: "x"|22P02
+    t|t
 }
 
 test current-setting-numeric-parameter-name-errors {

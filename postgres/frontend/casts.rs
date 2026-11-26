@@ -9,7 +9,7 @@
 //! `CastType`. cast_planning.rs finds the `CastType` of an expression.
 
 use crate::error::sqlstate_error;
-use crate::functions::{float8_text, parse_pg_bool, validate_pg_input};
+use crate::functions::{built_in_input_error, float8_text, parse_pg_bool};
 use crate::pg_type::{parse_oid, IntegerType};
 use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
@@ -407,7 +407,7 @@ fn parse_float(text: &str, target: CastType) -> Result<f64> {
     } else {
         "double precision"
     };
-    if let Some((message, code)) = validate_pg_input(text, type_name) {
+    if let Some((message, code)) = built_in_input_error(target.name(), text) {
         return Err(sqlstate_error(sqlstate_of(&code), message, None));
     }
     text.trim()

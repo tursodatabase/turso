@@ -4209,20 +4209,19 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
     assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
     drop(rows);
 
-    // unknown type: error
+    // unknown type: the statement fails, as in PostgreSQL
     let mut rows = conn
         .query("SELECT message, sql_error_code FROM pg_input_error_info('x', 'nonexistent_type')")
         .unwrap()
         .unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    assert_eq!(
-        row.get_value(0).to_string(),
-        "type \"nonexistent_type\" does not exist"
+    let error = rows.step().unwrap_err();
+    assert_eq!(error.sqlstate, "42704", "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("type \"nonexistent_type\" does not exist"),
+        "{error}"
     );
-    assert_eq!(row.get_value(1).to_string(), "42704");
     drop(rows);
 
     // oid: valid
