@@ -408,6 +408,132 @@ expect {
     1
 }
 
+test table-uuid-column-compared-with-any-uuid-spelling {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    SELECT count(*) FROM t WHERE u = '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}';
+    SELECT count(*) FROM t WHERE u = 'a0eebc999c0b4ef8bb6d6bb9bd380a11';
+    SELECT count(*) FROM t WHERE 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11' = u;
+    SELECT count(*) FROM t WHERE u <> 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    CREATE INDEX t_u ON t (u);
+    SELECT count(*) FROM t WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    SELECT count(*) FROM t WHERE u = '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}';
+    SELECT count(*) FROM t WHERE u = 'a0eebc999c0b4ef8bb6d6bb9bd380a11';
+}
+expect {
+    1
+    1
+    1
+    1
+    0
+    1
+    1
+    1
+}
+
+test table-uuid-column-ordered-against-any-uuid-spelling {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u < 'B0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A10';
+    SELECT count(*) FROM t WHERE u > '{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}';
+    SELECT count(*) FROM t WHERE u <= 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    SELECT count(*) FROM t WHERE u >= 'a0eebc999c0b4ef8bb6d6bb9bd380a12';
+    SELECT count(*) FROM t WHERE u BETWEEN 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11' AND 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    SELECT u FROM t ORDER BY u DESC;
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test table-uuid-column-matched-by-in-case-and-distinct-with-any-spelling {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u IN ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11' OR u = 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+    SELECT CASE u WHEN '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}' THEN 'y' ELSE 'n' END FROM t;
+    SELECT count(*) FROM t WHERE u IS NOT DISTINCT FROM 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    SELECT coalesce(nullif(u, 'a0eebc999c0b4ef8bb6d6bb9bd380a11')::text, 'null') FROM t;
+    CREATE INDEX t_u ON t (u);
+    SELECT count(*) FROM t WHERE u IN ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u IN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u IS NOT DISTINCT FROM 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+}
+expect {
+    1
+    1
+    y
+    1
+    null
+    1
+    1
+    1
+}
+
+test table-uuid-column-joined-with-uuid-expression {
+    CREATE TABLE t (id uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    CREATE TABLE s (x text);
+    INSERT INTO s VALUES ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');
+    SELECT count(*) FROM t, s WHERE t.id = s.x::uuid;
+    SELECT count(*) FROM t, s WHERE t.id = s.x::uuid OR false;
+    SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.x::uuid = t.id);
+}
+expect {
+    1
+    1
+    1
+}
+
+test table-uuid-column-compared-with-invalid-uuid {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u = 'zz';
+}
+expect error {}
+
+test table-uuid-column-joined-with-invalid-uuid-text {
+    CREATE TABLE t (id uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    CREATE TABLE s (x text);
+    INSERT INTO s VALUES ('zz');
+    SELECT count(*) FROM t, s WHERE t.id = s.x::uuid;
+}
+expect error {}
+
+test table-uuid-column-joined-with-invalid-uuid-text-other-table-first {
+    CREATE TABLE t (id uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    CREATE TABLE s (x text);
+    INSERT INTO s VALUES ('zz');
+    SELECT count(*) FROM s, t WHERE t.id = s.x::uuid;
+}
+expect error {}
+
+test table-uuid-column-left-joined-with-text-its-on-terms-drop {
+    CREATE TABLE t (id uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    CREATE TABLE s (x text, k int);
+    INSERT INTO s VALUES ('zz', 1), ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 2);
+    SELECT count(*) FROM t LEFT JOIN s ON s.k = 2 AND t.id = s.x::uuid;
+}
+expect {
+    1
+}
+
+test table-uuid-column-ordered-against-invalid-uuid {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT count(*) FROM t WHERE u < 'zz';
+}
+expect error {}
+
 @setup users
 test table-insert-returning-table-star {
     INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.*;
