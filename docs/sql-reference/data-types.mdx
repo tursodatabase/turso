@@ -37,6 +37,12 @@ other and sort after all other numbers. Text casts format NaN as `NaN`; JSON
 arrays represent it as the string `"NaN"`. `to_char` does not yet support NaN and
 returns SQLSTATE `0A000`.
 
+For PostgreSQL `float4` and `float8`, text input also accepts hexadecimal
+floats such as `'0x1.8p2'` (6). Input and integer casts round directly to the
+target precision. The float arithmetic functions and `sqrt` convert their
+arguments to the declared parameter types before evaluation; an out-of-range
+input raises an error.
+
 ## Type Affinity
 
 When a column is declared with a type name, Turso assigns a **type affinity** to that column. Type affinity is a recommendation for how to store values, not a strict constraint (unless using STRICT tables). Turso uses the same affinity rules as SQLite.

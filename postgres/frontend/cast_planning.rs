@@ -1,6 +1,6 @@
 //! Applies the casts of casts.rs to the expressions of a statement.
 //!
-//! FIXME(pg-catalog): This file is temporary. An expression does not carry its type, so this file reads the type of a cast operand from the type core gives it, which for a type that is not registered is only a name (`cast_rule`, `named_cast_type`), and it has no way to convert a value where the cast is but to rewrite the expression into a call of the function `pg_cast` (`conversion_call`). Once float4, float8 and text are registered types and the expression tree is typed, the engine asks the target type for the cast with the source type in hand, calls `resolve` and `convert` of casts.rs itself, and this file goes away.
+//! FIXME(pg-catalog): This file is temporary. An expression does not carry its type, so this file reads the type of a cast operand from the type core gives it, which for a type that is not registered is only a name (`cast_rule`, `named_cast_type`), and it has no way to convert a value where the cast is but to rewrite the expression into a call of the function `pg_cast` (`conversion_call`). Once text is a registered type and the expression tree is typed, the engine asks the target type for the cast with the source type in hand, calls `resolve` and `convert` of casts.rs itself, and this file goes away.
 
 use crate::casts::{convert, resolve, CastType, CastType::*, Resolution};
 use crate::error::sqlstate_error;
@@ -8,7 +8,9 @@ use crate::functions::format_type;
 use turso_core::ast;
 use turso_core::dialect::{CastContext, CastDecision, CastSource, TypeIdentity, TypeRef};
 use turso_core::{DialectError, LimboError, Register, Result, Value};
-use turso_pg_parser::sqlstate::{SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_UNDEFINED_FUNCTION,
+};
 
 /// Decides a CAST of `operand` to `target` as PostgreSQL does when `CASTS`
 /// covers both types, and fails when PostgreSQL has no such cast.
@@ -28,6 +30,59 @@ pub(crate) fn apply_cast(
         _ => operand.clone(),
     };
     Ok(CastDecision::Applied(operand))
+}
+
+/// Converts a resolved function's arguments using the same input and cast
+/// rules as other expressions. A typed text is not an unknown literal.
+/// FIXME(pg-catalog): The registered function supplies one fixed signature.
+/// A pg_proc overload lookup must choose it before these coercions are made.
+pub(crate) fn coerce_function_arguments(
+    name: &str,
+    arguments: &[&ast::Expr],
+    sources: &[CastSource],
+    targets: &[TypeRef],
+) -> Result<Vec<ast::Expr>> {
+    assert_eq!(arguments.len(), sources.len());
+    assert_eq!(arguments.len(), targets.len());
+    arguments
+        .iter()
+        .zip(sources)
+        .zip(targets)
+        .map(|((argument, source), target)| {
+            if matches!(argument, ast::Expr::Literal(ast::Literal::Null)) {
+                return Ok((*argument).clone());
+            }
+            let Some(cast) = table_cast(&|| source.clone(), target, CastContext::Implicit)? else {
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "argument conversion for function {name} is not supported for this type"
+                    ),
+                    None,
+                ));
+            };
+            match resolve(cast.source, cast.target, cast.context) {
+                Ok(Resolution::Unchanged) => Ok((*argument).clone()),
+                Ok(Resolution::Convert) => Ok(conversion_call(argument, cast.source, cast.target)),
+                Err(_) => {
+                    let names: Vec<String> = sources
+                        .iter()
+                        .map(|source| match source {
+                            CastSource::Typed(ty) => crate::catalog::pg_type_oid(ty.name())
+                                .map(|oid| format_type(oid, -1))
+                                .unwrap_or_else(|| ty.name().to_string()),
+                            _ => "unknown".to_string(),
+                        })
+                        .collect();
+                    Err(sqlstate_error(
+                        SQLSTATE_UNDEFINED_FUNCTION,
+                        format!("function {name}({}) does not exist", names.join(", ")),
+                        None,
+                    ))
+                }
+            }
+        })
+        .collect()
 }
 
 /// Fails as PostgreSQL does when the DEFAULT of the column `column_name` has a
@@ -205,6 +260,8 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
         "oid" => Oid,
         "timestamp" => Timestamp,
         "timestamptz" => TimestampTz,
+        "float4" => Float4,
+        "float8" => Float8,
         // FIXME(pg-catalog): numeric is registered only with a type modifier. Without one it is REAL, which `is_lowered_type_name` leaves to the engine. A numeric type that needs no modifier lets every numeric go through CASTS.
         "numeric" => Numeric,
         // FIXME(pg-catalog): varchar with a length is cast as text, and its length is checked when the value is stored. A pg_cast row for varchar, with the length coercion function, replaces this.
@@ -226,7 +283,7 @@ enum NamePlace {
     Value,
 }
 
-/// FIXME(pg-catalog): This guesses a PostgreSQL type from the name of a type that is not registered. The translator lowers float4 and float8 to REAL and varchar without a length to TEXT, and core gives an expression the SQLite name of its type, so the same name is a different type in a different place. Once float4, float8 and text are registered types, as the integer types are, they are read by `registered_cast_type`, and this function and `NamePlace` go away.
+/// FIXME(pg-catalog): This guesses a PostgreSQL type from the name of a type that is not registered. The translator lowers varchar without a length to TEXT, and core gives an expression the SQLite name of its type, so the same name is a different type in a different place. Once text is a registered type, as the integer types and floats are, they are read by `registered_cast_type`, and this function and `NamePlace` go away.
 /// The type of `CASTS` that the lowercase name `name` of a type that is not
 /// registered stands for.
 fn named_cast_type(name: &str, place: NamePlace) -> Option<CastType> {
@@ -234,9 +291,7 @@ fn named_cast_type(name: &str, place: NamePlace) -> Option<CastType> {
     Some(match (name, place) {
         // FIXME(pg-catalog): An integer written in the statement and the result of a function have no registered type, and core types them INTEGER. They are read as int4, also when PostgreSQL types them bigint, so `count(*)::boolean` is accepted where PostgreSQL has no cast from bigint. The target type still checks its range. Result types from pg_proc, and a literal typed by its size, give the expression its real type.
         ("integer", Value) => Int4,
-        ("float4", _) => Float4,
-        ("float8", _) => Float8,
-        // FIXME(pg-catalog): A float4 column is REAL in the schema, so it is only checked for the range of float8, and a float4 expression is typed float8. A registered float4 type fixes both.
+        // FIXME(pg-catalog): A numeric or money column without a type modifier is REAL in the schema, and core names the result of a function that PostgreSQL types float8 or numeric REAL. Both are read as float8. A registered numeric type, and result types from pg_proc, give them their real type.
         ("real", Column | Value) => Float8,
         // A decimal literal, which core types NUMERIC.
         ("numeric", Value) => Numeric,

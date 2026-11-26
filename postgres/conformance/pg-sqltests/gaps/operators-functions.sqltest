@@ -759,15 +759,11 @@ expect {
 }
 
 # B-85: float output
-@compat-gap "type:float8"
 test float-output {
     SELECT 0.1::float8 + 0.2::float8, 1::float8 / 3, 1e300::float8 * 10;
 }
 expect {
     0.30000000000000004|0.3333333333333333|1e+301
-}
-expect @tursopg {
-    0.30000000000000004|0.3333333333333333|1e301
 }
 
 # B-86: default NULL ordering ASC (nulls last)

@@ -72,7 +72,7 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     let Some(row) = OPERATORS.iter().find(takes_two) else {
         return Ok(OperatorChoice::LeftToTheEngine);
     };
-    if is_spelling_left_to_the_engine(literal, ty.oid) {
+    if is_spelling_left_to_the_engine(literal, ty) {
         return Ok(OperatorChoice::LeftToTheEngine);
     }
     check_number_literal(literal, ty)?;
@@ -242,7 +242,7 @@ pub(crate) fn choose_list_operator(
         .collect();
     let mut left_to_the_engine = literals.is_empty();
     for literal in literals {
-        if is_spelling_left_to_the_engine(literal, common) {
+        if is_spelling_left_to_the_engine(literal, ty) {
             left_to_the_engine = true;
         } else {
             check_number_literal(literal, ty)?;
@@ -346,15 +346,16 @@ fn is_run_by_core(op: &str, types: &[Option<Checked>]) -> bool {
 /// FIXME(registered-types): The engine stores numeric and double precision both as REAL, and cannot hold NaN or an exponent past a double, so these spellings are compared as text and give false. Once numeric is a registered type with its own storage, the input function of the type reads every spelling and this function goes away.
 /// Whether `literal` is a value of the type `oid` that PostgreSQL reads but
 /// the engine cannot store or the input check here does not know. The integer
-/// types and oid read every spelling themselves. For a real, a double precision or a
-/// numeric it is a number in the hex, octal or binary spelling or with
-/// underscores between digits, NaN and the infinities, and a number with an
-/// exponent past the range of a double, which a numeric holds. The engine
-/// names a numeric REAL, like a double precision, so that exponent is not
-/// refused for either. The operator is left to the engine for these, as for
-/// any literal.
-fn is_spelling_left_to_the_engine(literal: &str, oid: i64) -> bool {
-    if [INT2, INT4, INT8, OID].contains(&oid) {
+/// types and oid, and a registered float4 or float8, read every spelling
+/// themselves. For a numeric it is a number in the hex, octal or binary
+/// spelling or with underscores between digits, NaN and the infinities, and a
+/// number with an exponent past the range of a double, which a numeric holds.
+/// The engine names a numeric REAL, so that exponent is not refused. The
+/// operator is left to the engine for these, as for any literal.
+fn is_spelling_left_to_the_engine(literal: &str, ty: &Checked) -> bool {
+    let oid = ty.oid;
+    let is_registered_float = ty.engine.is_none() && [FLOAT4, FLOAT8].contains(&oid);
+    if [INT2, INT4, INT8, OID].contains(&oid) || is_registered_float {
         return false;
     }
     let text = literal.trim();

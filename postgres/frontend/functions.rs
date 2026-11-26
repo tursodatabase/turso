@@ -1,7 +1,10 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::{sqlstate_error, sqlstate_error_with_hint};
-use crate::pg_type::{built_in_type_named, lookup_type_name, type_input, NamedTypeKind};
+use crate::pg_type::{
+    built_in_type_named, float4_arithmetic, float4_negate, float8_arithmetic, float8_negate,
+    lookup_type_name, type_input, FloatOp, NamedTypeKind,
+};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
 use std::collections::HashSet;
@@ -20,11 +23,12 @@ use turso_core::{
 use turso_pg_parser::datetime_unit::DatetimeUnit;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
-    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_INVALID_ARGUMENT_FOR_POWER_FUNCTION, SQLSTATE_INVALID_DATETIME_FORMAT,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -33,21 +37,22 @@ use turso_pg_parser::sqlstate::{
 /// the body returns.
 macro_rules! scalar_functions {
     ($options:expr, |$context:ident, $connection:ident, $args:ident| {
-        $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
+        $($($name:literal)|+ ($arity:expr, $deterministic:expr $(; $parameters:expr)?) => $body:expr,)*
     }) => {{
         let mut options = $options;
-        $($(
+        $(
+            let parameter_types: Option<&'static [&'static str]> = None $(.or(Some($parameters)))?;
+            $(
             #[allow(unused_variables)]
             let step = |$context: &ScalarFuncContext<'_>, $args: &[Register]| -> Result<_> {
                 let $connection = $context.connection;
                 Ok($body)
             };
-            options = options.extension_function(pg_scalar_function(
-                $name,
-                $arity,
-                $deterministic,
-                step,
-            ));
+            let function = pg_scalar_function($name, $arity, $deterministic, step);
+            let function = if let Some(types) = parameter_types {
+                function.with_parameter_types(types)
+            } else { function };
+            options = options.extension_function(function);
         )+)*
         options
     }};
@@ -441,6 +446,32 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
+        "float4pl"(FunctionArity::Exact(2), true; &["float4", "float4"]) => {
+            float4_arithmetic(args, FloatOp::Add)?
+        },
+        "float4mi"(FunctionArity::Exact(2), true; &["float4", "float4"]) => {
+            float4_arithmetic(args, FloatOp::Subtract)?
+        },
+        "float4mul"(FunctionArity::Exact(2), true; &["float4", "float4"]) => {
+            float4_arithmetic(args, FloatOp::Multiply)?
+        },
+        "float4div"(FunctionArity::Exact(2), true; &["float4", "float4"]) => {
+            float4_arithmetic(args, FloatOp::Divide)?
+        },
+        "float4um"(FunctionArity::Exact(1), true; &["float4"]) => float4_negate(args),
+        "float8pl"(FunctionArity::Exact(2), true; &["float8", "float8"]) => {
+            float8_arithmetic(args, FloatOp::Add)?
+        },
+        "float8mi"(FunctionArity::Exact(2), true; &["float8", "float8"]) => {
+            float8_arithmetic(args, FloatOp::Subtract)?
+        },
+        "float8mul"(FunctionArity::Exact(2), true; &["float8", "float8"]) => {
+            float8_arithmetic(args, FloatOp::Multiply)?
+        },
+        "float8div"(FunctionArity::Exact(2), true; &["float8", "float8"]) => {
+            float8_arithmetic(args, FloatOp::Divide)?
+        },
+        "float8um"(FunctionArity::Exact(1), true; &["float8"]) => float8_negate(args),
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
@@ -475,6 +506,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             0i64
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
+        "sqrt"(FunctionArity::Exact(1), true; &["float8"]) => exec_sqrt(args)?,
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
@@ -882,6 +914,24 @@ fn unrecognized_parameter(name: &str) -> LimboError {
         format!("unrecognized configuration parameter \"{name}\""),
         None,
     )
+}
+
+/// Rejects a negative argument before evaluating the square root. A NaN
+/// argument remains a value; it is not a domain error.
+fn exec_sqrt(args: &[Register]) -> Result<Option<f64>> {
+    let number = match args[0].get_value() {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Float(number)) => f64::from(*number),
+        other => unreachable!("sqrt receives a converted float8, got {other:?}"),
+    };
+    if number < 0.0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+            "cannot take square root of a negative number",
+            None,
+        ));
+    }
+    Ok(Some(number.sqrt()))
 }
 
 /// Turns 64 random bits into a number in [0, 1). A double holds 53 bits of

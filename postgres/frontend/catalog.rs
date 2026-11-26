@@ -268,10 +268,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        // random() is a native function (see functions.rs) because it returns
-        // a double, not SQLite's integer. Skipping the builtin lets that one
-        // be found.
-        if name.eq_ignore_ascii_case("random") {
+        // These functions use PostgreSQL result or domain rules. Let the
+        // registered functions in functions.rs supply them.
+        if name.eq_ignore_ascii_case("random") || name.eq_ignore_ascii_case("sqrt") {
             return Ok(None);
         }
         turso_core::dialect::resolve_builtin_function(name, arg_count)
@@ -330,6 +329,16 @@ impl Dialect for PostgresDialect {
         context: turso_core::dialect::CastContext,
     ) -> Result<turso_core::dialect::CastDecision> {
         crate::cast_planning::apply_cast(operand, source, target, context)
+    }
+
+    fn coerce_function_arguments(
+        &self,
+        name: &str,
+        arguments: &[&turso_core::ast::Expr],
+        sources: &[turso_core::dialect::CastSource],
+        targets: &[turso_core::dialect::TypeRef],
+    ) -> Result<Vec<turso_core::ast::Expr>> {
+        crate::cast_planning::coerce_function_arguments(name, arguments, sources, targets)
     }
 
     fn check_column_default(

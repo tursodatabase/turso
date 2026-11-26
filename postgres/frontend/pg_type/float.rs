@@ -4,12 +4,13 @@ use crate::error::sqlstate_error;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use turso_core::ast;
+use turso_core::native_ext::{ReturnType, ScalarReturn};
 use turso_core::schema::{OperatorArg, OperatorSignature};
 use turso_core::type_ordering::{OrderingDef, TypeOrdering};
 use turso_core::types::{Conversion, StorageClass, TextInput, Type};
-use turso_core::{Double, LimboError, Numeric, Result, Value, ValueRef};
+use turso_core::{Double, LimboError, Numeric, Register, Result, Value, ValueRef};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_DIVISION_BY_ZERO, SQLSTATE_INVALID_TEXT_REPRESENTATION,
     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
@@ -60,7 +61,7 @@ impl Type for Float8 {
     }
 
     fn operator_signatures(&self) -> Vec<OperatorSignature> {
-        float_operators()
+        float_operators("float8")
     }
 }
 
@@ -100,7 +101,7 @@ impl Type for Float4 {
     }
 
     fn operator_signatures(&self) -> Vec<OperatorSignature> {
-        float_operators()
+        float_operators("float4")
     }
 }
 
@@ -111,27 +112,43 @@ fn float_params() -> Vec<ast::TypeParam> {
     }]
 }
 
-/// `+`, `-`, `*`, `/` and unary `-` run as SQLite's operators on the numbers
-/// that a float is read as. PostgreSQL has no other operator for floats.
-fn float_operators() -> Vec<OperatorSignature> {
-    use OperatorArg::{PlainValue, Value};
+/// The operators of a float type. As in PostgreSQL, an operator on two
+/// values of the type gives that type, and an operator on a float and
+/// anything else gives a float8: an integer, a decimal number, a numeric, or
+/// a float of the other type. `own` is the name of the type. PostgreSQL has
+/// no other operator for floats.
+///
+/// FIXME(perf): Each of these runs as a call of a scalar function, with a copy
+/// of every operand into argument registers and the generic function dispatch,
+/// where SQLite runs a native instruction. A VDBE instruction that calls a
+/// whitelisted function on two registers directly removes that cost.
+fn float_operators(own: &'static str) -> Vec<OperatorSignature> {
+    use OperatorArg::{PlainValue, Registered, Value};
+    let mut others = vec![PlainValue, Registered("numeric")];
+    if own == "float8" {
+        others.push(Registered("float4"));
+    }
+    let signature = |op, args: Vec<OperatorArg>, func: String, result| OperatorSignature {
+        op,
+        args,
+        func: Some(func),
+        result: Some(result),
+    };
     let mut signatures = Vec::new();
-    for op in ["+", "-", "*", "/"] {
-        for args in [[Value, PlainValue], [PlainValue, Value]] {
-            signatures.push(OperatorSignature {
-                op,
-                args: args.to_vec(),
-                func: None,
-                result: None,
-            });
+    for (op, name) in [("+", "pl"), ("-", "mi"), ("*", "mul"), ("/", "div")] {
+        signatures.push(signature(
+            op,
+            vec![Value, Value],
+            format!("{own}{name}"),
+            own,
+        ));
+        for other in &others {
+            for args in [vec![Value, *other], vec![*other, Value]] {
+                signatures.push(signature(op, args, format!("float8{name}"), "float8"));
+            }
         }
     }
-    signatures.push(OperatorSignature {
-        op: "-",
-        args: vec![Value],
-        func: None,
-        result: None,
-    });
+    signatures.push(signature("-", vec![Value], format!("{own}um"), own));
     signatures
 }
 
@@ -387,6 +404,114 @@ fn round_numeric(number: Numeric, precision: Precision) -> Result<f64> {
 fn out_of_range(message: &str) -> LimboError {
     sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, message, None)
 }
+
+/// A float4 that a function returns, in the form that a column of the type is
+/// read as.
+pub(crate) struct Float4Result(Value);
+
+/// A float8 that a function returns. See [Float4Result].
+pub(crate) struct Float8Result(Value);
+
+impl ScalarReturn for Float4Result {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("float4"));
+
+    fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl ScalarReturn for Float8Result {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("float8"));
+
+    fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum FloatOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+/// `float4pl`, `float4mi`, `float4mul` and `float4div` of PostgreSQL, and the
+/// same for float8. NULL gives NULL.
+pub(crate) fn float4_arithmetic(args: &[Register], op: FloatOp) -> Result<Option<Float4Result>> {
+    Ok(arithmetic(args, op, Precision::Single)?.map(Float4Result))
+}
+
+pub(crate) fn float8_arithmetic(args: &[Register], op: FloatOp) -> Result<Option<Float8Result>> {
+    Ok(arithmetic(args, op, Precision::Double)?.map(Float8Result))
+}
+
+/// `float4um` and `float8um`.
+pub(crate) fn float4_negate(args: &[Register]) -> Option<Float4Result> {
+    operand(&args[0]).map(|number| Float4Result(Value::from_f64(-number)))
+}
+
+pub(crate) fn float8_negate(args: &[Register]) -> Option<Float8Result> {
+    operand(&args[0]).map(|number| Float8Result(Value::from_f64(-number)))
+}
+
+fn arithmetic(args: &[Register], op: FloatOp, precision: Precision) -> Result<Option<Value>> {
+    let (Some(left), Some(right)) = (operand(&args[0]), operand(&args[1])) else {
+        return Ok(None);
+    };
+    let result = match precision {
+        Precision::Single => f64::from(single_arithmetic(op, left as f32, right as f32)?),
+        Precision::Double => double_arithmetic(op, left, right)?,
+    };
+    Ok(Some(Value::from_f64(result)))
+}
+
+/// Reads an argument after the planner converted it to the declared float
+/// type. Text parsing and numeric casts belong to that conversion.
+fn operand(register: &Register) -> Option<f64> {
+    match register.get_value() {
+        Value::Null => None,
+        Value::Numeric(Numeric::Float(float)) => Some(f64::from(*float)),
+        other => unreachable!("a float function receives converted arguments, got {other:?}"),
+    }
+}
+
+/// The checks of `float4pl`, `float4mi`, `float4mul` and `float4div` in
+/// PostgreSQL, written once for each width.
+macro_rules! float_arithmetic {
+    ($name:ident, $float:ty) => {
+        fn $name(op: FloatOp, left: $float, right: $float) -> Result<$float> {
+            if op == FloatOp::Divide && right == 0.0 && !left.is_nan() {
+                return Err(sqlstate_error(
+                    SQLSTATE_DIVISION_BY_ZERO,
+                    "division by zero",
+                    None,
+                ));
+            }
+            let result = match op {
+                FloatOp::Add => left + right,
+                FloatOp::Subtract => left - right,
+                FloatOp::Multiply => left * right,
+                FloatOp::Divide => left / right,
+            };
+            if result.is_infinite() && !left.is_infinite() && !right.is_infinite() {
+                return Err(out_of_range("value out of range: overflow"));
+            }
+            let underflows = match op {
+                FloatOp::Multiply => result == 0.0 && left != 0.0 && right != 0.0,
+                FloatOp::Divide => result == 0.0 && left != 0.0 && !right.is_infinite(),
+                FloatOp::Add | FloatOp::Subtract => false,
+            };
+            if underflows {
+                return Err(out_of_range("value out of range: underflow"));
+            }
+            Ok(result)
+        }
+    };
+}
+
+float_arithmetic!(single_arithmetic, f32);
+float_arithmetic!(double_arithmetic, f64);
 
 /// How floats compare, as PostgreSQL's float8 and float4 do: NaN equals NaN
 /// and is greater than every number, and -0 equals 0. It reads the stored

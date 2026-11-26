@@ -1981,8 +1981,8 @@ fn test_postgres_window_sum_avg_are_finite_after_infinite_values_leave_frame(db:
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE t (n int, x float8)").unwrap();
     conn.execute(
-        "INSERT INTO t VALUES (1, 1e308::float8 * 10), (2, 1), (3, 2), (4, 4), \
-         (5, -1e308::float8 * 10), (6, 1e308::float8 * 10), (7, 8)",
+        "INSERT INTO t VALUES (1, 'Infinity'::float8), (2, 1), (3, 2), (4, 4), \
+         (5, '-Infinity'::float8), (6, 'Infinity'::float8), (7, 8)",
     )
     .unwrap();
 
