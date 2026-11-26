@@ -3547,15 +3547,28 @@ fn translate_virtual_table_insert(
     if virtual_table.readonly() && !allow_dbpage_write {
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }
-    let (num_values, value) = match &mut body {
-        InsertBody::Select(select, None) => match &mut select.body.select {
-            OneSelect::Values(values) => (values[0].len(), values.pop().unwrap()),
-            _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
-        },
-        InsertBody::DefaultValues => (0, vec![]),
-        _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
-    };
+    if matches!(body, InsertBody::Select(_, Some(_))) {
+        crate::bail_parse_error!(
+            "UPSERT not implemented for virtual table \"{}\"",
+            virtual_table.name
+        );
+    }
     let table = Table::Virtual(virtual_table.clone());
+    // The UPSERT actions are not used: a virtual table resolves conflicts itself,
+    // from the conflict mode that VUpdate passes to it.
+    let BoundInsertResult {
+        values,
+        inserting_multiple_rows,
+        ..
+    } = bind_insert(
+        program,
+        resolver,
+        &table,
+        &columns,
+        &mut body,
+        on_conflict.unwrap_or(ResolveType::Abort),
+        namespace,
+    )?;
     let (table_references, result_columns, mut returning_subqueries) = plan_insert_returning(
         program,
         resolver,
@@ -3617,6 +3630,41 @@ fn translate_virtual_table_insert(
     if !allow_dbpage_write {
         program.emit_insn(Insn::VBegin { cursor_id });
     }
+
+    let halt_label = program.allocate_label();
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    let (num_values, row_source) = if inserting_multiple_rows {
+        let InsertBody::Select(select, _) = body else {
+            unreachable!("only a SELECT or VALUES body inserts multiple rows");
+        };
+        let (yield_reg, num_values) =
+            emit_insert_select_coroutine(program, select, halt_label, resolver, connection)?;
+        // As in SQLite, the rows are copied into a temporary table first when
+        // the SELECT reads the virtual table that the INSERT writes to.
+        let temp_table_ctx = if program.is_table_open(&table) {
+            Some(emit_insert_select_into_temp_table(
+                program,
+                ephemeral_table()?,
+                yield_reg,
+                num_values,
+            ))
+        } else {
+            program.preassign_label_to_next_insn(loop_start);
+            program.emit_insn(Insn::Yield {
+                yield_reg,
+                end_offset: loop_end,
+                subtype_clear_start_reg: 0,
+                subtype_clear_count: 0,
+            });
+            None
+        };
+        let select_result_start_reg = program.reg_result_cols_start.unwrap_or(yield_reg + 1);
+        (num_values, Some((select_result_start_reg, temp_table_ctx)))
+    } else {
+        (values.len(), None)
+    };
+
     /* *
      * Inserts for virtual tables are done in a single step.
      * argv[0] = (NULL for insert)
@@ -3631,8 +3679,17 @@ fn translate_virtual_table_insert(
      * argv[2..] = column values
      * */
     let insertion = build_insertion(program, &table, &columns, num_values, true)?;
-
-    translate_rows_single(program, &value, &insertion, resolver, false)?;
+    match &row_source {
+        Some((select_result_start_reg, temp_table_ctx)) => translate_rows_multiple(
+            program,
+            &insertion,
+            *select_result_start_reg,
+            resolver,
+            temp_table_ctx,
+            false,
+        )?,
+        None => translate_rows_single(program, &values, &insertion, resolver, false)?,
+    }
 
     // Like SQLite, RETURNING reads a copy of the row with column affinity
     // applied and with -1 as the rowid when none was given, and leaves the
@@ -3701,12 +3758,29 @@ fn translate_virtual_table_insert(
         conflict_action,
     });
 
+    match &row_source {
+        Some((_, Some(temp_table_ctx))) => {
+            program.emit_insn(Insn::Next {
+                cursor_id: temp_table_ctx.cursor_id,
+                pc_if_next: temp_table_ctx.loop_start_label,
+                fullscan: false,
+                is_index: false,
+            });
+            program.preassign_label_to_next_insn(temp_table_ctx.loop_end_label);
+        }
+        Some((_, None)) => {
+            program.emit_insn(Insn::Goto {
+                target_pc: loop_start,
+            });
+            program.preassign_label_to_next_insn(loop_end);
+        }
+        None => {}
+    }
+
     program.emit_insn(Insn::Close { cursor_id });
     if let Some(buf) = &returning_buffer {
         emit_returning_scan_back(program, buf);
     }
-
-    let halt_label = program.allocate_label();
     program.preassign_label_to_next_insn(halt_label);
 
     program.result_columns = result_columns;

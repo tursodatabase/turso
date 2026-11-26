@@ -155,6 +155,49 @@ do_execsql_test_on_specific_db {:memory:} insert-returning-rowid-into-vtab {
 } {-1|0
 77|k2}
 
+do_execsql_test_on_specific_db {:memory:} insert-multiple-rows-into-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v(key, value) VALUES ('k1', 'v1'), ('k2', 'v2'), ('k3', 'v3') RETURNING key;
+    INSERT INTO v VALUES ('k4', 'v4') UNION ALL VALUES ('k5', 'v5');
+    SELECT key, value FROM v ORDER BY key;
+} {k1
+k2
+k3
+k1|v1
+k2|v2
+k3|v3
+k4|v4
+k5|v5}
+
+do_execsql_test_on_specific_db {:memory:} insert-select-into-vtab {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES ('k1', 'v1'), ('k2', 'v2');
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v SELECT a, b FROM t ORDER BY a RETURNING key, value;
+    INSERT INTO v VALUES ('k3', (SELECT max(b) FROM t)) RETURNING key, value;
+    SELECT key, value FROM v ORDER BY key;
+} {k1|v1
+k2|v2
+k3|v2
+k1|v1
+k2|v2
+k3|v2}
+
+do_execsql_test_on_specific_db {:memory:} insert-select-from-same-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v VALUES ('k1', 'v1'), ('k2', 'v2');
+    INSERT INTO v SELECT key || 'x', value FROM v;
+    SELECT key, value FROM v ORDER BY key;
+} {k1|v1
+k1x|v1
+k2|v2
+k2x|v2}
+
+do_execsql_test_in_memory_error_content upsert-into-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v VALUES ('k1', 'v1') ON CONFLICT DO NOTHING;
+} {UPSERT not implemented for virtual table "v"}
+
 do_execsql_test_in_memory_error_content update-returning-on-vtab {
     CREATE VIRTUAL TABLE v USING kv_store;
     INSERT INTO v VALUES ('k1', 'v1');
