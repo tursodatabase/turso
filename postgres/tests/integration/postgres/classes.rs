@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::common::TempDatabase;
-use turso_core::{Connection, SessionRole, Value};
+use turso_core::{Connection, Numeric, SessionRole, Value};
 
 /// The class rows as `(oid, relname, relnamespace, relkind, relowner)`,
 /// ordered by oid.
@@ -606,6 +606,72 @@ fn stored_relownedbycolumn(conn: &Arc<Connection>, relname: &str) -> Option<Stri
         Value::Text(text) => Some(text.as_str().to_string()),
         other => panic!("relownedbycolumn is text or NULL, got {other:?}"),
     }
+}
+
+/// The stored values of the columns of `relname`'s class row that do not
+/// change when the relation is granted, renamed or given an owner, joined by
+/// commas.
+fn stored_pg_class_columns(conn: &Arc<Connection>, relname: &str) -> String {
+    let columns = "reltype, reloftype, relam, relfilenode, reltablespace, relpages, reltuples, \
+         relallvisible, reltoastrelid, relhasindex, relisshared, relpersistence, relkind, \
+         relnatts, relchecks, relhasrules, relhastriggers, relhassubclass, relforcerowsecurity, \
+         relispopulated, relreplident, relispartition, relrewrite, relfrozenxid, relminmxid, \
+         reloptions, relpartbound";
+    let rows = conn
+        .prepare(format!(
+            "SELECT {columns} FROM __turso_internal_classes WHERE relname = '{relname}'"
+        ))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{relname} has one class row: {rows:?}");
+    rows[0]
+        .iter()
+        .map(|value| match value {
+            Value::Null => "NULL".to_string(),
+            Value::Text(text) => text.as_str().to_string(),
+            Value::Numeric(Numeric::Integer(number)) => number.to_string(),
+            Value::Numeric(Numeric::Float(number)) => f64::from(*number).to_string(),
+            other => panic!("unexpected column value {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[turso_macros::test(mvcc)]
+fn every_new_class_row_has_all_the_columns_of_pg_class(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (id serial, x int)").unwrap();
+    pg.execute("CREATE INDEX t_x ON t (x)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT x FROM t").unwrap();
+
+    let table = "0,0,2,0,0,1,0,0,0,0,0,p,r,0,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
+    let index = "0,0,403,0,0,1,0,0,0,0,0,p,i,0,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
+    let sequence = "0,0,0,0,0,1,1,0,0,0,0,p,S,3,0,0,0,0,0,1,n,0,0,0,0,NULL,NULL";
+    let view = "0,0,0,0,0,1,0,0,0,0,0,p,v,0,0,0,0,0,0,1,n,0,0,0,0,NULL,NULL";
+    assert_eq!(stored_pg_class_columns(&conn, "t"), table);
+    assert_eq!(stored_pg_class_columns(&conn, "t_x"), index);
+    assert_eq!(stored_pg_class_columns(&conn, "t_id_seq"), sequence);
+    assert_eq!(stored_pg_class_columns(&conn, "v"), view);
+}
+
+#[turso_macros::test(mvcc)]
+fn rewriting_a_class_row_keeps_the_columns_it_does_not_change(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("CREATE TABLE t (id serial, x int)").unwrap();
+    let before = stored_pg_class_columns(&conn, "t");
+
+    pg.execute("GRANT SELECT ON t TO reader").unwrap();
+    pg.execute("ALTER TABLE t OWNER TO reader").unwrap();
+    pg.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    pg.execute("CREATE POLICY p ON t USING (true)").unwrap();
+    pg.execute("ALTER TABLE t RENAME TO u").unwrap();
+
+    assert_eq!(stored_pg_class_columns(&conn, "u"), before);
 }
 
 #[turso_macros::test(mvcc)]

@@ -71,29 +71,129 @@ pub(crate) const CLASSES_NAME_INDEX_NAME: &str = "__turso_internal_classes_name"
 /// relation. Smaller oids belong to built-in catalog objects.
 pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 
-/// The columns the rest of this module reads and writes. `relownedby` is
-/// the oid of the table whose serial column owns the relation, 0 when no
-/// relation owns it, and `relownedbycolumn` is the name of that column:
-/// what PostgreSQL records in `pg_depend` as an automatic dependency, kept
-/// here until there is a `pg_depend`, NULL when no relation owns it.
-/// `relacl` is the access control list in the text form of PostgreSQL's `aclitem[]`, NULL
-/// until the first `GRANT`, when the owner has every privilege and nobody
-/// else has any. `relrowsecurity` is 1 when the table has row-level
-/// security, 0 otherwise. `relpolicies` holds the table's row-level security
-/// policies in the form [`policies`] describes, NULL when it has none.
+/// The columns of the catalog table: those of PostgreSQL's `pg_class`, in its
+/// order, then three of ours. `relownedby` is the oid of the table whose
+/// serial column owns the relation, 0 when no relation owns it, and
+/// `relownedbycolumn` is the name of that column, NULL when no relation owns
+/// it: what PostgreSQL records in `pg_depend` as an automatic dependency,
+/// kept here until there is a `pg_depend`. `relpolicies` holds the table's
+/// row-level security policies in the form [`policies`] describes, NULL when
+/// it has none. `relacl` is the access control list in the text form of
+/// PostgreSQL's `aclitem[]`, NULL until the first `GRANT`, when the owner has
+/// every privilege and nobody else has any.
 const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     oid INTEGER PRIMARY KEY, \
     relname TEXT NOT NULL, \
     relnamespace INTEGER NOT NULL, \
-    relkind TEXT NOT NULL, \
+    reltype INTEGER NOT NULL, \
+    reloftype INTEGER NOT NULL, \
     relowner INTEGER NOT NULL, \
-    relownedby INTEGER NOT NULL, \
+    relam INTEGER NOT NULL, \
+    relfilenode INTEGER NOT NULL, \
+    reltablespace INTEGER NOT NULL, \
+    relpages INTEGER NOT NULL, \
+    reltuples REAL NOT NULL, \
+    relallvisible INTEGER NOT NULL, \
+    reltoastrelid INTEGER NOT NULL, \
+    relhasindex BOOLEAN NOT NULL, \
+    relisshared BOOLEAN NOT NULL, \
+    relpersistence TEXT NOT NULL, \
+    relkind TEXT NOT NULL, \
+    relnatts INTEGER NOT NULL, \
+    relchecks INTEGER NOT NULL, \
+    relhasrules BOOLEAN NOT NULL, \
+    relhastriggers BOOLEAN NOT NULL, \
+    relhassubclass BOOLEAN NOT NULL, \
+    relrowsecurity BOOLEAN NOT NULL, \
+    relforcerowsecurity BOOLEAN NOT NULL, \
+    relispopulated BOOLEAN NOT NULL, \
+    relreplident TEXT NOT NULL, \
+    relispartition BOOLEAN NOT NULL, \
+    relrewrite INTEGER NOT NULL, \
+    relfrozenxid INTEGER NOT NULL, \
+    relminmxid INTEGER NOT NULL, \
     relacl TEXT, \
-    relrowsecurity INTEGER NOT NULL DEFAULT 0, \
+    reloptions TEXT, \
+    relpartbound TEXT, \
+    relownedby INTEGER NOT NULL, \
     relpolicies TEXT, \
     relownedbycolumn TEXT)";
 
-const CLASS_COLUMN_COUNT: usize = 10;
+const CLASS_COLUMNS: [&str; 36] = [
+    "oid",
+    "relname",
+    "relnamespace",
+    "reltype",
+    "reloftype",
+    "relowner",
+    "relam",
+    "relfilenode",
+    "reltablespace",
+    "relpages",
+    "reltuples",
+    "relallvisible",
+    "reltoastrelid",
+    "relhasindex",
+    "relisshared",
+    "relpersistence",
+    "relkind",
+    "relnatts",
+    "relchecks",
+    "relhasrules",
+    "relhastriggers",
+    "relhassubclass",
+    "relrowsecurity",
+    "relforcerowsecurity",
+    "relispopulated",
+    "relreplident",
+    "relispartition",
+    "relrewrite",
+    "relfrozenxid",
+    "relminmxid",
+    "relacl",
+    "reloptions",
+    "relpartbound",
+    "relownedby",
+    "relpolicies",
+    "relownedbycolumn",
+];
+
+const CLASS_COLUMN_COUNT: usize = CLASS_COLUMNS.len();
+
+const COLUMN_RELNAME: usize = column_position("relname");
+const COLUMN_RELNAMESPACE: usize = column_position("relnamespace");
+const COLUMN_RELOWNER: usize = column_position("relowner");
+const COLUMN_RELROWSECURITY: usize = column_position("relrowsecurity");
+const COLUMN_RELACL: usize = column_position("relacl");
+const COLUMN_RELOWNEDBY: usize = column_position("relownedby");
+const COLUMN_RELPOLICIES: usize = column_position("relpolicies");
+const COLUMN_RELOWNEDBYCOLUMN: usize = column_position("relownedbycolumn");
+
+const fn column_position(name: &str) -> usize {
+    let mut position = 0;
+    while position < CLASS_COLUMNS.len() {
+        if same_text(CLASS_COLUMNS[position], name) {
+            return position;
+        }
+        position += 1;
+    }
+    panic!("not a column of the classes table");
+}
+
+const fn same_text(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
      ON __turso_internal_classes (relnamespace, relname)";
@@ -1391,46 +1491,13 @@ fn emit_class_row_insert(
 
     emit_class_name_index_insert(program, cursors, namespace, name, oid_reg);
 
-    // The oid is the rowid, so the record keeps NULL for it, as SQLite does
-    // for an INTEGER PRIMARY KEY column.
     let first_column_reg = program.alloc_registers(CLASS_COLUMN_COUNT);
-    program.emit_insn(Insn::Null {
-        dest: first_column_reg,
-        dest_end: None,
-    });
-    program.emit_insn(Insn::String8 {
-        value: name.to_string(),
-        dest: first_column_reg + 1,
-    });
-    program.emit_insn(Insn::Integer {
-        value: i64::from(namespace.as_u32()),
-        dest: first_column_reg + 2,
-    });
-    program.emit_insn(Insn::String8 {
-        value: relkind_letter(kind).to_string(),
-        dest: first_column_reg + 3,
-    });
-    program.emit_insn(Insn::Integer {
-        value: owner.get(),
-        dest: first_column_reg + 4,
-    });
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: first_column_reg + 5,
-    });
-    // No GRANT has touched a new relation, and it has no row-level security.
-    program.emit_insn(Insn::Null {
-        dest: first_column_reg + 6,
-        dest_end: None,
-    });
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: first_column_reg + 7,
-    });
-    program.emit_insn(Insn::Null {
-        dest: first_column_reg + 8,
-        dest_end: Some(first_column_reg + 9),
-    });
+    for (column, value) in new_class_values(name, namespace, kind, owner)
+        .into_iter()
+        .enumerate()
+    {
+        emit_class_value(program, value, first_column_reg + column);
+    }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(first_column_reg),
@@ -1454,7 +1521,88 @@ fn emit_class_row_insert(
         name: name.to_string(),
         kind,
     }
-    .emit(program, oid_reg, first_column_reg + 4);
+    .emit(program, oid_reg, first_column_reg + COLUMN_RELOWNER);
+}
+
+/// A value written into a column of a new class row.
+#[derive(Clone)]
+enum ClassValue {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(String),
+}
+
+/// The columns of a new class row, in table order. The oid is the rowid, so
+/// the record keeps NULL for it, as SQLite does for an INTEGER PRIMARY KEY
+/// column. No GRANT has touched a new relation, so `relacl` is NULL, and it
+/// has no row-level security and no policies.
+fn new_class_values(
+    name: &str,
+    namespace: NamespaceId,
+    kind: RelationKind,
+    owner: RoleId,
+) -> Vec<ClassValue> {
+    let (access_method, replica_identity, reltuples, relnatts) = match kind {
+        RelationKind::Table | RelationKind::MaterializedView => (2, "d", 0.0, 0),
+        RelationKind::Index => (403, "d", 0.0, 0),
+        RelationKind::Sequence => (0, "n", 1.0, 3),
+        RelationKind::View => (0, "n", 0.0, 0),
+    };
+    let mut values = vec![ClassValue::Null; CLASS_COLUMN_COUNT];
+    let mut set = |column: &str, value: ClassValue| values[column_position(column)] = value;
+    set("relname", ClassValue::Text(name.to_string()));
+    set(
+        "relnamespace",
+        ClassValue::Int(i64::from(namespace.as_u32())),
+    );
+    set("reltype", ClassValue::Int(0));
+    set("reloftype", ClassValue::Int(0));
+    set("relowner", ClassValue::Int(owner.get()));
+    set("relam", ClassValue::Int(access_method));
+    set("relfilenode", ClassValue::Int(0));
+    set("reltablespace", ClassValue::Int(0));
+    set("relpages", ClassValue::Int(1));
+    set("reltuples", ClassValue::Real(reltuples));
+    set("relallvisible", ClassValue::Int(0));
+    set("reltoastrelid", ClassValue::Int(0));
+    set("relhasindex", ClassValue::Int(0));
+    set("relisshared", ClassValue::Int(0));
+    set("relpersistence", ClassValue::Text("p".to_string()));
+    set(
+        "relkind",
+        ClassValue::Text(relkind_letter(kind).to_string()),
+    );
+    set("relnatts", ClassValue::Int(relnatts));
+    set("relchecks", ClassValue::Int(0));
+    set("relhasrules", ClassValue::Int(0));
+    set("relhastriggers", ClassValue::Int(0));
+    set("relhassubclass", ClassValue::Int(0));
+    set("relrowsecurity", ClassValue::Int(0));
+    set("relforcerowsecurity", ClassValue::Int(0));
+    set("relispopulated", ClassValue::Int(1));
+    set(
+        "relreplident",
+        ClassValue::Text(replica_identity.to_string()),
+    );
+    set("relispartition", ClassValue::Int(0));
+    set("relrewrite", ClassValue::Int(0));
+    set("relfrozenxid", ClassValue::Int(0));
+    set("relminmxid", ClassValue::Int(0));
+    set("relownedby", ClassValue::Int(0));
+    values
+}
+
+fn emit_class_value(program: &mut ProgramBuilder, value: ClassValue, dest: usize) {
+    match value {
+        ClassValue::Null => program.emit_insn(Insn::Null {
+            dest,
+            dest_end: None,
+        }),
+        ClassValue::Int(value) => program.emit_insn(Insn::Integer { value, dest }),
+        ClassValue::Real(value) => program.emit_insn(Insn::Real { value, dest }),
+        ClassValue::Text(value) => program.emit_insn(Insn::String8 { value, dest }),
+    }
 }
 
 /// Puts the next oid in the returned register and records it as the
@@ -1520,18 +1668,17 @@ fn emit_class_row_set_owned_by(
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
-            ClassRecordColumn::Literal(name.to_string()),
-            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
-            ClassRecordColumn::Register(row.relkind_reg),
-            ClassRecordColumn::Register(row.relowner_reg),
-            ClassRecordColumn::LiteralInt(table_oid),
-            ClassRecordColumn::Register(row.relacl_reg),
-            ClassRecordColumn::Register(row.relrowsecurity_reg),
-            ClassRecordColumn::Register(row.relpolicies_reg),
-            match column {
-                Some(column) => ClassRecordColumn::Literal(column.to_string()),
-                None => ClassRecordColumn::Null,
-            },
+            row,
+            vec![
+                (COLUMN_RELOWNEDBY, ClassRecordColumn::LiteralInt(table_oid)),
+                (
+                    COLUMN_RELOWNEDBYCOLUMN,
+                    match column {
+                        Some(column) => ClassRecordColumn::Literal(column.to_string()),
+                        None => ClassRecordColumn::Null,
+                    },
+                ),
+            ],
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1574,15 +1721,17 @@ fn emit_class_row_rename(
         emit_class_name_index_insert(program, cursors, namespace, new_name, row.rowid_reg);
         let record_reg = emit_class_record(
             program,
-            ClassRecordColumn::Literal(new_name.to_string()),
-            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
-            ClassRecordColumn::Register(row.relkind_reg),
-            ClassRecordColumn::Register(row.relowner_reg),
-            ClassRecordColumn::Register(row.relownedby_reg),
-            ClassRecordColumn::Register(row.relacl_reg),
-            ClassRecordColumn::Register(row.relrowsecurity_reg),
-            ClassRecordColumn::Register(row.relpolicies_reg),
-            ClassRecordColumn::Register(row.relownedbycolumn_reg),
+            row,
+            vec![
+                (
+                    COLUMN_RELNAME,
+                    ClassRecordColumn::Literal(new_name.to_string()),
+                ),
+                (
+                    COLUMN_RELNAMESPACE,
+                    ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
+                ),
+            ],
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1613,15 +1762,11 @@ fn emit_class_row_set_owner(
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
-            ClassRecordColumn::Literal(name.to_string()),
-            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
-            ClassRecordColumn::Register(row.relkind_reg),
-            ClassRecordColumn::Register(owner_reg),
-            ClassRecordColumn::Register(row.relownedby_reg),
-            ClassRecordColumn::Register(acl_reg),
-            ClassRecordColumn::Register(row.relrowsecurity_reg),
-            ClassRecordColumn::Register(row.relpolicies_reg),
-            ClassRecordColumn::Register(row.relownedbycolumn_reg),
+            row,
+            vec![
+                (COLUMN_RELOWNER, ClassRecordColumn::Register(owner_reg)),
+                (COLUMN_RELACL, ClassRecordColumn::Register(acl_reg)),
+            ],
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1645,15 +1790,8 @@ fn emit_class_row_set_acl(
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
-            ClassRecordColumn::Literal(name.to_string()),
-            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
-            ClassRecordColumn::Register(row.relkind_reg),
-            ClassRecordColumn::Register(row.relowner_reg),
-            ClassRecordColumn::Register(row.relownedby_reg),
-            ClassRecordColumn::Register(acl_reg),
-            ClassRecordColumn::Register(row.relrowsecurity_reg),
-            ClassRecordColumn::Register(row.relpolicies_reg),
-            ClassRecordColumn::Register(row.relownedbycolumn_reg),
+            row,
+            vec![(COLUMN_RELACL, ClassRecordColumn::Register(acl_reg))],
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1676,15 +1814,11 @@ fn emit_class_row_set_row_security(
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
-            ClassRecordColumn::Literal(name.to_string()),
-            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
-            ClassRecordColumn::Register(row.relkind_reg),
-            ClassRecordColumn::Register(row.relowner_reg),
-            ClassRecordColumn::Register(row.relownedby_reg),
-            ClassRecordColumn::Register(row.relacl_reg),
-            ClassRecordColumn::LiteralInt(i64::from(enabled)),
-            ClassRecordColumn::Register(row.relpolicies_reg),
-            ClassRecordColumn::Register(row.relownedbycolumn_reg),
+            row,
+            vec![(
+                COLUMN_RELROWSECURITY,
+                ClassRecordColumn::LiteralInt(i64::from(enabled)),
+            )],
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1757,15 +1891,11 @@ fn emit_class_row_set_policies(
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
-            ClassRecordColumn::Literal(name.to_string()),
-            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
-            ClassRecordColumn::Register(row.relkind_reg),
-            ClassRecordColumn::Register(row.relowner_reg),
-            ClassRecordColumn::Register(row.relownedby_reg),
-            ClassRecordColumn::Register(row.relacl_reg),
-            ClassRecordColumn::Register(row.relrowsecurity_reg),
-            ClassRecordColumn::Register(policies_reg),
-            ClassRecordColumn::Register(row.relownedbycolumn_reg),
+            row,
+            vec![(
+                COLUMN_RELPOLICIES,
+                ClassRecordColumn::Register(policies_reg),
+            )],
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -2093,16 +2223,11 @@ fn emit_acl(program: &mut ProgramBuilder, acl: Option<&Acl>) -> usize {
     }
 }
 
-/// The registers that [`emit_find_class_row`] fills for the found row.
+/// The registers that [`emit_find_class_row`] fills for the found row: its
+/// rowid, and its columns from `first_column_reg` on, in table order.
 struct FoundClassRow {
     rowid_reg: usize,
-    relkind_reg: usize,
-    relowner_reg: usize,
-    relownedby_reg: usize,
-    relacl_reg: usize,
-    relrowsecurity_reg: usize,
-    relpolicies_reg: usize,
-    relownedbycolumn_reg: usize,
+    first_column_reg: usize,
 }
 
 /// Scans the classes table for the row of relation `name` of `namespace` and
@@ -2152,25 +2277,19 @@ fn emit_find_class_row(
 
     let row = FoundClassRow {
         rowid_reg: program.alloc_register(),
-        relkind_reg: program.alloc_register(),
-        relowner_reg: program.alloc_register(),
-        relownedby_reg: program.alloc_register(),
-        relacl_reg: program.alloc_register(),
-        relrowsecurity_reg: program.alloc_register(),
-        relpolicies_reg: program.alloc_register(),
-        relownedbycolumn_reg: program.alloc_register(),
+        first_column_reg: program.alloc_registers(CLASS_COLUMN_COUNT),
     };
     program.emit_insn(Insn::RowId {
         cursor_id: cursors.table_cursor_id,
         dest: row.rowid_reg,
     });
-    program.emit_column_or_rowid(cursors.table_cursor_id, 3, row.relkind_reg);
-    program.emit_column_or_rowid(cursors.table_cursor_id, 4, row.relowner_reg);
-    program.emit_column_or_rowid(cursors.table_cursor_id, 5, row.relownedby_reg);
-    program.emit_column_or_rowid(cursors.table_cursor_id, 6, row.relacl_reg);
-    program.emit_column_or_rowid(cursors.table_cursor_id, 7, row.relrowsecurity_reg);
-    program.emit_column_or_rowid(cursors.table_cursor_id, 8, row.relpolicies_reg);
-    program.emit_column_or_rowid(cursors.table_cursor_id, 9, row.relownedbycolumn_reg);
+    for column in COLUMN_RELNAME..CLASS_COLUMN_COUNT {
+        program.emit_column_or_rowid(
+            cursors.table_cursor_id,
+            column,
+            row.first_column_reg + column,
+        );
+    }
     found(program, &row);
     program.emit_insn(Insn::Goto { target_pc: done });
 
@@ -2193,56 +2312,43 @@ enum ClassRecordColumn {
     Register(usize),
 }
 
-/// Builds a class record `(NULL, relname, relnamespace, relkind, relowner,
-/// relownedby, relacl, relrowsecurity, relpolicies, relownedbycolumn)` and
-/// returns its register.
-#[allow(clippy::too_many_arguments)]
+/// Builds the record of the found class row with the columns of `changes`
+/// replaced, and returns its register. The oid is the rowid, so the record
+/// keeps NULL for it.
 fn emit_class_record(
     program: &mut ProgramBuilder,
-    relname: ClassRecordColumn,
-    relnamespace: ClassRecordColumn,
-    relkind: ClassRecordColumn,
-    relowner: ClassRecordColumn,
-    relownedby: ClassRecordColumn,
-    relacl: ClassRecordColumn,
-    relrowsecurity: ClassRecordColumn,
-    relpolicies: ClassRecordColumn,
-    relownedbycolumn: ClassRecordColumn,
+    row: &FoundClassRow,
+    changes: Vec<(usize, ClassRecordColumn)>,
 ) -> usize {
     let first_column_reg = program.alloc_registers(CLASS_COLUMN_COUNT);
     program.emit_insn(Insn::Null {
         dest: first_column_reg,
         dest_end: None,
     });
-    for (offset, column) in [
-        relname,
-        relnamespace,
-        relkind,
-        relowner,
-        relownedby,
-        relacl,
-        relrowsecurity,
-        relpolicies,
-        relownedbycolumn,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let dest = first_column_reg + 1 + offset;
-        match column {
-            ClassRecordColumn::Literal(value) => {
+    let mut changes: HashMap<usize, ClassRecordColumn> = changes.into_iter().collect();
+    for column in COLUMN_RELNAME..CLASS_COLUMN_COUNT {
+        let dest = first_column_reg + column;
+        match changes.remove(&column) {
+            None => {
+                program.emit_insn(Insn::Copy {
+                    src_reg: row.first_column_reg + column,
+                    dst_reg: dest,
+                    extra_amount: 0,
+                });
+            }
+            Some(ClassRecordColumn::Literal(value)) => {
                 program.emit_insn(Insn::String8 { value, dest });
             }
-            ClassRecordColumn::LiteralInt(value) => {
+            Some(ClassRecordColumn::LiteralInt(value)) => {
                 program.emit_insn(Insn::Integer { value, dest });
             }
-            ClassRecordColumn::Null => {
+            Some(ClassRecordColumn::Null) => {
                 program.emit_insn(Insn::Null {
                     dest,
                     dest_end: None,
                 });
             }
-            ClassRecordColumn::Register(src_reg) => {
+            Some(ClassRecordColumn::Register(src_reg)) => {
                 program.emit_insn(Insn::Copy {
                     src_reg,
                     dst_reg: dest,
@@ -2251,6 +2357,10 @@ fn emit_class_record(
             }
         }
     }
+    assert!(
+        changes.is_empty(),
+        "a change names a column of no class row"
+    );
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(first_column_reg),
