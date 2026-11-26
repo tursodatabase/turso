@@ -698,56 +698,7 @@ impl DatabaseReplayGenerator {
             let drop_column = format!("ALTER TABLE {tbl_name} DROP COLUMN {name}");
             self.execute_ddl(&drop_column)?;
         }
-        return Ok(());
-
-        fn renamed_and_dropped_columns<'a>(
-            local_columns: &'a [turso_core::ast::ColumnDefinition],
-            remote_columns: &'a [turso_core::ast::ColumnDefinition],
-        ) -> (
-            Vec<(&'a turso_core::ast::Name, &'a turso_core::ast::Name)>,
-            Vec<&'a turso_core::ast::Name>,
-        ) {
-            let mut renamed = Vec::new();
-            let mut dropped = Vec::new();
-            let mut remote_columns = remote_columns.iter().peekable();
-            for (index, local_column) in local_columns.iter().enumerate() {
-                let local_name = &local_column.col_name;
-                let Some(remote_column) = remote_columns.peek() else {
-                    dropped.push(local_name);
-                    continue;
-                };
-                let remote_name = &remote_column.col_name;
-                if local_name
-                    .as_str()
-                    .eq_ignore_ascii_case(remote_name.as_str())
-                {
-                    remote_columns.next();
-                } else if has_column(&local_columns[index + 1..], remote_name.as_str()) {
-                    // This doesn't correctly handle a remote transaction that swaps two columns,
-                    // https://github.com/tursodatabase/turso/issues/9430 . But for now, this is the
-                    // best we can do. Note that this change didn't introduce the bug.
-                    dropped.push(local_name);
-                } else if is_generated(local_column)
-                    && dropped
-                        .iter()
-                        .any(|name| name.as_str().eq_ignore_ascii_case(remote_name.as_str()))
-                {
-                    // The remote dropped the column `remote_name` and added it
-                    // again at the end, so it added the remote columns from here
-                    // on after that column. A rename to that name would fail,
-                    // because the local column that is dropped still has it. A
-                    // generated column keeps no values, so it is dropped too and
-                    // added again from the remote table. A regular column is not
-                    // dropped, because the remote can have renamed it to the
-                    // dropped name, and a drop would lose its values.
-                    dropped.push(local_name);
-                } else {
-                    renamed.push((local_name, remote_name));
-                    remote_columns.next();
-                }
-            }
-            (renamed, dropped)
-        }
+        Ok(())
     }
 
     /// Execute a DDL statement idempotently: CREATE TABLE for an existing table
@@ -991,6 +942,59 @@ impl DatabaseReplayGenerator {
         };
         Ok((column_names, pk_column_indices, rowid_alias_pk_column_index))
     }
+}
+
+/// Matches the columns of the local table with the columns of the remote table
+/// by position. Returns the local columns to rename, each with its remote name,
+/// and the local columns to drop.
+fn renamed_and_dropped_columns<'a>(
+    local_columns: &'a [turso_core::ast::ColumnDefinition],
+    remote_columns: &'a [turso_core::ast::ColumnDefinition],
+) -> (
+    Vec<(&'a turso_core::ast::Name, &'a turso_core::ast::Name)>,
+    Vec<&'a turso_core::ast::Name>,
+) {
+    let mut renamed = Vec::new();
+    let mut dropped = Vec::new();
+    let mut remote_columns = remote_columns.iter().peekable();
+    for (index, local_column) in local_columns.iter().enumerate() {
+        let local_name = &local_column.col_name;
+        let Some(remote_column) = remote_columns.peek() else {
+            dropped.push(local_name);
+            continue;
+        };
+        let remote_name = &remote_column.col_name;
+        if local_name
+            .as_str()
+            .eq_ignore_ascii_case(remote_name.as_str())
+        {
+            remote_columns.next();
+        } else if has_column(&local_columns[index + 1..], remote_name.as_str()) {
+            // This doesn't correctly handle a remote transaction that swaps two columns,
+            // https://github.com/tursodatabase/turso/issues/9430 . But for now, this is the
+            // best we can do. Note that this change didn't introduce the bug.
+            dropped.push(local_name);
+        } else if local_columns[index..].iter().all(is_generated)
+            && dropped
+                .iter()
+                .any(|name| name.as_str().eq_ignore_ascii_case(remote_name.as_str()))
+        {
+            // The remote dropped the column `remote_name` and added it again at
+            // the end, so it added the remote columns from here on after that
+            // column. A rename to that name would fail, because the local column
+            // that is dropped still has it. This column and the later local
+            // columns are generated and keep no values, so they are dropped too
+            // and added again from the remote table. When one of them is regular,
+            // the column goes to the rename, as before: the remote can have
+            // renamed it to the dropped name. A drop here would make the match
+            // give that name to the next regular column, with its values.
+            dropped.push(local_name);
+        } else {
+            renamed.push((local_name, remote_name));
+            remote_columns.next();
+        }
+    }
+    (renamed, dropped)
 }
 
 /// returns true if a local column is generated and the remote either removed it or modified it
@@ -1308,5 +1312,39 @@ mod tests {
         .unwrap();
         assert!(!generator
             .upsert_needs_null_safe_predelete(&rowid_alias, &[turso_core::Value::Null, text("v")]));
+    }
+
+    /// The remote drops `k` and renames the generated column `g` to `k`. The
+    /// match must rename `g`, and not drop `g` and give the name `k` to the
+    /// regular column `z` after it.
+    #[test]
+    fn match_renames_generated_column_that_a_regular_column_follows() {
+        let local = column_definitions(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, x TEXT, g TEXT AS (upper(x)), z TEXT)",
+        );
+        let remote = column_definitions(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, k TEXT AS (upper(x)), z TEXT)",
+        );
+        let (renamed, dropped) = renamed_and_dropped_columns(&local, &remote);
+        let renamed = renamed
+            .iter()
+            .map(|(old_name, new_name)| (old_name.as_str(), new_name.as_str()))
+            .collect::<Vec<_>>();
+        let dropped = dropped.iter().map(|name| name.as_str()).collect::<Vec<_>>();
+        assert_eq!(renamed, vec![("g", "k")]);
+        assert_eq!(dropped, vec!["k"]);
+    }
+
+    /// Returns the column definitions of the CREATE TABLE statement `sql`.
+    fn column_definitions(sql: &str) -> Vec<turso_core::ast::ColumnDefinition> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let Some(Ok(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::CreateTable {
+            body: turso_core::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        }))) = parser.next()
+        else {
+            panic!("not a CREATE TABLE statement: {sql}");
+        };
+        columns
     }
 }
