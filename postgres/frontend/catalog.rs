@@ -465,19 +465,23 @@ impl Dialect for PostgresDialect {
 
     /// FIXME(registered-types): Core types the columns of the new table with the storage types of the engine. A column of a type that converts values is refused here. A copy of a smallint, integer, bigint or varchar(n) column is accepted, because its values stay what they are, but it is a plain column: it loses the range or length check, and a copied key is not described as its type. A CREATE TABLE AS that gives each column the registered type of its expression replaces this.
     fn check_ctas_column_type(&self, column: &str, type_name: Option<&str>) -> Result<()> {
-        let message = match type_name {
-            Some(type_name) => format!(
-                "CREATE TABLE AS with a column of type {type_name} is not supported (column \"{column}\")"
+        let sqlstate = turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED;
+        Err(match type_name {
+            Some(type_name) => crate::error::sqlstate_error_with_hint(
+                sqlstate,
+                format!(
+                    "CREATE TABLE AS with a column of type {type_name} is not supported (column \"{column}\")"
+                ),
+                "Create the table with CREATE TABLE, then fill it with INSERT ... SELECT.",
             ),
-            None => format!(
-                "CREATE TABLE AS with a column whose type cannot be determined is not supported (column \"{column}\")"
+            None => crate::error::sqlstate_error(
+                sqlstate,
+                format!(
+                    "CREATE TABLE AS with a column whose type cannot be determined is not supported (column \"{column}\")"
+                ),
+                None,
             ),
-        };
-        Err(crate::error::sqlstate_error(
-            turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
-            message,
-            None,
-        ))
+        })
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {

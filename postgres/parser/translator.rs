@@ -16,10 +16,10 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_RECURSION,
     SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_PARAMETER,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
-    SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -298,7 +298,13 @@ impl PostgreSQLTranslator {
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
             NodeRef::AlterSeqStmt(alter) => self.translate_alter_sequence(alter)?,
-            _ => return Err(ParseError::not_supported(node_ref_name(&node))),
+            _ => {
+                let error = ParseError::not_supported(node_ref_name(&node));
+                return Err(match unsupported_statement_hint(&node) {
+                    Some(hint) => error.with_hint(hint),
+                    None => error,
+                });
+            }
         })
     }
 
@@ -661,10 +667,15 @@ impl PostgreSQLTranslator {
                 continue;
             };
             if elem.defname != "owned_by" {
-                return Err(ParseError::not_supported(format!(
+                let error = ParseError::not_supported(format!(
                     "ALTER SEQUENCE {}",
                     elem.defname.to_uppercase().replace('_', " ")
-                )));
+                ));
+                return Err(if elem.defname == "restart" {
+                    error.with_hint("Run SELECT setval('seq', n, false), where n is the value to restart at; the next nextval returns n.")
+                } else {
+                    error
+                });
             }
             let Some(Node::List(list)) = elem.arg.as_ref().and_then(|arg| arg.node.as_ref()) else {
                 return Err(ParseError::internal_error(
@@ -785,7 +796,7 @@ impl PostgreSQLTranslator {
                     if foreign_key.is_some() {
                         return Err(ParseError::not_supported(
                             "multiple REFERENCES on one column",
-                        ));
+                        ).with_hint("Declare each foreign key as a separate table constraint: FOREIGN KEY (col) REFERENCES table."));
                     }
                     foreign_key = Some(extract_foreign_key(constraint)?);
                 }
@@ -1045,7 +1056,8 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::internal_error("GENERATED column missing expression"))?;
         if constraint.generated_kind == "v" {
-            return Err(ParseError::not_supported("a virtual generated column"));
+            return Err(ParseError::not_supported("a virtual generated column")
+                .with_hint("Use GENERATED ALWAYS AS (...) STORED."));
         }
         self.generation_expression_table
             .replace(Some(bare_table_name(tbl_name.name.as_str()).to_string()));
@@ -1127,7 +1139,8 @@ impl PostgreSQLTranslator {
         // The and_chain_is_rejected_in_every_transaction_state test pins the
         // rejection and says what must change.
         if txn.chain {
-            return Err(ParseError::not_supported("COMMIT/ROLLBACK AND CHAIN"));
+            return Err(ParseError::not_supported("COMMIT/ROLLBACK AND CHAIN")
+                .with_hint("Run COMMIT or ROLLBACK, then BEGIN with the same isolation level."));
         }
         check_transaction_options(&txn.options, true)?;
 
@@ -1231,9 +1244,10 @@ impl PostgreSQLTranslator {
         let name = self.qualified_name_from_range_var(relation)?;
 
         if alter.cmds.len() > 1 {
-            return Err(ParseError::not_supported(
-                "ALTER TABLE with multiple subcommands",
-            ));
+            return Err(
+                ParseError::not_supported("ALTER TABLE with multiple subcommands")
+                    .with_hint("Run one ALTER TABLE statement per subcommand, in one transaction."),
+            );
         }
         let cmd_node = alter
             .cmds
@@ -1294,10 +1308,15 @@ impl PostgreSQLTranslator {
             )));
         }
         if cmd.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
-            return Err(ParseError::not_supported(format!(
+            let error = ParseError::not_supported(format!(
                 "ALTER TABLE {} CASCADE",
                 alter_subtype_name(subtype)
-            )));
+            ));
+            return Err(if subtype == AlterTableType::AtDropColumn {
+                error.with_hint("Drop the objects that depend on the column first, then drop the column without CASCADE.")
+            } else {
+                error
+            });
         }
 
         let body = match subtype {
@@ -1376,10 +1395,20 @@ impl PostgreSQLTranslator {
                 ));
             }
             AlterTableType::AtAddConstraint => {
-                return Err(ParseError::sqlstate(
+                let error = ParseError::sqlstate(
                     SQLSTATE_FEATURE_NOT_SUPPORTED,
                     "ALTER TABLE ADD CONSTRAINT is not supported",
-                ));
+                );
+                let is_unique = matches!(
+                    cmd.def.as_ref().and_then(|def| def.node.as_ref()),
+                    Some(pg_query::protobuf::node::Node::Constraint(constraint))
+                        if constraint.contype == pg_query::protobuf::ConstrType::ConstrUnique as i32
+                );
+                return Err(if is_unique {
+                    error.with_hint("Use CREATE UNIQUE INDEX instead.")
+                } else {
+                    error
+                });
             }
             AlterTableType::AtEnableRowSecurity => ast::AlterTableBody::EnableRowSecurity,
             AlterTableType::AtDisableRowSecurity => ast::AlterTableBody::DisableRowSecurity,
@@ -1394,13 +1423,29 @@ impl PostgreSQLTranslator {
                 ));
             }
             _ => {
-                return Err(ParseError::sqlstate(
+                let error = ParseError::sqlstate(
                     SQLSTATE_FEATURE_NOT_SUPPORTED,
                     format!(
                         "ALTER TABLE {} is not supported",
                         alter_subtype_name(subtype)
                     ),
-                ));
+                );
+                return Err(
+                    if matches!(
+                        subtype,
+                        AlterTableType::AtSetStatistics
+                            | AlterTableType::AtSetStorage
+                            | AlterTableType::AtSetCompression
+                            | AlterTableType::AtClusterOn
+                            | AlterTableType::AtDropCluster
+                    ) {
+                        error.with_hint(
+                            "Remove this statement; it does not change the results of queries.",
+                        )
+                    } else {
+                        error
+                    },
+                );
             }
         };
 
@@ -1508,9 +1553,16 @@ impl PostgreSQLTranslator {
 
         let pg_type = extract_type_name(col_def)?;
         if is_serial_type(&pg_type) {
-            return Err(ParseError::not_supported(format!(
-                "{pg_type} in ALTER TABLE"
-            )));
+            let integer_type = match pg_type.to_uppercase().as_str() {
+                "SERIAL2" | "SMALLSERIAL" => "smallint",
+                "SERIAL8" | "BIGSERIAL" => "bigint",
+                _ => "integer",
+            };
+            return Err(
+                ParseError::not_supported(format!("{pg_type} in ALTER TABLE")).with_hint(format!(
+                    "Create a sequence, add the column as {integer_type} NOT NULL DEFAULT nextval('seq'), then run ALTER SEQUENCE ... OWNED BY."
+                )),
+            );
         }
         let typmods = extract_integer_typmods(col_def)?;
         let mapping = map_column_type(&pg_type, &typmods)?;
@@ -1561,10 +1613,15 @@ impl PostgreSQLTranslator {
                 | ConstrType::ConstrAttrNotDeferrable
                 | ConstrType::ConstrAttrImmediate => None,
                 other => {
-                    return Err(ParseError::not_supported(format!(
+                    let error = ParseError::not_supported(format!(
                         "column constraint {} in ALTER TABLE",
                         constr_type_name(other)
-                    )))
+                    ));
+                    return Err(if other == ConstrType::ConstrUnique {
+                        error.with_hint("Add the column, then run CREATE UNIQUE INDEX on it.")
+                    } else {
+                        error
+                    });
                 }
             };
             if let Some(c) = constraint_ast {
@@ -1592,14 +1649,28 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::internal_error("CREATE INDEX missing table name"))?;
         let tbl_name = exact_name(self.map_table_name(&relation.relname));
 
-        if !idx.access_method.is_empty() && !idx.access_method.eq_ignore_ascii_case("btree") {
-            return Err(ParseError::not_supported(format!(
-                "CREATE INDEX ... USING {}",
-                idx.access_method
-            )));
+        // PostgreSQL 18 fails on USING heap with an internal error, so heap
+        // stays a refusal.
+        if !idx.access_method.is_empty()
+            && idx.access_method != "heap"
+            && !PG_INDEX_ACCESS_METHODS.contains(&idx.access_method.as_str())
+        {
+            return Err(ParseError::sqlstate(
+                SQLSTATE_UNDEFINED_OBJECT,
+                format!("access method \"{}\" does not exist", idx.access_method),
+            ));
+        }
+        if !idx.access_method.is_empty() && idx.access_method != "btree" {
+            let error =
+                ParseError::not_supported(format!("CREATE INDEX ... USING {}", idx.access_method));
+            return Err(if ["hash", "brin"].contains(&idx.access_method.as_str()) {
+                error.with_hint("Remove the USING clause to create a B-tree index.")
+            } else {
+                error
+            });
         }
         if !idx.index_including_params.is_empty() {
-            return Err(ParseError::not_supported("CREATE INDEX ... INCLUDE"));
+            return Err(ParseError::not_supported("CREATE INDEX ... INCLUDE").with_hint("Remove the INCLUDE clause. On an index that is not UNIQUE you can instead add the columns to the end of the index key."));
         }
         if idx.nulls_not_distinct {
             return Err(ParseError::not_supported("NULLS NOT DISTINCT"));
@@ -1715,7 +1786,8 @@ impl PostgreSQLTranslator {
             return Err(ParseError::not_supported(format!(
                 "DROP {} of several objects",
                 drop_object_type_name(remove_type)
-            )));
+            ))
+            .with_hint("Run one DROP statement per object."));
         }
         let obj_node = drop
             .objects
@@ -1789,13 +1861,13 @@ impl PostgreSQLTranslator {
         truncate: &pg_query::protobuf::TruncateStmt,
     ) -> Result<ast::Stmt, ParseError> {
         if truncate.relations.len() > 1 {
-            return Err(ParseError::not_supported("TRUNCATE of several tables"));
+            return Err(ParseError::not_supported("TRUNCATE of several tables").with_hint("Run one TRUNCATE per table in one transaction, starting with the tables that reference the others."));
         }
         if truncate.restart_seqs {
-            return Err(ParseError::not_supported("TRUNCATE ... RESTART IDENTITY"));
+            return Err(ParseError::not_supported("TRUNCATE ... RESTART IDENTITY").with_hint("Run TRUNCATE, then run SELECT setval('seq', 1, false) for each sequence the table's columns own (use its start value if that is not 1)."));
         }
         if truncate.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
-            return Err(ParseError::not_supported("TRUNCATE ... CASCADE"));
+            return Err(ParseError::not_supported("TRUNCATE ... CASCADE").with_hint("Remove CASCADE, and also TRUNCATE each table that references this table, in one transaction, starting with the referencing tables."));
         }
         let relation = truncate
             .relations
@@ -1827,7 +1899,7 @@ impl PostgreSQLTranslator {
         let view_name = self.qualified_name_from_range_var(relation)?;
 
         if view.replace {
-            return Err(ParseError::not_supported("CREATE OR REPLACE VIEW"));
+            return Err(ParseError::not_supported("CREATE OR REPLACE VIEW").with_hint("Run DROP VIEW and CREATE VIEW in one transaction. Views that use this view must be dropped and created again too."));
         }
         reject_temporary(relation, "CREATE TEMPORARY VIEW")?;
         if relation.relpersistence == "u" {
@@ -1880,16 +1952,22 @@ impl PostgreSQLTranslator {
                 ..
             } = &select.body.select
             else {
-                return Err(ParseError::not_supported("a column list on a VALUES view"));
+                return Err(ParseError::not_supported("a column list on a VALUES view")
+                    .with_hint("Write the view as SELECT * FROM (VALUES ...) AS t(a, b)."));
             };
-            if result_columns
+            let has_star = result_columns
                 .iter()
-                .any(|c| !matches!(c, ast::ResultColumn::Expr(..)))
-                || result_columns.len() != columns.len()
-            {
+                .any(|c| !matches!(c, ast::ResultColumn::Expr(..)));
+            if !has_star && columns.len() > result_columns.len() {
+                return Err(ParseError::syntax_error(
+                    "CREATE VIEW specifies more column names than columns",
+                ));
+            }
+            if has_star || result_columns.len() != columns.len() {
                 return Err(ParseError::not_supported(
                     "a view column list that does not name every select-list column",
-                ));
+                )
+                .with_hint("Name the columns with AS in the query instead."));
             }
         }
 
@@ -2076,16 +2154,17 @@ impl PostgreSQLTranslator {
             "INSERT",
             SQLSTATE_DUPLICATE_COLUMN,
         )?;
-        let overriding_system_value =
-            match pg_query::protobuf::OverridingKind::try_from(insert.r#override) {
-                Ok(pg_query::protobuf::OverridingKind::OverridingUserValue) => {
-                    return Err(ParseError::not_supported(
+        let overriding_system_value = match pg_query::protobuf::OverridingKind::try_from(
+            insert.r#override,
+        ) {
+            Ok(pg_query::protobuf::OverridingKind::OverridingUserValue) => {
+                return Err(ParseError::not_supported(
                         "INSERT ... OVERRIDING USER VALUE",
-                    ));
-                }
-                Ok(pg_query::protobuf::OverridingKind::OverridingSystemValue) => true,
-                _ => false,
-            };
+                    ).with_hint("List the table's columns without the identity column, and leave out its value: INSERT INTO t (col, ...) VALUES (...)."));
+            }
+            Ok(pg_query::protobuf::OverridingKind::OverridingSystemValue) => true,
+            _ => false,
+        };
         let has_explicit_columns = !columns.is_empty();
 
         // Translate ON CONFLICT clause (upsert)
@@ -2129,6 +2208,9 @@ impl PostgreSQLTranslator {
             {
                 return Err(ParseError::not_supported(
                     "ORDER BY, LIMIT or OFFSET on INSERT ... VALUES",
+                )
+                .with_hint(
+                    "Write INSERT ... SELECT * FROM (VALUES ...) AS v ORDER BY ... LIMIT n.",
                 ));
             }
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
@@ -2148,7 +2230,8 @@ impl PostgreSQLTranslator {
                 if select_stmt.values_lists.len() > 1 {
                     return Err(ParseError::not_supported(
                         "INSERT of several rows whose values are all DEFAULT",
-                    ));
+                    )
+                    .with_hint("Run one INSERT ... DEFAULT VALUES per row."));
                 }
                 if upsert.is_some() {
                     return Err(ParseError::not_supported(
@@ -2331,7 +2414,7 @@ impl PostgreSQLTranslator {
                 .as_ref()
                 .is_some_and(|clause| clause.exprs.iter().any(is_bare_star))
         {
-            return Err(ParseError::not_supported("RETURNING * on UPDATE ... FROM"));
+            return Err(ParseError::not_supported("RETURNING * on UPDATE ... FROM").with_hint("Use RETURNING t.*. Columns of the tables in FROM cannot be returned; read them with a separate SELECT."));
         }
         let returning = self.translate_returning(
             update.returning_clause.as_ref(),
@@ -2364,7 +2447,8 @@ impl PostgreSQLTranslator {
         let tbl_name = self.qualified_name_from_range_var(relation)?;
 
         if !delete.using_clause.is_empty() {
-            return Err(ParseError::not_supported("DELETE ... USING"));
+            return Err(ParseError::not_supported("DELETE ... USING")
+                .with_hint("Use DELETE ... WHERE EXISTS (SELECT 1 FROM ... WHERE ...)."));
         }
 
         // Translate WHERE clause
@@ -2543,20 +2627,25 @@ impl PostgreSQLTranslator {
         {
             return Err(ParseError::not_supported(
                 "a parenthesized leading set operation operand without distinct column names",
+            )
+            .with_hint("Give the columns of the first operand distinct names with AS."));
+        }
+        // PostgreSQL allows INTO only on the first SELECT of a set operation,
+        // and checks that before it looks at the first SELECT's INTO.
+        if right_operands
+            .iter()
+            .any(|(_, rarg)| rarg.into_clause.is_some())
+        {
+            return Err(ParseError::syntax_error(
+                "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT",
             ));
         }
+        check_set_operation_column_counts(leftmost, &right_operands)?;
         let first_select = self.translate_compound_operand(leftmost)?;
         let compounds = right_operands
             .into_iter()
             .rev()
             .map(|(operator, rarg)| {
-                // PostgreSQL allows INTO only on the first SELECT of a set
-                // operation, and says so in parse analysis.
-                if rarg.into_clause.is_some() {
-                    return Err(ParseError::syntax_error(
-                        "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT",
-                    ));
-                }
                 Ok(ast::CompoundSelect {
                     operator,
                     select: self.translate_compound_operand(rarg)?,
@@ -2782,6 +2871,9 @@ impl PostgreSQLTranslator {
                             SQLSTATE_FEATURE_NOT_SUPPORTED,
                             "RIGHT and FULL joins after a comma in FROM are not supported"
                                 .to_string(),
+                        )
+                        .with_hint(
+                            "Write a CROSS JOIN (b RIGHT JOIN c ON ...) instead of the comma.",
                         ));
                     }
                     from_clause.joins.push(ast::JoinedSelectTable {
@@ -2911,7 +3003,7 @@ impl PostgreSQLTranslator {
         if range_func.functions.len() > 1 {
             return Err(ParseError::not_supported(
                 "ROWS FROM with several functions",
-            ));
+            ).with_hint("Call each function WITH ORDINALITY, FULL JOIN them on the ordinality columns, and ORDER BY the ordinality to keep the row order."));
         }
         let func_item = range_func
             .functions
@@ -3098,9 +3190,20 @@ impl PostgreSQLTranslator {
             )));
         }
         if !POSTGRES_TABLE_FUNCTIONS.contains(&func_name) && !func_name.starts_with("pragma_") {
-            return Err(ParseError::not_supported(format!(
-                "{func_name} as a function in FROM"
-            )));
+            let error = ParseError::not_supported(format!("{func_name} as a function in FROM"));
+            return Err(
+                if self
+                    .is_scalar_function
+                    .as_ref()
+                    .is_some_and(|is_scalar| is_scalar(func_name))
+                {
+                    error.with_hint(format!(
+                        "Call the function in the select list: SELECT {func_name}(...)."
+                    ))
+                } else {
+                    error
+                },
+            );
         }
         reject_column_aliases(&range_func.alias, "a function")?;
 
@@ -3358,12 +3461,13 @@ impl PostgreSQLTranslator {
         joins: &mut Vec<ast::JoinedSelectTable>,
     ) -> Result<ast::SelectTable, ParseError> {
         if join_expr.alias.is_some() {
-            return Err(ParseError::not_supported(
-                "an alias on a parenthesized JOIN",
-            ));
+            return Err(
+                ParseError::not_supported("an alias on a parenthesized JOIN")
+                    .with_hint("Use a subquery: (SELECT ... FROM a JOIN b ...) AS j."),
+            );
         }
         if join_expr.join_using_alias.is_some() {
-            return Err(ParseError::not_supported("JOIN ... USING (...) AS alias"));
+            return Err(ParseError::not_supported("JOIN ... USING (...) AS alias").with_hint("Remove the alias after USING (...) and refer to the USING columns without a table name."));
         }
 
         // Recursively process the left side
@@ -3493,7 +3597,8 @@ impl PostgreSQLTranslator {
                                         let [table, _] = col_ref.fields.as_slice() else {
                                             return Err(ParseError::not_supported(
                                                 "schema.table.* in a select list",
-                                            ));
+                                            )
+                                            .with_hint("Write table.* without the schema."));
                                         };
                                         let Some(pg_query::protobuf::node::Node::String(s)) =
                                             &table.node
@@ -3659,7 +3764,19 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::internal_error("TypeCast missing type name"))?;
                 if !pg_type_name.typmods.is_empty() {
-                    return Err(ParseError::not_supported("a type modifier in a cast"));
+                    let error = ParseError::not_supported("a type modifier in a cast");
+                    let hint = match extract_type_name_from_typename(pg_type_name)
+                        .ok()
+                        .map(|name| name.to_ascii_lowercase())
+                        .as_deref()
+                    {
+                        Some("varchar") => Some("Use substr(x, 1, n)."),
+                        _ => None,
+                    };
+                    return Err(match hint {
+                        Some(hint) => error.with_hint(hint),
+                        None => error,
+                    });
                 }
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
@@ -3809,9 +3926,18 @@ impl PostgreSQLTranslator {
                 ) {
                     // pg_query gives the N variants only when a precision was
                     // written. PostgreSQL rounds to it; tursopg cannot yet.
-                    return Err(ParseError::not_supported(
+                    let error = ParseError::not_supported(
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
-                    ));
+                    );
+                    return Err(
+                        if svf.op == SqlValueFunctionOp::SvfopCurrentTimestampN as i32
+                            && svf.typmod == 0
+                        {
+                            error.with_hint("Use date_trunc('second', CURRENT_TIMESTAMP + interval '500 milliseconds').")
+                        } else {
+                            error
+                        },
+                    );
                 }
                 // CURRENT_TIME and LOCALTIME are refused if tursopg does not
                 // support the type each returns in PostgreSQL.
@@ -4028,8 +4154,7 @@ impl PostgreSQLTranslator {
             ),
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
-                Err(ParseError::sqlstate(
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                Err(ParseError::internal_error(
                     "AStar should not be translated as expression".to_string(),
                 ))
             }
@@ -4106,7 +4231,8 @@ impl PostgreSQLTranslator {
             AExprKind::AexprBetween => self.translate_between_expr(a_expr, false),
             AExprKind::AexprNotBetween => self.translate_between_expr(a_expr, true),
             AExprKind::AexprBetweenSym | AExprKind::AexprNotBetweenSym => {
-                Err(ParseError::not_supported("BETWEEN SYMMETRIC"))
+                Err(ParseError::not_supported("BETWEEN SYMMETRIC")
+                    .with_hint("Write (x BETWEEN a AND b OR x BETWEEN b AND a)."))
             }
             AExprKind::AexprDistinct => {
                 // IS DISTINCT FROM → lhs IS NOT rhs
@@ -4581,10 +4707,18 @@ impl PostgreSQLTranslator {
             ("=", false) => false,
             ("<>", true) => true,
             _ => {
-                return Err(ParseError::sqlstate(
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    format!("{op_name} {kw} (array) is not supported"),
-                ));
+                let hint = if is_all {
+                    "Write NOT EXISTS (SELECT 1 FROM unnest(array) AS v(x) WHERE (expr op x) IS NOT TRUE). It returns false where ALL returns NULL, so the result differs under NOT and in a select list."
+                } else {
+                    "Write EXISTS (SELECT 1 FROM unnest(array) AS v(x) WHERE expr op x). It returns false where ANY returns NULL, so the result differs under NOT and in a select list."
+                };
+                let error =
+                    refused_operator(op_name, format!("{op_name} {kw} (array) is not supported"));
+                return Err(if is_pg_operator_name(op_name) {
+                    error.with_hint(hint)
+                } else {
+                    error
+                });
             }
         };
 
@@ -4771,7 +4905,12 @@ impl PostgreSQLTranslator {
             // tursopg implements none of the functions that return a date,
             // and SQLite's date() would run in their place.
             if result_type == "date" {
-                return Err(ParseError::not_supported(format!("{func_name}()")));
+                let error = ParseError::not_supported(format!("{func_name}()"));
+                return Err(if func_name.eq_ignore_ascii_case("date") {
+                    error.with_hint("Cast to date: x::date.")
+                } else {
+                    error
+                });
             }
             check_type_is_supported(result_type, 0)?;
         }
@@ -4783,7 +4922,8 @@ impl PostgreSQLTranslator {
             ));
         }
         if func_call.func_variadic {
-            return Err(ParseError::not_supported("a VARIADIC function argument"));
+            return Err(ParseError::not_supported("a VARIADIC function argument")
+                .with_hint("Pass the array elements as separate arguments."));
         }
 
         // Translate FILTER clause
@@ -5233,7 +5373,8 @@ impl PostgreSQLTranslator {
                     return Err(ParseError::not_supported(format!(
                         "{} ANY/SOME (subquery)",
                         op.last().map(String::as_str).unwrap_or_default()
-                    )));
+                    ))
+                    .with_hint("Write EXISTS (SELECT 1 FROM ... WHERE x op column). It returns false where ANY returns NULL, so the result differs under NOT and in a select list."));
                 }
                 // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
@@ -5246,10 +5387,20 @@ impl PostgreSQLTranslator {
                     rhs: select,
                 })
             }
-            other => Err(ParseError::sqlstate(
-                SQLSTATE_FEATURE_NOT_SUPPORTED,
-                format!("Unsupported SubLink type: {other:?}",),
+            SubLinkType::AllSublink => {
+                let op = extract_key_columns(&sub_link.oper_name)?;
+                Err(ParseError::not_supported(format!(
+                    "{} ALL (subquery)",
+                    op.last().map(String::as_str).unwrap_or_default()
+                ))
+                .with_hint("Write NOT EXISTS (SELECT 1 FROM ... WHERE (x op column) IS NOT TRUE). It returns false where ALL returns NULL, so the result differs under NOT and in a select list."))
+            }
+            SubLinkType::RowcompareSublink => Err(ParseError::not_supported(
+                "a row comparison with a subquery",
             )),
+            other => Err(ParseError::internal_error(format!(
+                "unexpected SubLink type {other:?}"
+            ))),
         }
     }
 
@@ -5468,7 +5619,8 @@ impl PostgreSQLTranslator {
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<Option<ast::Limit>, ParseError> {
         if select.limit_option() == pg_query::protobuf::LimitOption::WithTies {
-            return Err(ParseError::not_supported("FETCH FIRST ... WITH TIES"));
+            return Err(ParseError::not_supported("FETCH FIRST ... WITH TIES")
+                .with_hint("Filter on rank() OVER (ORDER BY ...) <= n in a subquery, using the query's ORDER BY in OVER."));
         }
         self.translate_limit(&select.limit_count, &select.limit_offset)
     }
@@ -5647,7 +5799,8 @@ impl PostgreSQLTranslator {
         // Translate conflict target (the columns in ON CONFLICT (col1, col2))
         let index = if let Some(infer) = &clause.infer {
             if !infer.conname.is_empty() {
-                return Err(ParseError::not_supported("ON CONFLICT ON CONSTRAINT"));
+                return Err(ParseError::not_supported("ON CONFLICT ON CONSTRAINT")
+                    .with_hint("Name the constraint's columns instead: ON CONFLICT (col, ...)."));
             }
             if !infer.index_elems.is_empty() {
                 let targets: Vec<ast::SortedColumn> = infer
@@ -6007,9 +6160,13 @@ impl PostgreSQLTranslator {
             ));
         }
         if !type_name_node.typmods.is_empty() {
-            return Err(ParseError::not_supported(format!(
-                "a type modifier on {pg_type} in CREATE DOMAIN"
-            )));
+            let error =
+                ParseError::not_supported(format!("a type modifier on {pg_type} in CREATE DOMAIN"));
+            return Err(if pg_type == "varchar" {
+                error.with_hint("Use varchar with CHECK (length(VALUE) <= n). A cast of a longer value to the domain then fails instead of being cut to n characters.")
+            } else {
+                error
+            });
         }
         if domain
             .coll_clause
@@ -6636,10 +6793,17 @@ impl SequenceOptions {
                                 if extract_key_columns(&l.items).is_ok_and(|n| n == ["none"])
                         ) => {}
                     other => {
-                        return Err(ParseError::not_supported(format!(
+                        let error = ParseError::not_supported(format!(
                             "CREATE SEQUENCE option {}",
                             other.to_uppercase().replace('_', " ")
-                        )))
+                        ));
+                        return Err(if other == "owned_by" {
+                            error.with_hint(
+                                "Create the sequence, then run ALTER SEQUENCE ... OWNED BY.",
+                            )
+                        } else {
+                            error
+                        });
                     }
                 }
             } else {
@@ -7024,20 +7188,7 @@ fn check_explain_options(options: &[pg_query::protobuf::Node]) -> Result<(), Par
             }
         };
         if choices.is_empty() {
-            let is_boolean = match arg {
-                None => true,
-                Some(Node::String(value)) => ["true", "false", "on", "off"]
-                    .iter()
-                    .any(|word| value.sval.eq_ignore_ascii_case(word)),
-                Some(Node::Integer(value)) => matches!(value.ival, 0 | 1),
-                Some(_) => false,
-            };
-            if !is_boolean {
-                return Err(ParseError::sqlstate(
-                    SQLSTATE_SYNTAX_ERROR,
-                    format!("{name} requires a Boolean value"),
-                ));
-            }
+            crate::defelem::boolean_option(elem)?;
             continue;
         }
         let value = match arg {
@@ -7585,7 +7736,11 @@ fn translate_create_role(
     match RoleStmtType::try_from(stmt.stmt_type) {
         Ok(RoleStmtType::RolestmtRole) => {}
         Ok(RoleStmtType::RolestmtUser) => return Err(ParseError::not_supported("CREATE USER")),
-        Ok(RoleStmtType::RolestmtGroup) => return Err(ParseError::not_supported("CREATE GROUP")),
+        Ok(RoleStmtType::RolestmtGroup) => {
+            return Err(
+                ParseError::not_supported("CREATE GROUP").with_hint("Use CREATE ROLE instead.")
+            )
+        }
         _ => {
             return Err(ParseError::internal_error(format!(
                 "unknown CREATE ROLE statement type: {}",
@@ -7768,7 +7923,8 @@ fn translate_drop_policy(drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stm
     use pg_query::protobuf::node::Node;
 
     if drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
-        return Err(ParseError::not_supported("DROP POLICY ... CASCADE"));
+        return Err(ParseError::not_supported("DROP POLICY ... CASCADE")
+            .with_hint("Remove CASCADE; nothing depends on a policy."));
     }
     let [object] = drop.objects.as_slice() else {
         return Err(ParseError::internal_error("DROP POLICY: invalid name"));
@@ -10237,7 +10393,8 @@ pub fn try_extract_copy_from(
         return Ok(None);
     }
     if copy.where_clause.is_some() {
-        return Err(ParseError::not_supported("COPY FROM ... WHERE"));
+        return Err(ParseError::not_supported("COPY FROM ... WHERE")
+            .with_hint("COPY into a staging table, then INSERT INTO ... SELECT ... WHERE."));
     }
 
     let Some(relation) = copy.relation.as_ref() else {
@@ -10264,7 +10421,7 @@ pub fn try_extract_copy_from(
     let mut header = false;
     let mut null_string = None;
 
-    crate::copy::check_copy_options(&copy.options)?;
+    crate::copy::check_copy_options(&copy.options, true)?;
     for opt in &copy.options {
         let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
             return Err(ParseError::internal_error("COPY: unexpected option node"));
@@ -10274,7 +10431,8 @@ pub fn try_extract_copy_from(
                 // Only support text format for now
                 let val = copy_string_option(def)?;
                 if val.to_lowercase() != "text" {
-                    return Err(ParseError::not_supported(format!("COPY FORMAT {val}")));
+                    return Err(ParseError::not_supported(format!("COPY FORMAT {val}"))
+                        .with_hint("Use FORMAT text."));
                 }
             }
             "delimiter" => {
@@ -10289,38 +10447,33 @@ pub fn try_extract_copy_from(
             }
             "header" => {
                 use pg_query::protobuf::node::Node;
-                header = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
-                    None => true,
-                    Some(Node::Boolean(b)) => b.boolval,
-                    Some(Node::Integer(i)) if matches!(i.ival, 0 | 1) => i.ival == 1,
-                    Some(Node::String(s)) => match s.sval.to_lowercase().as_str() {
-                        "true" | "on" | "1" => true,
-                        "false" | "off" | "0" => false,
-                        _ => return Err(ParseError::not_supported("this COPY HEADER value")),
-                    },
-                    _ => return Err(ParseError::not_supported("this COPY HEADER value")),
-                };
+                let is_match = matches!(
+                    def.arg.as_ref().and_then(|n| n.node.as_ref()),
+                    Some(Node::String(s)) if s.sval.eq_ignore_ascii_case("match")
+                );
+                if is_match {
+                    return Err(
+                        ParseError::not_supported("this COPY HEADER value").with_hint(
+                            "Use HEADER true; the header line is skipped but not checked.",
+                        ),
+                    );
+                }
+                header = crate::defelem::boolean_option(def)?;
             }
             "null" => null_string = Some(copy_string_option(def)?),
             "encoding" => {
                 let val = copy_string_option(def)?;
                 if !matches!(val.to_lowercase().as_str(), "utf8" | "utf-8" | "unicode") {
-                    return Err(ParseError::not_supported(format!("COPY ENCODING {val}")));
+                    return Err(ParseError::not_supported(format!("COPY ENCODING {val}"))
+                        .with_hint("Convert the data to UTF8 and leave out ENCODING."));
                 }
             }
             "freeze" => {
-                use pg_query::protobuf::node::Node;
-                let freeze = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
-                    None => true,
-                    Some(Node::Boolean(b)) => b.boolval,
-                    Some(Node::Integer(i)) if matches!(i.ival, 0 | 1) => i.ival == 1,
-                    Some(Node::String(s)) => {
-                        !matches!(s.sval.to_lowercase().as_str(), "false" | "off" | "0")
-                    }
-                    _ => true,
-                };
+                let freeze = crate::defelem::boolean_option(def)?;
                 if freeze {
-                    return Err(ParseError::not_supported("COPY ... FREEZE"));
+                    return Err(
+                        ParseError::not_supported("COPY ... FREEZE").with_hint("Remove FREEZE.")
+                    );
                 }
             }
             other => {
@@ -10742,6 +10895,23 @@ fn camel_to_sql(s: &str) -> String {
     result
 }
 
+/// The workaround for a statement that tursopg refuses, if one keeps the
+/// results of queries the same.
+fn unsupported_statement_hint(node: &NodeRef) -> Option<&'static str> {
+    match node {
+        NodeRef::VacuumStmt(_)
+        | NodeRef::CheckPointStmt(_)
+        | NodeRef::ReindexStmt(_)
+        | NodeRef::ClusterStmt(_) => {
+            Some("Remove this statement; it does not change the results of queries.")
+        }
+        NodeRef::PrepareStmt(_) | NodeRef::ExecuteStmt(_) | NodeRef::DeallocateStmt(_) => Some(
+            "Use the prepared statements of your driver (the extended query protocol) instead.",
+        ),
+        _ => None,
+    }
+}
+
 /// Returns a human-readable SQL name for a `NodeRef` statement type.
 /// Strips the "Stmt" suffix and converts CamelCase → "CREATE EXTENSION" etc.
 fn node_ref_name(node: &NodeRef) -> String {
@@ -10808,7 +10978,8 @@ fn reject_constraint_attributes(
         ));
     }
     if !constraint.including.is_empty() {
-        return Err(ParseError::not_supported("INCLUDE on a constraint"));
+        return Err(ParseError::not_supported("INCLUDE on a constraint")
+            .with_hint("Remove the INCLUDE clause."));
     }
     if (!constraint.options.is_empty() && contype != ConstrType::ConstrIdentity)
         || !constraint.indexspace.is_empty()
@@ -10829,12 +11000,17 @@ fn reject_constraint_attributes(
         ));
     }
     if !matches!(constraint.fk_matchtype.as_str(), "" | "s") {
-        return Err(ParseError::not_supported(
-            "a MATCH FULL / MATCH PARTIAL foreign key",
-        ));
+        let error = ParseError::not_supported("a MATCH FULL / MATCH PARTIAL foreign key");
+        return Err(if constraint.fk_matchtype == "f" {
+            error.with_hint("Use MATCH SIMPLE and add a CHECK that the referencing columns are all NULL or all non-NULL, such as CHECK ((a IS NULL) = (b IS NULL)).")
+        } else {
+            error
+        });
     }
     if constraint.is_no_inherit {
-        return Err(ParseError::not_supported("a NO INHERIT constraint"));
+        return Err(
+            ParseError::not_supported("a NO INHERIT constraint").with_hint("Remove NO INHERIT.")
+        );
     }
     if !constraint.is_enforced
         && matches!(contype, ConstrType::ConstrCheck | ConstrType::ConstrForeign)
@@ -10879,21 +11055,37 @@ fn reject_temporary(relation: &pg_query::protobuf::RangeVar, what: &str) -> Resu
     Ok(())
 }
 
+/// The index access methods of PostgreSQL 18's pg_am.
+// FIXME(pg-catalog): hand-copied from pg_am; tursopg has no pg_am to read.
+const PG_INDEX_ACCESS_METHODS: &[&str] = &["btree", "hash", "gist", "gin", "spgist", "brin"];
+
 fn reject_table_storage_clauses(
     options: &[pg_query::protobuf::Node],
     tablespace: &str,
     access_method: &str,
 ) -> Result<(), ParseError> {
     if !options.is_empty() {
-        return Err(ParseError::not_supported("WITH (storage parameters)"));
+        return Err(ParseError::not_supported("WITH (storage parameters)")
+            .with_hint("Remove the WITH clause."));
     }
     if !tablespace.is_empty() {
-        return Err(ParseError::not_supported("TABLESPACE"));
+        return Err(
+            ParseError::not_supported("TABLESPACE").with_hint("Remove the TABLESPACE clause.")
+        );
     }
-    if !access_method.is_empty() && !access_method.eq_ignore_ascii_case("heap") {
-        return Err(ParseError::not_supported(format!(
-            "table access method {access_method}"
-        )));
+    // PostgreSQL 18 has no table access method other than heap.
+    if !access_method.is_empty() && access_method != "heap" {
+        return Err(if PG_INDEX_ACCESS_METHODS.contains(&access_method) {
+            ParseError::sqlstate(
+                SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+                format!("access method \"{access_method}\" is not of type TABLE"),
+            )
+        } else {
+            ParseError::sqlstate(
+                SQLSTATE_UNDEFINED_OBJECT,
+                format!("access method \"{access_method}\" does not exist"),
+            )
+        });
     }
     Ok(())
 }
@@ -10921,9 +11113,10 @@ fn reject_index_elem_clauses(
         )));
     }
     if !elem.opclass.is_empty() || !elem.opclassopts.is_empty() {
-        return Err(ParseError::not_supported(format!(
-            "an operator class in {context}"
-        )));
+        return Err(
+            ParseError::not_supported(format!("an operator class in {context}"))
+                .with_hint("Remove the operator class."),
+        );
     }
     Ok(())
 }
@@ -11035,14 +11228,70 @@ fn compound_operator(
     }
 }
 
+/// Returns the 42601 error PostgreSQL gives when an operand of a set
+/// operation has a different number of columns than the first operand.
+/// Operands whose column count is not known before translation (a nested set
+/// operation, or a `*` in the select list) are skipped.
+fn check_set_operation_column_counts(
+    first: &pg_query::protobuf::SelectStmt,
+    right_operands: &[(ast::CompoundOperator, &pg_query::protobuf::SelectStmt)],
+) -> Result<(), ParseError> {
+    let Some(expected) = set_operand_column_count(first) else {
+        return Ok(());
+    };
+    for (operator, operand) in right_operands.iter().rev() {
+        if set_operand_column_count(operand).is_some_and(|count| count != expected) {
+            let name = match operator {
+                ast::CompoundOperator::Union | ast::CompoundOperator::UnionAll => "UNION",
+                ast::CompoundOperator::Intersect => "INTERSECT",
+                ast::CompoundOperator::Except => "EXCEPT",
+            };
+            return Err(ParseError::syntax_error(format!(
+                "each {name} query must have the same number of columns"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn set_operand_column_count(select: &pg_query::protobuf::SelectStmt) -> Option<usize> {
+    use pg_query::protobuf::node::Node;
+
+    if is_set_operation(select) {
+        return None;
+    }
+    if select.target_list.is_empty() {
+        return match select.values_lists.first()?.node.as_ref()? {
+            Node::List(row) => Some(row.items.len()),
+            _ => None,
+        };
+    }
+    let has_star = select.target_list.iter().any(|target| {
+        let Some(Node::ResTarget(target)) = &target.node else {
+            return false;
+        };
+        matches!(
+            target.val.as_ref().and_then(|val| val.node.as_ref()),
+            Some(Node::ColumnRef(column))
+                if matches!(column.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_)))
+        )
+    });
+    (!has_star).then_some(select.target_list.len())
+}
+
 fn reject_column_aliases(
     alias: &Option<pg_query::protobuf::Alias>,
     what: &str,
 ) -> Result<(), ParseError> {
     if alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) {
-        return Err(ParseError::not_supported(format!(
-            "a column alias list on {what}"
-        )));
+        let error = ParseError::not_supported(format!("a column alias list on {what}"));
+        return Err(if what == "a table" {
+            error.with_hint(
+                "Rename the columns with AS in a subquery: (SELECT a AS p, ... FROM t) AS x.",
+            )
+        } else {
+            error
+        });
     }
     Ok(())
 }
@@ -14381,7 +14630,7 @@ mod tests {
             "storage parameters",
         );
         assert_not_supported("CREATE TABLE t (a int) TABLESPACE ts", "TABLESPACE");
-        assert_not_supported("CREATE TABLE t (a int) USING columnar", "access method");
+        assert_rejected("CREATE TABLE t (a int) USING columnar", "access method");
         assert_translates("CREATE TABLE t (a int) USING heap");
     }
 
@@ -14631,8 +14880,11 @@ mod tests {
     #[test]
     fn fail_closed_view_column_list() {
         assert_not_supported("CREATE UNLOGGED VIEW v AS SELECT 1", "UNLOGGED VIEW");
-        for sql in [
+        assert_rejected(
             "CREATE VIEW v (p, q, r) AS SELECT a, b FROM t",
+            "more column names than columns",
+        );
+        for sql in [
             "CREATE VIEW v (p) AS SELECT a, b FROM t",
             "CREATE VIEW v (p, q) AS SELECT * FROM t",
         ] {
@@ -14671,7 +14923,7 @@ mod tests {
             "CREATE TABLE t TABLESPACE ts AS SELECT 1 AS a",
             "TABLESPACE",
         );
-        assert_not_supported(
+        assert_rejected(
             "CREATE MATERIALIZED VIEW m USING columnar AS SELECT 1 AS a",
             "access method",
         );

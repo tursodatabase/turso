@@ -69,6 +69,21 @@ pub fn sqlstate_error(
     }))
 }
 
+/// Like `sqlstate_error`, with the HINT `hint`: how to get the same result in
+/// a way that tursopg supports.
+pub fn sqlstate_error_with_hint(
+    sqlstate: &'static str,
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: sqlstate,
+        message: message.into(),
+        detail: None,
+        hint: Some(hint.into()),
+    }))
+}
+
 const DROP_CASCADE_HINT: &str = "Use DROP ... CASCADE to drop the dependent objects too.";
 
 /// The error of a DROP of several objects that `error` refused because other

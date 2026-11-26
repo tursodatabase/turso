@@ -36,6 +36,8 @@ pub(crate) fn try_extract_copy_to_stdout(
             "expected one statement",
         ));
     }
+    // PostgreSQL reads the options before it opens the destination.
+    check_copy_options(&copy.options, false)?;
     if copy.is_program {
         return Err(ParseError::sqlstate(
             crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
@@ -46,7 +48,8 @@ pub(crate) fn try_extract_copy_to_stdout(
         return Err(ParseError::sqlstate(
             crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
             "COPY TO only supports STDOUT",
-        ));
+        )
+        .with_hint("Use COPY ... TO STDOUT and write the file in the client (psql \\copy)."));
     }
     let table = copy.relation.as_ref().ok_or_else(|| {
         ParseError::sqlstate(
@@ -77,30 +80,10 @@ pub(crate) fn try_extract_copy_to_stdout(
             "COPY cannot name another database",
         ));
     }
-    check_copy_options(&copy.options)?;
     for option in &copy.options {
         let Some(Node::DefElem(option)) = &option.node else {
             unreachable!("COPY options are DefElem nodes");
         };
-        // PostgreSQL rejects FREEZE and an ON_ERROR other than stop for COPY TO
-        // after it has read all options.
-        let rejected_for_copy_to = match option.defname.as_str() {
-            "freeze" => boolean_option(option)?,
-            "on_error" => !matches!(
-                option.arg.as_ref().and_then(|arg| arg.node.as_ref()),
-                Some(Node::String(value)) if value.sval.eq_ignore_ascii_case("stop")
-            ),
-            _ => false,
-        };
-        if rejected_for_copy_to {
-            return Err(ParseError::sqlstate(
-                crate::sqlstate::SQLSTATE_INVALID_PARAMETER_VALUE,
-                format!(
-                    "COPY {} cannot be used with COPY TO",
-                    option.defname.to_uppercase()
-                ),
-            ));
-        }
         if option.defname != "format" {
             return Err(ParseError::sqlstate(
                 crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
@@ -140,14 +123,20 @@ pub(crate) fn try_extract_copy_to_stdout(
     }))
 }
 
-/// Checks the COPY option list the way PostgreSQL does while it reads the
-/// options: an unknown or repeated option, a HEADER value that is not a
-/// Boolean or "match", and a FORMAT other than text, csv or binary are
-/// errors of their own.
-pub(crate) fn check_copy_options(options: &[pg_query::protobuf::Node]) -> Result<(), ParseError> {
+/// Checks the COPY option list the way PostgreSQL's ProcessCopyOptions does:
+/// an unknown or repeated option, an option without the value it needs, a
+/// HEADER value that is not a Boolean or "match", a FORMAT other than text,
+/// csv or binary, and the options that COPY TO does not allow are errors of
+/// their own. `is_from` is true for COPY FROM.
+pub(crate) fn check_copy_options(
+    options: &[pg_query::protobuf::Node],
+    is_from: bool,
+) -> Result<(), ParseError> {
     use crate::sqlstate::{SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_SYNTAX_ERROR};
 
     let mut seen = std::collections::HashSet::new();
+    let mut freeze = false;
+    let mut on_error_ignore = false;
     for option in options {
         let Some(Node::DefElem(option)) = &option.node else {
             unreachable!("COPY options are DefElem nodes");
@@ -180,61 +169,80 @@ pub(crate) fn check_copy_options(options: &[pg_query::protobuf::Node]) -> Result
         if !seen.insert(name) {
             return Err(ParseError::syntax_error("conflicting or redundant options"));
         }
-        if name == "freeze" {
-            boolean_option(option)?;
-        }
         let arg = option.arg.as_ref().and_then(|arg| arg.node.as_ref());
-        match (name, arg) {
-            ("header", None) => {}
-            ("header", Some(Node::String(value))) => {
-                if !["true", "false", "on", "off", "match"]
-                    .iter()
-                    .any(|word| value.sval.eq_ignore_ascii_case(word))
-                {
-                    return Err(header_error());
-                }
+        match name {
+            "freeze" => freeze = crate::defelem::boolean_option(option)?,
+            "format" | "delimiter" | "null" | "default" | "quote" | "escape" | "encoding"
+            | "on_error" | "log_verbosity"
+                if arg.is_none() =>
+            {
+                return Err(ParseError::syntax_error(format!(
+                    "{name} requires a parameter"
+                )));
             }
-            ("header", Some(Node::Integer(value))) if matches!(value.ival, 0 | 1) => {}
-            ("header", Some(_)) => return Err(header_error()),
-            ("format", Some(Node::String(value)))
-                if !["text", "csv", "binary"].contains(&value.sval.as_str()) =>
+            "reject_limit" if arg.is_none() => {
+                return Err(ParseError::syntax_error(format!(
+                    "{name} requires a numeric value"
+                )));
+            }
+            "force_quote" | "force_not_null" | "force_null"
+                if !matches!(arg, Some(Node::List(_) | Node::AStar(_))) =>
             {
                 return Err(ParseError::sqlstate(
                     SQLSTATE_INVALID_PARAMETER_VALUE,
-                    format!("COPY format \"{}\" not recognized", value.sval),
+                    format!("argument to option \"{name}\" must be a list of column names"),
                 ));
+            }
+            "on_error" if !is_from => {
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_INVALID_PARAMETER_VALUE,
+                    "COPY ON_ERROR cannot be used with COPY TO",
+                ));
+            }
+            "on_error" => {
+                on_error_ignore = matches!(
+                    arg,
+                    Some(Node::String(value)) if value.sval.eq_ignore_ascii_case("ignore")
+                );
+            }
+            _ => {}
+        }
+        match (name, arg) {
+            ("header", Some(Node::String(value))) if value.sval.eq_ignore_ascii_case("match") => {}
+            ("header", _) => {
+                crate::defelem::boolean_option(option).map_err(|_| header_error())?;
+            }
+            ("format", Some(value)) => {
+                let value = match value {
+                    Node::String(value) => value.sval.clone(),
+                    Node::Integer(value) => value.ival.to_string(),
+                    Node::Float(value) => value.fval.clone(),
+                    _ => String::new(),
+                };
+                if !["text", "csv", "binary"].contains(&value.as_str()) {
+                    return Err(ParseError::sqlstate(
+                        SQLSTATE_INVALID_PARAMETER_VALUE,
+                        format!("COPY format \"{value}\" not recognized"),
+                    ));
+                }
             }
             _ => {}
         }
     }
-    Ok(())
-}
-
-/// Reads a Boolean COPY option the way PostgreSQL's defGetBoolean does: no
-/// value means true.
-fn boolean_option(option: &pg_query::protobuf::DefElem) -> Result<bool, ParseError> {
-    match option.arg.as_ref().and_then(|arg| arg.node.as_ref()) {
-        None => Ok(true),
-        Some(Node::Integer(value)) if matches!(value.ival, 0 | 1) => Ok(value.ival == 1),
-        Some(Node::String(value))
-            if ["true", "on"]
-                .iter()
-                .any(|w| value.sval.eq_ignore_ascii_case(w)) =>
-        {
-            Ok(true)
-        }
-        Some(Node::String(value))
-            if ["false", "off"]
-                .iter()
-                .any(|w| value.sval.eq_ignore_ascii_case(w)) =>
-        {
-            Ok(false)
-        }
-        _ => Err(ParseError::syntax_error(format!(
-            "{} requires a Boolean value",
-            option.defname
-        ))),
+    // PostgreSQL checks these after it has read all options.
+    if freeze && !is_from {
+        return Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "COPY FREEZE cannot be used with COPY TO",
+        ));
     }
+    if seen.contains("reject_limit") && !on_error_ignore {
+        return Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
+        ));
+    }
+    Ok(())
 }
 
 fn header_error() -> ParseError {

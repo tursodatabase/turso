@@ -2,6 +2,7 @@ pub mod cmdtag;
 pub mod copy;
 mod create_function;
 pub mod datetime_unit;
+mod defelem;
 pub mod functions;
 mod names;
 mod policy_condition;
@@ -103,8 +104,6 @@ impl ParseError {
     }
 
     /// The error with the HINT `hint`.
-    // The refusals that get a HINT call it in the next commit.
-    #[allow(dead_code)]
     pub(crate) fn with_hint(self, hint: impl Into<String>) -> Self {
         match self {
             Self::Sqlstate {
