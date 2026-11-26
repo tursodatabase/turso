@@ -6514,3 +6514,53 @@ fn checkpoint_with_queued_log_truncate_resets_log_offset() {
         vec![vec![Value::from_i64(1), Value::build_text("a")]]
     );
 }
+
+/// With the passive checkpoint flag on, a TRUNCATE that finds another checkpoint in
+/// progress must return Busy. Before, it did no work and returned `0|0|0`, which is also
+/// the result of a TRUNCATE that empties the logical log.
+#[test]
+fn truncate_returns_busy_while_another_checkpoint_runs() {
+    use turso_core::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    // The INSERT commits and starts its auto-checkpoint. Stop that checkpoint after it
+    // sets `checkpoint_in_progress` and before it collects rows.
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeCollectTableRows.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut insert = conn.prepare("INSERT INTO t VALUES (1, 'x')").unwrap();
+    let pager_io = conn.get_pager().io.clone();
+    while !injector.is_empty() {
+        match insert.step().unwrap() {
+            StepResult::IO => pager_io.step().unwrap(),
+            StepResult::Yield => {}
+            other => panic!("INSERT finished before its auto-checkpoint stopped: {other:?}"),
+        }
+    }
+
+    let other = db.connect();
+    let result = other
+        .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+        .and_then(|mut stmt| stmt.run_collect_rows());
+    let log_size = db.get_mvcc_store().get_logical_log_file().size().unwrap();
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "contended TRUNCATE must return Busy, got {result:?} with {log_size} bytes in the logical log"
+    );
+
+    drive_statement_to_done(&mut insert, &pager_io);
+    conn.set_yield_injector(None);
+    drop(insert);
+
+    // When the first checkpoint is done, the TRUNCATE succeeds and empties the log.
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        db.get_mvcc_store().get_logical_log_file().size().unwrap(),
+        0
+    );
+}

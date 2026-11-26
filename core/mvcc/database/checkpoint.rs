@@ -2406,15 +2406,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     // collection, so it needs an explicit single-orchestrator gate. The
                     // blocking (flag-off) path takes the lock up front and gets that
                     // invariant — plus Busy-on-contention — from the lock itself, so it
-                    // must NOT use this gate, which would turn a contended explicit
-                    // TRUNCATE into a silent no-op.
+                    // does not use this gate.
                     if self
                         .mvstore
                         .checkpoint_in_progress
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_err()
                     {
-                        // Another checkpoint is already running: no-op (no work, no resources).
+                        // Another checkpoint is already running. A blocking mode returns
+                        // Busy, as on the flag-off path and in SQLite. A no-op result would
+                        // be `0|0|0`, the same result as a TRUNCATE that empties the log,
+                        // so the caller could not see that nothing occurred.
+                        if !matches!(self.mode, CheckpointMode::Passive { .. }) {
+                            return Err(crate::LimboError::Busy);
+                        }
+                        // A PASSIVE checkpoint (for example an auto-checkpoint) does no
+                        // work. The running checkpoint moves the rows.
                         self.state = CheckpointState::Finalize;
                         return Ok(TransitionResult::Done(CheckpointResult::default()));
                     }
