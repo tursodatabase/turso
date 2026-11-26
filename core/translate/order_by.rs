@@ -96,6 +96,7 @@ impl EmitOrderBy {
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
+        has_limit: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
         for (expr, _, _) in order_by.iter() {
@@ -117,8 +118,9 @@ impl EmitOrderBy {
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
         let has_explicit_nulls = order_by.iter().any(|(_, _, nulls)| nulls.is_some());
-        let use_heap_sort =
-            !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some() && !has_explicit_nulls;
+        // The LIMIT counter is set up after this function runs (see `emit_query`), so the
+        // choice depends on whether the query has a LIMIT, not on `t_ctx.limit_ctx`.
+        let use_heap_sort = !has_distinct && !has_group_by && has_limit && !has_explicit_nulls;
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
@@ -507,14 +509,21 @@ impl EmitOrderBy {
                 target_pc: insert_label,
                 decrement_by: 1,
             });
+            // A negative LIMIT means no limit, so every row is inserted.
+            program.emit_insn(Insn::IfNeg {
+                reg: limit_reg,
+                target_pc: insert_label,
+            });
             program.emit_insn(Insn::Last {
                 cursor_id: *sort_cursor,
                 pc_if_empty: insert_label,
             });
+            // Compare only the sort keys: the sequence and result column registers
+            // are not yet computed for this row.
             program.emit_insn(Insn::IdxLE {
                 cursor_id: *sort_cursor,
                 start_reg,
-                num_regs: orderby_sorter_column_count,
+                num_regs: order_by_len,
                 target_pc: skip_label,
             });
             program.emit_insn(Insn::Delete {

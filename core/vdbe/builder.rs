@@ -2120,6 +2120,9 @@ impl ProgramBuilder {
                 Insn::IfPos { target_pc, .. } => {
                     resolve(target_pc, "IfPos")?;
                 }
+                Insn::IfNeg { target_pc, .. } => {
+                    resolve(target_pc, "IfNeg")?;
+                }
                 Insn::Next { pc_if_next, .. } => {
                     resolve(pc_if_next, "Next")?;
                 }
