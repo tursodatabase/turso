@@ -122,6 +122,63 @@ fn test_copy_from_with_columns(db: TempDatabase) {
     assert_text(&rows[0][2], "hello");
 }
 
+/// PostgreSQL checks foreign keys at the end of COPY, so a row may come
+/// before the row it references.
+#[turso_macros::test(mvcc)]
+fn test_copy_from_child_row_before_its_parent(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE t (id int PRIMARY KEY, parent int REFERENCES t (id))")
+        .unwrap();
+
+    let tsv = write_temp_file("4\t3\n3\t\\N\n");
+    let sql = format!("COPY t FROM '{}'", tsv.path().display());
+    conn.execute(&sql).unwrap();
+
+    let rows = query_all(&conn, "SELECT id, parent FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_int(&rows[0][0], 3);
+    assert_null(&rows[0][1]);
+    assert_int(&rows[1][0], 4);
+    assert_int(&rows[1][1], 3);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_copy_from_row_without_parent_loads_nothing(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE t (id int PRIMARY KEY, parent int REFERENCES t (id))")
+        .unwrap();
+
+    let tsv = write_temp_file("1\t\\N\n2\t5\n");
+    let sql = format!("COPY t FROM '{}'", tsv.path().display());
+    let err = conn.execute(&sql).unwrap_err();
+    assert_eq!(err.sqlstate, "23503", "unexpected error: {err}");
+
+    let rows = query_all(&conn, "SELECT count(*) FROM t");
+    assert_int(&rows[0][0], 0);
+}
+
+/// A row without its parent fails the COPY even when the rows after it are
+/// valid.
+#[turso_macros::test(mvcc)]
+fn test_copy_from_first_row_without_parent_loads_nothing(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE p (id int PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE c (id int PRIMARY KEY, pid int REFERENCES p (id))")
+        .unwrap();
+    conn.execute("INSERT INTO p VALUES (1)").unwrap();
+
+    let tsv = write_temp_file("1\t5\n2\t1\n3\t1\n");
+    let sql = format!("COPY c FROM '{}'", tsv.path().display());
+    let err = conn.execute(&sql).unwrap_err();
+    assert_eq!(err.sqlstate, "23503", "unexpected error: {err}");
+
+    let rows = query_all(&conn, "SELECT count(*) FROM c");
+    assert_int(&rows[0][0], 0);
+}
+
 #[turso_macros::test(mvcc)]
 fn test_copy_from_writes_always_identity_values(db: TempDatabase) {
     let conn = db.connect_postgres();

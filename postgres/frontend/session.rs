@@ -21,7 +21,7 @@ use turso_core::function::Func;
 use turso_core::schema::{Schema, Table};
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
-    Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
+    Connection, FkImmediateViolations, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
 use turso_core::{DependentObject, NamespaceId};
 use turso_pg_parser::foreign_key_tables;
@@ -1455,6 +1455,11 @@ impl CopyState {
         if self.rows.is_empty() {
             return Ok(None);
         }
+        // The INSERT of each row is one part of the COPY statement, so that,
+        // as in PostgreSQL, foreign keys are checked after the last row, and
+        // a row may come before the row it references.
+        stmt.inner
+            .continue_fk_immediate_violations(FkImmediateViolations::default());
         bind_copy_row(&mut stmt, &self.rows[self.index])?;
         Ok(Some(stmt))
     }
@@ -1471,13 +1476,16 @@ impl CopyState {
 
     fn finish_statement(&mut self, active: &mut Option<crate::Statement>) -> Result<bool> {
         let next = self.index + 1;
+        let violations = active.as_ref().unwrap().inner.fk_immediate_violations();
         if next == self.rows.len() {
             *active = None;
+            violations.check()?;
             return Ok(true);
         }
         let active = active.as_mut().unwrap();
         active.reset().map_err(crate::Error::into_core_error)?;
         active.clear_bindings();
+        active.inner.continue_fk_immediate_violations(violations);
         bind_copy_row(active, &self.rows[next])?;
         self.index = next;
         Ok(false)
@@ -2862,9 +2870,6 @@ fn prepare_copy_rows(
         None => (String::new(), column_count),
     };
 
-    let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
-
     let delimiter = stmt
         .delimiter
         .as_ref()
@@ -2873,6 +2878,11 @@ fn prepare_copy_rows(
     let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
 
     let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
+    let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
+    // A SELECT, unlike one VALUES row, makes the INSERT count a row without
+    // its parent instead of failing at once, so that a later row can still
+    // be the parent (see CopyState::prepare_active).
+    let insert_sql = format!("INSERT INTO {table_name}{insert_cols} SELECT {placeholders}");
     Ok((insert_sql, rows))
 }
 
