@@ -710,17 +710,21 @@ expect error {permission denied for table pg_operator}
 expect @tursopg error {cannot delete from pg_catalog table "pg_operator"}
 
 # pg_proc has the rows of PostgreSQL for the functions of the frontend: the
-# aggregates count, sum, avg, min, max, stddev and string_agg over the number,
-# text, bytea, date and timestamp types, and a few scalar functions.
+# aggregates count, sum, avg, min, max, stddev, string_agg, bool_and, bool_or
+# and every over the number, text, bytea, date, timestamp and boolean types,
+# the functions that the boolean aggregates call, and a few scalar functions.
 test pg-proc-lists-the-functions-of-the-frontend {
     SELECT oid, proname, pronamespace, proowner, prolang, procost::int, prorows::int, provariadic,
            prokind, prosecdef, proleakproof, proisstrict, proretset, provolatile, proparallel,
            pronargs, pronargdefaults, prorettype, proargtypes::text
     FROM pg_proc
-    WHERE proname IN ('abs', 'avg', 'count', 'format_type', 'max', 'min', 'now', 'pg_get_constraintdef',
+    WHERE proname IN ('abs', 'avg', 'bool_accum', 'bool_accum_inv', 'bool_alltrue', 'bool_and',
+                      'bool_anytrue', 'bool_or', 'booland_statefunc', 'boolor_statefunc', 'count',
+                      'every', 'format_type', 'max', 'min', 'now', 'pg_get_constraintdef',
                       'pg_is_in_recovery', 'quote_ident', 'stddev', 'string_agg', 'sum')
-      AND proargtypes::text IN ('', '17', '17 17', '20', '21', '23', '25', '25 25', '26', '26 16',
-                                '26 23', '700', '701', '1082', '1114', '1184', '1700', '2276')
+      AND proargtypes::text IN ('', '16', '16 16', '17', '17 17', '20', '21', '23', '25', '25 25',
+                                '26', '26 16', '26 23', '700', '701', '1082', '1114', '1184',
+                                '1700', '2276', '2281', '2281 16')
     ORDER BY oid;
 }
 expect {
@@ -776,13 +780,83 @@ expect {
     2158|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|701|701
     2159|stddev|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|1700|1700
     2508|pg_get_constraintdef|11|10|12|1|0|0|f|f|f|t|f|s|s|2|0|25|26 16
+    2515|booland_statefunc|11|10|12|1|0|0|f|f|f|t|f|i|s|2|0|16|16 16
+    2516|boolor_statefunc|11|10|12|1|0|0|f|f|f|t|f|i|s|2|0|16|16 16
+    2517|bool_and|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|16|16
+    2518|bool_or|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|16|16
+    2519|every|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|16|16
     2803|count|11|10|12|1|0|0|a|f|f|f|f|i|s|0|0|20|
+    3496|bool_accum|11|10|12|1|0|0|f|f|f|f|f|i|s|2|0|2281|2281 16
+    3497|bool_accum_inv|11|10|12|1|0|0|f|f|f|f|f|i|s|2|0|2281|2281 16
+    3498|bool_alltrue|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|16|2281
+    3499|bool_anytrue|11|10|12|1|0|0|f|f|f|t|f|i|s|1|0|16|2281
     3538|string_agg|11|10|12|1|0|0|a|f|f|f|f|i|s|2|0|25|25 25
     3545|string_agg|11|10|12|1|0|0|a|f|f|f|f|i|s|2|0|17|17 17
     3810|pg_is_in_recovery|11|10|12|1|0|0|f|f|f|t|f|v|s|0|0|16|
     6395|max|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17
     6396|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17
 }
+
+# pg_aggregate has the rows of PostgreSQL for bool_and, bool_or and every, and for
+# no other aggregate.
+test pg-aggregate-lists-the-boolean-aggregates {
+    SELECT aggfnoid::oid, aggkind, aggnumdirectargs, aggtransfn::oid, aggfinalfn::oid,
+           aggcombinefn::oid, aggserialfn::oid, aggdeserialfn::oid, aggmtransfn::oid,
+           aggminvtransfn::oid, aggmfinalfn::oid, aggfinalextra, aggmfinalextra,
+           aggfinalmodify, aggmfinalmodify, aggsortop, aggtranstype, aggtransspace,
+           aggmtranstype, aggmtransspace, agginitval IS NULL, aggminitval IS NULL
+    FROM pg_aggregate
+    WHERE aggfnoid::oid IN (2517, 2518, 2519)
+    ORDER BY aggfnoid::oid;
+}
+expect {
+    2517|n|0|2515|0|2515|0|0|3496|3497|3498|f|f|r|r|58|16|0|2281|16|t|t
+    2518|n|0|2516|0|2516|0|0|3496|3497|3499|f|f|r|r|59|16|0|2281|16|t|t
+    2519|n|0|2515|0|2515|0|0|3496|3497|3498|f|f|r|r|58|16|0|2281|16|t|t
+}
+
+test pg-aggregate-names-rows-of-pg-proc-as-its-functions {
+    SELECT p.proname, state.proname, combine.proname, moving.proname, inverse.proname,
+           moving_final.proname
+    FROM pg_aggregate a
+    JOIN pg_proc p ON p.oid = a.aggfnoid
+    JOIN pg_proc state ON state.oid = a.aggtransfn
+    JOIN pg_proc combine ON combine.oid = a.aggcombinefn
+    JOIN pg_proc moving ON moving.oid = a.aggmtransfn
+    JOIN pg_proc inverse ON inverse.oid = a.aggminvtransfn
+    JOIN pg_proc moving_final ON moving_final.oid = a.aggmfinalfn
+    WHERE p.proname IN ('bool_and', 'bool_or', 'every') AND p.prokind = 'a'
+    ORDER BY p.oid;
+}
+expect {
+    bool_and|booland_statefunc|booland_statefunc|bool_accum|bool_accum_inv|bool_alltrue
+    bool_or|boolor_statefunc|boolor_statefunc|bool_accum|bool_accum_inv|bool_anytrue
+    every|booland_statefunc|booland_statefunc|bool_accum|bool_accum_inv|bool_alltrue
+}
+
+test pg-aggregate-sort-operators-are-rows-of-pg-operator {
+    SELECT p.proname, o.oprname, o.oprleft, o.oprright
+    FROM pg_aggregate a
+    JOIN pg_proc p ON p.oid = a.aggfnoid
+    JOIN pg_operator o ON o.oid = a.aggsortop
+    WHERE p.proname IN ('bool_and', 'bool_or', 'every')
+    ORDER BY p.oid;
+}
+expect {
+    bool_and|<|16|16
+    bool_or|>|16|16
+    every|<|16|16
+}
+
+test pg-object-aggregate-is-read-only {
+    CREATE ROLE reader_of_object_aggregate_is_read_only_role;
+    SET ROLE reader_of_object_aggregate_is_read_only_role;
+    DELETE FROM pg_aggregate;
+}
+@sqlstate 42501
+expect error {permission denied for table pg_aggregate}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_aggregate"}
 
 test pg-object-opclass-is-read-only {
     CREATE ROLE reader_of_object_opclass_is_read_only_role;

@@ -113,13 +113,23 @@ timestamptz, which fail with 0A000, every operator of another type, such as
 bytea, time, interval, json, jsonb, inet and the array types, and every other
 operator name, such as `^`, `@` and `~~`. `oprcode`, `oprrest` and `oprjoin`
 are 0, because `pg_proc` does not have PostgreSQL's functions under their oids.
-`pg_proc` has the rows of PostgreSQL 18, with PostgreSQL's oids, for 58 functions:
-the aggregates `count`, `sum`, `avg`, `min`, `max`, `stddev` and `string_agg` over
-the number, text, bytea, date, timestamp and timestamptz types that tursopg
-accepts, `abs` for the six number types, and `now`, `quote_ident`,
-`format_type`, `pg_get_constraintdef` and `pg_is_in_recovery`. It does not list
-the other functions of PostgreSQL, and it does not list any function that
-only tursopg has.
+`pg_proc` has the rows of PostgreSQL 18, with PostgreSQL's oids, for 67 functions:
+the aggregates `count`, `sum`, `avg`, `min`, `max`, `stddev`, `string_agg`,
+`bool_and`, `bool_or` and `every` over the number, text, bytea, date, timestamp,
+timestamptz and boolean types that tursopg accepts, the functions the boolean
+aggregates call (`booland_statefunc`, `boolor_statefunc`, `bool_accum`,
+`bool_accum_inv`, `bool_alltrue` and `bool_anytrue`), `abs` for the six number
+types, and `now`, `quote_ident`, `format_type`, `pg_get_constraintdef` and
+`pg_is_in_recovery`. It does not list the other functions of PostgreSQL, and it
+does not list any function that only tursopg has.
+`pg_aggregate` has the rows of PostgreSQL 18 for `bool_and`, `bool_or` and
+`every`, and no other aggregate. Every column is as in PostgreSQL, but
+`aggmtranstype` is the type `internal`, which `pg_type` does not have.
+These three aggregates run from their rows: the engine calls the state function
+of the row (`booland_statefunc` or `boolor_statefunc`) for each row of a group.
+An argument that has no registered type is not checked, so `bool_and(1)` is
+accepted, where PostgreSQL fails with 42883. The window-frame columns
+(`aggmtransfn`, `aggminvtransfn` and `aggmfinalfn`) are not used yet.
 A comparison (also of BETWEEN, an IN list, `IN (SELECT ...)`, `CASE x WHEN`,
 NULLIF and each pair of two row values), an arithmetic operator or a
 bit operator is refused with 42883 (`operator does not exist`) when no row of
@@ -422,7 +432,7 @@ that pair, so Turso accepts a comparison that PostgreSQL rejects.
 | Underscores (_) for thousands separators | ✅ Supported | |
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest works in FROM with up to 100 arrays, and not in the select list. `unnest(a, b)` needs a column alias list that gives its columns different names, because two columns named `unnest` are rejected |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
-| Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
+| Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented; `bool_and`, `bool_or` and `every` cannot be used as window functions |
 | WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
 | WITH ORDINALITY clause | 🟡 Partial | Works on generate_series(), unnest(), json_each(), current_schema(), current_database(), version(), and on json_to_record / json_to_recordset and their jsonb_ variants in `ROWS FROM (f(...) AS (...))`; rejected on other functions and on ROWS FROM with several functions. Two columns with the same name, as in `generate_series(1, 2) WITH ORDINALITY AS ordinality`, are rejected. The ordinality column has type `integer`; in PostgreSQL it is `bigint` |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
