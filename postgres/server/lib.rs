@@ -743,6 +743,7 @@ enum BinaryEncoding {
     Int2,
     Int4,
     Int8,
+    Float4,
     Float8,
     Bytea,
 }
@@ -756,6 +757,7 @@ impl BinaryEncoding {
             Type::INT2 => Some(Self::Int2),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
+            Type::FLOAT4 => Some(Self::Float4),
             Type::FLOAT8 => Some(Self::Float8),
             Type::BYTEA => Some(Self::Bytea),
             _ => None,
@@ -1007,6 +1009,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
             | BinaryEncoding::Int2
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
+            | BinaryEncoding::Float4
             | BinaryEncoding::Float8,
         )
         | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
@@ -1028,7 +1031,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     }
 
     match *pg_type {
-        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
+        Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
                 PgWireError::UserError(Box::new(error_info(&format!(
                     "invalid float parameter: {e}"
@@ -1139,7 +1142,7 @@ fn encode_binary(
     text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float4, Float8, Int2, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
@@ -1157,11 +1160,13 @@ fn encode_binary(
         (Int8, Value::Numeric(Integer(i))) => encoder.encode_field(i),
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
+        (Float4, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f32)),
+        (Float4, Value::Numeric(Float(f))) => encoder.encode_field(&(f64::from(*f) as f32)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
         (Bool | Int2 | Int4 | Int8, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int2 | Int4 | Int8 | Float4 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int2 | Int4 | Int8 | Float4 | Float8, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1183,8 +1188,10 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "SMALLINT" | "INT2" => Type::INT2,
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        "FLOAT4" => Type::FLOAT4,
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" => {
+            Type::FLOAT8
+        }
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
@@ -2357,6 +2364,40 @@ mod tests {
 
         let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC).unwrap();
         assert_eq!(val, Value::from_f64(1.23));
+
+        for pg_type in [Type::FLOAT4, Type::FLOAT8] {
+            assert_eq!(
+                pg_bytes_to_value(b"0x1.8p2", &pg_type).unwrap(),
+                Value::from_f64(6.0)
+            );
+            assert!(pg_bytes_to_value(b" NaN ", &pg_type).unwrap().is_nan());
+            for (text, expected) in [
+                ("-0", -0.0_f64),
+                ("+Infinity", f64::INFINITY),
+                ("-inf", f64::NEG_INFINITY),
+            ] {
+                let Value::Numeric(turso_core::Numeric::Float(number)) =
+                    pg_bytes_to_value(text.as_bytes(), &pg_type).unwrap()
+                else {
+                    panic!("a float parameter must be a number");
+                };
+                assert_eq!(f64::from(number).to_bits(), expected.to_bits());
+            }
+            for (text, expected) in [("abc", "22P02"), ("1e400", "22003"), ("1e-400", "22003")] {
+                let error = pg_bytes_to_value(text.as_bytes(), &pg_type).unwrap_err();
+                assert_eq!(sqlstate(error), expected, "{text} as {pg_type}");
+            }
+        }
+
+        // Reading this as float8 first would round it to the midpoint and
+        // then to 1, instead of the next float4 above 1.
+        let val = pg_bytes_to_value(b"1.0000000596046448", &Type::FLOAT4).unwrap();
+        assert_eq!(val, Value::from_f64(f64::from(f32::from_bits(0x3f80_0001))));
+        for text in ["1e39", "1e-46"] {
+            let error = pg_bytes_to_value(text.as_bytes(), &Type::FLOAT4).unwrap_err();
+            assert_eq!(sqlstate(error), "22003");
+            assert!(pg_bytes_to_value(text.as_bytes(), &Type::FLOAT8).is_ok());
+        }
     }
 
     #[test]

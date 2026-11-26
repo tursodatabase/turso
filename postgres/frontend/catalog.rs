@@ -311,7 +311,14 @@ impl Dialect for PostgresDialect {
     }
 
     fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
-        let names: Vec<&str> = operand_types.iter().map(String::as_str).collect();
+        let names: Vec<&str> = operand_types
+            .iter()
+            .map(|name| match name.as_str() {
+                "float4" => "real",
+                "float8" => "double precision",
+                other => other,
+            })
+            .collect();
         crate::functions::undefined_operator_of(op, &names)
     }
 

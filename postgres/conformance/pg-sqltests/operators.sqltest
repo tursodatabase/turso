@@ -784,10 +784,6 @@ test numeric-modulo-double-precision-errors {
 expect error {
     operator does not exist: numeric % double precision
 }
-@sqlstate 42883
-expect @tursopg error {
-    operator does not exist: numeric % real
-}
 
 # tursopg gives the type text to a jsonb or inet value that a cast returns.
 # Those types have a `+` or a `-`, so tursopg does not refuse the arithmetic
@@ -805,9 +801,6 @@ expect @tursopg {
     2
 }
 
-# tursopg does not know the implicit casts of PostgreSQL, so it runs an
-# operator on two number types when pg_operator has it for any number types.
-@compat-gap "operator:float8 % int4"
 @setup operands
 test double-precision-modulo-integer-errors {
     SELECT f % 2 FROM operands;
@@ -815,9 +808,6 @@ test double-precision-modulo-integer-errors {
 @sqlstate 42883
 expect error {
     operator does not exist: double precision % integer
-}
-expect @tursopg {
-    1.0
 }
 
 # tursopg gives the type text to a uuid that a cast returns, so it compares a

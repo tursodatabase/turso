@@ -4938,7 +4938,8 @@ impl PostgreSQLTranslator {
         // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts float4 to the wider REAL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS int4), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
-            "FLOAT8" | "FLOAT4" => Some("REAL"),
+            "FLOAT8" => Some("float8"),
+            "FLOAT4" => Some("float4"),
             "INT2" => Some("smallint"),
             "INT4" => Some("int4"),
             "INT8" => Some("bigint"),
@@ -7529,7 +7530,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "SMALLSERIAL" | "SERIAL2" => "smallint".into(),
 
         // Base types (no Turso custom type needed)
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
+        "REAL" | "FLOAT4" => "float4".into(),
+        "DOUBLE PRECISION" | "FLOAT8" => "float8".into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
@@ -11390,7 +11392,13 @@ mod tests {
         // Base types (no Turso custom type)
         assert_eq!(map_pg_type("INTEGER", no_params), Some(s("int4")));
         assert_eq!(map_pg_type("SERIAL", no_params), Some(s("int4")));
-        assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type("REAL", no_params), Some(s("float4")));
+        assert_eq!(map_pg_type("FLOAT4", no_params), Some(s("float4")));
+        assert_eq!(map_pg_type("FLOAT8", no_params), Some(s("float8")));
+        assert_eq!(
+            map_pg_type("DOUBLE PRECISION", no_params),
+            Some(s("float8"))
+        );
         assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
         assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
 
