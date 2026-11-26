@@ -30,6 +30,9 @@ pub(crate) const TYPCATEGORY_STRING: char = 'S';
 pub(crate) trait Catalog {
     fn pg_type(&self, oid: i64) -> Option<TypeRow>;
 
+    /// The oid of the `pg_type` row with this `typname`, unless the type is only a shell.
+    fn pg_type_oid(&self, name: &str) -> Option<i64>;
+
     fn pg_cast(&self, source: i64, target: i64) -> Option<CastRow>;
 
     fn pg_proc(&self, name: &str) -> Vec<ProcRow<'_>>;
@@ -187,6 +190,7 @@ pub(crate) mod fixtures {
 
     pub(crate) struct FixtureCatalog {
         types: FxHashMap<i64, FixtureType>,
+        types_by_name: FxHashMap<String, i64>,
         casts: FxHashMap<(i64, i64), CastRow>,
         procs: Vec<FixtureProc>,
         operators: Vec<(String, OperatorRow)>,
@@ -211,6 +215,10 @@ pub(crate) mod fixtures {
         types: rows(include_str!("testdata/pg_type.json"))
             .iter()
             .map(|row| (int(row, "oid"), fixture_type(row)))
+            .collect(),
+        types_by_name: rows(include_str!("testdata/pg_type.json"))
+            .iter()
+            .map(|row| (text(row, "typname").to_string(), int(row, "oid")))
             .collect(),
         casts: rows(include_str!("testdata/pg_cast.json"))
             .iter()
@@ -256,6 +264,10 @@ pub(crate) mod fixtures {
     impl Catalog for FixtureCatalog {
         fn pg_type(&self, oid: i64) -> Option<TypeRow> {
             self.types.get(&oid).map(|fixture| fixture.row)
+        }
+
+        fn pg_type_oid(&self, name: &str) -> Option<i64> {
+            self.types_by_name.get(name).copied()
         }
 
         fn pg_cast(&self, source: i64, target: i64) -> Option<CastRow> {

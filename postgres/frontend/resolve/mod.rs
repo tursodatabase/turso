@@ -1,16 +1,83 @@
 //! Chooses the function or the operator of a call from the types of its
 //! arguments, with the rules of PostgreSQL 18.
 
+mod candidates;
 mod catalog;
 mod coerce;
+mod error;
+mod function;
+#[cfg(test)]
+mod oracle;
+
+use catalog::Catalog;
+pub(crate) use error::ResolveError;
+
+/// The type of one argument of a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgType {
+    Known(i64),
+    /// An untyped literal or parameter.
+    Unknown,
+}
+
+/// What PostgreSQL does to an argument to make it the type of its parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgCoercion {
+    None,
+    Relabel,
+    /// Calls the cast function with this oid.
+    Function(i64),
+    ViaInputOutput,
+    /// Reads the untyped literal or parameter as the type of the parameter.
+    Literal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedCall {
+    /// The oid of the chosen `pg_proc` row.
+    pub oid: i64,
+    pub parameter_types: Vec<i64>,
+    pub coercions: Vec<ArgCoercion>,
+    pub result_type: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolution {
+    Resolved(ResolvedCall),
+    Unsupported(Reason),
+    Error(ResolveError),
+}
 
 /// Why a call cannot be resolved here and is left to the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
     Polymorphic,
+    Variadic,
+    Defaults,
     Domain,
     Composite,
     Array,
+    /// The call is a cast written as a function call, such as `text(x)`.
+    Cast,
+    Aggregate,
+    Window,
+    Procedure,
+    /// A parameter or the result of the chosen function is of type `internal`.
+    Internal,
+    TooManyArguments,
     /// The catalog has no `pg_type` row for a type of the call.
     MissingType,
+}
+
+/// Chooses the function that PostgreSQL runs for `name(arguments)`.
+pub(crate) fn resolve_function(
+    catalog: &dyn Catalog,
+    name: &str,
+    arguments: &[ArgType],
+) -> Resolution {
+    match function::parse_func_or_column(catalog, name, arguments) {
+        Ok(Ok(call)) => Resolution::Resolved(call),
+        Ok(Err(error)) => Resolution::Error(error),
+        Err(reason) => Resolution::Unsupported(reason),
+    }
 }

@@ -9,7 +9,7 @@ use super::catalog::{
     OIDVECTOROID, RECORDARRAYOID, RECORDOID, TEXTOID, TYPCATEGORY_INVALID, TYPCATEGORY_STRING,
     UNKNOWNOID,
 };
-use super::Reason;
+use super::{ArgCoercion, Reason};
 use turso_core::dialect::CastContext as CoercionContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +78,80 @@ pub(crate) fn select_common_type(
     }
 
     Ok(CommonType::Type(ptype))
+}
+
+pub(crate) fn coerce_type(
+    catalog: &dyn Catalog,
+    input_type_id: i64,
+    target_type_id: i64,
+    ccontext: CoercionContext,
+) -> Result<ArgCoercion, Reason> {
+    if target_type_id == input_type_id {
+        return Ok(ArgCoercion::None);
+    }
+
+    if target_type_id == ANYOID
+        || target_type_id == ANYELEMENTOID
+        || target_type_id == ANYNONARRAYOID
+        || target_type_id == ANYCOMPATIBLEOID
+        || target_type_id == ANYCOMPATIBLENONARRAYOID
+    {
+        return Ok(ArgCoercion::None);
+    }
+
+    if (target_type_id == ANYARRAYOID
+        || target_type_id == ANYENUMOID
+        || target_type_id == ANYRANGEOID
+        || target_type_id == ANYMULTIRANGEOID
+        || target_type_id == ANYCOMPATIBLEARRAYOID
+        || target_type_id == ANYCOMPATIBLERANGEOID
+        || target_type_id == ANYCOMPATIBLEMULTIRANGEOID)
+        && input_type_id != UNKNOWNOID
+    {
+        get_base_type(catalog, input_type_id)?;
+        return Ok(ArgCoercion::None);
+    }
+
+    // An argument of type unknown is always an untyped literal or a parameter here.
+    if input_type_id == UNKNOWNOID {
+        get_base_type(catalog, target_type_id)?;
+        return Ok(ArgCoercion::Literal);
+    }
+
+    let coercion = match find_coercion_pathway(catalog, target_type_id, input_type_id, ccontext)? {
+        CoercionPathType::None => None,
+        CoercionPathType::Func(func_id) => Some(ArgCoercion::Function(func_id)),
+        CoercionPathType::CoerceViaIo => Some(ArgCoercion::ViaInputOutput),
+        CoercionPathType::RelabelType => Some(ArgCoercion::Relabel),
+    };
+    if let Some(coercion) = coercion {
+        get_base_type(catalog, target_type_id)?;
+        return Ok(coercion);
+    }
+
+    if input_type_id == RECORDOID && is_complex(catalog, target_type_id)? {
+        return Err(Reason::Composite);
+    }
+
+    if target_type_id == RECORDOID && is_complex(catalog, input_type_id)? {
+        return Err(Reason::Composite);
+    }
+
+    if target_type_id == RECORDARRAYOID && is_complex_array(catalog, input_type_id)? {
+        return Err(Reason::Composite);
+    }
+
+    if type_inherits_from(catalog, input_type_id, target_type_id)?
+        || type_is_of_typed_table(catalog, input_type_id)?
+    {
+        return Err(Reason::Composite);
+    }
+
+    panic!(
+        "failed to find conversion function from {} to {}",
+        catalog.format_type_name(input_type_id),
+        catalog.format_type_name(target_type_id)
+    );
 }
 
 pub(crate) fn can_coerce_type(
@@ -327,7 +401,7 @@ fn type_inherits_from(
 mod tests {
     use super::*;
     use crate::resolve::catalog::fixtures::FixtureCatalog;
-    use serde_json::Value;
+    use crate::resolve::oracle::{oracle_cases, OracleCase};
     use std::collections::BTreeSet;
     use CoercionContext::{Assignment, Explicit, Implicit};
 
@@ -353,46 +427,6 @@ mod tests {
     const JSONB: i64 = 3802;
     const INT4RANGE: i64 = 3904;
     const INT4MULTIRANGE: i64 = 4451;
-
-    struct OracleCase {
-        kind: String,
-        name: String,
-        args: Vec<i64>,
-        chosen: Option<i64>,
-        coercions: Vec<String>,
-        node: Option<String>,
-        sqlstate: Option<String>,
-    }
-
-    fn oracle_cases() -> Vec<OracleCase> {
-        let oracle: Value = serde_json::from_str(include_str!("testdata/oracle.json"))
-            .expect("oracle.json is JSON");
-        let cases = oracle["cases"].as_array().expect("the oracle has cases");
-        cases
-            .iter()
-            .map(|case| OracleCase {
-                kind: string(&case["kind"]),
-                name: string(&case["name"]),
-                args: case["args"]
-                    .as_array()
-                    .expect("a case has arguments")
-                    .iter()
-                    .map(|arg| arg.as_i64().unwrap_or(UNKNOWNOID))
-                    .collect(),
-                chosen: case["chosen"].as_i64(),
-                coercions: case["coercions"]
-                    .as_array()
-                    .map(|coercions| coercions.iter().map(string).collect())
-                    .unwrap_or_default(),
-                node: case["node"].as_str().map(str::to_string),
-                sqlstate: case["error"]["sqlstate"].as_str().map(str::to_string),
-            })
-            .collect()
-    }
-
-    fn string(value: &Value) -> String {
-        value.as_str().expect("a string").to_string()
-    }
 
     fn oracle_types() -> BTreeSet<i64> {
         oracle_cases()
@@ -509,7 +543,7 @@ mod tests {
         let catalog = FixtureCatalog::get();
         let mut checked = 0;
         for case in oracle_cases() {
-            let Some(parameters) = parameter_types(catalog, &case) else {
+            let Some(parameters) = parameter_types(catalog, case) else {
                 continue;
             };
             for ((&argument, &parameter), coercion) in
@@ -549,7 +583,7 @@ mod tests {
         let catalog = FixtureCatalog::get();
         let (mut coercible, mut unsupported) = (0, 0);
         for case in oracle_cases() {
-            let Some(parameters) = parameter_types(catalog, &case) else {
+            let Some(parameters) = parameter_types(catalog, case) else {
                 continue;
             };
             match can_coerce_type(catalog, &case.args, &parameters, Implicit) {
@@ -1005,6 +1039,70 @@ mod tests {
         );
         assert_eq!(
             select_common_type(catalog, &[INT4, 999_999]),
+            Err(Reason::MissingType)
+        );
+    }
+
+    #[test]
+    fn an_argument_is_coerced_the_way_its_implicit_cast_says() {
+        let catalog = FixtureCatalog::get();
+        let coerce = |input, target| coerce_type(catalog, input, target, Implicit);
+        assert_eq!(coerce(INT4, INT4), Ok(ArgCoercion::None));
+        assert_eq!(coerce(INT4, INT8), Ok(ArgCoercion::Function(481)));
+        assert_eq!(coerce(VARCHAR, TEXTOID), Ok(ArgCoercion::Relabel));
+        assert_eq!(coerce(INT4, OID), Ok(ArgCoercion::Relabel));
+        assert_eq!(coerce(UNKNOWNOID, DATE), Ok(ArgCoercion::Literal));
+        assert_eq!(coerce(UNKNOWNOID, UNKNOWNOID), Ok(ArgCoercion::None));
+        assert_eq!(
+            coerce_type(catalog, JSON, JSONB, Assignment),
+            Ok(ArgCoercion::ViaInputOutput)
+        );
+        assert_eq!(
+            coerce_type(catalog, INT8, INT4, Assignment),
+            Ok(ArgCoercion::Function(480))
+        );
+    }
+
+    #[test]
+    fn an_argument_of_a_polymorphic_parameter_is_left_as_it_is() {
+        let catalog = FixtureCatalog::get();
+        for (input, target) in [
+            (INT4, ANYOID),
+            (INT4, ANYELEMENTOID),
+            (UNKNOWNOID, ANYELEMENTOID),
+            (INT4, ANYCOMPATIBLEOID),
+            (INT4_ARRAY, ANYARRAYOID),
+            (INT4RANGE, ANYRANGEOID),
+        ] {
+            assert_eq!(
+                coerce_type(catalog, input, target, Implicit),
+                Ok(ArgCoercion::None),
+                "{input} to {target}"
+            );
+        }
+        assert_eq!(
+            coerce_type(catalog, UNKNOWNOID, ANYARRAYOID, Implicit),
+            Ok(ArgCoercion::Literal)
+        );
+    }
+
+    #[test]
+    fn coercing_an_argument_between_arrays_or_composites_is_not_supported() {
+        let catalog = FixtureCatalog::get();
+        assert_eq!(
+            coerce_type(catalog, INT4_ARRAY, INT8_ARRAY, Implicit),
+            Err(Reason::Array)
+        );
+        assert_eq!(
+            coerce_type(catalog, PG_TYPE_ROW, RECORDOID, Implicit),
+            Err(Reason::Composite)
+        );
+        assert_eq!(
+            coerce_type(catalog, RECORDOID, PG_TYPE_ROW, Implicit),
+            Err(Reason::Composite)
+        );
+        assert_eq!(
+            coerce_type(catalog, INT4, 999_999, Implicit),
             Err(Reason::MissingType)
         );
     }
