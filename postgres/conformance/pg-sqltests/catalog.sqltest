@@ -2838,6 +2838,55 @@ expect error {
     type "Zz_Ty_Quoted" already exists
 }
 
+# A type keeps the letter case of its quoted name.
+test a-quoted-table-named-like-the-same-quoted-type {
+    CREATE TYPE "Zz_Tbl_Quoted" AS ENUM ('sad', 'happy');
+    CREATE TABLE "Zz_Tbl_Quoted" (a int);
+}
+@sqlstate 42710
+expect error {
+    type "Zz_Tbl_Quoted" already exists
+}
+
+test a-quoted-view-named-like-the-same-quoted-domain {
+    CREATE DOMAIN "Zz_View_Quoted" AS int;
+    CREATE VIEW "Zz_View_Quoted" AS SELECT 1 AS a;
+}
+@sqlstate 42710
+expect error {
+    type "Zz_View_Quoted" already exists
+}
+
+test a-quoted-type-keeps-its-case-in-pg-type {
+    CREATE TYPE "Zz_Ty_Case" AS ENUM ('a');
+    CREATE DOMAIN "Zz_Dom_Case" AS int;
+    SELECT typname FROM pg_type WHERE lower(typname) IN ('zz_ty_case', 'zz_dom_case') ORDER BY 1;
+}
+expect {
+    Zz_Dom_Case
+    Zz_Ty_Case
+}
+
+# A table keeps the letter case of the name that RENAME TO gives it.
+test a-renamed-table-keeps-the-letter-case-of-its-new-name {
+    CREATE TABLE zz_rn_case_old (a int);
+    ALTER TABLE zz_rn_case_old RENAME TO "Zz_Rn_Case";
+    SELECT relname FROM pg_class WHERE lower(relname) = 'zz_rn_case';
+}
+expect {
+    Zz_Rn_Case
+}
+
+test a-type-may-not-take-the-mixed-case-name-of-a-renamed-table {
+    CREATE TABLE zz_rn_type_old (a int);
+    ALTER TABLE zz_rn_type_old RENAME TO "Zz_Rn_Type";
+    CREATE TYPE "Zz_Rn_Type" AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "Zz_Rn_Type" already exists
+}
+
 # A sequence has no row type, but CREATE SEQUENCE checks the type names too.
 test a-sequence-may-not-share-its-name-with-a-type {
     CREATE TYPE zz_seq_type AS ENUM ('a');

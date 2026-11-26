@@ -118,12 +118,11 @@ them, and `"$user"` counts when a schema has the name of the current role.
 A name such as `public.mood` creates the type in public whatever `search_path`
 is.
 
-The PostgreSQL frontend stores the name of a type in lower case, and finds types
-and relations by a name in any letter case. So a type and a relation whose
-names differ only in letter case, such as a table `"Mood"` and a type `mood`,
-are not supported: the second `CREATE` fails with SQLSTATE 0A000. A table
-`mood` after `CREATE TYPE "Mood"` fails with SQLSTATE 42710
-(duplicate_object), because the stored type name is `mood`.
+Types and relations keep the letter case of their names, but the PostgreSQL
+frontend finds them by a name in any letter case. So two types, or a type and a
+relation, whose names differ only in letter case, such as a table `"Mood"` and
+a type `mood`, are not supported: the second `CREATE` fails with SQLSTATE
+0A000.
 
 ## See Also
 

@@ -409,7 +409,11 @@ impl Dialect for PostgresDialect {
             return Ok(());
         };
         if type_def.name != name {
-            return Err(names_differ_only_in_case(&type_def.name, name));
+            return Err(names_differ_only_in_case(
+                "a type and a relation",
+                &type_def.name,
+                name,
+            ));
         }
         let hint = (!renaming).then_some(
             "A relation has an associated type of the same name, so you must use a name that \
@@ -419,7 +423,9 @@ impl Dialect for PostgresDialect {
     }
 
     /// Tables, views and materialized views have a row type of their name.
-    /// Sequences and indexes have none.
+    /// Sequences and indexes have none. The engine finds a type by the
+    /// lower-case name, so it cannot keep two types whose names differ only
+    /// in letter case, as PostgreSQL does.
     fn check_type_name_against_relations(
         &self,
         schema: &Schema,
@@ -428,6 +434,12 @@ impl Dialect for PostgresDialect {
     ) -> Result<()> {
         if !holds_user_types(schema, namespace) {
             return Err(crate::error::type_outside_public());
+        }
+        if let Some(type_def) = schema
+            .get_type_def_unchecked(name)
+            .filter(|type_def| !type_def.is_builtin && type_def.name != name)
+        {
+            return Err(names_differ_only_in_case("two types", &type_def.name, name));
         }
         // The engine looks relations up by the lower-case name. The row type
         // has the name in the letter case that CREATE gave it.
@@ -452,7 +464,11 @@ impl Dialect for PostgresDialect {
             Some(row_type_name) if row_type_name == name => {
                 Err(crate::error::type_already_exists(name, None))
             }
-            Some(row_type_name) => Err(names_differ_only_in_case(&row_type_name, name)),
+            Some(row_type_name) => Err(names_differ_only_in_case(
+                "a type and a relation",
+                &row_type_name,
+                name,
+            )),
             None => Ok(()),
         }
     }
@@ -734,20 +750,20 @@ fn holds_user_types(schema: &Schema, namespace: NamespaceRef) -> bool {
         && namespace_oid(schema, namespace.id) == PUBLIC_NAMESPACE_OID
 }
 
-/// FIXME(pg-quoted-identifier): The engine folds the name of a type to
-/// lower case and finds types and relations by a name in any letter case, so
-/// a type and a relation whose names differ only in case would be found by
-/// each other's name. PostgreSQL keeps them apart. Names that keep their
-/// case in the engine replace this error.
+/// FIXME(pg-quoted-identifier): The engine finds types and relations by the
+/// lower-case name, so two types, or a type and a relation, whose names
+/// differ only in case would be found by each other's name. PostgreSQL
+/// keeps them apart. Lookups by the name in its letter case replace this
+/// error.
 /// The error for a new type or relation named `new_name` when a relation or
 /// type of the schema is named `existing_name`, which differs from it only in
-/// letter case.
-fn names_differ_only_in_case(existing_name: &str, new_name: &str) -> LimboError {
+/// letter case. `objects` says what the two objects are.
+fn names_differ_only_in_case(objects: &str, existing_name: &str, new_name: &str) -> LimboError {
     crate::error::sqlstate_error(
         turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
         format!(
-            "a type and a relation named \"{existing_name}\" and \"{new_name}\", which differ \
-             only in letter case, are not supported"
+            "{objects} named \"{existing_name}\" and \"{new_name}\", which differ only in \
+             letter case, are not supported"
         ),
         None,
     )
@@ -2217,7 +2233,7 @@ impl SnapshotRows for PgTypeTable {
         }
 
         let schema = conn.current_schema();
-        for (name, td) in &schema.type_registry {
+        for td in schema.type_registry.values() {
             if td.is_builtin {
                 continue;
             }
@@ -2234,38 +2250,38 @@ impl SnapshotRows for PgTypeTable {
             let oid = user_type_oid(&td.name);
             let storage = type_storage(&schema, &td.name);
             rows.push(vec![
-                Value::from_i64(oid),             // oid
-                Value::Text(name.clone().into()), // typname
-                Value::from_i64(2200),            // typnamespace (public)
-                Value::from_i64(10),              // typowner
-                Value::from_i64(4),               // typlen
-                Value::from_i64(1),               // typbyval
-                Value::build_text(typtype),       // typtype
-                Value::build_text(typcategory),   // typcategory
-                Value::from_i64(0),               // typispreferred
-                Value::from_i64(1),               // typisdefined
-                Value::build_text(","),           // typdelim
-                Value::from_i64(0),               // typrelid
-                Value::Null,                      // typsubscript
-                Value::from_i64(0),               // typelem
-                Value::from_i64(0),               // typarray
-                Value::Null,                      // typinput
-                Value::Null,                      // typoutput
-                Value::Null,                      // typreceive
-                Value::Null,                      // typsend
-                Value::build_text("-"),           // typmodin
-                Value::Null,                      // typmodout
-                Value::Null,                      // typanalyze
-                Value::build_text("i"),           // typalign
-                Value::build_text(storage),       // typstorage
-                Value::from_i64(0),               // typnotnull
-                Value::from_i64(typbasetype),     // typbasetype
-                Value::from_i64(-1),              // typtypmod
-                Value::from_i64(0),               // typndims
-                Value::from_i64(0),               // typcollation
-                Value::Null,                      // typdefaultbin
-                Value::Null,                      // typdefault
-                Value::Null,                      // typacl
+                Value::from_i64(oid),                // oid
+                Value::Text(td.name.clone().into()), // typname
+                Value::from_i64(2200),               // typnamespace (public)
+                Value::from_i64(10),                 // typowner
+                Value::from_i64(4),                  // typlen
+                Value::from_i64(1),                  // typbyval
+                Value::build_text(typtype),          // typtype
+                Value::build_text(typcategory),      // typcategory
+                Value::from_i64(0),                  // typispreferred
+                Value::from_i64(1),                  // typisdefined
+                Value::build_text(","),              // typdelim
+                Value::from_i64(0),                  // typrelid
+                Value::Null,                         // typsubscript
+                Value::from_i64(0),                  // typelem
+                Value::from_i64(0),                  // typarray
+                Value::Null,                         // typinput
+                Value::Null,                         // typoutput
+                Value::Null,                         // typreceive
+                Value::Null,                         // typsend
+                Value::build_text("-"),              // typmodin
+                Value::Null,                         // typmodout
+                Value::Null,                         // typanalyze
+                Value::build_text("i"),              // typalign
+                Value::build_text(storage),          // typstorage
+                Value::from_i64(0),                  // typnotnull
+                Value::from_i64(typbasetype),        // typbasetype
+                Value::from_i64(-1),                 // typtypmod
+                Value::from_i64(0),                  // typndims
+                Value::from_i64(0),                  // typcollation
+                Value::Null,                         // typdefaultbin
+                Value::Null,                         // typdefault
+                Value::Null,                         // typacl
             ]);
         }
         rows

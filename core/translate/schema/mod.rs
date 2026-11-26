@@ -2872,8 +2872,9 @@ pub fn translate_create_type(
         check_decode_type(&type_def, resolver)?;
     }
 
-    // Build canonical SQL (without IF NOT EXISTS) for persistence
-    let sql = build_create_type_sql(&normalized_name, body);
+    // Build canonical SQL (without IF NOT EXISTS) for persistence. The type
+    // keeps the letter case of its name there, as a table does.
+    let sql = build_create_type_sql(type_name, body);
 
     persist_type_definition(normalized_name, sql, resolver, connection, program)
 }
@@ -3087,7 +3088,7 @@ pub fn translate_create_domain(
 
     // Build the CREATE DOMAIN SQL for persistence
     let sql = {
-        let mut s = format!("CREATE DOMAIN {normalized_name} AS {base_type}");
+        let mut s = format!("CREATE DOMAIN {domain_name} AS {base_type}");
         if let Some(ref def) = default {
             s.push_str(&format!(" DEFAULT {def}"));
         }

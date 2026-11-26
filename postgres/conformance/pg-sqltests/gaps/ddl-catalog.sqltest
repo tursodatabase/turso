@@ -1018,8 +1018,6 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# tursopg keeps only the lower-case name of a type, so it cannot tell that
-# the type is "Mood" and not mood.
 @compat-gap "syntax:quoted-identifier"
 test a-table-named-like-a-quoted-mixed-case-type {
     CREATE TYPE "Mood" AS ENUM ('sad', 'happy');
@@ -1027,17 +1025,27 @@ test a-table-named-like-a-quoted-mixed-case-type {
 }
 expect {
 }
-@sqlstate 42710
+@sqlstate 0A000
 expect @tursopg error {}
 
 @compat-gap "syntax:quoted-identifier"
-test a-quoted-table-named-like-the-same-quoted-type {
-    CREATE TYPE "Mood" AS ENUM ('sad', 'happy');
-    CREATE TABLE "Mood" (a int);
+test a-type-after-a-table-renamed-to-a-mixed-case-name {
+    CREATE TABLE b (a int);
+    ALTER TABLE b RENAME TO "Fc";
+    CREATE TYPE fc AS ENUM ('a');
 }
-@sqlstate 42710
-expect error {
-    type "Mood" already exists
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:quoted-identifier"
+test two-types-whose-names-differ-in-case {
+    CREATE TYPE vv AS ENUM ('a');
+    CREATE TYPE "Vv" AS ENUM ('a');
+    CREATE DOMAIN "VV" AS int;
+}
+expect {
 }
 @sqlstate 0A000
 expect @tursopg error {}
