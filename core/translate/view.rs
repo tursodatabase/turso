@@ -7,7 +7,7 @@ use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::alter_table::qualify_select_table_refs;
 use crate::schema::view::{extract_view_columns, referenced_tables};
-use crate::schema::{BTreeCharacteristics, BTreeTable, Schema, SchemaObjectType};
+use crate::schema::{BTreeCharacteristics, BTreeTable, RelationKind, Schema, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -81,7 +81,14 @@ pub fn translate_create_materialized_view(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
-    if schema::relation_name_is_taken(resolver, namespace, &normalized_view_name, if_not_exists)? {
+    if schema::relation_name_is_taken(
+        resolver,
+        namespace,
+        RelationKind::MaterializedView,
+        view_name.name.as_str(),
+        if_not_exists,
+        false,
+    )? {
         return Ok(());
     }
     if if_not_exists
@@ -366,7 +373,14 @@ pub fn translate_create_view(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
-    if schema::relation_name_is_taken(resolver, namespace, &normalized_view_name, if_not_exists)? {
+    if schema::relation_name_is_taken(
+        resolver,
+        namespace,
+        RelationKind::View,
+        view_name.name.as_str(),
+        if_not_exists,
+        false,
+    )? {
         return Ok(());
     }
     if if_not_exists

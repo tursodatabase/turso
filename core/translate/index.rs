@@ -7,7 +7,8 @@ use crate::index_method::IndexMethodConfiguration;
 use crate::namespace::{is_reserved_object_name, NamespaceRef};
 use crate::numeric::Numeric;
 use crate::schema::{
-    Column, GeneratedType, Schema, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
+    Column, GeneratedType, RelationKind, Schema, Table, EXPR_INDEX_SENTINEL,
+    RESERVED_TABLE_PREFIXES,
 };
 use crate::sync::Arc;
 use crate::translate::{
@@ -154,7 +155,14 @@ pub fn translate_create_index(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    if schema::relation_name_is_taken(resolver, namespace, &idx_name, if_not_exists)? {
+    if schema::relation_name_is_taken(
+        resolver,
+        namespace,
+        RelationKind::Index,
+        original_idx_name.name.as_str(),
+        if_not_exists,
+        false,
+    )? {
         return Ok(());
     }
     // Check if the index is being created on a valid btree table and

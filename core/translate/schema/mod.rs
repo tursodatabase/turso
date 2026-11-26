@@ -23,8 +23,8 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, RelationKind, Schema, SchemaObjectType, StructDef, Table, Type,
+    TypeDef, TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1279,7 +1279,14 @@ pub fn translate_create_table(
         );
     }
 
-    if relation_name_is_taken(resolver, namespace, &normalized_tbl_name, if_not_exists)? {
+    if relation_name_is_taken(
+        resolver,
+        namespace,
+        RelationKind::Table,
+        tbl_name.name.as_str(),
+        if_not_exists,
+        false,
+    )? {
         return Ok(());
     }
     // Check for name conflicts with existing schema objects
@@ -2764,26 +2771,33 @@ pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuild
 }
 
 /// Whether a relation of `namespace` already has `name`, in a dialect whose
-/// relation names are unique per schema across kinds. Ok(true) when
+/// relation names are unique per schema across kinds. `name` is the name
+/// as the statement gives it, before case folding. Ok(true) when
 /// `if_not_exists` makes the statement skip; an error when the name is
-/// taken and the statement has no IF NOT EXISTS; Ok(false) when the name
-/// is free, or the dialect keeps its own, kind-specific rules.
+/// taken and the statement has no IF NOT EXISTS, or when the dialect does
+/// not let a relation of kind `kind`, made by CREATE or, when `renaming`,
+/// by ALTER TABLE ... RENAME TO, take the name of a type; Ok(false) when
+/// the name is free, or the dialect keeps its own, kind-specific rules.
 pub(crate) fn relation_name_is_taken(
     resolver: &Resolver,
     namespace: NamespaceRef,
+    kind: RelationKind,
     name: &str,
     if_not_exists: bool,
+    renaming: bool,
 ) -> Result<bool> {
-    if !resolver
-        .catalog
-        .dialect
-        .relation_names_unique_across_kinds()
-    {
+    let dialect = &resolver.catalog.dialect;
+    if !dialect.relation_names_unique_across_kinds() {
         return Ok(false);
     }
     let taken = resolver.with_schema(namespace.database_id, |schema| {
-        schema.relation_kind(namespace.id, name).is_some()
-    });
+        if schema.relation_kind(namespace.id, name).is_some() {
+            return Ok(true);
+        }
+        dialect
+            .check_relation_name_against_types(schema, namespace, kind, name, renaming)
+            .map(|()| false)
+    })?;
     if !taken {
         return Ok(false);
     }
