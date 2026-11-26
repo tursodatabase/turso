@@ -448,24 +448,28 @@ impl fmt::Display for StatementMetrics {
             self.hash_join.grace_probe_rows_buffered
         )?;
         writeln!(f, "    Grace matches:     {}", self.hash_join.grace_matches)?;
-        writeln!(f, "  MVCC Cursor Work:")?;
-        writeln!(
-            f,
-            "    MvStore entries:  {}",
-            self.cursor_work.mvcc_entries_examined
-        )?;
-        writeln!(
-            f,
-            "    B-tree rows:      {}",
-            self.cursor_work.btree_rows_examined
-        )?;
-        writeln!(f, "    MvStore seeks:    {}", self.cursor_work.mvcc_seeks)?;
-        writeln!(f, "    B-tree seeks:     {}", self.cursor_work.btree_seeks)?;
-        writeln!(
-            f,
-            "    Visibility checks:{}",
-            self.cursor_work.visibility_checks
-        )?;
+        // The cursor work counters exist in debug builds only.
+        #[cfg(debug_assertions)]
+        {
+            writeln!(f, "  MVCC Cursor Work:")?;
+            writeln!(
+                f,
+                "    MvStore entries:  {}",
+                self.cursor_work.mvcc_entries_examined
+            )?;
+            writeln!(
+                f,
+                "    B-tree rows:      {}",
+                self.cursor_work.btree_rows_examined
+            )?;
+            writeln!(f, "    MvStore seeks:    {}", self.cursor_work.mvcc_seeks)?;
+            writeln!(f, "    B-tree seeks:     {}", self.cursor_work.btree_seeks)?;
+            writeln!(
+                f,
+                "    Visibility checks:{}",
+                self.cursor_work.visibility_checks
+            )?;
+        }
         Ok(())
     }
 }
