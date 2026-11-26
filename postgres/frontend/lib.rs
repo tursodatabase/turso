@@ -14,6 +14,7 @@ mod descriptions;
 mod error;
 mod function_choice;
 mod functions;
+mod math_functions;
 mod open;
 mod operators;
 mod options;
@@ -31,6 +32,7 @@ mod session;
 mod settings;
 mod statement;
 mod text;
+mod text_functions;
 mod unique_index;
 mod unnest;
 

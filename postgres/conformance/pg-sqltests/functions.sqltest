@@ -3444,3 +3444,87 @@ test a-function-whose-quoted-literals-fit-several-overloads-is-not-unique {
 expect error {
     function random\(unknown, unknown\) is not unique
 }
+
+test substr-counts-characters-from-one {
+    SELECT substr('abcdef'::text, 2, 3), substr('abcdef'::text, 2), substr('héllo'::text, 2, 2);
+}
+expect {
+    bcd|bcdef|él
+}
+
+test substr-with-a-start-before-the-text-uses-up-the-length {
+    SELECT substr('abcdef'::text, 0, 3), substr('abcdef'::text, -1, 3), substr('abcdef'::text, -5);
+}
+expect {
+    ab|a|abcdef
+}
+
+test substr-past-the-end-is-empty {
+    SELECT substr('abc'::text, 9, 2) = '', substr('abc'::text, 2, 0) = '';
+}
+expect {
+    t|t
+}
+
+test substr-with-a-negative-length-errors {
+    SELECT substr('abcdef'::text, 2, -1);
+}
+@sqlstate 22011
+expect error {
+    negative substring length not allowed
+}
+
+test sqrt-of-a-negative-number-errors {
+    SELECT sqrt(-1::float8);
+}
+@sqlstate 2201F
+expect error {
+    cannot take square root of a negative number
+}
+
+test ln-of-zero-errors {
+    SELECT ln(0::float8);
+}
+@sqlstate 2201E
+expect error {
+    cannot take logarithm of zero
+}
+
+test ln-of-a-negative-number-errors {
+    SELECT ln(-1::float8);
+}
+@sqlstate 2201E
+expect error {
+    cannot take logarithm of a negative number
+}
+
+test log-of-zero-errors {
+    SELECT log(0::float8);
+}
+@sqlstate 2201E
+expect error {
+    cannot take logarithm of zero
+}
+
+test power-of-zero-to-a-negative-exponent-errors {
+    SELECT power(0::float8, -1::float8);
+}
+@sqlstate 2201F
+expect error {
+    zero raised to a negative power is undefined
+}
+
+test power-of-a-negative-number-to-a-fraction-errors {
+    SELECT power(-8::float8, 0.5::float8);
+}
+@sqlstate 2201F
+expect error {
+    a negative number raised to a non-integer power yields a complex result
+}
+
+test math-functions-of-null-are-null {
+    SELECT sqrt(NULL::float8) IS NULL, ln(NULL::float8) IS NULL, power(2::float8, NULL::float8) IS NULL;
+}
+expect {
+    t|t|t
+}
