@@ -1,7 +1,8 @@
 use crate::alloc::TryClone;
 use crate::function::{ExtFunc, ExternalFunc};
 use crate::native_ext::{
-    AggregateFunction, ExtensionState, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
+    AggregateFunction, ExtensionState, FunctionArity, ReturnType, ScalarCall, ScalarFunction,
+    ScalarReturn,
 };
 use crate::sync::Arc;
 use crate::types::{AggContext, ExternalAggState, IOResultOr};
@@ -106,6 +107,20 @@ impl ExternalFunc {
         self
     }
 
+    /// Declares the type of the result of a native aggregate, so that the type
+    /// of a call to it is known.
+    pub fn returning(mut self, return_type: ReturnType) -> Self {
+        let ExtFunc::NativeAggregate {
+            return_type: declared,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native aggregate can declare the type of its result");
+        };
+        *declared = Some(return_type);
+        self
+    }
+
     pub fn new_native_aggregate<F: AggregateFunction + 'static>(
         name: String,
         argc: i32,
@@ -116,6 +131,7 @@ impl ExternalFunc {
             name,
             func: ExtFunc::NativeAggregate {
                 argc,
+                return_type: None,
                 function: Arc::new(function),
             },
         })
@@ -170,7 +186,7 @@ impl ExtFunc {
         start_reg: usize,
     ) -> IOResultOr<()> {
         match self {
-            Self::NativeAggregate { argc, function } => {
+            Self::NativeAggregate { argc, function, .. } => {
                 let args = registers[start_reg..start_reg + (*argc).max(0) as usize]
                     .iter()
                     .map(|arg| arg.get_value().try_clone())

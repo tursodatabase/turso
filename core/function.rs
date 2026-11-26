@@ -143,6 +143,7 @@ pub enum ExtFunc {
     },
     NativeAggregate {
         argc: i32,
+        return_type: Option<crate::native_ext::ReturnType>,
         function: Arc<dyn crate::native_ext::AggregateFactory>,
     },
 }
@@ -242,10 +243,10 @@ impl ExtFunc {
 
     pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {
         match self {
-            Self::NativeScalar { return_type, .. } | Self::Scalar { return_type, .. } => {
-                *return_type
-            }
-            Self::Aggregate { .. } | Self::NativeAggregate { .. } => None,
+            Self::NativeScalar { return_type, .. }
+            | Self::Scalar { return_type, .. }
+            | Self::NativeAggregate { return_type, .. } => *return_type,
+            Self::Aggregate { .. } => None,
         }
     }
 
@@ -276,8 +277,13 @@ impl ExtFunc {
                 value_destructor: *value_destructor,
                 context_owner: context_owner.clone(),
             },
-            Self::NativeAggregate { function, .. } => Self::NativeAggregate {
+            Self::NativeAggregate {
+                return_type,
+                function,
+                ..
+            } => Self::NativeAggregate {
                 argc: arg_count as i32,
+                return_type: *return_type,
                 function: function.clone(),
             },
             _ => self.clone(),
