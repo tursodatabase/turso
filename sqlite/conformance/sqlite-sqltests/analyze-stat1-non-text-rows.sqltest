@@ -1,0 +1,125 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/12397:
+# loading sqlite_stat1 must coerce non-text tbl, idx, and stat values to text
+# like SQLite's analysisLoader instead of failing with a conversion error and
+# discarding every statistic.
+
+test stat1-non-text-unmatched-tbl-rows-do-not-discard-other-stats {
+    CREATE TABLE t(a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b);
+    CREATE TABLE other(x);
+    ANALYZE;
+    INSERT INTO sqlite_stat1 VALUES
+        (123, 'x', '10 1'),
+        (1.5, 'x', '10 1'),
+        (X'fffe', 'x', '10 1'),
+        ('t', 'ia', '2000 2000'),
+        ('t', 'ib', '2000 1');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5;
+}
+expect pattern {
+    SEARCH t USING INDEX ib \(b>\?\)
+}
+
+test stat1-integer-tbl-coerced-to-text {
+    CREATE TABLE "123"(a, b);
+    CREATE INDEX ia ON "123"(a);
+    CREATE INDEX ib ON "123"(b);
+    CREATE TABLE other(x);
+    ANALYZE;
+    INSERT INTO sqlite_stat1 VALUES
+        (123, 'ia', '2000 2000'),
+        (123, 'ib', '2000 1');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM "123" WHERE a = 1 AND b > 5;
+}
+expect pattern {
+    SEARCH 123 USING INDEX ib \(b>\?\)
+}
+
+test stat1-real-tbl-coerced-to-text {
+    CREATE TABLE "1.5"(a, b);
+    CREATE INDEX ia ON "1.5"(a);
+    CREATE INDEX ib ON "1.5"(b);
+    CREATE TABLE other(x);
+    ANALYZE;
+    INSERT INTO sqlite_stat1 VALUES
+        (1.5, 'ia', '2000 2000'),
+        (1.5, 'ib', '2000 1');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM "1.5" WHERE a = 1 AND b > 5;
+}
+expect pattern {
+    SEARCH 1\.5 USING INDEX ib \(b>\?\)
+}
+
+test stat1-integer-idx-coerced-to-text {
+    CREATE TABLE t(a, b);
+    CREATE INDEX "111" ON t(a);
+    CREATE INDEX "222" ON t(b);
+    CREATE TABLE other(x);
+    ANALYZE;
+    INSERT INTO sqlite_stat1 VALUES
+        ('t', 111, '2000 2000'),
+        ('t', 222, '2000 1');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5;
+}
+expect pattern {
+    SEARCH t USING INDEX 222 \(b>\?\)
+}
+
+test stat1-blob-columns-coerced-to-text {
+    CREATE TABLE t(a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b);
+    CREATE TABLE other(x);
+    ANALYZE;
+    INSERT INTO sqlite_stat1 VALUES
+        (X'74', X'6961', X'323030302032303030'),
+        (X'74', X'6962', X'323030302031');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5;
+}
+expect pattern {
+    SEARCH t USING INDEX ib \(b>\?\)
+}
+
+test stat1-unmatched-idx-sets-table-row-count {
+    CREATE TABLE x(a);
+    CREATE TABLE y(a);
+    CREATE INDEX xa ON x(a);
+    CREATE INDEX ya ON y(a);
+    CREATE TABLE other(k);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1 VALUES
+        ('x', 1, '1000000'),
+        ('y', 1, '10');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM x, y WHERE x.a = y.a;
+}
+expect pattern {
+    SCAN y[\s\S]*SEARCH x USING COVERING INDEX xa \(a=\?\)
+}
+
+test stat1-unmatched-text-idx-sets-table-row-count {
+    CREATE TABLE x(a);
+    CREATE TABLE y(a);
+    CREATE INDEX xa ON x(a);
+    CREATE INDEX ya ON y(a);
+    CREATE TABLE other(k);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1 VALUES
+        ('x', 'nosuchidx', '1000000'),
+        ('y', 'nosuchidx', '10');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM x, y WHERE x.a = y.a;
+}
+expect pattern {
+    SCAN y[\s\S]*SEARCH x USING COVERING INDEX xa \(a=\?\)
+}
