@@ -170,6 +170,21 @@ impl Drop for EncryptionKey {
     }
 }
 
+/// A value that `PRAGMA cipher` or `PRAGMA hexkey` assigns.
+#[derive(Debug, Clone)]
+pub enum EncryptionSetting {
+    Cipher(CipherMode),
+    Key(EncryptionKey),
+}
+
+/// The error for an assignment to `PRAGMA cipher` or `PRAGMA hexkey` that
+/// cannot change the database. `reason` tells which condition failed.
+pub(crate) fn encryption_pragma_refused(reason: &str) -> LimboError {
+    LimboError::InvalidArgument(format!(
+        "encryption must be configured when opening the database; PRAGMA cipher and PRAGMA hexkey can encrypt only a new, empty database ({reason})"
+    ))
+}
+
 macro_rules! define_aegis_cipher {
     ($struct_name:ident, $cipher_type:ty, key128, $nonce_size:literal, $name:literal) => {
         define_aegis_cipher!(@impl $struct_name, $cipher_type, $nonce_size, $name, 16, as_128);
