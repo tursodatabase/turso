@@ -807,10 +807,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .current_root_page(&table_id)
                 .map(|rp| rp as i64)
         };
-        let db_id = crate::MAIN_DB_ID;
         Ok(self
             .connection
-            .with_schema(db_id, |schema| {
+            .with_schema(self.database_id, |schema| {
                 crate::without_allocation_faults!(
                     // Checkpoint has already written table/index rows by the time sequence
                     // compaction setup runs. An injected fault here can abort before the
