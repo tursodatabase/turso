@@ -7,7 +7,7 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::Result;
 
-use crate::descriptions::DESCRIPTION_TABLE_NAME;
+use crate::descriptions::{DESCRIPTION_INDEX_NAME, DESCRIPTION_TABLE_NAME};
 use crate::{auth_members, classes, descriptions, roles};
 
 /// The statements that create `table`. They run when the database has no
@@ -26,8 +26,10 @@ static TABLE_INITS: [TableInit; 4] = [
 ];
 
 /// The catalog tables that this frontend stores under their PostgreSQL
-/// names.
-const STORED_CATALOG_TABLES: [&str; 1] = [DESCRIPTION_TABLE_NAME];
+/// names, and the indexes of these tables. PostgreSQL has a row in
+/// `pg_class` for each of them among its built-in rows. The frontend keeps
+/// no class row for them.
+const STORED_CATALOG_RELATIONS: [&str; 2] = [DESCRIPTION_TABLE_NAME, DESCRIPTION_INDEX_NAME];
 
 /// The statements that create the frontend's tables that `schema` lacks.
 /// A read-only database gets none.
@@ -44,11 +46,11 @@ pub(crate) fn initialize_statements(
 }
 
 /// Whether `name` in the root namespace is a catalog table that this
-/// frontend stores. Every role reads such a table and no user statement
-/// writes it.
+/// frontend stores, or an index of one. Every role reads such a table and no
+/// user statement writes it.
 pub(crate) fn is_stored_catalog_table(namespace: NamespaceId, name: &str) -> bool {
     namespace.is_root()
-        && STORED_CATALOG_TABLES
+        && STORED_CATALOG_RELATIONS
             .iter()
-            .any(|table| name.eq_ignore_ascii_case(table))
+            .any(|relation| name.eq_ignore_ascii_case(relation))
 }

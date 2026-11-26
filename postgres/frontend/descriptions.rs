@@ -19,9 +19,10 @@ use std::sync::Arc;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{RelationKind, Schema};
 use turso_core::{
-    to_u32, CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn, ProgramBuilder,
-    RegisterOrLiteral, Result, MAIN_DB_ID,
+    to_u32, CmpInsFlags, CollationSeq, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn,
+    LimboError, ProgramBuilder, RegisterOrLiteral, Result, MAIN_DB_ID,
 };
+use turso_pg_catalog::PgDescription;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_SCHEMA_NAME,
     SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
@@ -45,8 +46,13 @@ const OBJSUBID_COLUMN: usize = 2;
 const DESCRIPTION_COLUMN: usize = 3;
 const DESCRIPTION_COLUMN_COUNT: usize = 4;
 
-const CREATE_DESCRIPTION_TABLE_SQL: &str = "CREATE TABLE pg_description \
-     (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
+/// The unique index of `pg_description` on `(objoid, classoid, objsubid)`,
+/// as `postgres.bki` declares it.
+pub(crate) const DESCRIPTION_INDEX_NAME: &str = "pg_description_o_c_o_index";
+
+/// The number of columns of a key of the index: the three columns of the
+/// index and the rowid.
+const DESCRIPTION_INDEX_KEY_LEN: usize = 4;
 
 /// The comment that PostgreSQL gives the public schema.
 const INSERT_PUBLIC_SCHEMA_COMMENT_SQL: &str =
@@ -59,7 +65,8 @@ const _: () = assert!(PUBLIC_NAMESPACE_OID == 2200 && PG_NAMESPACE_OID == 2615);
 pub(crate) const TABLE_INIT: TableInit = TableInit {
     table: DESCRIPTION_TABLE_NAME,
     statements: &[
-        CREATE_DESCRIPTION_TABLE_SQL,
+        PgDescription::CREATE_SQL,
+        PgDescription::INDEX_SQL[0],
         INSERT_PUBLIC_SCHEMA_COMMENT_SQL,
     ],
 };
@@ -340,19 +347,42 @@ pub(crate) enum Dropped {
 
 /// Deletes the comments that go with what the running statement drops from
 /// the relation with oid `oid`.
+///
+/// The bytecode writes the table through a cursor, which does not maintain
+/// the index as a DELETE or an UPDATE does. So each row that it deletes or
+/// changes also gets its index key deleted, and a changed row gets its new
+/// key added.
 pub(crate) fn emit_delete_comments(
     program: &mut ProgramBuilder,
     schema: &Schema,
     oid: i64,
     dropped: Dropped,
-) {
+) -> Result<()> {
     let Some(table) = schema.get_btree_table(NamespaceId::ROOT, DESCRIPTION_TABLE_NAME) else {
-        return;
+        return Ok(());
     };
+    let index = schema
+        .get_index(
+            NamespaceId::ROOT,
+            DESCRIPTION_TABLE_NAME,
+            DESCRIPTION_INDEX_NAME,
+        )
+        .cloned()
+        .ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "{DESCRIPTION_TABLE_NAME} has no index {DESCRIPTION_INDEX_NAME}"
+            ))
+        })?;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(Arc::clone(&table)));
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
         root_page: RegisterOrLiteral::Literal(table.root_page),
+        db: MAIN_DB_ID,
+    });
+    let index_cursor_id = program.alloc_cursor_index(None, &index)?;
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: index_cursor_id,
+        root_page: RegisterOrLiteral::Literal(index.root_page),
         db: MAIN_DB_ID,
     });
     let objoid_reg = program.alloc_register();
@@ -369,24 +399,34 @@ pub(crate) fn emit_delete_comments(
     program.preassign_label_to_next_insn(loop_start);
     let next = program.allocate_label();
 
-    let row_reg = program.alloc_registers(DESCRIPTION_COLUMN_COUNT);
+    // The index key of the current row: objoid, classoid, objsubid and the
+    // rowid, in the order of the index.
+    let key_reg = program.alloc_registers(DESCRIPTION_INDEX_KEY_LEN);
     for (column, expected_reg) in [(OBJOID_COLUMN, objoid_reg), (CLASSOID_COLUMN, classoid_reg)] {
-        program.emit_column_or_rowid(cursor_id, column, row_reg + column);
+        program.emit_column_or_rowid(cursor_id, column, key_reg + column);
         program.emit_insn(Insn::Ne {
-            lhs: row_reg + column,
+            lhs: key_reg + column,
             rhs: expected_reg,
             target_pc: next,
             flags: CmpInsFlags::default().jump_if_null(),
             collation: CollationSeq::for_internal_values(),
         });
     }
+    let objsubid_reg = key_reg + OBJSUBID_COLUMN;
+    program.emit_column_or_rowid(cursor_id, OBJSUBID_COLUMN, objsubid_reg);
+    let rowid_reg = key_reg + DESCRIPTION_INDEX_KEY_LEN - 1;
+    program.emit_insn(Insn::RowId {
+        cursor_id,
+        dest: rowid_reg,
+    });
     match dropped {
-        Dropped::Relation => emit_delete_current_row(program, cursor_id),
+        Dropped::Relation => {
+            emit_delete_index_key(program, index_cursor_id, key_reg);
+            emit_delete_current_row(program, cursor_id);
+        }
         Dropped::Column(number) => {
             let number_reg = program.alloc_register();
             program.emit_int(number, number_reg);
-            let objsubid_reg = row_reg + OBJSUBID_COLUMN;
-            program.emit_column_or_rowid(cursor_id, OBJSUBID_COLUMN, objsubid_reg);
             program.emit_insn(Insn::Lt {
                 lhs: objsubid_reg,
                 rhs: number_reg,
@@ -402,20 +442,52 @@ pub(crate) fn emit_delete_comments(
                 flags: CmpInsFlags::default(),
                 collation: CollationSeq::for_internal_values(),
             });
+            emit_delete_index_key(program, index_cursor_id, key_reg);
             emit_delete_current_row(program, cursor_id);
             program.emit_insn(Insn::Goto { target_pc: next });
 
+            // A later column gets the number before its own. The index
+            // loses the key with the old number and gets the key with the
+            // new one. The new key can be equal, in its three columns, to
+            // the key of a row that the loop has not reached. That row gets
+            // a new key too, or is deleted, before the statement ends, so
+            // the new key is added without a check for a duplicate.
             program.preassign_label_to_next_insn(later_column);
+            emit_delete_index_key(program, index_cursor_id, key_reg);
             program.emit_insn(Insn::AddImm {
                 register: objsubid_reg,
                 value: -1,
             });
+            let key_record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(key_reg),
+                count: to_u32(DESCRIPTION_INDEX_KEY_LEN),
+                dest_reg: to_u32(key_record_reg),
+                index_name: Some(DESCRIPTION_INDEX_NAME.to_string()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: index_cursor_id,
+                record_reg: key_record_reg,
+                unpacked_start: Some(key_reg),
+                unpacked_count: Some(to_u32(DESCRIPTION_INDEX_KEY_LEN)),
+                flags: IdxInsertFlags::new(),
+            });
+
+            let row_reg = program.alloc_registers(DESCRIPTION_COLUMN_COUNT);
+            for column in [OBJOID_COLUMN, CLASSOID_COLUMN, OBJSUBID_COLUMN] {
+                program.emit_insn(Insn::Copy {
+                    src_reg: key_reg + column,
+                    dst_reg: row_reg + column,
+                    extra_amount: 0,
+                });
+            }
             program.emit_column_or_rowid(
                 cursor_id,
                 DESCRIPTION_COLUMN,
                 row_reg + DESCRIPTION_COLUMN,
             );
-            emit_replace_current_row(program, cursor_id, row_reg);
+            emit_replace_current_row(program, cursor_id, row_reg, rowid_reg);
         }
     }
 
@@ -427,6 +499,17 @@ pub(crate) fn emit_delete_comments(
         is_index: false,
     });
     program.preassign_label_to_next_insn(loop_end);
+    Ok(())
+}
+
+/// Deletes the key in the registers from `key_reg` from the index.
+fn emit_delete_index_key(program: &mut ProgramBuilder, index_cursor_id: usize, key_reg: usize) {
+    program.emit_insn(Insn::IdxDelete {
+        start_reg: key_reg,
+        num_regs: DESCRIPTION_INDEX_KEY_LEN,
+        cursor_id: index_cursor_id,
+        raise_error_if_no_matching_entry: true,
+    });
 }
 
 fn emit_delete_current_row(program: &mut ProgramBuilder, cursor_id: usize) {
@@ -439,8 +522,13 @@ fn emit_delete_current_row(program: &mut ProgramBuilder, cursor_id: usize) {
 }
 
 /// Writes the columns in the registers from `row_reg` over the row the
-/// cursor is on.
-fn emit_replace_current_row(program: &mut ProgramBuilder, cursor_id: usize, row_reg: usize) {
+/// cursor is on, whose rowid is in `rowid_reg`.
+fn emit_replace_current_row(
+    program: &mut ProgramBuilder,
+    cursor_id: usize,
+    row_reg: usize,
+    rowid_reg: usize,
+) {
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(row_reg),
@@ -448,11 +536,6 @@ fn emit_replace_current_row(program: &mut ProgramBuilder, cursor_id: usize, row_
         dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
-    });
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::RowId {
-        cursor_id,
-        dest: rowid_reg,
     });
     program.emit_insn(Insn::Insert {
         cursor: cursor_id,
