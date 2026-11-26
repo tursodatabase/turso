@@ -245,6 +245,8 @@ pub struct CreateIndex<'a> {
     pub written_name: &'a ast::Name,
     pub table: &'a str,
     pub written_table: &'a ast::Name,
+    /// The table's name as its CREATE TABLE statement wrote it.
+    pub declared_table: &'a str,
     pub statement: &'a ast::Stmt,
     pub root_reg: usize,
 }
@@ -421,8 +423,10 @@ pub struct DropColumn<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct CreateTrigger<'a> {
     pub namespace: NamespaceId,
+    /// The trigger name as the user wrote it.
     pub name: &'a str,
     pub table_namespace: NamespaceRef,
+    /// The table name as the user wrote it in the ON clause.
     pub table: &'a str,
     pub sql: &'a str,
 }

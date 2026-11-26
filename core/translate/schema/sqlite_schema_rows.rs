@@ -23,6 +23,7 @@ use crate::translate::schema::sqlite_schema_alter_rows::{
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
 use crate::translate::sequence::{sequence_backing_table_name, sequence_backing_table_sql};
 use crate::translate::ProgramBuilder;
+use crate::util::renamed_automatic_index_name;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{CaptureDataChangesExt, Result, MAIN_DB_ID};
@@ -82,7 +83,8 @@ fn emit_create_table_rows(
         database_id: ctx.database_id,
         id: table.namespace,
     };
-    let stored_name = resolver.mangle_name(namespace, table.name);
+    // sqlite_schema keeps the name as the user wrote it; lookups ignore case.
+    let stored_name = resolver.mangle_name(namespace, table.written_name.as_str());
     let sql = table_sql(resolver, namespace, table)?;
 
     let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
@@ -103,14 +105,19 @@ fn emit_create_table_rows(
         table.root_reg,
         Some(sql),
     )?;
+    // Like SQLite, an automatic index is named after the declared table name.
+    let mangled_name = resolver.mangle_name(namespace, table.name);
     for index in table.automatic_indexes {
+        let stored_index_name =
+            renamed_automatic_index_name(&index.name, &mangled_name, &stored_name)
+                .expect("automatic index name is built from the table name");
         emit_schema_entry(
             program,
             resolver,
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Index,
-            &index.name,
+            &stored_index_name,
             &stored_name,
             index.root_reg,
             None,
@@ -159,7 +166,8 @@ fn emit_create_index_row(
         database_id: ctx.database_id,
         id: index.namespace,
     };
-    let stored_name = resolver.mangle_name(namespace, index.name);
+    // sqlite_schema keeps the name as the user wrote it; lookups ignore case.
+    let stored_name = resolver.mangle_name(namespace, index.written_name.as_str());
     let sql = canonical_create_index_sql(
         index.statement,
         resolver.name_in_sql(namespace, index.written_name),
@@ -180,7 +188,7 @@ fn emit_create_index_row(
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
         &stored_name,
-        &resolver.mangle_name(namespace, index.table),
+        &resolver.mangle_name(namespace, index.declared_table),
         index.root_reg,
         Some(sql),
     )?;
@@ -682,7 +690,8 @@ fn emit_create_view_row(
         database_id: ctx.database_id,
         id: view.namespace,
     };
-    let stored_name = resolver.mangle_name(namespace, view.name);
+    // sqlite_schema keeps the name as the user wrote it; lookups ignore case.
+    let stored_name = resolver.mangle_name(namespace, view.written_name.as_str());
     let sql = create_view_sql(
         "VIEW",
         &resolver

@@ -138,6 +138,8 @@ pub fn translate_create_index(
     };
     let database_id = namespace.database_id;
     let idx_name = normalize_ident(original_idx_name.name.as_str());
+    // sqlite_schema keeps the name as the user wrote it; lookups ignore case.
+    let stored_idx_name = resolver.mangle_name(namespace, original_idx_name.name.as_str());
     let tbl_name = normalize_ident(original_tbl_name.as_str());
 
     validate(
@@ -334,6 +336,7 @@ pub fn translate_create_index(
             written_name: &original_idx_name.name,
             table: &tbl_name,
             written_table: &original_tbl_name,
+            declared_table: &tbl.declared_name,
             statement: &written_stmt,
             root_reg: root_page_reg,
         }),
@@ -358,7 +361,7 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let escaped_idx_name = escape_sql_string_literal(&resolver.mangle_name(namespace, &idx_name));
+    let escaped_idx_name = escape_sql_string_literal(&stored_idx_name);
     let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
