@@ -45,10 +45,10 @@ fn check_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Result<(), Par
     let result_type = check_result_type(stmt, &parameters, &parameter_types, is_sql)?;
     let returns_set = stmt.return_type.as_ref().is_some_and(|t| t.setof);
     if options.contains_key("rows") && !returns_set {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-            message: "ROWS is not applicable when function does not return a set".to_string(),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "ROWS is not applicable when function does not return a set".to_string(),
+        ));
     }
     let body = function_body(&options, stmt, is_sql)?;
     let body_statements = match body {
@@ -107,19 +107,19 @@ fn function_options(
             continue;
         }
         if by_name.insert(def.defname.as_str(), def).is_some() {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_SYNTAX_ERROR,
-                message: "conflicting or redundant options".to_string(),
-            });
+            return Err(ParseError::sqlstate(
+                SQLSTATE_SYNTAX_ERROR,
+                "conflicting or redundant options".to_string(),
+            ));
         }
     }
     for (name, clause) in [("cost", "COST"), ("rows", "ROWS")] {
         if let Some(def) = by_name.get(name) {
             if numeric_value(def)? <= 0.0 {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                    message: format!("{clause} must be positive"),
-                });
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_INVALID_PARAMETER_VALUE,
+                    format!("{clause} must be positive"),
+                ));
             }
         }
     }
@@ -162,17 +162,17 @@ fn function_language(
         if stmt.sql_body.is_some() {
             return Ok("sql".to_string());
         }
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_FUNCTION_DEFINITION,
-            message: "no language specified".to_string(),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_FUNCTION_DEFINITION,
+            "no language specified".to_string(),
+        ));
     };
     let language = string_value(def)?;
     if !matches!(language, "sql" | "plpgsql" | "c" | "internal") {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_UNDEFINED_OBJECT,
-            message: format!("language \"{language}\" does not exist"),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_UNDEFINED_OBJECT,
+            format!("language \"{language}\" does not exist"),
+        ));
     }
     Ok(language.to_string())
 }
@@ -210,10 +210,10 @@ fn check_parameter_type(
         .as_ref()
         .ok_or_else(|| ParseError::ParseError("function parameter without a type".to_string()))?;
     match classify_type(type_name)? {
-        TypeClass::Pseudo(name) if is_sql => Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_FUNCTION_DEFINITION,
-            message: format!("SQL functions cannot have arguments of type {name}"),
-        }),
+        TypeClass::Pseudo(name) if is_sql => Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_FUNCTION_DEFINITION,
+            format!("SQL functions cannot have arguments of type {name}"),
+        )),
         TypeClass::NotBuiltIn { schema, name } => Err(ParseError::UnresolvedFunctionType {
             schema,
             name,
@@ -233,10 +233,8 @@ fn check_result_type(
     parameter_types: &[TypeClass],
     is_sql: bool,
 ) -> Result<Option<TypeClass>, ParseError> {
-    let invalid = |message: String| ParseError::Sqlstate {
-        sqlstate: SQLSTATE_INVALID_FUNCTION_DEFINITION,
-        message,
-    };
+    let invalid =
+        |message: String| ParseError::sqlstate(SQLSTATE_INVALID_FUNCTION_DEFINITION, message);
     let Some(type_name) = &stmt.return_type else {
         if parameters
             .iter()
@@ -296,9 +294,8 @@ fn function_body<'a>(
     stmt: &CreateFunctionStmt,
     is_sql: bool,
 ) -> Result<Option<&'a str>, ParseError> {
-    let invalid = |message: &str| ParseError::Sqlstate {
-        sqlstate: SQLSTATE_INVALID_FUNCTION_DEFINITION,
-        message: message.to_string(),
+    let invalid = |message: &str| {
+        ParseError::sqlstate(SQLSTATE_INVALID_FUNCTION_DEFINITION, message.to_string())
     };
     let Some(as_item) = options.get("as") else {
         if stmt.sql_body.is_none() {
@@ -328,12 +325,14 @@ fn function_body<'a>(
 }
 
 fn parse_body(body: &str) -> Result<pg_query::ParseResult, ParseError> {
-    pg_query::parse(body, pg_query::ParserOptions::DEFAULT).map_err(|error| ParseError::Sqlstate {
-        sqlstate: SQLSTATE_SYNTAX_ERROR,
-        message: match error {
-            pg_query::Error::Parse(message) => message,
-            error => error.to_string(),
-        },
+    pg_query::parse(body, pg_query::ParserOptions::DEFAULT).map_err(|error| {
+        ParseError::sqlstate(
+            SQLSTATE_SYNTAX_ERROR,
+            match error {
+                pg_query::Error::Parse(message) => message,
+                error => error.to_string(),
+            },
+        )
     })
 }
 

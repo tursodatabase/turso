@@ -85,8 +85,6 @@ pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError 
     }))
 }
 
-/// The engine error for SQL that `turso_pg_parser::parse` refuses, which
-/// keeps the SQLSTATE that the parser gave it.
 /// The error of a DROP that names a relation of another kind than the one
 /// it drops, with the DROP statement that removes that kind.
 pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> LimboError {
@@ -101,11 +99,20 @@ pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> Limbo
     }))
 }
 
+/// The engine error for SQL that `turso_pg_parser` refuses, which keeps the
+/// SQLSTATE and the HINT that the parser gave it.
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
     match error {
-        turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
-            sqlstate_error(sqlstate, message, None)
-        }
+        turso_pg_parser::ParseError::Sqlstate {
+            sqlstate,
+            message,
+            hint,
+        } => LimboError::Dialect(Box::new(DialectError {
+            code: sqlstate,
+            message,
+            detail: None,
+            hint,
+        })),
         other => LimboError::ParseError(other.to_string()),
     }
 }
@@ -603,6 +610,19 @@ fn object_name(object: &Object) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parser_hint_reaches_the_error_report() {
+        let error = sql_parse_error(turso_pg_parser::ParseError::Sqlstate {
+            sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message: "x is not supported".into(),
+            hint: Some("Use y.".into()),
+        });
+        let report = ErrorReport::from(&error);
+        assert_eq!(report.sqlstate, SQLSTATE_FEATURE_NOT_SUPPORTED);
+        assert_eq!(report.message, "x is not supported");
+        assert_eq!(report.hint.as_deref(), Some("Use y."));
+    }
 
     #[test]
     fn sqlstate_covers_errors_that_sql_alone_cannot_trigger() {

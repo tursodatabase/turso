@@ -26,6 +26,9 @@ pub enum ParseError {
     Sqlstate {
         sqlstate: &'static str,
         message: String,
+        /// PostgreSQL's HINT field: how to get the same result in a way
+        /// that is supported. The message does not repeat it.
+        hint: Option<String>,
     },
     /// A schema-qualified name of an object that the translator accepts only
     /// without a schema. If the schema does not exist, PostgreSQL reports the
@@ -47,11 +50,46 @@ pub enum ParseError {
 }
 
 impl ParseError {
+    /// An error that PostgreSQL reports with SQLSTATE `sqlstate`.
+    pub(crate) fn sqlstate(sqlstate: &'static str, message: impl Into<String>) -> Self {
+        Self::Sqlstate {
+            sqlstate,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
     /// PostgreSQL's `feature_not_supported` error, reading "`what` is not supported".
     pub(crate) fn not_supported(what: impl std::fmt::Display) -> Self {
-        Self::Sqlstate {
-            sqlstate: sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
-            message: format!("{what} is not supported"),
+        Self::sqlstate(
+            sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("{what} is not supported"),
+        )
+    }
+
+    /// PostgreSQL's `syntax_error`, for SQL that pg_query accepts but
+    /// PostgreSQL refuses in a later step.
+    pub(crate) fn syntax_error(message: impl Into<String>) -> Self {
+        Self::sqlstate(sqlstate::SQLSTATE_SYNTAX_ERROR, message)
+    }
+
+    /// PostgreSQL's `internal_error`, which PostgreSQL reports for an error
+    /// raised without a SQLSTATE.
+    pub(crate) fn internal_error(message: impl Into<String>) -> Self {
+        Self::sqlstate(sqlstate::SQLSTATE_INTERNAL_ERROR, message)
+    }
+
+    /// The error with the HINT `hint`.
+    pub(crate) fn with_hint(self, hint: impl Into<String>) -> Self {
+        match self {
+            Self::Sqlstate {
+                sqlstate, message, ..
+            } => Self::Sqlstate {
+                sqlstate,
+                message,
+                hint: Some(hint.into()),
+            },
+            other => unreachable!("a hint on an error without a SQLSTATE: {other:?}"),
         }
     }
 }
@@ -94,10 +132,7 @@ pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
 fn parse_error(error: pg_query::Error) -> ParseError {
     match &error {
         pg_query::Error::Parse(message) if is_reserved_role_name_error(message) => {
-            ParseError::Sqlstate {
-                sqlstate: sqlstate::SQLSTATE_RESERVED_NAME,
-                message: message.clone(),
-            }
+            ParseError::sqlstate(sqlstate::SQLSTATE_RESERVED_NAME, message.clone())
         }
         _ => ParseError::ParseError(error.to_string()),
     }

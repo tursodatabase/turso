@@ -66,10 +66,10 @@ pub(crate) fn is_default_schema(schema: &str) -> bool {
 /// an object stored under them would be in no schema the catalogs show.
 pub(crate) fn schema_qualifier(schema: &str) -> Result<&str, ParseError> {
     if schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("temp") {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_SCHEMA_NAME,
-            message: format!("schema \"{schema}\" does not exist"),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_SCHEMA_NAME,
+            format!("schema \"{schema}\" does not exist"),
+        ));
     }
     Ok(map_schema_name(schema))
 }

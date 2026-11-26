@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
-use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
+use crate::error::{in_failed_sql_transaction_error, sql_parse_error, sqlstate_error};
 use crate::pg_type::type_exists;
 use crate::roles::connection_roles;
 use crate::settings::{
@@ -1939,8 +1939,7 @@ fn try_prepare_special(
 /// The engine error for an error of the translator.
 fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
     match error {
-        ParseError::ParseError(message) => LimboError::ParseError(message),
-        ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message, None),
+        ParseError::ParseError(_) | ParseError::Sqlstate { .. } => sql_parse_error(error),
         ParseError::SchemaQualifiedName { ref schema, .. } => {
             match check_schema_exists(conn, schema) {
                 Err(missing_schema) => missing_schema,

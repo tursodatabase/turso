@@ -2175,13 +2175,9 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
     let escape = args
         .get(1)
         .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
-    match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
-        Ok(regex) => Ok(Some(regex)),
-        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
-            Err(sqlstate_error(sqlstate, message, None))
-        }
-        Err(error) => Err(LimboError::ParseError(error.to_string())),
-    }
+    turso_pg_parser::translator::similar_to_regex(&pattern, &escape)
+        .map(Some)
+        .map_err(crate::error::sql_parse_error)
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {

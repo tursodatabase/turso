@@ -796,11 +796,10 @@ impl PostgreSQLTranslator {
                         pg_type.as_str(),
                         "int2" | "int4" | "int8" | "smallint" | "integer" | "int" | "bigint"
                     ) {
-                        return Err(ParseError::Sqlstate {
-                            sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                            message: "identity column type must be smallint, integer, or bigint"
-                                .into(),
-                        });
+                        return Err(ParseError::sqlstate(
+                            SQLSTATE_INVALID_PARAMETER_VALUE,
+                            "identity column type must be smallint, integer, or bigint",
+                        ));
                     }
                     has_identity = true;
                     let (sequence_name, option_nodes) =
@@ -3064,10 +3063,10 @@ impl PostgreSQLTranslator {
         alias: Option<ast::As>,
     ) -> Result<ast::SelectTable, ParseError> {
         if range_func.ordinality && !range_func.coldeflist.is_empty() {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_SYNTAX_ERROR,
-                message: "WITH ORDINALITY cannot be used with a column definition list".into(),
-            });
+            return Err(ParseError::sqlstate(
+                SQLSTATE_SYNTAX_ERROR,
+                "WITH ORDINALITY cannot be used with a column definition list",
+            ));
         }
         let [arg] = args else {
             return Err(ParseError::ParseError(format!(
@@ -3651,10 +3650,10 @@ impl PostgreSQLTranslator {
                 // $1, $2, etc. — translate to Variable("$N")
                 let index =
                     std::num::NonZeroU32::new(param_ref.number as u32).ok_or_else(|| {
-                        ParseError::Sqlstate {
-                            sqlstate: SQLSTATE_UNDEFINED_PARAMETER,
-                            message: format!("there is no parameter ${}", param_ref.number),
-                        }
+                        ParseError::sqlstate(
+                            SQLSTATE_UNDEFINED_PARAMETER,
+                            format!("there is no parameter ${}", param_ref.number),
+                        )
                     })?;
 
                 Ok(ast::Expr::Variable(ast::Variable::indexed(index)))
@@ -4265,16 +4264,16 @@ impl PostgreSQLTranslator {
             // An index expression and a generation expression can use only
             // core functions.
             if self.translating_index.get() {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    message: format!("CREATE INDEX does not support the {op_name} operator"),
-                });
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!("CREATE INDEX does not support the {op_name} operator"),
+                ));
             }
             if self.generation_expression_table.borrow().is_some() {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    message: format!("a generated column does not support the {op_name} operator"),
-                });
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!("a generated column does not support the {op_name} operator"),
+                ));
             }
             // FIXME(pg-catalog): This hand-codes the right operand type of the pg_operator entry `jsonb ? text` with a cast, so that a parameter that the server binds as a number, such as 1, is read as text, as PostgreSQL reads a parameter of type unknown for a text operand. A lookup in pg_operator by the types of the operands, in an expression tree that carries PostgreSQL types, replaces this.
             // The functions of ?|, ?&, #> and #>> read their text array
@@ -4737,10 +4736,10 @@ impl PostgreSQLTranslator {
                     None
                 };
                 if let Some(unsupported_use) = unsupported_use {
-                    return Err(ParseError::Sqlstate {
-                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-                        message: format!("{func_name} {unsupported_use} is not supported"),
-                    });
+                    return Err(ParseError::sqlstate(
+                        SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        format!("{func_name} {unsupported_use} is not supported"),
+                    ));
                 }
                 return Ok(description);
             }
@@ -5620,12 +5619,10 @@ impl PostgreSQLTranslator {
         let expr = match &source.node {
             Some(Node::RowExpr(row)) => self.translate_row(row)?,
             Some(Node::SubLink(_)) => self.translate_expr(source)?,
-            _ => {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    message: "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression".into(),
-                })
-            }
+            _ => return Err(ParseError::sqlstate(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression",
+            )),
         };
         sets.push(ast::Set {
             col_names: vec![col_name],
@@ -5666,10 +5663,10 @@ impl PostgreSQLTranslator {
         for expr in exprs {
             match &expr.node {
                 Some(Node::AConst(constant)) if !matches!(constant.val, Some(Val::Ival(_))) => {
-                    return Err(ParseError::Sqlstate {
-                        sqlstate: SQLSTATE_SYNTAX_ERROR,
-                        message: format!("non-integer constant in {clause}"),
-                    });
+                    return Err(ParseError::sqlstate(
+                        SQLSTATE_SYNTAX_ERROR,
+                        format!("non-integer constant in {clause}"),
+                    ));
                 }
                 Some(Node::AConst(_)) => {}
                 _ if Self::is_integer_constant_with_sign_or_collation(expr) => {
@@ -6040,14 +6037,14 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
         check_call: |call| {
             let count = call.arg_count;
             if count == 0 || (call.schema_qualified && count > 1) {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
-                    message: if count == 0 {
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_UNDEFINED_FUNCTION,
+                    if count == 0 {
                         "function unnest() does not exist".into()
                     } else {
                         format!("function unnest with {count} arguments does not exist")
                     },
-                });
+                ));
             }
             if count > MAX_UNNEST_ARRAYS {
                 return Err(ParseError::not_supported(format!(
@@ -6077,13 +6074,13 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
         engine_name: "generate_series",
         check_call: |call| {
             if !(2..=3).contains(&call.arg_count) {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
-                    message: format!(
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_UNDEFINED_FUNCTION,
+                    format!(
                         "function generate_series with {} arguments does not exist",
                         call.arg_count
                     ),
-                });
+                ));
             }
             Ok(())
         },
@@ -6094,13 +6091,13 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
         engine_name: "pg_json_each",
         check_call: |call| {
             if call.arg_count != 1 {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
-                    message: format!(
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_UNDEFINED_FUNCTION,
+                    format!(
                         "function json_each with {} arguments does not exist",
                         call.arg_count
                     ),
-                });
+                ));
             }
             Ok(())
         },
@@ -6245,15 +6242,15 @@ fn range_function_column_names(
     if let Some(alias) = &range_func.alias {
         let aliases = alias_column_names(alias)?;
         if aliases.len() > names.len() {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
-                message: format!(
+            return Err(ParseError::sqlstate(
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+                format!(
                     "table \"{}\" has {} columns available but {} columns specified",
                     alias.aliasname,
                     names.len(),
                     aliases.len()
                 ),
-            });
+            ));
         }
         for (name, alias) in names.iter_mut().zip(aliases) {
             *name = alias;
@@ -6293,14 +6290,14 @@ fn rename_result_columns(
     }
     if let Some(columns) = result_column_names(select) {
         if names.len() > columns.len() {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
-                message: format!(
+            return Err(ParseError::sqlstate(
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+                format!(
                     "table \"{alias}\" has {} columns available but {} columns specified",
                     columns.len(),
                     names.len()
                 ),
-            });
+            ));
         }
         for column in columns.into_iter().skip(names.len()) {
             names.push(column.ok_or_else(|| {
@@ -6561,12 +6558,12 @@ impl SequenceOptions {
             };
             for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
                 if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
-                    return Err(ParseError::Sqlstate {
-                        sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                        message: format!(
+                    return Err(ParseError::sqlstate(
+                        SQLSTATE_INVALID_PARAMETER_VALUE,
+                        format!(
                             "{option} ({value}) is out of range for sequence data type {type_name}"
                         ),
-                    });
+                    ));
                 }
             }
             if increment.unwrap_or(1) > 0 {
@@ -6579,10 +6576,10 @@ impl SequenceOptions {
         match cache {
             None | Some(Some(1)) => {}
             Some(Some(cache)) if cache < 1 => {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                    message: format!("CACHE ({cache}) must be greater than zero"),
-                });
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_INVALID_PARAMETER_VALUE,
+                    format!("CACHE ({cache}) must be greater than zero"),
+                ));
             }
             Some(Some(cache)) => {
                 return Err(ParseError::not_supported(format!(
@@ -6623,10 +6620,10 @@ fn sequence_data_type(
         "int4" | "integer" | "int" => "integer",
         "int8" | "bigint" => "bigint",
         _ => {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                message: "sequence type must be smallint, integer, or bigint".to_string(),
-            })
+            return Err(ParseError::sqlstate(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "sequence type must be smallint, integer, or bigint".to_string(),
+            ))
         }
     };
     if !type_name.typmods.is_empty() || !type_name.array_bounds.is_empty() {
@@ -6638,17 +6635,17 @@ fn sequence_data_type(
 }
 
 fn type_does_not_exist(name: &str) -> ParseError {
-    ParseError::Sqlstate {
-        sqlstate: SQLSTATE_UNDEFINED_OBJECT,
-        message: format!("type \"{name}\" does not exist"),
-    }
+    ParseError::sqlstate(
+        SQLSTATE_UNDEFINED_OBJECT,
+        format!("type \"{name}\" does not exist"),
+    )
 }
 
 fn conflicting_options() -> ParseError {
-    ParseError::Sqlstate {
-        sqlstate: SQLSTATE_SYNTAX_ERROR,
-        message: "conflicting or redundant options".to_string(),
-    }
+    ParseError::sqlstate(
+        SQLSTATE_SYNTAX_ERROR,
+        "conflicting or redundant options".to_string(),
+    )
 }
 
 /// The sequence name an identity column's `SEQUENCE NAME` option gives, if
@@ -6977,10 +6974,10 @@ fn star_qualified_by_other_table(
         _ => return None,
     };
     if table != target.relname {
-        return Some(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_UNDEFINED_TABLE,
-            message: format!("missing FROM-clause entry for table \"{table}\""),
-        });
+        return Some(ParseError::sqlstate(
+            SQLSTATE_UNDEFINED_TABLE,
+            format!("missing FROM-clause entry for table \"{table}\""),
+        ));
     }
     let aliased = target
         .alias
@@ -6989,10 +6986,10 @@ fn star_qualified_by_other_table(
     if schema_qualified && !aliased && target.schemaname.is_empty() {
         return None;
     }
-    Some(ParseError::Sqlstate {
-        sqlstate: SQLSTATE_UNDEFINED_TABLE,
-        message: format!("invalid reference to FROM-clause entry for table \"{table}\""),
-    })
+    Some(ParseError::sqlstate(
+        SQLSTATE_UNDEFINED_TABLE,
+        format!("invalid reference to FROM-clause entry for table \"{table}\""),
+    ))
 }
 
 /// The error of PostgreSQL for a LATERAL item in the FROM clause of an UPDATE
@@ -7037,9 +7034,11 @@ fn lateral_reference_to_update_target(
         .flat_map(|item| item.nodes())
         .filter_map(|(node, ..)| column_qualifier(&node))
         .any(|qualifier| target_names.contains(&qualifier));
-    reads_target.then(|| ParseError::Sqlstate {
-        sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
-        message: format!("invalid reference to FROM-clause entry for table \"{refname}\""),
+    reads_target.then(|| {
+        ParseError::sqlstate(
+            SQLSTATE_INVALID_COLUMN_REFERENCE,
+            format!("invalid reference to FROM-clause entry for table \"{refname}\""),
+        )
     })
 }
 
@@ -7078,13 +7077,10 @@ fn recursive_cte_error(cte: &pg_query::protobuf::CommonTableExpr) -> Option<Pars
         return None;
     }
     if select.op() != pg_query::protobuf::SetOperation::SetopUnion {
-        return Some(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_RECURSION,
-            message: format!(
+        return Some(ParseError::sqlstate(SQLSTATE_INVALID_RECURSION, format!(
                 "recursive query \"{}\" does not have the form non-recursive-term UNION [ALL] recursive-term",
                 cte.ctename
-            ),
-        });
+            )));
     }
     // LIMIT ALL, LIMIT NULL and OFFSET NULL count too: the parse tree has
     // them as a NULL constant.
@@ -7099,10 +7095,10 @@ fn recursive_cte_error(cte: &pg_query::protobuf::CommonTableExpr) -> Option<Pars
     } else {
         return None;
     };
-    Some(ParseError::Sqlstate {
-        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-        message: format!("{clause} in a recursive query is not implemented"),
-    })
+    Some(ParseError::sqlstate(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!("{clause} in a recursive query is not implemented"),
+    ))
 }
 
 /// Whether `query` names the CTE `cte_name` as an unqualified table, outside
@@ -7396,10 +7392,10 @@ fn translate_create_role(
             ));
         };
         if !seen.insert(elem.defname.as_str()) {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_SYNTAX_ERROR,
-                message: "conflicting or redundant options".to_string(),
-            });
+            return Err(ParseError::sqlstate(
+                SQLSTATE_SYNTAX_ERROR,
+                "conflicting or redundant options".to_string(),
+            ));
         }
         match elem.defname.as_str() {
             "inherit" => options.inherit = extract_def_elem_bool(elem),
@@ -7416,16 +7412,16 @@ fn translate_create_role(
         }
     }
     if stmt.role.starts_with("pg_") {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_RESERVED_NAME,
-            message: format!("role name \"{}\" is reserved", stmt.role),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_RESERVED_NAME,
+            format!("role name \"{}\" is reserved", stmt.role),
+        ));
     }
     if stmt.role == BOOTSTRAP_SUPERUSER_NAME {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_DUPLICATE_OBJECT,
-            message: format!("role \"{BOOTSTRAP_SUPERUSER_NAME}\" already exists"),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_DUPLICATE_OBJECT,
+            format!("role \"{BOOTSTRAP_SUPERUSER_NAME}\" already exists"),
+        ));
     }
     Ok(ast::Stmt::CreateRole {
         role_name: stmt.role.clone(),
@@ -7480,10 +7476,10 @@ fn translate_grant_role(stmt: &pg_query::protobuf::GrantRoleStmt) -> Result<ast:
             // The grammar takes roles in the same list as privileges, which
             // may name columns.
             if role.priv_name.is_empty() || !role.cols.is_empty() {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_INVALID_GRANT_OPERATION,
-                    message: "column names cannot be included in GRANT/REVOKE ROLE".to_string(),
-                });
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_INVALID_GRANT_OPERATION,
+                    "column names cannot be included in GRANT/REVOKE ROLE".to_string(),
+                ));
             }
             Ok(role.priv_name.clone())
         })
@@ -8029,12 +8025,9 @@ fn check_type_is_supported(name: &str, array_dimensions: usize) -> Result<(), Pa
         // works only on the right of `timestamp + ` or `timestamp - `, which the
         // translator rewrites into pg_timestamp_plus_interval. An interval type
         // with its input function and pg_operator rows replaces this refusal.
-        return Err(ParseError::Sqlstate {
-            sqlstate: crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
-            message: format!(
+        return Err(ParseError::sqlstate(crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED, format!(
                 "{quoted} is not supported, except in a timestamp plus or minus an interval literal, such as now() - interval '7 days'"
-            ),
-        });
+            )));
     }
     Err(ParseError::not_supported(quoted))
 }
@@ -8315,13 +8308,13 @@ fn validate_generated_columns<'a>(
             continue;
         };
         if generation_clauses.next().is_some() {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_SYNTAX_ERROR,
-                message: format!(
+            return Err(ParseError::sqlstate(
+                SQLSTATE_SYNTAX_ERROR,
+                format!(
                     "multiple generation clauses specified for column \"{}\" of table \"{}\"",
                     col.colname, table.table_name
                 ),
-            });
+            ));
         }
         if let Some(expr) = &generated.raw_expr {
             validate_generation_expression(expr, &table)?;
@@ -8368,11 +8361,10 @@ impl GenerationTable<'_> {
 }
 
 fn undetermined_type() -> ParseError {
-    ParseError::Sqlstate {
-        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-        message: "cannot determine the type of an expression in a column generation expression"
-            .to_string(),
-    }
+    ParseError::sqlstate(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "cannot determine the type of an expression in a column generation expression".to_string(),
+    )
 }
 
 /// Check that a generation expression is immutable and reads only the non-generated columns
@@ -8381,8 +8373,7 @@ fn validate_generation_expression(
     expr: &pg_query::protobuf::Node,
     table: &GenerationTable<'_>,
 ) -> Result<(), ParseError> {
-    let error =
-        |sqlstate: &'static str, message: String| ParseError::Sqlstate { sqlstate, message };
+    let error = |sqlstate: &'static str, message: String| ParseError::sqlstate(sqlstate, message);
     let not_immutable = || {
         error(
             SQLSTATE_INVALID_OBJECT_DEFINITION,
@@ -8495,8 +8486,7 @@ fn validate_column_reference(
     column: &pg_query::protobuf::ColumnRef,
     table: &GenerationTable<'_>,
 ) -> Result<(), ParseError> {
-    let error =
-        |sqlstate: &'static str, message: String| ParseError::Sqlstate { sqlstate, message };
+    let error = |sqlstate: &'static str, message: String| ParseError::sqlstate(sqlstate, message);
     let names: Vec<&str> = column
         .fields
         .iter()
@@ -8542,19 +8532,17 @@ fn validate_column_qualifiers(
         _ => return Err(ParseError::not_supported("a cross-database reference")),
     };
     if qualifying_table != table.table_name {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_UNDEFINED_TABLE,
-            message: format!("missing FROM-clause entry for table \"{qualifying_table}\""),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_UNDEFINED_TABLE,
+            format!("missing FROM-clause entry for table \"{qualifying_table}\""),
+        ));
     }
     if let (Some(schema), Some(table_schema)) = (schema, table.schema_name) {
         if schema != table_schema {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_UNDEFINED_TABLE,
-                message: format!(
-                    "invalid reference to FROM-clause entry for table \"{qualifying_table}\""
-                ),
-            });
+            return Err(ParseError::sqlstate(
+                SQLSTATE_UNDEFINED_TABLE,
+                format!("invalid reference to FROM-clause entry for table \"{qualifying_table}\""),
+            ));
         }
     }
     Ok(())
@@ -8716,11 +8704,13 @@ impl ExprType {
 fn reject_foreign_key_actions_on_generated_column(
     constraint: &pg_query::protobuf::Constraint,
 ) -> Result<(), ParseError> {
-    let error = |event: &str| ParseError::Sqlstate {
-        sqlstate: SQLSTATE_SYNTAX_ERROR,
-        message: format!(
-            "invalid {event} action for foreign key constraint containing generated column"
-        ),
+    let error = |event: &str| {
+        ParseError::sqlstate(
+            SQLSTATE_SYNTAX_ERROR,
+            format!(
+                "invalid {event} action for foreign key constraint containing generated column"
+            ),
+        )
     };
     if matches!(constraint.fk_upd_action.as_str(), "c" | "n" | "d") {
         return Err(error("ON UPDATE"));
@@ -9014,18 +9004,17 @@ pub fn check_enum_labels(parse_result: &ParseResult) -> Result<(), ParseError> {
         .iter()
         .find(|label| label.len() > MAX_IDENTIFIER_BYTES)
     {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_NAME,
-            message: format!("invalid enum label \"{label}\""),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_NAME,
+            format!("invalid enum label \"{label}\""),
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     if !labels.iter().all(|label| seen.insert(label)) {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_UNIQUE_VIOLATION,
-            message: "duplicate key value violates unique constraint \"pg_enum_typid_label_index\""
-                .into(),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"pg_enum_typid_label_index\"",
+        ));
     }
     Ok(())
 }
@@ -9330,13 +9319,10 @@ fn create_schema_elements(
                 if relation.schemaname.is_empty() {
                     relation.schemaname = schema.to_string();
                 } else if relation.schemaname != schema {
-                    return Err(ParseError::Sqlstate {
-                        sqlstate: SQLSTATE_INVALID_SCHEMA_DEFINITION,
-                        message: format!(
+                    return Err(ParseError::sqlstate(SQLSTATE_INVALID_SCHEMA_DEFINITION, format!(
                             "CREATE specifies a schema ({}) different from the one being created ({schema})",
                             relation.schemaname
-                        ),
-                    });
+                        )));
                 }
             }
             let sql = element
@@ -9682,13 +9668,15 @@ fn relation_privilege(name: &str, on_sequences: bool) -> Result<ast::Privilege, 
         ("maintain", false) => Some(ast::Privilege::Maintain),
         _ => None,
     };
-    privilege.ok_or_else(|| ParseError::Sqlstate {
-        sqlstate: SQLSTATE_INVALID_GRANT_OPERATION,
-        message: format!(
-            "invalid privilege type {} for {}",
-            name.to_uppercase(),
-            if on_sequences { "sequence" } else { "table" }
-        ),
+    privilege.ok_or_else(|| {
+        ParseError::sqlstate(
+            SQLSTATE_INVALID_GRANT_OPERATION,
+            format!(
+                "invalid privilege type {} for {}",
+                name.to_uppercase(),
+                if on_sequences { "sequence" } else { "table" }
+            ),
+        )
     })
 }
 
@@ -10439,11 +10427,10 @@ pub fn similar_to_regex(pattern: &str, escape: &str) -> Result<String, ParseErro
     let escape = match (escape_chars.next(), escape_chars.next()) {
         (escape, None) => escape,
         _ => {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-                message: "invalid escape string: Escape string must be empty or one character."
-                    .to_string(),
-            })
+            return Err(ParseError::sqlstate(
+                SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+                "invalid escape string: Escape string must be empty or one character.".to_string(),
+            ))
         }
     };
     let mut regex = String::with_capacity(pattern.len() + 8);
@@ -10478,10 +10465,7 @@ pub fn similar_to_regex(pattern: &str, escape: &str) -> Result<String, ParseErro
                         0 => "){1,1}?(",
                         1 => "){1,1}(?:",
                         _ => {
-                            return Err(ParseError::Sqlstate {
-                                sqlstate: SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-                                message: "SQL regular expression may not contain more than two escape-double-quote separators".to_string(),
-                            })
+                            return Err(ParseError::sqlstate(SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, "SQL regular expression may not contain more than two escape-double-quote separators".to_string()))
                         }
                     });
                     separators += 1;
@@ -10762,10 +10746,10 @@ fn reject_positions_in_empty_select_list(
             ..
         })) = &item.node
         {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
-                message: format!("{clause} position {} is not in select list", position.ival),
-            });
+            return Err(ParseError::sqlstate(
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+                format!("{clause} position {} is not in select list", position.ival),
+            ));
         }
     }
     Ok(())
@@ -10870,10 +10854,10 @@ fn star_argument_error(names: &[pg_query::protobuf::Node]) -> ParseError {
         Ok(names) => names.join("."),
         Err(error) => return error,
     };
-    ParseError::Sqlstate {
-        sqlstate: SQLSTATE_WRONG_OBJECT_TYPE,
-        message: format!("{name}(*) specified, but {name} is not an aggregate function"),
-    }
+    ParseError::sqlstate(
+        SQLSTATE_WRONG_OBJECT_TYPE,
+        format!("{name}(*) specified, but {name} is not an aggregate function"),
+    )
 }
 
 fn no_such_function(name: &str) -> ParseError {
@@ -10903,10 +10887,10 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
     if name.bytes().any(|b| b.is_ascii_uppercase())
         || FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS.contains(&name.as_str())
     {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
-            message: format!("no such function: {name}"),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_UNDEFINED_FUNCTION,
+            format!("no such function: {name}"),
+        ));
     }
     Ok(name)
 }
@@ -15499,6 +15483,7 @@ mod tests {
                 Err(ParseError::Sqlstate {
                     sqlstate,
                     message: got,
+                    ..
                 }) => {
                     assert_eq!(sqlstate, SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
                     assert_eq!(got, message, "{sql}");
@@ -15513,7 +15498,9 @@ mod tests {
         match PostgreSQLTranslator::new()
             .translate(&crate::parse("GRANT admins (x) TO alice").unwrap())
         {
-            Err(ParseError::Sqlstate { sqlstate, message }) => {
+            Err(ParseError::Sqlstate {
+                sqlstate, message, ..
+            }) => {
                 assert_eq!(sqlstate, SQLSTATE_INVALID_GRANT_OPERATION);
                 assert_eq!(
                     message,
