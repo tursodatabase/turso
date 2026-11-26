@@ -1038,6 +1038,8 @@ fn has_column(columns: &[turso_core::ast::ColumnDefinition], name: &str) -> bool
 mod tests {
     use super::*;
     use crate::database_tape::DatabaseReplaySessionOpts;
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use turso_core::{ConnectOpts, SessionRole};
@@ -1333,6 +1335,204 @@ mod tests {
         let dropped = dropped.iter().map(|name| name.as_str()).collect::<Vec<_>>();
         assert_eq!(renamed, vec![("g", "k")]);
         assert_eq!(dropped, vec!["k"]);
+    }
+
+    /// The remote renames `x` to `y`, and then the generated column `l`, the
+    /// last column, to `x`. Only generated columns follow `l`, so the rule for
+    /// a name that the remote added again can apply to it. The match must still
+    /// rename `l`, because it drops no column with the name `x`.
+    #[test]
+    fn match_renames_trailing_generated_column_to_name_of_renamed_column() {
+        let local = column_definitions(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, l TEXT AS (upper(x)))",
+        );
+        let remote = column_definitions(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, y TEXT, x TEXT AS (upper(y)))",
+        );
+        let (renamed, dropped) = renamed_and_dropped_columns(&local, &remote);
+        let renamed = renamed
+            .iter()
+            .map(|(old_name, new_name)| (old_name.as_str(), new_name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(renamed, vec![("x", "y"), ("l", "x")]);
+        assert!(dropped.is_empty());
+    }
+
+    /// The number of random cases of
+    /// `fuzz_match_of_remote_drops_renames_and_adds`. Set `SEED` to run other
+    /// cases.
+    const MATCH_FUZZ_CASES: u64 = 2000;
+
+    /// The remote keeps, drops or renames each column, and adds columns at the
+    /// end. A rename gives a new name, or the old name of an earlier column
+    /// that the remote renamed. The final remote table shows what the remote
+    /// did, so the match must find exactly the renames and the drops of the
+    /// remote. Each table writes the names in a random form, with or without
+    /// quotes.
+    #[test]
+    fn fuzz_match_of_remote_drops_renames_and_adds() {
+        let seed = crate::tests::seed_u64();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        for case in 0..MATCH_FUZZ_CASES {
+            let local = random_columns(&mut rng);
+            let (remote, renamed, dropped) = random_remote_change(&mut rng, &local);
+            let local_sql = create_table_sql(&mut rng, &local);
+            let remote_sql = create_table_sql(&mut rng, &remote);
+            let local_columns = column_definitions(&local_sql);
+            let remote_columns = column_definitions(&remote_sql);
+            let (actual_renamed, actual_dropped) =
+                renamed_and_dropped_columns(&local_columns, &remote_columns);
+            let actual_renamed = actual_renamed
+                .iter()
+                .map(|(old_name, new_name)| {
+                    (old_name.as_str().to_string(), new_name.as_str().to_string())
+                })
+                .collect::<Vec<_>>();
+            let actual_dropped = actual_dropped
+                .iter()
+                .map(|name| name.as_str().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                (actual_renamed, actual_dropped),
+                (renamed, dropped),
+                "seed {seed}, case {case}\nlocal:  {local_sql}\nremote: {remote_sql}"
+            );
+        }
+    }
+
+    /// A column of a table in `fuzz_match_of_remote_drops_renames_and_adds`.
+    #[derive(Clone, Debug)]
+    struct FuzzColumn {
+        name: String,
+        generated: bool,
+    }
+
+    /// What the remote does with a local column in
+    /// `fuzz_match_of_remote_drops_renames_and_adds`.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Change {
+        Keep,
+        Drop,
+        Rename,
+    }
+
+    /// Returns the column `id` and up to eight more columns with the names
+    /// that `column_name` gives for 0, 1, 2 and so on, each regular or
+    /// generated at random. `id` is first, so that no table is empty.
+    fn random_columns(rng: &mut ChaCha8Rng) -> Vec<FuzzColumn> {
+        let count = rng.random_range(0..=8);
+        let mut columns = vec![FuzzColumn {
+            name: "id".to_string(),
+            generated: false,
+        }];
+        for index in 0..count {
+            columns.push(FuzzColumn {
+                name: column_name(index),
+                generated: rng.random_bool(0.4),
+            });
+        }
+        columns
+    }
+
+    /// Returns the name of the column number `index`. An odd number gives a
+    /// name with a space, which needs quotes.
+    fn column_name(index: usize) -> String {
+        if index % 2 == 0 {
+            format!("c{index}")
+        } else {
+            format!("c {index}")
+        }
+    }
+
+    /// Returns the remote columns after a random change of the table `local`,
+    /// as `fuzz_match_of_remote_drops_renames_and_adds` describes it, and the
+    /// renames and the drops of the change, in the local order. The first
+    /// column, `id`, stays.
+    fn random_remote_change(
+        rng: &mut ChaCha8Rng,
+        local: &[FuzzColumn],
+    ) -> (Vec<FuzzColumn>, Vec<(String, String)>, Vec<String>) {
+        let mut changes = local[1..]
+            .iter()
+            .map(|_| match rng.random_range(0..4) {
+                0 => Change::Drop,
+                1 => Change::Rename,
+                _ => Change::Keep,
+            })
+            .collect::<Vec<_>>();
+        // A drop right before a rename gives the remote table of a rename of
+        // the dropped column, so the column after one or more drops keeps its
+        // name.
+        let mut after_drop = false;
+        for change in &mut changes {
+            if after_drop && *change == Change::Rename {
+                *change = Change::Keep;
+            }
+            after_drop = *change == Change::Drop;
+        }
+        // A drop of the last column and an added column give the remote table
+        // of a rename of the last column.
+        let added_columns: usize = if changes.last() == Some(&Change::Drop) {
+            0
+        } else {
+            rng.random_range(0..3)
+        };
+
+        let mut remote = vec![local[0].clone()];
+        let mut renamed = Vec::new();
+        let mut dropped = Vec::new();
+        // The old names of the renamed columns that no column has now.
+        let mut free_names = Vec::new();
+        for (column, change) in local[1..].iter().zip(changes) {
+            match change {
+                Change::Keep => remote.push(column.clone()),
+                Change::Drop => dropped.push(column.name.clone()),
+                Change::Rename => {
+                    let new_name = if !free_names.is_empty() && rng.random_bool(0.5) {
+                        free_names.swap_remove(rng.random_range(0..free_names.len()))
+                    } else {
+                        format!("r{}", renamed.len())
+                    };
+                    free_names.push(column.name.clone());
+                    renamed.push((column.name.clone(), new_name.clone()));
+                    remote.push(FuzzColumn {
+                        name: new_name,
+                        generated: column.generated,
+                    });
+                }
+            }
+        }
+        for index in 0..added_columns {
+            remote.push(FuzzColumn {
+                name: format!("a{index}"),
+                generated: rng.random_bool(0.4),
+            });
+        }
+        (remote, renamed, dropped)
+    }
+
+    /// Returns a CREATE TABLE statement for `columns`. It writes each name
+    /// without quotes, or in double quotes, brackets or backticks, at random,
+    /// so that two tables can write a name in other forms.
+    fn create_table_sql(rng: &mut ChaCha8Rng, columns: &[FuzzColumn]) -> String {
+        let columns = columns
+            .iter()
+            .map(|column| {
+                let name = &column.name;
+                let name = match rng.random_range(0..4) {
+                    0 if !name.contains(' ') => name.clone(),
+                    0 | 1 => format!("\"{name}\""),
+                    2 => format!("[{name}]"),
+                    _ => format!("`{name}`"),
+                };
+                if column.generated {
+                    format!("{name} TEXT AS (1)")
+                } else {
+                    format!("{name} TEXT")
+                }
+            })
+            .collect::<Vec<_>>();
+        format!("CREATE TABLE t ({})", columns.join(", "))
     }
 
     /// Returns the column definitions of the CREATE TABLE statement `sql`.
