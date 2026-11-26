@@ -16,7 +16,7 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_RECURSION,
     SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
     SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
     SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
@@ -313,7 +313,6 @@ impl PostgreSQLTranslator {
         explain: &pg_query::protobuf::ExplainStmt,
     ) -> Result<ast::Cmd, ParseError> {
         if !explain.options.is_empty() {
-            check_explain_options(&explain.options)?;
             return Err(ParseError::sqlstate(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 "EXPLAIN options are not supported".to_string(),
@@ -1649,18 +1648,7 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::internal_error("CREATE INDEX missing table name"))?;
         let tbl_name = exact_name(self.map_table_name(&relation.relname));
 
-        // PostgreSQL 18 fails on USING heap with an internal error, so heap
-        // stays a refusal.
-        if !idx.access_method.is_empty()
-            && idx.access_method != "heap"
-            && !PG_INDEX_ACCESS_METHODS.contains(&idx.access_method.as_str())
-        {
-            return Err(ParseError::sqlstate(
-                SQLSTATE_UNDEFINED_OBJECT,
-                format!("access method \"{}\" does not exist", idx.access_method),
-            ));
-        }
-        if !idx.access_method.is_empty() && idx.access_method != "btree" {
+        if !idx.access_method.is_empty() && !idx.access_method.eq_ignore_ascii_case("btree") {
             let error =
                 ParseError::not_supported(format!("CREATE INDEX ... USING {}", idx.access_method));
             return Err(if ["hash", "brin"].contains(&idx.access_method.as_str()) {
@@ -1958,11 +1946,6 @@ impl PostgreSQLTranslator {
             let has_star = result_columns
                 .iter()
                 .any(|c| !matches!(c, ast::ResultColumn::Expr(..)));
-            if !has_star && columns.len() > result_columns.len() {
-                return Err(ParseError::syntax_error(
-                    "CREATE VIEW specifies more column names than columns",
-                ));
-            }
             if has_star || result_columns.len() != columns.len() {
                 return Err(ParseError::not_supported(
                     "a view column list that does not name every select-list column",
@@ -2630,17 +2613,6 @@ impl PostgreSQLTranslator {
             )
             .with_hint("Give the columns of the first operand distinct names with AS."));
         }
-        // PostgreSQL allows INTO only on the first SELECT of a set operation,
-        // and checks that before it looks at the first SELECT's INTO.
-        if right_operands
-            .iter()
-            .any(|(_, rarg)| rarg.into_clause.is_some())
-        {
-            return Err(ParseError::syntax_error(
-                "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT",
-            ));
-        }
-        check_set_operation_column_counts(leftmost, &right_operands)?;
         let first_select = self.translate_compound_operand(leftmost)?;
         let compounds = right_operands
             .into_iter()
@@ -2744,7 +2716,7 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::OneSelect, ParseError> {
         // The first leaf of a compound can carry an IntoClause, which PG
         // treats as CREATE TABLE AS; reject it rather than implement that
-        // form. INTO on a later leaf is rejected in translate_set_operation.
+        // form. A later leaf is rejected here too, when it is translated.
         if select.into_clause.is_some() {
             return Err(ParseError::sqlstate(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
@@ -2765,18 +2737,6 @@ impl PostgreSQLTranslator {
 
         let target_list = &select.target_list;
         if target_list.is_empty() {
-            // A VALUES operand of a set operation also has no target list.
-            // PostgreSQL refuses its rows of different lengths before it
-            // runs the operation.
-            let row_lengths = select.values_lists.iter().map(|row| match &row.node {
-                Some(pg_query::protobuf::node::Node::List(list)) => list.items.len(),
-                _ => 0,
-            });
-            if row_lengths.clone().min() != row_lengths.max() {
-                return Err(ParseError::syntax_error(
-                    "VALUES lists must all be the same length",
-                ));
-            }
             return Err(ParseError::sqlstate(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 "SELECT requires at least one column or expression".to_string(),
@@ -4110,30 +4070,10 @@ impl PostgreSQLTranslator {
                                 match expr {
                                     ast::Expr::Id(name) => name,
                                     _ => {
-                                        return Err(match &arg.node {
-                                            Some(pg_query::protobuf::node::Node::RowExpr(_)) => {
-                                                ParseError::sqlstate(
-                                                    SQLSTATE_UNDEFINED_COLUMN,
-                                                    format!(
-                                                        "could not identify column \"{}\" in record data type",
-                                                        s.sval
-                                                    ),
-                                                )
-                                            }
-                                            Some(pg_query::protobuf::node::Node::AArrayExpr(_)) => {
-                                                ParseError::sqlstate(
-                                                    SQLSTATE_WRONG_OBJECT_TYPE,
-                                                    format!(
-                                                        "column notation .{} applied to an array, which is not a composite type",
-                                                        s.sval
-                                                    ),
-                                                )
-                                            }
-                                            _ => ParseError::sqlstate(
-                                                SQLSTATE_FEATURE_NOT_SUPPORTED,
-                                                "Field access on non-identifier expression",
-                                            ),
-                                        })
+                                        return Err(ParseError::sqlstate(
+                                            SQLSTATE_FEATURE_NOT_SUPPORTED,
+                                            "Field access on non-identifier expression",
+                                        ))
                                     }
                                 },
                                 exact_name(s.sval.clone()),
@@ -4382,8 +4322,8 @@ impl PostgreSQLTranslator {
                     ast::UnaryOperator::BitwiseNot,
                     Box::new(operand),
                 )),
-                _ => Err(refused_operator(
-                    op_name,
+                _ => Err(ParseError::sqlstate(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
                     format!("Unsupported unary operator: {op_name}"),
                 )),
             };
@@ -4570,8 +4510,8 @@ impl PostgreSQLTranslator {
                 });
             }
             _ => {
-                return Err(refused_operator(
-                    op_name,
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
                     format!("Unsupported operator: {op_name}"),
                 ));
             }
@@ -4712,13 +4652,11 @@ impl PostgreSQLTranslator {
                 } else {
                     "Write EXISTS (SELECT 1 FROM unnest(array) AS v(x) WHERE expr op x). It returns false where ANY returns NULL, so the result differs under NOT and in a select list."
                 };
-                let error =
-                    refused_operator(op_name, format!("{op_name} {kw} (array) is not supported"));
-                return Err(if is_pg_operator_name(op_name) {
-                    error.with_hint(hint)
-                } else {
-                    error
-                });
+                return Err(ParseError::sqlstate(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!("{op_name} {kw} (array) is not supported"),
+                )
+                .with_hint(hint));
             }
         };
 
@@ -7156,89 +7094,6 @@ fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
     }
 }
 
-/// Checks an EXPLAIN option list the way PostgreSQL does before it runs the
-/// statement: an unknown option name, a non-Boolean value for a Boolean
-/// option, and a bad FORMAT or SERIALIZE value are errors of their own.
-fn check_explain_options(options: &[pg_query::protobuf::Node]) -> Result<(), ParseError> {
-    use pg_query::protobuf::node::Node;
-
-    for option in options {
-        let Some(Node::DefElem(elem)) = &option.node else {
-            unreachable!("EXPLAIN options are DefElem nodes");
-        };
-        let name = elem.defname.as_str();
-        let arg = elem.arg.as_ref().and_then(|arg| arg.node.as_ref());
-        let choices: &[&str] = match name {
-            "format" => &["text", "xml", "json", "yaml"],
-            "serialize" => &["off", "none", "text", "binary"],
-            "analyze" | "analyse" | "verbose" | "costs" | "settings" | "generic_plan"
-            | "buffers" | "wal" | "timing" | "summary" | "memory" => &[],
-            _ => {
-                return Err(ParseError::sqlstate(
-                    SQLSTATE_SYNTAX_ERROR,
-                    format!("unrecognized EXPLAIN option \"{name}\""),
-                ))
-            }
-        };
-        if choices.is_empty() {
-            crate::defelem::boolean_option(elem)?;
-            continue;
-        }
-        let value = match arg {
-            None if name == "format" => {
-                return Err(ParseError::sqlstate(
-                    SQLSTATE_SYNTAX_ERROR,
-                    "format requires a parameter",
-                ))
-            }
-            None => continue,
-            Some(Node::String(value)) => value.sval.clone(),
-            Some(Node::Integer(value)) => value.ival.to_string(),
-            Some(_) => continue,
-        };
-        if !choices
-            .iter()
-            .any(|choice| value.eq_ignore_ascii_case(choice))
-        {
-            return Err(ParseError::sqlstate(
-                SQLSTATE_INVALID_PARAMETER_VALUE,
-                format!("unrecognized value for EXPLAIN option \"{name}\": \"{value}\""),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The names of the operators in PostgreSQL's pg_operator catalog. tursopg
-/// cannot create operators, so a name outside this list names no operator.
-// FIXME(pg-catalog): this hand-copied list of PostgreSQL 18's pg_operator names
-// tells an unknown operator (42883) from an unsupported one (0A000); a lookup of
-// the name in a pg_operator catalog would replace it.
-const PG_OPERATOR_NAMES: &[&str] = &[
-    "!!", "!~", "!~*", "!~~", "!~~*", "#", "##", "#-", "#>", "#>>", "%", "&", "&&", "&<", "&<|",
-    "&>", "*", "*<", "*<=", "*<>", "*=", "*>", "*>=", "+", "-", "->", "->>", "-|-", "/", "<",
-    "<->", "<<", "<<=", "<<|", "<=", "<>", "<@", "<^", "=", ">", ">=", ">>", ">>=", ">^", "?",
-    "?#", "?&", "?-", "?-|", "?|", "?||", "@", "@-@", "@>", "@?", "@@", "@@@", "^", "^@", "|",
-    "|&>", "|/", "|>>", "||", "||/", "~", "~*", "~<=~", "~<~", "~=", "~>=~", "~>~", "~~", "~~*",
-];
-
-fn is_pg_operator_name(op_name: &str) -> bool {
-    PG_OPERATOR_NAMES.contains(&op_name)
-}
-
-/// The error for an operator the translator does not handle: PostgreSQL's
-/// `undefined_function` when no operator has that name, else `not_supported`.
-fn refused_operator(op_name: &str, unsupported_message: String) -> ParseError {
-    if is_pg_operator_name(op_name) {
-        ParseError::sqlstate(SQLSTATE_FEATURE_NOT_SUPPORTED, unsupported_message)
-    } else {
-        ParseError::sqlstate(
-            SQLSTATE_UNDEFINED_FUNCTION,
-            format!("operator does not exist: {op_name}"),
-        )
-    }
-}
-
 fn reject_duplicate_columns<'a>(
     names: impl IntoIterator<Item = &'a str>,
     what: &str,
@@ -7750,10 +7605,7 @@ fn translate_create_role(
             ));
         };
         if !seen.insert(elem.defname.as_str()) {
-            return Err(ParseError::sqlstate(
-                SQLSTATE_SYNTAX_ERROR,
-                "conflicting or redundant options".to_string(),
-            ));
+            return Err(ParseError::conflicting_options());
         }
         match elem.defname.as_str() {
             "inherit" => options.inherit = extract_def_elem_bool(elem),
@@ -10414,7 +10266,6 @@ pub fn try_extract_copy_from(
     let mut header = false;
     let mut null_string = None;
 
-    crate::copy::check_copy_options(&copy.options, true)?;
     for opt in &copy.options {
         let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
             return Err(ParseError::internal_error("COPY: unexpected option node"));
@@ -10440,18 +10291,22 @@ pub fn try_extract_copy_from(
             }
             "header" => {
                 use pg_query::protobuf::node::Node;
-                let is_match = matches!(
-                    def.arg.as_ref().and_then(|n| n.node.as_ref()),
-                    Some(Node::String(s)) if s.sval.eq_ignore_ascii_case("match")
-                );
-                if is_match {
-                    return Err(
-                        ParseError::not_supported("this COPY HEADER value").with_hint(
-                            "Use HEADER true; the header line is skipped but not checked.",
-                        ),
-                    );
-                }
-                header = crate::defelem::boolean_option(def)?;
+                let unsupported = || {
+                    ParseError::not_supported("this COPY HEADER value").with_hint(
+                        "Use HEADER true; the header line is skipped but not checked.",
+                    )
+                };
+                header = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
+                    None => true,
+                    Some(Node::Boolean(b)) => b.boolval,
+                    Some(Node::Integer(i)) if matches!(i.ival, 0 | 1) => i.ival == 1,
+                    Some(Node::String(s)) => match s.sval.to_lowercase().as_str() {
+                        "true" | "on" | "1" => true,
+                        "false" | "off" | "0" => false,
+                        _ => return Err(unsupported()),
+                    },
+                    _ => return Err(unsupported()),
+                };
             }
             "null" => null_string = Some(copy_string_option(def)?),
             "encoding" => {
@@ -10462,7 +10317,16 @@ pub fn try_extract_copy_from(
                 }
             }
             "freeze" => {
-                let freeze = crate::defelem::boolean_option(def)?;
+                use pg_query::protobuf::node::Node;
+                let freeze = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
+                    None => true,
+                    Some(Node::Boolean(b)) => b.boolval,
+                    Some(Node::Integer(i)) if matches!(i.ival, 0 | 1) => i.ival == 1,
+                    Some(Node::String(s)) => {
+                        !matches!(s.sval.to_lowercase().as_str(), "false" | "off" | "0")
+                    }
+                    _ => true,
+                };
                 if freeze {
                     return Err(
                         ParseError::not_supported("COPY ... FREEZE").with_hint("Remove FREEZE.")
@@ -10568,17 +10432,13 @@ pub fn frontend_stmt(
 
 fn copy_string_option(def: &pg_query::protobuf::DefElem) -> Result<String, ParseError> {
     def_elem_string_val(def).ok_or_else(|| {
-        let message = format!(
-            "COPY {} requires a string argument",
-            def.defname.to_uppercase()
-        );
-        // PostgreSQL reads a number given for a string option as its text,
-        // and refuses an option without an argument as a syntax error.
-        if def.arg.is_none() {
-            ParseError::syntax_error(message)
-        } else {
-            ParseError::sqlstate(SQLSTATE_FEATURE_NOT_SUPPORTED, message)
-        }
+        ParseError::sqlstate(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "COPY {} requires a string argument",
+                def.defname.to_uppercase()
+            ),
+        )
     })
 }
 
@@ -11048,10 +10908,6 @@ fn reject_temporary(relation: &pg_query::protobuf::RangeVar, what: &str) -> Resu
     Ok(())
 }
 
-/// The index access methods of PostgreSQL 18's pg_am.
-// FIXME(pg-catalog): hand-copied from pg_am; tursopg has no pg_am to read.
-const PG_INDEX_ACCESS_METHODS: &[&str] = &["btree", "hash", "gist", "gin", "spgist", "brin"];
-
 fn reject_table_storage_clauses(
     options: &[pg_query::protobuf::Node],
     tablespace: &str,
@@ -11066,19 +10922,11 @@ fn reject_table_storage_clauses(
             ParseError::not_supported("TABLESPACE").with_hint("Remove the TABLESPACE clause.")
         );
     }
-    // PostgreSQL 18 has no table access method other than heap.
-    if !access_method.is_empty() && access_method != "heap" {
-        return Err(if PG_INDEX_ACCESS_METHODS.contains(&access_method) {
-            ParseError::sqlstate(
-                SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
-                format!("access method \"{access_method}\" is not of type TABLE"),
-            )
-        } else {
-            ParseError::sqlstate(
-                SQLSTATE_UNDEFINED_OBJECT,
-                format!("access method \"{access_method}\" does not exist"),
-            )
-        });
+    if !access_method.is_empty() && !access_method.eq_ignore_ascii_case("heap") {
+        return Err(
+            ParseError::not_supported(format!("table access method {access_method}"))
+                .with_hint("Remove the USING clause."),
+        );
     }
     Ok(())
 }
@@ -11219,64 +11067,6 @@ fn compound_operator(
             format!("Unsupported set operation: {other:?}"),
         )),
     }
-}
-
-/// Returns the 42601 error PostgreSQL gives when an operand of a set
-/// operation has a different number of columns than the first operand.
-/// Operands whose column count is not known before translation (a nested set
-/// operation, or a `*` in the select list) are skipped.
-fn check_set_operation_column_counts(
-    first: &pg_query::protobuf::SelectStmt,
-    right_operands: &[(ast::CompoundOperator, &pg_query::protobuf::SelectStmt)],
-) -> Result<(), ParseError> {
-    let Some(expected) = set_operand_column_count(first) else {
-        return Ok(());
-    };
-    for (operator, operand) in right_operands.iter().rev() {
-        if set_operand_column_count(operand).is_some_and(|count| count != expected) {
-            let name = match operator {
-                ast::CompoundOperator::Union | ast::CompoundOperator::UnionAll => "UNION",
-                ast::CompoundOperator::Intersect => "INTERSECT",
-                ast::CompoundOperator::Except => "EXCEPT",
-            };
-            return Err(ParseError::syntax_error(format!(
-                "each {name} query must have the same number of columns"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn set_operand_column_count(select: &pg_query::protobuf::SelectStmt) -> Option<usize> {
-    use pg_query::protobuf::node::Node;
-
-    if is_set_operation(select) {
-        return None;
-    }
-    if select.target_list.is_empty() {
-        return match select.values_lists.first()?.node.as_ref()? {
-            Node::List(row) => Some(row.items.len()),
-            _ => None,
-        };
-    }
-    // `t.*` and `(row).*` expand to an unknown number of columns.
-    let ends_in_star = |nodes: &[pg_query::protobuf::Node]| {
-        matches!(
-            nodes.last().and_then(|node| node.node.as_ref()),
-            Some(Node::AStar(_))
-        )
-    };
-    let has_star = select.target_list.iter().any(|target| {
-        let Some(Node::ResTarget(target)) = &target.node else {
-            return false;
-        };
-        match target.val.as_ref().and_then(|val| val.node.as_ref()) {
-            Some(Node::ColumnRef(column)) => ends_in_star(&column.fields),
-            Some(Node::AIndirection(indirection)) => ends_in_star(&indirection.indirection),
-            _ => false,
-        }
-    });
-    (!has_star).then_some(select.target_list.len())
 }
 
 fn reject_column_aliases(
@@ -14630,7 +14420,7 @@ mod tests {
             "storage parameters",
         );
         assert_not_supported("CREATE TABLE t (a int) TABLESPACE ts", "TABLESPACE");
-        assert_rejected("CREATE TABLE t (a int) USING columnar", "access method");
+        assert_not_supported("CREATE TABLE t (a int) USING columnar", "access method");
         assert_translates("CREATE TABLE t (a int) USING heap");
     }
 
@@ -14880,11 +14670,8 @@ mod tests {
     #[test]
     fn fail_closed_view_column_list() {
         assert_not_supported("CREATE UNLOGGED VIEW v AS SELECT 1", "UNLOGGED VIEW");
-        assert_rejected(
-            "CREATE VIEW v (p, q, r) AS SELECT a, b FROM t",
-            "more column names than columns",
-        );
         for sql in [
+            "CREATE VIEW v (p, q, r) AS SELECT a, b FROM t",
             "CREATE VIEW v (p) AS SELECT a, b FROM t",
             "CREATE VIEW v (p, q) AS SELECT * FROM t",
         ] {
@@ -14923,7 +14710,7 @@ mod tests {
             "CREATE TABLE t TABLESPACE ts AS SELECT 1 AS a",
             "TABLESPACE",
         );
-        assert_rejected(
+        assert_not_supported(
             "CREATE MATERIALIZED VIEW m USING columnar AS SELECT 1 AS a",
             "access method",
         );

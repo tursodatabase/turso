@@ -245,95 +245,6 @@ test error-on-conflict-assigns-a-column-twice {
 @sqlstate 42601
 expect error {}
 
-test error-into-on-a-later-select-of-a-set-operation {
-    SELECT 1 UNION SELECT 2 INTO t;
-}
-@sqlstate 42601
-expect error {}
-
-test error-explain-option-with-a-non-boolean-value {
-    EXPLAIN (ANALYZE foo) SELECT 1;
-}
-@sqlstate 42601
-expect error {}
-
-test error-copy-to-with-freeze {
-    CREATE TABLE t (a int);
-    COPY t TO STDOUT (FREEZE);
-}
-@sqlstate 22023
-expect error {}
-
-test error-copy-from-with-an-unknown-option {
-    CREATE TABLE t (a int);
-    COPY t FROM '/nonexistent' (FOO 1);
-}
-@sqlstate 42601
-expect error {}
-
-test error-copy-from-with-an-unknown-format {
-    CREATE TABLE t (a int);
-    COPY t FROM '/nonexistent' (FORMAT xml);
-}
-@sqlstate 22023
-expect error {}
-
-test error-copy-with-a-repeated-format {
-    CREATE TABLE t (a int);
-    COPY t TO STDOUT (FORMAT text, FORMAT text);
-}
-@sqlstate 42601
-expect error {
-    conflicting or redundant options
-}
-
-test error-copy-to-a-file-with-a-non-boolean-freeze {
-    CREATE TABLE t (a int);
-    COPY t TO '/nonexistent/x' (FREEZE 2);
-}
-@sqlstate 42601
-expect error {}
-
-test error-into-on-two-selects-of-a-union {
-    SELECT 1 INTO t1 UNION SELECT 2 INTO t2;
-}
-@sqlstate 42601
-expect error {}
-
-test error-union-of-values-with-different-column-counts {
-    VALUES (1, 2) UNION VALUES (3);
-}
-@sqlstate 42601
-expect error {}
-
-test error-copy-format-without-a-value {
-    CREATE TABLE t (a int);
-    COPY t TO STDOUT (FORMAT);
-}
-@sqlstate 42601
-expect error {}
-
-test error-copy-to-with-on-error-stop {
-    CREATE TABLE t (a int);
-    COPY t TO STDOUT (ON_ERROR stop);
-}
-@sqlstate 22023
-expect error {}
-
-test error-copy-from-reject-limit-without-on-error-ignore {
-    CREATE TABLE t (a int);
-    COPY t FROM '/nonexistent' (REJECT_LIMIT 1);
-}
-@sqlstate 22023
-expect error {}
-
-test error-copy-force-quote-without-a-column-list {
-    CREATE TABLE t (a int);
-    COPY t TO STDOUT (FORMAT csv, FORCE_QUOTE);
-}
-@sqlstate 22023
-expect error {}
-
 @compat-gap "syntax:copy"
 test copy-to-with-freeze-false {
     CREATE TABLE t (a int);
@@ -351,49 +262,6 @@ test error-alter-sequence-owned-by-one-name {
 @sqlstate 42601
 expect error {}
 
-test error-unknown-operator {
-    SELECT 1 ### 2;
-}
-@sqlstate 42883
-expect error {}
-
-test error-field-of-a-row-that-does-not-exist {
-    SELECT (ROW(1, 2)).f9;
-}
-@sqlstate 42703
-expect error {}
-
-test error-field-of-an-array {
-    SELECT (ARRAY[1]).x;
-}
-@sqlstate 42809
-expect error {}
-
-test error-create-view-with-more-column-names-than-columns {
-    CREATE VIEW v(a, b) AS SELECT 1;
-}
-@sqlstate 42601
-expect error {}
-
-test error-create-table-with-an-unknown-access-method {
-    CREATE TABLE t(a int) USING heap2;
-}
-@sqlstate 42704
-expect error {}
-
-test error-create-table-with-an-index-access-method {
-    CREATE TABLE t(a int) USING btree;
-}
-@sqlstate 55000
-expect error {}
-
-test error-create-index-with-an-unknown-access-method {
-    CREATE TABLE t(a int);
-    CREATE INDEX ON t USING heap2 (a);
-}
-@sqlstate 42704
-expect error {}
-
 @compat-gap "syntax:row-star"
 test union-of-a-row-star-and-two-columns {
     CREATE TABLE u2(a int, b int);
@@ -403,6 +271,16 @@ test union-of-a-row-star-and-two-columns {
 expect {
     1|2
     3|4
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:row-field"
+test field-of-a-row-constructor {
+    SELECT (ROW(1, 2)).f1;
+}
+expect {
+    1
 }
 @sqlstate 0A000
 expect @tursopg error {}

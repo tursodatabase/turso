@@ -2,7 +2,6 @@ pub mod cmdtag;
 pub mod copy;
 mod create_function;
 pub mod datetime_unit;
-mod defelem;
 pub mod functions;
 mod names;
 mod policy_condition;
@@ -83,13 +82,13 @@ impl ParseError {
         }
     }
 
-    /// PostgreSQL's `feature_not_supported` error, reading "`what` is not supported".
     /// PostgreSQL's error for an option given twice or with options that
     /// exclude each other.
     pub(crate) fn conflicting_options() -> Self {
         Self::syntax_error("conflicting or redundant options")
     }
 
+    /// PostgreSQL's `feature_not_supported` error, reading "`what` is not supported".
     pub(crate) fn not_supported(what: impl std::fmt::Display) -> Self {
         Self::sqlstate(
             sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
