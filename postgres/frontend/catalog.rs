@@ -1444,7 +1444,6 @@ impl SnapshotRows for PgProcTable {
     const ESTIMATED_ROWS: u32 = 100;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        const INTERNAL_LANGUAGE: i64 = 12;
         crate::procs::PROCS
             .iter()
             .map(|proc| {
@@ -1459,7 +1458,7 @@ impl SnapshotRows for PgProcTable {
                     Value::build_text(proc.name),
                     Value::from_i64(11),
                     Value::from_i64(SUPERUSER_OID),
-                    Value::from_i64(INTERNAL_LANGUAGE),
+                    Value::from_i64(proc.language),
                     Value::from_f64(proc.cost),
                     Value::from_f64(proc.rows),
                     Value::from_i64(proc.variadic_type),
@@ -3014,18 +3013,18 @@ impl SnapshotRows for PgLanguageTable {
     )";
     const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 2;
+    const ESTIMATED_ROWS: u32 = 3;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        [(12, "internal"), (13, "c")]
+        [(12, "internal", false), (13, "c", false), (14, "sql", true)]
             .into_iter()
-            .map(|(oid, name)| {
+            .map(|(oid, name, trusted)| {
                 vec![
                     Value::from_i64(oid),
                     Value::build_text(name),
                     Value::from_i64(10),
                     Value::from_i64(0),
-                    Value::from_i64(0),
+                    Value::from_i64(i64::from(trusted)),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::from_i64(0),

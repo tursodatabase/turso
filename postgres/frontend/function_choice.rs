@@ -2,7 +2,7 @@
 //! arguments.
 
 use crate::catalog::pg_type_oid;
-use crate::procs::PROCS;
+use crate::procs::{PROCS, SQL_LANGUAGE};
 use crate::resolve::{resolve_function, ArgCoercion, ArgType, Resolution, ResolveError};
 use crate::resolve_catalog::FrontendCatalog;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,8 +15,8 @@ use turso_pg_parser::translator::cast_type_name;
 static REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
 /// Chooses the `pg_proc` row that runs `name(arguments)`. A name with no row
-/// is left to the engine, and so is a row whose function core runs under the
-/// SQL name.
+/// is left to the engine, and so is a row written in SQL or one whose function
+/// core runs under the SQL name.
 pub(crate) fn choose_function(name: &str, arguments: &[OperandType]) -> Result<FunctionChoice> {
     if !FrontendCatalog::has_function(name) {
         return Ok(FunctionChoice::LeftToTheEngine);
@@ -54,7 +54,7 @@ fn resolve(name: &str, arguments: &[OperandType]) -> Result<FunctionChoice> {
         .iter()
         .find(|proc| proc.oid == call.oid)
         .expect("the resolver chooses a row of PROCS");
-    if LEFT_TO_THE_ENGINE.contains(&proc.source) {
+    if proc.language == SQL_LANGUAGE || LEFT_TO_THE_ENGINE.contains(&proc.source) {
         return Ok(FunctionChoice::LeftToTheEngine);
     }
     let argument_types = call
@@ -243,7 +243,7 @@ mod tests {
         };
         let mut missing: Vec<&str> = PROCS
             .iter()
-            .filter(|proc| proc.kind == "f")
+            .filter(|proc| proc.kind == "f" && proc.language != SQL_LANGUAGE)
             .filter(|proc| {
                 let runs_somewhere = LEFT_TO_THE_ENGINE.contains(&proc.source)
                     || is_registered(proc.source, proc.arg_types.len());

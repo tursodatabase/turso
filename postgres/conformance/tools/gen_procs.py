@@ -4,8 +4,9 @@
 The rows come from testdata/pg_proc.json (oid, name, argument types, result,
 prosrc); the flags that file does not have (leakproof, volatility, parallel,
 cost, rows, set-returning) come from a PostgreSQL 18 server. A row is kept when
-every argument type is a type of the frontend's pg_type, the function is not
-variadic, has no default arguments and is written in the internal language.
+every argument type is a type of the frontend's pg_type or anyelement, the
+function is not variadic, has no default arguments and is written in the
+internal or the SQL language.
 
     gen_procs.py --through bytea --port 54361            # print the table
     gen_procs.py --through bytea --port 54361 --write    # replace it in procs.rs
@@ -29,6 +30,9 @@ TYPES_OF_FRONTEND = {
     1184, 1700, 2950, 3802,
 }
 BYTEA = 17
+ANYELEMENT = 2283
+INTERNAL_LANGUAGE = 12
+SQL_LANGUAGE = 14
 
 SEED_OIDS = [
     1081, 1282, 1299, 1387, 1394, 1395, 1396, 1397, 1398, 1705, 2100, 2101, 2102, 2103,
@@ -132,8 +136,8 @@ def wanted(row, spec):
 
 def keep(row, flag):
     return (
-        flag["internal"]
-        and all(t in TYPES_OF_FRONTEND for t in row["proargtypes"])
+        flag["language"] in (INTERNAL_LANGUAGE, SQL_LANGUAGE)
+        and all(t in TYPES_OF_FRONTEND or t == ANYELEMENT for t in row["proargtypes"])
         and row["provariadic"] == 0
         and row["pronargdefaults"] == 0
     )
@@ -158,15 +162,15 @@ def server_flags(args):
         sys.exit(f"need PostgreSQL 18, got {version}")
     out = psql(
         args,
-        """SELECT oid::int, prolang = 12, proleakproof, proretset, provolatile::text, proparallel::text,
+        """SELECT oid::int, prolang::int, proleakproof, proretset, provolatile::text, proparallel::text,
                   procost::float8, prorows::float8
            FROM pg_proc WHERE pronamespace = 'pg_catalog'::regnamespace""",
     )
     flags = {}
     for line in out.splitlines():
-        oid, internal, leak, retset, volatility, parallel, cost, rows = line.split("\t")
+        oid, language, leak, retset, volatility, parallel, cost, rows = line.split("\t")
         flags[int(oid)] = {
-            "internal": internal == "t",
+            "language": int(language),
             "leakproof": leak == "t", "returns_set": retset == "t", "volatility": volatility,
             "parallel": parallel, "cost": float(cost), "rows": float(rows),
         }
@@ -184,8 +188,12 @@ def render(row, flag):
         f'{rust_bool(flag["leakproof"])}, {rust_bool(row["proisstrict"])}, '
         f'{rust_bool(flag["returns_set"])}, "{flag["volatility"]}", "{flag["parallel"]}", '
         f'{float_literal(flag["cost"])}, {float_literal(flag["rows"])}, {row["provariadic"]}, '
-        f'&[{types}], {row["prorettype"]}, "{row["prosrc"]}"),\n'
+        f'&[{types}], {row["prorettype"]}, {flag["language"]}, {rust_string(row["prosrc"])}),\n'
     )
+
+
+def rust_string(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def float_literal(value):
@@ -201,7 +209,7 @@ def print_sqltest(family, chosen, flags):
     print(f"test pg-proc-{family}-rows-match-postgresql {{")
     print("    SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,")
     print("           proparallel, procost::int, prorows::int, provariadic, proargtypes::text,")
-    print("           prorettype, prosrc")
+    print("           prorettype, prolang, prosrc")
     print("    FROM pg_proc")
     print("    WHERE oid IN (")
     for line in wrapped:
@@ -217,7 +225,7 @@ def print_sqltest(family, chosen, flags):
             oid, row["proname"], row["prokind"], tf(flag["leakproof"]), tf(row["proisstrict"]),
             tf(flag["returns_set"]), flag["volatility"], flag["parallel"], int(flag["cost"]),
             int(flag["rows"]), row["provariadic"], " ".join(map(str, row["proargtypes"])),
-            row["prorettype"], row["prosrc"],
+            row["prorettype"], flag["language"], row["prosrc"],
         ]
         print("    " + "|".join(map(str, cells)))
     print("}")

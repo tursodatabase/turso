@@ -982,98 +982,105 @@ expect {
 test pg-proc-math-rows-match-postgresql {
     SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
            proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
-           prorettype, prosrc
+           prorettype, prolang, prosrc
     FROM pg_proc
     WHERE oid IN (
         753, 940, 941, 947, 1340, 1341, 1342, 1343, 1344, 1347, 1368, 1598, 1608, 1609, 1610, 1706,
-        1707, 1709, 1711, 1712, 1728, 1730, 1732, 1734, 1736, 2167, 2169, 2308, 2309, 2310, 2320, 6339,
-        6340, 6341
+        1707, 1708, 1709, 1710, 1711, 1712, 1728, 1730, 1732, 1734, 1736, 1741, 2167, 2169, 2308, 2309,
+        2310, 2320, 6339, 6340, 6341
     )
     ORDER BY oid;
 }
 expect {
-    753|trunc|f|f|t|f|i|s|1|0|0|829|829|macaddr_trunc
-    940|mod|f|f|t|f|i|s|1|0|0|21 21|21|int2mod
-    941|mod|f|f|t|f|i|s|1|0|0|23 23|23|int4mod
-    947|mod|f|f|t|f|i|s|1|0|0|20 20|20|int8mod
-    1340|log|f|f|t|f|i|s|1|0|0|701|701|dlog10
-    1341|ln|f|f|t|f|i|s|1|0|0|701|701|dlog1
-    1342|round|f|f|t|f|i|s|1|0|0|701|701|dround
-    1343|trunc|f|f|t|f|i|s|1|0|0|701|701|dtrunc
-    1344|sqrt|f|f|t|f|i|s|1|0|0|701|701|dsqrt
-    1347|exp|f|f|t|f|i|s|1|0|0|701|701|dexp
-    1368|power|f|f|t|f|i|s|1|0|0|701 701|701|dpow
-    1598|random|f|f|t|f|v|r|1|0|0||701|drandom
-    1608|degrees|f|f|t|f|i|s|1|0|0|701|701|degrees
-    1609|radians|f|f|t|f|i|s|1|0|0|701|701|radians
-    1610|pi|f|f|t|f|i|s|1|0|0||701|dpi
-    1706|sign|f|f|t|f|i|s|1|0|0|1700|1700|numeric_sign
-    1707|round|f|f|t|f|i|s|1|0|0|1700 23|1700|numeric_round
-    1709|trunc|f|f|t|f|i|s|1|0|0|1700 23|1700|numeric_trunc
-    1711|ceil|f|f|t|f|i|s|1|0|0|1700|1700|numeric_ceil
-    1712|floor|f|f|t|f|i|s|1|0|0|1700|1700|numeric_floor
-    1728|mod|f|f|t|f|i|s|1|0|0|1700 1700|1700|numeric_mod
-    1730|sqrt|f|f|t|f|i|s|1|0|0|1700|1700|numeric_sqrt
-    1732|exp|f|f|t|f|i|s|1|0|0|1700|1700|numeric_exp
-    1734|ln|f|f|t|f|i|s|1|0|0|1700|1700|numeric_ln
-    1736|log|f|f|t|f|i|s|1|0|0|1700 1700|1700|numeric_log
-    2167|ceiling|f|f|t|f|i|s|1|0|0|1700|1700|numeric_ceil
-    2169|power|f|f|t|f|i|s|1|0|0|1700 1700|1700|numeric_power
-    2308|ceil|f|f|t|f|i|s|1|0|0|701|701|dceil
-    2309|floor|f|f|t|f|i|s|1|0|0|701|701|dfloor
-    2310|sign|f|f|t|f|i|s|1|0|0|701|701|dsign
-    2320|ceiling|f|f|t|f|i|s|1|0|0|701|701|dceil
-    6339|random|f|f|t|f|v|r|1|0|0|23 23|23|int4random
-    6340|random|f|f|t|f|v|r|1|0|0|20 20|20|int8random
-    6341|random|f|f|t|f|v|r|1|0|0|1700 1700|1700|numeric_random
+    753|trunc|f|f|t|f|i|s|1|0|0|829|829|12|macaddr_trunc
+    940|mod|f|f|t|f|i|s|1|0|0|21 21|21|12|int2mod
+    941|mod|f|f|t|f|i|s|1|0|0|23 23|23|12|int4mod
+    947|mod|f|f|t|f|i|s|1|0|0|20 20|20|12|int8mod
+    1340|log|f|f|t|f|i|s|1|0|0|701|701|12|dlog10
+    1341|ln|f|f|t|f|i|s|1|0|0|701|701|12|dlog1
+    1342|round|f|f|t|f|i|s|1|0|0|701|701|12|dround
+    1343|trunc|f|f|t|f|i|s|1|0|0|701|701|12|dtrunc
+    1344|sqrt|f|f|t|f|i|s|1|0|0|701|701|12|dsqrt
+    1347|exp|f|f|t|f|i|s|1|0|0|701|701|12|dexp
+    1368|power|f|f|t|f|i|s|1|0|0|701 701|701|12|dpow
+    1598|random|f|f|t|f|v|r|1|0|0||701|12|drandom
+    1608|degrees|f|f|t|f|i|s|1|0|0|701|701|12|degrees
+    1609|radians|f|f|t|f|i|s|1|0|0|701|701|12|radians
+    1610|pi|f|f|t|f|i|s|1|0|0||701|12|dpi
+    1706|sign|f|f|t|f|i|s|1|0|0|1700|1700|12|numeric_sign
+    1707|round|f|f|t|f|i|s|1|0|0|1700 23|1700|12|numeric_round
+    1708|round|f|f|t|f|i|s|1|0|0|1700|1700|14|
+    1709|trunc|f|f|t|f|i|s|1|0|0|1700 23|1700|12|numeric_trunc
+    1710|trunc|f|f|t|f|i|s|1|0|0|1700|1700|14|
+    1711|ceil|f|f|t|f|i|s|1|0|0|1700|1700|12|numeric_ceil
+    1712|floor|f|f|t|f|i|s|1|0|0|1700|1700|12|numeric_floor
+    1728|mod|f|f|t|f|i|s|1|0|0|1700 1700|1700|12|numeric_mod
+    1730|sqrt|f|f|t|f|i|s|1|0|0|1700|1700|12|numeric_sqrt
+    1732|exp|f|f|t|f|i|s|1|0|0|1700|1700|12|numeric_exp
+    1734|ln|f|f|t|f|i|s|1|0|0|1700|1700|12|numeric_ln
+    1736|log|f|f|t|f|i|s|1|0|0|1700 1700|1700|12|numeric_log
+    1741|log|f|f|t|f|i|s|1|0|0|1700|1700|14|
+    2167|ceiling|f|f|t|f|i|s|1|0|0|1700|1700|12|numeric_ceil
+    2169|power|f|f|t|f|i|s|1|0|0|1700 1700|1700|12|numeric_power
+    2308|ceil|f|f|t|f|i|s|1|0|0|701|701|12|dceil
+    2309|floor|f|f|t|f|i|s|1|0|0|701|701|12|dfloor
+    2310|sign|f|f|t|f|i|s|1|0|0|701|701|12|dsign
+    2320|ceiling|f|f|t|f|i|s|1|0|0|701|701|12|dceil
+    6339|random|f|f|t|f|v|r|1|0|0|23 23|23|12|int4random
+    6340|random|f|f|t|f|v|r|1|0|0|20 20|20|12|int8random
+    6341|random|f|f|t|f|v|r|1|0|0|1700 1700|1700|12|numeric_random
 }
 
 # The rows of pg_proc for the string functions match PostgreSQL 18.
 test pg-proc-string-rows-match-postgresql {
     SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
            proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
-           prorettype, prosrc
+           prorettype, prolang, prosrc
     FROM pg_proc
     WHERE oid IN (
-        849, 868, 870, 871, 873, 874, 875, 876, 877, 881, 882, 883, 884, 885, 936, 937, 1283, 1317,
-        1369, 1374, 1381, 1621, 1622, 2073, 2087, 3062
+        849, 868, 870, 871, 873, 874, 875, 876, 877, 879, 880, 881, 882, 883, 884, 885, 936, 937, 1283,
+        1285, 1317, 1369, 1374, 1381, 1621, 1622, 2073, 2074, 2087, 3062
     )
     ORDER BY oid;
 }
 expect {
-    849|position|f|f|t|f|i|s|1|0|0|25 25|23|textpos
-    868|strpos|f|f|t|f|i|s|1|0|0|25 25|23|textpos
-    870|lower|f|f|t|f|i|s|1|0|0|25|25|lower
-    871|upper|f|f|t|f|i|s|1|0|0|25|25|upper
-    873|lpad|f|f|t|f|i|s|1|0|0|25 23 25|25|lpad
-    874|rpad|f|f|t|f|i|s|1|0|0|25 23 25|25|rpad
-    875|ltrim|f|f|t|f|i|s|1|0|0|25 25|25|ltrim
-    876|rtrim|f|f|t|f|i|s|1|0|0|25 25|25|rtrim
-    877|substr|f|f|t|f|i|s|1|0|0|25 23 23|25|text_substr
-    881|ltrim|f|f|t|f|i|s|1|0|0|25|25|ltrim1
-    882|rtrim|f|f|t|f|i|s|1|0|0|25|25|rtrim1
-    883|substr|f|f|t|f|i|s|1|0|0|25 23|25|text_substr_no_len
-    884|btrim|f|f|t|f|i|s|1|0|0|25 25|25|btrim
-    885|btrim|f|f|t|f|i|s|1|0|0|25|25|btrim1
-    936|substring|f|f|t|f|i|s|1|0|0|25 23 23|25|text_substr
-    937|substring|f|f|t|f|i|s|1|0|0|25 23|25|text_substr_no_len
-    1283|quote_literal|f|f|t|f|i|s|1|0|0|25|25|quote_literal
-    1317|length|f|f|t|f|i|s|1|0|0|25|23|textlen
-    1369|character_length|f|f|t|f|i|s|1|0|0|25|23|textlen
-    1374|octet_length|f|f|t|f|i|s|1|0|0|25|23|textoctetlen
-    1381|char_length|f|f|t|f|i|s|1|0|0|25|23|textlen
-    1621|chr|f|f|t|f|i|s|1|0|0|23|25|chr
-    1622|repeat|f|f|t|f|i|s|1|0|0|25 23|25|repeat
-    2073|substring|f|f|t|f|i|s|1|0|0|25 25|25|textregexsubstr
-    2087|replace|f|f|t|f|i|s|1|0|0|25 25 25|25|replace_text
-    3062|reverse|f|f|t|f|i|s|1|0|0|25|25|text_reverse
+    849|position|f|f|t|f|i|s|1|0|0|25 25|23|12|textpos
+    868|strpos|f|f|t|f|i|s|1|0|0|25 25|23|12|textpos
+    870|lower|f|f|t|f|i|s|1|0|0|25|25|12|lower
+    871|upper|f|f|t|f|i|s|1|0|0|25|25|12|upper
+    873|lpad|f|f|t|f|i|s|1|0|0|25 23 25|25|12|lpad
+    874|rpad|f|f|t|f|i|s|1|0|0|25 23 25|25|12|rpad
+    875|ltrim|f|f|t|f|i|s|1|0|0|25 25|25|12|ltrim
+    876|rtrim|f|f|t|f|i|s|1|0|0|25 25|25|12|rtrim
+    877|substr|f|f|t|f|i|s|1|0|0|25 23 23|25|12|text_substr
+    879|lpad|f|f|t|f|i|s|1|0|0|25 23|25|14|
+    880|rpad|f|f|t|f|i|s|1|0|0|25 23|25|14|
+    881|ltrim|f|f|t|f|i|s|1|0|0|25|25|12|ltrim1
+    882|rtrim|f|f|t|f|i|s|1|0|0|25|25|12|rtrim1
+    883|substr|f|f|t|f|i|s|1|0|0|25 23|25|12|text_substr_no_len
+    884|btrim|f|f|t|f|i|s|1|0|0|25 25|25|12|btrim
+    885|btrim|f|f|t|f|i|s|1|0|0|25|25|12|btrim1
+    936|substring|f|f|t|f|i|s|1|0|0|25 23 23|25|12|text_substr
+    937|substring|f|f|t|f|i|s|1|0|0|25 23|25|12|text_substr_no_len
+    1283|quote_literal|f|f|t|f|i|s|1|0|0|25|25|12|quote_literal
+    1285|quote_literal|f|f|t|f|s|s|1|0|0|2283|25|14|select pg_catalog.quote_literal($1::pg_catalog.text)
+    1317|length|f|f|t|f|i|s|1|0|0|25|23|12|textlen
+    1369|character_length|f|f|t|f|i|s|1|0|0|25|23|12|textlen
+    1374|octet_length|f|f|t|f|i|s|1|0|0|25|23|12|textoctetlen
+    1381|char_length|f|f|t|f|i|s|1|0|0|25|23|12|textlen
+    1621|chr|f|f|t|f|i|s|1|0|0|23|25|12|chr
+    1622|repeat|f|f|t|f|i|s|1|0|0|25 23|25|12|repeat
+    2073|substring|f|f|t|f|i|s|1|0|0|25 25|25|12|textregexsubstr
+    2074|substring|f|f|t|f|i|s|1|0|0|25 25 25|25|14|
+    2087|replace|f|f|t|f|i|s|1|0|0|25 25 25|25|12|replace_text
+    3062|reverse|f|f|t|f|i|s|1|0|0|25|25|12|text_reverse
 }
 
 # The rows of pg_proc for the bytea functions match PostgreSQL 18.
 test pg-proc-bytea-rows-match-postgresql {
     SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
            proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
-           prorettype, prosrc
+           prorettype, prolang, prosrc
     FROM pg_proc
     WHERE oid IN (
         720, 2010, 2012, 2013, 2014, 2015, 2085, 2086, 6195, 6196, 6382
@@ -1081,93 +1088,96 @@ test pg-proc-bytea-rows-match-postgresql {
     ORDER BY oid;
 }
 expect {
-    720|octet_length|f|f|t|f|i|s|1|0|0|17|23|byteaoctetlen
-    2010|length|f|f|t|f|i|s|1|0|0|17|23|byteaoctetlen
-    2012|substring|f|f|t|f|i|s|1|0|0|17 23 23|17|bytea_substr
-    2013|substring|f|f|t|f|i|s|1|0|0|17 23|17|bytea_substr_no_len
-    2014|position|f|f|t|f|i|s|1|0|0|17 17|23|byteapos
-    2015|btrim|f|f|t|f|i|s|1|0|0|17 17|17|byteatrim
-    2085|substr|f|f|t|f|i|s|1|0|0|17 23 23|17|bytea_substr
-    2086|substr|f|f|t|f|i|s|1|0|0|17 23|17|bytea_substr_no_len
-    6195|ltrim|f|f|t|f|i|s|1|0|0|17 17|17|bytealtrim
-    6196|rtrim|f|f|t|f|i|s|1|0|0|17 17|17|byteartrim
-    6382|reverse|f|f|t|f|i|s|1|0|0|17|17|bytea_reverse
+    720|octet_length|f|f|t|f|i|s|1|0|0|17|23|12|byteaoctetlen
+    2010|length|f|f|t|f|i|s|1|0|0|17|23|12|byteaoctetlen
+    2012|substring|f|f|t|f|i|s|1|0|0|17 23 23|17|12|bytea_substr
+    2013|substring|f|f|t|f|i|s|1|0|0|17 23|17|12|bytea_substr_no_len
+    2014|position|f|f|t|f|i|s|1|0|0|17 17|23|12|byteapos
+    2015|btrim|f|f|t|f|i|s|1|0|0|17 17|17|12|byteatrim
+    2085|substr|f|f|t|f|i|s|1|0|0|17 23 23|17|12|bytea_substr
+    2086|substr|f|f|t|f|i|s|1|0|0|17 23|17|12|bytea_substr_no_len
+    6195|ltrim|f|f|t|f|i|s|1|0|0|17 17|17|12|bytealtrim
+    6196|rtrim|f|f|t|f|i|s|1|0|0|17 17|17|12|byteartrim
+    6382|reverse|f|f|t|f|i|s|1|0|0|17|17|12|bytea_reverse
 }
 
 # The rows of pg_proc for the datetime functions match PostgreSQL 18.
 test pg-proc-datetime-rows-match-postgresql {
     SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
            proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
-           prorettype, prosrc
+           prorettype, prolang, prosrc
     FROM pg_proc
     WHERE oid IN (
-        1158, 1171, 1217, 1284, 1385, 1770, 1772, 1773, 1774, 1775, 1776, 1778, 2020, 2021, 2049, 2647,
-        2648, 2649, 6199, 6200, 6202, 6203
+        1158, 1171, 1217, 1284, 1384, 1385, 1770, 1772, 1773, 1774, 1775, 1776, 1778, 2020, 2021, 2049,
+        2647, 2648, 2649, 6199, 6200, 6202, 6203
     )
     ORDER BY oid;
 }
 expect {
-    1158|to_timestamp|f|f|t|f|i|s|1|0|0|701|1184|float8_timestamptz
-    1171|date_part|f|f|t|f|s|s|1|0|0|25 1184|701|timestamptz_part
-    1217|date_trunc|f|f|t|f|s|s|1|0|0|25 1184|1184|timestamptz_trunc
-    1284|date_trunc|f|f|t|f|i|s|1|0|0|25 1184 25|1184|timestamptz_trunc_zone
-    1385|date_part|f|f|t|f|i|s|1|0|0|25 1083|701|time_part
-    1770|to_char|f|f|t|f|s|s|1|0|0|1184 25|25|timestamptz_to_char
-    1772|to_char|f|f|t|f|s|s|1|0|0|1700 25|25|numeric_to_char
-    1773|to_char|f|f|t|f|s|s|1|0|0|23 25|25|int4_to_char
-    1774|to_char|f|f|t|f|s|s|1|0|0|20 25|25|int8_to_char
-    1775|to_char|f|f|t|f|s|s|1|0|0|700 25|25|float4_to_char
-    1776|to_char|f|f|t|f|s|s|1|0|0|701 25|25|float8_to_char
-    1778|to_timestamp|f|f|t|f|s|s|1|0|0|25 25|1184|to_timestamp
-    2020|date_trunc|f|f|t|f|i|s|1|0|0|25 1114|1114|timestamp_trunc
-    2021|date_part|f|f|t|f|i|s|1|0|0|25 1114|701|timestamp_part
-    2049|to_char|f|f|t|f|s|s|1|0|0|1114 25|25|timestamp_to_char
-    2647|transaction_timestamp|f|f|t|f|s|s|1|0|0||1184|now
-    2648|statement_timestamp|f|f|t|f|s|s|1|0|0||1184|statement_timestamp
-    2649|clock_timestamp|f|f|t|f|v|s|1|0|0||1184|clock_timestamp
-    6199|extract|f|f|t|f|i|s|1|0|0|25 1082|1700|extract_date
-    6200|extract|f|f|t|f|i|s|1|0|0|25 1083|1700|extract_time
-    6202|extract|f|f|t|f|i|s|1|0|0|25 1114|1700|extract_timestamp
-    6203|extract|f|f|t|f|s|s|1|0|0|25 1184|1700|extract_timestamptz
+    1158|to_timestamp|f|f|t|f|i|s|1|0|0|701|1184|12|float8_timestamptz
+    1171|date_part|f|f|t|f|s|s|1|0|0|25 1184|701|12|timestamptz_part
+    1217|date_trunc|f|f|t|f|s|s|1|0|0|25 1184|1184|12|timestamptz_trunc
+    1284|date_trunc|f|f|t|f|i|s|1|0|0|25 1184 25|1184|12|timestamptz_trunc_zone
+    1384|date_part|f|f|t|f|i|s|1|0|0|25 1082|701|14|
+    1385|date_part|f|f|t|f|i|s|1|0|0|25 1083|701|12|time_part
+    1770|to_char|f|f|t|f|s|s|1|0|0|1184 25|25|12|timestamptz_to_char
+    1772|to_char|f|f|t|f|s|s|1|0|0|1700 25|25|12|numeric_to_char
+    1773|to_char|f|f|t|f|s|s|1|0|0|23 25|25|12|int4_to_char
+    1774|to_char|f|f|t|f|s|s|1|0|0|20 25|25|12|int8_to_char
+    1775|to_char|f|f|t|f|s|s|1|0|0|700 25|25|12|float4_to_char
+    1776|to_char|f|f|t|f|s|s|1|0|0|701 25|25|12|float8_to_char
+    1778|to_timestamp|f|f|t|f|s|s|1|0|0|25 25|1184|12|to_timestamp
+    2020|date_trunc|f|f|t|f|i|s|1|0|0|25 1114|1114|12|timestamp_trunc
+    2021|date_part|f|f|t|f|i|s|1|0|0|25 1114|701|12|timestamp_part
+    2049|to_char|f|f|t|f|s|s|1|0|0|1114 25|25|12|timestamp_to_char
+    2647|transaction_timestamp|f|f|t|f|s|s|1|0|0||1184|12|now
+    2648|statement_timestamp|f|f|t|f|s|s|1|0|0||1184|12|statement_timestamp
+    2649|clock_timestamp|f|f|t|f|v|s|1|0|0||1184|12|clock_timestamp
+    6199|extract|f|f|t|f|i|s|1|0|0|25 1082|1700|12|extract_date
+    6200|extract|f|f|t|f|i|s|1|0|0|25 1083|1700|12|extract_time
+    6202|extract|f|f|t|f|i|s|1|0|0|25 1114|1700|12|extract_timestamp
+    6203|extract|f|f|t|f|s|s|1|0|0|25 1184|1700|12|extract_timestamptz
 }
 
 # The rows of pg_proc for the catalog functions match PostgreSQL 18.
 test pg-proc-catalog-rows-match-postgresql {
     SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
            proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
-           prorettype, prosrc
+           prorettype, prolang, prosrc
     FROM pg_proc
     WHERE oid IN (
-        89, 745, 746, 861, 1402, 1403, 1597, 1642, 1643, 1662, 2026, 2077, 2078, 2079, 2080, 2081, 2162,
-        2165, 2507, 2730, 3294, 3432, 6174, 6210
+        89, 745, 746, 861, 1216, 1348, 1402, 1403, 1597, 1642, 1643, 1662, 2026, 2077, 2078, 2079, 2080,
+        2081, 2162, 2165, 2507, 2730, 3294, 3432, 6174, 6210
     )
     ORDER BY oid;
 }
 expect {
-    89|version|f|f|t|f|s|s|1|0|0||25|pgsql_version
-    745|current_user|f|f|t|f|s|s|1|0|0||19|current_user
-    746|session_user|f|f|t|f|s|s|1|0|0||19|session_user
-    861|current_database|f|f|t|f|s|s|1|0|0||19|current_database
-    1402|current_schema|f|f|t|f|s|u|1|0|0||19|current_schema
-    1403|current_schemas|f|f|t|f|s|u|1|0|0|16|1003|current_schemas
-    1597|pg_encoding_to_char|f|f|t|f|s|s|1|0|0|23|19|PG_encoding_to_char
-    1642|pg_get_userbyid|f|f|t|f|s|s|1|0|0|26|19|pg_get_userbyid
-    1643|pg_get_indexdef|f|f|t|f|s|s|1|0|0|26|25|pg_get_indexdef
-    1662|pg_get_triggerdef|f|f|t|f|s|s|1|0|0|26|25|pg_get_triggerdef
-    2026|pg_backend_pid|f|f|t|f|s|r|1|0|0||23|pg_backend_pid
-    2077|current_setting|f|f|t|f|s|s|1|0|0|25|25|show_config_by_name
-    2078|set_config|f|f|f|f|v|u|1|0|0|25 25 16|25|set_config_by_name
-    2079|pg_table_is_visible|f|f|t|f|s|s|10|0|0|26|16|pg_table_is_visible
-    2080|pg_type_is_visible|f|f|t|f|s|s|10|0|0|26|16|pg_type_is_visible
-    2081|pg_function_is_visible|f|f|t|f|s|s|10|0|0|26|16|pg_function_is_visible
-    2162|pg_get_function_arguments|f|f|t|f|s|s|1|0|0|26|25|pg_get_function_arguments
-    2165|pg_get_function_result|f|f|t|f|s|s|1|0|0|26|25|pg_get_function_result
-    2507|pg_get_indexdef|f|f|t|f|s|s|1|0|0|26 23 16|25|pg_get_indexdef_ext
-    2730|pg_get_triggerdef|f|f|t|f|s|s|1|0|0|26 16|25|pg_get_triggerdef_ext
-    3294|current_setting|f|f|t|f|s|s|1|0|0|25 16|25|show_config_by_name_missing_ok
-    3432|gen_random_uuid|f|f|t|f|v|s|1|0|0||2950|gen_random_uuid
-    6174|pg_get_statisticsobjdef_columns|f|f|t|f|s|s|1|0|0|26|25|pg_get_statisticsobjdef_columns
-    6210|pg_input_is_valid|f|f|t|f|s|s|1|0|0|25 25|16|pg_input_is_valid
+    89|version|f|f|t|f|s|s|1|0|0||25|12|pgsql_version
+    745|current_user|f|f|t|f|s|s|1|0|0||19|12|current_user
+    746|session_user|f|f|t|f|s|s|1|0|0||19|12|session_user
+    861|current_database|f|f|t|f|s|s|1|0|0||19|12|current_database
+    1216|col_description|f|f|t|f|s|s|100|0|0|26 23|25|14|
+    1348|obj_description|f|f|t|f|s|s|100|0|0|26|25|14|
+    1402|current_schema|f|f|t|f|s|u|1|0|0||19|12|current_schema
+    1403|current_schemas|f|f|t|f|s|u|1|0|0|16|1003|12|current_schemas
+    1597|pg_encoding_to_char|f|f|t|f|s|s|1|0|0|23|19|12|PG_encoding_to_char
+    1642|pg_get_userbyid|f|f|t|f|s|s|1|0|0|26|19|12|pg_get_userbyid
+    1643|pg_get_indexdef|f|f|t|f|s|s|1|0|0|26|25|12|pg_get_indexdef
+    1662|pg_get_triggerdef|f|f|t|f|s|s|1|0|0|26|25|12|pg_get_triggerdef
+    2026|pg_backend_pid|f|f|t|f|s|r|1|0|0||23|12|pg_backend_pid
+    2077|current_setting|f|f|t|f|s|s|1|0|0|25|25|12|show_config_by_name
+    2078|set_config|f|f|f|f|v|u|1|0|0|25 25 16|25|12|set_config_by_name
+    2079|pg_table_is_visible|f|f|t|f|s|s|10|0|0|26|16|12|pg_table_is_visible
+    2080|pg_type_is_visible|f|f|t|f|s|s|10|0|0|26|16|12|pg_type_is_visible
+    2081|pg_function_is_visible|f|f|t|f|s|s|10|0|0|26|16|12|pg_function_is_visible
+    2162|pg_get_function_arguments|f|f|t|f|s|s|1|0|0|26|25|12|pg_get_function_arguments
+    2165|pg_get_function_result|f|f|t|f|s|s|1|0|0|26|25|12|pg_get_function_result
+    2507|pg_get_indexdef|f|f|t|f|s|s|1|0|0|26 23 16|25|12|pg_get_indexdef_ext
+    2730|pg_get_triggerdef|f|f|t|f|s|s|1|0|0|26 16|25|12|pg_get_triggerdef_ext
+    3294|current_setting|f|f|t|f|s|s|1|0|0|25 16|25|12|show_config_by_name_missing_ok
+    3432|gen_random_uuid|f|f|t|f|v|s|1|0|0||2950|12|gen_random_uuid
+    6174|pg_get_statisticsobjdef_columns|f|f|t|f|s|s|1|0|0|26|25|12|pg_get_statisticsobjdef_columns
+    6210|pg_input_is_valid|f|f|t|f|s|s|1|0|0|25 25|16|12|pg_input_is_valid
 }
 
 test pg-object-opclass-is-read-only {
