@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use turso_sync_engine::Result;
 
-use crate::harness::Remote;
+use crate::harness::{database_opts, InProcessServer, Remote, Replica};
 
 const TABLE_WITH_INDEXED_GENERATED_COLUMN: &[&str] = &[
     "CREATE TABLE core (id TEXT PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)))",
@@ -152,4 +154,68 @@ fn drop_newest_table_and_create_another_table_in_one_transaction() -> Result<()>
 
     assert_eq!(replica.snapshot()?, remote.snapshot()?);
     Ok(())
+}
+
+/// The remote changes a generated column and the generated column that uses
+/// it, with a regular column between them. It drops both and adds them again at
+/// the end. The replica must not take the last generated column as renamed to
+/// the name of the first one, which the replica still has until it drops it.
+#[test]
+fn redefine_generated_columns_around_regular_column_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, k TEXT AS (lower(a)), x TEXT, u TEXT AS (k || '!'))",
+        "INSERT INTO t (id, a, x) VALUES (1, 'Aa', 'x1')",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        "ALTER TABLE t DROP COLUMN u",
+        "ALTER TABLE t DROP COLUMN k",
+        "ALTER TABLE t ADD COLUMN k TEXT AS (upper(a))",
+        "ALTER TABLE t ADD COLUMN u TEXT AS (k || '!')",
+    ])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+
+    // A pull matches the values of a remote row with the columns by position.
+    // This insert shows that the replica has the column order of the server.
+    remote.execute_transaction(&["INSERT INTO t (id, a, x) VALUES (2, 'Bb', 'x2')"])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+/// A new replica starts from a checkpoint of the server before the change of
+/// `redefine_generated_columns_around_regular_column_in_one_transaction`, and
+/// replays the change from the log. It must be the same as the server.
+#[test]
+fn new_replica_replays_generated_columns_re_added_around_regular_column() -> Result<()> {
+    let setup = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, k TEXT AS (lower(a)), x TEXT, u TEXT AS (k || '!'))",
+        "INSERT INTO t (id, a, x) VALUES (1, 'Aa', 'x1')",
+    ];
+    let checkpoint = Remote::new(&setup)?;
+    let remote = Remote::new(&setup)?;
+    // A bootstrap checkpoints the remote, so its log holds only the change.
+    remote.bootstrap_replica()?;
+    remote.execute_transaction(&[
+        "ALTER TABLE t DROP COLUMN u",
+        "ALTER TABLE t DROP COLUMN k",
+        "ALTER TABLE t ADD COLUMN k TEXT AS (upper(a))",
+        "ALTER TABLE t ADD COLUMN u TEXT AS (k || '!')",
+    ])?;
+
+    let replica = open_new_replica(&remote, checkpoint)?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+/// Opens a new replica that starts from `checkpoint`, a database with the state
+/// of the server at its last checkpoint, and replays the log of `remote`.
+fn open_new_replica(remote: &Arc<Remote>, checkpoint: Arc<Remote>) -> Result<Replica> {
+    Replica::open(
+        &Arc::new(tempfile::tempdir()?),
+        InProcessServer::with_bootstrap_base(remote.clone(), checkpoint),
+        database_opts(),
+    )
 }
