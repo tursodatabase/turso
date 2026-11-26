@@ -105,7 +105,11 @@ use turso_macros::turso_debug_assert;
 
 use crate::pseudo::PseudoCursor;
 
+#[cfg(debug_assertions)]
+use crate::storage::btree::CursorOpcode;
 use crate::storage::btree::{BTreeCursor, BTreeKey};
+#[cfg(debug_assertions)]
+use crate::storage::model::ModelCursor;
 
 #[inline]
 fn btree_cursor_with_yield_context(
@@ -12265,6 +12269,14 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
+                #[cfg(debug_assertions)]
+                note_cursor_opcode(
+                    state,
+                    *cursor_id,
+                    CursorOpcode::Insert {
+                        require_seek: flag.has(InsertFlags::REQUIRE_SEEK),
+                    },
+                );
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, connection, *cursor_id)?
                 } else {
@@ -12916,6 +12928,8 @@ pub fn op_idx_delete(
         );
         match state.active_op_state.idx_delete() {
             OpIdxDeleteState::Seeking => {
+                #[cfg(debug_assertions)]
+                note_cursor_opcode(state, *cursor_id, CursorOpcode::IdxDelete);
                 let found = match seek_internal(
                     program,
                     state,
@@ -13043,6 +13057,16 @@ pub fn op_idx_insert(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    #[cfg(debug_assertions)]
+    if *state.active_op_state.idx_insert() == OpIdxInsertState::MaybeSeek {
+        note_cursor_opcode(
+            state,
+            cursor_id,
+            CursorOpcode::IdxInsert {
+                use_seek: flags.has(IdxInsertFlags::USE_SEEK),
+            },
+        );
+    }
     let record_to_insert = match &state.registers[record_reg] {
         Register::Record(ref r) => r,
         o => {
@@ -13232,6 +13256,8 @@ fn new_rowid_inner(
     loop {
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
+                #[cfg(debug_assertions)]
+                note_cursor_opcode(state, *cursor, CursorOpcode::NewRowid);
                 if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
@@ -13269,7 +13295,7 @@ fn new_rowid_inner(
                         // DB cursor without MVCC (e.g., :memory: attached DBs skip MVCC).
                         // Keep the downcast check as a safety net against unexpected cursor types.
                         assert!(
-                            cursor.downcast_ref::<BTreeCursor>().is_some(),
+                            cursor.downcast_ref::<BTreeCursor>().is_some() || is_model(&*cursor),
                             "Expected MvCursor or BTreeCursor in op_new_rowid"
                         );
                         *state.active_op_state.new_rowid() = OpNewRowidState::SeekingToLast {
@@ -13601,6 +13627,14 @@ pub fn op_no_conflict(
                     }),
                 };
 
+                #[cfg(debug_assertions)]
+                note_cursor_opcode(
+                    state,
+                    *cursor_id,
+                    CursorOpcode::NoConflict {
+                        has_null: contains_nulls,
+                    },
+                );
                 if contains_nulls {
                     state.pc = target_pc.as_offset_int();
                     state.active_op_state.clear();
@@ -16664,6 +16698,25 @@ pub fn op_reset_once(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Debug builds: tell a cursor behind a trait object which opcode calls it next.
+#[cfg(debug_assertions)]
+fn note_cursor_opcode(state: &mut ProgramState, cursor_id: usize, op: CursorOpcode) {
+    if let Some(Some(Cursor::Dyn(cursor, _))) = state.cursors.get_mut(cursor_id) {
+        cursor.note_opcode(op);
+    }
+}
+
+/// True for a cursor of the model storage (debug builds).
+fn is_model(cursor: &dyn Any) -> bool {
+    #[cfg(debug_assertions)]
+    return cursor.is::<ModelCursor>();
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = cursor;
+        false
+    }
+}
+
 pub fn op_found(
     program: &Program,
     state: &mut ProgramState,
@@ -16688,6 +16741,8 @@ pub fn op_found(
     };
 
     let not = matches!(insn, Insn::NotFound { .. });
+    #[cfg(debug_assertions)]
+    note_cursor_opcode(state, *cursor_id, CursorOpcode::Found);
 
     let record_source = if *num_regs == 0 {
         RecordSource::Packed {
