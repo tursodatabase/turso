@@ -21,7 +21,7 @@ fn results_have_the_declared_return_type(tmp_db: TempDatabase) {
         if entry.func_type != "s" {
             continue;
         }
-        // -1 means any number of arguments; try a few.
+        // A negative narg means a variable number of arguments; try a few.
         let argument_counts: Vec<i32> = if entry.narg < 0 {
             vec![1, 2, 3]
         } else {
