@@ -609,6 +609,14 @@ fn translate_statement<'a>(
         }
         ast::Stmt::DropTable { tbl_name, .. } => {
             reject_drop_of_other_relation_kind(&pg_conn.conn, tbl_name, "table")?;
+            reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, false)?;
+        }
+        ast::Stmt::Delete {
+            tbl_name,
+            truncate: true,
+            ..
+        } => {
+            reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, true)?;
         }
         _ => {}
     }
@@ -1769,6 +1777,73 @@ fn reject_drop_of_other_relation_kind(
         return Err(crate::error::wrong_relation_kind(name, expected_kind, kind));
     }
     Ok(())
+}
+
+/// Rejects DROP TABLE and TRUNCATE of a table that another table references
+/// with a foreign key, like PostgreSQL. Core would instead delete or check the
+/// rows, running the ON DELETE actions of the referencing tables. A table
+/// referencing itself does not count, as in PostgreSQL.
+fn reject_removal_of_referenced_table(
+    conn: &Arc<Connection>,
+    tbl_name: &ast::QualifiedName,
+    truncate: bool,
+) -> Result<()> {
+    let schema_name = tbl_name.namespace.as_ref().map(|name| name.as_str());
+    let table = tbl_name.name.as_str();
+    let Some((namespace, _)) = find_main_db_table(conn, tbl_name) else {
+        return Ok(());
+    };
+    let referenced = conn
+        .current_schema()
+        .resolved_fks_referencing(namespace, table)?
+        .iter()
+        .any(|fk_ref| {
+            fk_ref.child_namespace != namespace
+                || !fk_ref.child_table.name.eq_ignore_ascii_case(table)
+        });
+    if !referenced {
+        return Ok(());
+    }
+    Err(if truncate {
+        sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "cannot truncate a table referenced in a foreign key constraint",
+            None,
+        )
+    } else {
+        sqlstate_error(
+            SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+            match schema_name {
+                Some(schema_name) if !namespace.is_root() => format!(
+                    "cannot drop table {schema_name}.{table} because other objects depend on it"
+                ),
+                _ => format!("cannot drop table {table} because other objects depend on it"),
+            },
+            None,
+        )
+    })
+}
+
+/// The B-tree table `tbl_name` and its namespace, if it is in the main
+/// database. The frontend has no temp tables, and its schemas are namespaces
+/// of the main database, but a database may be attached through the SQLite
+/// connection.
+fn find_main_db_table(
+    conn: &Arc<Connection>,
+    tbl_name: &ast::QualifiedName,
+) -> Option<(turso_core::NamespaceId, Arc<turso_core::schema::BTreeTable>)> {
+    let schema_name = tbl_name.namespace.as_ref().map(|name| name.as_str());
+    let schema = conn.current_schema();
+    relation_lookup_namespaces(conn, schema_name)
+        .into_iter()
+        .filter(|candidate| candidate.database_id() == turso_core::MAIN_DB_ID)
+        .find_map(|candidate| {
+            let namespace = candidate.target.id;
+            Some((
+                namespace,
+                schema.get_btree_table(namespace, tbl_name.name.as_str())?,
+            ))
+        })
 }
 
 /// The namespaces that a relation is looked up in, in order. A relation
