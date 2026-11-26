@@ -4582,7 +4582,7 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
 
     let mut rows = conn
         .inner()
-        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' AND name NOT IN ('sqlite_sequence', 'pg_description') ORDER BY name")
+        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' AND name NOT IN ('sqlite_sequence', 'pg_description', 'pg_class') ORDER BY name")
         .unwrap();
     let mut stored = Vec::new();
     while let StepResult::Row = rows.step().unwrap() {

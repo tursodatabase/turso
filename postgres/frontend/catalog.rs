@@ -127,7 +127,8 @@ impl Dialect for PostgresDialect {
             else {
                 unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
             };
-            let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
+            let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
+            crate::classes::hide_internal_columns(&mut table);
             if !table.has_rowid {
                 return Err(sqlstate_error(
                     SQLSTATE_FEATURE_NOT_SUPPORTED,
@@ -148,7 +149,10 @@ impl Dialect for PostgresDialect {
             .map_err(sql_parse_error)?;
         match stmt {
             turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
+                let mut table =
+                    BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
+                crate::classes::hide_internal_columns(&mut table);
+                Ok(table)
             }
             _ => Err(sqlstate_error(
                 SQLSTATE_INTERNAL_ERROR,
@@ -805,10 +809,14 @@ pub(crate) fn builtin_catalog_columns(
     let columns = if let Some(table) = table.as_ref() {
         table.columns()
     } else {
-        // pg_description is created after the bootstrap statements are built.
-        assert_eq!(name, "pg_description");
+        // Stored catalogs do not exist when bootstrap statements are built.
+        let sql = match name {
+            "pg_description" => crate::descriptions::TABLE_INIT.statements[0],
+            "pg_class" => crate::classes::CREATE_CLASSES_TABLE_SQL,
+            _ => panic!("a registered catalog has a schema: {name}"),
+        };
         fallback = PostgresDialect
-            .parse_table_sql(crate::descriptions::TABLE_INIT.statements[0], 0)
+            .parse_table_sql(sql, 0)
             .expect("catalog DDL is valid");
         fallback.columns()
     };
@@ -819,50 +827,12 @@ pub(crate) fn builtin_catalog_columns(
         .collect()
 }
 
-/// Virtual table implementation for pg_catalog.pg_class
-/// Reads the class rows cached with the schema snapshot.
+/// Stored class rows used by dependent catalogs in the schema snapshot.
 #[derive(Debug)]
 struct PgClassTable;
 
 impl SnapshotRows for PgClassTable {
-    // PostgreSQL pg_class columns (simplified subset)
-    const SCHEMA: &'static str = "CREATE TABLE pg_class (
-            oid INTEGER,
-            relname TEXT,
-            relnamespace INTEGER,
-            reltype INTEGER,
-            reloftype INTEGER,
-            relowner INTEGER,
-            relam INTEGER,
-            relfilenode INTEGER,
-            reltablespace INTEGER,
-            relpages INTEGER,
-            reltuples REAL,
-            relallvisible INTEGER,
-            relallfrozen INTEGER,
-            reltoastrelid INTEGER,
-            relhasindex BOOLEAN,
-            relisshared BOOLEAN,
-            relpersistence TEXT,
-            relkind TEXT,
-            relnatts INTEGER,
-            relchecks INTEGER,
-            relhasrules BOOLEAN,
-            relhastriggers BOOLEAN,
-            relhassubclass BOOLEAN,
-            relrowsecurity BOOLEAN,
-            relforcerowsecurity BOOLEAN,
-            relispopulated BOOLEAN,
-            relreplident TEXT,
-            relispartition BOOLEAN,
-            relrewrite INTEGER,
-            relfrozenxid INTEGER,
-            relminmxid INTEGER,
-            relacl TEXT,
-            reloptions TEXT,
-            relpartbound TEXT,
-            tableoid INTEGER HIDDEN
-        )";
+    const SCHEMA: &'static str = crate::classes::CREATE_CLASSES_TABLE_SQL;
     /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
@@ -2699,11 +2669,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             schema: "CREATE TABLE pg_options_to_table (option_name TEXT, option_value TEXT, options_array TEXT HIDDEN)",
             append_rows: crate::options::append_options,
         },
-    );
-    options = options.native_module(
-        "pg_class",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgClassTable>(PhantomData),
     );
     options = options.native_module(
         "pg_namespace",
@@ -4798,7 +4763,6 @@ mod tests {
     #[test]
     fn catalogs_registered_at_open_survive_schema_refresh() {
         let catalog_names = [
-            "pg_class",
             "pg_namespace",
             "pg_attribute",
             "pg_roles",

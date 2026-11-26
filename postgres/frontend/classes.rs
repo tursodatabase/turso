@@ -1,14 +1,8 @@
-//! The relation catalog: one row per user relation, in the
-//! `__turso_internal_classes` table of the main database.
+//! The relation catalog: one stored `pg_class` row per relation.
 //!
-//! `sqlite_schema` stays the source of truth for storage: type, name, root
-//! page and SQL text. The catalog holds what `sqlite_schema` does not: a
-//! stable `oid` that survives creating and dropping other relations, the
-//! owning role, the privileges `GRANT` gave, and row-level security with
-//! its policies. The columns use
-//! PostgreSQL's `pg_class` names and value conventions, because when
-//! `sqlite_schema` itself moves behind the engine's dialect hooks, this
-//! table becomes `pg_class`, by renaming and adding columns.
+//! `sqlite_schema` describes the engine's storage: type, name, root page
+//! and SQL. `pg_class` stores the PostgreSQL columns and hidden fields for
+//! engine names, ownership dependencies and row-level security policies.
 //!
 //! Core knows nothing of this table. [`crate::catalog::PostgresDialect`]
 //! maintains it through the engine's catalog hooks: every statement that
@@ -65,7 +59,7 @@ use crate::schema_state::{change_schema_state, emit_catalog_apply, schema_state}
 use crate::unique_index::emit_unique_index_insert;
 use turso_core::security::policy::RowPolicy;
 
-pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
+pub(crate) const CLASSES_TABLE_NAME: &str = "pg_class";
 
 pub(crate) const CLASSES_NAME_INDEX_NAME: &str = "__turso_internal_classes_name";
 
@@ -74,7 +68,8 @@ pub(crate) const CLASSES_NAME_INDEX_NAME: &str = "__turso_internal_classes_name"
 pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 
 /// The columns of the catalog table: those of PostgreSQL's `pg_class`, in its
-/// order, then three of ours. `relownedby` is the oid of the table whose
+/// order, then hidden implementation fields. `relownedby` is the oid of
+/// the table whose
 /// serial column owns the relation, 0 when no relation owns it, and
 /// `relownedbycolumn` is the name of that column, NULL when no relation owns
 /// it: what PostgreSQL records in `pg_depend` as an automatic dependency,
@@ -87,8 +82,10 @@ pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 /// row-level security policies in the form [`policies`] describes, NULL when
 /// it has none. `relacl` is the access control list in the text form of
 /// PostgreSQL's `aclitem[]`, NULL until the first `GRANT`, when the owner has
-/// every privilege and nobody else has any.
-const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
+/// every privilege and nobody else has any. `relprivileges` keeps the same
+/// ACL with numeric role OIDs for permission checks. `relenginenamespace`
+/// is the engine namespace ID; `relnamespace` is the PostgreSQL OID.
+pub(crate) const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE pg_class (\
     oid INTEGER PRIMARY KEY, \
     relname TEXT NOT NULL, \
     relnamespace INTEGER NOT NULL, \
@@ -129,9 +126,10 @@ const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     relenginename TEXT, \
     relindrelid INTEGER NOT NULL, \
     relenginenamespace INTEGER NOT NULL, \
-    relprivileges TEXT)";
+    relprivileges TEXT, \
+    tableoid INTEGER NOT NULL)";
 
-const CLASS_COLUMNS: [&str; 41] = [
+const CLASS_COLUMNS: [&str; 42] = [
     "oid",
     "relname",
     "relnamespace",
@@ -173,6 +171,7 @@ const CLASS_COLUMNS: [&str; 41] = [
     "relindrelid",
     "relenginenamespace",
     "relprivileges",
+    "tableoid",
 ];
 
 const CLASS_COLUMN_COUNT: usize = CLASS_COLUMNS.len();
@@ -217,7 +216,17 @@ const fn same_text(left: &str, right: &str) -> bool {
 }
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
-     ON __turso_internal_classes (relenginenamespace, relname)";
+     ON pg_class (relenginenamespace, relname)";
+
+/// Hides the implementation columns after parsing either engine SQL or
+/// SQL rewritten by VACUUM. User relations have mangled names on disk.
+pub(crate) fn hide_internal_columns(table: &mut BTreeTable) {
+    if table.name == CLASSES_TABLE_NAME {
+        for column in table.columns_mut().iter_mut().skip(PG_CLASS_COLUMN_COUNT) {
+            column.set_hidden(true);
+        }
+    }
+}
 
 /// Fails for a database that has relations and no class table, as an
 /// earlier version of tursopg made it.
@@ -243,7 +252,7 @@ const CREATE_SEQUENCE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS sqlite_seque
 /// Stores the highest oid ever used. No oid is used yet, so it is the one
 /// before [`FIRST_NORMAL_OBJECT_ID`].
 const INSERT_HIGHEST_OID_SQL: &str =
-    "INSERT INTO sqlite_sequence (name, seq) VALUES ('__turso_internal_classes', 16383)";
+    "INSERT INTO sqlite_sequence (name, seq) VALUES ('pg_class', 16383)";
 
 // The statement above spells the oid so that it can be a constant.
 const _: () = assert!(FIRST_NORMAL_OBJECT_ID - 1 == 16383);
@@ -270,7 +279,6 @@ pub(crate) fn bootstrap_statements(schema: &Schema) -> Vec<String> {
             };
             let mut values = new_class_values(&new, RoleId::SUPERUSER, 11);
             values[column_position("oid")] = ClassValue::Int(oid);
-            values[column_position("relnamespace")] = ClassValue::Int(11);
             values[column_position("relisshared")] = ClassValue::Int(i64::from(shared));
             let values = values
                 .into_iter()
@@ -383,15 +391,11 @@ impl ClassCatalog {
         for class in catalog.classes() {
             catalog.check_relation(schema, &relations, class)?;
         }
-        // The table is briefly empty during atomic bootstrap. Once it has
-        // rows, every catalog identity must be present too.
-        if !rows.is_empty() {
-            for &(oid, name, _, _) in crate::catalog::BUILTIN_CATALOGS {
-                if catalog.get_by_oid(oid).is_none() {
-                    return Err(LimboError::Corrupt(format!(
-                        "catalog {name} has no row in {CLASSES_TABLE_NAME}"
-                    )));
-                }
+        for &(oid, name, _, _) in crate::catalog::BUILTIN_CATALOGS {
+            if catalog.get_by_oid(oid).is_none() {
+                return Err(LimboError::Corrupt(format!(
+                    "catalog {name} has no row in {CLASSES_TABLE_NAME}"
+                )));
             }
         }
         Ok(catalog)
@@ -1788,12 +1792,21 @@ pub(crate) fn translate_access_statement(
                 // privileges in. Only a superuser uses the engine's own
                 // tables, so a GRANT or REVOKE on one would claim a change it
                 // does not make, and is refused. Every role reads the catalog
-                // views, such as pg_class, so a GRANT on one changes nothing,
+                // relations, such as pg_class, so a GRANT on one changes nothing,
                 // but a REVOKE would leave every role reading it, and is
                 // refused too.
-                let Some(class) =
-                    class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
+                let Some(class) = class_catalog(schema)
+                    .and_then(|catalog| catalog.get_by_name(*namespace, name))
+                    .filter(|class| !class.relnamespace.is_root())
                 else {
+                    // Public catalogs already grant SELECT to every role,
+                    // whether their rows are stored or virtual.
+                    if !revoke
+                        && is_stored_catalog_table(*namespace, name)
+                        && privileges.iter().all(|p| *p == ast::Privilege::Select)
+                    {
+                        continue;
+                    }
                     if schema.get_btree_table(*namespace, name).is_some() {
                         return Err(not_supported(format!(
                             "{statement} on internal table {name}"
@@ -1865,11 +1878,7 @@ pub(crate) fn translate_access_statement(
             name,
             enabled,
         } => {
-            let Some(class) =
-                class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
-            else {
-                return Err(system_catalog_permission_denied(name));
-            };
+            let class = user_relation_class(schema, *namespace, name)?;
             if class.relrowsecurity == *enabled {
                 return Ok(());
             }
@@ -1880,7 +1889,7 @@ pub(crate) fn translate_access_statement(
             name,
             policy,
         } => {
-            let class = table_class(schema, *namespace, name)?;
+            let class = user_relation_class(schema, *namespace, name)?;
             let policy_name = policy.policy_name.as_str();
             if class.relpolicies.contains(policy_name) {
                 return Err(sqlstate_error(
@@ -1934,7 +1943,9 @@ pub(crate) fn translate_access_statement(
             policy_name,
             if_exists,
         } => {
-            let class = table_class(schema, *namespace, name)?;
+            let class = class_catalog(schema)
+                .and_then(|catalog| catalog.get_by_name(*namespace, name))
+                .ok_or_else(|| system_catalog_permission_denied(name))?;
             if !class.relpolicies.contains(policy_name) {
                 if *if_exists {
                     return Ok(());
@@ -1945,6 +1956,7 @@ pub(crate) fn translate_access_statement(
                     None,
                 ));
             }
+            user_relation_class(schema, *namespace, name)?;
             let relpolicies = class.relpolicies.without(policy_name);
             let stored = if relpolicies.is_empty() {
                 StoredPolicies::None
@@ -1971,15 +1983,15 @@ fn catalog_view_name(name: &str) -> String {
     }
 }
 
-/// The class row of table `name` of `namespace`, which row-level security
-/// statements change. A relation without one is the engine's.
-fn table_class<'a>(
+/// The class row of a user relation that access-control statements may change.
+fn user_relation_class<'a>(
     schema: &'a Schema,
     namespace: NamespaceId,
     name: &str,
 ) -> turso_core::Result<&'a RelationClass> {
     class_catalog(schema)
         .and_then(|catalog| catalog.get_by_name(namespace, name))
+        .filter(|class| !class.relnamespace.is_root())
         .ok_or_else(|| system_catalog_permission_denied(name))
 }
 
@@ -2039,11 +2051,7 @@ fn resolve_new_owner(
     name: &str,
     new_owner: &ast::RoleSpec,
 ) -> turso_core::Result<RoleId> {
-    let has_row =
-        class_catalog(schema).is_some_and(|catalog| catalog.get_by_name(namespace, name).is_some());
-    if !has_row {
-        return Err(system_catalog_permission_denied(name));
-    }
+    user_relation_class(schema, namespace, name)?;
     resolve_role(schema, connection, new_owner)
 }
 
@@ -2234,6 +2242,10 @@ fn new_class_values(new: &NewRelation<'_>, owner: RoleId, namespace_oid: i64) ->
     set("reltuples", ClassValue::Real(reltuples));
     set("relallvisible", ClassValue::Int(0));
     set("relallfrozen", ClassValue::Int(0));
+    set(
+        "tableoid",
+        ClassValue::Int(turso_pg_parser::translator::PG_CLASS_OID),
+    );
     set("reltoastrelid", ClassValue::Int(0));
     set("relhasindex", ClassValue::Int(i64::from(new.has_index)));
     set("relisshared", ClassValue::Int(0));

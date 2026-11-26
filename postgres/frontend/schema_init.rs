@@ -27,7 +27,7 @@ static TABLE_INITS: [TableInit; 4] = [
 
 /// The catalog tables that this frontend stores under their PostgreSQL
 /// names.
-const STORED_CATALOG_TABLES: [&str; 1] = [DESCRIPTION_TABLE_NAME];
+const STORED_CATALOG_TABLES: [&str; 2] = [DESCRIPTION_TABLE_NAME, classes::CLASSES_TABLE_NAME];
 
 /// The statements that create the frontend's tables that `schema` lacks.
 /// A read-only database gets none.
