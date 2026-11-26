@@ -372,54 +372,6 @@ pub fn translate_insert(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            table: Table::BTree(
-                table
-                    .btree()
-                    .expect("we shouldn't have got here without a BTree table"),
-            ),
-            identifier: normalize_ident(table_name.as_str()),
-            has_alias: false,
-            internal_id: program.table_reference_counter.next(),
-            op: Operation::default_scan_for(&table),
-            unmatched_right_rows_plan: None,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            namespace,
-            indexed: None,
-            plan_estimate: None,
-            row_filter: None,
-        }],
-        vec![],
-    );
-
-    // Plan CTEs and add them as outer query references for the subqueries of
-    // RETURNING and of DO UPDATE
-    let mut subquery_table_refs = Vec::new();
-    for column in &returning {
-        if let ResultColumn::Expr(expr, _) = column {
-            collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
-        }
-    }
-    for (_, _, upsert) in &upsert_actions {
-        if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
-            for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
-                collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
-            }
-        }
-    }
-    plan_ctes_as_outer_refs(
-        with_for_returning,
-        &subquery_table_refs,
-        resolver,
-        program,
-        &mut table_references,
-        connection,
-    )?;
-
     let updates_on_conflict = upsert_actions
         .iter()
         .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
@@ -434,21 +386,18 @@ pub fn translate_insert(
         None
     };
 
-    // Plan subqueries in RETURNING expressions before processing
-    // (so SubqueryResult nodes are cloned into result_columns)
-    let mut returning_subqueries = vec![];
-    plan_subqueries_from_returning(
-        program,
-        &mut returning_subqueries,
-        &mut table_references,
-        &mut returning,
-        resolver,
-        connection,
-    )?;
-
-    // Process RETURNING clause using shared module
-    let mut result_columns =
-        process_returning_clause(&mut returning, &mut table_references, resolver)?;
+    let (mut table_references, mut result_columns, mut returning_subqueries) =
+        plan_insert_returning(
+            program,
+            resolver,
+            &table,
+            table_name.as_str(),
+            namespace,
+            &mut returning,
+            &upsert_actions,
+            with_for_returning,
+            connection,
+        )?;
     let reads_columns = updates_on_conflict
         || upsert_actions
             .iter()
@@ -1036,31 +985,17 @@ pub fn translate_insert(
 
     // RETURNING reads the row before the AFTER triggers run, as in SQLite, so
     // a subquery in it does not see what a trigger writes.
-    if !returning_subqueries.is_empty() {
-        emit_returning_subqueries(
-            program,
-            resolver,
-            &table_references,
-            &mut returning_subqueries,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            &btree_table.column_layout()?,
-        )?;
-    }
-
-    // Emit RETURNING results if specified
-    if !result_columns.is_empty() {
-        emit_returning_results(
-            program,
-            &table_references,
-            &result_columns,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            resolver,
-            ctx.returning_buffer.as_ref(),
-            &btree_table.column_layout()?,
-        )?;
-    }
+    emit_insert_returning_row(
+        program,
+        resolver,
+        &table_references,
+        &result_columns,
+        &mut returning_subqueries,
+        insertion.first_col_register(),
+        insertion.key_register(),
+        ctx.returning_buffer.as_ref(),
+        &btree_table.column_layout()?,
+    )?;
 
     // Fire AFTER INSERT triggers
     let relevant_after_triggers = get_triggers_including_temp(
@@ -3648,6 +3583,124 @@ fn translate_virtual_table_insert(
     program.preassign_label_to_next_insn(halt_label);
 
     Ok(())
+}
+
+/// Builds the table references of an INSERT, which hold only the target table,
+/// and plans the INSERT's RETURNING clause against them: its CTEs, its
+/// subqueries and its result columns.
+#[allow(clippy::too_many_arguments)]
+fn plan_insert_returning(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Table,
+    table_name: &str,
+    namespace: NamespaceRef,
+    returning: &mut [ResultColumn],
+    upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    with: Option<With>,
+    connection: &Arc<Connection>,
+) -> Result<(
+    TableReferences,
+    Vec<ResultSetColumn>,
+    Vec<NonFromClauseSubquery>,
+)> {
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            table: table.clone(),
+            identifier: normalize_ident(table_name),
+            has_alias: false,
+            internal_id: program.table_reference_counter.next(),
+            op: Operation::default_scan_for(table),
+            unmatched_right_rows_plan: None,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            namespace,
+            indexed: None,
+            plan_estimate: None,
+            row_filter: None,
+        }],
+        vec![],
+    );
+
+    // Plan CTEs and add them as outer query references for the subqueries of
+    // RETURNING and of DO UPDATE
+    let mut subquery_table_refs = Vec::new();
+    for column in returning.iter() {
+        if let ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+        }
+    }
+    for (_, _, upsert) in upsert_actions {
+        if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
+            for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
+                collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+            }
+        }
+    }
+    plan_ctes_as_outer_refs(
+        with,
+        &subquery_table_refs,
+        resolver,
+        program,
+        &mut table_references,
+        connection,
+    )?;
+
+    // Plan subqueries in RETURNING expressions before processing
+    // (so SubqueryResult nodes are cloned into result_columns)
+    let mut returning_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut returning_subqueries,
+        &mut table_references,
+        returning,
+        resolver,
+        connection,
+    )?;
+
+    let result_columns = process_returning_clause(returning, &mut table_references, resolver)?;
+    Ok((table_references, result_columns, returning_subqueries))
+}
+
+/// Emits the RETURNING row of an INSERT from the registers that hold the
+/// inserted row: the subqueries of the RETURNING clause that read the row,
+/// then the result columns.
+#[allow(clippy::too_many_arguments)]
+fn emit_insert_returning_row(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    result_columns: &[ResultSetColumn],
+    returning_subqueries: &mut [NonFromClauseSubquery],
+    columns_start_reg: usize,
+    rowid_reg: usize,
+    returning_buffer: Option<&ReturningBufferCtx>,
+    layout: &ColumnLayout,
+) -> Result<()> {
+    if !returning_subqueries.is_empty() {
+        emit_returning_subqueries(
+            program,
+            resolver,
+            table_references,
+            returning_subqueries,
+            columns_start_reg,
+            rowid_reg,
+            layout,
+        )?;
+    }
+
+    emit_returning_results(
+        program,
+        table_references,
+        result_columns,
+        columns_start_reg,
+        rowid_reg,
+        resolver,
+        returning_buffer,
+        layout,
+    )
 }
 
 /// Emits a coroutine that yields the rows of the SELECT, or of the multi-row
