@@ -2160,6 +2160,17 @@ impl TableReferences {
         self.outer_query_refs.clear();
     }
 
+    /// Removes the [OuterQueryReference]s, so that names cannot be bound to them
+    /// until they are put back with [Self::restore_outer_query_refs].
+    pub(crate) fn take_outer_query_refs(&mut self) -> Vec<OuterQueryReference> {
+        std::mem::take(&mut self.outer_query_refs)
+    }
+
+    pub(crate) fn restore_outer_query_refs(&mut self, outer_query_refs: Vec<OuterQueryReference>) {
+        assert!(self.outer_query_refs.is_empty());
+        self.outer_query_refs = outer_query_refs;
+    }
+
     /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
     pub fn find_outer_query_ref_by_internal_id(
         &self,

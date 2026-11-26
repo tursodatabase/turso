@@ -632,7 +632,16 @@ fn prepare_one_select_plan(
 
                     if !group_by.exprs.is_empty() {
                         // Normal GROUP BY with expressions
-                        for expr in group_by.exprs.iter_mut() {
+                        // Like SQLite, a GROUP BY term cannot name a column of an outer query,
+                        // but it can name a result column, by number or alias, that reads one.
+                        for expr in group_by.exprs.iter() {
+                            reject_outer_table_names_in_group_by_expr(
+                                expr,
+                                &plan.table_references,
+                            )?;
+                        }
+                        let outer_query_refs = plan.table_references.take_outer_query_refs();
+                        let bound = group_by.exprs.iter_mut().try_for_each(|expr| {
                             replace_column_number_with_copy_of_column_expr(
                                 expr,
                                 &plan.result_columns,
@@ -644,8 +653,11 @@ fn prepare_one_select_plan(
                                 Some(&plan.result_columns),
                                 resolver,
                                 BindingBehavior::TryCanonicalColumnsFirst,
-                            )?;
-                        }
+                            )
+                        });
+                        plan.table_references
+                            .restore_outer_query_refs(outer_query_refs);
+                        bound?;
 
                         let exprs: Vec<ast::Expr> =
                             group_by.exprs.into_iter().map(|expr| *expr).collect();
@@ -1104,8 +1116,44 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
     Ok(())
 }
 
-/// SQLite compatibility: GROUP BY expressions in a correlated subquery cannot
-/// reference columns from the outer query scope.
+/// Fails like SQLite when a GROUP BY expression names a column as `table.column`
+/// where the table belongs to an outer query.
+fn reject_outer_table_names_in_group_by_expr(
+    expr: &Expr,
+    table_references: &TableReferences,
+) -> Result<()> {
+    walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
+        let (schema, table, column) = match node {
+            Expr::Qualified(table, column) => (None, table, column),
+            Expr::DoublyQualified(schema, table, column) => (Some(schema), table, column),
+            _ => return Ok(WalkControl::Continue),
+        };
+        let table_name = normalize_ident(table.as_str());
+        let names_joined_table = table_references
+            .joined_tables()
+            .iter()
+            .any(|t| t.identifier == table_name);
+        if !names_joined_table
+            && table_references
+                .find_outer_query_ref_by_identifier(&table_name)
+                .is_some()
+        {
+            let schema = schema
+                .map(|s| format!("{}.", s.as_str()))
+                .unwrap_or_default();
+            crate::bail_parse_error!(
+                "no such column: {schema}{}.{}",
+                table.as_str(),
+                column.as_str()
+            );
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// SQLite compatibility: subqueries in the GROUP BY expressions of a correlated
+/// subquery cannot reference columns from the outer query scope.
 fn validate_group_by_outer_scope_refs(plan: &SelectPlan) -> Result<()> {
     if plan.table_references.outer_query_refs().is_empty() {
         return Ok(());
@@ -1129,46 +1177,18 @@ fn reject_outer_query_refs_in_group_by_expr(
     subqueries: &[super::plan::NonFromClauseSubquery],
 ) -> Result<()> {
     walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
-        match node {
-            Expr::Column { table, column, .. } => {
-                if let Some(outer_ref) =
-                    table_references.find_outer_query_ref_by_internal_id(*table)
-                {
-                    let column_name = outer_ref
-                        .columns()
-                        .get(*column)
-                        .and_then(|col| col.name.as_deref())
-                        .expect(
-                            "bound outer-scope Expr::Column must point to a named column in schema",
-                        );
-                    crate::bail_parse_error!(
-                        "no such column: {}.{}",
-                        outer_ref.identifier,
-                        normalize_ident(column_name)
-                    );
-                }
-            }
-            Expr::RowId { table, .. } => {
-                if let Some(outer_ref) =
-                    table_references.find_outer_query_ref_by_internal_id(*table)
-                {
-                    crate::bail_parse_error!("no such column: {}.rowid", outer_ref.identifier);
-                }
-            }
-            Expr::SubqueryResult { subquery_id, .. } => {
-                let subquery = subqueries
-                    .iter()
-                    .find(|subquery| subquery.internal_id == *subquery_id)
-                    .expect("GROUP BY SubqueryResult must reference a planned subquery");
-                let super::plan::SubqueryState::Unevaluated {
-                    plan: Some(subquery_plan),
-                } = &subquery.state
-                else {
-                    unreachable!("GROUP BY subquery must be in unevaluated state during planning");
-                };
-                reject_outer_scope_refs_inside_plan_tree(subquery_plan, table_references)?;
-            }
-            _ => {}
+        if let Expr::SubqueryResult { subquery_id, .. } = node {
+            let subquery = subqueries
+                .iter()
+                .find(|subquery| subquery.internal_id == *subquery_id)
+                .expect("GROUP BY SubqueryResult must reference a planned subquery");
+            let super::plan::SubqueryState::Unevaluated {
+                plan: Some(subquery_plan),
+            } = &subquery.state
+            else {
+                unreachable!("GROUP BY subquery must be in unevaluated state during planning");
+            };
+            reject_outer_scope_refs_inside_plan_tree(subquery_plan, table_references)?;
         }
         Ok(WalkControl::Continue)
     })?;
