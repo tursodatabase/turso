@@ -16,10 +16,10 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_RECURSION,
     SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
-    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_PARAMETER,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -10292,9 +10292,8 @@ pub fn try_extract_copy_from(
             "header" => {
                 use pg_query::protobuf::node::Node;
                 let unsupported = || {
-                    ParseError::not_supported("this COPY HEADER value").with_hint(
-                        "Use HEADER true; the header line is skipped but not checked.",
-                    )
+                    ParseError::not_supported("this COPY HEADER value")
+                        .with_hint("Use HEADER true; the header line is skipped but not checked.")
                 };
                 header = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
                     None => true,
