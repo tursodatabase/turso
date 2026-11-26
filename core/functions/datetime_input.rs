@@ -8,7 +8,8 @@
 //! The input is split into fields as PostgreSQL's `ParseDateTime` does and the
 //! fields are read as its `DecodeDateTime` does, for a subset of its forms.
 //! Values whose text would not sort in time order are rejected: BC, years past
-//! 9999, years not written with 4 digits and `infinity`.
+//! 9999, years not written with 4 digits and `infinity`. `epoch` is read as
+//! 1970-01-01 00:00:00 UTC.
 
 use crate::types::Value;
 use crate::{LimboError, Result};
@@ -179,6 +180,18 @@ impl Fields {
                     time: Some(0),
                     ..Self::default()
                 })
+            }
+            "epoch" if ty != TemporalType::Time => {
+                // PostgreSQL reads `epoch` as 1970-01-01 00:00:00 UTC. Unlike
+                // `infinity` it is an ordinary instant, so its stored text sorts
+                // in time order with the others.
+                let text = match ty {
+                    TemporalType::Date => "1970-01-01",
+                    TemporalType::Timestamp => "1970-01-01 00:00:00",
+                    TemporalType::Timestamptz => "1970-01-01 00:00:00+00",
+                    TemporalType::Time => unreachable!("the guard excludes time"),
+                };
+                return Self::read(text, ty);
             }
             word @ ("infinity" | "-infinity" | "epoch" | "now" | "today" | "tomorrow"
             | "yesterday" | "allballs") => {

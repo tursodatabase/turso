@@ -212,6 +212,14 @@ expect {
 @sqlstate 22007
 expect @tursopg error {}
 
+# A-38: special value epoch
+test special-value-epoch {
+    SELECT 'epoch'::timestamptz, 'epoch'::timestamp, 'epoch'::date;
+}
+expect {
+    1970-01-01 00:00:00+00|1970-01-01 00:00:00|1970-01-01
+}
+
 # A-39: invalid date (Feb 30)
 test invalid-date-feb-30 {
     SELECT '2026-02-30'::date;
