@@ -29,7 +29,8 @@ SELECT typeof(x'CAFE');    -- 'blob'
 In the SQLite frontend, a floating-point NaN is `NULL`. This applies to results
 from arithmetic, functions, and extensions, and to NaN bits in a database REAL
 field. Table reads and index lookups use the same rule. Positive and negative
-infinity remain REAL values.
+infinity remain REAL values. The PostgreSQL frontend preserves NaN for `float4`
+and `float8`, including aggregate results.
 
 The PostgreSQL dialect preserves numeric NaN values. NaNs compare equal to each
 other and sort after all other numbers. Text casts format NaN as `NaN`; JSON
