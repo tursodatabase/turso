@@ -6,6 +6,8 @@ mod catalog;
 mod coerce;
 mod error;
 mod function;
+#[cfg(test)]
+mod golden;
 mod operator;
 #[cfg(test)]
 mod oracle;
