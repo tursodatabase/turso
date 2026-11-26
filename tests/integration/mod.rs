@@ -13,6 +13,7 @@ mod checkpoint_write_failure;
 mod common;
 mod conflict_resolution;
 mod connection;
+mod cursor_contract;
 mod custom_types;
 mod database;
 mod database_leak;
