@@ -2,6 +2,11 @@
 //! an MVCC database. See `SPEC.md`. This module only runs programs and returns
 //! observations. A model or oracle can be added on top of `run`.
 
+mod index_model;
+mod index_program;
+#[cfg(test)]
+mod index_tests;
+mod index_walk;
 mod model;
 mod program;
 mod walk;
