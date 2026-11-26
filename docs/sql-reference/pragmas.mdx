@@ -852,7 +852,7 @@ After the first of the two values is set, the connection refuses all other state
 
 Run `PRAGMA page_size` before the encryption PRAGMAs. After the database is encrypted, its page size and reserved bytes cannot change.
 
-After the PRAGMAs, the encryption applies to the whole database. Every other connection and every open must give the same cipher and key; an open or connection without a key is refused. The language bindings give each new connection the key of their open options, so after the PRAGMAs a binding's database object cannot make another connection: to get more connections, open the database again with the cipher and key. With a connection pool, for example Go's `database/sql`, give the cipher and key in the open options instead of the PRAGMAs. To open an existing encrypted database, give the cipher and key when you open it, for example:
+After the PRAGMAs, the encryption applies to the whole database. Every other connection and every open must give the same cipher and key; an open or connection without a key is refused. The language bindings give each new connection the key of their open options, so after the PRAGMAs a binding's database object cannot make another connection with `connect()`. In the Rust binding, call `Database::connect_with_encryption` with the cipher and key. In the other bindings, open the database again with the cipher and key to get more connections. With a connection pool, for example Go's `database/sql`, give the cipher and key in the open options instead of the PRAGMAs. To open an existing encrypted database, give the cipher and key when you open it, for example:
 
 ```shell
 tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=YOUR_HEX_KEY"

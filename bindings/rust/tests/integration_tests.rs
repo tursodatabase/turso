@@ -824,6 +824,91 @@ async fn test_encryption() {
 }
 
 #[tokio::test]
+async fn test_encryption_with_pragmas() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_file = temp_dir.path().join("test-pragma-encrypted.db");
+    let db_file = db_file.to_str().unwrap();
+    let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+
+    // 1. Encrypt a new database with the PRAGMAs and insert data
+    {
+        let db = Builder::new_local(db_file)
+            .experimental_encryption(true)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA cipher = 'aegis256'", ())
+            .await
+            .unwrap();
+        conn.execute(&format!("PRAGMA hexkey = '{hexkey}'"), ())
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE test (value TEXT)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO test VALUES ('secret_data')", ())
+            .await
+            .unwrap();
+        // The database object has no key for a new connection, so a second
+        // connection gives the key itself, or comes from a second object
+        // opened with the cipher and key.
+        assert!(db.connect().is_err());
+        let encryption = EncryptionOpts {
+            hexkey: hexkey.to_string(),
+            cipher: "aegis256".to_string(),
+        };
+        let wrong_key = EncryptionOpts {
+            hexkey: "ff".repeat(32),
+            cipher: "aegis256".to_string(),
+        };
+        assert!(db.connect_with_encryption(&wrong_key).is_err());
+        let keyed = Builder::new_local(db_file)
+            .experimental_encryption(true)
+            .with_encryption(encryption.clone())
+            .build()
+            .await
+            .unwrap();
+        for other in [
+            db.connect_with_encryption(&encryption).unwrap(),
+            keyed.connect().unwrap(),
+        ] {
+            let mut rows = other.query("SELECT value FROM test", ()).await.unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), "secret_data");
+        }
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .unwrap();
+        while rows.next().await.unwrap().is_some() {}
+    }
+
+    // 2. The data is encrypted on disk
+    let content = std::fs::read(db_file).unwrap();
+    assert!(content.starts_with(b"Turso"));
+    assert!(!content.windows(11).any(|w| w == b"secret_data"));
+
+    // 3. Only the cipher and key open it again
+    let builder = Builder::new_local(db_file).experimental_encryption(true);
+    assert!(builder.build().await.is_err());
+    let db = Builder::new_local(db_file)
+        .experimental_encryption(true)
+        .with_encryption(EncryptionOpts {
+            hexkey: hexkey.to_string(),
+            cipher: "aegis256".to_string(),
+        })
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("SELECT value FROM test", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "secret_data");
+    assert!(rows.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
 /// This results in a panic if the query isn't correctly reset
 async fn test_query_without_reset_does_not_panic() {
     let tempfile = tempfile::NamedTempFile::new().unwrap();

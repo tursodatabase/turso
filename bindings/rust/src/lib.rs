@@ -382,6 +382,17 @@ impl Database {
         let conn = self.inner.connect()?;
         Ok(Connection::create(conn, None))
     }
+
+    /// Connect to an encrypted database with the cipher and key of
+    /// `encryption`, not the ones of the builder. Each connection to an
+    /// encrypted database must give the key, so use this after
+    /// `PRAGMA cipher` and `PRAGMA hexkey` encrypted a database that was
+    /// built without [`Builder::with_encryption`]. The cipher must be the
+    /// cipher of the database.
+    pub fn connect_with_encryption(&self, encryption: &EncryptionOpts) -> Result<Connection> {
+        let conn = self.inner.connect_with_encryption(encryption)?;
+        Ok(Connection::create(conn, None))
+    }
 }
 
 /// A prepared statement.
