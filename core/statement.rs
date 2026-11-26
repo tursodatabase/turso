@@ -933,6 +933,22 @@ impl Statement {
         self.state.query_deadline = deadline;
     }
 
+    /// Runs this statement as the next part of one statement that the caller
+    /// runs as several, as PostgreSQL's COPY runs one INSERT per row. The
+    /// statement starts with `earlier`, the immediate foreign key violations
+    /// that the earlier parts counted, so that a later part can repair them.
+    /// It does not fail at its end when violations remain: the caller checks
+    /// [Statement::fk_immediate_violations] after the last part, and rolls
+    /// back all parts when they fail. A reset keeps this setting.
+    pub fn continue_fk_immediate_violations(&mut self, earlier: vdbe::FkImmediateViolations) {
+        self.state.continue_fk_immediate_violations(earlier);
+    }
+
+    /// The immediate foreign key violations that this statement counted.
+    pub fn fk_immediate_violations(&self) -> vdbe::FkImmediateViolations {
+        self.state.fk_immediate_violations()
+    }
+
     /// Starts this trigger or foreign key action subprogram with the immediate
     /// foreign key violations counted so far by the statement that runs it.
     pub(crate) fn copy_fk_immediate_violations_from_parent(&mut self, parent: &vdbe::ProgramState) {

@@ -1240,6 +1240,11 @@ pub struct ProgramState {
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
     fk_immediate_violation: Option<LimboError>,
+    /// The immediate foreign key violations that the earlier parts counted,
+    /// when the caller runs this statement as one part of a statement that it
+    /// runs as several (see [crate::Statement::continue_fk_immediate_violations]).
+    /// The statement starts with them, and leaves their check to the caller.
+    fk_immediate_violations_of_earlier_parts: Option<FkImmediateViolations>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -1356,6 +1361,7 @@ impl ProgramState {
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             fk_immediate_violation: None,
+            fk_immediate_violations_of_earlier_parts: None,
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
@@ -1540,8 +1546,7 @@ impl ProgramState {
         self.view_delta_state = ViewDeltaApplyState::NotStarted;
         self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
-        *self.fk_immediate_violations_during_stmt.get_mut() = 0;
-        self.fk_immediate_violation = None;
+        self.start_fk_immediate_violations();
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
@@ -1895,10 +1900,8 @@ impl ProgramState {
             connection.fk_deferred_violations.load(Ordering::Acquire),
             Ordering::SeqCst,
         );
-        // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
-        self.fk_immediate_violations_during_stmt
-            .store(0, Ordering::Release);
-        self.fk_immediate_violation = None;
+        // Reset the immediate foreign key violations counter. If this is nonzero when the statement completes, the statement subtransaction will roll back.
+        self.start_fk_immediate_violations();
         Ok(IOResult::Done(()))
     }
 
@@ -2100,14 +2103,35 @@ impl ProgramState {
     }
 
     pub(crate) fn immediate_foreign_key_error(&self) -> LimboError {
-        self.fk_immediate_violation.clone().unwrap_or_else(|| {
-            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
-        })
+        self.fk_immediate_violations().error()
     }
 
     pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);
+    }
+
+    /// Sets the immediate foreign key violations to those the statement
+    /// starts with: none, or those of the earlier parts.
+    pub(crate) fn start_fk_immediate_violations(&mut self) {
+        let earlier = self
+            .fk_immediate_violations_of_earlier_parts
+            .clone()
+            .unwrap_or_default();
+        *self.fk_immediate_violations_during_stmt.get_mut() = earlier.count;
+        self.fk_immediate_violation = earlier.error;
+    }
+
+    pub(crate) fn continue_fk_immediate_violations(&mut self, earlier: FkImmediateViolations) {
+        self.fk_immediate_violations_of_earlier_parts = Some(earlier);
+        self.start_fk_immediate_violations();
+    }
+
+    pub(crate) fn fk_immediate_violations(&self) -> FkImmediateViolations {
+        FkImmediateViolations {
+            count: self.get_fk_immediate_violations_during_stmt(),
+            error: self.fk_immediate_violation.clone(),
+        }
     }
 
     /// Gives this state the immediate foreign key violations counted by
@@ -2118,6 +2142,30 @@ impl ProgramState {
             other.get_fk_immediate_violations_during_stmt();
         self.fk_immediate_violation
             .clone_from(&other.fk_immediate_violation);
+    }
+}
+
+/// The immediate foreign key violations that a statement counted.
+#[derive(Debug, Clone, Default)]
+pub struct FkImmediateViolations {
+    count: isize,
+    /// The error of the first violation that is still counted.
+    error: Option<LimboError>,
+}
+
+impl FkImmediateViolations {
+    /// Fails when violations remain.
+    pub fn check(&self) -> Result<()> {
+        if self.count > 0 {
+            return Err(self.error());
+        }
+        Ok(())
+    }
+
+    fn error(&self) -> LimboError {
+        self.error.clone().unwrap_or_else(|| {
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
+        })
     }
 }
 
