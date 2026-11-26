@@ -8,10 +8,9 @@ mod integer;
 mod integer_operators;
 mod oid;
 
-pub(crate) use integer::split_sign;
 pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
-pub(crate) use oid::parse_oid;
+pub(crate) use oid::{check_oid_range, oid_input};
 
 use crate::error::sqlstate_error;
 use crate::session::relation_lookup_namespaces;

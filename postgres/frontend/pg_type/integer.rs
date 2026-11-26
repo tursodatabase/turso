@@ -81,70 +81,19 @@ impl IntegerType {
     /// PostgreSQL's integer input: white space around the number, a sign,
     /// decimal digits or `0x`, `0o` or `0b` digits, and `_` between digits.
     pub fn parse(self, text: &str) -> Result<i64> {
-        let invalid = || {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!(
-                    "invalid input syntax for type {}: \"{text}\"",
-                    self.sql_name()
-                ),
-                None,
-            )
-        };
-        let out_of_range = || {
-            sqlstate_error(
-                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-                format!(
-                    "value \"{text}\" is out of range for type {}",
-                    self.sql_name()
-                ),
-                None,
-            )
-        };
-        let (negative, unsigned) = split_sign(text);
-        let (radix, digits) = match unsigned.as_bytes() {
-            [b'0', b'x' | b'X', ..] => (16, &unsigned[2..]),
-            [b'0', b'o' | b'O', ..] => (8, &unsigned[2..]),
-            [b'0', b'b' | b'B', ..] => (2, &unsigned[2..]),
-            _ => (10, unsigned),
-        };
-        let has_prefix = radix != 10;
-        let largest_magnitude = self.min().unsigned_abs();
-        let mut magnitude: u64 = 0;
-        let mut previous_was_digit = false;
-        let mut bytes = digits.bytes().peekable();
-        if bytes.peek().is_none() {
-            return Err(invalid());
+        let number = read_integer_text(
+            text,
+            self.sql_name(),
+            IntegerSpelling::PrefixesAndUnderscores,
+            self.min().unsigned_abs(),
+        )?;
+        if number.is_negative {
+            return Ok(0i64.wrapping_sub_unsigned(number.magnitude));
         }
-        while let Some(byte) = bytes.next() {
-            if byte == b'_' {
-                let digit_follows = bytes
-                    .peek()
-                    .is_some_and(|next| char::from(*next).is_digit(radix));
-                if !(digit_follows && (previous_was_digit || has_prefix)) {
-                    return Err(invalid());
-                }
-                previous_was_digit = false;
-                continue;
-            }
-            let Some(digit) = char::from(byte).to_digit(radix) else {
-                return Err(invalid());
-            };
-            magnitude = magnitude
-                .checked_mul(u64::from(radix))
-                .and_then(|shifted| shifted.checked_add(u64::from(digit)))
-                .filter(|magnitude| *magnitude <= largest_magnitude)
-                .ok_or_else(out_of_range)?;
-            previous_was_digit = true;
-        }
-        if negative {
-            Ok(0i64.wrapping_sub_unsigned(magnitude))
-        } else {
-            i64::try_from(magnitude)
-                .ok()
-                .filter(|integer| *integer <= self.max())
-                .ok_or_else(out_of_range)
-        }
+        i64::try_from(number.magnitude)
+            .ok()
+            .filter(|integer| *integer <= self.max())
+            .ok_or_else(|| integer_text_out_of_range(text, self.sql_name()))
     }
 
     /// FIXME(pg-catalog): The cast table of casts.rs decides a cast to an integer type when it can name both types, and then this function is not asked. It still converts for the casts that the engine decides: a cast to an array of the type or to a domain over it, and a cast from a type that has no pg_cast rows yet, such as uuid, which PostgreSQL refuses. It sees the value but not the type it is cast from, so a decimal rounds half away from zero, as numeric does, where PostgreSQL rounds a float8 half to even. This function goes away when the cast table decides those casts too.
@@ -159,10 +108,102 @@ impl IntegerType {
     }
 }
 
+/// The sign and the digits of a number written as text.
+pub(super) struct IntegerText {
+    pub(super) is_negative: bool,
+    pub(super) magnitude: u64,
+}
+
+/// How the digits of a number are written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IntegerSpelling {
+    /// The integer types: `0x`, `0o` and `0b` name the base, and `_` may
+    /// stand between two digits.
+    PrefixesAndUnderscores,
+    /// oid, which PostgreSQL reads with C's `strtoul`: `0x` is hex and any
+    /// other leading `0` is octal.
+    LeadingZeroIsOctal,
+}
+
+/// Reads `text` as a number of the type that PostgreSQL calls `type_name`:
+/// white space around the number, a sign, and digits written as `spelling`
+/// says. Text that is not a number fails with 22P02, and a number whose
+/// digits pass `largest_magnitude` with 22003.
+pub(super) fn read_integer_text(
+    text: &str,
+    type_name: &str,
+    spelling: IntegerSpelling,
+    largest_magnitude: u64,
+) -> Result<IntegerText> {
+    let invalid = || {
+        sqlstate_error(
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            format!("invalid input syntax for type {type_name}: \"{text}\""),
+            None,
+        )
+    };
+    let (is_negative, unsigned) = split_sign(text);
+    let hex_digit_follows = unsigned
+        .as_bytes()
+        .get(2)
+        .is_some_and(u8::is_ascii_hexdigit);
+    let (radix, digits) = match (spelling, unsigned.as_bytes()) {
+        (IntegerSpelling::PrefixesAndUnderscores, [b'0', b'x' | b'X', ..]) => (16, &unsigned[2..]),
+        (IntegerSpelling::PrefixesAndUnderscores, [b'0', b'o' | b'O', ..]) => (8, &unsigned[2..]),
+        (IntegerSpelling::PrefixesAndUnderscores, [b'0', b'b' | b'B', ..]) => (2, &unsigned[2..]),
+        (IntegerSpelling::LeadingZeroIsOctal, [b'0', b'x' | b'X', ..]) if hex_digit_follows => {
+            (16, &unsigned[2..])
+        }
+        (IntegerSpelling::LeadingZeroIsOctal, [b'0', _, ..]) => (8, &unsigned[1..]),
+        _ => (10, unsigned),
+    };
+    let has_prefix = radix != 10;
+    let takes_underscores = spelling == IntegerSpelling::PrefixesAndUnderscores;
+    let mut magnitude: u64 = 0;
+    let mut previous_was_digit = false;
+    let mut bytes = digits.bytes().peekable();
+    if bytes.peek().is_none() {
+        return Err(invalid());
+    }
+    while let Some(byte) = bytes.next() {
+        if byte == b'_' && takes_underscores {
+            let digit_follows = bytes
+                .peek()
+                .is_some_and(|next| char::from(*next).is_digit(radix));
+            if !(digit_follows && (previous_was_digit || has_prefix)) {
+                return Err(invalid());
+            }
+            previous_was_digit = false;
+            continue;
+        }
+        let Some(digit) = char::from(byte).to_digit(radix) else {
+            return Err(invalid());
+        };
+        magnitude = magnitude
+            .checked_mul(u64::from(radix))
+            .and_then(|shifted| shifted.checked_add(u64::from(digit)))
+            .filter(|magnitude| *magnitude <= largest_magnitude)
+            .ok_or_else(|| integer_text_out_of_range(text, type_name))?;
+        previous_was_digit = true;
+    }
+    Ok(IntegerText {
+        is_negative,
+        magnitude,
+    })
+}
+
+pub(super) fn integer_text_out_of_range(text: &str, type_name: &str) -> turso_core::LimboError {
+    sqlstate_error(
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+        format!("value \"{text}\" is out of range for type {type_name}"),
+        None,
+    )
+}
+
 /// Whether `text` is negative, and the digits that follow the sign, as
 /// PostgreSQL's integer and oid input read them: white space around the
 /// number does not count, and one `+` or `-` may come first.
-pub(crate) fn split_sign(text: &str) -> (bool, &str) {
+fn split_sign(text: &str) -> (bool, &str) {
     let number = text.trim_matches([' ', '\t', '\n', '\r', '\u{b}', '\u{c}']);
     match number.as_bytes().first() {
         Some(b'-') => (true, &number[1..]),

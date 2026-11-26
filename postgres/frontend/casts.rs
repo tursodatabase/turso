@@ -10,7 +10,7 @@
 
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text};
-use crate::pg_type::{parse_oid, type_input};
+use crate::pg_type::{check_oid_range, type_input};
 use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
 use turso_core::{LimboError, Numeric, Result, Value};
@@ -245,17 +245,10 @@ pub(crate) fn convert(value: &Value, source: CastType, target: CastType) -> Resu
 
 fn to_oid(value: &Value, source: CastType) -> Result<Value> {
     match value {
-        Value::Text(text) => parse_oid(text.as_str()).map(Value::from_i64),
-        Value::Numeric(Numeric::Integer(n)) => match *n {
-            0..=0xFFFF_FFFF => Ok(value.clone()),
-            -0x8000_0000..=-1 if source != Int8 => Ok(Value::from_i64(n + (1 << 32))),
-            _ => Err(sqlstate_error(
-                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-                "OID out of range",
-                None,
-            )),
-        },
-        _ => Ok(value.clone()),
+        Value::Numeric(Numeric::Integer(n @ -0x8000_0000..=-1)) if source != Int8 => {
+            Ok(Value::from_i64(n + (1 << 32)))
+        }
+        _ => check_oid_range(value),
     }
 }
 

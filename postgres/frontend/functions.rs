@@ -770,7 +770,7 @@ fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
     let value = args[i].get_value();
     match value {
         Value::Null => Ok(None),
-        Value::Text(text) => crate::pg_type::parse_oid(text.as_str()).map(Some),
+        Value::Text(text) => Ok(crate::pg_type::oid_input(text.as_str())?.as_int()),
         value => value.as_int().map(Some).ok_or_else(|| {
             LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
         }),
@@ -2533,7 +2533,6 @@ fn hand_written_input_error(
                 ))
             }
         }
-        "oid" => check_integer_input(crate::pg_type::parse_oid(input)),
         _ => return None,
     })
 }
@@ -2579,16 +2578,6 @@ pub fn parse_pg_bool(text: &str) -> Option<bool> {
         Some(false)
     } else {
         None
-    }
-}
-
-/// The message and SQLSTATE of the error that reading an integer or oid from
-/// text gave, so `pg_input_is_valid` and the type agree on what is valid.
-fn check_integer_input(parsed: Result<i64>) -> Option<(String, String)> {
-    match parsed {
-        Ok(_) => None,
-        Err(LimboError::Dialect(error)) => Some((error.message, error.code.to_string())),
-        Err(other) => unreachable!("integer input failed with {other}"),
     }
 }
 
