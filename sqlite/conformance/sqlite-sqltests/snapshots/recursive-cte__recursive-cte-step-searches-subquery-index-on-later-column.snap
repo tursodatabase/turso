@@ -1,0 +1,32 @@
+---
+source: recursive-cte.sqltest
+expression: |-
+  WITH RECURSIVE walk(n) AS (
+          VALUES(5)
+          UNION ALL
+          SELECT edge.src
+            FROM walk JOIN (SELECT DISTINCT id, next FROM node) nd ON nd.next = walk.n
+            JOIN edge ON edge.dst = nd.id
+      )
+      SELECT count(*) FROM walk;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - edge
+  - edge.dst
+  - nd.next
+  - node
+  - walk
+  setup_blocks:
+  - edge-node
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN walk
+   |--SETUP
+   `--RECURSIVE STEP
+      |--SCAN walk
+      |--SEARCH nd USING INDEX ephemeral_subquery_t3 (next=?)
+      |  |--SCAN node
+      |  `--USE HASH TABLE FOR DISTINCT
+      `--SEARCH edge USING COVERING INDEX ephemeral_edge_t4 (dst=?)

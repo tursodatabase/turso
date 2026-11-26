@@ -310,18 +310,16 @@ pub struct TableConstraints {
     pub constraints: Vec<Constraint>,
     /// Candidates for indexes that may use the constraints to perform a lookup.
     pub candidates: Vec<ConstraintUseCandidate>,
-    /// Conditions that a temporary index may use for a lookup.
-    pub temporary_index_terms: SmallVec<[ConstraintRef; 4]>,
+    /// Positions in `constraints` of the terms that a temporary index may use for a lookup.
+    pub temporary_index_terms: SmallVec<[usize; 4]>,
 }
 
-/// Build the search terms for an automatic index.
-///
-/// Terms for the same table column use the same index column.
+/// Find the terms that an automatic index may use for a lookup.
 pub(super) fn automatic_index_terms(
     table: &JoinedTable,
     constraints: &TableConstraints,
     schema: &Schema,
-) -> SmallVec<[ConstraintRef; 4]> {
+) -> SmallVec<[usize; 4]> {
     let columns = table.columns();
     let can_use_term = |term: &Constraint| {
         if !term.can_drive_index_seek(columns) {
@@ -336,20 +334,49 @@ pub(super) fn automatic_index_terms(
         !column.index_order_differs_from_value_order(schema, table.table.is_strict())
             || term.operator == ast::Operator::Equals.into()
     };
-    let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
-        .constraints
-        .iter()
-        .filter(|term| can_use_term(term))
-        .collect();
-    let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
-
-    let mut terms: SmallVec<[ConstraintRef; 4]> = constraints
+    constraints
         .constraints
         .iter()
         .enumerate()
         .filter(|(_, term)| can_use_term(term))
-        .filter_map(|(term_index, term)| {
-            let table_col_pos = term.table_col_pos?;
+        .map(|(term_index, _)| term_index)
+        .collect()
+}
+
+/// Build the search key of an automatic index on table `table_idx` for a lookup
+/// that runs after the tables in `lhs_mask`. `candidate_terms` holds the positions
+/// in `constraints` of the terms that the index may use.
+///
+/// Returns the key columns, as positions of table columns, and the terms of the
+/// usable key prefix. Only the terms that the tables in `lhs_mask` can supply
+/// become key columns, as in SQLite's `constructAutomaticIndex()`. A term that
+/// needs a table joined later would otherwise take a key column before the usable
+/// ones and leave no usable key prefix. Terms for the same table column use the
+/// same index column.
+pub fn automatic_index_key(
+    constraints: &[Constraint],
+    candidate_terms: &[usize],
+    lhs_mask: &TableMask,
+    table_idx: usize,
+) -> (SmallVec<[usize; 4]>, SmallVec<[RangeConstraintRef; 2]>) {
+    let usable_terms: SmallVec<[usize; 4]> = candidate_terms
+        .iter()
+        .copied()
+        .filter(|&term_index| {
+            let term = &constraints[term_index];
+            !term.lhs_mask.get(table_idx) && lhs_mask.contains_all_set_bits_of(&term.lhs_mask)
+        })
+        .collect();
+    let usable_constraints: SmallVec<[&Constraint; 4]> = usable_terms
+        .iter()
+        .map(|&term_index| &constraints[term_index])
+        .collect();
+    let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
+
+    let mut refs: SmallVec<[ConstraintRef; 4]> = usable_terms
+        .iter()
+        .filter_map(|&term_index| {
+            let table_col_pos = constraints[term_index].table_col_pos?;
             Some(ConstraintRef {
                 constraint_vec_pos: term_index,
                 index_col_pos: index_columns
@@ -360,8 +387,9 @@ pub(super) fn automatic_index_terms(
             })
         })
         .collect();
-    terms.sort_by_key(|term| term.index_col_pos);
-    terms
+    refs.sort_by_key(|term| term.index_col_pos);
+    let usable_refs = usable_constraints_for_lhs_mask(constraints, &refs, lhs_mask, table_idx);
+    (index_columns, usable_refs)
 }
 
 /// Estimate selectivity for IN expressions given the number of values and table row count.
@@ -1686,22 +1714,6 @@ pub fn usable_constraints_for_lhs_mask(
         current_required_column_pos += 1;
     }
     usable
-}
-
-pub fn usable_constraints_for_join_order<'a>(
-    constraints: &'a [Constraint],
-    refs: &'a [ConstraintRef],
-    join_order: &[JoinOrderMember],
-) -> Result<Vec<RangeConstraintRef>> {
-    turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
-
-    let table_idx = join_order.last().unwrap().original_idx;
-    let lhs_mask = join_order
-        .iter()
-        .take(join_order.len() - 1)
-        .map(|j| j.original_idx)
-        .try_collect()?;
-    Ok(usable_constraints_for_lhs_mask(constraints, refs, &lhs_mask, table_idx).into_vec())
 }
 
 /// Order key columns for a temporary index.

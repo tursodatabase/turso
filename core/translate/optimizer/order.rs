@@ -10,9 +10,7 @@ use crate::{
         emitter::Resolver,
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
-        optimizer::constraints::{
-            usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
-        },
+        optimizer::constraints::{automatic_index_key, RangeConstraintRef, TableConstraints},
         plan::{
             GroupBy, IterationDirection, JoinInfo, JoinedTable, Operation, Plan, Scan,
             SimpleAggregate, TableReferences,
@@ -348,9 +346,10 @@ pub fn plan_satisfies_order_target(
                 constraint_refs,
             } => {
                 if *build_index {
-                    let constraint_refs = usable_constraints_for_lhs_mask(
-                        &table_constraints[*table_index].constraints,
-                        &table_constraints[*table_index].temporary_index_terms,
+                    let constraints = &table_constraints[*table_index];
+                    let (_, constraint_refs) = automatic_index_key(
+                        &constraints.constraints,
+                        &constraints.temporary_index_terms,
                         &prior_tables,
                         *table_index,
                     );

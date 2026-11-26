@@ -2594,7 +2594,10 @@ mod tests {
             collate::CollationSeq,
             optimizer::{
                 access_method::AccessMethodParams,
-                constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
+                constraints::{
+                    automatic_index_key, constraints_from_where_clause, BinaryExprSide,
+                    RangeConstraintRef,
+                },
                 cost_params::DEFAULT_PARAMS,
                 order::{ColumnOrder, ColumnTarget, EliminatesSortBy, OrderTargetPurpose},
             },
@@ -2730,18 +2733,29 @@ mod tests {
         )
         .unwrap();
 
-        let operators: Vec<_> = constraints[1]
-            .temporary_index_terms
+        let mut lhs_mask = TableMask::default();
+        lhs_mask.set(0).unwrap();
+        let (_, key) = automatic_index_key(
+            &constraints[1].constraints,
+            &constraints[1].temporary_index_terms,
+            &lhs_mask,
+            1,
+        );
+        let key_shapes: Vec<_> = key
             .iter()
             .map(|term| {
-                constraints[1].constraints[term.constraint_vec_pos]
-                    .operator
-                    .as_ast_operator()
-                    .unwrap()
+                (
+                    term.table_col_pos,
+                    term.eq.is_some(),
+                    term.lower_bound.is_some(),
+                )
             })
             .collect();
 
-        assert_eq!(operators, vec![Operator::Equals, Operator::Greater]);
+        assert_eq!(
+            key_shapes,
+            vec![(Some(1), true, false), (Some(0), false, true)]
+        );
     }
 
     /// `WHERE` work waits for every table it needs.

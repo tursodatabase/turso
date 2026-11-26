@@ -463,6 +463,67 @@ expect {
     5
 }
 
+# The walk runs backward, so the join term on the CTE is on a later column of
+# node than the term that needs edge. The automatic index on node is keyed on
+# the term the CTE can supply.
+@setup edge-node
+snapshot-eqp recursive-cte-step-searches-automatic-index-on-later-column {
+    WITH RECURSIVE walk(n) AS (
+        VALUES(5)
+        UNION ALL
+        SELECT edge.src
+          FROM walk JOIN node ON node.next = walk.n JOIN edge ON edge.dst = node.id
+    )
+    SELECT count(*) FROM walk;
+}
+
+@setup edge-node
+test recursive-cte-step-searches-automatic-index-on-later-column-results {
+    WITH RECURSIVE walk(n) AS (
+        VALUES(5)
+        UNION ALL
+        SELECT edge.src
+          FROM walk JOIN node ON node.next = walk.n JOIN edge ON edge.dst = node.id
+    )
+    SELECT n FROM walk ORDER BY n;
+}
+expect {
+    1
+    3
+    5
+}
+
+# The same backward walk through a subquery: the ephemeral index on the
+# materialized subquery is keyed on the term the CTE can supply.
+@setup edge-node
+snapshot-eqp recursive-cte-step-searches-subquery-index-on-later-column {
+    WITH RECURSIVE walk(n) AS (
+        VALUES(5)
+        UNION ALL
+        SELECT edge.src
+          FROM walk JOIN (SELECT DISTINCT id, next FROM node) nd ON nd.next = walk.n
+          JOIN edge ON edge.dst = nd.id
+    )
+    SELECT count(*) FROM walk;
+}
+
+@setup edge-node
+test recursive-cte-step-searches-subquery-index-on-later-column-results {
+    WITH RECURSIVE walk(n) AS (
+        VALUES(5)
+        UNION ALL
+        SELECT edge.src
+          FROM walk JOIN (SELECT DISTINCT id, next FROM node) nd ON nd.next = walk.n
+          JOIN edge ON edge.dst = nd.id
+    )
+    SELECT n FROM walk ORDER BY n;
+}
+expect {
+    1
+    3
+    5
+}
+
 setup org-tree-filtered {
     CREATE TABLE org(name TEXT, boss TEXT, k INTEGER);
     CREATE TABLE indexed_org(name TEXT, boss TEXT, k INTEGER);
