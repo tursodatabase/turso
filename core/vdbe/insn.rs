@@ -2786,6 +2786,21 @@ impl Insn {
             _ => true,
         }
     }
+
+    /// Returns true if this opcode reads or writes a database file. These are
+    /// the opcodes that set SQLite's `Vdbe.bIsReader`.
+    pub fn reads_database_file(&self) -> bool {
+        matches!(
+            self,
+            Self::Transaction { .. }
+                | Self::AutoCommit { .. }
+                | Self::Savepoint { .. }
+                | Self::Checkpoint { .. }
+                | Self::JournalMode { .. }
+                | Self::Vacuum { .. }
+                | Self::VacuumInto { .. }
+        )
+    }
 }
 
 // TODO: Add remaining cookies.

@@ -5453,3 +5453,78 @@ test fk-deferred-restrict-drop-parent-table-fails {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+test fk-defer-pragma-default-and-boolean-values {
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=off;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=yes;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=0;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=1;
+    PRAGMA defer_foreign_keys;
+}
+expect {
+    0
+    1
+    0
+    1
+    0
+    1
+}
+
+# The pragma turns off when a transaction ends: COMMIT, ROLLBACK, or an
+# autocommit statement that reads the database file. `SELECT 1` does not.
+test fk-defer-pragma-resets-when-transaction-ends {
+    CREATE TABLE t(x);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA defer_foreign_keys;
+    COMMIT;
+    PRAGMA defer_foreign_keys;
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    ROLLBACK;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=ON;
+    SELECT 1;
+    PRAGMA defer_foreign_keys;
+    SELECT count(*) FROM t;
+    PRAGMA defer_foreign_keys;
+}
+expect {
+    1
+    0
+    0
+    1
+    1
+    0
+    0
+}
+
+# Like SQLite, statements that read the database file without opening a
+# transaction also turn the pragma off. `EXPLAIN SELECT 1` does not.
+test fk-defer-pragma-resets-after-statements-without-transaction {
+    CREATE TABLE t(x);
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA journal_mode;
+    PRAGMA defer_foreign_keys;
+    SELECT 'a';
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA wal_checkpoint;
+    PRAGMA defer_foreign_keys;
+    SELECT 'b';
+    PRAGMA defer_foreign_keys=ON;
+    EXPLAIN SELECT 1;
+    PRAGMA defer_foreign_keys;
+    SELECT 'c';
+    EXPLAIN SELECT x FROM t;
+    PRAGMA defer_foreign_keys;
+}
+expect pattern {
+    (?s)^\w+\n0\na\n[-\d|]+\n0\nb\n.*\n1\nc\n.*\n0$
+}
+

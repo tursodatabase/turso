@@ -433,6 +433,7 @@ impl ProgramBuilderFlags {
     const READS_STORED_VALUES: u16 = 1 << 9;
     const WRITES_STORED_VALUES: u16 = 1 << 10;
     const HIDES_CONSTRAINT_VALUES: u16 = 1 << 11;
+    const READS_DATABASE_FILE: u16 = 1 << 12;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -504,6 +505,17 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_readonly(&mut self, v: bool) {
         self.set(Self::READONLY, v)
+    }
+
+    #[inline]
+    /// Whether the builder emitted an opcode that reads or writes a database
+    /// file, mirroring SQLite's `Vdbe.bIsReader`.
+    pub const fn reads_database_file(self) -> bool {
+        self.get(Self::READS_DATABASE_FILE)
+    }
+    #[inline]
+    pub const fn set_reads_database_file(&mut self, v: bool) {
+        self.set(Self::READS_DATABASE_FILE, v)
     }
 
     #[inline]
@@ -1554,6 +1566,8 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
+        self.flags
+            .set_reads_database_file(self.flags.reads_database_file() | insn.reads_database_file());
         // Any function can raise at runtime, and so can the conversion of a
         // type; see Self::may_abort.
         if matches!(insn, Insn::Function { .. } | Insn::TypeConversion { .. }) {
@@ -2778,6 +2792,7 @@ impl ProgramBuilder {
             parameters: self.parameters,
             change_cnt_on,
             readonly: self.flags.readonly(),
+            reads_database_file: self.flags.reads_database_file(),
             result_columns: self.result_columns,
             result_column_types: self.result_column_types,
             table_references: self.table_references,

@@ -536,6 +536,8 @@ pub struct Connection {
     /// The namespace whose objects this connection is dropping one statement
     /// at a time.
     pub(super) namespace_being_dropped: RwLock<Option<NamespaceId>>,
+    /// Whether pragma defer_foreign_keys=ON for this connection
+    pub(super) defer_fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Whether non-TEMP triggers fire for statements prepared on this
     /// connection. TEMP triggers always fire, matching SQLite's
@@ -1739,6 +1741,21 @@ impl Connection {
 
     pub(crate) fn writes_stored_values(&self) -> bool {
         self.writes_stored_values.load(Ordering::Acquire)
+    }
+
+    /// Like SQLite, turning the pragma off also drops every counted foreign
+    /// key violation, including those of DEFERRABLE INITIALLY DEFERRED keys.
+    pub fn set_defer_foreign_keys(&self, enable: bool) {
+        if self.defer_fk_pragma.swap(enable, Ordering::AcqRel) != enable {
+            self.bump_prepare_context_generation();
+        }
+        if !enable {
+            self.clear_deferred_foreign_key_violations();
+        }
+    }
+
+    pub fn defer_foreign_keys(&self) -> bool {
+        self.defer_fk_pragma.load(Ordering::Acquire)
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
@@ -4966,6 +4983,7 @@ impl Connection {
         self.set_tx_state(TransactionState::None);
         self.set_tx_read_only(false);
         self.clear_tx_poison();
+        self.set_defer_foreign_keys(false);
         // The entire transaction is being rolled back, so every materialized
         // view delta captured within it is void. Leaving them behind would
         // apply phantom changes to the views at the next successful commit.
@@ -4999,6 +5017,7 @@ impl Connection {
             self.set_tx_state(TransactionState::None);
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_read_only(false);
+            self.set_defer_foreign_keys(false);
         }
 
         self.rollback_temp_schema();

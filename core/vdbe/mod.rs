@@ -2242,6 +2242,9 @@ pub struct PreparedProgram {
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
     /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
+    /// Whether the program reads or writes a database file, like SQLite's
+    /// `Vdbe.bIsReader`.
+    pub reads_database_file: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     pub table_references: TableReferences,
@@ -3301,6 +3304,21 @@ impl Program {
             }
         }
         Ok(res)
+    }
+
+    /// Like SQLite's `sqlite3VdbeHalt`, `PRAGMA defer_foreign_keys` turns off
+    /// when a statement that reads a database file ends and no transaction is
+    /// left open. That covers COMMIT, ROLLBACK, autocommit statements, and
+    /// statements such as `PRAGMA journal_mode` or EXPLAIN that start no
+    /// transaction.
+    pub(crate) fn reset_defer_foreign_keys_after_statement(&self, connection: &Connection) {
+        if self.reads_database_file
+            && !connection.is_nested_stmt()
+            && connection.auto_commit.load(Ordering::SeqCst)
+            && connection.get_tx_state() == TransactionState::None
+        {
+            connection.set_defer_foreign_keys(false);
+        }
     }
 
     fn commit_txn_wal(
