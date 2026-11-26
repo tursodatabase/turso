@@ -904,16 +904,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
             }
             rounded as i64
         }
-        Value::Text(text) => text.as_str().trim().parse().map_err(|_| {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!(
-                    "invalid input syntax for type bigint: \"{}\"",
-                    text.as_str()
-                ),
-                None,
-            )
-        })?,
+        Value::Text(text) => IntegerType::Int8.parse(text.as_str())?,
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
     };
     if value < 0 {
