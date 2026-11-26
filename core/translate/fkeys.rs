@@ -2,7 +2,9 @@ use crate::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::namespace::NamespaceRef;
-use crate::translate::emitter::emit_columns_and_dependencies;
+use crate::translate::emitter::{
+    delete::emit_fk_child_decrement_for_key, emit_columns_and_dependencies,
+};
 use crate::translate::expr::{emit_constraint_values_decode, emit_stored_column};
 use crate::translate::plan::ColumnMask;
 use crate::turso_assert;
@@ -2849,6 +2851,91 @@ pub fn emit_fk_drop_table_check(
         program.preassign_label_to_next_insn(no_violations);
     }
 
+    Ok(())
+}
+
+/// Before DROP TABLE removes a child table, subtracts from the deferred
+/// counter one violation for each row whose parent key is missing, because
+/// those violations go away with the row. SQLite's `sqlite3FkDropTable` gets
+/// the same result when it deletes the rows of the table.
+pub fn emit_fk_drop_child_table_check(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    child_table_name: &str,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    let database_id = namespace.database_id;
+    let child_tbl = resolver
+        .with_schema(database_id, |s| {
+            s.get_btree_table(namespace.id, child_table_name)
+        })
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("child table {child_table_name} not found"))
+        })?;
+    // Only a deferred key can have violations that the statement does not
+    // reject at once.
+    let mut deferred_fks = Vec::new();
+    for fk in child_tbl
+        .foreign_keys
+        .iter()
+        .filter(|fk| resolver.fk_is_deferred(fk))
+    {
+        match resolver.with_schema(database_id, |s| {
+            s.resolve_child_fk(namespace.id, fk, &child_tbl)
+        }) {
+            Ok(resolved) => deferred_fks.push((fk, resolved.map(|(fk_ref, _)| fk_ref))),
+            // Like SQLite, DROP TABLE ignores a key whose parent has no
+            // matching UNIQUE index. No statement counted violations for it,
+            // because each one failed with the mismatch error.
+            Err(LimboError::ForeignKeyConstraint(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if deferred_fks.is_empty() {
+        return Ok(());
+    }
+
+    let done = program.allocate_label();
+    program.emit_insn(Insn::FkIfZero {
+        deferred: true,
+        target_pc: done,
+    });
+    let child_cur = open_read_table(program, &child_tbl, database_id);
+    let scan_done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: child_cur,
+        pc_if_empty: scan_done,
+    });
+    let scan_loop = program.allocate_label();
+    program.preassign_label_to_next_insn(scan_loop);
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: child_cur,
+        dest: rowid_reg,
+    });
+    for (fk, fk_ref) in &deferred_fks {
+        emit_fk_child_decrement_for_key(
+            program,
+            &child_tbl,
+            child_cur,
+            rowid_reg,
+            fk,
+            fk_ref.as_ref(),
+            database_id,
+            resolver,
+        )?;
+    }
+    program.emit_insn(Insn::Next {
+        cursor_id: child_cur,
+        pc_if_next: scan_loop,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(scan_done);
+    program.emit_insn(Insn::Close {
+        cursor_id: child_cur,
+    });
+    program.preassign_label_to_next_insn(done);
     Ok(())
 }
 

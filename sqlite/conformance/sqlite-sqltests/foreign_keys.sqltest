@@ -5740,6 +5740,105 @@ expect {
     0
 }
 
+# Dropping a child table removes the violations counted for its rows, as
+# SQLite's DROP TABLE deletes the rows first (fkey6-2.4 and fkey6-2.6).
+test fk-defer-pragma-drop-child-table-removes-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(5);
+    DROP TABLE c;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema WHERE name='c';
+}
+expect {
+    0
+}
+
+test fk-deferred-drop-child-table-removes-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a, b, UNIQUE(a, b));
+    CREATE TABLE c(x, y, FOREIGN KEY(x, y) REFERENCES p(a, b) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO p VALUES(1, 1);
+    INSERT INTO c VALUES(1, 1), (2, 2), (3, 3);
+    DROP TABLE c;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema WHERE name='c';
+}
+expect {
+    0
+}
+
+# After the parent table is dropped, each child row with a non-NULL key is an
+# orphan, so dropping the child table removes one violation for each of them.
+test fk-deferred-drop-parent-then-child-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1), (1), (NULL);
+    BEGIN;
+    DROP TABLE p;
+    DROP TABLE c;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# DROP TABLE ignores a key whose parent is missing or has no UNIQUE index on
+# the parent columns, as SQLite does.
+test fk-deferred-drop-child-table-parent-mismatch {
+    CREATE TABLE p(x);
+    CREATE TABLE c1(y REFERENCES p(x) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE c2(y REFERENCES nosuchtable DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO c1 VALUES(1);
+    INSERT INTO c2 VALUES(1);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE c1;
+    DROP TABLE c2;
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    p
+}
+
+# The violations counted for the rows of another child table remain.
+test fk-deferred-drop-child-table-keeps-other-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c1(pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE c2(pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c1 VALUES(5);
+    INSERT INTO c2 VALUES(6);
+    DROP TABLE c1;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# ROLLBACK TO restores the child table and the violations of its rows.
+test fk-deferred-drop-child-table-rollback-to-savepoint {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(5);
+    SAVEPOINT s;
+    DROP TABLE c;
+    ROLLBACK TO s;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 
 # A CASCADE, SET NULL or SET DEFAULT action removes one counted violation for
 # each child row it changes, so the parent change must count those rows first.

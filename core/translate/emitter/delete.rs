@@ -3,7 +3,7 @@ use crate::ast::TriggerEvent;
 use crate::namespace::NamespaceRef;
 use crate::{
     emit_explain,
-    schema::{BTreeTable, ColumnLayout, ResolvedFkRef},
+    schema::{BTreeTable, ColumnLayout, ForeignKey, ResolvedFkRef},
     sync::Arc,
     translate::{
         emitter::{
@@ -384,7 +384,8 @@ pub fn emit_fk_child_decrement_on_delete(
             child_tbl,
             child_cursor_id,
             child_rowid_reg,
-            &fk_ref,
+            &fk_ref.fk,
+            Some(&fk_ref),
             database_id,
             resolver,
         )?;
@@ -392,19 +393,21 @@ pub fn emit_fk_child_decrement_on_delete(
     Ok(())
 }
 
-/// Subtracts one from the deferred counter when the key of `fk_ref` in the
-/// current child row is not NULL and no parent row matches it.
+/// Subtracts one from the deferred counter when the key of `fk` in the
+/// current child row is not NULL and no parent row matches it. `fk_ref` is
+/// `None` when the parent table does not exist, so no parent row can match.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_decrement_for_key(
     program: &mut ProgramBuilder,
     child_tbl: &BTreeTable,
     child_cursor_id: usize,
     child_rowid_reg: usize,
-    fk_ref: &ResolvedFkRef,
+    fk: &ForeignKey,
+    fk_ref: Option<&ResolvedFkRef>,
     database_id: usize,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    let child_positions: Vec<usize> = fk_ref
-        .fk
+    let child_positions: Vec<usize> = fk
         .child_columns
         .iter()
         .map(|cname| child_tbl.get_column(cname).unwrap().0)
@@ -427,6 +430,11 @@ pub fn emit_fk_child_decrement_for_key(
         });
     }
 
+    let Some(fk_ref) = fk_ref else {
+        emit_guarded_fk_decrement(program, null_skip, true);
+        program.preassign_label_to_next_insn(null_skip);
+        return Ok(());
+    };
     if fk_ref.parent_uses_rowid {
         // Probe parent table by rowid
         let parent_tbl = resolver
