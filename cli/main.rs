@@ -8,7 +8,6 @@ mod input;
 mod manual;
 mod mcp_server;
 mod opcodes_dictionary;
-mod read_state_machine;
 mod sync_server;
 
 #[cfg(feature = "mvcc_repl")]

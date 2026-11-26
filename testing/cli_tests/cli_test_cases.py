@@ -202,6 +202,17 @@ def test_comments():
     shell.quit()
 
 
+def test_statement_end_detection():
+    shell = TestTursoShell()
+    shell.run_test("string-with-semicolon-across-lines", "SELECT 'a;\nb';\n.mode list", "a;\nb")
+    shell.run_test_fn(
+        "SELECT 1; 'x'\n;SELECT 2;",
+        lambda res: "syntax error" in res and "2" not in res.splitlines(),
+        "A string after a semicolon starts a statement that ends at the next semicolon",
+    )
+    shell.quit()
+
+
 def test_import_csv():
     shell = TestTursoShell()
     shell.run_test("memory-db", ".open :memory:", "")
@@ -588,6 +599,7 @@ def main():
     test_output_file()
     test_multi_line_single_line_comments_succession()
     test_comments()
+    test_statement_end_detection()
     test_import_csv()
     test_import_csv_verbose()
     test_import_csv_skip()
