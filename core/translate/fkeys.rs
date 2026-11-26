@@ -1093,7 +1093,7 @@ fn build_parent_key(
 
 /// Child-side FK maintenance for UPDATE/UPSERT:
 /// If any FK columns of this child row changed:
-///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing: decrement deferred counter (guarded).
+///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing: decrement the FK counter (guarded).
 ///  Pass 2 (NEW tuple): if NEW is non-NULL and parent is missing: immediate error or deferred(+1).
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_update_counters(
@@ -1166,91 +1166,95 @@ pub fn emit_fk_child_update_counters(
 
         let ncols = fk_ref.fk.child_columns.len();
 
-        // Pass 1: OLD tuple handling only for deferred FKs
-        if fk_ref.fk.deferred {
-            if let Some((dml_ctx, fk_col_positions, null_skip)) =
-                load_old_fk_values(program, &fk_ref.fk.child_columns)?
-            {
-                if fk_ref.parent_uses_rowid {
-                    // Parent key is rowid: probe parent table by rowid
-                    let parent_tbl = resolver
-                        .with_schema(database_id, |s| {
-                            s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
-                        })
-                        .expect("parent btree");
-                    let pcur = open_read_table(program, &parent_tbl, database_id);
+        // Pass 1: OLD tuple handling
+        if let Some((dml_ctx, fk_col_positions, null_skip)) =
+            load_old_fk_values(program, &fk_ref.fk.child_columns)?
+        {
+            // With no violation counted there is nothing to cancel, so the
+            // parent probe is skipped, as in SQLite.
+            program.emit_insn(Insn::FkIfZero {
+                deferred: fk_ref.fk.deferred,
+                target_pc: null_skip,
+            });
+            if fk_ref.parent_uses_rowid {
+                // Parent key is rowid: probe parent table by rowid
+                let parent_tbl = resolver
+                    .with_schema(database_id, |s| {
+                        s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+                    })
+                    .expect("parent btree");
+                let pcur = open_read_table(program, &parent_tbl, database_id);
 
-                    // first FK col is the rowid value
-                    let rid = program.alloc_register();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: dml_ctx.to_column_reg(fk_col_positions[0]),
-                        dst_reg: rid,
-                        extra_amount: 0,
-                    });
+                // first FK col is the rowid value
+                let rid = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: dml_ctx.to_column_reg(fk_col_positions[0]),
+                    dst_reg: rid,
+                    extra_amount: 0,
+                });
 
-                    // If NOT exists => decrement
-                    let miss = program.allocate_label();
-                    program.emit_insn(Insn::MustBeInt {
-                        reg: rid,
-                        target_pc: Some(miss),
-                    });
-                    program.emit_insn(Insn::NotExists {
-                        cursor: pcur,
-                        rowid_reg: rid,
-                        target_pc: miss,
-                    });
-                    // found: close & continue
-                    let join = program.allocate_label();
-                    program.emit_insn(Insn::Close { cursor_id: pcur });
-                    program.emit_insn(Insn::Goto { target_pc: join });
+                // If NOT exists => decrement
+                let miss = program.allocate_label();
+                program.emit_insn(Insn::MustBeInt {
+                    reg: rid,
+                    target_pc: Some(miss),
+                });
+                program.emit_insn(Insn::NotExists {
+                    cursor: pcur,
+                    rowid_reg: rid,
+                    target_pc: miss,
+                });
+                // found: close & continue
+                let join = program.allocate_label();
+                program.emit_insn(Insn::Close { cursor_id: pcur });
+                program.emit_insn(Insn::Goto { target_pc: join });
 
-                    // missing: guarded decrement
-                    program.preassign_label_to_next_insn(miss);
-                    program.emit_insn(Insn::Close { cursor_id: pcur });
-                    let skip = program.allocate_label();
-                    emit_guarded_fk_decrement(program, skip, fk_ref.fk.deferred);
-                    program.preassign_label_to_next_insn(skip);
+                // missing: guarded decrement
+                program.preassign_label_to_next_insn(miss);
+                program.emit_insn(Insn::Close { cursor_id: pcur });
+                let skip = program.allocate_label();
+                emit_guarded_fk_decrement(program, skip, fk_ref.fk.deferred);
+                program.preassign_label_to_next_insn(skip);
 
-                    program.preassign_label_to_next_insn(join);
-                } else {
-                    // Parent key is a unique index: use index probe
-                    let parent_tbl = resolver
-                        .with_schema(database_id, |s| {
-                            s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
-                        })
-                        .expect("parent btree");
-                    let idx = fk_ref
-                        .parent_unique_index
-                        .as_ref()
-                        .expect("parent unique index required");
-                    let icur = open_read_index(program, idx, database_id);
+                program.preassign_label_to_next_insn(join);
+            } else {
+                // Parent key is a unique index: use index probe
+                let parent_tbl = resolver
+                    .with_schema(database_id, |s| {
+                        s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+                    })
+                    .expect("parent btree");
+                let idx = fk_ref
+                    .parent_unique_index
+                    .as_ref()
+                    .expect("parent unique index required");
+                let icur = open_read_index(program, idx, database_id);
 
-                    let probe = copy_context_columns_with_affinity(
-                        program,
-                        &dml_ctx,
-                        &fk_col_positions,
-                        idx,
-                        &parent_tbl,
-                    );
-                    // Found: nothing; Not found: guarded decrement
-                    index_probe(
-                        program,
-                        icur,
-                        probe,
-                        ncols,
-                        |_p| Ok(()),
-                        |p| {
-                            let skip = p.allocate_label();
-                            emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
-                            p.preassign_label_to_next_insn(skip);
-                            Ok(())
-                        },
-                    )?;
-                }
-                // Resolve the null skip label after the FK check block so that
-                // when any OLD column is NULL, the entire check is bypassed.
-                program.preassign_label_to_next_insn(null_skip);
+                let probe = copy_context_columns_with_affinity(
+                    program,
+                    &dml_ctx,
+                    &fk_col_positions,
+                    idx,
+                    &parent_tbl,
+                );
+                // Found: nothing; Not found: guarded decrement
+                index_probe(
+                    program,
+                    icur,
+                    probe,
+                    ncols,
+                    |_p| Ok(()),
+                    |p| {
+                        let skip = p.allocate_label();
+                        emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
+                        p.preassign_label_to_next_insn(skip);
+                        Ok(())
+                    },
+                )?;
             }
+            // Resolve the null skip label after the FK check block so that
+            // when any OLD column is NULL, the entire check is bypassed.
+            program.preassign_label_to_next_insn(null_skip);
         }
 
         // Pass 2: NEW tuple handling

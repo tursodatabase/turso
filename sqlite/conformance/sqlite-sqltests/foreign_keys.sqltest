@@ -5398,3 +5398,111 @@ test fk-update-child-without-parent-fails {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+# Deleting a child whose parent was deleted earlier in the same statement
+# cancels the violation that the parent delete counted.
+@cross-check-integrity
+test fk-self-ref-delete-parent-and-child-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-unique-key-delete-parent-and-child-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k TEXT UNIQUE, parent TEXT REFERENCES t(k));
+    INSERT INTO t VALUES ('a', NULL), ('b', 'a'), ('c', 'b');
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-parent-only-still-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+}
+
+# A later row of a multi-row INSERT replaces an orphan that an earlier row
+# wrote, whatever the FK's actions are.
+@cross-check-integrity
+test fk-insert-or-replace-later-row-replaces-orphan-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES (1);
+    INSERT OR REPLACE INTO c VALUES (1, 99), (1, 1);
+    SELECT id, pid FROM c;
+}
+expect {
+    1|1
+}
+
+# A row without a parent, written while foreign keys were off, is deleted
+# while another row references it. Removing the row's own orphan key must not
+# cancel the violation its removal causes as a parent.
+test fk-delete-orphan-row-that-has-children-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, x REFERENCES q(id));
+    CREATE TABLE q (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1, 99);
+    INSERT INTO c VALUES (1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-update-orphan-row-that-has-children-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, x REFERENCES q(id));
+    CREATE TABLE q (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1, 99);
+    INSERT INTO c VALUES (1);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET id = 2, x = NULL WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-self-ref-delete-orphan-row-that-has-children-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent REFERENCES t(id));
+    INSERT INTO t VALUES (1, 6), (4, 1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-replace-orphan-row-that-has-children-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, x REFERENCES q(id));
+    CREATE TABLE q (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1, 99);
+    INSERT INTO c VALUES (1);
+    PRAGMA foreign_keys=ON;
+    INSERT OR REPLACE INTO p VALUES (1, NULL);
+    SELECT id, x IS NULL FROM p;
+}
+expect {
+    1|1
+}
