@@ -32,7 +32,7 @@ use crate::{
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
         expr::{
-            check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
+            choose_and_check_operators, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
             WalkControl,
         },
         insert::expr_contains_subquery,
@@ -696,16 +696,12 @@ fn plan_subqueries_with_outer_query_access<'a>(
             let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
             walk_expr_mut(expr, &mut subquery_parser)?;
             if has_subquery {
-                let expr: &ast::Expr = expr;
                 with_subqueries.push(expr);
             }
         }
     }
-    // Binding checked these with the types of their subqueries not known yet.
-    // Check them again with those types, as compiling them would, in case
-    // the planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
     for expr in with_subqueries {
-        check_custom_types(expr, Some(referenced_tables), resolver)?;
+        choose_and_check_operators(expr, Some(referenced_tables), resolver)?;
     }
     Ok(())
 }
