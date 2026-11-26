@@ -7,7 +7,6 @@ mod config;
 mod dot_command;
 #[path = "../../cli/helper.rs"]
 mod helper;
-mod read_state_machine;
 
 // Stubs for shared modules that reference crate-level types from the tursodb binary.
 // tursopg doesn't use these codepaths, but the types must exist so shared code compiles.
@@ -30,7 +29,6 @@ use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use config::{TableConfig, CONFIG_DIR};
 use helper::LimboHelper;
-use read_state_machine::ReadState;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
@@ -45,6 +43,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso_core::{OpenFlags, SessionRole, Value};
 use turso_pg::{Connection, Error, Statement};
+use turso_pg_scanner::{Scanner, Segment};
 use turso_pg_server::TursoPgServer;
 
 // ---------------------------------------------------------------------------
@@ -147,7 +146,7 @@ fn init_tracing(opts: &Opts) -> Result<WorkerGuard, std::io::Error> {
 // Meta-commands
 // ---------------------------------------------------------------------------
 
-fn cmd_help(w: &mut dyn Write) {
+fn cmd_help(w: &mut dyn Write) -> bool {
     let _ = writeln!(w, "Meta-commands:");
     let _ = writeln!(w, "  \\dt            List tables");
     let _ = writeln!(w, "  \\dt+           List tables (extended)");
@@ -166,9 +165,10 @@ fn cmd_help(w: &mut dyn Write) {
     let _ = writeln!(w, "  \\conninfo      Show connection info");
     let _ = writeln!(w, "  \\?             Show this help");
     let _ = writeln!(w, "  \\q             Quit");
+    true
 }
 
-fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename";
     match conn.query(sql) {
         Ok(Some(mut rows)) => {
@@ -191,11 +191,13 @@ fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) {
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
+fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) -> bool {
     let safe_name = table_name.replace('\'', "''");
     let sql = format!(
         "SELECT a.attname, t.typname, a.attnotnull, COALESCE(d.adbin, ''), a.attnum \
@@ -237,18 +239,22 @@ fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
                 let _ = writeln!(w, "{table}");
             } else {
                 let _ = writeln!(w, "Table '{table_name}' not found.");
+                return false;
             }
         }
         Ok(None) => {
             let _ = writeln!(w, "Table '{table_name}' not found.");
+            return false;
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_list_databases(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_databases(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT datname FROM pg_database ORDER BY datname";
     match conn.query(sql) {
         Ok(Some(mut rows)) => {
@@ -265,16 +271,19 @@ fn cmd_list_databases(conn: &Connection, w: &mut dyn Write) {
         Ok(None) => {}
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_conninfo(db_file: &str, w: &mut dyn Write) {
+fn cmd_conninfo(db_file: &str, w: &mut dyn Write) -> bool {
     let _ = writeln!(w, "Database: {db_file}");
     let _ = writeln!(w, "Dialect:  PostgreSQL");
+    true
 }
 
-fn cmd_list_indexes(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_indexes(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT c2.relname, c.relname \
                FROM pg_index i \
                JOIN pg_class c ON i.indexrelid = c.oid \
@@ -305,11 +314,13 @@ fn cmd_list_indexes(conn: &Connection, w: &mut dyn Write) {
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_list_views(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_views(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT relname FROM pg_class WHERE relkind = 'v' ORDER BY relname";
     match conn.query(sql) {
         Ok(Some(mut rows)) => {
@@ -332,11 +343,13 @@ fn cmd_list_views(conn: &Connection, w: &mut dyn Write) {
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_list_schemas(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_schemas(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT nspname, rolname \
                FROM pg_namespace n \
                JOIN pg_roles r ON n.nspowner = r.oid \
@@ -366,11 +379,13 @@ fn cmd_list_schemas(conn: &Connection, w: &mut dyn Write) {
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_list_types(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_types(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT typname, typcategory FROM pg_type WHERE typtype = 'e' ORDER BY typname";
     match conn.query(sql) {
         Ok(Some(mut rows)) => {
@@ -397,11 +412,13 @@ fn cmd_list_types(conn: &Connection, w: &mut dyn Write) {
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_list_roles(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_roles(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT rolname, CASE WHEN rolsuper = 1 THEN 'Superuser' ELSE '' END \
                FROM pg_roles ORDER BY rolname";
     match conn.query(sql) {
@@ -429,11 +446,13 @@ fn cmd_list_roles(conn: &Connection, w: &mut dyn Write) {
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_list_functions(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_functions(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT p.proname, p.pronargs, COALESCE(t.typname, '') \
                FROM pg_proc p \
                LEFT JOIN pg_type t ON p.prorettype = t.oid \
@@ -465,13 +484,17 @@ fn cmd_list_functions(conn: &Connection, w: &mut dyn Write) {
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn Write) {
+fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn Write) -> bool {
     // First show the regular column description
-    cmd_describe_table(conn, table_name, w);
+    if !cmd_describe_table(conn, table_name, w) {
+        return false;
+    }
 
     let safe_name = table_name.replace('\'', "''");
 
@@ -528,9 +551,10 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
             }
         }
     }
+    true
 }
 
-fn cmd_list_tables_extended(conn: &Connection, w: &mut dyn Write) {
+fn cmd_list_tables_extended(conn: &Connection, w: &mut dyn Write) -> bool {
     let sql = "SELECT c.relname, c.reltuples \
                FROM pg_class c \
                JOIN pg_namespace n ON c.relnamespace = n.oid \
@@ -561,11 +585,23 @@ fn cmd_list_tables_extended(conn: &Connection, w: &mut dyn Write) {
         }
         Err(e) => {
             write_pg_error(w, &e);
+            return false;
         }
     }
+    true
 }
 
-/// Dispatch a backslash meta-command. Returns true if the REPL should quit.
+/// What a meta-command did.
+#[derive(Debug, PartialEq, Eq)]
+enum MetaOutcome {
+    Done,
+    /// The command is unknown or failed. As in psql, the rest of its line
+    /// does not run.
+    Failed,
+    Quit,
+}
+
+/// Dispatch a backslash meta-command.
 fn handle_meta_command(
     line: &str,
     conn: &Connection,
@@ -573,17 +609,17 @@ fn handle_meta_command(
     expanded_display: &mut bool,
     timing: &mut bool,
     w: &mut dyn Write,
-) -> bool {
+) -> MetaOutcome {
     let (tokens, unterminated_quote) = dot_command::tokenize_dot_command(line);
     if let Some(quote) = unterminated_quote {
         let _ = writeln!(w, "unterminated {quote} quote");
-        return false;
+        return MetaOutcome::Failed;
     }
     let cmd = tokens.first().map(String::as_str).unwrap_or_default();
     let arg = tokens.get(1..).unwrap_or_default().join(" ");
     let arg = arg.as_str();
-    match cmd {
-        "\\q" => return true,
+    let ok = match cmd {
+        "\\q" => return MetaOutcome::Quit,
         "\\?" => cmd_help(w),
         "\\dt+" => cmd_list_tables_extended(conn, w),
         "\\dt" => cmd_list_tables(conn, w),
@@ -595,16 +631,16 @@ fn handle_meta_command(
         "\\df" => cmd_list_functions(conn, w),
         "\\d+" => {
             if arg.is_empty() {
-                cmd_list_tables_extended(conn, w);
+                cmd_list_tables_extended(conn, w)
             } else {
-                cmd_describe_table_extended(conn, arg, w);
+                cmd_describe_table_extended(conn, arg, w)
             }
         }
         "\\d" => {
             if arg.is_empty() {
-                cmd_list_tables(conn, w);
+                cmd_list_tables(conn, w)
             } else {
-                cmd_describe_table(conn, arg, w);
+                cmd_describe_table(conn, arg, w)
             }
         }
         "\\l" => cmd_list_databases(conn, w),
@@ -615,6 +651,7 @@ fn handle_meta_command(
             } else {
                 let _ = writeln!(w, "Expanded display is off.");
             }
+            true
         }
         "\\timing" => {
             *timing = !*timing;
@@ -623,16 +660,23 @@ fn handle_meta_command(
             } else {
                 let _ = writeln!(w, "Timing is off.");
             }
+            true
         }
         "\\echo" => {
             let _ = writeln!(w, "{arg}");
+            true
         }
         "\\conninfo" => cmd_conninfo(db_file, w),
         _ => {
             let _ = writeln!(w, "Unknown command: {cmd}. Type \\? for help.");
+            false
         }
+    };
+    if ok {
+        MetaOutcome::Done
+    } else {
+        MetaOutcome::Failed
     }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +841,13 @@ struct Repl {
     db_file: String,
     table_config: TableConfig,
     input_buf: String,
-    read_state: ReadState,
+    /// The statement to send, as the scanner reads `input_buf`: the same
+    /// text, but with `;` and `:` for `\;` and `\:`, as psql sends it.
+    sql_buf: String,
+    /// The statements and meta-commands that the input has ended so far,
+    /// which run one at a time and in order, as psql runs them.
+    pending: Vec<Pending>,
+    scanner: Scanner,
     interrupt_count: Arc<AtomicUsize>,
     had_error: bool,
     expanded_display: bool,
@@ -818,7 +868,9 @@ impl Repl {
             db_file,
             table_config,
             input_buf: String::new(),
-            read_state: ReadState::default(),
+            sql_buf: String::new(),
+            pending: Vec::new(),
+            scanner: Scanner::default(),
             interrupt_count,
             had_error: false,
             expanded_display: false,
@@ -836,61 +888,137 @@ impl Repl {
 
     fn reset_input(&mut self) {
         self.input_buf.clear();
-        self.read_state = ReadState::default();
+        self.sql_buf.clear();
+        self.pending.clear();
+        self.scanner = Scanner::default();
     }
 
+    /// Reads the input from byte `from` of `input_buf` on, adds it to the
+    /// statement to send, and runs the statements and meta-commands that it
+    /// ends. As in psql, a meta-command runs before the text after it is
+    /// read, and the rest of the line does not run after a meta-command
+    /// that is unknown or fails.
+    fn scan_input(&mut self, mut from: usize) {
+        while let Some(resume) = self.scan_up_to_meta_command(from) {
+            if self.run_pending() {
+                from += resume;
+            } else {
+                // psql drops the rest of the line, but keeps the newline
+                // between the lines of a statement.
+                let line_end = self.input_buf.len() - usize::from(self.input_buf.ends_with('\n'));
+                if from + resume > line_end {
+                    return;
+                }
+                from = line_end;
+            }
+        }
+        self.run_pending();
+    }
+
+    /// Reads the input from byte `from` of `input_buf` on, up to the end of
+    /// its first meta-command, and queues what it ends. Returns where the
+    /// rest of the input starts, from `from`, as [`Scanner::scan`] does.
+    fn scan_up_to_meta_command(&mut self, from: usize) -> Option<usize> {
+        let Self {
+            input_buf,
+            sql_buf,
+            pending,
+            scanner,
+            ..
+        } = self;
+        scanner.scan(&input_buf[from..], |segment| match segment {
+            // As in psql, whitespace and `--` comments before a statement
+            // are not part of it, so that a script can end with them.
+            Segment::Code(text) if sql_buf.is_empty() => sql_buf.push_str(text.trim_start()),
+            Segment::LineComment(_) if sql_buf.is_empty() => {}
+            Segment::Code(text)
+            | Segment::Quoted(text)
+            | Segment::LineComment(text)
+            | Segment::Variable { text, .. } => sql_buf.push_str(text),
+            // As in psql, the meta-command runs when the scanner reads it,
+            // and the statement that it interrupts stays in `sql_buf`.
+            Segment::MetaCommand(text) => pending.push(Pending::MetaCommand(text.to_string())),
+            Segment::End => {
+                sql_buf.push(';');
+                pending.push(Pending::Statement(std::mem::take(sql_buf)));
+            }
+        })
+    }
+
+    /// Runs the statements and the meta-command that the input has ended,
+    /// in order. Returns false when the meta-command is unknown or failed.
+    fn run_pending(&mut self) -> bool {
+        for item in std::mem::take(&mut self.pending) {
+            match item {
+                Pending::Statement(sql) => self.run_sql(&sql),
+                Pending::MetaCommand(command) => match handle_meta_command(
+                    command.trim(),
+                    &self.conn,
+                    &self.db_file,
+                    &mut self.expanded_display,
+                    &mut self.timing,
+                    &mut std::io::stdout(),
+                ) {
+                    MetaOutcome::Done => {}
+                    MetaOutcome::Failed => return false,
+                    MetaOutcome::Quit => std::process::exit(0),
+                },
+            }
+        }
+        true
+    }
+
+    /// Finishes reading a line: at the end of the input, runs what is left,
+    /// and starts a new statement when the query buffer is empty.
     fn consume(&mut self, flush: bool) {
         if self.input_buf.trim().is_empty() {
             return;
         }
-
-        let trimmed = self.input_buf.trim();
-
-        // Backslash meta-commands
-        if trimmed.starts_with('\\') {
-            let input = self.input_buf.clone();
-            let quit = handle_meta_command(
-                input.trim(),
-                &self.conn,
-                &self.db_file,
-                &mut self.expanded_display,
-                &mut self.timing,
-                &mut std::io::stdout(),
-            );
+        // At the end of the input, psql sends what is left without a
+        // semicolon.
+        if flush {
+            let sql = std::mem::take(&mut self.sql_buf);
+            self.run_sql(&sql);
+        }
+        // psql shows the prompt for a new statement when its query buffer is
+        // empty, for example after a meta-command.
+        let empty = self.sql_buf.is_empty() && !self.scanner.in_quote();
+        if self.scanner.is_complete() || empty || flush {
             self.reset_input();
-            if quit {
-                std::process::exit(0);
-            }
+        }
+    }
+
+    /// Runs one statement and prints its result.
+    fn run_sql(&mut self, sql: &str) {
+        let sql = sql.trim();
+        // psql would send an empty query, which prints nothing. A query of
+        // comments alone is empty too, as the server reads it.
+        let no_statements = matches!(turso_pg_parser::split_statements(sql), Ok(statements) if statements.is_empty());
+        if sql.is_empty() || no_statements {
             return;
         }
-
-        let is_complete = self.read_state.is_complete();
-        if is_complete || flush {
-            let sql = self.input_buf.clone();
-            let start = if self.timing {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let had_err = execute_sql(
-                &self.conn,
-                sql.trim(),
-                &self.table_config,
-                self.expanded_display,
-                &mut std::io::stdout(),
+        let start = if self.timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let had_err = execute_sql(
+            &self.conn,
+            sql,
+            &self.table_config,
+            self.expanded_display,
+            &mut std::io::stdout(),
+        );
+        if let Some(start) = start {
+            let elapsed = start.elapsed();
+            let _ = writeln!(
+                std::io::stdout(),
+                "Time: {:.3}ms",
+                elapsed.as_secs_f64() * 1000.0
             );
-            if let Some(start) = start {
-                let elapsed = start.elapsed();
-                let _ = writeln!(
-                    std::io::stdout(),
-                    "Time: {:.3}ms",
-                    elapsed.as_secs_f64() * 1000.0
-                );
-            }
-            if had_err {
-                self.had_error = true;
-            }
-            self.reset_input();
+        }
+        if had_err {
+            self.had_error = true;
         }
     }
 
@@ -927,12 +1055,7 @@ impl Repl {
                     }
 
                     self.interrupt_count.store(0, Ordering::Release);
-                    self.read_state.process(&line);
-                    self.input_buf.push_str(&line);
-                    if !self.input_buf.ends_with(char::is_whitespace) {
-                        self.input_buf.push('\n');
-                    }
-                    self.consume(false);
+                    self.read_interactive_line(&line);
                 }
                 Err(ReadlineError::Interrupted) => {
                     if self.interrupt_count.fetch_add(1, Ordering::SeqCst) >= 1 {
@@ -956,6 +1079,17 @@ impl Repl {
         let _ = rl.save_history(HISTORY_FILE.as_path());
     }
 
+    /// Reads and runs one line that the user typed.
+    fn read_interactive_line(&mut self, line: &str) {
+        let prev_len = self.input_buf.len();
+        // The newline ends a `--` comment of the line, also in the text that
+        // goes to the server.
+        self.input_buf.push_str(line);
+        self.input_buf.push('\n');
+        self.scan_input(prev_len);
+        self.consume(false);
+    }
+
     fn run_stdin(&mut self) {
         let stdin = std::io::stdin();
         loop {
@@ -965,10 +1099,19 @@ impl Repl {
                 self.consume(true);
                 break;
             }
-            self.read_state.process(&self.input_buf[prev_len..]);
+            self.scan_input(prev_len);
             self.consume(false);
         }
     }
+}
+
+/// A statement or a meta-command that the input has ended, and that has
+/// not run yet.
+enum Pending {
+    /// A statement, with its semicolon.
+    Statement(String),
+    /// A meta-command, from its backslash to the end of its line.
+    MetaCommand(String),
 }
 
 fn is_exit_command(line: &str) -> bool {
@@ -1050,6 +1193,27 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After a meta-command, the query buffer is empty, so the shell shows
+    /// the prompt for a new statement and `exit` quits, as in psql. The shell
+    /// showed the continuation prompt and sent `exit` to the server.
+    #[test]
+    fn prompt_after_meta_command_is_for_a_new_statement() {
+        let (io, _db, conn) = open_database(":memory:", None, false, false).unwrap();
+        let mut repl = Repl::new(
+            conn,
+            io,
+            ":memory:".to_string(),
+            TableConfig::adaptive_colors(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        for line in ["\\x", "-- comment", "SELECT 1;"] {
+            repl.read_interactive_line(line);
+            assert_eq!(repl.prompt(), PROMPT, "after {line:?}");
+        }
+        repl.read_interactive_line("SELECT");
+        assert_eq!(repl.prompt(), PROMPT_CONT);
+    }
 
     #[test]
     fn test_successful_exit_commands() {

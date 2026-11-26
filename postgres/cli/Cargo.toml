@@ -19,6 +19,8 @@ turso_core = { workspace = true, default-features = true, features = [
     "fts",
 ] }
 turso_pg = { workspace = true }
+turso_pg_parser = { workspace = true }
+turso_pg_scanner = { workspace = true }
 turso_pg_server = { workspace = true }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
@@ -41,7 +43,6 @@ cfg-if = { workspace = true }
 ctrlc = "3.4.4"
 libc = "0.2.172"
 clap_complete = { version = "=4.5.47", features = ["unstable-dynamic"] }
-itertools.workspace = true
 mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
