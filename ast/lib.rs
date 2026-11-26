@@ -1319,6 +1319,12 @@ pub enum SelectTable {
         select: Select,
         alias: Option<As>,
         lateral: bool,
+        /// The subquery sees none of the tables and none of the WITH queries
+        /// of the queries around it, as the query of a view does. No SQL
+        /// text says this: a dialect sets it on a subquery that it puts into
+        /// a statement and that is a query of its own, such as the body of a
+        /// function.
+        closed: bool,
     },
     /// subquery
     Sub(FromClause, Option<As>),

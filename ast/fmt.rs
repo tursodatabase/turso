@@ -1533,6 +1533,8 @@ impl WriteSql for SelectTable {
                 select,
                 alias,
                 lateral,
+                // No SQL text says that a subquery is closed.
+                closed: _,
             } => {
                 if *lateral {
                     s.keyword("LATERAL")?;

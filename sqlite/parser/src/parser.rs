@@ -3143,6 +3143,7 @@ impl<'a> Parser<'a> {
             select,
             alias,
             lateral,
+            closed: false,
         }))
     }
 
@@ -9869,6 +9870,7 @@ mod tests {
                                     },
                                     alias: None,
                                     lateral: false,
+                                    closed: false,
                                 }),
                                 joins: vec![]
                             }),
@@ -10612,6 +10614,7 @@ mod tests {
                                             },
                                             alias: None,
                                             lateral: false,
+                                            closed: false,
                                         }),
                                         constraint: None,
                                     }

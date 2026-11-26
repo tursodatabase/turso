@@ -2700,6 +2700,7 @@ impl PostgreSQLTranslator {
                     select: self.translate_select(stmt)?,
                     alias: None,
                     lateral: false,
+                    closed: false,
                 }),
                 joins: vec![],
             }),
@@ -2951,6 +2952,7 @@ impl PostgreSQLTranslator {
             select,
             alias,
             lateral: range_sub.lateral,
+            closed: false,
         })
     }
 
@@ -3119,6 +3121,7 @@ impl PostgreSQLTranslator {
                 select,
                 alias,
                 lateral: false,
+                closed: false,
             });
         }
 
@@ -3270,6 +3273,7 @@ impl PostgreSQLTranslator {
             },
             alias: Some(ast::As::Elided(exact_name("arg"))),
             lateral: false,
+            closed: false,
         };
         let arg_json = ast::Expr::Qualified(exact_name("arg"), exact_name("json"));
         let (source, joins) = if is_recordset {
@@ -3398,6 +3402,7 @@ impl PostgreSQLTranslator {
             },
             alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)))),
             lateral: true,
+            closed: false,
         })
     }
 
@@ -6370,6 +6375,7 @@ fn translate_rewritten_function(
         ),
         alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(function.name)))),
         lateral: true,
+        closed: false,
     })
 }
 
@@ -10033,6 +10039,7 @@ fn description_subquery(conditions: Vec<(&str, ast::Expr)>) -> ast::Expr {
                         select: pg_description,
                         alias: None,
                         lateral: false,
+                        closed: false,
                     }),
                     joins: vec![],
                 }),

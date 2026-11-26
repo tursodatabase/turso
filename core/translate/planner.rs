@@ -299,6 +299,8 @@ impl RecursiveRefCounter<'_> {
                 }
                 count
             }
+            // A closed subquery sees no WITH query of the queries around it.
+            ast::SelectTable::Select { closed: true, .. } => 0,
             ast::SelectTable::Select {
                 select: subselect, ..
             } => self.count_select(subselect, scope),
@@ -420,6 +422,8 @@ fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
                 collect_subquery_table_refs_in_expr(arg, out);
             }
         }
+        // A closed subquery sees no WITH query of the queries around it.
+        ast::SelectTable::Select { closed: true, .. } => {}
         ast::SelectTable::Select {
             select: subselect, ..
         } => {
@@ -1834,20 +1838,29 @@ fn parse_subquery_table(
         select: subselect,
         alias: maybe_alias,
         lateral,
+        closed,
     } = *table
     else {
         unreachable!("the table is a subquery");
     };
+    turso_assert!(
+        !(lateral && closed),
+        "a closed subquery cannot be LATERAL: it sees no table around it"
+    );
     let lateral = lateral && !table_references.joined_tables().is_empty();
-    let outer_query_refs_for_subquery = subquery_outer_query_refs(
-        &subselect,
-        lateral,
-        table_references,
-        cte_definitions,
-        resolver,
-        program,
-        connection,
-    )?;
+    let outer_query_refs_for_subquery = if closed {
+        Vec::new()
+    } else {
+        subquery_outer_query_refs(
+            &subselect,
+            lateral,
+            table_references,
+            cte_definitions,
+            resolver,
+            program,
+            connection,
+        )?
+    };
     let subplan = if lateral {
         prepare_lateral_subquery_plan(
             subselect,
@@ -2025,6 +2038,7 @@ fn parse_join_group_table(
             select: join_select,
             alias: Some(alias),
             lateral: false,
+            closed: false,
         }),
         resolver,
         program,

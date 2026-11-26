@@ -231,6 +231,7 @@ impl FromClause {
                     select: select.to_sql_ast(),
                     alias: None,
                     lateral: false,
+                    closed: false,
                 },
             }),
             joins: self

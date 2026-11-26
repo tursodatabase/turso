@@ -338,6 +338,11 @@ pub trait Dialect: Send + Sync + 'static {
     /// own, though, so it cannot tell when a call inside a subquery of the
     /// expression expands into the same call again. The dialect has to
     /// refuse such a call.
+    ///
+    /// A subquery of the expression sees the tables and the WITH queries of
+    /// the statement that has the call. A dialect whose function is a query
+    /// of its own puts the subquery in a closed subquery in FROM
+    /// (`SelectTable::Select::closed`).
     fn expand_function_call(
         &self,
         scope: &FunctionScope<'_>,
