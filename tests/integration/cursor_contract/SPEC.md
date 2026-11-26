@@ -235,7 +235,7 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | N10 | WAL | Index: an ended cursor finds a peer's new entry. It keeps its cell index: a failed seek on an empty index (one peer insert) and a `Next` past the last entry (two peer inserts) both show it |
 | N11 | WAL | Index: `Found` hit, then `IdxInsert` with `use_seek`: the new key goes before the match and the index is out of order. SQLite seeks again. The model still lets a hit set the token; it must not |
 | N12 | WAL | Index: panic on `idx < cell_count` |
-| CL1 | MVCC | Index, NOCASE or RTRIM: `IdxDelete` of `('a', 1)` and `IdxInsert` of `('A', 1)` (equal under the collation, same rowid): a later read of the entry returns the old bytes `'a'`, not `'A'`. SQLite and WAL return the new bytes. Needs no checkpointed row |
+| CL1 | MVCC | Index, NOCASE or RTRIM: `IdxDelete` of `('a', 1)` and `IdxInsert` of `('A', 1)` (equal under the collation, same rowid): a later read of the entry returns the old bytes `'a'`, not `'A'`. SQLite and WAL return the new bytes. Needs no checkpointed row. Reachable from SQL (`UPDATE t SET a='A'`, then a covering index scan): issue 9285 |
 | IDX_N6 | WAL | Index: own `Delete`, then a peer `IdxInsert`, then `Next` or `Prev`: the cursor finds the wrong entry or the end. Shows with the default index; the walk found it only after the text values were added |
 | N8 | model | Index: `IdxGT` after own `IdxDelete` compares the successor. Probably a model choice. Open |
 

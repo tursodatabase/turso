@@ -1889,7 +1889,7 @@ mod collation {
         agree(def(NOCASE, BIN), &rows, 1, &ops);
     }
 
-    /// CL1: the MVCC overlay keeps the key bytes of the deleted entry when a key that is equal
+    /// CL1 (issue 9285): the MVCC overlay keeps the key bytes of the deleted entry when a key that is equal
     /// under the collation takes its place. `Rewind` and `SeekGE` read the old text.
     ///
     /// Fails today because of CL1; see SPEC section 5b.
