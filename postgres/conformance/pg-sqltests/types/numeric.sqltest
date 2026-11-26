@@ -194,3 +194,50 @@ test numeric-column-with-precision-rejects-infinity {
 }
 @sqlstate 22003
 expect error {}
+
+test numeric-addition-and-subtraction-with-nan-and-infinity {
+    SELECT 'NaN'::numeric + 1, 'Infinity'::numeric + '-Infinity'::numeric, 'Infinity'::numeric + 1, 1 - 'Infinity'::numeric, 'Infinity'::numeric - 'Infinity'::numeric, 'Infinity'::numeric - '-Infinity'::numeric;
+}
+expect {
+    NaN|NaN|Infinity|-Infinity|NaN|Infinity
+}
+
+test numeric-multiplication-with-nan-and-infinity {
+    SELECT 'Infinity'::numeric * 0, 'Infinity'::numeric * -2, 'NaN'::numeric * 0, '-Infinity'::numeric * '-Infinity'::numeric;
+}
+expect {
+    NaN|-Infinity|NaN|Infinity
+}
+
+test numeric-division-with-nan-and-infinity {
+    SELECT 1 / 'Infinity'::numeric, 'Infinity'::numeric / 'Infinity'::numeric, 'Infinity'::numeric / -2, '1.50'::numeric / 'Infinity'::numeric, 'NaN'::numeric / 0;
+}
+expect {
+    0|NaN|-Infinity|0|NaN
+}
+
+test numeric-infinity-divided-by-zero-is-an-error {
+    SELECT 'Infinity'::numeric / 0;
+}
+@sqlstate 22012
+expect error {}
+
+test numeric-remainder-with-nan-and-infinity {
+    SELECT 'Infinity'::numeric % 2, 5 % 'Infinity'::numeric, -5 % 'Infinity'::numeric, '5.50'::numeric % '-Infinity'::numeric, 'NaN'::numeric % 0, 'Infinity'::numeric % 'Infinity'::numeric;
+}
+expect {
+    NaN|5|-5|5.50|NaN|NaN
+}
+
+test numeric-infinity-remainder-zero-is-an-error {
+    SELECT 'Infinity'::numeric % 0;
+}
+@sqlstate 22012
+expect error {}
+
+test numeric-negation-of-nan-and-infinity {
+    SELECT -'NaN'::numeric, -'Infinity'::numeric, -'-Infinity'::numeric;
+}
+expect {
+    NaN|-Infinity|Infinity
+}

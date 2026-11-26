@@ -753,3 +753,13 @@ test numeric-cast-reads-nan {
 expect {
     NaN
 }
+
+@requires strict "uses STRICT tables"
+test numeric-arithmetic-with-nan {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('NaN');
+    SELECT val + 1, 2 * val, val - val, -val, val / 0, val % 0 FROM t1;
+}
+expect {
+    NaN|NaN|NaN|NaN|NaN|NaN
+}

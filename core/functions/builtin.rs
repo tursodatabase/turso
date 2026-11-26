@@ -16,8 +16,8 @@ use crate::json;
 use crate::namespace::{mangle_name, NamespaceId};
 use crate::numeric::decimal::{
     blob_to_numeric_value, check_numeric_limits, format_numeric, format_numeric_value,
-    numeric_from_value, numeric_value_to_blob, validate_precision_scale, NumericValue,
-    MAX_FRACTION_DIGITS,
+    negate_special, numeric_from_value, numeric_value_to_blob, special_arithmetic,
+    validate_precision_scale, NumericOp, NumericValue, MAX_FRACTION_DIGITS,
 };
 use crate::numeric::Numeric;
 use crate::stats::StatAccum;
@@ -1114,10 +1114,20 @@ pub fn call_builtin_scalar(
             Ok(match (lhs_val, rhs_val) {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
                 _ => {
-                    let (NumericValue::Finite(a), NumericValue::Finite(b)) =
-                        (numeric_from_value(lhs_val)?, numeric_from_value(rhs_val)?)
-                    else {
-                        return Err(unsupported_special_arithmetic());
+                    let (a, b) = match (numeric_from_value(lhs_val)?, numeric_from_value(rhs_val)?)
+                    {
+                        (NumericValue::Finite(a), NumericValue::Finite(b)) => (a, b),
+                        (a, b) => {
+                            let op = match func {
+                                ScalarFunc::NumericAdd => NumericOp::Add,
+                                ScalarFunc::NumericSub => NumericOp::Sub,
+                                ScalarFunc::NumericMul => NumericOp::Mul,
+                                ScalarFunc::NumericDiv => NumericOp::Div,
+                                _ => NumericOp::Mod,
+                            };
+                            let result = special_arithmetic(op, &a, &b)?;
+                            return Ok(Value::build_text(format_numeric_value(&result)));
+                        }
                     };
                     let (a_scale, b_scale) =
                         (a.fractional_digit_count(), b.fractional_digit_count());
@@ -1151,7 +1161,7 @@ pub fn call_builtin_scalar(
                 Value::Null => Value::Null,
                 val => match numeric_from_value(val)? {
                     NumericValue::Finite(number) => Value::build_text(format_numeric(&-number)),
-                    _ => return Err(unsupported_special_arithmetic()),
+                    special => Value::build_text(format_numeric_value(&negate_special(&special))),
                 },
             })
         }
@@ -1309,10 +1319,6 @@ pub(crate) fn exec_validate_ipaddr(value: &Value) -> crate::Result<Value> {
             )));
         }
     })
-}
-
-fn unsupported_special_arithmetic() -> LimboError {
-    LimboError::Constraint("arithmetic on NaN or infinity is not supported".to_string())
 }
 
 /// The stored form of the number `value` as a numeric.

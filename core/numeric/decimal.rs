@@ -33,6 +33,16 @@ pub enum NumericValue {
     NegativeInfinity,
 }
 
+/// The arithmetic operators of the numeric type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
 /// The text that PostgreSQL's numeric type writes for the number `text`, such
 /// as `0.002` for `2e-3` and `100` for `1e2`. It reads `text` as
 /// [`numeric_from_value`] does, so it fails for text that is not a number and
@@ -500,6 +510,78 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     Ok(BigDecimal::new(bigint, scale))
 }
 
+/// `left op right` when `left` or `right` is NaN or an infinity, with the
+/// results of PostgreSQL. NaN with anything is NaN. An infinity minus the same
+/// infinity, or times zero, is NaN. A finite number divided by an infinity is
+/// zero, and its remainder is the number. An infinity divided by zero, or its
+/// remainder, is a division by zero.
+pub fn special_arithmetic(
+    op: NumericOp,
+    left: &NumericValue,
+    right: &NumericValue,
+) -> crate::Result<NumericValue> {
+    use NumericValue::{Finite, Infinity, NaN, NegativeInfinity};
+    let division_by_zero = || LimboError::DivisionByZero;
+    let infinity_with_sign = |negative: bool| {
+        if negative {
+            NegativeInfinity
+        } else {
+            Infinity
+        }
+    };
+    // The sign of a value that is not NaN: true when it is below zero.
+    let is_negative = |value: &NumericValue| match value {
+        NegativeInfinity => true,
+        Finite(number) => number.sign() == Sign::Minus,
+        Infinity | NaN => false,
+    };
+    let is_zero = |value: &NumericValue| matches!(value, Finite(number) if number.is_zero());
+    let is_infinite = |value: &NumericValue| matches!(value, Infinity | NegativeInfinity);
+
+    if matches!(left, NaN) || matches!(right, NaN) {
+        return Ok(NaN);
+    }
+    Ok(match op {
+        NumericOp::Add | NumericOp::Sub => {
+            let right_negative = is_negative(right) != (op == NumericOp::Sub);
+            match (is_infinite(left), is_infinite(right)) {
+                (true, true) if is_negative(left) != right_negative => NaN,
+                (true, _) => infinity_with_sign(is_negative(left)),
+                _ => infinity_with_sign(right_negative),
+            }
+        }
+        NumericOp::Mul => {
+            if is_zero(left) || is_zero(right) {
+                NaN
+            } else {
+                infinity_with_sign(is_negative(left) != is_negative(right))
+            }
+        }
+        NumericOp::Div => match (is_infinite(left), is_infinite(right)) {
+            (true, true) => NaN,
+            (true, false) if is_zero(right) => return Err(division_by_zero()),
+            (true, false) => infinity_with_sign(is_negative(left) != is_negative(right)),
+            _ => Finite(BigDecimal::from(0)),
+        },
+        NumericOp::Mod => match (is_infinite(left), is_infinite(right)) {
+            (true, true) => NaN,
+            (true, false) if is_zero(right) => return Err(division_by_zero()),
+            (true, false) => NaN,
+            _ => left.clone(),
+        },
+    })
+}
+
+/// `-value` for NaN and the infinities.
+pub fn negate_special(value: &NumericValue) -> NumericValue {
+    match value {
+        NumericValue::NaN => NumericValue::NaN,
+        NumericValue::Infinity => NumericValue::NegativeInfinity,
+        NumericValue::NegativeInfinity => NumericValue::Infinity,
+        NumericValue::Finite(number) => NumericValue::Finite(-number),
+    }
+}
+
 /// The text of a numeric value: `NaN`, `Infinity`, `-Infinity`, or the digits
 /// of a finite number as `format_numeric` writes them.
 pub fn format_numeric_value(value: &NumericValue) -> String {
@@ -636,6 +718,43 @@ mod tests {
         assert!(blob_to_numeric_value(&[SPECIAL_BLOB_VERSION]).is_err());
         let finite = bigdecimal_to_blob(&BigDecimal::from_str("1.50").unwrap());
         assert_eq!(finite[0], NUMERIC_BLOB_VERSION);
+    }
+
+    #[test]
+    fn arithmetic_on_special_values_gives_the_results_of_postgres() {
+        let value = |text: &str| numeric_from_text(text).unwrap();
+        let run = |op, left: &str, right: &str| {
+            special_arithmetic(op, &value(left), &value(right)).map(|v| format_numeric_value(&v))
+        };
+        use NumericOp::{Add, Div, Mod, Mul, Sub};
+        for (op, left, right, expected) in [
+            (Add, "NaN", "1", "NaN"),
+            (Add, "Infinity", "-Infinity", "NaN"),
+            (Add, "Infinity", "1", "Infinity"),
+            (Add, "1", "-Infinity", "-Infinity"),
+            (Sub, "Infinity", "Infinity", "NaN"),
+            (Sub, "Infinity", "-Infinity", "Infinity"),
+            (Sub, "1", "Infinity", "-Infinity"),
+            (Mul, "Infinity", "0", "NaN"),
+            (Mul, "Infinity", "-2", "-Infinity"),
+            (Mul, "-Infinity", "-Infinity", "Infinity"),
+            (Div, "NaN", "0", "NaN"),
+            (Div, "Infinity", "Infinity", "NaN"),
+            (Div, "Infinity", "-2", "-Infinity"),
+            (Div, "1.50", "Infinity", "0"),
+            (Mod, "Infinity", "2", "NaN"),
+            (Mod, "5.50", "-Infinity", "5.50"),
+            (Mod, "NaN", "0", "NaN"),
+            (Mod, "Infinity", "Infinity", "NaN"),
+        ] {
+            assert_eq!(
+                run(op, left, right).unwrap(),
+                expected,
+                "{left} {op:?} {right}"
+            );
+        }
+        assert!(run(Div, "Infinity", "0").is_err());
+        assert!(run(Mod, "Infinity", "0").is_err());
     }
 
     #[test]
