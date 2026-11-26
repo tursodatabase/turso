@@ -1039,9 +1039,38 @@ macro_rules! comparison_opcode {
                     return Ok(InsnFunctionStepResult::Step);
                 }
             }
+            // Two numbers, such as a REAL column and an integer constant,
+            // compare by their numeric order. Only TEXT affinity converts a
+            // number, and a type's order can place numbers differently.
+            // Otherwise op_comparison_slow converts nothing and gives this
+            // order too. The test is here and not in op_comparison_slow,
+            // because that function saves and restores on each call the
+            // registers that its other paths need.
+            if let (Register::Value(Value::Numeric(l)), Register::Value(Value::Numeric(r))) =
+                (&state.registers[*lhs], &state.registers[*rhs])
+            {
+                if flags.get_affinity() != Affinity::Text
+                    && matches!(collation, CollationSeq::Text(_))
+                {
+                    state.pc = if comparison_matches_order($op, numeric_order(l, r)) {
+                        target_pc
+                    } else {
+                        state.pc + 1
+                    };
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            }
             op_comparison_slow(state, *lhs, *rhs, target_pc, *flags, *collation, $op)
         }
     };
+}
+
+/// The order of two numbers, for the comparison opcodes. Not inlined, so that
+/// the comparison of an integer with a REAL does not add its code to each
+/// comparison opcode of the dispatch loop.
+#[inline(never)]
+fn numeric_order(lhs: &Numeric, rhs: &Numeric) -> std::cmp::Ordering {
+    lhs.cmp(rhs)
 }
 
 comparison_opcode!(op_eq, Eq, ComparisonOp::Eq, |l: i64, r: i64| l == r);
@@ -1066,9 +1095,9 @@ fn texts_compare_as_bytes(
             && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
 }
 
-/// The comparison opcodes for every operand pair that is not two integers or
-/// two texts compared by their bytes: NULLs, affinity conversions, text
-/// collations and array comparison.
+/// The comparison opcodes for every operand pair that is not two integers, two
+/// texts compared by their bytes or two numbers compared by their numeric
+/// order: NULLs, affinity conversions, text collations and array comparison.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn op_comparison_slow(
@@ -1096,16 +1125,6 @@ fn op_comparison_slow(
             }
             return Ok(InsnFunctionStepResult::Step);
         };
-    }
-
-    // Two numbers, such as a REAL column and an integer constant, compare by
-    // their numeric order. Only TEXT affinity converts a number, and a type's
-    // order can place numbers differently. Otherwise the general comparison
-    // below converts nothing and gives this order too.
-    if let (Value::Numeric(l), Value::Numeric(r)) = (lhs_value, rhs_value) {
-        if affinity != Affinity::Text && matches!(collation, CollationSeq::Text(_)) {
-            take_jump_if!(comparison_matches_order(op, l.cmp(r)));
-        }
     }
 
     match (lhs_value, rhs_value) {
