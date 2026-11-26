@@ -1063,6 +1063,58 @@ fn schema_is_read_again_while_a_role_is_set() {
 }
 
 #[turso_macros::test(mvcc)]
+fn rename_cannot_take_a_constraint_index_name(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE source (id integer PRIMARY KEY, x integer UNIQUE)")
+        .unwrap();
+    let before = class_rows(pg.inner());
+    for name in ["source_pkey", "source_x_key"] {
+        let error = pg
+            .execute(format!("ALTER TABLE source RENAME TO {name}"))
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "42P07", "{error:?}");
+        assert_eq!(class_rows(pg.inner()), before);
+        pg.inner().force_reparse_schema_without_publish().unwrap();
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn an_explicit_primary_key_name_is_not_renamed_on_collision(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE t_pkey(x int)").unwrap();
+    for sql in [
+        "CREATE TABLE t(id int CONSTRAINT t_pkey PRIMARY KEY)",
+        "CREATE TABLE t(id text, CONSTRAINT t_pkey PRIMARY KEY(id))",
+    ] {
+        let error = pg.execute(sql).unwrap_err();
+        assert_eq!(error.sqlstate, "42P07", "{error:?}");
+        assert_eq!(class_rows(pg.inner()).len(), 1);
+    }
+    pg.execute("CREATE TABLE t(id int PRIMARY KEY)").unwrap();
+    assert!(class_row(pg.inner(), "t_pkey1").is_some());
+}
+
+#[turso_macros::test(mvcc)]
+fn constraint_names_cannot_collide_with_relations_in_the_same_statement(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    for sql in [
+        "CREATE TABLE t (x int CONSTRAINT t PRIMARY KEY)",
+        "CREATE TABLE t (x text CONSTRAINT t PRIMARY KEY)",
+        "CREATE TABLE t (x int CONSTRAINT t UNIQUE)",
+        "CREATE TABLE t (x int CONSTRAINT same UNIQUE, y int CONSTRAINT same UNIQUE)",
+        "CREATE TABLE t (x int CONSTRAINT same PRIMARY KEY, y int CONSTRAINT same UNIQUE)",
+    ] {
+        let error = pg.execute(sql).unwrap_err();
+        assert_eq!(error.sqlstate, "42P07", "{sql}: {error:?}");
+        assert!(class_rows(pg.inner()).is_empty(), "{sql}");
+        pg.inner().force_reparse_schema_without_publish().unwrap();
+    }
+    pg.execute("CREATE TABLE t (x int PRIMARY KEY, y int UNIQUE)")
+        .unwrap();
+    assert_eq!(class_rows(pg.inner()).len(), 3);
+}
+
+#[turso_macros::test(mvcc)]
 fn quoted_relation_names_survive_catalog_updates(db: TempDatabase) {
     let pg = db.connect_postgres();
     pg.execute("CREATE TABLE \"MiXeD\" (id int PRIMARY KEY, x text, \"CoDe\" text UNIQUE)")

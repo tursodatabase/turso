@@ -923,7 +923,7 @@ fn emit_new_table_rows(
     };
     let btree = table.table;
     let mut automatic_indexes = table.automatic_indexes.iter();
-    let mut chosen_names = Vec::new();
+    let mut chosen_names = vec![table.written_name.as_str().to_string()];
     let mut new_index = |program: &mut ProgramBuilder,
                          key: ConstraintKey<'_>,
                          engine_name: Option<&str>|
@@ -1011,9 +1011,14 @@ fn constraint_index_name(
                 .is_some_and(|catalog| catalog.name_is_taken(table.namespace, name))
     };
     if let Some(name) = written {
-        if !matches!(key, ConstraintKey::PrimaryKey) || name != format!("{table_name}_pkey") {
-            return Ok(name);
+        if is_taken(&name) {
+            return Err(sqlstate_error(
+                SQLSTATE_DUPLICATE_TABLE,
+                format!("relation \"{name}\" already exists"),
+                None,
+            ));
         }
+        return Ok(name);
     }
     let mut name = match &columns {
         Some(columns) => format!("{table_name}_{columns}_{label}"),
@@ -1192,6 +1197,15 @@ impl<'a> ClassRowWriter<'a> {
         let has_row = class_catalog(self.schema)
             .is_some_and(|catalog| catalog.get_by_name(namespace, old_name).is_some());
         if has_row {
+            if class_catalog(self.schema)
+                .is_some_and(|catalog| catalog.name_is_taken(namespace, new_name))
+            {
+                return Err(sqlstate_error(
+                    SQLSTATE_DUPLICATE_TABLE,
+                    format!("relation \"{new_name}\" already exists"),
+                    None,
+                ));
+            }
             emit_class_row_rename(program, &self.cursors, namespace, old_name, new_name);
         }
         Ok(())

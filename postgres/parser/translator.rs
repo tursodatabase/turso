@@ -491,10 +491,7 @@ impl PostgreSQLTranslator {
                             let pk_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
                                 name: if constraint.conname.is_empty() {
-                                    Some(exact_name(format!(
-                                        "{}_pkey",
-                                        bare_table_name(&tbl_name_str)
-                                    )))
+                                    None
                                 } else {
                                     Some(exact_name(constraint.conname.clone()))
                                 },
@@ -905,9 +902,7 @@ impl PostgreSQLTranslator {
         // PRIMARY KEY (only on column level if there's no table-level PK)
         if is_primary_key && !has_table_pk {
             constraints.push(ast::NamedColumnConstraint {
-                name: Some(pk_conname.unwrap_or_else(|| {
-                    exact_name(format!("{}_pkey", bare_table_name(tbl_name.name.as_str())))
-                })),
+                name: pk_conname,
                 constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
