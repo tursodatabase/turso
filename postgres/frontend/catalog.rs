@@ -2062,6 +2062,26 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
     ]
 }
 
+/// The `typname` of the `pg_type` row with oid `oid`, and the oid of its
+/// element type when it is an array type, which `format_type` prints as its
+/// element type followed by `[]`.
+pub(crate) fn pg_type_by_oid(conn: &Connection, oid: i64) -> Option<(String, Option<i64>)> {
+    let row = PgTypeTable::load_rows(conn)
+        .into_iter()
+        .find(|row| row[0].as_int() == Some(oid))?;
+    let name = row[1]
+        .to_text()
+        .expect("pg_type names are text")
+        .to_string();
+    let typlen = row[4].as_int().expect("pg_type.typlen is an integer");
+    let typelem = row[13].as_int().expect("pg_type.typelem is an integer");
+    // PostgreSQL's IsTrueArrayType: a type with an element type is an array
+    // type only when it has variable length, as PostgreSQL's `name`, whose
+    // element type is `char`, is not.
+    let element_oid = (typelem != 0 && typlen == -1).then_some(typelem);
+    Some((name, element_oid))
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // pg_index
 // ──────────────────────────────────────────────────────────────────────

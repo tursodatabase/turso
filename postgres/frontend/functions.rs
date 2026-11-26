@@ -402,8 +402,12 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "jsonb_exists_all"(FunctionArity::Exact(2), true) => {
             exec_jsonb_exists_keys(args[0].get_value(), args[1].get_value(), true)?
         },
-        "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
-            .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
+        "format_type"(FunctionArity::OneOf(&[1, 2]), false) => {
+            let typemod = args.get(1).and_then(|arg| arg.get_value().as_int());
+            oid_arg(args, 0)?
+                .map(|type_oid| format_type(connection, type_oid, typemod))
+                .transpose()?
+        },
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
         "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -2167,60 +2171,121 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
-/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It prints unknown for an oid it does not list, where PostgreSQL prints the name of that pg_type row, and character for bpchar with typemod -1, where PostgreSQL prints bpchar. A lookup in a pg_type table replaces this.
-/// The name of a type as `format_type` prints it.
-pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
-    match type_oid {
-        16 => "boolean".to_string(),
-        17 => "bytea".to_string(),
-        18 => "\"char\"".to_string(),
-        19 => "name".to_string(),
-        20 => "bigint".to_string(),
-        21 => "smallint".to_string(),
-        23 => "integer".to_string(),
-        25 => "text".to_string(),
-        26 => "oid".to_string(),
-        114 => "json".to_string(),
-        700 => "real".to_string(),
-        701 => "double precision".to_string(),
-        1000 => "boolean[]".to_string(),
-        1007 => "integer[]".to_string(),
-        1009 => "text[]".to_string(),
-        1022 => "double precision[]".to_string(),
-        1042 => {
-            if typemod > 4 {
-                format!("character({})", typemod - 4)
-            } else {
-                "character".to_string()
-            }
+/// The name of type `type_oid` as `format_type` prints it, with the type
+/// modifier `typemod` when the call gives one.
+fn format_type(conn: &Connection, type_oid: i64, typemod: Option<i64>) -> Result<String> {
+    if type_oid == 0 {
+        return Ok("-".to_string());
+    }
+    let Some((name, element_oid)) = type_by_oid(conn, type_oid) else {
+        return Ok("???".to_string());
+    };
+    let Some(element_oid) = element_oid else {
+        return format_type_name(type_oid, &name, typemod);
+    };
+    let (element_name, _) =
+        type_by_oid(conn, element_oid).expect("the element type of an array type is in pg_type");
+    Ok(format!(
+        "{}[]",
+        format_type_name(element_oid, &element_name, typemod)?
+    ))
+}
+
+/// The `typname` of type `type_oid`, and the oid of its element type when it
+/// is an array type, from its pg_type row or else from `TYPES_WITHOUT_ROWS`.
+fn type_by_oid(conn: &Connection, type_oid: i64) -> Option<(String, Option<i64>)> {
+    crate::catalog::pg_type_by_oid(conn, type_oid).or_else(|| {
+        TYPES_WITHOUT_ROWS
+            .iter()
+            .find_map(|&(oid, name, array_oid)| {
+                if oid == type_oid {
+                    Some((name.to_string(), None))
+                } else if array_oid != 0 && array_oid == type_oid {
+                    Some((format!("_{name}"), Some(oid)))
+                } else {
+                    None
+                }
+            })
+    })
+}
+
+/// The name of the built-in type `type_oid`, which is not an array type, as
+/// PostgreSQL's format_type_be prints it in error messages.
+pub(crate) fn format_builtin_type(type_oid: i64) -> String {
+    let name = crate::catalog::pg_type_name(type_oid)
+        .or_else(|| {
+            TYPES_WITHOUT_ROWS
+                .iter()
+                .find(|(oid, _, _)| *oid == type_oid)
+                .map(|(_, name, _)| *name)
+        })
+        .expect("the type is a built-in type");
+    format_type_name(type_oid, name, None).expect("a type without a modifier has a name")
+}
+
+/// FIXME(pg-catalog): pg_type lists only the types that tursopg takes as the
+/// type of a column, so these built-in types have no row, but they are the
+/// types of functions in pg_proc and of values that casts make. This list
+/// copies their oid, typname and typarray from PostgreSQL's pg_type so that
+/// format_type can name them and their arrays. A pg_type catalog with a row
+/// for every built-in type replaces it.
+const TYPES_WITHOUT_ROWS: &[(i64, &str, i64)] = &[
+    (18, "char", 1002),
+    (19, "name", 1003),
+    (1042, "bpchar", 1014),
+    (1083, "time", 1183),
+    (1186, "interval", 1187),
+    (2205, "regclass", 2210),
+    (2206, "regtype", 2211),
+    (2278, "void", 0),
+];
+
+/// The name of type `type_oid` named `name`, which is not an array type, as
+/// `format_type` prints it. `typemod` is None when the call gives no modifier or NULL, and a
+/// negative modifier means none too.
+fn format_type_name(type_oid: i64, name: &str, typemod: Option<i64>) -> Result<String> {
+    let modifier = typemod.filter(|&typemod| typemod >= 0);
+    // The types matched by oid print the SQL standard names that PostgreSQL's
+    // format_type_extended prints. Every other type prints its pg_type name.
+    Ok(match (type_oid, modifier) {
+        (16, _) => "boolean".to_string(),
+        (20, _) => "bigint".to_string(),
+        (21, _) => "smallint".to_string(),
+        (23, _) => "integer".to_string(),
+        (114, _) => "json".to_string(),
+        (700, _) => "real".to_string(),
+        (701, _) => "double precision".to_string(),
+        (1042, Some(typemod)) => format!("character{}", char_typmod(typemod)),
+        // bpchar with modifier -1 has no length, while `character` means
+        // character(1), so PostgreSQL prints the catalog name instead.
+        (1042, None) if typemod.is_none() => "character".to_string(),
+        (1043, Some(typemod)) => format!("character varying{}", char_typmod(typemod)),
+        (1043, None) => "character varying".to_string(),
+        (1083, Some(typemod)) => format!("time({typemod}) without time zone"),
+        (1083, None) => "time without time zone".to_string(),
+        (1114, Some(typemod)) => format!("timestamp({typemod}) without time zone"),
+        (1114, None) => "timestamp without time zone".to_string(),
+        (1184, Some(typemod)) => format!("timestamp({typemod}) with time zone"),
+        (1184, None) => "timestamp with time zone".to_string(),
+        (1186, _) => "interval".to_string(),
+        (1700, Some(typemod)) if typemod >= 4 => {
+            let precision = ((typemod - 4) >> 16) & 0xffff;
+            let scale = (((typemod - 4) & 0x7ff) ^ 1024) - 1024;
+            format!("numeric({precision},{scale})")
         }
-        1043 => {
-            if typemod > 4 {
-                format!("character varying({})", typemod - 4)
-            } else {
-                "character varying".to_string()
-            }
-        }
-        1082 => "date".to_string(),
-        1083 => "time without time zone".to_string(),
-        1114 => "timestamp without time zone".to_string(),
-        1184 => "timestamp with time zone".to_string(),
-        1186 => "interval".to_string(),
-        1700 => {
-            if typemod > 4 {
-                let precision = ((typemod - 4) >> 16) & 0xffff;
-                let scale = (typemod - 4) & 0xffff;
-                format!("numeric({precision},{scale})")
-            } else {
-                "numeric".to_string()
-            }
-        }
-        2205 => "regclass".to_string(),
-        2206 => "regtype".to_string(),
-        2278 => "void".to_string(),
-        2950 => "uuid".to_string(),
-        3802 => "jsonb".to_string(),
-        _ => "unknown".to_string(),
+        (1700, _) => "numeric".to_string(),
+        (_, Some(typemod)) => format!("{}({typemod})", turso_pg_parser::quote_identifier(name)),
+        (_, None) => turso_pg_parser::quote_identifier(name),
+    })
+}
+
+/// The length modifier of `character` and `character varying`, which store
+/// the length plus 4 in `typemod`.
+fn char_typmod(typemod: i64) -> String {
+    if typemod > 4 {
+        format!("({})", typemod - 4)
+    } else {
+        String::new()
     }
 }
 

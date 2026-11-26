@@ -1194,6 +1194,47 @@ expect {
     character varying(50)
 }
 
+test format-type-names-domains-and-enums {
+    CREATE DOMAIN dint AS int;
+    CREATE TYPE mood AS ENUM ('a');
+    SELECT typname, typtype, format_type(oid, NULL), format_type(oid, 3)
+    FROM pg_type WHERE typname IN ('dint', 'mood') ORDER BY typname;
+}
+expect {
+    dint|d|dint|dint(3)
+    mood|e|mood|mood(3)
+}
+
+test format-type-names-array-types-by-element {
+    SELECT typname, format_type(oid, NULL) FROM pg_type
+    WHERE typname IN ('_varchar', '_int4', '_numeric', '_json') ORDER BY typname;
+    SELECT format_type(1015, 14), format_type(1231, 655366), format_type(1014, -1),
+           format_type(1002, NULL), format_type(1183, 3), format_type(2211, NULL);
+}
+expect {
+    _int4|integer[]
+    _json|json[]
+    _numeric|numeric[]
+    _varchar|character varying[]
+    character varying(10)[]|numeric(10,2)[]|bpchar[]|"char"[]|time(3) without time zone[]|regtype[]
+}
+
+test format-type-unknown-and-invalid-oids {
+    SELECT format_type(999999, NULL), format_type(0, NULL), format_type(19, NULL);
+}
+expect {
+    ???|-|name
+}
+
+test format-type-typmods {
+    SELECT format_type(1042, NULL), format_type(1042, -1), format_type(1042, 9),
+           format_type(1114, 3), format_type(1184, 0), format_type(1083, 2),
+           format_type(1700, 4), format_type(1700, 655363), format_type(25, 5);
+}
+expect {
+    character|bpchar|character(5)|timestamp(3) without time zone|timestamp(0) with time zone|time(2) without time zone|numeric(0,0)|numeric(9,-1)|text(5)
+}
+
 test pg-type-is-visible {
     SELECT CASE WHEN pg_type_is_visible(23) THEN 1 ELSE 0 END;
 }

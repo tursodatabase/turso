@@ -649,8 +649,8 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     assert_eq!(
         rows,
         [
-            ("format_type", 1, 2048),
-            ("format_type", 2, 2048),
+            ("format_type", 1, 0),
+            ("format_type", 2, 0),
             ("now", 0, 0),
             ("pg_get_constraintdef", 1, 0),
             ("pg_get_constraintdef", 2, 0),
