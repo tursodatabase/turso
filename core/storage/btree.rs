@@ -1288,6 +1288,9 @@ impl BTreeNodeState {
 }
 
 impl BTreeCursor {
+    pub(crate) fn nan_policy(&self) -> crate::types::NanPolicy {
+        self.pager.nan_policy
+    }
     pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
         Self::new_with_index_info(pager, root_page, num_columns, None)
     }
@@ -1298,6 +1301,12 @@ impl BTreeCursor {
         _num_columns: usize,
         index_info: Option<Arc<IndexInfo>>,
     ) -> Self {
+        if let Some(info) = &index_info {
+            assert_eq!(
+                info.nan_policy, pager.nan_policy,
+                "index metadata must use its database's NaN rule"
+            );
+        }
         let valid_state = if root_page == 1 && !pager.db_initialized() {
             CursorValidState::Invalid
         } else {
@@ -1373,7 +1382,7 @@ impl BTreeCursor {
         table: &BTreeTable,
         num_columns: usize,
     ) -> Self {
-        let index_info = Self::without_rowid_index_info(table);
+        let index_info = Self::without_rowid_index_info(table, pager.nan_policy);
         Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
     }
 
@@ -1385,12 +1394,15 @@ impl BTreeCursor {
         table: &BTreeTable,
         num_columns: usize,
     ) -> Box<Self> {
-        let index_info = Self::without_rowid_index_info(table);
+        let index_info = Self::without_rowid_index_info(table, pager.nan_policy);
         Self::new_boxed_with_index_info(pager, root_page, num_columns, Some(index_info))
     }
 
     /// The key of a WITHOUT ROWID table: its primary key columns.
-    fn without_rowid_index_info(table: &BTreeTable) -> Arc<IndexInfo> {
+    fn without_rowid_index_info(
+        table: &BTreeTable,
+        nan_policy: crate::types::NanPolicy,
+    ) -> Arc<IndexInfo> {
         let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
             let (_, column) = table
                 .get_column(col_name)
@@ -1402,8 +1414,14 @@ impl BTreeCursor {
             }
         });
         Arc::new(
-            IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
-                .expect(crate::alloc::ALLOC_ERR_MSG),
+            IndexInfo::new(
+                key_info,
+                false,
+                table.primary_key_columns.len(),
+                true,
+                nan_policy,
+            )
+            .expect(crate::alloc::ALLOC_ERR_MSG),
         )
     }
 
@@ -1413,7 +1431,7 @@ impl BTreeCursor {
         index: &Index,
         num_columns: usize,
     ) -> Result<Self> {
-        let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+        let index_info = Arc::new(IndexInfo::new_from_index(index, pager.nan_policy)?);
         Ok(Self::new_with_index_info(
             pager,
             root_page,
@@ -1428,7 +1446,7 @@ impl BTreeCursor {
         index: &Index,
         num_columns: usize,
     ) -> Result<Box<Self>> {
-        let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+        let index_info = Arc::new(IndexInfo::new_from_index(index, pager.nan_policy)?);
         Ok(Self::new_boxed_with_index_info(
             pager,
             root_page,
@@ -2278,7 +2296,9 @@ impl BTreeCursor {
         index_key: &ImmutableRecordRef<'_>,
         cmp: SeekOp,
     ) -> IOResultOr<()> {
-        let key_values = index_key.get_values_inline()?;
+        let key_values = index_key
+            .decode(self.pager.nan_policy)
+            .get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -2869,7 +2889,7 @@ impl BTreeCursor {
         key: &ImmutableRecordRef<'_>,
         seek_op: SeekOp,
     ) -> IOResultOr<SeekResult> {
-        let key_values = key.get_values_inline()?;
+        let key_values = key.decode(self.pager.nan_policy).get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -3272,13 +3292,12 @@ impl BTreeCursor {
                             BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
                                 return_if_io!(self.record());
                                 let cmp = compare_immutable_iter(
-                                    record.iter()?,
+                                    record.decode(self.pager.nan_policy).iter()?,
                                     self.get_immutable_record()
                                         .as_ref()
                                         .unwrap()
-                                        .iter()?,
-                                        &self.index_info.as_ref().unwrap().key_info,
-                                )?;
+                                        .decode(self.pager.nan_policy).iter()?,
+                                    &self.index_info.as_ref().unwrap().key_info)?;
                                 if cmp == Ordering::Equal {
                                     tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
                                     self.set_has_record(true);
@@ -7009,10 +7028,11 @@ impl CursorTrait for BTreeCursor {
             if !cursor.has_rowid() {
                 return Ok(IOResult::Done(None));
             }
+            let nan_policy = cursor.nan_policy();
             let Some(payload) = return_if_io!(cursor.record_payload()) else {
                 return Ok(IOResult::Done(None));
             };
-            let rowid = match crate::types::ValueIterator::new(payload)?.last() {
+            let rowid = match crate::types::ValueIterator::new(payload, nan_policy)?.last() {
                 Some(Ok(ValueRef::Numeric(Numeric::Integer(rowid)))) => rowid,
                 _ => unreachable!(
                     "index where has_rowid() is true should have an integer rowid as the last value"
@@ -11600,8 +11620,18 @@ mod tests {
 
         // `allocate_page1` needs the initial page 1 to be present.
         let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
-        let pager =
-            Arc::new(Pager::new(db_file, Some(wal), io, page_cache, buffer_pool, shared).unwrap());
+        let pager = Arc::new(
+            Pager::new(
+                db_file,
+                Some(wal),
+                io,
+                page_cache,
+                buffer_pool,
+                shared,
+                crate::types::NanPolicy::Null,
+            )
+            .unwrap(),
+        );
 
         pager.io.step().unwrap();
         pager
@@ -12252,6 +12282,7 @@ mod tests {
                 };
                 let record = record.as_ref().unwrap();
                 let cur = record
+                    .decode(crate::types::NanPolicy::Null)
                     .get_values()
                     .unwrap()
                     .iter()
@@ -12514,7 +12545,10 @@ mod tests {
                 }
             };
             let record = record.as_ref().unwrap();
-            let cur = record.get_value(0).expect("expected at least one column");
+            let cur = record
+                .decode(crate::types::NanPolicy::Null)
+                .get_value(0)
+                .expect("expected at least one column");
             let ValueRef::Blob(ref cur) = cur else {
                 panic!("expected blob, got {cur:?}");
             };
@@ -12812,6 +12846,7 @@ mod tests {
                         IOResult::Done(record) => {
                             let record = record.unwrap();
                             break record
+                                .decode(crate::types::NanPolicy::Null)
                                 .get_value_opt(0)
                                 .and_then(|v| match v {
                                     crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
@@ -13398,7 +13433,7 @@ mod tests {
                 }
             }
             .unwrap();
-            let value = record.get_value(0)?;
+            let value = record.decode(crate::types::NanPolicy::Null).get_value(0)?;
             assert_eq!(
                 value,
                 ValueRef::Numeric(Numeric::Integer(i)),
@@ -15336,9 +15371,15 @@ mod tests {
                 run_until_done(
                     || {
                         Ok(peer.record()?.map(|record| {
-                            record.map(|record| match record.first_value().unwrap() {
-                                ValueRef::Numeric(Numeric::Integer(k)) => k,
-                                value => panic!("unexpected key {value:?}"),
+                            record.map(|record| {
+                                match record
+                                    .decode(crate::types::NanPolicy::Null)
+                                    .first_value()
+                                    .unwrap()
+                                {
+                                    ValueRef::Numeric(Numeric::Integer(k)) => k,
+                                    value => panic!("unexpected key {value:?}"),
+                                }
                             })
                         }))
                     },

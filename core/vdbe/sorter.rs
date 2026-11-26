@@ -80,8 +80,9 @@ fn normalized_first_key(values: &[ValueRef<'_>], key_info: &[KeyInfo]) -> (u64, 
                 Numeric::Integer(i) => (*i as f64, i.unsigned_abs() < (1u64 << 49)),
                 Numeric::Float(f) => (f64::from(*f), false),
             };
-            let f = if f == 0.0 { 0.0 } else { f }; // collapse -0.0 with +0.0
-            let bits = f.to_bits();
+            // Equality treats all NaNs alike. Their sign and payload must not
+            // change the prefix or bypass a secondary-column comparison.
+            let bits = crate::Double::new(f).canonical_bits();
             let monotone = if bits >> 63 == 1 {
                 !bits
             } else {
@@ -156,7 +157,7 @@ pub struct Sorter {
     /// The number of values in the key.
     key_len: usize,
     /// The key info.
-    pub index_key_info: Rc<Vec<KeyInfo>>,
+    pub index_info: Rc<crate::types::IndexInfo>,
     /// Sorted chunks stored on disk.
     chunks: Vec<SortedChunk>,
     /// The heap of records consumed from the chunks and their corresponding chunk index.
@@ -198,24 +199,29 @@ impl Sorter {
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
         temp_store: crate::TempStore,
+        nan_policy: crate::types::NanPolicy,
     ) -> Result<Self> {
         turso_assert_eq!(order.len(), collations.len());
-        let index_key_info = order
-            .iter()
-            .zip(collations)
-            .zip(nulls_orders)
-            .map(|((order, collation), nulls)| KeyInfo {
-                sort_order: *order,
-                collation,
-                nulls_order: nulls,
-            })
-            .try_collect()?;
+        let index_info =
+            crate::types::IndexInfo::new(
+                order.iter().zip(collations).zip(nulls_orders).map(
+                    |((order, collation), nulls)| KeyInfo {
+                        sort_order: *order,
+                        collation,
+                        nulls_order: nulls,
+                    },
+                ),
+                false,
+                order.len(),
+                false,
+                nan_policy,
+            )?;
         let this = Self {
             arena: Bump::new(),
             records: vec![],
             current: None,
             key_len: order.len(),
-            index_key_info: Rc::new(index_key_info),
+            index_info: Rc::new(index_info),
             chunks: vec![],
             chunk_heap: TursoAllocExt::new(),
             max_buffer_size: max_buffer_size_bytes,
@@ -388,7 +394,7 @@ impl Sorter {
                         &self.arena,
                         record,
                         self.key_len,
-                        &self.index_key_info,
+                        &self.index_info,
                     )?;
                     let record_ref = self.arena.try_alloc(sortable_record)?;
                     // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
@@ -493,7 +499,7 @@ impl Sorter {
                     Reverse(Box::new(BoxedSortableRecord::new(
                         record,
                         self.key_len,
-                        self.index_key_info.clone(),
+                        self.index_info.clone(),
                     )?)),
                     chunk_idx,
                 ))?;
@@ -872,7 +878,7 @@ struct ArenaSortableRecord {
     key_values: NonNull<[ValueRef<'static>]>,
     /// Shared KeyInfo owned by Sorter. Avoids Rc refcount overhead that would
     /// leak when arena.reset() skips Drop.
-    index_key_info: NonNull<[KeyInfo]>,
+    index_info: NonNull<crate::types::IndexInfo>,
     /// Order-preserving prefix of the first key column; see [normalized_first_key].
     norm_key: u64,
     /// True when equal `norm_key`s prove the full keys are equal.
@@ -884,11 +890,12 @@ impl ArenaSortableRecord {
         arena: &Bump,
         record: &ImmutableRecord,
         key_len: usize,
-        index_key_info: &[KeyInfo],
+        index_info: &crate::types::IndexInfo,
     ) -> Result<Self> {
         let payload = arena.try_alloc_slice_copy(record.get_payload())?;
 
-        let mut payload_iter = ValueIterator::new(payload)?;
+        // Use the sorter's rule for both scalar decoding and array comparison.
+        let mut payload_iter = ValueIterator::new(payload, index_info.nan_policy)?;
 
         let mut key_values = bumpalo::collections::Vec::new_in(arena);
         key_values.try_reserve(key_len)?;
@@ -904,11 +911,11 @@ impl ArenaSortableRecord {
         }
 
         let key_values = key_values.into_bump_slice();
-        let (norm_key, norm_decisive) = normalized_first_key(key_values, index_key_info);
+        let (norm_key, norm_decisive) = normalized_first_key(key_values, &index_info.key_info);
         Ok(Self {
             payload: NonNull::from(payload),
             key_values: NonNull::from(key_values),
-            index_key_info: NonNull::from(index_key_info),
+            index_info: NonNull::from(index_info),
             norm_key,
             norm_decisive,
         })
@@ -940,13 +947,13 @@ impl ArenaSortableRecord {
     fn full_cmp(&self, other: &Self) -> Ordering {
         let self_values = self.key_values();
         let other_values = other.key_values();
-        // SAFETY: index_key_info points to Sorter-owned data that outlives all records.
-        let index_key_info = unsafe { self.index_key_info.as_ref() };
+        // SAFETY: index_info points to Sorter-owned data that outlives all records.
+        let index_info = unsafe { self.index_info.as_ref() };
 
         for ((&self_val, &other_val), key_info) in self_values
             .iter()
             .zip(other_values.iter())
-            .zip(index_key_info.iter())
+            .zip(index_info.key_info.iter())
         {
             let cmp = cmp_in_column(&self_val, &other_val, key_info);
             if cmp != Ordering::Equal {
@@ -988,7 +995,7 @@ impl Eq for ArenaSortableRecord {}
 struct BoxedSortableRecord {
     record: ImmutableRecord,
     key_values: Vec<ValueRef<'static>>,
-    index_key_info: Rc<Vec<KeyInfo>>,
+    index_info: Rc<crate::types::IndexInfo>,
     deserialization_error: Option<LimboError>,
     /// Order-preserving prefix of the first key column; see [normalized_first_key].
     norm_key: u64,
@@ -1000,9 +1007,10 @@ impl BoxedSortableRecord {
     fn new(
         record: ImmutableRecord,
         key_len: usize,
-        index_key_info: Rc<Vec<KeyInfo>>,
+        index_info: Rc<crate::types::IndexInfo>,
     ) -> Result<Self> {
-        let mut value_iterator = record.iter()?;
+        // Spill reads use the same context as the in-memory sort.
+        let mut value_iterator = record.decode(index_info.nan_policy).iter()?;
         let mut key_values = Vec::try_with_capacity_ext(key_len)?;
         let mut deserialization_error = None;
 
@@ -1030,11 +1038,11 @@ impl BoxedSortableRecord {
             }
         }
 
-        let (norm_key, norm_decisive) = normalized_first_key(&key_values, &index_key_info);
+        let (norm_key, norm_decisive) = normalized_first_key(&key_values, &index_info.key_info);
         Ok(Self {
             record,
             key_values,
-            index_key_info,
+            index_info,
             deserialization_error,
             norm_key,
             norm_decisive,
@@ -1049,7 +1057,7 @@ impl BoxedSortableRecord {
             .key_values
             .iter()
             .zip(other.key_values.iter())
-            .zip(self.index_key_info.iter())
+            .zip(self.index_info.key_info.iter())
         {
             let cmp = cmp_in_column(&self_val, &other_val, key_info);
             if cmp != Ordering::Equal {
@@ -1122,6 +1130,110 @@ mod tests {
                     .expect("Failed to parse SEED environment variable as u64")
             },
         ) as u64
+    }
+
+    #[test]
+    fn array_sort_uses_its_owner_policy_in_memory_and_on_disk() {
+        use crate::types::NanPolicy;
+        for policy in [NanPolicy::Null, NanPolicy::Preserve] {
+            for budget in [32, 1 << 20] {
+                let io = Arc::new(PlatformIO::new().unwrap());
+                let mut sorter = Sorter::new(
+                    &[SortOrder::Asc, SortOrder::Asc],
+                    try_vec![
+                        CollationSeq::Type(crate::type_ordering::TypeOrdering::array(policy)),
+                        CollationSeq::BINARY
+                    ]
+                    .unwrap(),
+                    try_vec![None, None].unwrap(),
+                    budget,
+                    64,
+                    io.clone(),
+                    crate::TempStore::Default,
+                    policy,
+                )
+                .unwrap();
+                for (id, element) in [
+                    Value::Null,
+                    Value::from_f64(f64::NAN),
+                    Value::from_f64(f64::INFINITY),
+                    Value::from_f64(f64::from_bits(0xfff8_0000_0000_0001)),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let array = Value::Blob(
+                        ImmutableRecord::from_values(&[element], 1)
+                            .unwrap()
+                            .into_payload(),
+                    );
+                    let record =
+                        ImmutableRecord::from_values(&[array, Value::from_i64(id as i64)], 2)
+                            .unwrap();
+                    io.block(|| sorter.insert(&record)).unwrap();
+                }
+                io.block(|| sorter.sort()).unwrap();
+                assert_eq!(sorter.chunks.is_empty(), budget > 32);
+                let mut ids = Vec::new();
+                while sorter.has_more() {
+                    ids.push(
+                        sorter
+                            .record()
+                            .unwrap()
+                            .decode(policy)
+                            .get_values()
+                            .unwrap()[1]
+                            .as_int()
+                            .unwrap(),
+                    );
+                    io.block(|| sorter.next()).unwrap();
+                }
+                assert_eq!(
+                    ids.as_slice(),
+                    if policy == NanPolicy::Null {
+                        &[2, 0, 1, 3]
+                    } else {
+                        &[2, 1, 3, 0]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nan_representations_have_one_sort_prefix() {
+        for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+            let keys = [KeyInfo {
+                sort_order,
+                collation: CollationSeq::BINARY,
+                nulls_order: None,
+            }; 2];
+            let canonical = [ValueRef::from_f64(f64::NAN), ValueRef::from_i64(1)];
+            let expected = normalized_first_key(&canonical, &keys);
+            assert!(!expected.1, "NaNs must fall back to the secondary column");
+            for bits in [
+                0x7ff8_0000_0000_0000u64,
+                0xfff8_0000_0000_0001,
+                0x7ff0_0000_0000_0001,
+                0x7fff_ffff_ffff_ffff,
+            ] {
+                let values = [
+                    ValueRef::from_f64(f64::from_bits(bits)),
+                    ValueRef::from_i64(2),
+                ];
+                assert_eq!(normalized_first_key(&values, &keys), expected);
+            }
+            let infinity = [ValueRef::from_f64(f64::INFINITY), ValueRef::from_i64(1)];
+            let cmp = expected.0.cmp(&normalized_first_key(&infinity, &keys).0);
+            assert_eq!(
+                cmp,
+                if sort_order == SortOrder::Asc {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            );
+        }
     }
 
     #[test]
@@ -1250,6 +1362,7 @@ mod tests {
                 64,
                 io.clone(),
                 crate::TempStore::Default,
+                crate::types::NanPolicy::Preserve,
             )
             .unwrap();
 
@@ -1279,7 +1392,13 @@ mod tests {
             for i in 0..num_records {
                 assert!(sorter.has_more());
                 let record = sorter.record().unwrap();
-                assert_eq!(record.get_values().unwrap()[0], ValueRef::from_i64(i));
+                assert_eq!(
+                    record
+                        .decode(crate::types::NanPolicy::Null)
+                        .get_values()
+                        .unwrap()[0],
+                    ValueRef::from_i64(i)
+                );
                 // Check that the record remained unchanged after sorting.
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 
@@ -1303,6 +1422,7 @@ mod tests {
             min_read_buffer_size,
             io.clone(),
             crate::TempStore::Default,
+            crate::types::NanPolicy::Preserve,
         )
         .unwrap();
 
@@ -1340,7 +1460,13 @@ mod tests {
         for i in 0..n {
             assert!(sorter.has_more());
             let record = sorter.record().unwrap();
-            assert_eq!(record.get_values().unwrap()[0], ValueRef::from_i64(i));
+            assert_eq!(
+                record
+                    .decode(crate::types::NanPolicy::Null)
+                    .get_values()
+                    .unwrap()[0],
+                ValueRef::from_i64(i)
+            );
             io.block(|| sorter.next())
                 .expect("Failed to get the next record");
         }
@@ -1364,6 +1490,7 @@ mod tests {
                 4096,
                 io.clone(),
                 crate::TempStore::File,
+                crate::types::NanPolicy::Preserve,
             )
             .unwrap();
             let payload = try_vec![0; 800_000].unwrap();
@@ -1418,6 +1545,7 @@ mod tests {
             64,
             io.clone(),
             crate::TempStore::File,
+            crate::types::NanPolicy::Preserve,
         )
         .unwrap();
         let values = try_vec![Value::Blob(try_vec![0; 1000].unwrap())].unwrap();
@@ -1510,6 +1638,7 @@ mod tests {
             64,
             io.clone(),
             crate::TempStore::Default,
+            crate::types::NanPolicy::Preserve,
         )
         .unwrap();
 
@@ -1528,7 +1657,10 @@ mod tests {
         while sorter.has_more() {
             {
                 let record = sorter.record().unwrap();
-                let vals = record.get_values().unwrap();
+                let vals = record
+                    .decode(crate::types::NanPolicy::Null)
+                    .get_values()
+                    .unwrap();
                 assert_eq!(vals[0], ValueRef::from_i64(1));
                 assert_eq!(vals[1], expected[idx]);
             }
@@ -1551,6 +1683,7 @@ mod tests {
             64,
             io.clone(),
             crate::TempStore::Default,
+            crate::types::NanPolicy::Preserve,
         )
         .unwrap();
 
@@ -1574,7 +1707,10 @@ mod tests {
         while sorter.has_more() {
             {
                 let record = sorter.record().unwrap();
-                let vals = record.get_values().unwrap();
+                let vals = record
+                    .decode(crate::types::NanPolicy::Null)
+                    .get_values()
+                    .unwrap();
                 assert_eq!(vals[0], ValueRef::from_i64(1));
                 assert_eq!(
                     vals[1],
@@ -1600,6 +1736,7 @@ mod tests {
             64,
             io.clone(),
             crate::TempStore::Default,
+            crate::types::NanPolicy::Preserve,
         )
         .unwrap();
 
@@ -1626,7 +1763,10 @@ mod tests {
         while sorter.has_more() {
             {
                 let record = sorter.record().unwrap();
-                let vals = record.get_values().unwrap();
+                let vals = record
+                    .decode(crate::types::NanPolicy::Null)
+                    .get_values()
+                    .unwrap();
                 assert_eq!(vals[0], ValueRef::from_i64(1));
                 match vals[1] {
                     ValueRef::Null => {

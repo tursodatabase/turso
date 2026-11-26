@@ -9,8 +9,11 @@ use crate::Result;
 /// Extract values from a record-format array blob.
 /// Returns Err if the blob is not a valid record.
 /// Uses zero-copy iteration over the blob bytes — no Vec<u8> allocation.
-pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
-    let iter = ValueIterator::new(blob)?;
+pub(crate) fn array_values_from_blob(
+    nan_policy: crate::types::NanPolicy,
+    blob: &[u8],
+) -> Result<Vec<Value>> {
+    let iter = ValueIterator::new(blob, nan_policy)?;
     let mut values = Vec::with_capacity(iter.size_hint().0);
     for value in iter {
         values.push(value?.to_owned()?);
@@ -21,9 +24,12 @@ pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
 /// Extract elements from any Value that represents an array.
 /// Handles record blobs, JSON text input, and NULL (empty array).
 /// Returns None if the value cannot be interpreted as an array.
-pub fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
+pub fn array_values_from_any(
+    nan_policy: crate::types::NanPolicy,
+    arr: &Value,
+) -> Option<Vec<Value>> {
     match arr {
-        Value::Blob(blob) => array_values_from_blob(blob).ok(),
+        Value::Blob(blob) => array_values_from_blob(nan_policy, blob).ok(),
         Value::Text(text) => parse_text_array(text.as_str()),
         Value::Null => Some(Vec::new()),
         _ => None,
@@ -178,7 +184,7 @@ pub(crate) fn values_to_record_blob(values: &[Value]) -> Result<Value> {
 /// - Numeric elements → unquoted
 /// - Blob elements → as `dialect` writes them
 pub(crate) fn serialize_array_from_blob(blob: &[u8], dialect: &dyn Dialect) -> Result<String> {
-    let iter = ValueIterator::new(blob)?;
+    let iter = ValueIterator::new(blob, crate::types::NanPolicy::for_dialect(dialect))?;
     let mut result = String::from("{");
     let mut first = true;
     for vref in iter {
@@ -271,7 +277,7 @@ fn write_pg_text_element(result: &mut String, s: &str) {
 pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     match val {
         Value::Null => None,
-        Value::Blob(b) => match ValueIterator::new(b) {
+        Value::Blob(b) => match ValueIterator::new(b, crate::types::NanPolicy::Preserve) {
             Ok(iter) => Some(iter.count() as i64),
             Err(_) => None,
         },
@@ -291,7 +297,11 @@ pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
 /// `array_length(arr, dim)` contract — except Turso doesn't track per-
 /// dimension lower bounds, so `array_upper(arr, dim)` equals this function
 /// for all valid `dim`.
-pub(crate) fn compute_array_length_at_dim(val: &Value, dim: i64) -> Option<i64> {
+pub(crate) fn compute_array_length_at_dim(
+    nan_policy: crate::types::NanPolicy,
+    val: &Value,
+    dim: i64,
+) -> Option<i64> {
     if dim < 1 {
         return None;
     }
@@ -301,20 +311,28 @@ pub(crate) fn compute_array_length_at_dim(val: &Value, dim: i64) -> Option<i64> 
     // dim > 1: peek into element zero and recurse. Uniform-shape arrays let
     // us answer "length at depth N" by looking at any element at depth 1;
     // element zero is the cheapest to extract.
-    let first = array_values_from_any(val)?.into_iter().next()?;
-    compute_array_length_at_dim(&first, dim - 1)
+    let first = array_values_from_any(nan_policy, val)?.into_iter().next()?;
+    compute_array_length_at_dim(nan_policy, &first, dim - 1)
 }
 
-pub(crate) fn exec_array_append(arr: &Value, elem: &Value) -> Result<Value> {
-    let Some(mut elements) = array_values_from_any(arr) else {
+pub(crate) fn exec_array_append(
+    nan_policy: crate::types::NanPolicy,
+    arr: &Value,
+    elem: &Value,
+) -> Result<Value> {
+    let Some(mut elements) = array_values_from_any(nan_policy, arr) else {
         return Ok(Value::Null);
     };
     elements.push(elem.clone());
     values_to_record_blob(&elements)
 }
 
-pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Result<Value> {
-    let Some(elements) = array_values_from_any(arr) else {
+pub(crate) fn exec_array_prepend(
+    nan_policy: crate::types::NanPolicy,
+    arr: &Value,
+    elem: &Value,
+) -> Result<Value> {
+    let Some(elements) = array_values_from_any(nan_policy, arr) else {
         return Ok(Value::Null);
     };
     // Build new vec with elem first — avoids O(n) shift from Vec::insert(0, ...)
@@ -324,57 +342,73 @@ pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Result<Value> {
     values_to_record_blob(&result)
 }
 
-pub(crate) fn exec_array_cat(a: &Value, b: &Value) -> Result<Value> {
+pub(crate) fn exec_array_cat(
+    nan_policy: crate::types::NanPolicy,
+    a: &Value,
+    b: &Value,
+) -> Result<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(mut elems_a) = array_values_from_any(a) else {
+    let Some(mut elems_a) = array_values_from_any(nan_policy, a) else {
         return Ok(Value::Null);
     };
-    let Some(elems_b) = array_values_from_any(b) else {
+    let Some(elems_b) = array_values_from_any(nan_policy, b) else {
         return Ok(Value::Null);
     };
     elems_a.extend(elems_b);
     values_to_record_blob(&elems_a)
 }
 
-pub(crate) fn exec_array_remove(arr: &Value, target: &Value) -> Result<Value> {
+pub(crate) fn exec_array_remove(
+    nan_policy: crate::types::NanPolicy,
+    arr: &Value,
+    target: &Value,
+) -> Result<Value> {
     if matches!(arr, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(elements) = array_values_from_any(nan_policy, arr) else {
         return Ok(Value::Null);
     };
     let result: Vec<Value> = elements.into_iter().filter(|e| e != target).collect();
     values_to_record_blob(&result)
 }
 
-pub(crate) fn exec_array_contains(arr: &Value, target: &Value) -> Value {
+pub(crate) fn exec_array_contains(
+    nan_policy: crate::types::NanPolicy,
+    arr: &Value,
+    target: &Value,
+) -> Value {
     if matches!(arr, Value::Null) {
         return Value::Null;
     }
     if let Value::Blob(blob) = arr {
-        return array_find_streaming(blob, |vref| vref == *target)
+        return array_find_streaming(nan_policy, blob, |vref| vref == *target)
             .map(|_| Value::from_i64(1))
             .unwrap_or_else(|| Value::from_i64(0));
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(elements) = array_values_from_any(nan_policy, arr) else {
         return Value::Null;
     };
     let found = elements.iter().any(|e| e == target);
     Value::from_i64(found as i64)
 }
 
-pub(crate) fn exec_array_position(arr: &Value, target: &Value) -> Value {
+pub(crate) fn exec_array_position(
+    nan_policy: crate::types::NanPolicy,
+    arr: &Value,
+    target: &Value,
+) -> Value {
     if matches!(arr, Value::Null) {
         return Value::Null;
     }
     if let Value::Blob(blob) = arr {
-        return array_find_streaming(blob, |vref| vref == *target)
+        return array_find_streaming(nan_policy, blob, |vref| vref == *target)
             .map(|i| Value::from_i64(i as i64 + 1)) // 1-based (PG convention)
             .unwrap_or(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(elements) = array_values_from_any(nan_policy, arr) else {
         return Value::Null;
     };
     for (i, elem) in elements.iter().enumerate() {
@@ -389,10 +423,11 @@ pub(crate) fn exec_array_position(arr: &Value, target: &Value) -> Value {
 /// Returns Some(index) for the first element where the predicate returns true,
 /// or None if no match or on error.
 fn array_find_streaming(
+    nan_policy: crate::types::NanPolicy,
     blob: &[u8],
     predicate: impl Fn(crate::ValueRef<'_>) -> bool,
 ) -> Option<usize> {
-    let iter = ValueIterator::new(blob).ok()?;
+    let iter = ValueIterator::new(blob, nan_policy).ok()?;
     for (i, vref) in iter.enumerate() {
         let vref = vref.ok()?;
         if predicate(vref) {
@@ -402,11 +437,16 @@ fn array_find_streaming(
     None
 }
 
-pub(crate) fn exec_array_slice(arr: &Value, start: &Value, end: &Value) -> Result<Value> {
+pub(crate) fn exec_array_slice(
+    nan_policy: crate::types::NanPolicy,
+    arr: &Value,
+    start: &Value,
+    end: &Value,
+) -> Result<Value> {
     if matches!(arr, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(elements) = array_values_from_any(nan_policy, arr) else {
         return Ok(Value::Null);
     };
     // PG convention: 1-based inclusive bounds
@@ -493,6 +533,7 @@ pub(crate) fn exec_string_to_array(
 /// array_to_string(array, delimiter [, null_string])
 /// NULL elements are omitted unless null_string is provided.
 pub(crate) fn exec_array_to_string(
+    nan_policy: crate::types::NanPolicy,
     arr: &Value,
     delimiter: &Value,
     null_str: Option<&Value>,
@@ -515,7 +556,7 @@ pub(crate) fn exec_array_to_string(
 
     // Fast path: stream from blob without materializing Vec<Value>
     if let Value::Blob(blob) = arr {
-        if let Ok(iter) = ValueIterator::new(blob) {
+        if let Ok(iter) = ValueIterator::new(blob, nan_policy) {
             let mut result = String::new();
             let mut first = true;
             for vref in iter {
@@ -543,7 +584,7 @@ pub(crate) fn exec_array_to_string(
         }
     }
 
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(elements) = array_values_from_any(nan_policy, arr) else {
         return Value::Null;
     };
 
@@ -574,14 +615,18 @@ pub(crate) fn exec_array_to_string(
 /// Check if two arrays have any elements in common.
 /// Returns 1 if they share at least one element, 0 otherwise.
 /// NULL if either input is not a valid array.
-pub(crate) fn exec_array_overlap(a: &Value, b: &Value) -> Value {
+pub(crate) fn exec_array_overlap(
+    nan_policy: crate::types::NanPolicy,
+    a: &Value,
+    b: &Value,
+) -> Value {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Value::Null;
     }
-    let Some(elems_a) = array_values_from_any(a) else {
+    let Some(elems_a) = array_values_from_any(nan_policy, a) else {
         return Value::Null;
     };
-    let Some(elems_b) = array_values_from_any(b) else {
+    let Some(elems_b) = array_values_from_any(nan_policy, b) else {
         return Value::Null;
     };
     // O(n log n + m log n) via BTreeSet instead of O(n*m)
@@ -593,8 +638,12 @@ pub(crate) fn exec_array_overlap(a: &Value, b: &Value) -> Value {
 /// Check if array `a` contains all elements of array `b` (@> operator).
 /// Returns 1 if every element in `b` appears in `a`, 0 otherwise.
 /// NULL if either input is not a valid array.
-pub(crate) fn exec_array_contains_all(a: &Value, b: &Value) -> Value {
-    match array_contains_all(a, b) {
+pub(crate) fn exec_array_contains_all(
+    nan_policy: crate::types::NanPolicy,
+    a: &Value,
+    b: &Value,
+) -> Value {
+    match array_contains_all(nan_policy, a, b) {
         Some(all_found) => Value::from_i64(all_found as i64),
         None => Value::Null,
     }
@@ -602,12 +651,16 @@ pub(crate) fn exec_array_contains_all(a: &Value, b: &Value) -> Value {
 
 /// Whether array `a` contains every element of array `b`, as `a @> b` compares
 /// two arrays. None when either value is NULL or not an array.
-pub fn array_contains_all(a: &Value, b: &Value) -> Option<bool> {
+pub fn array_contains_all(
+    nan_policy: crate::types::NanPolicy,
+    a: &Value,
+    b: &Value,
+) -> Option<bool> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return None;
     }
-    let elems_a = array_values_from_any(a)?;
-    let elems_b = array_values_from_any(b)?;
+    let elems_a = array_values_from_any(nan_policy, a)?;
+    let elems_b = array_values_from_any(nan_policy, b)?;
     // O(n log n + m log n) via BTreeSet instead of O(n*m)
     let set: BTreeSet<&Value> = elems_a.iter().collect();
     Some(elems_b.iter().all(|eb| set.contains(eb)))
@@ -681,11 +734,12 @@ mod tests {
             Value::from_i64(1),
         ])
         .unwrap();
-        let result = exec_array_remove(&arr, &Value::from_i64(2)).unwrap();
+        let result =
+            exec_array_remove(crate::types::NanPolicy::Null, &arr, &Value::from_i64(2)).unwrap();
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = array_values_from_blob(crate::types::NanPolicy::Null, blob).unwrap();
         assert_eq!(elements.len(), 3);
         assert_eq!(elements[0], Value::from_i64(1));
         assert_eq!(elements[1], Value::from_i64(3));
@@ -695,7 +749,11 @@ mod tests {
     #[test]
     fn test_array_contains_null_array_returns_null() {
         assert_eq!(
-            exec_array_contains(&Value::Null, &Value::from_i64(1)),
+            exec_array_contains(
+                crate::types::NanPolicy::Null,
+                &Value::Null,
+                &Value::from_i64(1)
+            ),
             Value::Null,
         );
     }
@@ -703,7 +761,11 @@ mod tests {
     #[test]
     fn test_array_position_null_array_returns_null() {
         assert_eq!(
-            exec_array_position(&Value::Null, &Value::from_i64(1)),
+            exec_array_position(
+                crate::types::NanPolicy::Null,
+                &Value::Null,
+                &Value::from_i64(1)
+            ),
             Value::Null,
         );
     }
@@ -740,7 +802,7 @@ mod tests {
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob, got {result:?}");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = array_values_from_blob(crate::types::NanPolicy::Null, blob).unwrap();
         assert_eq!(elements.len(), 5);
         assert_eq!(elements[0], Value::build_text("h"));
         assert_eq!(elements[1], Value::build_text("e"));
@@ -756,11 +818,11 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            exec_array_contains(&arr, &Value::from_i64(20)),
+            exec_array_contains(crate::types::NanPolicy::Null, &arr, &Value::from_i64(20)),
             Value::from_i64(1)
         );
         assert_eq!(
-            exec_array_contains(&arr, &Value::from_i64(99)),
+            exec_array_contains(crate::types::NanPolicy::Null, &arr, &Value::from_i64(99)),
             Value::from_i64(0)
         );
     }
@@ -775,10 +837,13 @@ mod tests {
         .unwrap();
         // 1-based: element 20 is at position 2
         assert_eq!(
-            exec_array_position(&arr, &Value::from_i64(20)),
+            exec_array_position(crate::types::NanPolicy::Null, &arr, &Value::from_i64(20)),
             Value::from_i64(2)
         );
-        assert_eq!(exec_array_position(&arr, &Value::from_i64(99)), Value::Null);
+        assert_eq!(
+            exec_array_position(crate::types::NanPolicy::Null, &arr, &Value::from_i64(99)),
+            Value::Null
+        );
     }
 
     #[test]
@@ -793,13 +858,18 @@ mod tests {
         let Value::Blob(blob) = &arr else {
             panic!("Expected Blob");
         };
-        assert!(array_find_streaming(blob, |_| false).is_none());
+        assert!(array_find_streaming(crate::types::NanPolicy::Null, blob, |_| false).is_none());
     }
 
     #[test]
     fn test_dc4_array_remove_null_returns_null() {
         assert_eq!(
-            exec_array_remove(&Value::Null, &Value::from_i64(1)).unwrap(),
+            exec_array_remove(
+                crate::types::NanPolicy::Null,
+                &Value::Null,
+                &Value::from_i64(1)
+            )
+            .unwrap(),
             Value::Null
         );
     }
@@ -807,7 +877,13 @@ mod tests {
     #[test]
     fn test_dc4_array_slice_null_returns_null() {
         assert_eq!(
-            exec_array_slice(&Value::Null, &Value::from_i64(0), &Value::from_i64(2)).unwrap(),
+            exec_array_slice(
+                crate::types::NanPolicy::Null,
+                &Value::Null,
+                &Value::from_i64(0),
+                &Value::from_i64(2)
+            )
+            .unwrap(),
             Value::Null,
         );
     }
@@ -815,11 +891,16 @@ mod tests {
     #[test]
     fn test_dc4_array_cat_null_returns_null() {
         assert_eq!(
-            exec_array_cat(&Value::Null, &Value::Null).unwrap(),
+            exec_array_cat(crate::types::NanPolicy::Null, &Value::Null, &Value::Null).unwrap(),
             Value::Null
         );
         assert_eq!(
-            exec_array_cat(&Value::Null, &Value::from_i64(1)).unwrap(),
+            exec_array_cat(
+                crate::types::NanPolicy::Null,
+                &Value::Null,
+                &Value::from_i64(1)
+            )
+            .unwrap(),
             Value::Null,
         );
     }
@@ -854,7 +935,7 @@ mod tests {
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = array_values_from_blob(crate::types::NanPolicy::Null, blob).unwrap();
         assert_eq!(elements.len(), 3);
         assert_eq!(elements[0], Value::from_i64(1));
         assert_eq!(elements[1], Value::build_text("two"));

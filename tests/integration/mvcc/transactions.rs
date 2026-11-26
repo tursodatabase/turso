@@ -869,7 +869,11 @@ fn test_restart() {
             .unwrap()
             .unwrap();
         let record = get_record_value(&row);
-        match record.get_value(0).unwrap() {
+        match record
+            .decode(turso_core::types::NanPolicy::Null)
+            .get_value(0)
+            .unwrap()
+        {
             ValueRef::Text(text) => {
                 assert_eq!(text.as_str(), "bar");
             }

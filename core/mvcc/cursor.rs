@@ -181,11 +181,13 @@ fn current_pos_is_only_row_of_seek_key(
             *current == *target
         }
         (RowKey::Record(current), SeekKey::IndexKey(target), MvccCursorType::Index(index_info)) => {
-            let target_values = target.get_values_inline()?;
+            let target_values = target
+                .decode(current.metadata.nan_policy)
+                .get_values_inline()?;
             index_key_matches_at_most_one_row(&target_values, index_info)
                 && compare_immutable(
                     target_values.iter(),
-                    current.key.get_values_inline()?.iter(),
+                    current.decoded().get_values_inline()?.iter(),
                     &index_info.key_info[..target.column_count()],
                 )
                 .is_eq()
@@ -604,6 +606,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     snapshot: MvccReadSnapshot,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
+    nan_policy: crate::types::NanPolicy,
     /// Eq-only table seek copies the occupying payload under the version lock.
     /// Passive GC can empty the live chain before Column.
     eq_seek_row: Option<Row>,
@@ -655,6 +658,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             (&*btree_cursor as &dyn Any).is::<BTreeCursor>(),
             "BTreeCursor expected for mvcc cursor"
         );
+        if let MvccCursorType::Index(info) = &mv_cursor_type {
+            assert_eq!(
+                info.nan_policy,
+                connection.nan_policy(),
+                "index metadata must use its database's NaN rule"
+            );
+        }
         // Resolve the root page against this reader's snapshot: a PASSIVE checkpoint may have
         // dropped (and possibly reused) the page during collection while we still reference it at an
         // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
@@ -686,6 +696,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             current_pos: CursorPosition::BeforeFirst,
             table_id,
             reusable_immutable_record: None,
+            nan_policy: connection.nan_policy(),
             eq_seek_row: None,
             btree_readable: false,
             btree_cursor,
@@ -1720,7 +1731,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         panic!("RowKey::Record requires Index cursor type");
                     };
                     if index_info.has_rowid {
-                        match sortable_key.key.last_value() {
+                        match sortable_key.decoded().last_value() {
                             Some(Ok(crate::types::ValueRef::Numeric(
                                 crate::numeric::Numeric::Integer(rowid),
                             ))) => Some(rowid),
@@ -1885,6 +1896,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                         index_info.has_rowid,
                                         num_cols,
                                         index_info.is_unique,
+                                        index_info.nan_policy,
                                         self.db.allocator(),
                                     )?)
                                 }
@@ -1966,8 +1978,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     let key_len =
                                         index_key.column_count().min(index_info.key_info.len());
                                     let cmp = compare_immutable(
-                                        index_key.get_values_inline()?.iter(),
-                                        found_key.key.get_values_inline()?.iter(),
+                                        index_key
+                                            .decode(self.nan_policy)
+                                            .get_values_inline()?
+                                            .iter(),
+                                        found_key.decoded().get_values_inline()?.iter(),
                                         &index_info.key_info[..key_len],
                                     );
                                     cmp.is_eq()

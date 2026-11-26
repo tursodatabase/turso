@@ -2588,6 +2588,7 @@ fn tamper_db_metadata_row_value(db_path: &str, metadata_root_page: u32, new_valu
     let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
     let record = ImmutableRecordRef::from_bin_record(payload);
     let key = record
+        .decode(turso_core::types::NanPolicy::Null)
         .get_value_opt(0)
         .expect("metadata key column missing");
     let ValueRef::Text(key) = key else {
@@ -2626,6 +2627,7 @@ fn tamper_db_metadata_row_key(db_path: &str, metadata_root_page: u32, new_key: &
     let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
     let record = ImmutableRecordRef::from_bin_record(payload);
     let value = record
+        .decode(turso_core::types::NanPolicy::Null)
         .get_value_opt(1)
         .expect("metadata value column missing");
     let ValueRef::Numeric(Numeric::Integer(value)) = value else {
@@ -9646,6 +9648,7 @@ fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
     });
     let delete_pk_record = delete_pk_record.expect("expected data DELETE op");
     let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .decode(turso_core::types::NanPolicy::Null)
         .get_values_owned()
         .unwrap();
     assert_eq!(
@@ -9681,6 +9684,7 @@ fn test_mvcc_portable_changes_delete_of_checkpointed_row_carries_pk_projection()
         })
         .expect("expected data DELETE op");
     let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .decode(turso_core::types::NanPolicy::Null)
         .get_values_owned()
         .unwrap();
     assert_eq!(
@@ -13136,6 +13140,7 @@ fn tamper_db_metadata_row_value_by_key(
         let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
         let record = ImmutableRecordRef::from_bin_record(payload);
         let key = record
+            .decode(turso_core::types::NanPolicy::Null)
             .get_value_opt(0)
             .expect("metadata key column missing");
         let ValueRef::Text(key) = key else {
@@ -13564,7 +13569,11 @@ fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
             .unwrap()
             .unwrap();
         let record = get_record_value(&row);
-        match record.get_value(0).unwrap() {
+        match record
+            .decode(turso_core::types::NanPolicy::Null)
+            .get_value(0)
+            .unwrap()
+        {
             ValueRef::Text(text) => assert_eq!(text.as_str(), "encrypted_value"),
             other => panic!("Expected Text, got {other:?}"),
         }

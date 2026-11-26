@@ -1339,8 +1339,11 @@ fn text_array_elements(func: &str, value: &Value) -> Result<Option<Vec<Option<St
                 )
             })?
         }
-        Value::Blob(_) => turso_core::array_values_from_any(value)
-            .ok_or_else(|| undefined_function(func, &["jsonb", "bytea"]))?,
+        Value::Blob(_) => turso_core::array_values_from_any(
+            turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+            value,
+        )
+        .ok_or_else(|| undefined_function(func, &["jsonb", "bytea"]))?,
         Value::Numeric(_) => return Err(undefined_function(func, &["jsonb", pg_type_name(value)])),
     };
     elements
@@ -1497,14 +1500,20 @@ fn exec_jsonb_contains(json: &Value, template: &Value) -> Result<Option<bool>> {
                 Ok((json, template)) => Ok(Some(json_document_contains(&json, &template))),
                 // `{a}` is an array, not JSON. A JSON object such as `{"a":1}`
                 // is not an array, so a jsonb value keeps the JSON error.
-                Err(error) => turso_core::array_contains_all(json, template)
-                    .map(Some)
-                    .ok_or(error),
+                Err(error) => turso_core::array_contains_all(
+                    turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+                    json,
+                    template,
+                )
+                .map(Some)
+                .ok_or(error),
             }
         }
-        _ if holds_array(json) || holds_array(template) => {
-            Ok(turso_core::array_contains_all(json, template))
-        }
+        _ if holds_array(json) || holds_array(template) => Ok(turso_core::array_contains_all(
+            turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+            json,
+            template,
+        )),
         // A number or a bytea has no @> for jsonb in PostgreSQL.
         _ => Err(undefined_operator(
             pg_type_name(json),
@@ -1517,7 +1526,12 @@ fn exec_jsonb_contains(json: &Value, template: &Value) -> Result<Option<bool>> {
 /// Whether `value` is a blob that holds an array. An array is stored as a
 /// blob, and a bytea is a blob too.
 fn holds_array(value: &Value) -> bool {
-    matches!(value, Value::Blob(_)) && turso_core::array_values_from_any(value).is_some()
+    matches!(value, Value::Blob(_))
+        && turso_core::array_values_from_any(
+            turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+            value,
+        )
+        .is_some()
 }
 
 /// A JSON value as jsonb compares it. A number is its exact decimal value, so
@@ -1803,8 +1817,11 @@ fn write_json_array_level(
     level: usize,
     json: &mut String,
 ) -> Result<()> {
-    let elements = turso_core::array_values_from_any(array)
-        .ok_or_else(|| undefined_function("array_to_json", &[pg_type_name(array)]))?;
+    let elements = turso_core::array_values_from_any(
+        turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+        array,
+    )
+    .ok_or_else(|| undefined_function("array_to_json", &[pg_type_name(array)]))?;
     json.push('[');
     for (i, element) in elements.iter().enumerate() {
         if i > 0 {

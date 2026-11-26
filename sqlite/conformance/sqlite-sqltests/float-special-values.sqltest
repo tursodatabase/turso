@@ -84,3 +84,95 @@ test float-arithmetic-that-gives-nan-gives-null {
 expect {
     1|1|1
 }
+
+
+test nan-results-are-null-before-another-function-or-predicate {
+    SELECT coalesce(sin(1e999), 7), typeof(sqrt(-1)),
+           cos(1e999) IS NULL, (1e999 / 1e999) IS NULL,
+           (1e999 + -1e999) IS NULL, (1e999 % 2) IS NULL;
+}
+expect {
+    7|null|1|1|1|0
+}
+
+test nan-results-are-null-before-record-and-index-insertion {
+    CREATE TABLE t(x);
+    CREATE INDEX t_x ON t(x);
+    INSERT INTO t VALUES (sin(1e999)), (1e999 - 1e999), (sqrt(-1));
+    SELECT count(*) FROM t INDEXED BY t_x WHERE x IS NULL;
+    SELECT count(*) FROM (SELECT DISTINCT x FROM t);
+    PRAGMA integrity_check;
+    DELETE FROM t WHERE x IS NULL;
+    SELECT count(*) FROM t;
+}
+expect {
+    3
+    1
+    ok
+    0
+}
+
+
+test nan-results-are-null-before-formatting {
+    SELECT printf('%f', sin(1e999)), printf('%e', sin(1e999)), printf('%g', sin(1e999));
+}
+expect {
+    0.000000|0.000000e+00|0
+}
+
+# A record-format array blob can contain NaN without passing through a scalar
+# SQL register. Decode it as NULL before array functions inspect its elements.
+@skip-if sqlite "SQLite does not support Turso array functions or array syntax"
+@requires custom_types "array functions require custom types support"
+test nan-array-blob-functions {
+    SELECT array_to_string(x'02077ff8000000000000', ',', 'null'),
+           array_contains(x'02077ff8000000000000', NULL),
+           array_position(x'02077ff8000000000000', NULL),
+           array_contains(x'0207fff8000000000001', NULL),
+           array_contains(x'02077ff0000000000001', NULL);
+}
+expect {
+    null|1|1|1|1
+}
+
+@skip-if sqlite "SQLite does not support Turso array functions or array syntax"
+@requires custom_types "array functions require custom types support"
+test nan-array-blob-transformations {
+    SELECT array_to_string(array_append(x'02077ff8000000000000', 2), ',', 'null'),
+           array_length(array_remove(x'02077ff8000000000000', NULL)),
+           array_overlap(x'02077ff8000000000000', ARRAY[NULL]),
+           array_contains_all(x'02077ff8000000000000', ARRAY[NULL]),
+           ARRAY[NULL] = x'02077ff8000000000000';
+}
+expect {
+    null,2|0|1|1|1
+}
+
+@skip-if sqlite "SQLite does not support Turso arrays"
+@requires custom_types "array functions require custom types support"
+test nan-array-ordering-in-expressions-and-indexes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY[]) STRICT;
+    INSERT INTO t VALUES (1, ARRAY[1]), (2, x'02077ff8000000000000'),
+                         (3, ARRAY[NULL]), (4, x'0207fff8000000000001');
+    SELECT count(DISTINCT a) FROM t;
+    SELECT id FROM t ORDER BY a, id;
+    CREATE INDEX t_a ON t(a);
+    SELECT id FROM t WHERE a = ARRAY[NULL] ORDER BY id;
+    SELECT count(DISTINCT a) FROM t;
+    SELECT id FROM t ORDER BY a, id;
+}
+expect {
+    2
+    1
+    2
+    3
+    4
+    2
+    3
+    4
+    2
+    1
+    2
+    3
+    4
+}

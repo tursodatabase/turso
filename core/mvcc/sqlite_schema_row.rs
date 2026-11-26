@@ -30,7 +30,7 @@ impl<'a> SqliteSchemaRow<'a> {
                 "sqlite_schema row must have at least {SQLITE_SCHEMA_COLUMN_COUNT} columns, got {column_count}",
             )));
         }
-        let mut columns = ValueIterator::new(record)?;
+        let mut columns = ValueIterator::new(record, crate::types::NanPolicy::Null)?;
         let mut next_column = || {
             columns.next().unwrap_or_else(|| {
                 Err(LimboError::Corrupt(

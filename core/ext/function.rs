@@ -165,7 +165,7 @@ impl ExtFunc {
 
     pub(crate) fn step_aggregate(
         &self,
-        registers: &mut [Register],
+        registers: &mut crate::vdbe::registers::Registers,
         acc_reg: usize,
         start_reg: usize,
     ) -> IOResultOr<()> {
@@ -175,10 +175,14 @@ impl ExtFunc {
                     .iter()
                     .map(|arg| arg.get_value().try_clone())
                     .collect::<Result<Vec<_>, _>>()?;
-                crate::native_ext::step_aggregate(&mut registers[acc_reg], function.as_ref(), &args)
+                crate::native_ext::step_aggregate(
+                    &mut registers.write(acc_reg),
+                    function.as_ref(),
+                    &args,
+                )
             }
             Self::Aggregate { .. } => {
-                let aggregate = self.c_aggregate(&mut registers[acc_reg]).clone();
+                let aggregate = self.c_aggregate(&mut registers.write(acc_reg)).clone();
                 let args: Vec<_> = registers[start_reg..start_reg + aggregate.argc]
                     .iter()
                     .map(|arg| arg.get_value().to_ffi())
@@ -200,7 +204,7 @@ impl ExtFunc {
                     if let Some(destructor) = aggregate.aggregate_destructor {
                         unsafe { destructor(aggregate.state as usize) };
                     }
-                    registers[acc_reg].set_null();
+                    registers.set_null(acc_reg);
                     return Err(err.into());
                 }
                 Ok(IOResult::Done(()))

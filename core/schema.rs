@@ -1259,6 +1259,8 @@ pub enum SchemaObjectType {
 /// has, and the namespaces stored in it, each with its own objects.
 #[derive(Debug)]
 pub struct Schema {
+    /// Array orderings selected by the database dialect, shared by columns and expressions.
+    array_orderings: [TypeOrdering; 2],
     namespaces: HashMap<NamespaceId, NamespaceSchema>,
     #[cfg(feature = "conn_raw_api")]
     pub(crate) table_names_by_root_page: HashMap<i64, String>,
@@ -1404,6 +1406,10 @@ impl SchemaBuilder {
         namespaces.insert(NamespaceId::ROOT, root);
         Ok(Self {
             schema: Schema {
+                array_orderings: [
+                    TypeOrdering::array(crate::types::NanPolicy::Null),
+                    TypeOrdering::text_array(crate::types::NanPolicy::Null),
+                ],
                 namespaces,
                 #[cfg(feature = "conn_raw_api")]
                 table_names_by_root_page,
@@ -1419,6 +1425,15 @@ impl SchemaBuilder {
                 dialect_schema: None,
             },
         })
+    }
+
+    /// Select how array orderings interpret encoded elements.
+    pub(crate) fn array_orderings(mut self, policy: crate::types::NanPolicy) -> Self {
+        self.schema.array_orderings = [
+            TypeOrdering::array(policy),
+            TypeOrdering::text_array(policy),
+        ];
+        self
     }
 
     /// Whether the schema loads the types made by CREATE TYPE.
@@ -1536,6 +1551,10 @@ impl RangeOffsets {
 }
 
 impl Schema {
+    pub(crate) fn array_ordering(&self, text_elements: bool) -> TypeOrdering {
+        self.array_orderings[usize::from(text_elements)]
+    }
+
     fn normalize_table_lookup_name(&self, name: &str) -> String {
         let name = normalize_ident(name);
         if name.eq(SCHEMA_TABLE_NAME_ALT)
@@ -3483,24 +3502,27 @@ impl Schema {
 
                     // Process the row (no IO - CPU only)
                     // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
-                    let ty_value = row.get_value(0)?;
+                    let ty_value = row.decode(crate::types::NanPolicy::Null).get_value(0)?;
                     let ValueRef::Text(ty) = ty_value else {
                         return Err(
                             LimboError::ConversionError("Expected text value".into()).into()
                         );
                     };
-                    let ValueRef::Text(name) = row.get_value(1)? else {
+                    let ValueRef::Text(name) =
+                        row.decode(crate::types::NanPolicy::Null).get_value(1)?
+                    else {
                         return Err(
                             LimboError::ConversionError("Expected text value".into()).into()
                         );
                     };
-                    let table_name_value = row.get_value(2)?;
+                    let table_name_value =
+                        row.decode(crate::types::NanPolicy::Null).get_value(2)?;
                     let ValueRef::Text(table_name) = table_name_value else {
                         return Err(
                             LimboError::ConversionError("Expected text value".into()).into()
                         );
                     };
-                    let root_page_value = row.get_value(3)?;
+                    let root_page_value = row.decode(crate::types::NanPolicy::Null).get_value(3)?;
                     let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
                         root_page_value
                     else {
@@ -3508,7 +3530,7 @@ impl Schema {
                             LimboError::ConversionError("Expected integer value".into()).into()
                         );
                     };
-                    let sql_value = row.get_value(4)?;
+                    let sql_value = row.decode(crate::types::NanPolicy::Null).get_value(4)?;
                     let sql_textref = match sql_value {
                         ValueRef::Text(sql) => Some(sql),
                         _ => None,
@@ -3704,7 +3726,10 @@ impl Schema {
     /// The CREATE TYPE statement stored in a row of the types table,
     /// which is (name TEXT PRIMARY KEY, sql TEXT).
     pub(crate) fn type_sql_from_record(record: &ImmutableRecordRef) -> Result<String> {
-        match record.get_value_opt(1) {
+        match record
+            .decode(crate::types::NanPolicy::Null)
+            .get_value_opt(1)
+        {
             Some(ValueRef::Text(sql)) => Ok(sql.as_str().to_string()),
             _ => Err(LimboError::Corrupt(format!(
                 "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
@@ -4338,7 +4363,10 @@ impl Schema {
     fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
         let mut values = [0i64; 6];
         for (i, value) in values.iter_mut().enumerate() {
-            match record.get_value(i + 1) {
+            match record
+                .decode(crate::types::NanPolicy::Null)
+                .get_value(i + 1)
+            {
                 Ok(ValueRef::Numeric(crate::numeric::Numeric::Integer(v))) => {
                     *value = v;
                 }
@@ -5272,6 +5300,7 @@ impl TryClone for Schema {
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,
+            array_orderings: self.array_orderings,
         })
     }
 }

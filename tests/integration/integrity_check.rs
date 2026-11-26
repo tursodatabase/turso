@@ -17,6 +17,116 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use turso_core::{Numeric, Value};
 
+// SQLite treats every NaN encoding in a REAL field as NULL, including index keys.
+#[test]
+#[cfg(not(feature = "checksum"))]
+fn indexed_real_nan_is_null_for_reads_integrity_and_delete() {
+    check_indexed_real_nan(false);
+}
+
+#[test]
+#[cfg(not(feature = "checksum"))]
+fn indexed_real_nan_is_null_in_mvcc() {
+    check_indexed_real_nan(true);
+}
+
+#[cfg(not(feature = "checksum"))]
+fn check_indexed_real_nan(mvcc: bool) {
+    for bits in [
+        0x7ff8_0000_0000_0000u64,
+        0xfff8_0000_0000_0001,
+        0x7ff0_0000_0000_0001,
+    ] {
+        for padding in [0, 10000] {
+            for update in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("nan.db");
+                {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.execute_batch("CREATE TABLE t(c TEXT, a REAL, b INTEGER); CREATE INDEX t_a ON t(a); CREATE INDEX t_ba ON t(b, a); CREATE INDEX t_ca ON t(c, a);").unwrap();
+                    conn.execute("INSERT INTO t VALUES (?1, 1.25, 1)", ["x".repeat(padding)])
+                        .unwrap();
+                }
+                let mut bytes = std::fs::read(&path).unwrap();
+                let positions: Vec<_> = bytes
+                    .windows(8)
+                    .enumerate()
+                    .filter_map(|(i, b)| (b == 1.25f64.to_be_bytes()).then_some(i))
+                    .collect();
+                assert_eq!(positions.len(), 4, "one table field and three index fields");
+                for position in positions {
+                    bytes[position..position + 8].copy_from_slice(&bits.to_be_bytes());
+                }
+                std::fs::write(&path, bytes).unwrap();
+                let mut db = TempDatabase::new_with_existent(&path);
+                let mut conn = db.connect_limbo();
+                if mvcc {
+                    conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+                }
+                assert_eq!(run_integrity_check(&conn), "ok");
+                for access in [
+                    "NOT INDEXED",
+                    "INDEXED BY t_a",
+                    "INDEXED BY t_ba",
+                    "INDEXED BY t_ca",
+                ] {
+                    let rows = crate::common::limbo_exec_rows(
+                        &conn,
+                        &format!("SELECT b FROM t {access} WHERE a IS NULL AND b = 1"),
+                    );
+                    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+                }
+                if update {
+                    conn.execute("UPDATE t SET b = 2 WHERE b = 1").unwrap();
+                    assert_indexed_nan_row(&conn, 2);
+                    // Reopen before checkpointing to exercise MVCC log replay.
+                    drop(conn);
+                    drop(db);
+                    db = TempDatabase::new_with_existent(&path);
+                    conn = db.connect_limbo();
+                    assert_indexed_nan_row(&conn, 2);
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                    drop(conn);
+                    drop(db);
+                    db = TempDatabase::new_with_existent(&path);
+                    conn = db.connect_limbo();
+                    assert_indexed_nan_row(&conn, 2);
+                }
+                conn.execute(if update {
+                    "DELETE FROM t WHERE b = 2"
+                } else {
+                    "DELETE FROM t WHERE b = 1"
+                })
+                .unwrap();
+                assert_eq!(run_integrity_check(&conn), "ok");
+                assert_eq!(
+                    crate::common::limbo_exec_rows(&conn, "SELECT count(*) FROM t"),
+                    vec![vec![rusqlite::types::Value::Integer(0)]]
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "checksum"))]
+fn assert_indexed_nan_row(conn: &Arc<turso_core::Connection>, b: i64) {
+    assert_eq!(run_integrity_check(conn), "ok");
+    for access in [
+        "NOT INDEXED",
+        "INDEXED BY t_a",
+        "INDEXED BY t_ba",
+        "INDEXED BY t_ca",
+    ] {
+        assert_eq!(
+            crate::common::limbo_exec_rows(
+                conn,
+                &format!("SELECT b FROM t {access} WHERE a IS NULL AND b = {b}")
+            ),
+            vec![vec![rusqlite::types::Value::Integer(b)]]
+        );
+    }
+}
+
 #[test]
 fn test_integrity_check_strict_stored_types() {
     for (ty, value, expected) in [

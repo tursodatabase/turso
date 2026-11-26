@@ -284,6 +284,7 @@ impl BackingStore {
             false,
             keys.len(),
             index.unique,
+            connection.nan_policy(),
         )?);
         let mvcc = match connection.mv_store_for_db(database_id) {
             None => None,

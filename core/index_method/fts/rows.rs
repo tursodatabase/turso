@@ -71,6 +71,7 @@ pub(super) fn chunk_rows(path: &str, data: &[u8], chunk_size: usize) -> Vec<Pend
 /// Extract `(path, chunk_no, bytes)` from the cursor's current record.
 pub(super) fn row_fields(record: &ImmutableRecord) -> Result<(String, i64, Vec<u8>)> {
     let path = record
+        .decode(crate::types::NanPolicy::Null)
         .get_value_opt(0)
         .and_then(|value| match value {
             crate::types::ValueRef::Text(text) => Some(text.value.to_string()),
@@ -78,6 +79,7 @@ pub(super) fn row_fields(record: &ImmutableRecord) -> Result<(String, i64, Vec<u
         })
         .ok_or_else(|| LimboError::Corrupt("FTS row path is not text".into()))?;
     let chunk_no = record
+        .decode(crate::types::NanPolicy::Null)
         .get_value_opt(1)
         .and_then(|value| match value {
             crate::types::ValueRef::Numeric(crate::numeric::Numeric::Integer(value)) => Some(value),
@@ -85,6 +87,7 @@ pub(super) fn row_fields(record: &ImmutableRecord) -> Result<(String, i64, Vec<u
         })
         .ok_or_else(|| LimboError::Corrupt("FTS row chunk number is not an integer".into()))?;
     let bytes = record
+        .decode(crate::types::NanPolicy::Null)
         .get_value_opt(2)
         .and_then(|value| match value {
             crate::types::ValueRef::Blob(blob) => Some(blob.to_vec()),
@@ -97,6 +100,7 @@ pub(super) fn row_fields(record: &ImmutableRecord) -> Result<(String, i64, Vec<u
 /// Extract only the path from the cursor's current record.
 fn row_path(record: &ImmutableRecord) -> Result<String> {
     record
+        .decode(crate::types::NanPolicy::Null)
         .get_value_opt(0)
         .and_then(|value| match value {
             crate::types::ValueRef::Text(text) => Some(text.value.to_string()),

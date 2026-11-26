@@ -27,7 +27,6 @@ use crate::{
     },
     type_ordering::TypeOrdering,
     types::ValueRef,
-    vdbe::hash_table::normalized_f64_bits,
     LimboError, Numeric, Result,
 };
 
@@ -107,7 +106,7 @@ impl CollationSeq {
             Self::Text(TextCollation::Rtrim) => 3,
             Self::Text(TextCollation::Locale(id)) => id.to_bits(),
             Self::Text(TextCollation::Custom(_)) => Self::NO_COLLATION_BITS,
-            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering as u16,
+            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering.to_bits(),
         }
     }
 
@@ -209,7 +208,7 @@ impl CollationSeq {
                 let f = i as f64;
                 if (f as i64) == i && f.is_finite() {
                     hasher.write_u8(FLOAT_HASH);
-                    hasher.write(&normalized_f64_bits(f).to_le_bytes());
+                    hasher.write(&crate::Double::new(f).canonical_bits().to_le_bytes());
                 } else {
                     // The REAL would lose precision, so no REAL can equal this integer.
                     hasher.write_u8(INT_HASH);
@@ -218,7 +217,7 @@ impl CollationSeq {
             }
             ValueRef::Numeric(Numeric::Float(f)) => {
                 hasher.write_u8(FLOAT_HASH);
-                hasher.write(&normalized_f64_bits(f64::from(f)).to_le_bytes());
+                hasher.write(&f.canonical_bits().to_le_bytes());
             }
             ValueRef::Text(text) => {
                 hasher.write_u8(TEXT_HASH);
@@ -786,10 +785,8 @@ fn common_ordering(
         }
     }
     match (found, array_of_unknown_elements) {
-        (None, Some(_)) => Ok(Some(TypeOrdering::Array)),
-        (Some((other, other_ty)), Some(array_ty))
-            if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) =>
-        {
+        (None, Some(_)) => Ok(Some(schema.array_ordering(false))),
+        (Some((other, other_ty)), Some(array_ty)) if !other.is_array() => {
             Err(cannot_compare(other_ty, array_ty))
         }
         (found, _) => Ok(found.map(|(ordering, _)| ordering)),
@@ -1508,6 +1505,43 @@ mod tests {
         }
         assert!(CollationSeq::from_bits(CollationSeq::NO_COLLATION_BITS).is_err());
         assert!(CollationSeq::from_bits(u16::MAX).is_err());
+    }
+
+    #[test]
+    fn array_ordering_survives_schema_clone_and_column_flags() {
+        use crate::alloc::TryClone;
+        use crate::types::{ImmutableRecord, NanPolicy};
+        use crate::Value;
+        use std::hash::{DefaultHasher, Hasher};
+
+        let nan = ImmutableRecord::from_values(&[Value::from_f64(f64::NAN)], 1).unwrap();
+        let null = ImmutableRecord::from_values(&[Value::Null], 1).unwrap();
+        let nan = ValueRef::Blob(nan.get_payload());
+        let null = ValueRef::Blob(null.get_payload());
+        for policy in [NanPolicy::Null, NanPolicy::Preserve] {
+            let schema = crate::schema::SchemaBuilder::new()
+                .unwrap()
+                .array_orderings(policy)
+                .build()
+                .try_clone()
+                .unwrap();
+            for text in [false, true] {
+                let original = CollationSeq::Type(schema.array_ordering(text));
+                let restored = CollationSeq::from_bits(original.to_bits()).unwrap();
+                assert_eq!(restored, original);
+                assert_eq!(
+                    restored.compare(nan, null).is_eq(),
+                    policy == NanPolicy::Null
+                );
+                for value in [nan, null] {
+                    let mut before = DefaultHasher::new();
+                    let mut after = DefaultHasher::new();
+                    original.hash_value(value, &mut before);
+                    restored.hash_value(value, &mut after);
+                    assert_eq!(before.finish(), after.finish());
+                }
+            }
+        }
     }
 
     #[test]

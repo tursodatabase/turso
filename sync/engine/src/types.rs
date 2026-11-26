@@ -747,6 +747,7 @@ pub fn parse_bin_record(
     bin_record: impl AsRef<[u8]>,
 ) -> Result<crate::alloc::Vec<turso_core::Value>> {
     match turso_core::types::ImmutableRecordRef::from_bin_record(bin_record.as_ref())
+        .decode(turso_core::types::NanPolicy::Null)
         .get_values_owned()
     {
         Ok(values) => Ok(values),

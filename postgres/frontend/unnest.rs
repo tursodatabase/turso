@@ -128,13 +128,20 @@ impl VirtualTableCursor for UnnestCursor {
 
 fn flattened_elements(array: &Value) -> Result<Vec<Value>> {
     let mut elements = Vec::new();
-    let mut pending = vec![array_values_from_any(array)
-        .ok_or_else(|| LimboError::InvalidArgument("unnest requires an array".into()))?
-        .into_iter()];
+    let mut pending = vec![array_values_from_any(
+        turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+        array,
+    )
+    .ok_or_else(|| LimboError::InvalidArgument("unnest requires an array".into()))?
+    .into_iter()];
     while let Some(values) = pending.last_mut() {
         match values.next() {
             Some(Value::Blob(blob)) => {
-                let nested = array_values_from_any(&Value::Blob(blob)).ok_or_else(|| {
+                let nested = array_values_from_any(
+                    turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+                    &Value::Blob(blob),
+                )
+                .ok_or_else(|| {
                     LimboError::InvalidArgument("invalid nested array in unnest".into())
                 })?;
                 pending.push(nested.into_iter());

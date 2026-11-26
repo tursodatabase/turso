@@ -173,7 +173,11 @@ impl ViewCursorTestExt for dyn CursorTrait {
         }
         let record = return_if_io!(self.record());
         let value = record
-            .and_then(|record| record.get_value_opt(column))
+            .and_then(|record| {
+                record
+                    .decode(turso_core::types::NanPolicy::Null)
+                    .get_value_opt(column)
+            })
             .map(|value| value.to_owned())
             .transpose()?;
         Ok(IOResult::Done(value.unwrap_or(Value::Null)))
