@@ -105,10 +105,20 @@ fn emit_conditions(
         subqueries,
         join_index,
     )?;
+    let probe_prefilter_terms = hash_probe_prefilter_where_terms(
+        t_ctx,
+        table_references,
+        join_order,
+        predicates,
+        subqueries,
+        join_index,
+    )?;
     for cond in predicates
         .iter()
         .enumerate()
-        .filter(|(cond_idx, _)| !prefiltered_terms.contains(cond_idx))
+        .filter(|(cond_idx, _)| {
+            !prefiltered_terms.contains(cond_idx) && !probe_prefilter_terms.contains(cond_idx)
+        })
         .map(|(_, cond)| cond)
         .filter(|cond| cond.origin.is_outer_join() == from_outer_join)
         .filter(|cond| {
@@ -284,6 +294,57 @@ pub(super) fn hash_build_prefilter_where_terms(
         hash_join_op,
         uses_materialized_keys_and_payload,
     )
+}
+
+/// Where-clause indices that this loop checks on each probe row before
+/// probing the hash table: terms that do not read the build table and that,
+/// when false, leave the row with no build row to match. Like a nested loop,
+/// the join then compares the keys of only the rows these terms keep. Empty
+/// for loops that do not probe a hash table.
+pub(super) fn hash_probe_prefilter_where_terms(
+    t_ctx: &TranslateCtx<'_>,
+    table_references: &TableReferences,
+    join_order: &[JoinOrderMember],
+    predicates: &[WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
+    join_index: usize,
+) -> Result<Vec<usize>> {
+    let probe_table = &table_references.joined_tables()[join_order[join_index].original_idx];
+    let Operation::HashJoin(hash_join_op) = &probe_table.op else {
+        return Ok(Vec::new());
+    };
+    let mut term_indices = Vec::new();
+    for (cond_idx, cond) in predicates.iter().enumerate() {
+        let drops_probe_row = match hash_join_op.join_type {
+            HashJoinType::Inner | HashJoinType::LeftAnti => !cond.origin.is_outer_join(),
+            // Only the probe table's own ON terms: a WHERE term must see the
+            // NULL row of a build row that no probe row matched.
+            HashJoinType::LeftOuter => {
+                cond.origin
+                    .join_origin()
+                    .and_then(|origin| origin.outer_table())
+                    == Some(probe_table.internal_id)
+            }
+            // A FULL JOIN emits a probe row that fails its terms with NULLs.
+            HashJoinType::FullOuter => false,
+        };
+        if !drops_probe_row
+            || condition_references_subquery(&cond.expr, subqueries)
+            || !cond.should_eval_at_loop(
+                join_index,
+                join_order,
+                subqueries,
+                Some(table_references),
+                &t_ctx.resolver,
+            )
+            || table_mask_from_expr(&cond.expr, table_references, subqueries)?
+                .get(hash_join_op.build_table_idx)
+        {
+            continue;
+        }
+        term_indices.push(cond_idx);
+    }
+    Ok(term_indices)
 }
 
 /// Per-loop predicate emission.
