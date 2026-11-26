@@ -17,6 +17,9 @@ csv = ["dep:limbo_csv"]
 
 [package.metadata.dist]
 dist = true
+package-libraries = ["cstaticlib"]
+installers = []
+include = ["include/sqlite3.h"]
 
 [lib]
 doc = false
