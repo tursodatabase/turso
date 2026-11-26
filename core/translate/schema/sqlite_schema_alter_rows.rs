@@ -56,13 +56,14 @@ pub(super) fn emit_rename_table_rows(
         return Ok(());
     }
 
+    // Like SQLite, sqlite_sequence names the table as declared.
     emit_rename_sqlite_sequence_entry(
         program,
         resolver,
         ctx.connection,
         ctx.database_id,
         stored_old_name,
-        stored_new_name,
+        &declared_new_name,
     );
     let has_autoincrement_backing_table = resolver.with_schema(ctx.database_id, |s| {
         s.get_sequence(
@@ -404,8 +405,8 @@ fn emit_rename_sqlite_sequence_entry(
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
-    old_table_name_norm: &str,
-    new_table_name_norm: &str,
+    old_table_name: &str,
+    new_table_name: &str,
 ) {
     let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
         s.get_btree_table(NamespaceId::ROOT, crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
@@ -416,9 +417,9 @@ fn emit_rename_sqlite_sequence_entry(
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
     let sequence_name_reg = program.alloc_register();
     let sequence_value_reg = program.alloc_register();
-    let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name_norm.to_string());
+    let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name.to_string());
     program.mark_last_insn_constant();
-    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name_norm.to_string());
+    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name.to_string());
     program.mark_last_insn_constant();
 
     let affinity_str = sqlite_sequence
@@ -442,7 +443,7 @@ fn emit_rename_sqlite_sequence_entry(
             rhs: row_name_to_replace_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default().jump_if_null(),
-            collation: CollationSeq::for_internal_values(),
+            collation: CollationSeq::NOCASE,
         });
 
         program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);

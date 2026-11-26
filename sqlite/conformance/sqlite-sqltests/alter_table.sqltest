@@ -16,6 +16,33 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-autoincrement-to-mixed-case-name {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES ('a');
+    DELETE FROM t;
+    ALTER TABLE t RENAME TO "NewName";
+    INSERT INTO newname(v) VALUES ('b');
+    SELECT * FROM sqlite_sequence;
+    SELECT * FROM "NewName";
+}
+expect {
+    NewName|2
+    2|b
+}
+
+@cross-check-integrity
+test alter-table-rename-mixed-case-autoincrement-table {
+    CREATE TABLE "Pk6"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO pk6(v) VALUES ('a');
+    ALTER TABLE PK6 RENAME TO r;
+    INSERT INTO r(v) VALUES ('b');
+    SELECT * FROM sqlite_sequence;
+}
+expect {
+    r|2
+}
+
+@cross-check-integrity
 test alter-table-rename-mixed-case-table-in-other-case {
     CREATE TABLE "Pk6"(a UNIQUE);
     ALTER TABLE pk6 RENAME TO r;
