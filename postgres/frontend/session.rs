@@ -18,18 +18,20 @@ use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::ast::{self};
 use turso_core::dialect::Dialect;
 use turso_core::function::Func;
-use turso_core::schema::{Schema, Table};
+use turso_core::schema::{BTreeTable, ForeignKey, Schema, Table};
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
-    Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
+    Connection, FkImmediateViolations, IOResult, LimboError, Qualifier, Result, Statement,
+    StepResult, Value,
 };
 use turso_core::{DependentObject, NamespaceId};
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_FOREIGN_KEY,
+    SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_COLUMN,
+    SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_TABLE,
 };
 use turso_pg_parser::translator::{
     check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
@@ -168,6 +170,7 @@ impl PgConnection {
         let conn = db.connect_with_hooks(opts, Arc::new(PgSessionState::default()))?;
         refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
+        conn.set_foreign_keys_enabled(true);
         Ok(Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
@@ -413,7 +416,11 @@ fn prepare_statement_inner(
     let role = tx_role(translated.cmd.stmt());
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
-    if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
+    // CREATE TABLE runs in the deferred path, which checks the foreign keys
+    // of the new table once it exists and rolls the statement back if they
+    // fail.
+    let creates_table = matches!(translated.cmd.stmt(), ast::Stmt::CreateTable { .. });
+    if translated.prereqs.is_empty() && translated.postreqs.is_empty() && !creates_table {
         let stmt = pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
@@ -608,6 +615,17 @@ fn translate_statement<'a>(
         }
         ast::Stmt::DropTable { tbl_name, .. } => {
             reject_drop_of_other_relation_kind(&pg_conn.conn, tbl_name, "table")?;
+            reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, false)?;
+        }
+        ast::Stmt::Delete {
+            tbl_name,
+            truncate: true,
+            ..
+        } => {
+            reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, true)?;
+        }
+        ast::Stmt::DropIndex { idx_name, .. } => {
+            reject_drop_of_foreign_key_index(&pg_conn.conn, idx_name)?
         }
         _ => {}
     }
@@ -892,27 +910,40 @@ impl DeferredExecution {
             }
             CommandContext::DropSchema { schema } => {
                 let schema = schema.clone();
-                let foreign_keys_enabled = conn.foreign_keys_enabled();
-                if foreign_keys_enabled {
-                    conn.set_foreign_keys_enabled(false);
-                }
                 conn.set_namespace_being_dropped(
                     conn.qualifier(&schema).map(|namespace| namespace.target.id),
                 );
-                let result = self.run_phase_inner(inner);
+                let result = self.run_phase_without_foreign_keys(&conn, inner);
                 conn.set_namespace_being_dropped(None);
-                if foreign_keys_enabled {
-                    conn.set_foreign_keys_enabled(true);
-                }
                 result.map_err(|error| unsupported_cascade_to_other_schemas(&schema, error))
             }
             CommandContext::Cascade => self
-                .run_phase_inner(inner)
+                .run_phase_without_foreign_keys(&conn, inner)
                 .map_err(unsupported_cascade_to_other_objects),
             CommandContext::DropSeveral => self
-                .run_phase_inner(inner)
+                .run_phase_without_foreign_keys(&conn, inner)
                 .map_err(crate::error::several_dropped_objects_have_dependents),
         }
+    }
+
+    /// Runs a statement of a DROP of a schema or of several relations with
+    /// foreign keys not enforced. The DROP has already checked that no table
+    /// it keeps references a table it drops, and the tables it drops may
+    /// reference each other in any order.
+    fn run_phase_without_foreign_keys(
+        &mut self,
+        conn: &Connection,
+        inner: &mut Statement,
+    ) -> Result<IOResult<()>> {
+        let foreign_keys_enabled = conn.foreign_keys_enabled();
+        if foreign_keys_enabled {
+            conn.set_foreign_keys_enabled(false);
+        }
+        let result = self.run_phase_inner(inner);
+        if foreign_keys_enabled {
+            conn.set_foreign_keys_enabled(true);
+        }
+        result
     }
 
     fn run_phase_inner(&mut self, inner: &mut Statement) -> Result<IOResult<()>> {
@@ -1009,11 +1040,11 @@ impl DeferredExecution {
                 Execute
             }
             Execute => {
-                let done = self
-                    .work
-                    .as_mut()
-                    .unwrap()
-                    .finish_statement(&mut self.active, inner)?;
+                let done = self.work.as_mut().unwrap().finish_statement(
+                    &self.pg_conn.conn,
+                    &mut self.active,
+                    inner,
+                )?;
                 if !done {
                     return Ok(());
                 }
@@ -1350,11 +1381,21 @@ impl DeferredWork {
 
     fn finish_statement(
         &mut self,
+        conn: &Arc<Connection>,
         active: &mut Option<crate::Statement>,
         inner: &mut Statement,
     ) -> Result<bool> {
         match self {
             Self::Prerequisites(state) => {
+                if let DeferredCommand::Translated(
+                    ast::Cmd::Stmt(ast::Stmt::CreateTable { tbl_name, .. }),
+                    _,
+                ) = &state.commands.current().command
+                {
+                    if !state.target_exists {
+                        check_foreign_keys_of_new_table(conn, tbl_name)?;
+                    }
+                }
                 let done = state.commands.advance();
                 let finished = active.take().unwrap();
                 if done {
@@ -1454,6 +1495,11 @@ impl CopyState {
         if self.rows.is_empty() {
             return Ok(None);
         }
+        // The INSERT of each row is one part of the COPY statement, so that,
+        // as in PostgreSQL, foreign keys are checked after the last row, and
+        // a row may come before the row it references.
+        stmt.inner
+            .continue_fk_immediate_violations(FkImmediateViolations::default());
         bind_copy_row(&mut stmt, &self.rows[self.index])?;
         Ok(Some(stmt))
     }
@@ -1470,17 +1516,71 @@ impl CopyState {
 
     fn finish_statement(&mut self, active: &mut Option<crate::Statement>) -> Result<bool> {
         let next = self.index + 1;
+        let violations = active.as_ref().unwrap().inner.fk_immediate_violations();
         if next == self.rows.len() {
             *active = None;
+            violations.check()?;
             return Ok(true);
         }
         let active = active.as_mut().unwrap();
         active.reset().map_err(crate::Error::into_core_error)?;
         active.clear_bindings();
+        active.inner.continue_fk_immediate_violations(violations);
         bind_copy_row(active, &self.rows[next])?;
         self.index = next;
         Ok(false)
     }
+}
+
+/// Rejects a foreign key of new table `tbl_name` whose parent key core
+/// cannot find, as PostgreSQL does when it creates the table. Core would
+/// instead fail every later write to the table with "foreign key mismatch".
+fn check_foreign_keys_of_new_table(
+    conn: &Arc<Connection>,
+    tbl_name: &ast::QualifiedName,
+) -> Result<()> {
+    let schema = conn.current_schema();
+    // A table created in a database attached through the SQLite connection
+    // is not checked, as `reject_removal_of_referenced_table` does not check it.
+    let Some((namespace, child)) = find_main_db_table(conn, tbl_name) else {
+        return Ok(());
+    };
+    for fk in &child.foreign_keys {
+        let Some(parent) = schema.get_btree_table(fk.parent_namespace, &fk.parent_table) else {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_TABLE,
+                format!("relation \"{}\" does not exist", fk.parent_table),
+                None,
+            ));
+        };
+        if let Some(column) = fk
+            .parent_columns
+            .iter()
+            .find(|column| parent.get_column(column).is_none())
+        {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_COLUMN,
+                format!("column \"{column}\" referenced in foreign key constraint does not exist"),
+                None,
+            ));
+        }
+        // Core needs a unique key with the columns in the foreign key's
+        // order, where PostgreSQL takes them in any order.
+        if schema
+            .resolve_fk(namespace, fk, &child, &parent, true)
+            .is_err()
+        {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_FOREIGN_KEY,
+                format!(
+                    "there is no unique constraint matching given keys for referenced table \"{}\"",
+                    fk.parent_table
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn prepare_create_table_target_check(
@@ -1760,6 +1860,166 @@ fn reject_drop_of_other_relation_kind(
         return Err(crate::error::wrong_relation_kind(name, expected_kind, kind));
     }
     Ok(())
+}
+
+/// Rejects DROP TABLE and TRUNCATE of a table that another table references
+/// with a foreign key, like PostgreSQL. Core would instead delete or check the
+/// rows, running the ON DELETE actions of the referencing tables. A table
+/// referencing itself does not count, as in PostgreSQL.
+fn reject_removal_of_referenced_table(
+    conn: &Arc<Connection>,
+    tbl_name: &ast::QualifiedName,
+    truncate: bool,
+) -> Result<()> {
+    // A DROP of a schema or of several relations runs its DROP TABLEs with
+    // foreign keys not enforced, after checking the references itself.
+    if !conn.foreign_keys_enabled() {
+        return Ok(());
+    }
+    let schema_name = tbl_name.namespace.as_ref().map(|name| name.as_str());
+    let table = tbl_name.name.as_str();
+    let Some((namespace, referenced)) = find_main_db_table(conn, tbl_name) else {
+        return Ok(());
+    };
+    let schema = conn.current_schema();
+    let referencing: Vec<_> = schema
+        .resolved_fks_referencing(namespace, table)?
+        .into_iter()
+        .filter(|fk_ref| {
+            fk_ref.child_namespace != namespace
+                || !fk_ref.child_table.name.eq_ignore_ascii_case(table)
+        })
+        .collect();
+    // PostgreSQL names one of the referencing tables.
+    let Some(child) = referencing
+        .iter()
+        .map(|fk_ref| &fk_ref.child_table.declared_name)
+        .min()
+    else {
+        return Ok(());
+    };
+    if truncate {
+        return Err(crate::error::truncate_of_referenced_table(
+            child,
+            &referenced.declared_name,
+        ));
+    }
+    let dropped = match schema_name {
+        Some(schema_name) if !namespace.is_root() => format!("table {schema_name}.{table}"),
+        _ => format!("table {table}"),
+    };
+    let mut dependents: Vec<String> = referencing
+        .iter()
+        .map(|fk_ref| {
+            foreign_key_dependent(
+                conn,
+                &schema,
+                fk_ref.child_namespace,
+                &fk_ref.child_table,
+                &fk_ref.fk,
+                &dropped,
+            )
+        })
+        .collect();
+    // Sorted, because the schema keeps its tables in no order. PostgreSQL
+    // lists them in the order they were created.
+    dependents.sort();
+    Err(LimboError::dependent_objects(dropped, dependents))
+}
+
+/// Rejects DROP INDEX of the unique index that a foreign key uses to find its
+/// parent row, like PostgreSQL. Core would instead fail every later write
+/// that checks the foreign key with "foreign key mismatch".
+fn reject_drop_of_foreign_key_index(
+    conn: &Arc<Connection>,
+    idx_name: &ast::QualifiedName,
+) -> Result<()> {
+    let schema_name = idx_name.namespace.as_ref().map(|name| name.as_str());
+    let name = idx_name.name.as_str();
+    let schema = conn.current_schema();
+    let Some((namespace, index)) = relation_lookup_namespaces(conn, schema_name)
+        .into_iter()
+        .filter(|candidate| candidate.database_id() == turso_core::MAIN_DB_ID)
+        .find_map(|candidate| {
+            let namespace = candidate.target.id;
+            let index = schema
+                .indexes(namespace)
+                .find(|index| index.name.eq_ignore_ascii_case(name))?;
+            Some((namespace, Arc::clone(index)))
+        })
+    else {
+        return Ok(());
+    };
+    let dropped = match schema_name {
+        Some(schema_name) if !namespace.is_root() => format!("index {schema_name}.{name}"),
+        _ => format!("index {name}"),
+    };
+    let mut dependents: Vec<String> = schema
+        .resolved_fks_referencing(namespace, &index.table_name)?
+        .iter()
+        .filter(|fk_ref| {
+            fk_ref
+                .parent_unique_index
+                .as_ref()
+                .is_some_and(|parent_index| Arc::ptr_eq(parent_index, &index))
+        })
+        .map(|fk_ref| {
+            foreign_key_dependent(
+                conn,
+                &schema,
+                fk_ref.child_namespace,
+                &fk_ref.child_table,
+                &fk_ref.fk,
+                &dropped,
+            )
+        })
+        .collect();
+    if dependents.is_empty() {
+        return Ok(());
+    }
+    // Sorted, as in reject_removal_of_referenced_table.
+    dependents.sort();
+    Err(LimboError::dependent_objects(dropped, dependents))
+}
+
+/// The line of the DETAIL of a refused DROP of `dropped` that names the
+/// foreign key `fk` of table `child` of namespace `child_namespace`, which
+/// depends on it: "constraint c_pid_fkey on table c depends on table p".
+fn foreign_key_dependent(
+    conn: &Connection,
+    schema: &Schema,
+    child_namespace: NamespaceId,
+    child: &BTreeTable,
+    fk: &ForeignKey,
+    dropped: &str,
+) -> String {
+    format!(
+        "constraint {} on table {} depends on {dropped}",
+        catalog::foreign_key_constraint_name(child, fk),
+        catalog::relation_name(conn, schema, child_namespace, &child.name),
+    )
+}
+
+/// The B-tree table `tbl_name` and its namespace, if it is in the main
+/// database. The frontend has no temp tables, and its schemas are namespaces
+/// of the main database, but a database may be attached through the SQLite
+/// connection.
+fn find_main_db_table(
+    conn: &Arc<Connection>,
+    tbl_name: &ast::QualifiedName,
+) -> Option<(turso_core::NamespaceId, Arc<turso_core::schema::BTreeTable>)> {
+    let schema_name = tbl_name.namespace.as_ref().map(|name| name.as_str());
+    let schema = conn.current_schema();
+    relation_lookup_namespaces(conn, schema_name)
+        .into_iter()
+        .filter(|candidate| candidate.database_id() == turso_core::MAIN_DB_ID)
+        .find_map(|candidate| {
+            let namespace = candidate.target.id;
+            Some((
+                namespace,
+                schema.get_btree_table(namespace, tbl_name.name.as_str())?,
+            ))
+        })
 }
 
 /// The namespaces that a relation is looked up in, in order. A relation
@@ -2467,6 +2727,34 @@ fn drop_schema_commands(
         ));
     }
 
+    // PostgreSQL drops a foreign key of another schema's table that
+    // references the schema, but a foreign key cannot be dropped from a
+    // table here, and one left behind would make every write to its table
+    // fail.
+    if let Some(namespace) = conn.qualifier(&name).map(|namespace| namespace.target.id) {
+        let dropped: Vec<Relation> = objects
+            .iter()
+            .filter_map(|object| match object {
+                SchemaObject::Table(table) => Some((namespace, table.clone())),
+                SchemaObject::View(_) | SchemaObject::Sequence(_) => None,
+            })
+            .collect();
+        if let Some((_, table, _)) = foreign_keys_from_outside(&conn.current_schema(), &dropped)
+            .into_iter()
+            .next()
+        {
+            let table = &table.declared_name;
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "cannot drop schema \"{name}\" because table \"{table}\" of another schema \
+                     has a foreign key referencing it"
+                ),
+                None,
+            ));
+        }
+    }
+
     let dropped_with_a_table = sequences_owned_by_tables(conn, &name, &objects);
     let mut commands: Vec<_> = views_of_other_schemas_that_read(conn, &name, &objects)
         .into_iter()
@@ -2538,18 +2826,35 @@ fn drop_relations_commands(
     }
     let relations: Vec<Relation> = targets.iter().map(|(target, _)| target.clone()).collect();
     let dropped = in_drop_order(&schema, &relations, stmt.cascade);
-    if stmt.cascade {
-        if let Some((table, referenced)) = foreign_key_from_outside(&schema, &dropped) {
+    let from_outside = foreign_keys_from_outside(&schema, &dropped);
+    if let Some((_, table, fk)) = from_outside.first() {
+        if stmt.cascade {
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!(
                     "DROP ... CASCADE is not supported when a foreign key of a table that is \
-                     not dropped references a dropped table: table {table} references table \
-                     {referenced}"
+                     not dropped references a dropped table: table {} references table {}",
+                    table.declared_name, fk.parent_table
                 ),
                 None,
             ));
         }
+        let dropped_name = |fk: &ForeignKey| {
+            let parent =
+                catalog::relation_name(conn, &schema, fk.parent_namespace, &fk.parent_table);
+            format!("table {parent}")
+        };
+        let mut dependents: Vec<String> = from_outside
+            .iter()
+            .map(|(namespace, table, fk)| {
+                foreign_key_dependent(conn, &schema, *namespace, table, fk, &dropped_name(fk))
+            })
+            .collect();
+        // Sorted, as in reject_removal_of_referenced_table.
+        dependents.sort();
+        return Err(crate::error::several_dropped_objects_have_dependents(
+            LimboError::dependent_objects(dropped_name(fk), dependents),
+        ));
     }
     for relation in dropped {
         let target_sql = targets
@@ -2608,32 +2913,36 @@ fn namespace_with_relation(
         })
 }
 
-/// The names of a table that is not among `dropped` and of a table among
-/// `dropped` that a foreign key of the first one references. PostgreSQL
-/// drops such a foreign key with CASCADE, which is not supported.
-fn foreign_key_from_outside(schema: &Schema, dropped: &[Relation]) -> Option<(String, String)> {
+/// The foreign keys, with the namespace and the table that has each one, of
+/// the tables that are not among `dropped` and that reference a table among
+/// `dropped`. PostgreSQL drops such a foreign key with CASCADE, which is not
+/// supported.
+fn foreign_keys_from_outside(
+    schema: &Schema,
+    dropped: &[Relation],
+) -> Vec<(NamespaceId, Arc<BTreeTable>, Arc<ForeignKey>)> {
     let is_dropped = |namespace: NamespaceId, name: &str| {
         dropped
             .iter()
             .any(|relation| relation.0 == namespace && relation.1.eq_ignore_ascii_case(name))
     };
-    schema.namespace_ids().find_map(|namespace| {
-        schema
-            .tables(namespace)
-            .filter(|table| !is_dropped(namespace, table.get_name()))
-            .find_map(|table| {
-                let foreign_key = table
-                    .btree()?
-                    .foreign_keys
-                    .iter()
-                    .find(|fk| is_dropped(fk.parent_namespace, &fk.parent_table))?
-                    .clone();
-                Some((
-                    table.get_name().to_string(),
-                    foreign_key.parent_table.clone(),
-                ))
-            })
-    })
+    let mut found = Vec::new();
+    for namespace in schema.namespace_ids() {
+        for table in schema.tables(namespace) {
+            let Some(table) = table.btree() else {
+                continue;
+            };
+            if is_dropped(namespace, &table.name) {
+                continue;
+            }
+            for fk in &table.foreign_keys {
+                if is_dropped(fk.parent_namespace, &fk.parent_table) {
+                    found.push((namespace, Arc::clone(&table), Arc::clone(fk)));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// `relations` in an order in which they can be dropped: each one after the
@@ -2861,9 +3170,6 @@ fn prepare_copy_rows(
         None => (String::new(), column_count),
     };
 
-    let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
-
     let delimiter = stmt
         .delimiter
         .as_ref()
@@ -2872,6 +3178,11 @@ fn prepare_copy_rows(
     let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
 
     let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
+    let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
+    // A SELECT, unlike one VALUES row, makes the INSERT count a row without
+    // its parent instead of failing at once, so that a later row can still
+    // be the parent (see CopyState::prepare_active).
+    let insert_sql = format!("INSERT INTO {table_name}{insert_cols} SELECT {placeholders}");
     Ok((insert_sql, rows))
 }
 

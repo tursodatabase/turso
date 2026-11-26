@@ -376,15 +376,14 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, child_table_name, None)
     })? {
-        if !fk_ref.fk.deferred {
-            continue;
-        }
-        let child_positions: Vec<usize> = fk_ref
-            .fk
-            .child_columns
-            .iter()
-            .map(|cname| child_tbl.get_column(cname).unwrap().0)
-            .collect();
+        // With no violation counted there is nothing to cancel, so the parent
+        // probe is skipped, as in SQLite.
+        let null_skip = program.allocate_label();
+        program.emit_insn(Insn::FkIfZero {
+            deferred: fk_ref.fk.deferred,
+            target_pc: null_skip,
+        });
+        let child_positions = &fk_ref.child_pos;
         let child_key = emit_columns_and_dependencies(
             program,
             child_tbl,
@@ -395,8 +394,7 @@ pub fn emit_fk_child_decrement_on_delete(
         )?;
 
         // Fast path: if any FK column is NULL can't be a violation
-        let null_skip = program.allocate_label();
-        for &pos in &child_positions {
+        for &pos in child_positions.iter() {
             program.emit_insn(Insn::IsNull {
                 reg: child_key.to_column_reg(pos),
                 target_pc: null_skip,
@@ -440,7 +438,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
+            emit_guarded_fk_decrement(program, done, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -453,7 +451,7 @@ pub fn emit_fk_child_decrement_on_delete(
             let icur = open_read_index(program, idx, database_id);
 
             // Build probe from current child row
-            let n = fk_ref.fk.child_columns.len();
+            let n = fk_ref.child_cols.len();
             let probe = program.alloc_registers(n);
             for (i, &pos) in child_positions.iter().enumerate() {
                 program.emit_insn(Insn::Copy {
@@ -476,7 +474,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
+            emit_guarded_fk_decrement(program, ok, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
@@ -680,23 +678,9 @@ fn emit_delete_row_common(
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let delete_namespace = unsafe { (*table_reference).namespace };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx
-                .resolver
-                .with_schema(delete_namespace.database_id, |s| {
-                    s.any_resolved_fks_referencing(delete_namespace.id, table_name)
-                }) {
-                ForeignKeyActions::prepare_fk_delete_actions(
-                    program,
-                    &mut t_ctx.resolver,
-                    table_name,
-                    main_table_cursor_id,
-                    rowid_reg,
-                    None,
-                    delete_namespace,
-                )?
-            } else {
-                ForeignKeyActions::default()
-            };
+            // The row's own foreign keys first, as in SQLite: the guarded
+            // decrement for a row without a parent must not cancel a
+            // violation that this row's removal counts as a parent.
             if t_ctx
                 .resolver
                 .with_schema(delete_namespace.database_id, |s| {
@@ -713,7 +697,24 @@ fn emit_delete_row_common(
                     &t_ctx.resolver,
                 )?;
             }
-            prepared
+            if t_ctx
+                .resolver
+                .with_schema(delete_namespace.database_id, |s| {
+                    s.any_resolved_fks_referencing(delete_namespace.id, table_name)
+                })
+            {
+                ForeignKeyActions::prepare_fk_delete_actions(
+                    program,
+                    &mut t_ctx.resolver,
+                    table_name,
+                    main_table_cursor_id,
+                    rowid_reg,
+                    None,
+                    delete_namespace,
+                )?
+            } else {
+                ForeignKeyActions::default()
+            }
         } else {
             ForeignKeyActions::default()
         }

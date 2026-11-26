@@ -1004,12 +1004,6 @@ pub fn emit_upsert(
         }
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {
-        matches!(
-            fk.fk.on_update,
-            ast::RefAct::NoAction | ast::RefAct::Restrict
-        )
-    });
     let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
         matches!(
             fk.fk.on_update,
@@ -1216,7 +1210,7 @@ pub fn emit_upsert(
                         .transpose()
                 })
                 .collect::<crate::Result<_>>()?;
-            if has_parent_fk_checks {
+            if !affected_parent_fks.is_empty() {
                 let _ = emit_fk_update_parent_actions(
                     program,
                     &bt,

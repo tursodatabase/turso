@@ -33,6 +33,7 @@ DROP TABLE [IF EXISTS] [schema-name.]table-name;
 - All triggers associated with the table are removed.
 - The table entry is removed from the `sqlite_schema` system table.
 - If foreign key constraints reference the dropped table, those references become invalid. Turso does not prevent dropping a table that is referenced by foreign keys in other tables.
+- Through the PostgreSQL frontend, dropping or truncating a table that another table references with a foreign key is an error, as in PostgreSQL. A table that references only itself can be dropped, and so can tables dropped by one `DROP TABLE` that reference each other.
 - `DROP TABLE` fails with `database table is locked` while any other statement on the same connection that reads the database is running, even one that reads a different table. Finish or reset that statement first. While `DROP TABLE` waits for I/O, a statement that starts reading the database on the same connection fails with the same error.
 
 ## Examples

@@ -841,3 +841,75 @@ fn primary_key_of_each_integer_type_is_the_rowid() {
 //         ]
 //     );
 // }
+
+/// The refusals of a DROP or TRUNCATE of what a foreign key depends on name
+/// the foreign key, as in PostgreSQL.
+#[test]
+fn refused_removal_of_foreign_key_parent_names_the_constraint() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE p (id int PRIMARY KEY, u int)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX ui ON p (u)").unwrap();
+    conn.execute("CREATE TABLE c (pid int REFERENCES p (id), pu int REFERENCES p (u))")
+        .unwrap();
+    conn.execute("CREATE TABLE x (a int)").unwrap();
+    let hint = Some("Use DROP ... CASCADE to drop the dependent objects too.");
+
+    let error = conn.execute("DROP TABLE p").unwrap_err();
+    assert_eq!(error.sqlstate, "2BP01", "{error}");
+    assert_eq!(
+        error.message,
+        "cannot drop table p because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(
+            "constraint c_pid_fkey on table c depends on table p\n\
+             constraint c_pu_fkey on table c depends on table p"
+        )
+    );
+    assert_eq!(error.hint.as_deref(), hint);
+
+    let error = conn.execute("DROP TABLE p, x").unwrap_err();
+    assert_eq!(error.sqlstate, "2BP01", "{error}");
+    assert_eq!(
+        error.message,
+        "cannot drop desired object(s) because other objects depend on them"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(
+            "constraint c_pid_fkey on table c depends on table p\n\
+             constraint c_pu_fkey on table c depends on table p"
+        )
+    );
+    assert_eq!(error.hint.as_deref(), hint);
+
+    let error = conn.execute("DROP INDEX ui").unwrap_err();
+    assert_eq!(error.sqlstate, "2BP01", "{error}");
+    assert_eq!(
+        error.message,
+        "cannot drop index ui because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("constraint c_pu_fkey on table c depends on index ui")
+    );
+    assert_eq!(error.hint.as_deref(), hint);
+
+    let error = conn.execute("TRUNCATE p").unwrap_err();
+    assert_eq!(error.sqlstate, "0A000", "{error}");
+    assert_eq!(
+        error.message,
+        "cannot truncate a table referenced in a foreign key constraint"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("Table \"c\" references \"p\".")
+    );
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("Truncate table \"c\" at the same time, or use TRUNCATE ... CASCADE.")
+    );
+}

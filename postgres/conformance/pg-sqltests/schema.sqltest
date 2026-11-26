@@ -49,6 +49,37 @@ expect {
     0
 }
 
+test drop-schema-cascade-drops-foreign-keys-inside-the-schema {
+    CREATE SCHEMA IF NOT EXISTS drop_fk_inside;
+    DROP SCHEMA drop_fk_inside CASCADE;
+    CREATE SCHEMA drop_fk_inside;
+    CREATE TABLE drop_fk_inside.p (id int PRIMARY KEY);
+    CREATE TABLE drop_fk_inside.c (pid int REFERENCES drop_fk_inside.p (id));
+    INSERT INTO drop_fk_inside.p VALUES (1);
+    INSERT INTO drop_fk_inside.c VALUES (1);
+    DROP SCHEMA drop_fk_inside CASCADE;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'drop_fk_inside';
+}
+expect {
+    0
+}
+
+# PostgreSQL drops the foreign key of the other schema's table; Turso cannot
+# drop a foreign key from a table, so it refuses the DROP SCHEMA.
+@skip-if postgres "PostgreSQL drops the foreign key that references the schema"
+test drop-schema-cascade-with-foreign-key-from-another-schema-errors {
+    CREATE SCHEMA IF NOT EXISTS drop_fk_target;
+    DROP SCHEMA drop_fk_target CASCADE;
+    CREATE SCHEMA drop_fk_target;
+    CREATE TABLE drop_fk_target.p (id int PRIMARY KEY);
+    CREATE TABLE drop_fk_source (pid int REFERENCES drop_fk_target.p (id));
+    DROP SCHEMA drop_fk_target CASCADE;
+}
+@sqlstate 0A000
+expect error {
+    cannot drop schema "drop_fk_target" because table "drop_fk_source" of another schema has a foreign key referencing it
+}
+
 test drop-schema-public-cascade-drops-its-objects {
     CREATE TABLE t (x int);
     CREATE VIEW v AS SELECT x FROM t;

@@ -85,6 +85,19 @@ pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError 
     }))
 }
 
+/// The error of a TRUNCATE of table `parent` that table `child` references
+/// with a foreign key.
+pub fn truncate_of_referenced_table(child: &str, parent: &str) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: SQLSTATE_FEATURE_NOT_SUPPORTED,
+        message: "cannot truncate a table referenced in a foreign key constraint".into(),
+        detail: Some(format!("Table \"{child}\" references \"{parent}\".")),
+        hint: Some(format!(
+            "Truncate table \"{child}\" at the same time, or use TRUNCATE ... CASCADE."
+        )),
+    }))
+}
+
 /// The engine error for SQL that `turso_pg_parser::parse` refuses, which
 /// keeps the SQLSTATE that the parser gave it.
 /// The error of a DROP that names a relation of another kind than the one

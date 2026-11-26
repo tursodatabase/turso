@@ -3190,9 +3190,12 @@ impl Schema {
         Ok(())
     }
 
+    /// The table `name` of namespace `namespace`. A namespace that does not
+    /// exist has no tables: a foreign key stored before its parent's
+    /// namespace was dropped still names that namespace.
     pub fn get_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<Table>> {
         let name = self.normalize_table_lookup_name(name);
-        self.namespace(namespace).tables.get(&name).cloned()
+        self.namespaces.get(&namespace)?.tables.get(&name).cloned()
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -3237,13 +3240,10 @@ impl Schema {
         }
     }
 
+    /// The B-tree table `name` of namespace `namespace`. Like
+    /// [Schema::get_table], a namespace that does not exist has no tables.
     pub fn get_btree_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<BTreeTable>> {
-        let name = self.normalize_table_lookup_name(name);
-        if let Some(table) = self.namespace(namespace).tables.get(&name) {
-            table.btree()
-        } else {
-            None
-        }
+        self.get_table(namespace, name)?.btree()
     }
 
     pub fn add_index(&mut self, namespace: NamespaceId, index: Arc<Index>) -> Result<()> {
@@ -4812,8 +4812,8 @@ impl Schema {
 
     /// Resolve a single FK declared on `child` referencing `parent_tbl`.
     /// When `require_unique` is set, a non-rowid parent key must be backed by
-    /// a non-partial UNIQUE index on exactly those columns.
-    fn resolve_fk(
+    /// a non-partial UNIQUE index on exactly those columns, in any order.
+    pub fn resolve_fk(
         &self,
         child_namespace: NamespaceId,
         fk: &Arc<ForeignKey>,
@@ -4898,29 +4898,45 @@ impl Schema {
                 })
         };
 
+        let mut child_cols = fk.child_columns.clone();
+        let mut parent_cols = parent_cols;
         let parent_unique_index = if parent_uses_rowid {
             None
         } else {
-            let found = self
-                .get_indices(fk.parent_namespace, &parent_tbl.name)
-                .find(|idx| {
-                    idx.unique
-                        && idx.where_clause.is_none()
-                        && idx.columns.len() == parent_cols.len()
-                        && idx
-                            .columns
-                            .iter()
-                            .zip(parent_cols.iter())
-                            .zip(parent_collations.iter())
-                            .all(|((ic, pc), collation)| {
-                                ic.name.eq_ignore_ascii_case(pc) && ic.collation == *collation
-                            })
-                })
-                .cloned();
+            let mut found = None;
+            for idx in self.get_indices(fk.parent_namespace, &parent_tbl.name) {
+                if !idx.unique || idx.where_clause.is_some() {
+                    continue;
+                }
+                let Some(order) = parent_key_order_in_index(idx, &parent_cols, &parent_collations)
+                else {
+                    continue;
+                };
+                // An index whose columns are in the order of the parent
+                // columns keeps the key in its declared order.
+                let in_declared_order = order.iter().enumerate().all(|(i, &key)| i == key);
+                found = Some((idx, order));
+                if in_declared_order {
+                    break;
+                }
+            }
             if require_unique && found.is_none() {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             }
-            found
+            found.map(|(idx, order)| {
+                // The key columns are put in the order of the index columns,
+                // so that a key built in that order probes the index and
+                // compares with the child row, as SQLite's
+                // sqlite3FkLocateIndex maps each index column to a child
+                // column.
+                child_cols = order.iter().map(|&i| child_cols[i].clone()).collect();
+                parent_cols = order.iter().map(|&i| parent_cols[i].clone()).collect();
+                child_pos = order.iter().map(|&i| child_pos[i]).collect();
+                parent_pos = order.iter().map(|&i| parent_pos[i]).collect();
+                parent_collations = order.iter().map(|&i| parent_collations[i]).collect();
+                key_affinities = order.iter().map(|&i| key_affinities[i]).collect();
+                Arc::clone(idx)
+            })
         };
 
         fk.validate()?;
@@ -4928,6 +4944,7 @@ impl Schema {
             child_namespace,
             child_table: Arc::clone(child),
             fk: Arc::clone(fk),
+            child_cols,
             parent_cols,
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
@@ -8034,6 +8051,29 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
     ))
 }
 
+/// For each column of `index`, the position in `parent_cols` of the parent
+/// key column it holds, or `None` when the index is not on exactly the parent
+/// key columns with their collations.
+fn parent_key_order_in_index(
+    index: &Index,
+    parent_cols: &[String],
+    parent_collations: &[CollationSeq],
+) -> Option<Vec<usize>> {
+    if index.columns.len() != parent_cols.len() {
+        return None;
+    }
+    let mut order = Vec::with_capacity(parent_cols.len());
+    for column in &index.columns {
+        let key = parent_cols.iter().enumerate().position(|(i, name)| {
+            column.name.eq_ignore_ascii_case(name)
+                && column.collation == parent_collations[i]
+                && !order.contains(&i)
+        })?;
+        order.push(key);
+    }
+    Some(order)
+}
+
 impl ForeignKey {
     /// Builds the foreign key of a column constraint such as
     /// `c REFERENCES parent(p) ON DELETE CASCADE`. Used by CREATE TABLE,
@@ -8126,6 +8166,10 @@ pub struct ResolvedFkRef {
     /// The FK as declared on the child table.
     pub fk: Arc<ForeignKey>,
 
+    /// The child columns of the key. They and the per-column fields below are
+    /// in the order of the columns of `parent_unique_index`, which can differ
+    /// from the order in which the FK lists them.
+    pub child_cols: Box<[String]>,
     /// Resolved parent columns: either `fk.parent_columns` or, when that is
     /// empty, the parent table's PRIMARY KEY columns. Always non-empty.
     pub parent_cols: Box<[String]>,
