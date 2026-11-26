@@ -1869,7 +1869,10 @@ impl Jsonb {
             b'n' | b'N' => {
                 pos = self.deserialize_null_or_nan(input, pos, info)?;
             }
-            b'"' | b'\'' => {
+            b'"' => {
+                pos = self.deserialize_double_quoted(input, pos, info)?;
+            }
+            b'\'' => {
                 pos = self.deserialize_string(input, pos, info)?;
             }
             c if c.is_ascii_digit()
@@ -1927,7 +1930,7 @@ impl Jsonb {
                 break;
             }
             if c == b'"' {
-                pos = self.deserialize_key(input, pos, info)?;
+                pos = self.deserialize_double_quoted(input, pos, info)?;
             } else if c == b'\'' || c == b'\\' || is_json5_id_char(c, true) {
                 pos = self.deserialize_string(input, pos, info)?;
             } else if matches!(c, b']' | b',' | b':') {
@@ -2146,12 +2149,13 @@ impl Jsonb {
         self.deserialize_string_with_escapes(input, pos, pos + len, string_start, quote, info)
     }
 
-    /// Parses the double-quoted object key at `pos`, as
-    /// [Self::deserialize_string] does. Most keys are short and plain, and
-    /// this copy of its fast path for them can be inlined into the object
-    /// loop, without the call.
-    #[inline]
-    fn deserialize_key(
+    /// Parses the double-quoted string at `pos`, an object key or a value,
+    /// as [Self::deserialize_string] does. Most strings are plain and shorter
+    /// than 256 bytes, and this copy of its fast path for them is inlined into
+    /// the parser, without the call. A string of 12 to 255 bytes gets the
+    /// 2-byte header that [Self::write_element_header] writes for it.
+    #[inline(always)]
+    fn deserialize_double_quoted(
         &mut self,
         input: &[u8],
         pos: usize,
@@ -2159,8 +2163,16 @@ impl Jsonb {
     ) -> PResult<usize> {
         if let Some(rest) = input.get(pos + 1..) {
             let len = plain_part_len(rest, b'"');
-            if let (Some(b'"'), Some(&header)) = (rest.get(len), TEXT_HEADERS.get(len)) {
-                self.data.push(header);
+            if rest.get(len) == Some(&b'"') {
+                if let Some(&header) = TEXT_HEADERS.get(len) {
+                    self.data.push(header);
+                } else if len <= 0xFF {
+                    self.data
+                        .push(ElementType::TEXT as u8 | (SIZE_MARKER_8BIT << 4));
+                    self.data.push(len as u8);
+                } else {
+                    return self.deserialize_string(input, pos, info);
+                }
                 self.data.extend_from_slice(&rest[..len]);
                 return Ok(pos + len + 2);
             }
@@ -5070,6 +5082,30 @@ mod tests {
     fn parse_has_json5(input: &str) -> bool {
         let (_, info) = Jsonb::from_str_tracking(input).unwrap();
         info.has_json5
+    }
+
+    /// The inline path for double-quoted strings writes the same bytes as
+    /// deserialize_string: for headers of 1, 2 and 3 bytes, and for a string
+    /// with an escape, which the inline path leaves to deserialize_string.
+    #[test]
+    fn double_quoted_strings_match_deserialize_string() {
+        for len in [0, 1, 11, 12, 13, 100, 255, 256, 1000] {
+            for text in ["x".repeat(len), format!("{}\\n", "y".repeat(len))] {
+                let input = format!("\"{text}\"");
+                let input = input.as_bytes();
+                let mut fast = Jsonb::new(input.len() + PARSE_CAPACITY_SLACK).unwrap();
+                let mut slow = Jsonb::new(input.len() + PARSE_CAPACITY_SLACK).unwrap();
+                let mut fast_info = ParseInfo::default();
+                let mut slow_info = ParseInfo::default();
+                let fast_end = fast
+                    .deserialize_double_quoted(input, 0, &mut fast_info)
+                    .unwrap();
+                let slow_end = slow.deserialize_string(input, 0, &mut slow_info).unwrap();
+                assert_eq!(fast_end, slow_end, "{text:?}");
+                assert_eq!(fast.as_bytes(), slow.as_bytes(), "{text:?}");
+                assert_eq!(fast_info.has_json5, slow_info.has_json5, "{text:?}");
+            }
+        }
     }
 
     #[test]
