@@ -1071,6 +1071,30 @@ expect @tursopg error {
     cannot compare type oid with type int4
 }
 
+@setup oid_paths
+test oid-equals-column-of-cte-of-negative-integer {
+    WITH c(x) AS (SELECT -1) SELECT count(*) FROM t, c WHERE o = c.x;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-equals-column-of-subquery-in-from-of-negative-integer {
+    SELECT count(*) FROM t, (SELECT -1 AS x) s WHERE o = s.x;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-equals-column-of-values-of-negative-integer {
+    SELECT count(*) FROM t, (VALUES (-1)) v(x) WHERE o = v.x;
+}
+expect {
+    1
+}
+
 @compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-equals-scalar-subquery-of-integer-column {
