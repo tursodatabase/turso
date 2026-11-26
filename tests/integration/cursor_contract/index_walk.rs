@@ -17,7 +17,7 @@
 
 use super::index_model::{
     above_all, compare_engines, icheck, imax, imem, is_legal, project, IFailure, IKey, IMObs, IPos,
-    IReplay, ITok, IVerdict,
+    IReplay, ITok, IVerdict, Val,
 };
 use super::index_program::{run_index, IOp, IndexRun, Outcome, Prefix, Row};
 use super::model::Spec;
@@ -507,7 +507,8 @@ impl Gen {
         if rng.random_bool(0.5) {
             match &cur.ictok {
                 ITok::ITKey(p) if p.len() == 2 => {
-                    return make(p[0], p[1], self.new_rowid(rng, p), true);
+                    let rowid = self.new_rowid(rng, p);
+                    return make(p[0].clone(), p[1].clone(), rowid, true);
                 }
                 ITok::ITApp => {
                     let (a, b, rowid) = self.above_all_key(rng);
@@ -517,21 +518,23 @@ impl Gen {
                     // A NULL in the key: Turso seeks, so no token is needed.
                     if rng.random_bool(0.4) {
                         let (a, b) = if rng.random_bool(0.7) {
-                            (None, rand_b(rng))
+                            (Val::Null, rand_b(rng))
                         } else {
-                            (rand_a(rng), None)
+                            (rand_a(rng), Val::Null)
                         };
-                        return make(a, b, self.new_rowid(rng, &[a, b]), true);
+                        let rowid = self.new_rowid(rng, &[a.clone(), b.clone()]);
+                        return make(a, b, rowid, true);
                     }
                 }
             }
         }
         let (a, b) = (rand_a(rng), rand_b(rng));
-        make(a, b, self.new_rowid(rng, &[a, b]), false)
+        let rowid = self.new_rowid(rng, &[a.clone(), b.clone()]);
+        make(a, b, rowid, false)
     }
 
     /// A rowid that makes the key `(cols, rowid)` new.
-    fn new_rowid(&self, rng: &mut ChaCha8Rng, cols: &[Option<i64>]) -> i64 {
+    fn new_rowid(&self, rng: &mut ChaCha8Rng, cols: &[Val]) -> i64 {
         let s = &self.replay.st.irows;
         for _ in 0..20 {
             let r = rng.random_range(1..=ROWID_MAX);
@@ -543,14 +546,19 @@ impl Gen {
     }
 
     /// A key that is above every key of the index: an append.
-    fn above_all_key(&self, rng: &mut ChaCha8Rng) -> (Option<i64>, Option<i64>, i64) {
+    fn above_all_key(&self, rng: &mut ChaCha8Rng) -> (Val, Val, i64) {
         match imax(&self.replay.st.irows) {
             // The same columns as the largest key, with a higher rowid.
             Some((cols, r)) if rng.random_bool(0.6) => {
-                (cols[0], cols[1], r + rng.random_range(1..4))
+                (cols[0].clone(), cols[1].clone(), r + rng.random_range(1..4))
             }
             Some((cols, _)) => (
-                Some(cols[0].unwrap_or(0) + rng.random_range(1..3)),
+                Val::Int(
+                    match cols[0] {
+                        Val::Int(x) => x,
+                        _ => 0,
+                    } + rng.random_range(1..3),
+                ),
                 rand_b(rng),
                 rng.random_range(1..=ROWID_MAX),
             ),
@@ -572,8 +580,8 @@ impl Gen {
         let (cols, rowid) = s[rng.random_range(0..s.len())].clone();
         IOp::IdxDelete {
             cur: c,
-            a: cols[0],
-            b: cols[1],
+            a: cols[0].clone(),
+            b: cols[1].clone(),
             rowid,
         }
     }
@@ -636,14 +644,14 @@ impl Gen {
         }
         // `NoConflict` with a NULL does not touch the engine cursor, so the history of the
         // cursor stays as it is (a position that `Count` or `SeekEnd` broke stays broken).
-        let keeps_position = matches!(op, IOp::NoConflict(_, p) if p.contains(&None));
+        let keeps_position = matches!(op, IOp::NoConflict(_, p) if p.contains(&Val::Null));
         if moves && !keeps_position {
             self.peer_deleted[c] = false;
             self.after_seek_end[c] = matches!(op, IOp::SeekEnd(_));
             self.after_count[c] = matches!(op, IOp::Count(_));
             self.peer_wrote[c] = false;
             let insert = match op {
-                IOp::IdxInsert { a, b, rowid, .. } => Some((vec![*a, *b], *rowid)),
+                IOp::IdxInsert { a, b, rowid, .. } => Some((vec![a.clone(), b.clone()], *rowid)),
                 _ => None,
             };
             self.ended_empty[c] =
@@ -751,12 +759,12 @@ impl Gen {
             b,
             use_seek: true,
             ..
-        } = *op
+        } = op
         else {
             return false;
         };
-        let hit = matches!(self.replay.st.icurs[cur].icpos, IPos::Matched(_));
-        hit && a.is_some() && b.is_some()
+        let hit = matches!(self.replay.st.icurs[*cur].icpos, IPos::Matched(_));
+        hit && *a != Val::Null && *b != Val::Null
     }
 
     /// IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN: `Delete` of an entry that an `IdxInsert` of this run
@@ -832,19 +840,19 @@ impl Gen {
     }
 }
 
-fn rand_a(rng: &mut ChaCha8Rng) -> Option<i64> {
+fn rand_a(rng: &mut ChaCha8Rng) -> Val {
     if rng.random_bool(0.15) {
-        None
+        Val::Null
     } else {
-        Some(rng.random_range(0..A_RANGE))
+        Val::Int(rng.random_range(0..A_RANGE))
     }
 }
 
-fn rand_b(rng: &mut ChaCha8Rng) -> Option<i64> {
+fn rand_b(rng: &mut ChaCha8Rng) -> Val {
     if rng.random_bool(0.1) {
-        None
+        Val::Null
     } else {
-        Some(rng.random_range(0..B_RANGE))
+        Val::Int(rng.random_range(0..B_RANGE))
     }
 }
 
@@ -852,9 +860,17 @@ fn rand_b(rng: &mut ChaCha8Rng) -> Option<i64> {
 fn perturb(rng: &mut ChaCha8Rng, mut p: Prefix) -> Prefix {
     for v in p.iter_mut() {
         match rng.random_range(0..20) {
-            0..=2 => *v = v.map(|x| (x - 1).max(-1)),
-            3..=5 => *v = v.map(|x| x + 1),
-            6..=7 => *v = None,
+            0..=2 => {
+                if let Val::Int(x) = v {
+                    *x = (*x - 1).max(-1);
+                }
+            }
+            3..=5 => {
+                if let Val::Int(x) = v {
+                    *x += 1;
+                }
+            }
+            6..=7 => *v = Val::Null,
             _ => {}
         }
     }
@@ -1067,7 +1083,7 @@ fn shrink(case: &Case, cfg: Cfg, sig: &str, filter: &Filter) -> Case {
 
 /// The case with the prefix of op `i` cut to one value, if the op has a prefix of two.
 fn with_shorter_prefix(case: &Case, i: usize) -> Option<Case> {
-    let shorten = |p: &Prefix| (p.len() == 2).then(|| vec![p[0]]);
+    let shorten = |p: &Prefix| (p.len() == 2).then(|| vec![p[0].clone()]);
     let op = match case.ops[i].clone() {
         IOp::SeekGE(c, p) => IOp::SeekGE(c, shorten(&p)?),
         IOp::SeekGT(c, p) => IOp::SeekGT(c, shorten(&p)?),
@@ -1098,7 +1114,7 @@ fn show_op(op: &IOp) -> String {
     format!("{op:?}").replacen(", [", ", vec![", 1)
 }
 
-fn show_slot(s: &Spec<Option<i64>>) -> String {
+fn show_slot<A: std::fmt::Debug>(s: &Spec<A>) -> String {
     match s {
         Spec::Unspec => "?".to_string(),
         Spec::Is(v) => format!("{v:?}"),
@@ -1201,8 +1217,14 @@ mod tests {
     // Each one asserts what the model says. The ids N7 to N12 continue the table
     // gaps N1 to N6 of `mod.rs`; the others are index twins of gaps in SPEC.md.
 
-    use super::super::index_model::assert_agrees;
+    use super::super::index_model::{assert_agrees, Val};
     use super::super::known_bug;
+
+    const NUL: Val = Val::Null;
+
+    fn v(x: i64) -> Val {
+        Val::Int(x)
+    }
 
     const WAL: [(DbKind, Layout); 2] = [
         (DbKind::Wal, Layout::AllInMemory),
@@ -1223,14 +1245,14 @@ mod tests {
     fn ins(cur: usize, a: i64, b: i64, rowid: i64) -> IOp {
         IOp::IdxInsert {
             cur,
-            a: Some(a),
-            b: Some(b),
+            a: Val::Int(a),
+            b: Val::Int(b),
             rowid,
             use_seek: false,
         }
     }
 
-    fn del(cur: usize, a: Option<i64>, b: Option<i64>, rowid: i64) -> IOp {
+    fn del(cur: usize, a: Val, b: Val, rowid: i64) -> IOp {
         IOp::IdxDelete { cur, a, b, rowid }
     }
 
@@ -1242,18 +1264,18 @@ mod tests {
     fn known_bug_idx_g2_peer_delete_then_read() {
         known_bug("IDX_G2", "Mismatch", || {
             use IOp::*;
-            let rows = [(4, Some(2), Some(6))];
+            let rows = [(4, v(2), v(6))];
             let ops = [
-                SeekLE(0, vec![Some(2)]),
-                SeekGE(1, vec![Some(2)]),
+                SeekLE(0, vec![v(2)]),
+                SeekGE(1, vec![v(2)]),
                 Delete(0),
                 IdxRowId(1),
             ];
             agree(&ALL_FOUR, &rows, 2, &ops);
             let ops = [
-                SeekGE(0, vec![Some(2)]),
-                SeekGE(1, vec![Some(2)]),
-                del(0, Some(2), Some(6), 4),
+                SeekGE(0, vec![v(2)]),
+                SeekGE(1, vec![v(2)]),
+                del(0, v(2), v(6), 4),
                 Observe(1),
             ];
             agree(&ALL_FOUR, &rows, 2, &ops);
@@ -1268,11 +1290,7 @@ mod tests {
     fn known_bug_idx_g3_peer_write_keeps_null_row() {
         known_bug("IDX_G3", "Mismatch", || {
             use IOp::*;
-            let rows = [
-                (10, Some(4), Some(5)),
-                (11, Some(5), Some(5)),
-                (12, Some(6), Some(1)),
-            ];
+            let rows = [(10, v(4), v(5)), (11, v(5), v(5)), (12, v(6), v(1))];
             let ops = [Rewind(1), NullRow(1), ins(0, 9, 9, 4), Observe(1)];
             agree(&ALL_FOUR, &rows, 2, &ops);
         });
@@ -1288,11 +1306,11 @@ mod tests {
             use IOp::*;
             agree(
                 &WAL,
-                &[(2, None, Some(6))],
+                &[(2, NUL, v(6))],
                 1,
                 &[Rewind(0), Count(0), IdxRowId(0)],
             );
-            agree(&EPH, &[(2, None, Some(6))], 1, &[Count(0), Observe(0)]);
+            agree(&EPH, &[(2, NUL, v(6))], 1, &[Count(0), Observe(0)]);
         });
     }
 
@@ -1305,13 +1323,13 @@ mod tests {
     fn known_bug_idx_n4_delete_of_inserted_entry_then_next() {
         known_bug("IDX_N4", "Mismatch", || {
             use IOp::*;
-            let rows = [(6, Some(2), Some(3))];
+            let rows = [(6, v(2), v(3))];
             let ops = [
-                SeekGE(0, vec![Some(2)]),
+                SeekGE(0, vec![v(2)]),
                 IdxInsert {
                     cur: 0,
-                    a: None,
-                    b: Some(1),
+                    a: NUL,
+                    b: v(1),
                     rowid: 33,
                     use_seek: true,
                 },
@@ -1332,11 +1350,11 @@ mod tests {
             use IOp::*;
             agree(
                 &WAL,
-                &[(6, Some(4), None)],
+                &[(6, v(4), NUL)],
                 1,
                 &[Last(0), SeekEnd(0), Observe(0)],
             );
-            agree(&EPH, &[(6, Some(4), None)], 1, &[SeekEnd(0), Observe(0)]);
+            agree(&EPH, &[(6, v(4), NUL)], 1, &[SeekEnd(0), Observe(0)]);
         });
     }
 
@@ -1351,8 +1369,8 @@ mod tests {
     fn known_bug_n8_idx_compare_after_peer_delete() {
         known_bug("N8", "Mismatch", || {
             use IOp::*;
-            let rows = [(4, None, Some(6))];
-            let ops = [Rewind(1), del(0, None, Some(6), 4), IdxGT(1, vec![None])];
+            let rows = [(4, NUL, v(6))];
+            let ops = [Rewind(1), del(0, NUL, v(6), 4), IdxGT(1, vec![NUL])];
             agree(&ALL_FOUR, &rows, 2, &ops);
         });
     }
@@ -1366,16 +1384,16 @@ mod tests {
     fn known_bug_n9_own_insert_then_peer_write_then_read() {
         known_bug("N9", "Mismatch", || {
             use IOp::*;
-            let rows = [(4, Some(3), Some(3))];
+            let rows = [(4, v(3), v(3))];
             // A peer delete.
             agree(
                 &WAL,
                 &rows,
                 2,
-                &[ins(1, 2, 1, 16), del(0, Some(3), Some(3), 4), Observe(1)],
+                &[ins(1, 2, 1, 16), del(0, v(3), v(3), 4), Observe(1)],
             );
             // A peer insert after our entry.
-            let rows = [(10, Some(4), Some(5))];
+            let rows = [(10, v(4), v(5))];
             agree(
                 &WAL,
                 &rows,
@@ -1394,12 +1412,7 @@ mod tests {
     fn known_bug_n10_next_after_failed_seek_on_empty_index() {
         known_bug("N10", "Mismatch", || {
             use IOp::*;
-            let ops = [
-                SeekGE(0, vec![Some(0)]),
-                ins(1, 3, 3, 4),
-                Next(0),
-                Observe(0),
-            ];
+            let ops = [SeekGE(0, vec![v(0)]), ins(1, 3, 3, 4), Next(0), Observe(0)];
             agree(&WAL, &[], 2, &ops);
         });
     }
@@ -1417,17 +1430,17 @@ mod tests {
     fn known_bug_n11_use_seek_insert_after_hit_keeps_order() {
         known_bug("N11", "Mismatch", || {
             use IOp::*;
-            let rows = [(8, Some(2), Some(7))];
+            let rows = [(8, v(2), v(7))];
             let ops = [
-                NotFound(0, vec![Some(2), Some(7)]),
+                NotFound(0, vec![v(2), v(7)]),
                 IdxInsert {
                     cur: 0,
-                    a: Some(2),
-                    b: Some(7),
+                    a: v(2),
+                    b: v(7),
                     rowid: 13,
                     use_seek: true,
                 },
-                SeekGE(0, vec![Some(2)]),
+                SeekGE(0, vec![v(2)]),
                 Observe(0),
             ];
             agree(&WAL, &rows, 1, &ops);
@@ -1443,12 +1456,8 @@ mod tests {
     fn known_bug_n12_delete_after_peer_delete() {
         known_bug("N12", "idx < cell_count", || {
             use IOp::*;
-            let rows = [
-                (5, None, Some(6)),
-                (12, Some(3), Some(4)),
-                (13, Some(3), Some(2)),
-            ];
-            let ops = [Last(1), del(0, None, Some(6), 5), Delete(1)];
+            let rows = [(5, NUL, v(6)), (12, v(3), v(4)), (13, v(3), v(2))];
+            let ops = [Last(1), del(0, NUL, v(6), 5), Delete(1)];
             agree(&WAL, &rows, 2, &ops);
         });
     }

@@ -18,8 +18,51 @@ use std::cmp::Ordering;
 // Types (cols, ikey, istore, ipos, itok, icursor, istate, iop, iaction, iobs)
 // ---------------------------------------------------------------------------------------
 
-/// The columns of an index key. NULL is `None`.
-pub type Cols = Vec<Option<i64>>;
+/// One value of an index column. The order is NULL, then integers, then text (BINARY, by
+/// byte). NULL equals NULL.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum Val {
+    Null,
+    Int(i64),
+    Text(String),
+}
+
+/// Prints a value as Rust source (`Val::Int(1)`), so that the repro tests that the walker
+/// prints compile.
+impl std::fmt::Debug for Val {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Val::Null => write!(f, "Val::Null"),
+            Val::Int(x) => write!(f, "Val::Int({x})"),
+            Val::Text(t) => write!(f, "Val::Text({t:?}.to_string())"),
+        }
+    }
+}
+
+impl Val {
+    pub fn int(x: i64) -> Val {
+        Val::Int(x)
+    }
+
+    pub fn text(x: &str) -> Val {
+        Val::Text(x.to_string())
+    }
+}
+
+impl From<i64> for Val {
+    fn from(x: i64) -> Val {
+        Val::Int(x)
+    }
+}
+
+impl From<&str> for Val {
+    fn from(x: &str) -> Val {
+        Val::text(x)
+    }
+}
+
+/// The columns of an index key.
+pub type Cols = Vec<Val>;
 
 /// `(columns, rowid)`.
 pub type IKey = (Cols, i64);
@@ -426,21 +469,24 @@ fn iread(s: &IStore, c: &ICursor) -> Spec<Option<IKey>> {
 // Keys and order (cmp_val, cmp_cols, cmp_key, cmp_pre, cmp_prefix, is_*)
 // ---------------------------------------------------------------------------------------
 
-/// NULL is smallest and equals NULL. `Option<i64>` already orders like this, the match is
-/// here to look like `cmp_val`.
-fn cmp_val(a: Option<i64>, b: Option<i64>) -> Ordering {
+/// NULL is smallest and equals NULL, then come integers, then text. Text compares by byte
+/// (BINARY).
+fn cmp_val(a: &Val, b: &Val) -> Ordering {
     match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(x), Some(y)) => x.cmp(&y),
+        (Val::Null, Val::Null) => Ordering::Equal,
+        (Val::Null, _) => Ordering::Less,
+        (_, Val::Null) => Ordering::Greater,
+        (Val::Int(x), Val::Int(y)) => x.cmp(y),
+        (Val::Int(_), Val::Text(_)) => Ordering::Less,
+        (Val::Text(_), Val::Int(_)) => Ordering::Greater,
+        (Val::Text(x), Val::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
     }
 }
 
 /// Lexicographic order on whole column lists; a shorter list that is a prefix is smaller.
-pub fn cmp_cols(a: &[Option<i64>], b: &[Option<i64>]) -> Ordering {
+pub fn cmp_cols(a: &[Val], b: &[Val]) -> Ordering {
     for (x, y) in a.iter().zip(b) {
-        match cmp_val(*x, *y) {
+        match cmp_val(x, y) {
             Ordering::Equal => {}
             c => return c,
         }
@@ -456,12 +502,12 @@ pub fn cmp_key(a: &IKey, b: &IKey) -> Ordering {
 }
 
 /// Compare the first `|p|` columns of `a` with `p`. A key with fewer columns is smaller.
-fn cmp_pre(a: &[Option<i64>], p: &[Option<i64>]) -> Ordering {
+fn cmp_pre(a: &[Val], p: &[Val]) -> Ordering {
     for (i, y) in p.iter().enumerate() {
         let Some(x) = a.get(i) else {
             return Ordering::Less;
         };
-        match cmp_val(*x, *y) {
+        match cmp_val(x, y) {
             Ordering::Equal => {}
             c => return c,
         }
@@ -469,7 +515,7 @@ fn cmp_pre(a: &[Option<i64>], p: &[Option<i64>]) -> Ordering {
     Ordering::Equal
 }
 
-pub fn cmp_prefix(k: &IKey, p: &[Option<i64>]) -> Ordering {
+pub fn cmp_prefix(k: &IKey, p: &[Val]) -> Ordering {
     cmp_pre(&k.0, p)
 }
 
@@ -519,19 +565,19 @@ pub fn imem(k: &IKey, s: &IStore) -> bool {
 
 /// First key whose prefix compares `>= p`, `> p`; last key whose prefix compares `<= p`,
 /// `< p`.
-pub fn iseek_ge(p: &[Option<i64>], s: &IStore) -> Option<IKey> {
+pub fn iseek_ge(p: &[Val], s: &IStore) -> Option<IKey> {
     s.iter().find(|k| is_ge(cmp_prefix(k, p))).cloned()
 }
 
-pub fn iseek_gt(p: &[Option<i64>], s: &IStore) -> Option<IKey> {
+pub fn iseek_gt(p: &[Val], s: &IStore) -> Option<IKey> {
     s.iter().find(|k| is_gt(cmp_prefix(k, p))).cloned()
 }
 
-pub fn iseek_le(p: &[Option<i64>], s: &IStore) -> Option<IKey> {
+pub fn iseek_le(p: &[Val], s: &IStore) -> Option<IKey> {
     s.iter().rev().find(|k| is_le(cmp_prefix(k, p))).cloned()
 }
 
-pub fn iseek_lt(p: &[Option<i64>], s: &IStore) -> Option<IKey> {
+pub fn iseek_lt(p: &[Val], s: &IStore) -> Option<IKey> {
     s.iter().rev().find(|k| is_lt(cmp_prefix(k, p))).cloned()
 }
 
@@ -552,12 +598,12 @@ pub fn ipred(k: &IKey, s: &IStore) -> Option<IKey> {
     s.iter().rev().find(|k2| is_lt(cmp_key(k2, k))).cloned()
 }
 
-pub fn has_prefix(p: &[Option<i64>], s: &IStore) -> bool {
+pub fn has_prefix(p: &[Val], s: &IStore) -> bool {
     s.iter().any(|k| is_eq(cmp_prefix(k, p)))
 }
 
-pub fn has_null(p: &[Option<i64>]) -> bool {
-    p.iter().any(|v| v.is_none())
+pub fn has_null(p: &[Val]) -> bool {
+    p.iter().any(|v| v == &Val::Null)
 }
 
 /// The key is above every key of the store: an append is legal.
@@ -580,7 +626,10 @@ impl IReplay {
     /// `ephemeral`: the program of an ephemeral run writes the setup entries through cursor 0,
     /// so that cursor starts in a position that the contract does not define (`Lost`).
     pub fn new(rows: &[Row], nidx: usize, ephemeral: bool) -> IReplay {
-        let mut keys: IStore = rows.iter().map(|&(id, a, b)| (vec![a, b], id)).collect();
+        let mut keys: IStore = rows
+            .iter()
+            .map(|(id, a, b)| (vec![a.clone(), b.clone()], *id))
+            .collect();
         keys.sort_by(cmp_key);
         let mut st = iinit(keys, nidx);
         if ephemeral && nidx > 0 {
@@ -621,9 +670,12 @@ impl IReplay {
                 b,
                 rowid,
                 use_seek,
-            } => act(*cur, IMOp::IdxInsert((vec![*a, *b], *rowid), *use_seek)),
+            } => act(
+                *cur,
+                IMOp::IdxInsert((vec![a.clone(), b.clone()], *rowid), *use_seek),
+            ),
             IOp::IdxDelete { cur, a, b, rowid } => {
-                act(*cur, IMOp::IdxDelete((vec![*a, *b], *rowid)))
+                act(*cur, IMOp::IdxDelete((vec![a.clone(), b.clone()], *rowid)))
             }
             IOp::Delete(c) => act(*c, IMOp::IDelete),
             IOp::Column(c, _) | IOp::IdxRowId(c) | IOp::Observe(c) => act(*c, IMOp::IObserve),
@@ -637,28 +689,24 @@ impl IReplay {
 }
 
 /// The four slots of an engine `IObs`, as the model says them: jump flag, `rowid`, `c0`, `c1`.
-pub type Slots = (
-    bool,
-    Spec<Option<i64>>,
-    Spec<Option<i64>>,
-    Spec<Option<i64>>,
-);
+pub type Slots = (bool, Spec<Option<i64>>, Spec<Val>, Spec<Val>);
 
 /// What the harness `IObs` of `op` must contain, given the model observation. A slot that the
 /// op does not read is NULL.
 pub fn project(op: &IOp, m: &IMObs) -> Slots {
     let null = Spec::Is(None);
+    let vnull = || Spec::Is(Val::Null);
     let col = |i: usize| match &m.icolv {
         Spec::Unspec => Spec::Unspec,
-        Spec::Is(None) => Spec::Is(None),
-        Spec::Is(Some(cs)) => Spec::Is(cs.get(i).copied().flatten()),
+        Spec::Is(None) => Spec::Is(Val::Null),
+        Spec::Is(Some(cs)) => Spec::Is(cs.get(i).cloned().unwrap_or(Val::Null)),
     };
     match op {
-        IOp::IdxRowId(_) | IOp::Count(_) => (m.ijumped, m.irid, null, null),
-        IOp::Column(_, 0) => (m.ijumped, null, col(0), null),
-        IOp::Column(..) => (m.ijumped, null, null, col(1)),
+        IOp::IdxRowId(_) | IOp::Count(_) => (m.ijumped, m.irid, vnull(), vnull()),
+        IOp::Column(_, 0) => (m.ijumped, null, col(0), vnull()),
+        IOp::Column(..) => (m.ijumped, null, vnull(), col(1)),
         IOp::Observe(_) => (m.ijumped, m.irid, col(0), col(1)),
-        _ => (m.ijumped, null, null, null),
+        _ => (m.ijumped, null, vnull(), vnull()),
     }
 }
 
@@ -765,7 +813,7 @@ pub fn icheck(rows: &[Row], nidx: usize, ephemeral: bool, ops: &[IOp], got: &Out
         if !iobs_agree(op, e, &m) {
             return IVerdict::Fail(IFailure::Mismatch {
                 step,
-                engine: *e,
+                engine: e.clone(),
                 model: m,
             });
         }
@@ -796,8 +844,9 @@ pub fn compare_engines(
     a: (&[IObs], &[IMObs]),
     b: (&[IObs], &[IMObs]),
 ) -> Option<IFailure> {
-    let open =
-        |x: &Spec<Option<i64>>, y: &Spec<Option<i64>>| *x == Spec::Unspec || *y == Spec::Unspec;
+    fn open<A: PartialEq>(x: &Spec<A>, y: &Spec<A>) -> bool {
+        *x == Spec::Unspec || *y == Spec::Unspec
+    }
     for (i, op) in ops.iter().enumerate() {
         let (aj, ar, a0, a1) = project(op, &a.1[i]);
         let (bj, br, b0, b1) = project(op, &b.1[i]);
@@ -808,8 +857,8 @@ pub fn compare_engines(
         if differ {
             return Some(IFailure::Cross {
                 step: i,
-                a: a.0[i],
-                b: b.0[i],
+                a: a.0[i].clone(),
+                b: b.0[i].clone(),
             });
         }
     }
@@ -863,13 +912,13 @@ mod tests {
     use super::*;
     use IMOp::*;
 
-    const NUL: Option<i64> = None;
+    const NUL: Val = Val::Null;
 
-    fn some(v: i64) -> Option<i64> {
-        Some(v)
+    fn some(v: i64) -> Val {
+        Val::int(v)
     }
 
-    fn k(c1: Option<i64>, c2: Option<i64>, r: i64) -> IKey {
+    fn k(c1: Val, c2: Val, r: i64) -> IKey {
         (vec![c1, c2], r)
     }
 
@@ -937,7 +986,7 @@ mod tests {
     }
 
     fn some_p(vs: &[i64]) -> Cols {
-        vs.iter().map(|v| Some(*v)).collect()
+        vs.iter().map(|v| Val::int(*v)).collect()
     }
 
     #[test]
@@ -1406,7 +1455,7 @@ mod tests {
 
     #[test]
     fn bridge_projects_reads_by_op() {
-        let rows: Vec<Row> = vec![(1, Some(1), Some(10)), (2, None, Some(5))];
+        let rows: Vec<Row> = vec![(1, some(1), some(10)), (2, NUL, some(5))];
         let mut rep = IReplay::new(&rows, 1, false);
         let ops = [
             IOp::Rewind(0),
@@ -1425,38 +1474,38 @@ mod tests {
         // The first entry in the order is (NULL, 5, rowid 2).
         assert!(iobs_agree(
             &ops[1],
-            &mk(false, None, None, Some(5)),
+            &mk(false, None, NUL, some(5)),
             &trace[1]
         ));
         assert!(!iobs_agree(
             &ops[1],
-            &mk(false, Some(2), None, Some(5)),
+            &mk(false, Some(2), NUL, some(5)),
             &trace[1]
         ));
         assert!(iobs_agree(
             &ops[2],
-            &mk(false, Some(2), None, None),
+            &mk(false, Some(2), NUL, NUL),
             &trace[2]
         ));
         assert!(iobs_agree(
             &ops[3],
-            &mk(false, Some(2), None, Some(5)),
+            &mk(false, Some(2), NUL, some(5)),
             &trace[3]
         ));
         assert!(iobs_agree(
             &ops[4],
-            &mk(false, Some(2), None, None),
+            &mk(false, Some(2), NUL, NUL),
             &trace[4]
         ));
     }
 
     #[test]
     fn bridge_ephemeral_cursor_starts_lost() {
-        let rows: Vec<Row> = vec![(1, Some(1), Some(10))];
+        let rows: Vec<Row> = vec![(1, some(1), some(10))];
         // On a persistent database a fresh cursor is `Invalid`, so `IdxGE` jumps. In an
         // ephemeral run the position is open, so the model calls it illegal.
-        assert!(is_legal(&rows, 1, false, &[IOp::IdxGE(0, vec![Some(1)])]));
-        assert!(!is_legal(&rows, 1, true, &[IOp::IdxGE(0, vec![Some(1)])]));
+        assert!(is_legal(&rows, 1, false, &[IOp::IdxGE(0, vec![some(1)])]));
+        assert!(!is_legal(&rows, 1, true, &[IOp::IdxGE(0, vec![some(1)])]));
         assert!(is_legal(&rows, 1, true, &[IOp::Rewind(0), IOp::Next(0)]));
     }
 

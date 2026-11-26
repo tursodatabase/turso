@@ -6,24 +6,29 @@
 //! `(NULL,5,6) (1,10,1) (1,20,2) (2,10,3) (2,30,4) (3,NULL,5)`.
 //! Column `a` has duplicates, NULL sorts first, and `b` is NULL in the last entry.
 
+use super::index_model::Val;
 use super::index_program::{run_index, IObs, IOp::*, IndexRun, Outcome, Row};
 use super::program::ReadMode;
 use super::{known_bug, DbKind, Layout};
 
-const NULL: Option<i64> = None;
+const NULL: Val = Val::Null;
+
+const fn v(x: i64) -> Val {
+    Val::Int(x)
+}
 
 const ROWS: &[Row] = &[
-    (1, Some(1), Some(10)),
-    (2, Some(1), Some(20)),
-    (3, Some(2), Some(10)),
-    (4, Some(2), Some(30)),
-    (5, Some(3), None),
-    (6, None, Some(5)),
+    (1, v(1), v(10)),
+    (2, v(1), v(20)),
+    (3, v(2), v(10)),
+    (4, v(2), v(30)),
+    (5, v(3), NULL),
+    (6, NULL, v(5)),
 ];
 
 /// A prefix, written as `p![1, NULL]`.
 macro_rules! p {
-    ($($x:expr),*) => { vec![$(Option::<i64>::from($x)),*] };
+    ($($x:expr),*) => { vec![$(Val::from($x)),*] };
 }
 
 // Expected observations.
@@ -33,8 +38,8 @@ fn n() -> IObs {
     IObs {
         jumped: false,
         rowid: None,
-        c0: None,
-        c1: None,
+        c0: NULL,
+        c1: NULL,
     }
 }
 
@@ -47,7 +52,7 @@ fn j() -> IObs {
 }
 
 /// `Observe` on the entry `(a, b, rowid)`.
-fn e(rowid: i64, a: impl Into<Option<i64>>, b: impl Into<Option<i64>>) -> IObs {
+fn e(rowid: i64, a: impl Into<Val>, b: impl Into<Val>) -> IObs {
     IObs {
         jumped: false,
         rowid: Some(rowid),
@@ -274,11 +279,8 @@ fn separate_reads_agree_with_observe() {
     ];
     let expected = [
         n(),
-        IObs { c0: Some(2), ..n() },
-        IObs {
-            c1: Some(10),
-            ..n()
-        },
+        IObs { c0: v(2), ..n() },
+        IObs { c1: v(10), ..n() },
         r(3),
         e(3, 2, 10),
     ];
@@ -557,18 +559,18 @@ fn scan_all() -> Vec<super::index_program::IOp> {
 }
 
 /// What `scan_all` gives for the given entries (in index order) and a trailing end.
-fn scan_expected(entries: &[(i64, Option<i64>, Option<i64>)]) -> Vec<IObs> {
+fn scan_expected(entries: &[(i64, Val, Val)]) -> Vec<IObs> {
     let mut out = vec![if entries.is_empty() { j() } else { n() }];
     let mut it = entries.iter();
     match it.next() {
-        Some((rowid, a, b)) => out.push(e(*rowid, *a, *b)),
+        Some((rowid, a, b)) => out.push(e(*rowid, a.clone(), b.clone())),
         None => out.push(n()),
     }
     for _ in 0..8 {
         match it.next() {
             Some((rowid, a, b)) => {
                 out.push(j());
-                out.push(e(*rowid, *a, *b));
+                out.push(e(*rowid, a.clone(), b.clone()));
             }
             None => {
                 out.push(n());
@@ -586,8 +588,8 @@ fn idx_insert_after_no_conflict_miss_with_seek() {
         NoConflict(0, p![1, 15]),
         IdxInsert {
             cur: 0,
-            a: Some(1),
-            b: Some(15),
+            a: v(1),
+            b: v(15),
             rowid: 7,
             use_seek: true,
         },
@@ -599,13 +601,13 @@ fn idx_insert_after_no_conflict_miss_with_seek() {
     ops.extend(scan_all());
     let mut expected = vec![j(), n(), e(7, 1, 15), r(7)];
     expected.extend(scan_expected(&[
-        (6, NULL, Some(5)),
-        (1, Some(1), Some(10)),
-        (7, Some(1), Some(15)),
-        (2, Some(1), Some(20)),
-        (3, Some(2), Some(10)),
-        (4, Some(2), Some(30)),
-        (5, Some(3), NULL),
+        (6, NULL, v(5)),
+        (1, v(1), v(10)),
+        (7, v(1), v(15)),
+        (2, v(1), v(20)),
+        (3, v(2), v(10)),
+        (4, v(2), v(30)),
+        (5, v(3), NULL),
     ]));
     assert_eq!(ops.len(), prefix + 18);
     check(
@@ -625,8 +627,8 @@ fn idx_insert_without_seek_flag() {
     let mut ops = vec![
         IdxInsert {
             cur: 0,
-            a: Some(2),
-            b: Some(20),
+            a: v(2),
+            b: v(20),
             rowid: 8,
             use_seek: false,
         },
@@ -635,13 +637,13 @@ fn idx_insert_without_seek_flag() {
     let mut expected = vec![n(), e(8, 2, 20)];
     ops.extend(scan_all());
     expected.extend(scan_expected(&[
-        (6, NULL, Some(5)),
-        (1, Some(1), Some(10)),
-        (2, Some(1), Some(20)),
-        (3, Some(2), Some(10)),
-        (8, Some(2), Some(20)),
-        (4, Some(2), Some(30)),
-        (5, Some(3), NULL),
+        (6, NULL, v(5)),
+        (1, v(1), v(10)),
+        (2, v(1), v(20)),
+        (3, v(2), v(10)),
+        (8, v(2), v(20)),
+        (4, v(2), v(30)),
+        (5, v(3), NULL),
     ]));
     // `Observe` right after an `IdxInsert`: see `rowdata_after_idx_insert_reads_the_new_entry`.
     check(
@@ -661,15 +663,15 @@ fn idx_insert_duplicate_prefix_different_rowid() {
     let mut ops = vec![
         IdxInsert {
             cur: 0,
-            a: Some(1),
-            b: Some(10),
+            a: v(1),
+            b: v(10),
             rowid: 0,
             use_seek: false,
         },
         IdxInsert {
             cur: 0,
-            a: Some(1),
-            b: Some(10),
+            a: v(1),
+            b: v(10),
             rowid: 9,
             use_seek: false,
         },
@@ -677,14 +679,14 @@ fn idx_insert_duplicate_prefix_different_rowid() {
     let mut expected = vec![n(), n()];
     ops.extend(scan_all());
     expected.extend(scan_expected(&[
-        (6, NULL, Some(5)),
-        (0, Some(1), Some(10)),
-        (1, Some(1), Some(10)),
-        (9, Some(1), Some(10)),
-        (2, Some(1), Some(20)),
-        (3, Some(2), Some(10)),
-        (4, Some(2), Some(30)),
-        (5, Some(3), NULL),
+        (6, NULL, v(5)),
+        (0, v(1), v(10)),
+        (1, v(1), v(10)),
+        (9, v(1), v(10)),
+        (2, v(1), v(20)),
+        (3, v(2), v(10)),
+        (4, v(2), v(30)),
+        (5, v(3), NULL),
     ]));
     check_all(ROWS, 1, &ops, &expected);
 }
@@ -697,8 +699,8 @@ fn idx_insert_with_null_key_and_use_seek() {
         NoConflict(0, p![NULL, 7]),
         IdxInsert {
             cur: 0,
-            a: None,
-            b: Some(7),
+            a: NULL,
+            b: v(7),
             rowid: 8,
             use_seek: true,
         },
@@ -707,13 +709,13 @@ fn idx_insert_with_null_key_and_use_seek() {
     let mut expected = vec![j(), n(), e(8, NULL, 7)];
     ops.extend(scan_all());
     expected.extend(scan_expected(&[
-        (6, NULL, Some(5)),
-        (8, NULL, Some(7)),
-        (1, Some(1), Some(10)),
-        (2, Some(1), Some(20)),
-        (3, Some(2), Some(10)),
-        (4, Some(2), Some(30)),
-        (5, Some(3), NULL),
+        (6, NULL, v(5)),
+        (8, NULL, v(7)),
+        (1, v(1), v(10)),
+        (2, v(1), v(20)),
+        (3, v(2), v(10)),
+        (4, v(2), v(30)),
+        (5, v(3), NULL),
     ]));
     check(
         ROWS,
@@ -731,15 +733,15 @@ fn idx_insert_at_both_ends() {
     let mut ops = vec![
         IdxInsert {
             cur: 0,
-            a: Some(0),
-            b: Some(0),
+            a: v(0),
+            b: v(0),
             rowid: 20,
             use_seek: false,
         },
         IdxInsert {
             cur: 0,
-            a: Some(9),
-            b: Some(9),
+            a: v(9),
+            b: v(9),
             rowid: 21,
             use_seek: false,
         },
@@ -747,14 +749,14 @@ fn idx_insert_at_both_ends() {
     let mut expected = vec![n(), n()];
     ops.extend(scan_all());
     expected.extend(scan_expected(&[
-        (6, NULL, Some(5)),
-        (20, Some(0), Some(0)),
-        (1, Some(1), Some(10)),
-        (2, Some(1), Some(20)),
-        (3, Some(2), Some(10)),
-        (4, Some(2), Some(30)),
-        (5, Some(3), NULL),
-        (21, Some(9), Some(9)),
+        (6, NULL, v(5)),
+        (20, v(0), v(0)),
+        (1, v(1), v(10)),
+        (2, v(1), v(20)),
+        (3, v(2), v(10)),
+        (4, v(2), v(30)),
+        (5, v(3), NULL),
+        (21, v(9), v(9)),
     ]));
     check_all(ROWS, 1, &ops, &expected);
 }
@@ -767,8 +769,8 @@ fn idx_delete_removes_the_entry() {
         SeekGE(0, p![2, 10]),
         IdxDelete {
             cur: 0,
-            a: Some(2),
-            b: Some(10),
+            a: v(2),
+            b: v(10),
             rowid: 3,
         },
         NotFound(0, p![2, 10]),
@@ -777,11 +779,11 @@ fn idx_delete_removes_the_entry() {
     let mut expected = vec![n(), n(), j(), r(5)];
     ops.extend(scan_all());
     expected.extend(scan_expected(&[
-        (6, NULL, Some(5)),
-        (1, Some(1), Some(10)),
-        (2, Some(1), Some(20)),
-        (4, Some(2), Some(30)),
-        (5, Some(3), NULL),
+        (6, NULL, v(5)),
+        (1, v(1), v(10)),
+        (2, v(1), v(20)),
+        (4, v(2), v(30)),
+        (5, v(3), NULL),
     ]));
     check_all(ROWS, 1, &ops, &expected);
 }
@@ -791,24 +793,24 @@ fn idx_delete_with_null_columns() {
     let mut ops = vec![
         IdxDelete {
             cur: 0,
-            a: None,
-            b: Some(5),
+            a: NULL,
+            b: v(5),
             rowid: 6,
         },
         IdxDelete {
             cur: 0,
-            a: Some(3),
-            b: None,
+            a: v(3),
+            b: NULL,
             rowid: 5,
         },
     ];
     let mut expected = vec![n(), n()];
     ops.extend(scan_all());
     expected.extend(scan_expected(&[
-        (1, Some(1), Some(10)),
-        (2, Some(1), Some(20)),
-        (3, Some(2), Some(10)),
-        (4, Some(2), Some(30)),
+        (1, v(1), v(10)),
+        (2, v(1), v(20)),
+        (3, v(2), v(10)),
+        (4, v(2), v(30)),
     ]));
     check_all(ROWS, 1, &ops, &expected);
 }
@@ -822,8 +824,8 @@ fn peer_idx_delete_then_next() {
         SeekGE(1, p![2, 10]),
         IdxDelete {
             cur: 1,
-            a: Some(2),
-            b: Some(10),
+            a: v(2),
+            b: v(10),
             rowid: 3,
         },
         Next(0),
@@ -837,8 +839,8 @@ fn peer_idx_delete_then_next() {
         SeekGE(1, p![2, 10]),
         IdxDelete {
             cur: 1,
-            a: Some(2),
-            b: Some(10),
+            a: v(2),
+            b: v(10),
             rowid: 3,
         },
         Prev(0),
@@ -919,8 +921,8 @@ fn peer_insert_is_seen_by_next() {
         SeekGE(0, p![1, 20]),
         IdxInsert {
             cur: 1,
-            a: Some(1),
-            b: Some(25),
+            a: v(1),
+            b: v(25),
             rowid: 9,
             use_seek: false,
         },
@@ -939,8 +941,8 @@ fn peer_insert_before_is_seen_by_prev() {
         SeekGE(0, p![1, 20]),
         IdxInsert {
             cur: 1,
-            a: Some(1),
-            b: Some(15),
+            a: v(1),
+            b: v(15),
             rowid: 8,
             use_seek: false,
         },
@@ -961,15 +963,15 @@ fn peer_insert_keeps_our_entry() {
         SeekGE(0, p![2, 10]),
         IdxInsert {
             cur: 1,
-            a: Some(0),
-            b: Some(1),
+            a: v(0),
+            b: v(1),
             rowid: 30,
             use_seek: false,
         },
         IdxInsert {
             cur: 1,
-            a: Some(2),
-            b: Some(10),
+            a: v(2),
+            b: v(10),
             rowid: 4,
             use_seek: false,
         },
@@ -1042,8 +1044,8 @@ fn seek_end_then_idx_insert_at_the_end() {
         SeekEnd(0),
         IdxInsert {
             cur: 0,
-            a: Some(9),
-            b: Some(9),
+            a: v(9),
+            b: v(9),
             rowid: 40,
             use_seek: false,
         },
@@ -1054,13 +1056,13 @@ fn seek_end_then_idx_insert_at_the_end() {
     let mut expected = vec![n(), n(), n(), e(40, 9, 9)];
     ops.extend(scan_all());
     expected.extend(scan_expected(&[
-        (6, NULL, Some(5)),
-        (1, Some(1), Some(10)),
-        (2, Some(1), Some(20)),
-        (3, Some(2), Some(10)),
-        (4, Some(2), Some(30)),
-        (5, Some(3), NULL),
-        (40, Some(9), Some(9)),
+        (6, NULL, v(5)),
+        (1, v(1), v(10)),
+        (2, v(1), v(20)),
+        (3, v(2), v(10)),
+        (4, v(2), v(30)),
+        (5, v(3), NULL),
+        (40, v(9), v(9)),
     ]));
     check_all(ROWS, 1, &ops, &expected);
 }
@@ -1071,16 +1073,16 @@ fn count_after_writes() {
         Count(0),
         IdxInsert {
             cur: 1,
-            a: Some(5),
-            b: Some(5),
+            a: v(5),
+            b: v(5),
             rowid: 50,
             use_seek: false,
         },
         Count(0),
         IdxDelete {
             cur: 1,
-            a: Some(5),
-            b: Some(5),
+            a: v(5),
+            b: v(5),
             rowid: 50,
         },
         Count(0),
@@ -1155,8 +1157,8 @@ fn deferred_seek_reads_the_table_row() {
         TblColumn(0, 2),
         TblColumn(0, 0),
     ];
-    let c0 = |v| IObs { c0: Some(v), ..n() };
-    let c1 = |v| IObs { c1: Some(v), ..n() };
+    let c0 = |x| IObs { c0: v(x), ..n() };
+    let c1 = |x| IObs { c1: v(x), ..n() };
     let expected = [
         n(),
         n(),
@@ -1194,7 +1196,7 @@ fn deferred_seek_then_move_the_index() {
         FinishSeek(0),
         TblColumn(0, 0),
     ];
-    let c1 = |v| IObs { c1: Some(v), ..n() };
+    let c1 = |x| IObs { c1: v(x), ..n() };
     // The index is on (2,10,3), the table cursor on row 2 = (1, 20).
     let expected = [n(), n(), j(), c1(20), n(), r(2)];
     check(
@@ -1220,8 +1222,8 @@ const HAS_FIELD_AND_ROW_DATA: &[ReadMode] = &[ReadMode::ColumnHasField, ReadMode
 fn insert_key(a: i64, b: i64, rowid: i64) -> super::index_program::IOp {
     IdxInsert {
         cur: 0,
-        a: Some(a),
-        b: Some(b),
+        a: v(a),
+        b: v(b),
         rowid,
         use_seek: false,
     }
@@ -1403,11 +1405,8 @@ fn known_bug_r1_deferred_seek_with_has_field_and_row_data() {
             TblColumn(0, 1),
             TblColumn(0, 2),
         ];
-        let c0 = IObs { c0: Some(2), ..n() };
-        let c1 = IObs {
-            c1: Some(10),
-            ..n()
-        };
+        let c0 = IObs { c0: v(2), ..n() };
+        let c1 = IObs { c1: v(10), ..n() };
         let expected = [n(), n(), c0, c1];
         check(
             ROWS,

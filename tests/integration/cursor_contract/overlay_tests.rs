@@ -147,24 +147,29 @@ mod table {
 }
 
 mod index {
+    use super::super::index_model::Val;
     use super::*;
 
-    /// A shorter name for the expected entry of `Observe`: `(a, b, rowid)`.
-    fn e(a: i64, b: i64, rowid: i64) -> (Option<i64>, Option<i64>, Option<i64>) {
-        (Some(a), Some(b), Some(rowid))
+    const fn v(x: i64) -> Val {
+        Val::Int(x)
     }
 
-    type Entry = (Option<i64>, Option<i64>, Option<i64>);
+    /// A shorter name for the expected entry of `Observe`: `(a, b, rowid)`.
+    fn e(a: i64, b: i64, rowid: i64) -> (Val, Val, Option<i64>) {
+        (v(a), v(b), Some(rowid))
+    }
+
+    type Entry = (Val, Val, Option<i64>);
 
     fn entry(obs: &IObs) -> Entry {
-        (obs.c0, obs.c1, obs.rowid)
+        (obs.c0.clone(), obs.c1.clone(), obs.rowid)
     }
 
     fn insert_key(a: i64, b: i64, rowid: i64, use_seek: bool) -> IOp {
         IdxInsert {
             cur: 1,
-            a: Some(a),
-            b: Some(b),
+            a: v(a),
+            b: v(b),
             rowid,
             use_seek,
         }
@@ -176,7 +181,7 @@ mod index {
     }
 
     /// Runs `ops` on every engine with the B-tree rows `rows`. Asserts that the `Observe`
-    /// ops give the entries of `expected` (an observe on a missing entry gives `None`s) and
+    /// ops give the entries of `expected` (an observe on a missing entry gives NULLs) and
     /// that every `Next` found a row, but the last ones if `expected` is shorter.
     #[track_caller]
     fn check(name: &str, rows: &[Row], eq_only: bool, ops: &[IOp], expected: &[Entry]) {
@@ -215,14 +220,14 @@ mod index {
     /// The cluster of the index tests: B-tree entries (1,1,4) and (3,1,5), overlay
     /// entries (1,2,5) and (2,5,1).
     fn cluster_rows() -> Vec<Row> {
-        vec![(4, Some(1), Some(1)), (5, Some(3), Some(1))]
+        vec![(4, v(1), v(1)), (5, v(3), v(1))]
     }
 
     fn cluster_writes() -> Vec<IOp> {
         vec![insert_key(1, 2, 5, false), insert_key(2, 5, 1, false)]
     }
 
-    fn seek_and_scan(prefix: Vec<Option<i64>>) -> Vec<IOp> {
+    fn seek_and_scan(prefix: Vec<Val>) -> Vec<IOp> {
         let mut ops = cluster_writes();
         ops.extend([ISeekGE(0, prefix), Observe(0)]);
         ops.extend(steps(3));
@@ -230,10 +235,10 @@ mod index {
     }
 
     const FLAT: [Entry; 4] = [
-        (Some(1), Some(1), Some(4)),
-        (Some(1), Some(2), Some(5)),
-        (Some(2), Some(5), Some(1)),
-        (Some(3), Some(1), Some(5)),
+        (v(1), v(1), Some(4)),
+        (v(1), v(2), Some(5)),
+        (v(2), v(5), Some(1)),
+        (v(3), v(1), Some(5)),
     ];
 
     /// I1, plain `SeekGE` on the prefix [1], then `Next` three times. Control for I1 eq-only.
@@ -243,7 +248,7 @@ mod index {
             "I1 plain",
             &cluster_rows(),
             false,
-            &seek_and_scan(vec![Some(1)]),
+            &seek_and_scan(vec![v(1)]),
             &FLAT,
         );
     }
@@ -259,7 +264,7 @@ mod index {
                 "I1 eq-only",
                 &cluster_rows(),
                 true,
-                &seek_and_scan(vec![Some(1)]),
+                &seek_and_scan(vec![v(1)]),
                 &FLAT,
             );
         });
@@ -271,10 +276,10 @@ mod index {
     #[test]
     fn known_bug_ov1_i2_eq_only_seek_ge_overlay_only_then_next() {
         known_bug("OV1", "I2 eq-only Mvcc", || {
-            let rows = vec![(5, Some(3), Some(1))];
+            let rows = vec![(5, v(3), v(1))];
             let ops = [
                 insert_key(1, 2, 5, false),
-                ISeekGE(0, vec![Some(1)]),
+                ISeekGE(0, vec![v(1)]),
                 Observe(0),
                 INext(0),
                 Observe(0),
@@ -293,11 +298,11 @@ mod index {
     fn found_hit_then_insert(name: &str, a: i64, b: i64, expected: &[Entry]) {
         let mut ops = vec![
             insert_key(1, 2, 5, false),
-            IOp::Found(0, vec![Some(a), Some(b)]),
+            IOp::Found(0, vec![v(a), v(b)]),
             IdxInsert {
                 cur: 0,
-                a: Some(a),
-                b: Some(b),
+                a: v(a),
+                b: v(b),
                 rowid: 9,
                 use_seek: true,
             },

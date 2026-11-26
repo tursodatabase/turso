@@ -5,7 +5,8 @@
 //! b INTEGER)`. An index key is `(a, b, rowid)`. The ops write the index b-tree directly, so
 //! the table may be out of step with the index after a program. Do not run `integrity_check`.
 
-use super::program::{decode_record, emit_column_read, ReadMode};
+use super::index_model::Val;
+use super::program::{emit_column_read, ReadMode};
 use super::{catch_panic, open_database, step_rows, DbKind, Layout};
 use std::sync::Arc;
 use turso_core::namespace::NamespaceId;
@@ -33,10 +34,10 @@ pub fn with_eq_only_seek_ge<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// A prefix of an index key: one or two values, NULL allowed.
-pub type Prefix = Vec<Option<i64>>;
+pub type Prefix = Vec<Val>;
 
 /// A setup row `(id, a, b)` of the table `ti`. SQL puts it into the table and the index.
-pub type Row = (i64, Option<i64>, Option<i64>);
+pub type Row = (i64, Val, Val);
 
 /// One op. `cur` is the number of an index cursor, `tbl` the number of a table cursor.
 /// All index cursors are open on `i_ab`, all table cursors on `ti`.
@@ -60,16 +61,16 @@ pub enum IOp {
     /// `use_seek` tells the engine to trust the position of the last seek.
     IdxInsert {
         cur: usize,
-        a: Option<i64>,
-        b: Option<i64>,
+        a: Val,
+        b: Val,
         rowid: i64,
         use_seek: bool,
     },
     /// The key must be in the index.
     IdxDelete {
         cur: usize,
-        a: Option<i64>,
-        b: Option<i64>,
+        a: Val,
+        b: Val,
         rowid: i64,
     },
     Delete(usize),
@@ -100,12 +101,12 @@ pub enum IOp {
 
 /// What one op returned. `jumped` is true when the jump target of the op was taken (for
 /// `Next` and `Prev` this means "a row was found").
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IObs {
     pub jumped: bool,
     pub rowid: Option<i64>,
-    pub c0: Option<i64>,
-    pub c1: Option<i64>,
+    pub c0: Val,
+    pub c1: Val,
 }
 
 /// The result of a run. If the engine fails in the middle of the program (as MVCC does on
@@ -166,8 +167,12 @@ fn run_index_inner(cfg: &IndexRun, ops: &[IOp]) -> Result<Outcome, String> {
     Ok(Outcome { obs, error })
 }
 
-fn sql(value: &Option<i64>) -> String {
-    value.map_or("NULL".to_string(), |v| v.to_string())
+fn sql(value: &Val) -> String {
+    match value {
+        Val::Null => "NULL".to_string(),
+        Val::Int(v) => v.to_string(),
+        Val::Text(t) => format!("'{}'", t.replace('\'', "''")),
+    }
 }
 
 /// Registers that are shared by all ops. `flag`, `rowid`, `c0`, `c1` and `raw` are next to
@@ -277,10 +282,10 @@ fn compile_index(conn: &Arc<Connection>, cfg: &IndexRun, ops: &[IOp]) -> Result<
         // An ephemeral b-tree has no SQL, so the program writes the setup rows.
         for (id, a, v) in cfg.rows {
             if !tbl_cursors.is_empty() {
-                emit_table_row(&mut b, &cx, &regs, *id, *a, *v);
+                emit_table_row(&mut b, &cx, &regs, *id, a, v);
             }
             if !idx_cursors.is_empty() {
-                emit_idx_insert(&mut b, idx_cursors[0], &regs, *a, *v, *id, false);
+                emit_idx_insert(&mut b, idx_cursors[0], &regs, a, v, *id, false);
             }
         }
     }
@@ -466,7 +471,7 @@ fn emit_op(b: &mut ProgramBuilder, cx: &Cx, regs: &Regs, op: &IOp) -> Result<(),
             use_seek,
         } => {
             load_int(b, regs.flag, 0);
-            emit_idx_insert(b, idx(cur), regs, *a, *bb, *rowid, *use_seek);
+            emit_idx_insert(b, idx(cur), regs, a, bb, *rowid, *use_seek);
         }
         IOp::IdxDelete {
             cur,
@@ -475,7 +480,7 @@ fn emit_op(b: &mut ProgramBuilder, cx: &Cx, regs: &Regs, op: &IOp) -> Result<(),
             rowid,
         } => {
             load_int(b, regs.flag, 0);
-            load_key(b, regs, *a, *bb, *rowid);
+            load_key(b, regs, a, bb, *rowid);
             b.emit_insn(Insn::IdxDelete {
                 start_reg: regs.key,
                 num_regs: 3,
@@ -592,13 +597,20 @@ fn emit_jump(
 }
 
 fn load_int(b: &mut ProgramBuilder, dest: usize, value: i64) {
-    load_value(b, dest, Some(value));
+    load_value(b, dest, &Val::Int(value));
 }
 
-fn load_value(b: &mut ProgramBuilder, dest: usize, value: Option<i64>) {
+fn load_value(b: &mut ProgramBuilder, dest: usize, value: &Val) {
     match value {
-        Some(value) => b.emit_insn(Insn::Integer { value, dest }),
-        None => b.emit_insn(Insn::Null {
+        Val::Int(value) => b.emit_insn(Insn::Integer {
+            value: *value,
+            dest,
+        }),
+        Val::Text(value) => b.emit_insn(Insn::String8 {
+            value: value.clone(),
+            dest,
+        }),
+        Val::Null => b.emit_insn(Insn::Null {
             dest,
             dest_end: None,
         }),
@@ -611,11 +623,11 @@ fn load_prefix(b: &mut ProgramBuilder, regs: &Regs, prefix: &Prefix) {
         "a prefix has 1 or 2 values"
     );
     for (i, value) in prefix.iter().enumerate() {
-        load_value(b, regs.prefix + i, *value);
+        load_value(b, regs.prefix + i, value);
     }
 }
 
-fn load_key(b: &mut ProgramBuilder, regs: &Regs, a: Option<i64>, bb: Option<i64>, rowid: i64) {
+fn load_key(b: &mut ProgramBuilder, regs: &Regs, a: &Val, bb: &Val, rowid: i64) {
     load_value(b, regs.key, a);
     load_value(b, regs.key + 1, bb);
     load_int(b, regs.key + 2, rowid);
@@ -625,8 +637,8 @@ fn emit_idx_insert(
     b: &mut ProgramBuilder,
     cursor: usize,
     regs: &Regs,
-    a: Option<i64>,
-    bb: Option<i64>,
+    a: &Val,
+    bb: &Val,
     rowid: i64,
     use_seek: bool,
 ) {
@@ -648,16 +660,9 @@ fn emit_idx_insert(
 }
 
 /// Writes the row `(NULL, a, b)` at `rowid` into the first table cursor.
-fn emit_table_row(
-    b: &mut ProgramBuilder,
-    cx: &Cx,
-    regs: &Regs,
-    rowid: i64,
-    a: Option<i64>,
-    bb: Option<i64>,
-) {
+fn emit_table_row(b: &mut ProgramBuilder, cx: &Cx, regs: &Regs, rowid: i64, a: &Val, bb: &Val) {
     // The `id` field of a rowid alias column is stored as NULL.
-    load_value(b, regs.key, None);
+    load_value(b, regs.key, &Val::Null);
     load_value(b, regs.key + 1, a);
     load_value(b, regs.key + 2, bb);
     b.emit_insn(Insn::MakeRecord {
@@ -685,15 +690,25 @@ fn to_iobs(row: &[Value], op: &IOp) -> Result<IObs, String> {
         Value::Numeric(_) => Ok(v.as_int()),
         other => Err(format!("unexpected value {other:?}")),
     };
+    let val = |v: &Value| match v {
+        Value::Null => Ok(Val::Null),
+        Value::Numeric(_) => Ok(v.as_int().map_or(Val::Null, Val::Int)),
+        Value::Text(t) => Ok(Val::text(t.as_str())),
+        other => Err(format!("unexpected value {other:?}")),
+    };
     let mut obs = IObs {
         jumped: int(&row[0])? == Some(1),
         rowid: int(&row[1])?,
-        c0: int(&row[2])?,
-        c1: int(&row[3])?,
+        c0: val(&row[2])?,
+        c1: val(&row[3])?,
     };
     if matches!(row[4], Value::Blob(_)) {
-        let fields = decode_record(&row[4])?;
-        let field = |i: usize| fields.get(i).copied().flatten();
+        let fields = decode_index_record(&row[4])?;
+        let field = |i: usize| fields.get(i).cloned().unwrap_or(Val::Null);
+        let rowid_field = |i: usize| match fields.get(i) {
+            Some(Val::Int(v)) => Some(*v),
+            _ => None,
+        };
         match op {
             IOp::Column(_, 0) => obs.c0 = field(0),
             IOp::Column(_, i) => obs.c1 = field(*i),
@@ -704,10 +719,77 @@ fn to_iobs(row: &[Value], op: &IOp) -> Result<IObs, String> {
             IOp::Observe(_) => {
                 obs.c0 = field(0);
                 obs.c1 = field(1);
-                obs.rowid = field(2);
+                obs.rowid = rowid_field(2);
             }
             other => return Err(format!("{other:?} gave a record")),
         }
     }
     Ok(obs)
+}
+
+/// Decodes a record that holds NULL, integers and text. Like `decode_record` in `program.rs`,
+/// but a text field is decoded too.
+fn decode_index_record(raw: &Value) -> Result<Vec<Val>, String> {
+    let bytes = match raw {
+        Value::Null => return Ok(Vec::new()),
+        Value::Blob(bytes) => bytes.to_vec(),
+        other => return Err(format!("RowData gave {other:?}")),
+    };
+    fn varint(bytes: &[u8], pos: &mut usize) -> u64 {
+        let mut value = 0u64;
+        for i in 0..9 {
+            let byte = bytes[*pos];
+            *pos += 1;
+            if i == 8 {
+                return (value << 8) | byte as u64;
+            }
+            value = (value << 7) | (byte & 0x7f) as u64;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        value
+    }
+    let mut pos = 0;
+    let header_len = varint(&bytes, &mut pos) as usize;
+    let mut types = Vec::new();
+    while pos < header_len {
+        types.push(varint(&bytes, &mut pos));
+    }
+    let mut fields = Vec::new();
+    for ty in types {
+        let size = match ty {
+            0 | 8 | 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 => 8,
+            // An odd serial type from 13 is text.
+            t if t >= 13 && t % 2 == 1 => ((t - 13) / 2) as usize,
+            other => return Err(format!("serial type {other} is not an integer or text")),
+        };
+        fields.push(match ty {
+            0 => Val::Null,
+            8 => Val::Int(0),
+            9 => Val::Int(1),
+            t if t >= 13 => {
+                let text = std::str::from_utf8(&bytes[pos..pos + size])
+                    .map_err(|e| format!("text field is not UTF-8: {e}"))?;
+                Val::text(text)
+            }
+            _ => {
+                // Big endian, two's complement.
+                let slice = &bytes[pos..pos + size];
+                let mut value = if slice[0] & 0x80 != 0 { -1i64 } else { 0 };
+                for byte in slice {
+                    value = (value << 8) | *byte as i64;
+                }
+                Val::Int(value)
+            }
+        });
+        pos += size;
+    }
+    Ok(fields)
 }
