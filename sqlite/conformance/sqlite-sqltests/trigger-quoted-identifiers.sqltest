@@ -84,3 +84,65 @@ expect {
     inserted: 2
     inserted: 3
 }
+
+setup dqs_dml {
+    .dbconfig dqs_dml on
+}
+
+# A WHEN clause has no table, so a double-quoted name that is also a column
+# of the trigger's table is read as a string, as in SQLite. The sqlite.org CLI
+# that CI runs reads double-quoted names as strings only with dqs_dml on.
+@backend cli
+@setup dqs_dml
+test when-clause-double-quoted-column-name-is-string {
+    CREATE TABLE t(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN 'b' = "b" BEGIN
+        INSERT INTO log VALUES(new.a);
+    END;
+    INSERT INTO t VALUES(1, 2);
+    SELECT * FROM log;
+}
+expect {
+    1
+}
+
+test when-clause-bare-column-after-same-name-quoted-is-error {
+    CREATE TABLE t(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN "b" IS b BEGIN
+        INSERT INTO log VALUES(1);
+    END;
+    INSERT INTO t VALUES(1, NULL);
+}
+expect error {
+    no such column: b
+}
+
+@backend cli
+@setup dqs_dml
+test when-clause-bare-rowid-after-same-name-quoted-is-error {
+    CREATE TABLE t(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN "rowid" = rowid BEGIN
+        INSERT INTO log VALUES(1);
+    END;
+    INSERT INTO t VALUES(1, NULL);
+}
+expect error {
+    no such column: rowid
+}
+
+@backend cli
+@setup dqs_dml
+test when-clause-bare-unknown-name-after-same-name-quoted-is-error {
+    CREATE TABLE t(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN "zz" = zz BEGIN
+        INSERT INTO log VALUES(1);
+    END;
+    INSERT INTO t VALUES(1, NULL);
+}
+expect error {
+    no such column: zz
+}

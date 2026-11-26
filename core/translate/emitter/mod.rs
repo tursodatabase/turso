@@ -226,21 +226,6 @@ impl RegisterColumn {
         }
     }
 
-    /// NEW.x or OLD.x in a trigger. It has the collation and type of column x
-    /// but, as in SQLite, no affinity unless x is the rowid alias.
-    /// See https://www.sqlite.org/forum/forumpost/819f2d6627
-    pub fn trigger_row_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
-        Self {
-            affinity: if column.is_rowid_alias() {
-                Affinity::Integer
-            } else {
-                Affinity::None
-            },
-            collation: crate::translate::collate::column_collation(column),
-            column_type: column_type(column, is_strict, schema),
-        }
-    }
-
     pub fn rowid() -> Self {
         Self {
             affinity: Affinity::Integer,

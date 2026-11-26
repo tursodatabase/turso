@@ -4,7 +4,6 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, Column, Trigger};
 use crate::sync::Arc;
 use crate::translate::collate::column_collation;
-use crate::translate::emitter::RegisterColumn;
 use crate::translate::expr::WalkControl;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
@@ -17,7 +16,6 @@ use crate::translate::{
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
-use crate::turso_assert;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::DmlRowForm;
 use crate::vdbe::insn::{Insn, Subprogram};
@@ -573,6 +571,14 @@ fn execute_trigger_commands(
         override_conflict: ctx.override_conflict,
         db_name,
     };
+    let when_expr = match &trigger.when_clause {
+        Some(when_expr) => {
+            let mut when_expr = when_expr.clone();
+            rewrite_when_clause_for_subprogram(&mut when_expr, &subprogram_ctx)?;
+            Some(when_expr)
+        }
+        None => None,
+    };
     // The compilation of nested triggers recurses one time for each level, so
     // new_program_builder makes the large builder in its own stack frame, and
     // not in the frame of this function.
@@ -607,7 +613,50 @@ fn execute_trigger_commands(
     // `resolver` as a parameter rather than capturing the outer binding -
     // see `Resolver::with_database_scope_mut`.
     subprogram_builder.prologue();
-    resolver.with_trigger_scope(trigger_namespace, trigger.name.clone(), |resolver| {
+    // The subprogram's registers are its own, so the caller's register
+    // columns do not describe them.
+    let saved_register_columns = std::mem::take(&mut resolver.register_columns);
+    let result = resolver.with_trigger_scope(trigger_namespace, trigger.name.clone(), |resolver| {
+        // The WHEN clause is evaluated inside the subprogram, as in SQLite, so
+        // that a firing skipped because the trigger is already running does
+        // not evaluate it.
+        let trigger_end = subprogram_builder.allocate_label();
+        if let Some(mut when_expr) = when_expr {
+            let mut subqueries = Vec::new();
+            plan_subqueries_in_expr_without_from_clause(
+                &mut subprogram_builder,
+                &mut subqueries,
+                &mut when_expr,
+                resolver,
+                connection,
+            )?;
+            // Always re-evaluate the subqueries (no `Once`), because the WHEN
+            // clause is checked for each row and the trigger bodies may change
+            // the tables the subqueries read.
+            for subquery in &mut subqueries {
+                let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
+                emit_non_from_clause_subquery(
+                    &mut subprogram_builder,
+                    resolver,
+                    *plan,
+                    &subquery.query_type,
+                    true,
+                )?;
+            }
+            let when_reg = subprogram_builder.alloc_register();
+            translate_expr(
+                &mut subprogram_builder,
+                None,
+                &when_expr,
+                when_reg,
+                resolver,
+            )?;
+            subprogram_builder.emit_insn(Insn::IfNot {
+                reg: when_reg,
+                jump_if_null: true,
+                target_pc: trigger_end,
+            });
+        }
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
             translate_inner(
@@ -626,8 +675,11 @@ fn execute_trigger_commands(
                 subprogram_builder.emit_insn(Insn::ResetCount);
             }
         }
+        subprogram_builder.preassign_label_to_next_insn(trigger_end);
         Ok(())
-    })?;
+    });
+    resolver.register_columns = saved_register_columns;
+    result?;
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         build_program(subprogram_builder, connection, true, "trigger subprogram")?;
@@ -691,6 +743,35 @@ fn execute_trigger_commands(
     });
 
     Ok(true)
+}
+
+/// Rewrite NEW and OLD references in a trigger's WHEN clause into parameters.
+/// Outside its subqueries a WHEN clause has no table, so a column there must
+/// be qualified with NEW or OLD. A double-quoted bare name is left to
+/// `translate_expr`, which reads it as a string when DQS allows it.
+fn rewrite_when_clause_for_subprogram(
+    expr: &mut ast::Expr,
+    ctx: &TriggerSubprogramContext,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if let Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) = e {
+            let ns = normalize_ident(ns.as_str());
+            if !ns.eq_ignore_ascii_case("new") && !ns.eq_ignore_ascii_case("old") {
+                bail_parse_error!("no such column: {}.{}", ns, normalize_ident(col.as_str()));
+            }
+        }
+        // Rejected here rather than left to `translate_expr`, which reuses the
+        // register of an equal expression already emitted, so in `"b" = b` it
+        // would read `b` from the string emitted for `"b"`.
+        if let Expr::Id(name) = e {
+            if !name.quoted_with('"') {
+                bail_parse_error!("no such column: {}", name.as_str());
+            }
+        }
+        rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
@@ -924,100 +1005,16 @@ pub fn fire_trigger(
     // So we can use the decoded registers directly, skipping N Copy + 1 Affinity per fire.
     let ctx = &decode_trigger_registers(program, resolver, ctx)?;
 
-    let saved_register_columns = std::mem::take(&mut resolver.register_columns);
-    populate_trigger_register_columns(resolver, ctx);
-    let result = (|| -> Result<()> {
-        // A trigger body is inlined and re-executed once per affected row. Any
-        // run-once block inside it (an uncorrelated subquery, a hash or
-        // ephemeral-index build) is guarded by Insn::Once, whose "already ran"
-        // state otherwise persists across firings and would reuse a value
-        // cached during an earlier firing. Clear that state at the start of
-        // each firing so every firing re-evaluates from the current table
-        // state, the same fresh start SQLite gets from a per-invocation trigger
-        // sub-program.
-        let firing_end = program.allocate_label();
-        program.emit_insn(Insn::ResetOnce {
-            region_end: firing_end,
-        });
-
-        // Evaluate WHEN clause if present
-        if let Some(mut when_expr) = trigger.when_clause.clone() {
-            crate::stack::trace_stack!("when_clause");
-            // Rewrite NEW/OLD references in WHEN clause to use registers
-            // NEW and OLD registers hold decoded values, so they say which
-            // custom type they hold.
-            let column_types = column_custom_type_names(
-                ctx.table.columns(),
-                ctx.table.is_strict,
-                resolver.schema(),
-            );
-            rewrite_trigger_expr_for_when_clause(&mut when_expr, ctx, &column_types)?;
-
-            // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
-            // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
-            let mut subqueries = Vec::new();
-            plan_subqueries_in_expr_without_from_clause(
-                program,
-                &mut subqueries,
-                &mut when_expr,
-                resolver,
-                connection,
-            )?;
-            // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
-            // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
-            // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
-            for subquery in &mut subqueries {
-                let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
-                emit_non_from_clause_subquery(
-                    program,
-                    resolver,
-                    *plan,
-                    &subquery.query_type,
-                    true, // always re-evaluate: trigger WHEN is checked per-row
-                )?;
-            }
-
-            let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
-
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: when_reg,
-                jump_if_null: true,
-                target_pc: skip_label,
-            });
-
-            // Execute trigger commands if WHEN clause is true
-            execute_trigger_commands(
-                program,
-                resolver,
-                &trigger,
-                ctx,
-                connection,
-                namespace,
-                ignore_jump_target,
-            )?;
-
-            program.preassign_label_to_next_insn(skip_label);
-        } else {
-            // No WHEN clause - always execute
-            execute_trigger_commands(
-                program,
-                resolver,
-                &trigger,
-                ctx,
-                connection,
-                namespace,
-                ignore_jump_target,
-            )?;
-        }
-
-        // Marks the end of this firing's instruction range for ResetOnce above.
-        program.preassign_label_to_next_insn(firing_end);
-        Ok(())
-    })();
-    resolver.register_columns = saved_register_columns;
-    result
+    execute_trigger_commands(
+        program,
+        resolver,
+        &trigger,
+        ctx,
+        connection,
+        namespace,
+        ignore_jump_target,
+    )?;
+    Ok(())
 }
 
 fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
@@ -1095,63 +1092,6 @@ fn decode_trigger_registers(
         old_registers: decoded_old,
         override_conflict: ctx.override_conflict,
         new_form: DmlRowForm::UserFacing, // decoded now
-    })
-}
-
-fn populate_trigger_register_columns(resolver: &mut Resolver, ctx: &TriggerContext) {
-    populate_trigger_row_register_columns(resolver, &ctx.table, ctx.new_registers.as_deref());
-    populate_trigger_row_register_columns(resolver, &ctx.table, ctx.old_registers.as_deref());
-}
-
-/// NEW/OLD registers hold one register per table column followed by the rowid.
-fn populate_trigger_row_register_columns(
-    resolver: &mut Resolver,
-    table: &BTreeTable,
-    row_registers: Option<&[usize]>,
-) {
-    let Some(registers) = row_registers else {
-        return;
-    };
-    let columns = table.columns();
-    turso_assert!(
-        registers.len() == columns.len() + 1,
-        "a trigger row has one register per column and one for the rowid"
-    );
-    for (column, &register) in columns.iter().zip(registers) {
-        let register_column =
-            RegisterColumn::trigger_row_column(column, table.is_strict, resolver.schema());
-        resolver.register_columns.insert(register, register_column);
-    }
-    let rowid_register = *registers
-        .last()
-        .expect("a trigger row has a rowid register");
-    resolver
-        .register_columns
-        .insert(rowid_register, RegisterColumn::rowid());
-}
-
-/// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)
-#[turso_macros::trace_stack]
-fn rewrite_trigger_expr_for_when_clause(
-    expr: &mut ast::Expr,
-    ctx: &TriggerContext,
-    column_types: &[Option<Box<ast::Type>>],
-) -> Result<()> {
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_trigger_expr_single_for_when_clause(e, ctx, column_types, false)?;
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
-/// Rewrite NEW/OLD references in all expressions within a SELECT statement for trigger WHEN clauses.
-fn rewrite_expressions_in_select_for_when_clause(
-    select: &mut ast::Select,
-    ctx: &TriggerContext,
-    column_types: &[Option<Box<ast::Type>>],
-) -> Result<()> {
-    rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
-        rewrite_trigger_expr_single_for_when_clause(e, ctx, column_types, true)
     })
 }
 
@@ -1350,114 +1290,6 @@ where
             Ok(WalkControl::Continue)
         },
     )?;
-
-    Ok(())
-}
-
-fn rewrite_trigger_expr_single_for_when_clause(
-    expr: &mut ast::Expr,
-    ctx: &TriggerContext,
-    column_types: &[Option<Box<ast::Type>>],
-    allow_non_trigger_qualified: bool,
-) -> Result<()> {
-    let table = &ctx.table;
-    let decoded_column = |register: usize, column: usize| Expr::Register {
-        register,
-        custom_type: column_types[column].clone(),
-    };
-    match expr {
-        // Bare column references are not valid in trigger WHEN clauses.
-        // Per SQLite docs, columns must be qualified with NEW or OLD.
-        Expr::Id(name) if !allow_non_trigger_qualified => {
-            let ident = normalize_ident(name.as_str());
-            if table.get_column(&ident).is_some()
-                || ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident))
-            {
-                crate::bail_parse_error!("no such column: {}", ident);
-            }
-            return Ok(());
-        }
-        Expr::Exists(select) | Expr::Subquery(select) => {
-            rewrite_expressions_in_select_for_when_clause(select, ctx, column_types)?;
-            return Ok(());
-        }
-        Expr::InSelect { rhs, .. } => {
-            rewrite_expressions_in_select_for_when_clause(rhs, ctx, column_types)?;
-            return Ok(());
-        }
-        Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-            let ns = normalize_ident(ns.as_str());
-            let col = normalize_ident(col.as_str());
-
-            // Handle NEW.column references
-            if ns.eq_ignore_ascii_case("new") {
-                if let Some(new_regs) = &ctx.new_registers {
-                    if let Some((idx, col_def)) = table.get_column(&col) {
-                        if col_def.is_rowid_alias() {
-                            // Rowid alias columns map to the rowid register (last element)
-                            *expr = Expr::register(
-                                *new_regs.last().expect("NEW registers must be provided"),
-                            );
-                            return Ok(());
-                        }
-                        if idx < new_regs.len() {
-                            *expr = decoded_column(new_regs[idx], idx);
-                            return Ok(());
-                        }
-                    }
-                    // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
-                        *expr = Expr::register(
-                            *ctx.new_registers
-                                .as_ref()
-                                .expect("NEW registers must be provided")
-                                .last()
-                                .expect("NEW registers must be provided"),
-                        );
-                        return Ok(());
-                    }
-                    bail_parse_error!("no such column in NEW: {}", col);
-                } else {
-                    bail_parse_error!(
-                        "NEW references are only valid in INSERT and UPDATE triggers"
-                    );
-                }
-            }
-
-            // Handle OLD.column references
-            if ns.eq_ignore_ascii_case("old") {
-                if let Some(old_regs) = &ctx.old_registers {
-                    if let Some((idx, _)) = table.get_column(&col) {
-                        if idx < old_regs.len() {
-                            *expr = decoded_column(old_regs[idx], idx);
-                            return Ok(());
-                        }
-                    }
-                    // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
-                        *expr = Expr::register(
-                            *ctx.old_registers
-                                .as_ref()
-                                .expect("OLD registers must be provided")
-                                .last()
-                                .expect("OLD registers must be provided"),
-                        );
-                        return Ok(());
-                    }
-                    bail_parse_error!("no such column in OLD: {}", col);
-                } else {
-                    bail_parse_error!(
-                        "OLD references are only valid in UPDATE and DELETE triggers"
-                    );
-                }
-            }
-
-            if !allow_non_trigger_qualified {
-                bail_parse_error!("no such column: {ns}.{col}");
-            }
-        }
-        _ => {}
-    }
 
     Ok(())
 }
