@@ -93,8 +93,11 @@ use explain::{
     insn_to_row_with_comment, ExplainInfo, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS,
     EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
 };
+// The maps of ProgramState have keys that are register, cursor or instruction
+// numbers, and some opcodes read them for each row. SipHash, the hash of the
+// standard HashMap, costs much more than FxHash for these keys.
+use rustc_hash::FxHashMap;
 use std::{
-    collections::HashMap,
     num::NonZero,
     ops::Deref,
     sync::{
@@ -1190,10 +1193,10 @@ pub struct ProgramState {
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
-    hash_tables: HashMap<usize, HashTable>,
+    hash_tables: FxHashMap<usize, HashTable>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
-    ephemeral_temp_files: HashMap<usize, TempFile>,
+    ephemeral_temp_files: FxHashMap<usize, TempFile>,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
     /// Pending error to return after FAIL mode commit completes.
@@ -1221,17 +1224,17 @@ pub struct ProgramState {
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
-    pub(crate) subprogram_stmt_cache: HashMap<usize, crate::alloc::DynBox<Statement>>,
+    pub(crate) subprogram_stmt_cache: FxHashMap<usize, crate::alloc::DynBox<Statement>>,
     /// Number of trigger and foreign key action programs that execute this
     /// program, one inside the other. It is 0 for the program of a statement.
     pub(crate) subprogram_depth: usize,
     /// RowSet objects stored by register index
-    rowsets: HashMap<usize, RowSet>,
+    rowsets: FxHashMap<usize, RowSet>,
     // Cache of unused allocated Vecs
     pub(crate) spare_agg_payloads: Vec<crate::alloc::Vec<Value>>,
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
     /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
-    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
+    pub(crate) bloom_filters: FxHashMap<usize, BloomFilter>,
     /// Number of deferred foreign key violations when the statement started.
     /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
     /// is reset to this value.
@@ -1356,11 +1359,11 @@ impl ProgramState {
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             fk_immediate_violation: None,
-            rowsets: HashMap::default(),
+            rowsets: FxHashMap::default(),
             spare_agg_payloads: Vec::new(),
-            bloom_filters: HashMap::default(),
-            hash_tables: HashMap::default(),
-            ephemeral_temp_files: HashMap::default(),
+            bloom_filters: FxHashMap::default(),
+            hash_tables: FxHashMap::default(),
+            ephemeral_temp_files: FxHashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
             is_active_read: false,
@@ -1376,7 +1379,7 @@ impl ProgramState {
             pending_fail_prepare_error: None,
             halt_in_progress: false,
             pending_cdc_info: None,
-            subprogram_stmt_cache: HashMap::default(),
+            subprogram_stmt_cache: FxHashMap::default(),
             subprogram_depth: 0,
             mv_store_cache: None,
             pending_fresh_tx: None,
