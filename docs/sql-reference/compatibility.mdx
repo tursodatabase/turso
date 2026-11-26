@@ -68,7 +68,9 @@ The PostgreSQL opening functions initialize the relation catalog before returnin
 the database, including for asynchronous server opens. Relations receive stable,
 persisted OIDs when created, and column `attrelid` values identify those relations.
 
-`pg_catalog.pg_description` is a table in the database file. `COMMENT ON`
+`pg_catalog.pg_description` is a table in the database file from the first
+`COMMENT ON` of the database. Before that, the file has no such table, and the
+catalog has only the built-in comments of PostgreSQL 18. `COMMENT ON`
 stores the comment of a table, view, materialized view, index, sequence, table
 column or schema in it, in the transaction of the statement, and `COMMENT ON
 ... IS NULL` deletes it. Dropping the relation, the column or the schema

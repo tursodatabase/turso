@@ -95,7 +95,13 @@ always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_collation` has the 7 built-in rows and the columns of PostgreSQL 18. It
 does not have the collations of the operating system, which PostgreSQL adds
 when it creates a cluster.
-`pg_description` is a stored table. It has the comments that `COMMENT ON`
+`pg_description` has the 3,675 built-in comments of PostgreSQL 18, and the
+unique index of PostgreSQL on `(objoid, classoid, objsubid)`. The first
+`COMMENT ON` of a database stores the table. Before that, the database file has
+no such table, and the catalog has only the built-in comments. A built-in
+comment names its object by the oid of PostgreSQL, and `pg_proc` has other
+oids, so `obj_description` of a function can return the comment of another
+function. It has the comments that `COMMENT ON`
 stored, and the default `standard public schema` comment for `public`, so
 pg_dump does not emit a command to clear that comment on restore. Dropping a
 relation, a column or a schema deletes its comments. The public schema reports

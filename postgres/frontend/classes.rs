@@ -485,6 +485,14 @@ pub(crate) fn row_security_policies<'a>(
 pub(crate) struct PostgresCatalog;
 
 impl Catalog for PostgresCatalog {
+    /// The catalogs that have the built-in rows of PostgreSQL before a
+    /// statement stores them. The first statement that writes to one of
+    /// them stores it, and the stored table then has the name in place of
+    /// the virtual table.
+    fn seeded_tables(&self) -> &'static [&'static str] {
+        crate::seeded::names_of_catalogs_that_a_write_stores()
+    }
+
     fn emit(
         &self,
         program: &mut ProgramBuilder,

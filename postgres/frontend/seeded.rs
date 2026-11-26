@@ -4,14 +4,21 @@
 //! `CREATE TABLE` statement and its built-in rows, the seed. A
 //! [`SeededCatalog`] is a virtual table over one of them. It reads a row
 //! from the seed when a statement asks for it, and stores nothing.
+//!
+//! [`SEEDED_CATALOGS`] lists the catalogs. The first statement that writes
+//! to a catalog can store it: [`statements_that_write`] puts the statements
+//! that create and fill the table before the statements of the write.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use turso_core::native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule};
+use turso_core::schema::Schema;
 use turso_core::types::IOResultOr;
-use turso_core::{Connection, IOResult, LimboError, Numeric, Result, Value};
+use turso_core::{
+    Connection, IOResult, LimboError, NamespaceId, Numeric, OpenOptions, Result, Value,
+};
 use turso_ext::{
-    ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
+    ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode, VTabKind,
 };
 use turso_pg_catalog::SeededTable;
 
@@ -20,21 +27,146 @@ const SCAN: i32 = 0;
 /// `idx_num` of a lookup of the row whose rowid is the first argument.
 const FIND: i32 = 1;
 
-/// The virtual table of a catalog that has the rows of a seed, and the
-/// hidden system column `tableoid` after the columns of the seed.
+/// A catalog that has the rows of a seed, and its virtual table. The table
+/// can have the hidden system column `tableoid` after the columns of the
+/// seed.
 #[derive(Clone, Copy)]
 pub(crate) struct SeededCatalog {
     table: &'static SeededTable,
     /// The oid of the catalog in `pg_class`, which is the `tableoid` of
     /// each row. It is the number of the `create` line of the catalog in
-    /// `postgres.bki`.
-    table_oid: i64,
+    /// `postgres.bki`. None for a catalog without the column: a catalog
+    /// that a statement can store has the columns of the stored table and
+    /// no other.
+    table_oid: Option<i64>,
+    /// Whether the first statement that writes to the catalog stores it.
+    /// The stored table then has the name in place of the virtual table.
+    /// A catalog that no statement writes is never stored.
+    first_write_stores: bool,
 }
 
-impl SeededCatalog {
-    pub(crate) const fn new(table: &'static SeededTable, table_oid: i64) -> Self {
-        Self { table, table_oid }
+/// The seeded table of `pg_collation`. A seeded table is a static, so that
+/// its catalog can refer to it for the life of the process.
+static PG_COLLATION: SeededTable = turso_pg_catalog::PG_COLLATION_SEEDED_TABLE;
+/// The seeded table of `pg_description`.
+static PG_DESCRIPTION: SeededTable = turso_pg_catalog::PG_DESCRIPTION_SEEDED_TABLE;
+
+/// Each catalog that serves the built-in rows of PostgreSQL 18. To add a
+/// catalog, add its line.
+static SEEDED_CATALOGS: [SeededCatalog; 2] = [
+    // `create pg_collation 3456` in `postgres.bki`. No statement writes it.
+    SeededCatalog {
+        table: &PG_COLLATION,
+        table_oid: Some(3456),
+        first_write_stores: false,
+    },
+    // COMMENT ON writes it.
+    SeededCatalog {
+        table: &PG_DESCRIPTION,
+        table_oid: None,
+        first_write_stores: true,
+    },
+];
+
+/// Registers the virtual table of each seeded catalog under the name of the
+/// catalog.
+pub(crate) fn register_seeded_catalogs(mut options: OpenOptions) -> OpenOptions {
+    for catalog in &SEEDED_CATALOGS {
+        options =
+            options.native_module(catalog.table.name, VTabKind::TableValuedFunction, *catalog);
     }
+    options
+}
+
+/// The names of the catalogs that the first write stores, for
+/// `Catalog::seeded_tables`: core lets a stored table of one of these names
+/// replace the virtual table.
+pub(crate) fn names_of_catalogs_that_a_write_stores() -> &'static [&'static str] {
+    static NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        SEEDED_CATALOGS
+            .iter()
+            .filter(|catalog| catalog.first_write_stores)
+            .map(|catalog| catalog.table.name)
+            .collect()
+    });
+    &NAMES
+}
+
+/// Whether the seeded catalog `name` is stored in the database of `schema`.
+pub(crate) fn is_stored(schema: &Schema, name: &str) -> bool {
+    schema.get_btree_table(NamespaceId::ROOT, name).is_some()
+}
+
+/// `statements`, which write to the seeded catalog `name`, after the engine
+/// statements that store the catalog when it is not stored. The first
+/// statement that writes to a catalog so stores it, in its own transaction.
+pub(crate) fn statements_that_write(
+    schema: &Schema,
+    name: &str,
+    statements: Vec<String>,
+) -> Result<Vec<String>> {
+    if is_stored(schema, name) {
+        return Ok(statements);
+    }
+    let Some(catalog) = SEEDED_CATALOGS
+        .iter()
+        .find(|catalog| catalog.first_write_stores && catalog.table.name == name)
+    else {
+        return Err(LimboError::InternalError(format!(
+            "{name} is not a catalog that a write stores"
+        )));
+    };
+    let mut all = store_statements(catalog.table)?;
+    all.extend(statements);
+    Ok(all)
+}
+
+/// The number of rows that one INSERT statement of [`store_statements`]
+/// has.
+const ROWS_IN_ONE_INSERT: usize = 500;
+
+/// The engine statements that store `table`: they create the table, insert
+/// the rows of the seed, and create the indexes. The indexes come after the
+/// rows, so that each index is built one time from all rows.
+fn store_statements(table: &SeededTable) -> Result<Vec<String>> {
+    let seed = table.seed;
+    let mut statements = vec![table.create_sql.to_string()];
+    let mut row = Vec::new();
+    let mut rows = Vec::with_capacity(ROWS_IN_ONE_INSERT);
+    for index in 0..seed.len() {
+        row.clear();
+        seed.row(index, &mut row);
+        let values = row
+            .iter()
+            .map(sql_literal)
+            .collect::<Result<Vec<String>>>()?;
+        rows.push(format!("({})", values.join(", ")));
+        if rows.len() == ROWS_IN_ONE_INSERT || index + 1 == seed.len() {
+            statements.push(format!(
+                "INSERT INTO {} VALUES {}",
+                table.name,
+                rows.join(", ")
+            ));
+            rows.clear();
+        }
+    }
+    statements.extend(table.index_sql.iter().map(|sql| sql.to_string()));
+    Ok(statements)
+}
+
+/// `value` as a literal of SQLite.
+fn sql_literal(value: &Value) -> Result<String> {
+    Ok(match value {
+        Value::Null => "NULL".to_string(),
+        Value::Numeric(Numeric::Integer(integer)) => integer.to_string(),
+        Value::Numeric(Numeric::Float(real)) => format!("{:?}", f64::from(*real)),
+        Value::Text(text) => format!("'{}'", text.as_str().replace('\'', "''")),
+        Value::Blob(_) => {
+            return Err(LimboError::InternalError(
+                "a seed row has a blob, which no catalog of PostgreSQL has".to_string(),
+            ))
+        }
+    })
 }
 
 impl std::fmt::Debug for SeededCatalog {
@@ -57,7 +189,10 @@ impl VirtualTableModule for SeededCatalog {
                 self.table.name
             )));
         };
-        Ok(format!("{columns}, tableoid INTEGER HIDDEN)"))
+        Ok(match self.table_oid {
+            Some(_) => format!("{columns}, tableoid INTEGER HIDDEN)"),
+            None => self.table.create_sql.to_string(),
+        })
     }
 
     fn create(&self, _args: &[Value]) -> Result<Self::Table> {
@@ -236,7 +371,10 @@ impl VirtualTableCursor for SeededCursor {
         let value = match self.position {
             Position::Done => Value::Null,
             // `tableoid` is the column after the columns of the seed.
-            _ if column == self.row.len() => Value::from_i64(self.catalog.table_oid),
+            _ if column == self.row.len() => match self.catalog.table_oid {
+                Some(table_oid) => Value::from_i64(table_oid),
+                None => Value::Null,
+            },
             _ => self.row[column].clone(),
         };
         Ok(IOResult::Done(value))

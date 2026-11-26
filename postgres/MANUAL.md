@@ -407,7 +407,8 @@ engine's own tables, which have no row in `pg_class`, can only be read and
 written by a superuser: the `__turso_internal_*` tables, which hold catalogs
 such as the roles and the privileges of each table, and `sqlite_sequence`.
 Roles read the catalogs through `pg_class`, `pg_roles` and the other
-`pg_catalog` views. `pg_description` is a stored table too, which every role
+`pg_catalog` views. `pg_description` is a stored table too, from the first
+`COMMENT ON` of the database, which every role
 reads and no statement of a user writes. `COMMENT ON` writes it for the owner
 of the object.
 

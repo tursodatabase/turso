@@ -7,7 +7,13 @@
 //! and schemas have comments. `COMMENT ON` any other kind of object is
 //! refused.
 //!
-//! Nothing in memory holds these rows. `COMMENT ON` writes them with
+//! `pg_description` is a seeded catalog (see [`crate::seeded`]). A database
+//! has the built-in comments of PostgreSQL before anything is stored: a
+//! virtual table serves them from memory. The first statement that writes a
+//! comment stores the table with the built-in comments, and the stored
+//! table then has the name.
+//!
+//! Nothing in memory holds the stored rows. `COMMENT ON` writes them with
 //! statements of the engine in the user's transaction, and
 //! `obj_description` and `col_description` are queries on the table.
 //! A statement that drops a relation or a column deletes its comments in
@@ -22,7 +28,7 @@ use turso_core::{
     to_u32, CmpInsFlags, CollationSeq, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn,
     LimboError, ProgramBuilder, RegisterOrLiteral, Result, MAIN_DB_ID,
 };
-use turso_pg_catalog::PgDescription;
+use turso_pg_catalog::PG_DESCRIPTION;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_SCHEMA_NAME,
     SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
@@ -31,11 +37,11 @@ use turso_pg_parser::translator::{
     is_catalog_table_name, PgCommentObject, PgCommentOnStmt, PG_CLASS_OID, PG_NAMESPACE_OID,
 };
 
-use crate::catalog::{key_constraint_names, namespace_oid, PUBLIC_NAMESPACE_OID};
+use crate::catalog::{key_constraint_names, namespace_oid};
 use crate::classes::{class_catalog, RelationClass};
 use crate::error::sqlstate_error;
 use crate::roles::schema_roles;
-use crate::schema_init::TableInit;
+use crate::seeded::{is_stored, statements_that_write};
 use crate::session::relation_lookup_namespaces;
 
 pub(crate) const DESCRIPTION_TABLE_NAME: &str = "pg_description";
@@ -54,25 +60,9 @@ pub(crate) const DESCRIPTION_INDEX_NAME: &str = "pg_description_o_c_o_index";
 /// index and the rowid.
 const DESCRIPTION_INDEX_KEY_LEN: usize = 4;
 
-/// The comment that PostgreSQL gives the public schema.
-const INSERT_PUBLIC_SCHEMA_COMMENT_SQL: &str =
-    "INSERT INTO pg_description (objoid, classoid, objsubid, description) \
-     VALUES (2200, 2615, 0, 'standard public schema')";
-
-// The statement above spells the oids so that it can be a constant.
-const _: () = assert!(PUBLIC_NAMESPACE_OID == 2200 && PG_NAMESPACE_OID == 2615);
-
-pub(crate) const TABLE_INIT: TableInit = TableInit {
-    table: DESCRIPTION_TABLE_NAME,
-    statements: &[
-        PgDescription::CREATE_SQL,
-        PgDescription::INDEX_SQL[0],
-        INSERT_PUBLIC_SCHEMA_COMMENT_SQL,
-    ],
-};
-
-/// The engine statements that `stmt` runs: they replace the comment of its
-/// object, or delete it.
+/// The engine statements that `stmt` runs: they store `pg_description` when
+/// this is the first statement that writes to it, and they replace the
+/// comment of the object of `stmt`, or delete it.
 pub(crate) fn comment_statements(
     conn: &Arc<Connection>,
     stmt: &PgCommentOnStmt,
@@ -82,24 +72,33 @@ pub(crate) fn comment_statements(
     if let Some(comment) = &stmt.comment {
         statements.push(object.insert_statement(comment));
     }
-    Ok(statements)
+    statements_that_write(&conn.current_schema(), DESCRIPTION_TABLE_NAME, statements)
 }
 
-/// The engine statement that deletes the comment of the schema `namespace`
-/// of `schema`, which the running statement drops. None when the database
-/// has no table of comments, which only happens outside the frontend's own
-/// open path, such as a core-level open for tests.
-pub(crate) fn delete_schema_comment_statement(
+/// The engine statements that delete the comment of the schema `namespace`
+/// of `schema`, which the running statement drops.
+///
+/// When `pg_description` is not stored, only a built-in comment can be the
+/// comment of the schema. The statements then store the table first, so
+/// that the comment can be deleted. For a schema without a built-in
+/// comment there is nothing to delete, and nothing is stored.
+pub(crate) fn delete_schema_comment_statements(
     schema: &Schema,
     namespace: NamespaceId,
-) -> Option<String> {
-    schema.get_btree_table(NamespaceId::ROOT, DESCRIPTION_TABLE_NAME)?;
+) -> Result<Vec<String>> {
     let comment = DescribedObject {
         objoid: namespace_oid(schema, namespace),
         classoid: PG_NAMESPACE_OID,
         objsubid: 0,
     };
-    Some(comment.delete_statement())
+    if !is_stored(schema, DESCRIPTION_TABLE_NAME) && !comment.has_builtin_comment() {
+        return Ok(Vec::new());
+    }
+    statements_that_write(
+        schema,
+        DESCRIPTION_TABLE_NAME,
+        vec![comment.delete_statement()],
+    )
 }
 
 /// What `pg_description` names an object by.
@@ -110,6 +109,16 @@ struct DescribedObject {
 }
 
 impl DescribedObject {
+    /// Whether the built-in rows of PostgreSQL have a comment for the
+    /// object.
+    fn has_builtin_comment(&self) -> bool {
+        PG_DESCRIPTION.iter().any(|row| {
+            i64::from(row.objoid) == self.objoid
+                && i64::from(row.classoid) == self.classoid
+                && i64::from(row.objsubid) == self.objsubid
+        })
+    }
+
     fn delete_statement(&self) -> String {
         let Self {
             objoid,

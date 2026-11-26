@@ -8,7 +8,7 @@ use turso_core::schema::Schema;
 use turso_core::Result;
 
 use crate::descriptions::{DESCRIPTION_INDEX_NAME, DESCRIPTION_TABLE_NAME};
-use crate::{auth_members, classes, descriptions, roles};
+use crate::{auth_members, classes, roles};
 
 /// The statements that create `table`. They run when the database has no
 /// such table.
@@ -18,11 +18,10 @@ pub(crate) struct TableInit {
 }
 
 /// Every table of the frontend, in the order in which they are created.
-static TABLE_INITS: [TableInit; 4] = [
+static TABLE_INITS: [TableInit; 3] = [
     classes::TABLE_INIT,
     roles::TABLE_INIT,
     auth_members::TABLE_INIT,
-    descriptions::TABLE_INIT,
 ];
 
 /// The catalog tables that this frontend stores under their PostgreSQL
