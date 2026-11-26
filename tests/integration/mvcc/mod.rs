@@ -1,5 +1,6 @@
 mod checkpoint;
 mod concurrent_inserts;
+mod cost_scaling;
 mod database;
 mod group_commit;
 mod hermitage;
