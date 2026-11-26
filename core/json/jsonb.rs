@@ -2048,7 +2048,28 @@ impl Jsonb {
     /// at `header_pos`, for the payload after the 2-byte placeholder. When the
     /// header is not 2 bytes, the payload moves to follow it. The result is
     /// the same as a header written for the payload size in the first place.
+    ///
+    /// A payload of 12 to 255 bytes, the common case, keeps the 2-byte header
+    /// of the placeholder, so only its size byte changes. This case is inlined
+    /// into the parser, without a call that saves and restores six registers.
+    #[inline(always)]
     fn finish_container(&mut self, header_pos: usize, element_type: ElementType) -> Result<()> {
+        let payload_size = self.len() - (header_pos + 2);
+        if (12..=0xFF).contains(&payload_size) {
+            self.data[header_pos + 1] = payload_size as u8;
+            return Ok(());
+        }
+        self.finish_container_with_other_header(header_pos, element_type)
+    }
+
+    /// [Self::finish_container] for a payload that does not have a header of
+    /// 2 bytes: the payload moves to follow the header.
+    #[inline(never)]
+    fn finish_container_with_other_header(
+        &mut self,
+        header_pos: usize,
+        element_type: ElementType,
+    ) -> Result<()> {
         let payload_start = header_pos + 2;
         let payload_end = self.len();
         let header = JsonbHeader::new(element_type, payload_end - payload_start).into_bytes();
