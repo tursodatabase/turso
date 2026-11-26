@@ -933,6 +933,18 @@ impl Statement {
         self.state.query_deadline = deadline;
     }
 
+    /// Starts this trigger or foreign key action subprogram with the immediate
+    /// foreign key violations counted so far by the statement that runs it.
+    pub(crate) fn copy_fk_immediate_violations_from_parent(&mut self, parent: &vdbe::ProgramState) {
+        self.state.copy_fk_immediate_violations_from(parent);
+    }
+
+    /// Hands the immediate foreign key violations of this subprogram back to
+    /// the statement that runs it, which checks them when it ends.
+    pub(crate) fn copy_fk_immediate_violations_to_parent(&self, parent: &mut vdbe::ProgramState) {
+        parent.copy_fk_immediate_violations_from(&self.state);
+    }
+
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
         let result = self
             .program
