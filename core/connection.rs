@@ -8,12 +8,13 @@ use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 use crate::security::roles::RoleId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
+use crate::storage::encryption::{encryption_pragma_refused, EncryptionSetting};
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
 use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
     },
-    Arc, Mutex, RwLock,
+    Arc, Mutex, OnceLock, RwLock,
 };
 use crate::types::IOResult;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -367,6 +368,14 @@ impl StorageStatsRead {
     }
 }
 
+/// The values that `PRAGMA cipher` and `PRAGMA hexkey` accepted on a
+/// connection before the other value is known.
+#[derive(Clone, Default)]
+pub(crate) struct PendingEncryption {
+    cipher: Option<CipherMode>,
+    key: Option<EncryptionKey>,
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -515,7 +524,15 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
-    pub(crate) encryption_key: Option<EncryptionKey>,
+    /// The key of the main database. It is set when the connection is
+    /// created, or one time by `PRAGMA cipher` and `PRAGMA hexkey`.
+    pub(crate) encryption_key: OnceLock<EncryptionKey>,
+    /// The values that `PRAGMA cipher` and `PRAGMA hexkey` accepted while
+    /// the other value is not known yet.
+    pub(super) pending_encryption: Mutex<PendingEncryption>,
+    /// True while `pending_encryption` holds a value. Lets each statement
+    /// check for an incomplete encryption setup without taking the lock.
+    pub(super) encryption_setup_pending: AtomicBool,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
     pub(super) data_sync_retry: AtomicBool,
@@ -2407,7 +2424,7 @@ impl Connection {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn reload_wal_after_external_restore(&self) -> Result<()> {
-        let encryption_key = self.encryption_key.clone();
+        let encryption_key = self.encryption_key.get().cloned();
         self.db
             .reload_wal_after_external_restore_with_encryption_key(encryption_key)
     }
@@ -4434,16 +4451,142 @@ impl Connection {
         Arc::as_ptr(&self.db) as usize
     }
 
+    /// Always returns an error. Give the key in [ConnectOpts] and the cipher
+    /// in the open options, or use `PRAGMA cipher` and `PRAGMA hexkey` on a
+    /// new, empty database.
     pub fn set_encryption_key(&self, _key: EncryptionKey) -> Result<()> {
         Err(LimboError::InvalidArgument(
             "encryption must be configured when opening the database".into(),
         ))
     }
 
+    /// Always returns an error. See [Connection::set_encryption_key].
     pub fn set_encryption_cipher(&self, _cipher_mode: CipherMode) -> Result<()> {
         Err(LimboError::InvalidArgument(
             "encryption must be configured when opening the database".into(),
         ))
+    }
+
+    /// Checks an assignment to `PRAGMA cipher` or `PRAGMA hexkey` when it is
+    /// prepared, so that a refused assignment fails before it runs.
+    /// [Connection::set_encryption_pragma] checks again when it runs.
+    pub(crate) fn check_encryption_pragma(&self, database_id: usize) -> Result<()> {
+        if database_id != MAIN_DB_ID {
+            return Err(encryption_pragma_refused(
+                "an attached database takes its key from the ATTACH URI",
+            ));
+        }
+        self.check_new_database_encryption(false)
+    }
+
+    /// Runs `PRAGMA cipher = ...` or `PRAGMA hexkey = ...` on the main
+    /// database. The value waits until the other value is known. Then the
+    /// new, empty database becomes encrypted and the connection gets the key.
+    ///
+    /// While only one value is known, the connection refuses other statements
+    /// (see [Connection::check_encryption_setup_complete]), so it cannot write
+    /// a plaintext database that the user wanted encrypted. A refused value
+    /// changes nothing: a value that was accepted before stays.
+    pub(crate) fn set_encryption_pragma(&self, setting: EncryptionSetting) -> Result<()> {
+        self.check_new_database_encryption(true)?;
+        let mut pending = self.pending_encryption.lock();
+        let mut next = pending.clone();
+        match setting {
+            EncryptionSetting::Cipher(cipher) => {
+                // Check the page size now, not when the key comes: the setup
+                // must not wait for a key that cannot finish it.
+                self.pager.load().check_cipher_fits_page_size(cipher)?;
+                next.cipher = Some(cipher);
+            }
+            EncryptionSetting::Key(key) => next.key = Some(key),
+        }
+        if let (Some(cipher), Some(key)) = (next.cipher, next.key.as_ref()) {
+            self.pager.load().encrypt_new_database(cipher, key)?;
+            // The database was plaintext, and a connection to a plaintext
+            // database has no key.
+            let stored = self.encryption_key.set(key.clone());
+            turso_assert!(
+                stored.is_ok(),
+                "connection to a plaintext database had a key"
+            );
+            next = PendingEncryption::default();
+        }
+        self.encryption_setup_pending.store(
+            next.cipher.is_some() || next.key.is_some(),
+            Ordering::Release,
+        );
+        *pending = next;
+        // Statements prepared before this one must be prepared again, because
+        // they were prepared for the plaintext page layout and before the check
+        // for an incomplete setup.
+        self.bump_prepare_context_generation();
+        Ok(())
+    }
+
+    /// Checks that the main database can become encrypted through this
+    /// connection. `running` is true when the PRAGMA runs. Only then are the
+    /// active statements checked: the running PRAGMA is one of them, and a
+    /// PRAGMA that is prepared again when it starts to run is one as well.
+    fn check_new_database_encryption(&self, running: bool) -> Result<()> {
+        let pager = self.pager.load();
+        if !pager.is_encryption_enabled() {
+            return Err(LimboError::InvalidArgument(
+                "encryption is an opt in feature".into(),
+            ));
+        }
+        if pager.encryption_cipher() != CipherMode::None {
+            return Err(encryption_pragma_refused(
+                "the database is already encrypted",
+            ));
+        }
+        if self.mvcc_enabled() {
+            return Err(encryption_pragma_refused("MVCC is enabled"));
+        }
+        // Other processes can use the same new database file.
+        if self.db.opts.enable_multiprocess_wal {
+            return Err(encryption_pragma_refused("multiprocess WAL is enabled"));
+        }
+        // The PRAGMAs write nothing, but they decide how each later write of
+        // each connection is encrypted.
+        if self.db.is_readonly() {
+            return Err(encryption_pragma_refused("the database is read-only"));
+        }
+        if self.is_query_only() {
+            return Err(encryption_pragma_refused("PRAGMA query_only is on"));
+        }
+        if !self.get_auto_commit() || self.get_tx_state() != TransactionState::None {
+            return Err(encryption_pragma_refused("a transaction is open"));
+        }
+        if running && self.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+            return Err(encryption_pragma_refused("another statement is running"));
+        }
+        pager.check_can_encrypt_new_database()
+    }
+
+    /// Refuses a statement while `PRAGMA cipher` or `PRAGMA hexkey` waits for
+    /// the other value, because the statement could write the database as
+    /// plaintext. The encryption PRAGMAs themselves are always allowed.
+    pub(crate) fn check_encryption_setup_complete(&self, is_encryption_pragma: bool) -> Result<()> {
+        if is_encryption_pragma || !self.encryption_setup_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let pending = self.pending_encryption.lock();
+        let missing = match (pending.cipher, pending.key.is_some()) {
+            (None, false) => return Ok(()),
+            (None, true) => "PRAGMA cipher",
+            (Some(_), _) => "PRAGMA hexkey",
+        };
+        // Another connection can write the database while a value waits.
+        // Then the setup can never finish, so do not ask for the other value.
+        let pager = self.pager.load();
+        if pager.db_initialized() || pager.encryption_cipher() != CipherMode::None {
+            return Err(LimboError::InvalidArgument(
+                "encryption setup is incomplete and cannot finish, because the database is no longer new and empty; close the connection".into(),
+            ));
+        }
+        Err(LimboError::InvalidArgument(format!(
+            "encryption setup is incomplete: set {missing} before other statements, or close the connection"
+        )))
     }
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
@@ -5421,6 +5564,52 @@ mod shuttle_encryption_tests {
             );
             assert_eq!(db.clone_schema().schema_version, 1);
             assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
+    }
+
+    /// A keyless connect that races `PRAGMA cipher` and `PRAGMA hexkey` on
+    /// the only connection of a new database: exactly one of them succeeds,
+    /// so no plaintext pager exists next to the encrypted database.
+    #[test]
+    fn seeded_encryption_pragma_races_keyless_connect() {
+        seeded("encryption PRAGMA races a keyless connect", || {
+            let db = Database::open(
+                Arc::new(crate::MemoryIO::new()),
+                ":memory:",
+                crate::OpenOptions::new(Arc::new(
+                    crate::dialect::cannot_parse::DialectThatCannotParse,
+                ))
+                .db_opts(DatabaseOpts::new().with_encryption(true)),
+            )
+            .unwrap();
+            let owner = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
+            let peer_db = db.clone();
+            // Each thread returns its connection, so both stay open until the check.
+            let owner = thread::spawn(move || {
+                let encrypted = owner
+                    .set_encryption_pragma(EncryptionSetting::Cipher(CipherMode::Aegis256))
+                    .is_ok()
+                    && owner
+                        .set_encryption_pragma(EncryptionSetting::Key(key(1)))
+                        .is_ok();
+                (owner, encrypted)
+            });
+            let peer = thread::spawn(move || {
+                peer_db
+                    .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                    .ok()
+            });
+            let (_owner, encrypted) = owner.join().unwrap();
+            let peer = peer.join().unwrap();
+            assert_ne!(encrypted, peer.is_some());
+            if let Some(peer) = peer {
+                assert_eq!(peer.get_encryption_cipher_mode(), None);
+                assert_eq!(db.encryption_cipher(), CipherMode::None);
+            } else {
+                assert_single_binding(&db, CipherMode::Aegis256, 1);
+            }
         });
     }
 

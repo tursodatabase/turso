@@ -1740,7 +1740,7 @@ fn query_pragma(
         }
         PragmaName::EncryptionKey => {
             let msg = {
-                if connection.encryption_key.is_some() {
+                if connection.encryption_key.get().is_some() {
                     "encryption key is set for this session"
                 } else {
                     "encryption key is not set for this session"
