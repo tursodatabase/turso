@@ -443,6 +443,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn stores_cte_read_more_than_once(&self) -> bool {
+        true
+    }
+
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }

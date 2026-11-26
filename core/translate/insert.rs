@@ -45,7 +45,10 @@ use crate::{
             ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, NonFromClauseSubquery, Operation,
             QueryDestination, ResultSetColumn, TableReferences,
         },
-        planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
+        planner::{
+            add_ctes_read_by_subqueries_as_outer_refs, collect_cte_definitions,
+            collect_subquery_table_refs_in_expr, CteDefinition, ROWID_STRS,
+        },
         select::translate_insert_source_select,
         stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
@@ -187,6 +190,9 @@ pub struct InsertEmitCtx<'a> {
     pub written_rowids_cursor_id: Option<usize>,
     /// The source type of each value of a row, in the order of the values.
     pub value_sources: Vec<crate::dialect::CastSource>,
+    /// The CTEs whose result the SELECT source stored. SQLite plans DO UPDATE
+    /// after the SELECT, so a DO UPDATE read of one of them reuses the result.
+    pub source_stored_cte_ids: Vec<usize>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -244,6 +250,7 @@ impl<'a> InsertEmitCtx<'a> {
             returning_buffer: None,
             written_rowids_cursor_id: None,
             value_sources: Vec::new(),
+            source_stored_cte_ids: Vec::new(),
         })
     }
 }
@@ -265,32 +272,10 @@ pub fn translate_insert(
     let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
 
-    // Merge INSERT's WITH clause into the SELECT source's WITH clause.
-    // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
-    // path which goes through translate_select and handles CTEs properly.
-    // We also keep a copy for RETURNING clause subqueries.
-    let with_for_returning = with.clone();
-    if let Some(insert_with) = with {
-        if let InsertBody::Select(select, _) = &mut body {
-            match &mut select.with {
-                Some(select_with) => {
-                    // Prepend INSERT's CTEs to SELECT's CTEs
-                    let mut merged = insert_with.ctes;
-                    merged.append(&mut select_with.ctes);
-                    select_with.ctes = merged;
-                    select_with.recursive |= insert_with.recursive;
-                }
-                None => select.with = Some(insert_with),
-            }
-        } else {
-            // WITH clause on INSERT with VALUES or DEFAULT VALUES is not useful
-            // e.g. WITH unused AS (SELECT c FROM a) INSERT INTO b VALUES (1, 2, 3)
-            // but: we can, and indeed must, just ignore it instead of erroring.
-            // leaving this empty else block here for documentation.
-        }
-        // For DEFAULT VALUES/VALUES without SELECT body, CTEs are still needed
-        // for RETURNING clause subqueries - handled below via with_for_returning.
-    }
+    // The CTEs of the INSERT's WITH clause are collected once, so that the
+    // SELECT source and the subqueries of RETURNING and DO UPDATE read them
+    // under the same ids and can share one stored result, as in SQLite.
+    let cte_definitions = collect_cte_definitions(with, program)?;
 
     let namespace = resolver.resolve_queried_table(&tbl_name)?;
     let database_id = namespace.database_id;
@@ -337,7 +322,7 @@ pub fn translate_insert(
             columns,
             body,
             returning,
-            with_for_returning,
+            cte_definitions,
             on_conflict,
             connection,
         )?;
@@ -403,7 +388,7 @@ pub fn translate_insert(
             namespace,
             &mut returning,
             &upsert_actions,
-            with_for_returning,
+            &cte_definitions,
             connection,
         )?;
     let reads_columns = updates_on_conflict
@@ -525,10 +510,12 @@ pub fn translate_insert(
         resolver,
         &mut values,
         body,
+        cte_definitions,
         &columns,
         &table_references,
         namespace,
     )?;
+    ctx.source_stored_cte_ids = program.materialized_cte_ids();
     let has_upsert = !upsert_actions.is_empty();
 
     // Set up the program to return result columns if RETURNING is specified
@@ -2445,6 +2432,7 @@ fn init_source_emission<'a>(
     resolver: &Resolver,
     values: &mut Vec<Box<Expr>>,
     body: InsertBody,
+    cte_definitions: Vec<CteDefinition>,
     columns: &[ast::Name],
     table_references: &TableReferences,
     namespace: NamespaceRef,
@@ -2497,6 +2485,7 @@ fn init_source_emission<'a>(
                 let (yield_reg, num_result_cols, value_sources) = emit_insert_select_coroutine(
                     program,
                     select,
+                    cte_definitions,
                     ctx.halt_label,
                     resolver,
                     connection,
@@ -3530,7 +3519,7 @@ fn translate_virtual_table_insert(
     columns: Vec<ast::Name>,
     mut body: InsertBody,
     mut returning: Vec<ResultColumn>,
-    with_for_returning: Option<With>,
+    cte_definitions: Vec<CteDefinition>,
     on_conflict: Option<ResolveType>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
@@ -3578,7 +3567,7 @@ fn translate_virtual_table_insert(
         namespace,
         &mut returning,
         &[],
-        with_for_returning,
+        &cte_definitions,
         connection,
     )?;
     let reads_columns = roles::reads_columns_of(
@@ -3639,8 +3628,15 @@ fn translate_virtual_table_insert(
         let InsertBody::Select(select, _) = body else {
             unreachable!("only a SELECT or VALUES body inserts multiple rows");
         };
-        let (yield_reg, num_values, _) =
-            emit_insert_select_coroutine(program, select, halt_label, resolver, connection, &[])?;
+        let (yield_reg, num_values, _) = emit_insert_select_coroutine(
+            program,
+            select,
+            cte_definitions,
+            halt_label,
+            resolver,
+            connection,
+            &[],
+        )?;
         // As in SQLite, the rows are copied into a temporary table first when
         // the SELECT reads the virtual table that the INSERT writes to.
         let temp_table_ctx = if program.is_table_open(&table) {
@@ -3814,7 +3810,7 @@ fn plan_insert_returning(
     namespace: NamespaceRef,
     returning: &mut [ResultColumn],
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
-    with: Option<With>,
+    cte_definitions: &[CteDefinition],
     connection: &Arc<Connection>,
 ) -> Result<(
     TableReferences,
@@ -3856,8 +3852,8 @@ fn plan_insert_returning(
             }
         }
     }
-    plan_ctes_as_outer_refs(
-        with,
+    add_ctes_read_by_subqueries_as_outer_refs(
+        cte_definitions,
         &subquery_table_refs,
         resolver,
         program,
@@ -3927,6 +3923,7 @@ fn emit_insert_returning_row(
 fn emit_insert_select_coroutine(
     program: &mut ProgramBuilder,
     select: ast::Select,
+    cte_definitions: Vec<CteDefinition>,
     halt_label: BranchOffset,
     resolver: &Resolver,
     connection: &Arc<Connection>,
@@ -3949,6 +3946,7 @@ fn emit_insert_select_coroutine(
     let (num_result_cols, value_sources) = program.nested(|program| {
         translate_insert_source_select(
             select,
+            cte_definitions,
             resolver,
             program,
             query_destination,

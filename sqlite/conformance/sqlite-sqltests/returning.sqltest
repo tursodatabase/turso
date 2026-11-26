@@ -2746,3 +2746,25 @@ expect {
     1
     1
 }
+
+# A RETURNING subquery runs again for each written row only when its own FROM
+# clause names the written table, as in SQLite. A FROM clause subquery or a
+# nested subquery that reads the table does not count.
+test update-returning-subquery-reads-written-table-through-nested-query {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    UPDATE t SET b = b * 10 RETURNING b, (SELECT sum(x) FROM (SELECT b AS x FROM t));
+    UPDATE t SET b = b + 1 RETURNING b, (SELECT (SELECT sum(b) FROM t));
+    UPDATE t SET b = b + 1 RETURNING b, (SELECT sum(b) FROM t);
+}
+expect {
+    10|15
+    20|15
+    30|15
+    11|61
+    21|61
+    31|61
+    12|64
+    22|65
+    32|66
+}

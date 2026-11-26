@@ -59,7 +59,7 @@ use smallvec::SmallVec;
 ///
 /// Separate plans prevent two references from accidentally sharing table IDs
 /// or cursor IDs unless the CTE is deliberately materialized once.
-struct CteDefinition {
+pub(crate) struct CteDefinition {
     /// Identifies materialized results shared by references to this CTE.
     cte_id: usize,
     /// Normalized CTE name.
@@ -70,18 +70,41 @@ struct CteDefinition {
     explicit_columns: Vec<String>,
     /// Other CTE definitions referenced by this CTE.
     referenced_cte_indices: SmallVec<[usize; 2]>,
-    /// True when `AS MATERIALIZED` requires one stored result.
-    materialize_hint: bool,
+    /// The `MATERIALIZED` or `NOT MATERIALIZED` keyword. `AS MATERIALIZED`
+    /// requires one stored result.
+    materialized: Materialized,
     /// The CTE body contains a reference to its own name.
     references_itself: bool,
 }
 
-/// Returns the definitions of the CTEs of a WITH clause. This function is not
-/// inlined, so that its values are not in the frame of [parse_from], which is
-/// on the stack one time for each level of nested queries.
+/// Collect the CTEs of a WITH clause. Every query that the WITH clause applies to
+/// plans its CTE reads from the same definitions, so that reads in different
+/// arms of a compound SELECT can share one materialized result.
+pub(crate) fn collect_cte_definitions(
+    with: Option<With>,
+    program: &mut ProgramBuilder,
+) -> Result<Vec<CteDefinition>> {
+    append_cte_definitions(Vec::new(), with, program)
+}
+
+/// Collect the CTEs of a WITH clause after the CTEs of an enclosing WITH clause,
+/// such as the WITH clause of an INSERT around the WITH clause of its SELECT.
+/// The CTEs of the enclosing clause keep their ids, so that a read in the SELECT
+/// and a read in the INSERT's RETURNING can share one materialized result.
+/// This function is not inlined, so that its values are not in the frames of
+/// its callers, which are on the stack one time for each level of nested
+/// queries.
 #[inline(never)]
-fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<Vec<CteDefinition>> {
-    let mut definitions = Vec::with_capacity(with.ctes.len());
+pub(crate) fn append_cte_definitions(
+    mut definitions: Vec<CteDefinition>,
+    with: Option<With>,
+    program: &mut ProgramBuilder,
+) -> Result<Vec<CteDefinition>> {
+    let Some(with) = with else {
+        return Ok(definitions);
+    };
+    let first_new_index = definitions.len();
+    definitions.reserve(with.ctes.len());
     let mut referenced_table_names_by_cte = Vec::with_capacity(with.ctes.len());
 
     for cte in with.ctes {
@@ -109,12 +132,14 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
                 .map(|column| normalize_ident(column.col_name.as_str()))
                 .collect(),
             referenced_cte_indices: SmallVec::new(),
-            materialize_hint: cte.materialized == Materialized::Yes,
+            materialized: cte.materialized,
             references_itself,
         });
     }
 
-    for (cte_index, referenced_table_names) in referenced_table_names_by_cte.iter().enumerate() {
+    for (cte_index, referenced_table_names) in
+        (first_new_index..).zip(referenced_table_names_by_cte.iter())
+    {
         definitions[cte_index].referenced_cte_indices = definitions
             .iter()
             .enumerate()
@@ -1417,7 +1442,7 @@ fn cte_table_from_plan(
                 program.table_reference_counter.next(),
                 explicit_columns,
                 Some(cte_definition.cte_id),
-                cte_definition.materialize_hint,
+                cte_definition.materialized,
                 resolver,
             )?))
         }
@@ -1445,12 +1470,15 @@ fn prepare_recursive_cte_plan(
     let (first_recursive_query_index, recursive_compound_operator) =
         find_recursive_cte_queries(cte_definition)?;
 
+    // A WITH clause in the CTE body applies to both the initial and the
+    // recursive queries.
+    let body_cte_definitions = collect_cte_definitions(select.with.clone(), program)?;
     let initial_query = prepare_select_plan_from_arms(
         select.body.select.clone(),
         select.body.compounds[..first_recursive_query_index - 1]
             .iter()
             .cloned(),
-        select.with.clone(),
+        &body_cte_definitions,
         vec![],
         None,
         resolver,
@@ -1479,7 +1507,7 @@ fn prepare_recursive_cte_plan(
                 operator: ast::CompoundOperator::UnionAll,
                 select: compound.select.clone(),
             }),
-        select.with.clone(),
+        &body_cte_definitions,
         vec![],
         None,
         resolver,
@@ -1729,10 +1757,6 @@ pub fn plan_ctes_as_outer_refs(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let Some(with) = with else {
-        return Ok(());
-    };
-
     let cte_definitions = collect_cte_definitions(with, program)?;
     add_ctes_read_by_subqueries_as_outer_refs(
         &cte_definitions,
@@ -1970,9 +1994,9 @@ fn add_subquery_table(
         subplan,
         None,
         program.table_reference_counter.next(),
-        None,  // No explicit columns for regular subqueries
-        None,  // Regular inline subqueries don't have a CTE identity
-        false, // No materialize hint for inline subqueries
+        None,              // No explicit columns for regular subqueries
+        None,              // Regular inline subqueries don't have a CTE identity
+        Materialized::Any, // No materialize hint for inline subqueries
         resolver,
     )?;
     joined_table.has_alias = maybe_alias.is_some();
@@ -2417,6 +2441,21 @@ fn parse_outer_cte_table(
     let outer_ref = table_references
         .find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
         .expect("the caller found the CTE in the outer query references");
+    // A read of the CTE in the FROM clause of an outer query holds a plan of
+    // its body, which this read would share. Plan the body again from its
+    // definition, as SQLite copies it for each read, so that the CTEs of a
+    // WITH clause inside the body get new ids.
+    let outer_ref = if outer_ref.cte_select.is_none() && outer_ref.cte_id.is_some() {
+        table_references
+            .outer_query_refs()
+            .iter()
+            .find(|reference| {
+                reference.cte_id == outer_ref.cte_id && reference.cte_select.is_some()
+            })
+            .unwrap_or(outer_ref)
+    } else {
+        outer_ref
+    };
     if !args.is_empty() {
         if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
             // SQLite resolves the recursive self-reference as a plain
@@ -2439,9 +2478,11 @@ fn parse_outer_cte_table(
     };
     let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
     let cte_id = outer_ref.cte_id;
-    let materialize_hint = match &outer_ref.table {
-        Table::FromClauseSubquery(subquery) => subquery.materialize_hint(),
-        _ => false,
+    let materialized = match &outer_ref.table {
+        Table::FromClauseSubquery(subquery) => subquery
+            .cte
+            .map_or(Materialized::Any, |cte| cte.materialized),
+        _ => Materialized::Any,
     };
     // Plan each use separately so two uses do not receive the same
     // table or cursor IDs.
@@ -2461,7 +2502,7 @@ fn parse_outer_cte_table(
         cte_query_plan,
         &cte_explicit_columns,
         cte_id,
-        materialize_hint,
+        materialized,
         maybe_alias,
     )
 }
@@ -2480,7 +2521,7 @@ fn add_outer_cte_plan_table(
     cte_query_plan: Plan,
     cte_explicit_columns: &[String],
     cte_id: Option<usize>,
-    materialize_hint: bool,
+    materialized: Materialized,
     maybe_alias: Option<&As>,
 ) -> Result<()> {
     let explicit_columns = if cte_explicit_columns.is_empty() {
@@ -2508,7 +2549,7 @@ fn add_outer_cte_plan_table(
         program.table_reference_counter.next(),
         explicit_columns,
         cte_id,
-        materialize_hint,
+        materialized,
         resolver,
     )?;
     if let Some(alias) = alias {
@@ -2527,11 +2568,21 @@ fn add_outer_cte_reference_table(
     table_references: &mut TableReferences,
     program: &mut ProgramBuilder,
     normalized_qualified_name: String,
-    outer_table: Table,
+    mut outer_table: Table,
     outer_internal_id: TableInternalId,
     maybe_alias: Option<&As>,
 ) -> Result<()> {
     let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
+    // This read shares its plan with the other reads of the reference, so
+    // [mark_shared_cte_materialization_requirements] must store the CTE once
+    // for them.
+    //
+    // [mark_shared_cte_materialization_requirements]: crate::translate::subquery::mark_shared_cte_materialization_requirements
+    if let Table::FromClauseSubquery(subquery) = &mut outer_table {
+        if let Some(cte) = &mut Arc::make_mut(subquery).cte {
+            cte.uses_outer_reference_plan = true;
+        }
+    }
     // All recursive arms read the same one-row pseudo-cursor.
     let internal_id = if matches!(outer_table, Table::RecursiveCteInput(_)) {
         outer_internal_id
@@ -2702,7 +2753,7 @@ fn add_view_table(
         program.table_reference_counter.next(),
         (!view.explicit_columns.is_empty()).then_some(view.explicit_columns.as_slice()),
         None,
-        false,
+        Materialized::Any,
         resolver,
     )?;
     joined_table.has_alias = has_alias;
@@ -2940,19 +2991,16 @@ pub fn parse_from(
     from: Option<FromClause>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    with: Option<With>,
+    cte_definitions: &[CteDefinition],
     table_refs_outside_from: &[String],
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let mut cte_definitions = Vec::new();
     let mut shadowed_outer_ctes = Vec::new();
 
-    if let Some(with) = with {
-        cte_definitions = collect_cte_definitions(with, program)?;
-
+    if !cte_definitions.is_empty() {
         // This WITH clause's definitions shadow same-named CTEs from outer
         // scopes that are still being planned, so references to those names
         // here are not circular.
@@ -2963,7 +3011,7 @@ pub fn parse_from(
         shadowed_outer_ctes = program.mask_shadowed_ctes_being_defined(&shadowing_names);
 
         add_ctes_read_by_subqueries_as_outer_refs(
-            &cte_definitions,
+            cte_definitions,
             table_refs_outside_from,
             resolver,
             program,
@@ -2993,7 +3041,7 @@ pub fn parse_from(
             program,
             table_references,
             vtab_predicates,
-            &cte_definitions,
+            cte_definitions,
             connection,
         )?;
 
@@ -3002,7 +3050,7 @@ pub fn parse_from(
                 join,
                 resolver,
                 program,
-                &cte_definitions,
+                cte_definitions,
                 out_where_clause,
                 vtab_predicates,
                 table_references,
@@ -3021,7 +3069,7 @@ pub fn parse_from(
 /// are not reported. This function is not inlined, so that its values are not
 /// in the frame of [parse_from].
 #[inline(never)]
-fn add_ctes_read_by_subqueries_as_outer_refs(
+pub(crate) fn add_ctes_read_by_subqueries_as_outer_refs(
     cte_definitions: &[CteDefinition],
     subquery_table_refs: &[String],
     resolver: &Resolver,

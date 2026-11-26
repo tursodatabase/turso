@@ -471,6 +471,17 @@ WHERE total_sales > 100000
 ORDER BY total_sales DESC;
 ```
 
+A CTE that the statement reads more than once is computed once, and all reads see the same rows, when the CTE has no `FROM` clause, or has an aggregate, `DISTINCT`, a window function, `OFFSET`, `VALUES` or a compound other than `UNION ALL`. This includes reads in subqueries and in the arms of a compound `SELECT`. A CTE marked `MATERIALIZED` is always computed once. A CTE marked `NOT MATERIALIZED` is computed again for each read, except that reads in the same `FROM` clause share one result. For other CTEs, the result follows the same rules as SQLite.
+
+```sql
+WITH c(x) AS (SELECT random())
+SELECT x FROM c UNION SELECT x FROM c;   -- one row
+```
+
+A subquery in the `RETURNING` clause of an `INSERT`, `UPDATE` or `DELETE` runs after the write. It runs again for each written row when it reads a column of the written row or when its own `FROM` clause names the written table. Otherwise it runs once. It uses the stored result of a CTE only when a read before the write stored that result. Otherwise it computes the CTE again and sees the rows written so far. All `RETURNING` subqueries of a statement share one result of the CTE, and so do all subqueries in the `DO UPDATE` of an upsert.
+
+Known difference: when one query reads a CTE two or more times and SQLite computes the CTE again for each of these reads, Turso computes it once. This changes the result only when the CTE gives different rows each time it runs, for example when it calls `random()`, or when the statement writes a table that the CTE reads.
+
 ### Multiple CTEs
 
 ```sql

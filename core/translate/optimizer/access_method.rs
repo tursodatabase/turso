@@ -1984,45 +1984,38 @@ fn find_best_access_method_for_subquery(
     // For non-extremum targets this only applies when there are no seek
     // constraints — with constraints, we fall through to the materialized
     // index path which has its own order-satisfaction logic.
-    if extremum_constraints_compatible || usable.is_empty() {
-        if let Some(iter_dir) = intrinsic_subquery_scan_direction(
+    // An ordered scan with range constraints is not chosen outright: it walks
+    // from one end of the rows until a row satisfies the range, which can read
+    // most of the rows for each outer row, so it is cost-compared below with a
+    // seek on an ephemeral index.
+    let intrinsic_scan_dir = if extremum_constraints_compatible || usable.is_empty() {
+        intrinsic_subquery_scan_direction(
             rhs_table,
             subquery,
             maybe_order_target,
             table_materialization_required,
             schema,
-        ) {
-            return Ok(Some(AccessMethod {
-                cost: scan_cost,
-                estimated_rows_per_outer_row: *base_row_count,
-                consumed_where_terms: Default::default(),
-                params: AccessMethodParams::Subquery { iter_dir },
-            }));
-        }
-    }
+        )
+    } else {
+        None
+    };
+    let scan_method = AccessMethod {
+        cost: scan_cost,
+        estimated_rows_per_outer_row: *base_row_count,
+        consumed_where_terms: Default::default(),
+        params: AccessMethodParams::Subquery {
+            iter_dir: intrinsic_scan_dir.unwrap_or(IterationDirection::Forwards),
+        },
+    };
 
     if usable.is_empty() {
-        return Ok(Some(AccessMethod {
-            cost: scan_cost,
-            estimated_rows_per_outer_row: *base_row_count,
-            consumed_where_terms: Default::default(),
-            params: AccessMethodParams::Subquery {
-                iter_dir: IterationDirection::Forwards,
-            },
-        }));
+        return Ok(Some(scan_method));
     }
 
     let usable_constraints: Vec<&Constraint> = usable.iter().map(|(_, c)| *c).collect();
     let key_col_positions = ordered_ephemeral_key_columns(&usable_constraints);
     if key_col_positions.is_empty() {
-        return Ok(Some(AccessMethod {
-            cost: scan_cost,
-            estimated_rows_per_outer_row: *base_row_count,
-            consumed_where_terms: Default::default(),
-            params: AccessMethodParams::Subquery {
-                iter_dir: IterationDirection::Forwards,
-            },
-        }));
+        return Ok(Some(scan_method));
     }
 
     let key_col_pos_to_index_pos: HashMap<usize, usize> = key_col_positions
@@ -2064,14 +2057,7 @@ fn find_best_access_method_for_subquery(
             cost = ?scan_cost,
             "using coroutine subquery access because no usable seek constraints remain"
         );
-        return Ok(Some(AccessMethod {
-            cost: scan_cost,
-            estimated_rows_per_outer_row: *base_row_count,
-            consumed_where_terms: Default::default(),
-            params: AccessMethodParams::Subquery {
-                iter_dir: IterationDirection::Forwards,
-            },
-        }));
+        return Ok(Some(scan_method));
     }
 
     let ephemeral_index =
@@ -2123,14 +2109,6 @@ fn find_best_access_method_for_subquery(
             + input_cardinality * estimated_rows_per_outer_row * params.cpu_cost_per_row,
     );
     let total_cost = Cost(subquery_cost) + seek_setup_cost + seek_cost;
-    let scan_method = AccessMethod {
-        cost: scan_cost,
-        estimated_rows_per_outer_row: *base_row_count,
-        consumed_where_terms: Default::default(),
-        params: AccessMethodParams::Subquery {
-            iter_dir: IterationDirection::Forwards,
-        },
-    };
     let index_method = AccessMethod {
         cost: total_cost,
         estimated_rows_per_outer_row,
@@ -2147,7 +2125,14 @@ fn find_best_access_method_for_subquery(
     let scan_cost = cost_with_where_work(&scan_method, ready_where, input_cardinality, params);
     let index_cost = cost_with_where_work(&index_method, ready_where, input_cardinality, params);
 
-    if index_cost >= scan_cost + order_satisfiability_bonus {
+    // The index only saves a sort when the scan does not already return rows
+    // in the order the outer query wants.
+    let index_order_bonus = if intrinsic_scan_dir.is_some() {
+        Cost(0.0)
+    } else {
+        order_satisfiability_bonus
+    };
+    if index_cost >= scan_cost + index_order_bonus {
         Ok(Some(scan_method))
     } else {
         Ok(Some(index_method))

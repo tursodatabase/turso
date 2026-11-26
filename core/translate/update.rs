@@ -27,12 +27,12 @@ use super::plan::{
     ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
 };
 use super::planner::{
-    append_vtab_predicates_to_where_clause, collect_subquery_table_refs_in_expr, parse_from,
-    parse_where,
+    append_vtab_predicates_to_where_clause, collect_cte_definitions,
+    collect_subquery_table_refs_in_expr, parse_from, parse_where,
 };
 use super::subquery::{
-    mark_shared_cte_materialization_requirements, plan_subqueries_from_returning,
-    plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
+    plan_subqueries_from_returning, plan_subqueries_from_update_sets,
+    plan_subqueries_from_where_clause,
 };
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -227,10 +227,6 @@ fn prepare_and_optimize_update_plan(
             update_plan.target_table.table.get_name(),
         );
     }
-    mark_shared_cte_materialization_requirements(
-        &mut read_scope_tables,
-        &mut update_plan.non_from_clause_subqueries,
-    );
     update_plan.target_table = read_scope_tables.joined_tables_mut().remove(0);
     update_plan.from_tables = read_scope_tables;
 
@@ -378,7 +374,7 @@ fn prepare_update_plan(
     )?;
 
     // Extract WITH, OR conflict clause, and INDEXED BY before borrowing body mutably
-    let with = body.with.take();
+    let cte_definitions = collect_cte_definitions(body.with.take(), program)?;
     let or_conflict = body.or_conflict.take();
     let indexed = body.indexed.take();
 
@@ -419,7 +415,7 @@ fn prepare_update_plan(
         body.from.take(),
         resolver,
         program,
-        with,
+        &cte_definitions,
         &table_refs_outside_from,
         &mut where_clause,
         &mut vtab_predicates,
