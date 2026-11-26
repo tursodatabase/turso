@@ -1131,10 +1131,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# PostgreSQL has no to_char for boolean, text or jsonb. tursopg decides from
-# each row's value, so it formats a row that holds a number and returns NULL
-# for a NULL row.
-@compat-gap "function:to_char"
+# PostgreSQL has no to_char for boolean, text or jsonb.
 test to-char-boolean-column {
     CREATE TABLE to_char_flags (flag boolean);
     INSERT INTO to_char_flags VALUES (true);
@@ -1144,11 +1141,7 @@ test to-char-boolean-column {
 expect error {
     function to_char\(boolean, unknown\) does not exist
 }
-expect @tursopg raw {
-  1
-}
 
-@compat-gap "function:to_char"
 test to-char-text-column {
     CREATE TABLE to_char_texts (t text);
     INSERT INTO to_char_texts VALUES ('12');
@@ -1158,11 +1151,7 @@ test to-char-text-column {
 expect error {
     function to_char\(text, unknown\) does not exist
 }
-expect @tursopg raw {
- 12
-}
 
-@compat-gap "function:to_char"
 test to-char-jsonb-column {
     CREATE TABLE to_char_documents (doc jsonb);
     INSERT INTO to_char_documents VALUES ('12');
@@ -1171,9 +1160,6 @@ test to-char-jsonb-column {
 @sqlstate 42883
 expect error {
     function to_char\(jsonb, unknown\) does not exist
-}
-expect @tursopg raw {
- 12
 }
 
 # to_timestamp(double precision)
@@ -1307,16 +1293,12 @@ expect @tursopg raw {
  12345| 100.0
 }
 
-@compat-gap "function:to_char"
 test to-char-unknown-literal-is-ambiguous {
     SELECT to_char('12', '99');
 }
 @sqlstate 42725
 expect error {
     function to_char\(unknown, unknown\) is not unique
-}
-expect @tursopg raw {
- 12
 }
 
 # Unquoted C folds to c, and PostgreSQL has no collation named "c".
@@ -1428,75 +1410,47 @@ expect @tursopg {
     \x414
 }
 
-@compat-gap "function:abs"
 test abs-of-text-does-not-exist {
     SELECT abs('abc'::text);
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    0
-}
 
-@compat-gap "function:round"
 test round-of-text-does-not-exist {
     SELECT round('abc'::text);
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    0
-}
 
-@compat-gap "function:sqrt"
 test sqrt-of-text-does-not-exist {
     SELECT sqrt('abc'::text);
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    
-}
 
-@compat-gap "function:quote_ident"
 test quote-ident-of-integer-does-not-exist {
     SELECT quote_ident(7);
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    ""
-}
 
-@compat-gap "function:lower"
 test lower-of-integer-does-not-exist {
     SELECT lower(7);
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    7
-}
 
-@compat-gap "function:upper"
 test upper-of-integer-does-not-exist {
     SELECT upper(7);
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    7
-}
 
-@compat-gap "function:length"
 test length-of-integer-does-not-exist {
     SELECT length(7);
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    1
-}
 
 @compat-gap "function:ceil"
 test ceil-of-numeric-has-no-fraction-digits {
@@ -1531,6 +1485,8 @@ expect @tursopg {
     3.0
 }
 
+# tursopg reads a numeric cast as a double precision, which has no round
+# with a scale.
 @compat-gap "function:round"
 test round-of-numeric-keeps-the-scale {
     SELECT round(2.5::numeric, 7);
@@ -1538,8 +1494,9 @@ test round-of-numeric-keeps-the-scale {
 expect {
     2.5000000
 }
-expect @tursopg {
-    2.5
+@sqlstate 42883
+expect @tursopg error {
+    function round\(double precision, integer\) does not exist
 }
 
 @compat-gap "function:trunc"
@@ -1553,12 +1510,8 @@ expect @tursopg {
     2.0
 }
 
-@compat-gap "function:mod"
 test mod-of-two-quoted-literals-is-ambiguous {
     SELECT mod('7', '7');
 }
 @sqlstate 42725
 expect error {}
-expect @tursopg {
-    0
-}

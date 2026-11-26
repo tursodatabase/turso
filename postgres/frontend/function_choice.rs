@@ -5,14 +5,11 @@ use crate::catalog::pg_type_oid;
 use crate::procs::{PROCS, SQL_LANGUAGE};
 use crate::resolve::{resolve_function, ArgCoercion, ArgType, Resolution, ResolveError};
 use crate::resolve_catalog::FrontendCatalog;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use turso_core::ast;
 use turso_core::dialect::{ChosenFunction, EngineType, FunctionChoice, OperandType};
 use turso_core::{DialectError, LimboError, Result};
 use turso_pg_parser::sqlstate::SQLSTATE_INDETERMINATE_DATATYPE;
 use turso_pg_parser::translator::cast_type_name;
-
-static REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
 /// Chooses the `pg_proc` row that runs `name(arguments)`. A name with no row
 /// is left to the engine, and so is a row written in SQL or one whose function
@@ -21,19 +18,7 @@ pub(crate) fn choose_function(name: &str, arguments: &[OperandType]) -> Result<F
     if !FrontendCatalog::has_function(name) {
         return Ok(FunctionChoice::LeftToTheEngine);
     }
-    match resolve(name, arguments) {
-        Ok(choice) => Ok(choice),
-        Err(_) => {
-            REFUSALS.fetch_add(1, Ordering::Relaxed);
-            Ok(FunctionChoice::LeftToTheEngine)
-        }
-    }
-}
-
-/// How many calls the resolver refused. They run as before.
-#[cfg(test)]
-pub(crate) fn refusals() -> usize {
-    REFUSALS.load(Ordering::Relaxed)
+    resolve(name, arguments)
 }
 
 fn resolve(name: &str, arguments: &[OperandType]) -> Result<FunctionChoice> {
@@ -95,10 +80,10 @@ fn cast_type(oid: i64) -> Option<ast::Type> {
     })
 }
 
-// FIXME(registered-types): A column of a subquery, a CTE or a catalog table, and a
-// subquery used as a value, have no type yet, so a function called on one fails with 42P18.
-// An engine type stands for several PostgreSQL types: the function gets the one in
-// `engine_type_oid`. Typing those columns and registering the types removes both.
+// FIXME(registered-types): A column of a table that is not STRICT and a catalog column whose
+// declared type is not PostgreSQL's have no type yet, so a function called on one fails with 42P18. An engine type stands for several PostgreSQL types: the
+// function gets the one in `engine_type_oid`. Typing those columns and registering the types
+// removes both.
 /// The type the resolver is given for the argument at `index`, or `None` for an
 /// argument of a type PostgreSQL has no row for here: a custom type such as an
 /// enum or a domain, which the engine runs as before.
@@ -263,10 +248,15 @@ mod tests {
     }
 
     #[test]
-    fn a_call_the_resolver_refuses_is_counted_and_runs_as_before() {
+    fn a_call_on_a_value_with_no_type_fails_with_42p18() {
         let conn = test_connection();
-        let before = refusals();
-        conn.execute("SELECT quote_ident(7)").unwrap();
-        assert!(refusals() > before);
+        let error = conn
+            .execute("SELECT length(typinput) FROM pg_type")
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "42P18");
+        assert_eq!(
+            error.message,
+            "could not determine data type of argument 1 of length()"
+        );
     }
 }

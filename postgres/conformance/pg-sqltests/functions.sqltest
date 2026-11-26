@@ -3348,17 +3348,12 @@ expect {
     1
 }
 
-# A typed NULL unit needs function signature typing in tursopg, which
-# returns NULL.
-@compat-gap "function:date_trunc"
+# date_trunc has no integer unit, even for NULL.
 test date-trunc-typed-null-unit {
     SELECT (date_trunc(NULL::int, '2026-10-08 12:34:56+00'::timestamptz) IS NULL)::int;
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    1
-}
 
 # PostgreSQL has no year 0. A decade that starts before year 1 is BC in
 # PostgreSQL, which tursopg cannot store, so it refuses.
@@ -3423,4 +3418,29 @@ test to-char-null-timestamptz-row {
 }
 expect {
     t
+}
+
+# A quoted literal takes the overload of the string category when one exists,
+# so length reads it as text, not as bytea.
+test a-quoted-literal-takes-the-text-overload {
+    SELECT length('\x41'), octet_length('ab'), quote_ident('a b');
+}
+expect {
+    4|2|"a b"
+}
+
+test a-function-called-with-an-argument-of-another-type-does-not-exist {
+    SELECT lower(7);
+}
+@sqlstate 42883
+expect error {
+    function lower\(integer\) does not exist
+}
+
+test a-function-whose-quoted-literals-fit-several-overloads-is-not-unique {
+    SELECT random('1', '10');
+}
+@sqlstate 42725
+expect error {
+    function random\(unknown, unknown\) is not unique
 }

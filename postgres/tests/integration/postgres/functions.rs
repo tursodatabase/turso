@@ -176,11 +176,11 @@ fn test_pg_set_config_validates_arguments(db: TempDatabase) {
         ),
         (
             "SELECT set_config('search_path', 5, false)",
-            "set_config requires a text value",
+            "function set_config(unknown, integer, boolean) does not exist",
         ),
         (
             "SELECT set_config('search_path', '', 2)",
-            "set_config requires a boolean",
+            "function set_config(unknown, unknown, integer) does not exist",
         ),
         (
             "SELECT set_config('search_path', 'public,', false)",
@@ -603,10 +603,6 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         ("SELECT booleq(1, 0)", Value::from_i64(0)),
         ("SELECT boolne(1, 0)", Value::from_i64(1)),
         (
-            "SELECT format_type(1043)",
-            Value::build_text("character varying"),
-        ),
-        (
             "SELECT format_type(1043, 17)",
             Value::build_text("character varying(13)"),
         ),
@@ -632,6 +628,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         "SELECT statement_timestamp('x')",
         "SELECT quote_ident()",
         "SELECT format_type()",
+        "SELECT format_type(1043)",
         "SELECT format_type(23, -1, 0)",
         "SELECT pg_get_expr('x')",
         "SELECT pg_get_expr('x', 1, 1, 1)",
