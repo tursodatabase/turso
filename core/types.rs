@@ -4792,13 +4792,13 @@ mod tests {
 
         let other_cases = vec![
             (
-                vec![Value::Text(Text::new(long.clone()))],
+                vec![Value::Text(Text::new(long))],
                 vec![ValueRef::Text(TextRef::new(&shorter, TextSubtype::Text))],
                 &index_info,
                 "long_strings",
             ),
             (
-                vec![Value::Text(Text::new(very_long.clone()))],
+                vec![Value::Text(Text::new(very_long))],
                 vec![ValueRef::Text(TextRef::new(&shorter, TextSubtype::Text))],
                 &index_info,
                 "very_long_strings",
