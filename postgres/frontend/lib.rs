@@ -13,6 +13,7 @@ mod operators;
 mod options;
 mod pg_type;
 mod policies;
+mod procs;
 mod roles;
 mod schema_init;
 mod schema_state;

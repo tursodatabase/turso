@@ -675,11 +675,10 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     assert_eq!(
         rows,
         [
-            ("format_type", 1, "i"),
-            ("format_type", 2, "i"),
-            ("now", 0, "v"),
-            ("pg_get_constraintdef", 1, "v"),
-            ("pg_get_constraintdef", 2, "v"),
+            ("format_type", 2, "s"),
+            ("now", 0, "s"),
+            ("pg_get_constraintdef", 1, "s"),
+            ("pg_get_constraintdef", 2, "s"),
             ("quote_ident", 1, "i"),
         ]
         .into_iter()

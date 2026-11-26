@@ -1310,7 +1310,6 @@ impl SnapshotRows for PgAuthMembersTable {
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
-/// Populated from the same function registry as PRAGMA function_list.
 #[derive(Debug)]
 struct PgProcTable;
 
@@ -1351,94 +1350,50 @@ impl SnapshotRows for PgProcTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        use crate::Func;
-
-        let mut rows = Vec::new();
-        let mut oid = 1i64;
-
-        // Built-in functions from the same registry as PRAGMA function_list
-        for entry in Func::builtin_function_list() {
-            let prokind = match entry.func_type {
-                "a" => "a", // aggregate
-                "w" => "w", // window
-                _ => "f",   // function
-            };
-            let provolatile = if entry.deterministic { "i" } else { "v" };
-
-            rows.push(vec![
-                Value::from_i64(oid),               // oid
-                Value::build_text(entry.name),      // proname
-                Value::from_i64(11),                // pronamespace (pg_catalog)
-                Value::from_i64(10),                // proowner
-                Value::from_i64(12),                // prolang (internal)
-                Value::from_f64(1.0),               // procost
-                Value::from_f64(0.0),               // prorows
-                Value::from_i64(0),                 // provariadic
-                Value::build_text(prokind),         // prokind
-                Value::from_i64(0),                 // prosecdef
-                Value::from_i64(0),                 // proleakproof
-                Value::from_i64(0),                 // proisstrict
-                Value::from_i64(0),                 // proretset
-                Value::build_text(provolatile),     // provolatile
-                Value::build_text("u"),             // proparallel (unsafe)
-                Value::from_i64(entry.narg as i64), // pronargs
-                Value::from_i64(0),                 // pronargdefaults
-                Value::from_i64(0),                 // prorettype
-                Value::Null,                        // proargtypes
-                Value::Null,                        // proallargtypes
-                Value::Null,                        // proargmodes
-                Value::Null,                        // proargnames
-                Value::Null,                        // proargdefaults
-                Value::Null,                        // protrftypes
-                Value::Null,                        // prosrc
-                Value::Null,                        // probin
-                Value::Null,                        // prosqlbody
-                Value::Null,                        // proconfig
-                Value::Null,                        // proacl
-            ]);
-            oid += 1;
-        }
-
-        // Extension functions
-        for (name, is_agg, argc, deterministic) in conn.get_syms_functions() {
-            let prokind = if is_agg { "a" } else { "f" };
-            let provolatile = if deterministic { "i" } else { "v" };
-
-            rows.push(vec![
-                Value::from_i64(oid),       // oid
-                Value::build_text(name),    // proname
-                Value::from_i64(11),        // pronamespace (pg_catalog)
-                Value::from_i64(10),        // proowner
-                Value::from_i64(13),        // prolang (C)
-                Value::from_f64(1.0),       // procost
-                Value::from_f64(0.0),       // prorows
-                Value::from_i64(0),         // provariadic
-                Value::build_text(prokind), // prokind
-                Value::from_i64(0),         // prosecdef
-                Value::from_i64(0),         // proleakproof
-                Value::from_i64(0),         // proisstrict
-                Value::from_i64(0),         // proretset
-                Value::build_text(provolatile),
-                Value::build_text("u"),       // proparallel
-                Value::from_i64(argc as i64), // pronargs
-                Value::from_i64(0),           // pronargdefaults
-                Value::from_i64(0),           // prorettype
-                Value::Null,                  // proargtypes
-                Value::Null,                  // proallargtypes
-                Value::Null,                  // proargmodes
-                Value::Null,                  // proargnames
-                Value::Null,                  // proargdefaults
-                Value::Null,                  // protrftypes
-                Value::Null,                  // prosrc
-                Value::Null,                  // probin
-                Value::Null,                  // prosqlbody
-                Value::Null,                  // proconfig
-                Value::Null,                  // proacl
-            ]);
-            oid += 1;
-        }
-        rows
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        const INTERNAL_LANGUAGE: i64 = 12;
+        crate::procs::PROCS
+            .iter()
+            .map(|proc| {
+                let arg_types = proc
+                    .arg_types
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                vec![
+                    Value::from_i64(proc.oid),
+                    Value::build_text(proc.name),
+                    Value::from_i64(11),
+                    Value::from_i64(SUPERUSER_OID),
+                    Value::from_i64(INTERNAL_LANGUAGE),
+                    Value::from_f64(proc.cost),
+                    Value::from_f64(proc.rows),
+                    Value::from_i64(proc.variadic_type),
+                    Value::build_text(proc.kind),
+                    Value::from_i64(0),
+                    Value::from_i64(i64::from(proc.leakproof)),
+                    Value::from_i64(i64::from(proc.strict)),
+                    Value::from_i64(i64::from(proc.returns_set)),
+                    Value::build_text(proc.volatility),
+                    Value::build_text(proc.parallel),
+                    Value::from_i64(proc.arg_types.len() as i64),
+                    Value::from_i64(0),
+                    Value::from_i64(proc.result),
+                    Value::build_text(arg_types),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]
+            })
+            .collect()
     }
 }
 

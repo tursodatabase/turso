@@ -113,6 +113,13 @@ timestamptz, which fail with 0A000, every operator of another type, such as
 bytea, time, interval, json, jsonb, inet and the array types, and every other
 operator name, such as `^`, `@` and `~~`. `oprcode`, `oprrest` and `oprjoin`
 are 0, because `pg_proc` does not have PostgreSQL's functions under their oids.
+`pg_proc` has the rows of PostgreSQL 18, with PostgreSQL's oids, for 58 functions:
+the aggregates `count`, `sum`, `avg`, `min`, `max`, `stddev` and `string_agg` over
+the number, text, bytea, date, timestamp and timestamptz types that tursopg
+accepts, `abs` for the six number types, and `now`, `quote_ident`,
+`format_type`, `pg_get_constraintdef` and `pg_is_in_recovery`. It does not list
+the other functions of PostgreSQL, and it does not list any function that
+only tursopg has.
 A comparison (also of BETWEEN, an IN list, `IN (SELECT ...)`, `CASE x WHEN`,
 NULLIF and each pair of two row values), an arithmetic operator or a
 bit operator is refused with 42883 (`operator does not exist`) when no row of
