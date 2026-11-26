@@ -1311,6 +1311,12 @@ impl Jsonb {
         Ok(result)
     }
 
+    /// Writes the JSON text of the element at `cursor` to `string`, and
+    /// returns the position after the element. The function is inlined into
+    /// its callers: serialize_object and serialize_array call it for each
+    /// element, and a call saved and restored six registers each time, also
+    /// for an element as small as a number.
+    #[inline(always)]
     fn serialize_value(
         &self,
         string: &mut String,
