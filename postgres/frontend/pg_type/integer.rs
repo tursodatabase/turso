@@ -6,7 +6,7 @@ use turso_core::ast;
 use turso_core::schema::{
     OperatorArg, OperatorSignature, RangeOffsets, BINARY_OPERATORS, PREFIX_OPERATORS,
 };
-use turso_core::types::{Conversion, Type};
+use turso_core::types::{Conversion, TextInput, Type};
 use turso_core::{Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -147,7 +147,7 @@ impl IntegerType {
         }
     }
 
-    /// FIXME(pg-catalog): This hand-codes the pg_cast entries from text, numeric and float8 to the integer types, and it sees the value but not the type it is cast from. So a decimal rounds half away from zero, as numeric does, where PostgreSQL rounds a float8 half to even and refuses one outside the range of bigint; and `true::smallint` and `true::bigint` give 1, where pg_cast only has a cast from boolean to integer. A lookup in a pg_cast table by the type of the value replaces this.
+    /// FIXME(pg-catalog): The cast table of casts.rs decides a cast to an integer type when it can name both types, and then this function is not asked. It still converts for the casts that the engine decides: a cast to an array of the type or to a domain over it, and a cast from a type that has no pg_cast rows yet, such as uuid, which PostgreSQL refuses. It sees the value but not the type it is cast from, so a decimal rounds half away from zero, as numeric does, where PostgreSQL rounds a float8 half to even. This function goes away when the cast table decides those casts too.
     fn cast(self, value: &Value) -> Result<Value> {
         match value {
             Value::Text(text) => Ok(Value::from_i64(self.parse(text.as_str())?)),
@@ -200,13 +200,20 @@ impl Type for IntegerType {
         "integer"
     }
 
-    /// FIXME(pg-catalog): The types have no ENCODE, so a value written to a column is not converted as PostgreSQL's assignment casts convert it: text that is not an integer fails with 23000 where PostgreSQL fails with 22P02, and a decimal fails where PostgreSQL rounds it. An ENCODE would do it, but core then refuses CREATE TABLE AS on the column and a comparison of two integer types. The assignment casts of pg_cast, applied where a value is written, replace this.
     fn coerce(&self) -> Option<Conversion> {
         match self {
             IntegerType::Int2 => Some(Conversion::Function(int2_coerce)),
             IntegerType::Int4 => Some(Conversion::Function(int4_coerce)),
             IntegerType::Int8 => None,
         }
+    }
+
+    fn input(&self) -> Option<TextInput> {
+        Some(match self {
+            IntegerType::Int2 => |text| IntegerType::Int2.parse(text).map(Value::from_i64),
+            IntegerType::Int4 => |text| IntegerType::Int4.parse(text).map(Value::from_i64),
+            IntegerType::Int8 => |text| IntegerType::Int8.parse(text).map(Value::from_i64),
+        })
     }
 
     fn cast(&self) -> Option<Conversion> {

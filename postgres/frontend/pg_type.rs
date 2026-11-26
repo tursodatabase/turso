@@ -17,7 +17,7 @@ use crate::error::sqlstate_error;
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
 use turso_core::schema::{RelationKind, SchemaBuilder};
-use turso_core::types::Type;
+use turso_core::types::{TextInput, Type};
 use turso_core::{Connection, Result};
 use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_UNDEFINED_OBJECT};
 use turso_pg_parser::WrittenTypeName;
@@ -135,6 +135,17 @@ pub(crate) fn register_builtin_types(builder: SchemaBuilder) -> Result<SchemaBui
             Support::Registered(registered) => builder.builtin_type(registered),
             Support::NotRegistered => Ok(builder),
         })
+}
+
+/// FIXME(pg-catalog): This finds the input function of a type (`typinput` of its pg_type row) in `BUILT_IN_TYPES`, for a caller that holds only the oid of a built-in type: the conversions of casts.rs, the parameters of the server and the check of a string literal. A caller that resolves a type name finds the INPUT in the definition of the type (`lookup_type_name`). A type without an INPUT is still read by hand (`hand_written_input_error`, the conversions of casts.rs, the parameters of the server). Each of those copies goes away when its type gets an INPUT, and a lookup of `typinput` in a pg_type table replaces this function (see `Type::input`).
+/// The INPUT of the built-in type whose pg_type row has `oid`: the function
+/// that reads text as a value of the type. None for a type that has no INPUT
+/// yet.
+pub fn type_input(oid: i64) -> Option<TextInput> {
+    match built_in_type(oid)?.support {
+        Support::Registered(registered) => registered.input(),
+        Support::NotRegistered => None,
+    }
 }
 
 // FIXME(pg-catalog): `lookup_type_name` is the one place that says what a type name written as text is. The names written in a statement do not come here yet: the translator of turso_pg_parser maps them by its own lists (`map_pg_type`, `pg_type_name_to_ast_type`, and `BASE_TYPES`, `PSEUDO_TYPES` and `POLYMORPHIC_TYPES` in create_function.rs) and passes a name it does not know on, so `1::nosuchtype` is not refused. `pg_type_oid` of catalog.rs is not a lookup of a written name: it reads the type of a stored column, and knows names of SQLite such as `tinyint`. When casts, column types and function signatures resolve their type names here, those lists go away.
@@ -319,7 +330,7 @@ fn lookup_type(conn: &Arc<Connection>, written: &WrittenTypeName) -> Option<(Nam
 /// The oid and the typname of the built-in type whose pg_type row has the
 /// name `typname`, and 1 when the name is that of the row of its array, such
 /// as `_int4`: the oid and the typname are then those of the element type.
-fn built_in_type_named(typname: &str) -> Option<(i64, &'static str, u32)> {
+pub(crate) fn built_in_type_named(typname: &str) -> Option<(i64, &'static str, u32)> {
     const BPCHAR: i64 = 1042;
     let named = |name: &str| BUILT_IN_TYPES.iter().find(|ty| ty.name == name);
     if let Some(ty) = named(typname) {

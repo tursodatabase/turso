@@ -10,7 +10,7 @@
 
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text, parse_pg_bool};
-use crate::pg_type::{parse_oid, IntegerType};
+use crate::pg_type::{parse_oid, type_input};
 use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
 use turso_core::{LimboError, Numeric, Result, Value};
@@ -222,6 +222,11 @@ pub(crate) fn resolve(
 }
 
 pub(crate) fn convert(value: &Value, source: CastType, target: CastType) -> Result<Value> {
+    if let (Value::Text(text), CastType::Text, Some(read)) =
+        (value, source, type_input(target.oid()))
+    {
+        return read(text.as_str());
+    }
     if target.is_integer() {
         return to_integer(value, source, target);
     }
@@ -259,15 +264,13 @@ fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value
         (Value::Text(text), CastType::Numeric) => {
             float_to_i64(parse_numeric(text.as_str())?.round(), target)?
         }
-        (Value::Text(text), _) => {
-            return parse_integer(text.as_str(), target).map(Value::from_i64);
-        }
         (Value::Numeric(Numeric::Integer(n)), Oid) if target == Int4 => i64::from(*n as u32 as i32),
         (Value::Numeric(Numeric::Integer(n)), _) => *n,
         // The server reads the text of a parameter with no type as a float
         // when it looks like one. As text it is not an integer.
         (Value::Numeric(Numeric::Float(f)), CastType::Text) => {
-            parse_integer(&format!("{:?}", f64::from(*f)), target)?
+            let read = type_input(target.oid()).expect("an integer type has an INPUT");
+            return read(&format!("{:?}", f64::from(*f)));
         }
         (Value::Numeric(Numeric::Float(f)), CastType::Numeric) => {
             float_to_i64(f64::from(*f).round(), target)?
@@ -320,15 +323,6 @@ fn out_of_range(target: CastType) -> LimboError {
         _ => "bigint out of range",
     };
     sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, message, None)
-}
-
-fn parse_integer(text: &str, target: CastType) -> Result<i64> {
-    let integer_type = match target {
-        Int2 => IntegerType::Int2,
-        Int4 => IntegerType::Int4,
-        _ => IntegerType::Int8,
-    };
-    integer_type.parse(text)
 }
 
 fn sqlstate_of(code: &str) -> &'static str {

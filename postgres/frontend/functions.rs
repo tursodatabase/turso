@@ -1,7 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::{sqlstate_error, sqlstate_error_with_hint};
-use crate::pg_type::{lookup_type_name, IntegerType, NamedTypeKind};
+use crate::pg_type::{built_in_type_named, lookup_type_name, type_input, NamedTypeKind};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
 use std::collections::HashSet;
@@ -2369,11 +2369,14 @@ pub(crate) fn validate_pg_input(
             None,
         )
     };
-    let NamedTypeKind::BuiltIn { typname, .. } = ty.kind else {
+    let NamedTypeKind::BuiltIn { oid, typname } = ty.kind else {
         return Err(not_supported());
     };
     if ty.array_dimensions > 0 {
         return Err(not_supported());
+    }
+    if let Some(read) = type_input(oid) {
+        return Ok(input_error_of(read(input)));
     }
     let modifier = ty
         .modifiers
@@ -2385,7 +2388,13 @@ pub(crate) fn validate_pg_input(
 /// What is wrong with `text` as input of the built-in type whose pg_type row
 /// is named `typname`, for a caller that already holds the type.
 pub(crate) fn built_in_input_error(typname: &str, text: &str) -> Option<InputError> {
-    hand_written_input_error(typname, None, text).flatten()
+    let read = built_in_type_named(typname)
+        .filter(|(_, _, dimensions_of_name)| *dimensions_of_name == 0)
+        .and_then(|(oid, _, _)| type_input(oid));
+    match read {
+        Some(read) => input_error_of(read(text)),
+        None => hand_written_input_error(typname, None, text).flatten(),
+    }
 }
 
 fn input_error_of(read: Result<Value>) -> Option<InputError> {
@@ -2420,9 +2429,6 @@ fn hand_written_input_error(
                 ))
             }
         }
-        "int2" => check_integer_input(IntegerType::Int2.parse(input)),
-        "int4" => check_integer_input(IntegerType::Int4.parse(input)),
-        "int8" => check_integer_input(IntegerType::Int8.parse(input)),
         "float4" => float_input_error(input, "real", true),
         "float8" => float_input_error(input, "double precision", false),
         "numeric" => match trimmed.parse::<f64>() {

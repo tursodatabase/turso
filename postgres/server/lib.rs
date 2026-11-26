@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, IntegerType, PgConnection,
+    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, type_input, PgConnection,
     StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
@@ -1024,10 +1024,11 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         ))))
     })?;
 
+    if let Some(read) = type_input(i64::from(pg_type.oid())) {
+        return read(text).map_err(|error| pg_error(error.into()));
+    }
+
     match *pg_type {
-        Type::INT2 => integer_parameter(IntegerType::Int2, text),
-        Type::INT4 => integer_parameter(IntegerType::Int4, text),
-        Type::INT8 => integer_parameter(IntegerType::Int8, text),
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
                 PgWireError::UserError(Box::new(error_info(&format!(
@@ -1075,13 +1076,6 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         }
         // TEXT, VARCHAR, and all other types → text
         _ => Ok(Value::from_text(text.to_owned())),
-    }
-}
-
-fn integer_parameter(ty: IntegerType, text: &str) -> PgWireResult<Value> {
-    match ty.parse(text) {
-        Ok(integer) => Ok(Value::from_i64(integer)),
-        Err(error) => Err(pg_error(error.into())),
     }
 }
 
