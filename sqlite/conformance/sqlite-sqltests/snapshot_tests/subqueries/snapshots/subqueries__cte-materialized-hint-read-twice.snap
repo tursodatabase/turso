@@ -1,0 +1,28 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH spenders AS MATERIALIZED (
+          SELECT customer_id, sum(total_amount) AS total FROM orders GROUP BY customer_id
+      )
+      SELECT c.name, s1.total
+      FROM customers c
+      JOIN spenders s1 ON s1.customer_id = c.id
+      JOIN spenders s2 ON s2.customer_id = c.id + 1;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - customers
+  - orders
+  - s1.customer_id
+  - s2.customer_id
+  - spenders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--MATERIALIZE spenders
+|  `--SCAN orders USING INDEX idx_orders_customer
+|--SCAN customers AS c
+|--SEARCH s1 USING INDEX ephemeral_subquery_t3 (customer_id=?)
+`--SEARCH s2 USING INDEX ephemeral_subquery_t5 (customer_id=?)

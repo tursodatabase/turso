@@ -1115,52 +1115,9 @@ impl Limbo {
         rows: &mut Statement,
         statistics: Option<&mut QueryStatistics>,
     ) -> turso_core::Result<()> {
-        struct Entry {
-            id: usize,
-            detail: String,
-            child_prefix: String,
-            children: Vec<Entry>,
-        }
-
-        fn add_children(id: usize, parent_id: usize, detail: String, current: &mut Entry) -> bool {
-            if current.id == parent_id {
-                current.children.push(Entry {
-                    id,
-                    detail,
-                    child_prefix: current.child_prefix.clone() + "   ",
-                    children: vec![],
-                });
-                if current.children.len() > 1 {
-                    let idx = current.children.len() - 2;
-                    current.children[idx].child_prefix = current.child_prefix.clone() + "|  ";
-                }
-                return false;
-            }
-            for child in &mut current.children {
-                if !add_children(id, parent_id, detail.clone(), child) {
-                    return false;
-                }
-            }
-            true
-        }
-
-        fn print_entry(app: &mut Limbo, entry: &Entry, prefix: &str) {
-            writeln!(app, "{}{}", prefix, entry.detail).unwrap();
-            for (i, child) in entry.children.iter().enumerate() {
-                let is_last = i == entry.children.len() - 1;
-                let child_prefix = format!(
-                    "{}{}",
-                    entry.child_prefix,
-                    if is_last { "`--" } else { "|--" }
-                );
-                print_entry(app, child, child_prefix.as_str());
-            }
-        }
-
-        let mut root = Entry {
+        let mut root = EqpTreeEntry {
             id: 0,
             detail: "QUERY PLAN".to_owned(),
-            child_prefix: "".to_owned(),
             children: vec![],
         };
 
@@ -1171,7 +1128,7 @@ impl Limbo {
                     let id = row.get_value(0).as_uint() as usize;
                     let parent_id = row.get_value(1).as_uint() as usize;
                     let detail = row.get_value(3).to_string();
-                    add_children(id, parent_id, detail, &mut root);
+                    root.add_child(id, parent_id, detail);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -1181,7 +1138,9 @@ impl Limbo {
             }
         }
 
-        print_entry(self, &root, "");
+        let mut tree = String::new();
+        root.write_tree(&mut tree, "", "");
+        self.write(tree).unwrap();
         Ok(())
     }
 
@@ -2527,10 +2486,89 @@ fn normalize_db_path(db_file: String) -> String {
     db_file
 }
 
+/// A row of `EXPLAIN QUERY PLAN` output, with the rows whose parent it is.
+struct EqpTreeEntry {
+    id: usize,
+    detail: String,
+    children: Vec<EqpTreeEntry>,
+}
+
+impl EqpTreeEntry {
+    /// Adds a row below the entry with id `parent_id`. Returns false when it
+    /// found that entry.
+    fn add_child(&mut self, id: usize, parent_id: usize, detail: String) -> bool {
+        if self.id == parent_id {
+            self.children.push(EqpTreeEntry {
+                id,
+                detail,
+                children: vec![],
+            });
+            return false;
+        }
+        for child in &mut self.children {
+            if !child.add_child(id, parent_id, detail.clone()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Writes the entry and its children as a tree, one line for each row.
+    /// The prefix of a line depends on whether each ancestor is the last child
+    /// of its parent, which is known only after all rows are read.
+    fn write_tree(&self, out: &mut String, prefix: &str, children_prefix: &str) {
+        out.push_str(prefix);
+        out.push_str(&self.detail);
+        out.push('\n');
+        for (i, child) in self.children.iter().enumerate() {
+            let is_last = i == self.children.len() - 1;
+            let (branch, continuation) = if is_last {
+                ("`--", "   ")
+            } else {
+                ("|--", "|  ")
+            };
+            child.write_tree(
+                out,
+                &format!("{children_prefix}{branch}"),
+                &format!("{children_prefix}{continuation}"),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use turso_core::SessionRole;
+
+    #[test]
+    fn eqp_tree_continues_the_line_of_an_ancestor_that_has_a_later_sibling() {
+        let mut root = EqpTreeEntry {
+            id: 0,
+            detail: "QUERY PLAN".to_owned(),
+            children: vec![],
+        };
+        for (id, parent_id, detail) in [
+            (1, 0, "LIST SUBQUERY 1"),
+            (2, 1, "MATERIALIZE s"),
+            (3, 2, "SCAN orders"),
+            (4, 1, "SCAN s"),
+            (5, 0, "SCAN users"),
+        ] {
+            root.add_child(id, parent_id, detail.to_owned());
+        }
+        let mut tree = String::new();
+        root.write_tree(&mut tree, "", "");
+        assert_eq!(
+            tree,
+            "QUERY PLAN\n\
+             |--LIST SUBQUERY 1\n\
+             |  |--MATERIALIZE s\n\
+             |  |  `--SCAN orders\n\
+             |  `--SCAN s\n\
+             `--SCAN users\n"
+        );
+    }
 
     #[test]
     fn sync_workers_above_the_maximum_are_rejected_at_parse_time() {

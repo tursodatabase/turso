@@ -24,11 +24,12 @@ QUERY PLAN
 |--SCAN nested_correlated_outer
 `--CORRELATED SCALAR SUBQUERY 1
    |--SCAN nested_correlated_anchor
-   |--SCAN (join-1)
+   |--MATERIALIZE (join-1)
    |  |--SCAN nested_correlated_left
    |  |--SCAN nested_correlated_right LEFT-JOIN
    |  `--RIGHT-JOIN nested_correlated_right
    |     `--SCAN nested_correlated_right
+   |--SCAN (join-1)
    `--RIGHT-JOIN (join-1)
       `--SCAN (join-1)
 

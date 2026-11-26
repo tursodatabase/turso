@@ -513,6 +513,63 @@ snapshot cte-in-subquery-and-main {
     ) * 0.8;
 }
 
+# A CTE that is stored once shows its body under MATERIALIZE <name>, as in
+# SQLite, so that its steps are not mistaken for steps of the main loop.
+@setup schema
+snapshot-eqp cte-materialized-hint-read-twice {
+    WITH spenders AS MATERIALIZED (
+        SELECT customer_id, sum(total_amount) AS total FROM orders GROUP BY customer_id
+    )
+    SELECT c.name, s1.total
+    FROM customers c
+    JOIN spenders s1 ON s1.customer_id = c.id
+    JOIN spenders s2 ON s2.customer_id = c.id + 1;
+}
+
+@setup schema
+snapshot-eqp cte-materialized-hint-read-once {
+    WITH big AS MATERIALIZED (SELECT * FROM orders WHERE total_amount > 100)
+    SELECT * FROM big;
+}
+
+@setup schema
+snapshot-eqp cte-materialized-inside-in-subquery {
+    WITH big AS MATERIALIZED (SELECT customer_id FROM orders WHERE total_amount > 100)
+    SELECT name FROM customers
+    WHERE id IN (SELECT customer_id FROM big)
+      AND id + 1 IN (SELECT customer_id FROM big);
+}
+
+# A CTE that is filled again for each reader, because its body is correlated
+# or reads a column of an outer query, also shows MATERIALIZE <name>.
+@setup schema
+snapshot-eqp cte-materialized-hint-correlated-body {
+    WITH named AS MATERIALIZED (
+        SELECT (SELECT name FROM customers WHERE customers.id = o.customer_id) AS name
+        FROM orders o
+    )
+    SELECT * FROM named;
+}
+
+@setup schema
+snapshot-eqp cte-materialized-hint-reads-outer-column {
+    SELECT name, (
+        WITH own AS MATERIALIZED (SELECT id FROM orders WHERE customer_id = customers.id)
+        SELECT count(*) FROM own
+    )
+    FROM customers;
+}
+
+@setup schema
+snapshot-eqp recursive-cte-read-twice {
+    WITH RECURSIVE chain(id) AS (
+        SELECT id FROM employees WHERE manager_id IS NULL
+        UNION ALL
+        SELECT e.id FROM employees e JOIN chain ON e.manager_id = chain.id
+    )
+    SELECT a.id, b.id FROM chain a JOIN chain b ON a.id < b.id;
+}
+
 # =============================================================================
 # COMPLEX COMBINATIONS
 # =============================================================================

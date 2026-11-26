@@ -96,22 +96,23 @@ QUERY PLAN
 |  |     |        `--SCAN journal_entries
 |  |     |--USE HASH TABLE FOR DISTINCT
 |  |     `--USE SORTER FOR ORDER BY
-|  |--SCAN (subquery-0)
-|  |  `--COMPOUND QUERY
-|  |     |--LEFT-MOST SUBQUERY
-|  |     |  `--SCAN user_messages
-|  |     |--UNION ALL
-|  |     |  `--SCAN session_starts
-|  |     |--UNION ALL
-|  |     |  `--SCAN observed_items
-|  |     |--UNION ALL
-|  |     |  `--SCAN observed_items
-|  |     |--UNION ALL
-|  |     |  `--SCAN observed_items
-|  |     `--UNION ALL
-|  |        `--SCAN journal_entries
-|  |--USE HASH TABLE FOR DISTINCT
-|  |--USE SORTER FOR ORDER BY
+|  |--MATERIALIZE signal_days
+|  |  |--SCAN (subquery-0)
+|  |  |  `--COMPOUND QUERY
+|  |  |     |--LEFT-MOST SUBQUERY
+|  |  |     |  `--SCAN user_messages
+|  |  |     |--UNION ALL
+|  |  |     |  `--SCAN session_starts
+|  |  |     |--UNION ALL
+|  |  |     |  `--SCAN observed_items
+|  |  |     |--UNION ALL
+|  |  |     |  `--SCAN observed_items
+|  |  |     |--UNION ALL
+|  |  |     |  `--SCAN observed_items
+|  |  |     `--UNION ALL
+|  |  |        `--SCAN journal_entries
+|  |  |--USE HASH TABLE FOR DISTINCT
+|  |  `--USE SORTER FOR ORDER BY
 |  `--SCAN run_ids
 |     `--SCAN window_subquery_0
 |        `--SCAN run_boundaries

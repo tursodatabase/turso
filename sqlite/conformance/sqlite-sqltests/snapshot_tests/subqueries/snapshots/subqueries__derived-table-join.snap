@@ -24,8 +24,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
+|--MATERIALIZE order_stats
+|  `--SCAN orders USING INDEX idx_orders_customer
 `--SEARCH order_stats USING INDEX ephemeral_subquery_t3 (customer_id=? AND total_spent>?)
-   `--SCAN orders USING INDEX idx_orders_customer
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4            p5  comment

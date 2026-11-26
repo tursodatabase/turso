@@ -36,11 +36,12 @@ info:
 QUERY PLAN
 |--SCAN large_orders AS l
 |  `--SCAN orders
+|--MATERIALIZE vip_customers
+|  |--LIST SUBQUERY 1
+|  |  `--SCAN large_orders
+|  |     `--SCAN orders
+|  `--SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
 `--SEARCH v USING INDEX ephemeral_subquery_t6 (id=?)
-   |--LIST SUBQUERY 1
-   |  `--SCAN large_orders
-   |     `--SCAN orders
-   `--SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4            p5  comment

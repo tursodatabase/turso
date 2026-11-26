@@ -28,9 +28,10 @@ info:
 ---
 QUERY PLAN
 |--HASH JOIN lineitem
-|--SEARCH scalar_subquery_t3 USING INDEX ephemeral_subquery_t3 (correlation_key_0=?)
+|--MATERIALIZE scalar_subquery_t3
 |  |--SCAN lineitem
 |  `--USE SORTER FOR GROUP BY
+|--SEARCH scalar_subquery_t3 USING INDEX ephemeral_subquery_t3 (correlation_key_0=?)
 `--SCAN part
 
 BYTECODE
