@@ -2902,6 +2902,53 @@ mod tests {
         assert_eq!(remote_rows[1][2], Value::Text("from-local".to_string()));
     }
 
+    /// Pull test: remote and local both rename the same column. The pull must
+    /// skip the local rename when it replays local changes.
+    #[tokio::test]
+    pub async fn test_sync_pull_alter_table_rename_column_idempotent() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        let (db, conn) = bootstrap_table_t(&server).await;
+
+        server
+            .db_sql("ALTER TABLE t RENAME COLUMN y TO w")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('b', 'beta')")
+            .await
+            .unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN y TO w", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('c', 'gamma')", ())
+            .await
+            .unwrap();
+
+        db.pull().await.unwrap();
+        let rows = all_rows(
+            conn.query("SELECT x, w FROM t ORDER BY x", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            rows_of(&[("a", "alpha"), ("b", "beta"), ("c", "gamma")])
+        );
+
+        db.push().await.unwrap();
+        let remote_rows = server
+            .db_sql("SELECT x, w FROM t ORDER BY x")
+            .await
+            .unwrap();
+        assert_eq!(
+            remote_rows,
+            rows_of(&[("a", "alpha"), ("b", "beta"), ("c", "gamma")])
+        );
+    }
+
     /// Pull test: remote and local both rename the same table. The pull must
     /// skip the local rename when it replays local changes.
     #[tokio::test]
@@ -2927,6 +2974,83 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, rows_of(&[("a", "alpha"), ("b", "beta")]));
+    }
+
+    /// Push test: remote and local both rename the same column, so the pushed
+    /// rename must be skipped on the remote.
+    #[tokio::test]
+    pub async fn test_sync_push_alter_table_rename_column_idempotent() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        let (db, conn) = bootstrap_table_t(&server).await;
+
+        server
+            .db_sql("ALTER TABLE t RENAME COLUMN y TO w")
+            .await
+            .unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN y TO w", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('b', 'beta')", ())
+            .await
+            .unwrap();
+
+        db.push().await.unwrap();
+        let remote_rows = server
+            .db_sql("SELECT x, w FROM t ORDER BY x")
+            .await
+            .unwrap();
+        assert_eq!(remote_rows, rows_of(&[("a", "alpha"), ("b", "beta")]));
+    }
+
+    /// Push test: remote and local both rename the same table, so the pushed
+    /// rename must be skipped on the remote.
+    #[tokio::test]
+    pub async fn test_sync_push_alter_table_rename_to_idempotent() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        let (db, conn) = bootstrap_table_t(&server).await;
+
+        server.db_sql("ALTER TABLE t RENAME TO t2").await.unwrap();
+        conn.execute("ALTER TABLE t RENAME TO t2", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('b', 'beta')", ())
+            .await
+            .unwrap();
+
+        db.push().await.unwrap();
+        let remote_rows = server
+            .db_sql("SELECT x, y FROM t2 ORDER BY x")
+            .await
+            .unwrap();
+        assert_eq!(remote_rows, rows_of(&[("a", "alpha"), ("b", "beta")]));
+    }
+
+    /// Push test: only local renames the table and a column, so the pushed
+    /// renames must run on the remote.
+    #[tokio::test]
+    pub async fn test_sync_push_alter_table_renames() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        let (db, conn) = bootstrap_table_t(&server).await;
+
+        conn.execute("ALTER TABLE t RENAME TO t2", ())
+            .await
+            .unwrap();
+        conn.execute("ALTER TABLE t2 RENAME COLUMN y TO w", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('b', 'beta')", ())
+            .await
+            .unwrap();
+
+        db.push().await.unwrap();
+        let remote_rows = server
+            .db_sql("SELECT x, w FROM t2 ORDER BY x")
+            .await
+            .unwrap();
+        assert_eq!(remote_rows, rows_of(&[("a", "alpha"), ("b", "beta")]));
     }
 
     async fn bootstrap_table_t(server: &TursoServer) -> (crate::sync::Database, crate::Connection) {
