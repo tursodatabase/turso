@@ -2148,7 +2148,6 @@ impl PostgreSQLTranslator {
             Ok(pg_query::protobuf::OverridingKind::OverridingSystemValue) => true,
             _ => false,
         };
-        let has_explicit_columns = !columns.is_empty();
 
         // Translate ON CONFLICT clause (upsert)
         let upsert = self.translate_on_conflict(&insert.on_conflict_clause)?;
@@ -2196,44 +2195,18 @@ impl PostgreSQLTranslator {
                     "Write INSERT ... SELECT * FROM (VALUES ...) AS v ORDER BY ... LIMIT n.",
                 ));
             }
-            // VALUES clause — compute which columns are DEFAULT in ALL rows.
-            let (rows, default_mask) =
-                self.translate_values(&select_stmt.values_lists, has_explicit_columns)?;
-            // Strip columns that use DEFAULT in every row
-            let filtered_columns: Vec<ast::Name> = columns
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| !default_mask.get(*i).copied().unwrap_or(false))
-                .map(|(_, col)| col)
-                .collect();
-            // If ALL named columns are DEFAULT, use DEFAULT VALUES.
-            // But only when the INSERT had explicit column names — an empty
-            // column list means "all columns" (positional VALUES), not defaults.
-            if filtered_columns.is_empty() && has_explicit_columns {
-                if select_stmt.values_lists.len() > 1 {
-                    return Err(ParseError::not_supported(
-                        "INSERT of several rows whose values are all DEFAULT",
-                    )
-                    .with_hint("Run one INSERT ... DEFAULT VALUES per row."));
-                }
-                if upsert.is_some() {
-                    return Err(ParseError::not_supported(
-                        "ON CONFLICT on an INSERT whose values are all DEFAULT",
-                    ));
-                }
-                (ast::InsertBody::DefaultValues, filtered_columns)
-            } else {
-                let select = ast::Select {
-                    with: self.translate_with_clause(&select_stmt.with_clause)?,
-                    body: ast::SelectBody {
-                        select: ast::OneSelect::Values(rows),
-                        compounds: vec![],
-                    },
-                    order_by: vec![],
-                    limit: None,
-                };
-                (ast::InsertBody::Select(select, upsert), filtered_columns)
-            }
+            let select = ast::Select {
+                with: self.translate_with_clause(&select_stmt.with_clause)?,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Values(
+                        self.translate_values(&select_stmt.values_lists)?,
+                    ),
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            (ast::InsertBody::Select(select, upsert), columns)
         } else {
             // INSERT ... SELECT
             let select = self.translate_select(select_stmt)?;
@@ -2255,69 +2228,30 @@ impl PostgreSQLTranslator {
         })
     }
 
-    /// Translate VALUES lists, returning both the translated rows and a bitmask of
-    /// which column positions contain DEFAULT in every row. When `strip_defaults` is set
-    /// these positions are left out of the rows, and should be stripped from the INSERT
-    /// column list too — omitting the column achieves the same effect.
+    /// Translate the rows of an INSERT ... VALUES. A DEFAULT value becomes
+    /// `Expr::Default`, which core replaces with the default of its target column.
     // The Box<Expr> is required by ast::OneSelect::Values(Vec<Vec<Box<Expr>>>)
-    #[allow(clippy::vec_box, clippy::type_complexity)]
+    #[allow(clippy::vec_box)]
     fn translate_values(
         &self,
         values_lists: &[pg_query::protobuf::Node],
-        strip_defaults: bool,
-    ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
+    ) -> Result<Vec<Vec<Box<ast::Expr>>>, ParseError> {
         use pg_query::protobuf::node::Node;
 
         let mut expected_len: Option<usize> = None;
-        // First pass: compute the default mask across ALL rows.
-        // A column is "all defaults" only if every row has DEFAULT for that position.
-        let mut default_mask: Vec<bool> = Vec::new();
-        for (row_idx, row_node) in values_lists.iter().enumerate() {
-            if let Some(Node::List(list)) = &row_node.node {
-                if let Some(expected_len) = expected_len {
-                    if list.items.len() != expected_len {
-                        return Err(ParseError::syntax_error(
-                            "VALUES lists must all be the same length",
-                        ));
-                    }
-                } else {
-                    expected_len = Some(list.items.len());
-                }
-
-                if row_idx == 0 {
-                    default_mask = list
-                        .items
-                        .iter()
-                        .map(|item| matches!(&item.node, Some(Node::SetToDefault(_))))
-                        .collect();
-                } else {
-                    for (i, item) in list.items.iter().enumerate() {
-                        if let Some(mask) = default_mask.get_mut(i) {
-                            if !matches!(&item.node, Some(Node::SetToDefault(_))) {
-                                *mask = false;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !strip_defaults {
-            default_mask.clear();
-        }
-
-        // Second pass: translate values, filtering out all-default columns.
-        // Columns with DEFAULT in only some rows emit NULL (via translate_expr).
         let mut rows = Vec::new();
         for row_node in values_lists.iter() {
             match &row_node.node {
                 Some(Node::List(list)) => {
+                    if *expected_len.get_or_insert(list.items.len()) != list.items.len() {
+                        return Err(ParseError::syntax_error(
+                            "VALUES lists must all be the same length",
+                        ));
+                    }
                     let row: Vec<Box<ast::Expr>> = list
                         .items
                         .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !default_mask.get(*i).copied().unwrap_or(false))
-                        .map(|(_, item)| Ok(Box::new(self.translate_expr(item)?)))
+                        .map(|item| Ok(Box::new(self.translate_expr(item)?)))
                         .collect::<Result<Vec<_>, ParseError>>()?;
                     rows.push(row);
                 }
@@ -2327,7 +2261,7 @@ impl PostgreSQLTranslator {
             }
         }
 
-        Ok((rows, default_mask))
+        Ok(rows)
     }
 
     fn translate_update(
@@ -12345,54 +12279,21 @@ mod tests {
 
     #[test]
     fn test_insert_with_default_values() {
-        let translator = PostgreSQLTranslator::new();
         // Drizzle generates DEFAULT for columns with default values
-        let sql = "INSERT INTO users (id, name, verified, jsonb) VALUES ($1, $2, default, default)";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-
-        if let ast::Stmt::Insert { columns, body, .. } = translated {
-            // DEFAULT columns should be stripped
-            assert_eq!(columns.len(), 2, "should only have id and name columns");
-            assert_eq!(columns[0].as_str(), "id");
-            assert_eq!(columns[1].as_str(), "name");
-            // VALUES should also have 2 entries per row
-            if let ast::InsertBody::Select(select, _) = body {
-                if let ast::OneSelect::Values(rows) = &select.body.select {
-                    assert_eq!(rows.len(), 1);
-                    assert_eq!(rows[0].len(), 2, "should only have 2 values per row");
-                } else {
-                    panic!("Expected Values");
-                }
-            }
-        } else {
-            panic!("Expected Insert");
-        }
+        assert_eq!(
+            translate_to_sql(
+                "INSERT INTO users (id, name, verified, jsonb) VALUES ($1, $2, default, default)"
+            ),
+            "INSERT INTO users (id, name, verified, jsonb) VALUES (?1, ?2, DEFAULT, DEFAULT)"
+        );
     }
 
     #[test]
     fn test_insert_multi_row_with_defaults() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "INSERT INTO t (a, b, c) VALUES ($1, default, $2), ($3, default, $4)";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-
-        if let ast::Stmt::Insert { columns, body, .. } = translated {
-            assert_eq!(columns.len(), 2, "column b should be stripped");
-            assert_eq!(columns[0].as_str(), "a");
-            assert_eq!(columns[1].as_str(), "c");
-            if let ast::InsertBody::Select(select, _) = body {
-                if let ast::OneSelect::Values(rows) = &select.body.select {
-                    assert_eq!(rows.len(), 2);
-                    assert_eq!(rows[0].len(), 2);
-                    assert_eq!(rows[1].len(), 2);
-                } else {
-                    panic!("Expected Values");
-                }
-            }
-        } else {
-            panic!("Expected Insert");
-        }
+        assert_eq!(
+            translate_to_sql("INSERT INTO t (a, b, c) VALUES ($1, default, $2), ($3, default, $4)"),
+            "INSERT INTO t (a, b, c) VALUES (?1, DEFAULT, ?2), (?3, DEFAULT, ?4)"
+        );
     }
 
     #[test]
@@ -14641,16 +14542,6 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_insert_several_all_default_rows() {
-        assert_not_supported(
-            "INSERT INTO t (a) VALUES (DEFAULT), (DEFAULT)",
-            "several rows whose values are all DEFAULT",
-        );
-        assert_translates("INSERT INTO t (a) VALUES (DEFAULT)");
-        assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 1), (DEFAULT, 2)");
-    }
-
-    #[test]
     fn fail_closed_truncate() {
         assert_not_supported("TRUNCATE a, b", "several tables");
         assert_not_supported("TRUNCATE t RESTART IDENTITY", "RESTART IDENTITY");
@@ -14809,13 +14700,11 @@ mod tests {
             "INSERT INTO t DEFAULT VALUES ON CONFLICT DO NOTHING",
             "ON CONFLICT",
         );
-        assert_not_supported(
-            "INSERT INTO t (a) VALUES (DEFAULT) ON CONFLICT DO NOTHING",
-            "ON CONFLICT",
-        );
+        assert_translates("INSERT INTO t (a) VALUES (DEFAULT) ON CONFLICT DO NOTHING");
         assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 5)");
         assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 1), (5, 2)");
         assert_translates("INSERT INTO t (a) VALUES (DEFAULT)");
+        assert_translates("INSERT INTO t (a) VALUES (DEFAULT), (DEFAULT)");
     }
 
     #[test]
