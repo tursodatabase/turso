@@ -111,7 +111,7 @@ fn split_fields(input: &str) -> Option<Vec<Field<'_>>> {
     while i < bytes.len() {
         let start = i;
         let c = bytes[i];
-        if c.is_ascii_whitespace() || c == b',' {
+        if is_c_space(c) || c == b',' {
             i += 1;
         } else if c.is_ascii_digit() {
             i = skip(i, &|c| c.is_ascii_digit());
@@ -176,7 +176,7 @@ impl Fields {
     fn read(input: &str, ty: TemporalType) -> Result<Self> {
         // PostgreSQL skips only the ASCII spaces that C's isspace() accepts, so a
         // special word with a no-break space around it is not that word.
-        let word = input.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+        let word = input.trim_matches(|c: char| c.is_ascii() && is_c_space(c as u8));
         match word.to_ascii_lowercase().as_str() {
             "allballs" if ty == TemporalType::Time => {
                 return Ok(Self {
@@ -602,6 +602,12 @@ fn read_offset(text: &str, input: &str, ty: TemporalType) -> Result<i64> {
     }
     let offset = (hours * 60 + minutes) * 60;
     Ok(if sign == "-" { -offset } else { offset })
+}
+
+/// C's isspace() in the C locale, which PostgreSQL uses to skip spaces in date and
+/// time input: the ASCII whitespace characters and the vertical tab.
+fn is_c_space(c: u8) -> bool {
+    c.is_ascii_whitespace() || c == 0x0b
 }
 
 #[cfg(test)]

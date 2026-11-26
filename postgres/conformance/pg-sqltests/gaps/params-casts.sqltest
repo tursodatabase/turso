@@ -220,6 +220,14 @@ expect {
     1970-01-01 00:00:00+00|1970-01-01 00:00:00|1970-01-01
 }
 
+# PostgreSQL skips a vertical tab like any other ASCII space.
+test date-with-vertical-tab {
+    SELECT E'\x0b2024-01-01'::date, E'\x0bepoch'::date;
+}
+expect {
+    2024-01-01|1970-01-01
+}
+
 # PostgreSQL skips only ASCII spaces around a special word; the first
 # character here is U+00A0 NO-BREAK SPACE.
 test special-value-epoch-with-no-break-space {
