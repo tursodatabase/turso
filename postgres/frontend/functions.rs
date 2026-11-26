@@ -54,6 +54,7 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
+    let options = crate::pg_type::register_integer_operator_functions(options);
     options
         .extension_function(
             pg_scalar_function(

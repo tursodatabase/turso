@@ -5,9 +5,11 @@
 
 mod boolean;
 mod integer;
+mod integer_operators;
 
 pub(crate) use integer::split_sign;
 pub use integer::IntegerType;
+pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
 
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;

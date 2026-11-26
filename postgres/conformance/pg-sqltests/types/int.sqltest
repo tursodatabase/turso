@@ -618,6 +618,191 @@ expect {
     {1,2,3}
 }
 
+# Arithmetic on the integer types.
+
+setup ints {
+    CREATE TABLE ints (s smallint, i integer, b bigint);
+    INSERT INTO ints VALUES (32767, 2147483647, 9223372036854775807);
+}
+
+@setup ints
+test smallint-plus-smallint-out-of-range-errors {
+    SELECT s + s FROM ints;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+@setup ints
+test integer-plus-integer-out-of-range-errors {
+    SELECT i + i FROM ints;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup ints
+test bigint-plus-bigint-out-of-range-errors {
+    SELECT b + b FROM ints;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+@setup ints
+test integer-plus-an-integer-literal-out-of-range-errors {
+    SELECT i + 1 FROM ints;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup ints
+test integer-times-integer-out-of-range-errors {
+    SELECT i * 2 FROM ints;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup ints
+test bigint-minus-out-of-range-errors {
+    SELECT -b - 2 FROM ints;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+@setup ints
+test arithmetic-on-two-integer-types-gives-the-wider-type {
+    SELECT s - i + i, s * 2, i - b + b, i::bigint + 1, s::integer + s FROM ints;
+}
+expect {
+    32767|65534|2147483647|2147483648|65534
+}
+
+@setup ints
+test integer-plus-a-literal-wider-than-integer-is-a-bigint {
+    SELECT i + 3000000000, s + 3000000000 FROM ints;
+}
+expect {
+    5147483647|3000032767
+}
+
+test integer-division-cuts-off-the-fraction {
+    SELECT 7::integer / 2, (-7)::integer / 2, 7::smallint / 2::bigint, 7::integer % 2, (-7)::integer % 2;
+}
+expect {
+    3|-3|3|1|-1
+}
+
+test integer-division-by-zero-errors {
+    SELECT 1::integer / 0;
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+
+test integer-remainder-by-zero-errors {
+    SELECT 1::bigint % 0::bigint;
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+
+test smallest-integer-divided-by-minus-one-errors {
+    SELECT (-2147483648)::integer / (-1);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test smallest-integer-remainder-by-minus-one-is-zero {
+    SELECT (-2147483648)::integer % (-1), (-32768)::smallint % (-1)::smallint;
+}
+expect {
+    0|0
+}
+
+test negating-the-smallest-integer-errors {
+    CREATE TABLE t (i integer);
+    INSERT INTO t VALUES (-2147483648);
+    SELECT -i FROM t;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test bit-operators-on-integers {
+    SELECT 12::integer & 10, 12::integer | 10, ~5::integer, ~5::smallint, 12::bigint & 10::bigint;
+}
+expect {
+    8|14|-6|-6|8
+}
+
+test integer-shifts-read-the-low-bits-of-the-count {
+    SELECT 1::integer << 33, 1::integer << 31, 1::smallint << 15, 1::bigint << 65, (-8)::integer >> 1;
+}
+expect {
+    2|-2147483648|-32768|2|-4
+}
+
+@setup ints
+test string-literal-in-integer-arithmetic-is-read-as-the-integer-type {
+    SELECT s - '1', i - '0x10', b - '1_000' FROM ints;
+}
+expect {
+    32766|2147483631|9223372036854774807
+}
+
+@setup ints
+test string-literal-in-integer-arithmetic-out-of-range-errors {
+    SELECT i + '1' FROM ints;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test integer-arithmetic-in-where-group-by-order-by-and-aggregates {
+    CREATE TABLE t (id integer PRIMARY KEY, n smallint);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+    SELECT id % 2, sum(n + 1), max(id * n) FROM t WHERE id + 1 > 2 GROUP BY id % 2 ORDER BY id % 2;
+}
+expect {
+    0|62|160
+    1|31|90
+}
+
+test integer-arithmetic-in-an-index-and-a-check {
+    CREATE TABLE t (i integer CHECK (i + 1 > 0));
+    CREATE INDEX t_double ON t ((i * 2));
+    INSERT INTO t VALUES (3), (4);
+    SELECT i FROM t WHERE i * 2 = 8;
+}
+expect {
+    4
+}
+
+test integer-arithmetic-of-null-is-null {
+    CREATE TABLE t (i integer, b bigint);
+    INSERT INTO t VALUES (NULL, 1);
+    SELECT i + 1 IS NULL, i * b IS NULL, -i IS NULL FROM t;
+}
+expect {
+    t|t|t
+}
+
 test pg-input-is-valid-reads-integers-as-the-types-do {
     SELECT pg_input_is_valid('0x10', 'integer'), pg_input_is_valid(' 7 ', 'bigint'),
         pg_input_is_valid('1.5', 'integer'), pg_input_is_valid('40000', 'smallint');

@@ -150,11 +150,9 @@ numeric and is false, while `1 IN ('1.5', 2)` fails with 22P02. A value that
 reads a column is compared with the left side alone. The implicit casts of that choice are the
 rows of `pg_cast` between the types that `pg_operator` has rows for, written
 in the frontend.
-A literal next to a numeric or a double precision that the engine stores as a double, and that a double does not keep exactly (`n = '9007199254740993'`), fails with 0A000, where PostgreSQL compares all the digits of a numeric. Still different from PostgreSQL: a literal next to an integer is checked
+A literal next to a numeric or a double precision that the engine stores as a double, and that a double does not keep exactly (`n = '9007199254740993'`), fails with 0A000, where PostgreSQL compares all the digits of a numeric. Still different from PostgreSQL: a literal next to an integer that has no registered type, such as an integer written in the statement or the result of a function, is checked
 against the range of bigint, a literal that is NaN, an infinity or a numeric past the range
-of a double next to a real, a double precision or a numeric is compared as text, `x IS DISTINCT FROM y` does not choose an operator unless an operand is a string literal, and `-'1'` is -1 where PostgreSQL fails with 42725. The message names the
-type that Turso gives the value: `1::smallint = 'a'::text` says
-`integer = text`, where PostgreSQL says `smallint = text`.
+of a double next to a real, a double precision or a numeric is compared as text, `x IS DISTINCT FROM y` does not choose an operator unless an operand is a string literal, and `-'1'` is -1 where PostgreSQL fails with 42725.
 `pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
@@ -187,8 +185,14 @@ a decimal written to such a column fail with 23000, where PostgreSQL fails with
 text as PostgreSQL does (white space around the number, a sign, `0x`, `0o` and
 `0b`, `_` between digits; 22P02 for other text, 22003 outside the range) and
 rounds a decimal half away from zero. A float8 is rounded the same way, where
-PostgreSQL rounds it half to even. Arithmetic on these types is 64-bit:
-`2147483647::int4 + 1` gives 2147483648, where PostgreSQL fails with 22003.
+PostgreSQL rounds it half to even. `+ - * / % & | << >>`, `-x` and `~x` on
+these types run the function of their `pg_operator` row (`int4pl`, `int48mul`
+and the others): the result has the wider type of the operands and fails with
+22003 outside its range, and division by zero fails with 22012. An integer
+written in the statement and the result of a function have no registered type:
+next to a smallint, integer or bigint they count as an integer, or as a bigint
+when the value is outside the range of integer, and two of them are added as
+64-bit integers, so `2147483647 + 1` gives 2147483648 where PostgreSQL fails.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.

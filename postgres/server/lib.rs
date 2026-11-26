@@ -1715,7 +1715,7 @@ mod tests {
         }
         // A value that the column's binary type cannot hold is refused.
         for sql in [
-            "SELECT i * 100000000 FROM t",
+            "SELECT abs(i) * 100000000 FROM t",
             "SELECT 1 UNION ALL SELECT 12.5",
         ] {
             let mut stmt = conn.prepare(sql).unwrap();
@@ -1993,9 +1993,12 @@ mod tests {
         assert_ne!(first[0], second[0], "COMMIT ends the transaction");
     }
 
-    // The product is described as int4, and 4000000000 doesn't fit it, so the
-    // second row is refused after the first row is inserted.
-    const INSERT_RETURNING_MISFIT: &str = "INSERT INTO r VALUES (1), (2) RETURNING i * 2000000000";
+    // The result of abs() has no registered type, so the product is not
+    // checked against the range of int4 but is described as int4.
+    // 4000000000 doesn't fit it, so the second row is refused after the first
+    // row is inserted.
+    const INSERT_RETURNING_MISFIT: &str =
+        "INSERT INTO r VALUES (1), (2) RETURNING abs(i) * 2000000000";
 
     #[test]
     fn a_refused_returning_row_rolls_back_the_insert() {

@@ -13,7 +13,8 @@ use turso_pg_parser::sqlstate::{
 };
 
 /// One of PostgreSQL's integer types. A value is stored as an integer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The variants are in the order of their ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IntegerType {
     Int2,
     Int4,
@@ -28,6 +29,19 @@ impl IntegerType {
             IntegerType::Int4 => "integer",
             IntegerType::Int8 => "bigint",
         }
+    }
+
+    /// The number in the type's name in pg_type: 2, 4 or 8.
+    pub(crate) fn digits(self) -> u8 {
+        match self {
+            IntegerType::Int2 => 2,
+            IntegerType::Int4 => 4,
+            IntegerType::Int8 => 8,
+        }
+    }
+
+    pub(crate) fn contains(self, integer: i64) -> bool {
+        (self.min()..=self.max()).contains(&integer)
     }
 
     fn min(self) -> i64 {
@@ -56,9 +70,7 @@ impl IntegerType {
 
     fn check_range(self, value: &Value) -> Result<Value> {
         match value {
-            Value::Numeric(Numeric::Integer(integer))
-                if (self.min()..=self.max()).contains(integer) =>
-            {
+            Value::Numeric(Numeric::Integer(integer)) if self.contains(*integer) => {
                 Ok(value.clone())
             }
             _ => Err(self.out_of_range()),
@@ -220,7 +232,7 @@ impl Type for IntegerType {
         true
     }
 
-    /// FIXME(pg-catalog): This runs SQLite's operators on every integer type, so the result has no width and `2147483647::int4 + 1` does not fail. The pg_operator entries of each pair of integer types (int4pl, int48pl, ...) replace this.
+    /// FIXME(pg-catalog): The operators that a pg_operator row takes with exactly the types of the operands run the function of the row (see `IntegerOperator`). These signatures run SQLite's operator for every other pair, such as `smallint % integer` and `integer + numeric`, where PostgreSQL casts an operand first. The implicit casts of pg_cast replace this.
     fn operator_signatures(&self) -> Vec<OperatorSignature> {
         let binary = BINARY_OPERATORS.into_iter().flat_map(|op| {
             [
