@@ -4,7 +4,7 @@
 use crate::casts::{resolve, wraps_negative_integers, CastType};
 use crate::catalog::{pg_type_category, pg_type_name, pg_type_oid};
 use crate::error::sqlstate_error;
-use crate::functions::{format_type, undefined_operator_of, validate_pg_input};
+use crate::functions::{built_in_input_error, format_type, undefined_operator_of};
 use crate::pg_type::{built_in_type, IntegerOperator, IntegerType};
 use turso_core::ast;
 use turso_core::dialect::{
@@ -420,12 +420,12 @@ fn a_double_keeps(text: &str) -> bool {
 /// Fails when `literal` is not a value of the number type `ty`.
 fn check_number_literal(literal: &str, ty: &Checked) -> Result<()> {
     let type_name = pg_type_name(ty.oid).expect("an operand type is a row of pg_type");
-    let Some((message, sqlstate)) = validate_pg_input(literal, type_name) else {
+    let Some((message, sqlstate)) = built_in_input_error(type_name, literal) else {
         return check_a_double_keeps(literal, ty);
     };
     let out_of_range = sqlstate == SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE;
     let is_engine_integer = ty.engine == Some(EngineType::Integer);
-    if out_of_range && is_engine_integer && validate_pg_input(literal, "int8").is_none() {
+    if out_of_range && is_engine_integer && built_in_input_error("int8", literal).is_none() {
         return Ok(());
     }
     let sqlstate = if out_of_range {

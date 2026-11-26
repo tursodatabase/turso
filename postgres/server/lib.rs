@@ -11,14 +11,13 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, IntegerType, PgConnection,
+    split_statements, sql_parse_error, sqlstate_error, type_input, PgConnection,
     StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_PROTOCOL_VIOLATION,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
 };
 use turso_pg_parser::ParseResult;
 
@@ -1024,10 +1023,11 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         ))))
     })?;
 
+    if let Some(read) = type_input(i64::from(pg_type.oid())) {
+        return read(text).map_err(|error| pg_error(error.into()));
+    }
+
     match *pg_type {
-        Type::INT2 => integer_parameter(IntegerType::Int2, text),
-        Type::INT4 => integer_parameter(IntegerType::Int4, text),
-        Type::INT8 => integer_parameter(IntegerType::Int8, text),
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
                 PgWireError::UserError(Box::new(error_info(&format!(
@@ -1036,13 +1036,6 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             })?;
             Ok(Value::from_f64(f))
         }
-        Type::BOOL => match parse_pg_bool(text) {
-            Some(truth) => Ok(Value::from_i64(i64::from(truth))),
-            None => Err(wire_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!("invalid input syntax for type boolean: \"{text}\""),
-            )),
-        },
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
@@ -1075,13 +1068,6 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         }
         // TEXT, VARCHAR, and all other types → text
         _ => Ok(Value::from_text(text.to_owned())),
-    }
-}
-
-fn integer_parameter(ty: IntegerType, text: &str) -> PgWireResult<Value> {
-    match ty.parse(text) {
-        Ok(integer) => Ok(Value::from_i64(integer)),
-        Err(error) => Err(pg_error(error.into())),
     }
 }
 
@@ -1311,6 +1297,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turso_pg_parser::sqlstate::SQLSTATE_INVALID_TEXT_REPRESENTATION;
 
     use turso_pg_client::{BackendEvent, ConnParams, PgConn};
 

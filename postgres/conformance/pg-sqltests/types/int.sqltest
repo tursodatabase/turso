@@ -29,6 +29,86 @@ expect {
     1|2|3|4
 }
 
+# A string literal written to an integer column is read as the type reads
+# text.
+
+test int-columns-read-a-string-literal-in-every-spelling {
+    CREATE TABLE t (id int, s smallint, i integer, b bigint);
+    INSERT INTO t VALUES
+        (1, '010', '0x10', '1_000'),
+        (2, ' 42 ', '+7', '-0b11'),
+        (3, '0o17', '-0', '007');
+    SELECT s, i, b FROM t ORDER BY id;
+}
+expect {
+    10|16|1000
+    42|7|-3
+    15|0|7
+}
+
+test int-column-reads-a-string-literal-in-an-update {
+    CREATE TABLE t (i integer);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET i = '0x20';
+    SELECT i FROM t;
+}
+expect {
+    32
+}
+
+test int-column-reads-a-string-literal-as-its-default {
+    CREATE TABLE t (id int, i integer DEFAULT '0x10');
+    INSERT INTO t (id) VALUES (1);
+    SELECT i FROM t;
+}
+expect {
+    16
+}
+
+test int-column-refuses-a-string-literal-with-an-exponent {
+    CREATE TABLE t (i integer);
+    INSERT INTO t VALUES ('1e3');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1e3"
+}
+
+test smallint-column-refuses-a-string-literal-with-a-fraction {
+    CREATE TABLE t (s smallint);
+    INSERT INTO t VALUES ('1.0');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type smallint: "1.0"
+}
+
+test bigint-column-refuses-a-string-literal-that-is-not-an-integer {
+    CREATE TABLE t (b bigint);
+    INSERT INTO t VALUES ('abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "abc"
+}
+
+test int-column-refuses-a-string-literal-out-of-its-range {
+    CREATE TABLE t (i integer);
+    INSERT INTO t VALUES ('2147483648');
+}
+@sqlstate 22003
+expect error {
+    value "2147483648" is out of range for type integer
+}
+
+test int-column-refuses-the-text-of-another-column {
+    CREATE TABLE t (i integer, x text);
+    INSERT INTO t (x) VALUES ('5');
+    UPDATE t SET i = x;
+}
+@sqlstate 42804
+expect error {}
+
 test smallint-column-refuses-a-value-above-its-range {
     CREATE TABLE t (n smallint);
     INSERT INTO t VALUES (32768);

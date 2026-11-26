@@ -3926,13 +3926,15 @@ impl PgInputErrorInfoTable {
 }
 
 struct PgInputErrorInfoCursor {
+    conn: Arc<Connection>,
     row: Option<[Value; 4]>,
     returned: bool,
 }
 
 impl PgInputErrorInfoCursor {
-    fn new() -> Self {
+    fn new(conn: Arc<Connection>) -> Self {
         Self {
+            conn,
             row: None,
             returned: false,
         }
@@ -3987,7 +3989,7 @@ impl VirtualTableCursor for PgInputErrorInfoCursor {
             }
         };
 
-        self.row = Some(match validate_pg_input(&input, &type_name) {
+        self.row = Some(match validate_pg_input(&self.conn, &input, &type_name)? {
             Some((message, code)) => [
                 Value::build_text(message),
                 Value::Null,
@@ -4004,8 +4006,8 @@ impl VirtualTableCursor for PgInputErrorInfoCursor {
 impl VirtualTable for PgInputErrorInfoTable {
     type Cursor = PgInputErrorInfoCursor;
 
-    fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
-        Ok(PgInputErrorInfoCursor::new())
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgInputErrorInfoCursor::new(conn))
     }
 
     fn best_index(

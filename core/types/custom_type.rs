@@ -18,6 +18,9 @@ use std::fmt::Debug;
 /// them. An ENCODE and a DECODE get none.
 pub type ConversionFn = fn(value: &Value, params: &[Value]) -> Result<Value>;
 
+/// A Rust function that reads `text` as a value of a type.
+pub type TextInput = fn(text: &str) -> Result<Value>;
+
 /// How a type converts a value when it stores the value or reads it back.
 #[derive(Debug, Clone)]
 pub enum Conversion {
@@ -92,6 +95,17 @@ pub trait Type: Debug + Send + Sync {
     /// The SQLite type that holds the stored form: integer, real, text or
     /// blob.
     fn base(&self) -> &str;
+
+    /// INPUT: reads text as a value that a column of the type takes, as the
+    /// input function of a PostgreSQL type does (`typinput` in pg_type). A
+    /// dialect calls it where its rules read text as the type: for a string
+    /// literal, for a parameter with no type and for a cast from text. Core
+    /// does not call it.
+    ///
+    /// FIXME(pg-catalog): Only a type written in Rust has an INPUT. PostgreSQL's CREATE TYPE names the input function of a new type (`CREATE TYPE name (INPUT = function, OUTPUT = function, ...)`). When the PostgreSQL frontend supports that statement, the function it names is the INPUT of the type it creates: [UserType] gets an INPUT that calls it, and the frontend's lookup of the INPUT of a type (`typinput` of its pg_type row) finds it as it finds the INPUT of a built-in type. Do not add another way to read the text of a type.
+    fn input(&self) -> Option<TextInput> {
+        None
+    }
 
     /// ENCODE: turns a value that is written into the stored form.
     fn encode(&self) -> Option<Conversion> {
