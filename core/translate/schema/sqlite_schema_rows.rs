@@ -799,7 +799,7 @@ fn emit_drop_view_row(
         rhs: view_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
@@ -925,7 +925,7 @@ fn emit_delete_trigger_row(
         rhs: trigger_name_str_reg,
         target_pc: skip_non_trigger_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NOCASE,
     });
 
     program.emit_insn(Insn::Delete {
