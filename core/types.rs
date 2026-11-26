@@ -3813,6 +3813,29 @@ impl Cursor {
         }
     }
 
+    /// The record of the index entry that the cursor points to, and the index
+    /// info, as `as_index_cursor_mut` and `record_payload` give them. A b-tree
+    /// cursor gets a direct call, so the fast path of its `record_payload` is
+    /// inlined, without a call through `dyn CursorTrait`.
+    #[inline(always)]
+    pub fn index_record_payload(&mut self) -> (IOResultOr<Option<&[u8]>>, &IndexInfo) {
+        match self {
+            Self::BTree(cursor, Some(index_info)) => {
+                crate::turso_debug_assert!(
+                    cursor
+                        .index_info()
+                        .is_some_and(|own| Arc::ptr_eq(own, index_info)),
+                    "the cursor's index info is not the one stored beside it"
+                );
+                (cursor.record_payload(), index_info)
+            }
+            cursor => {
+                let (cursor, index_info) = cursor.as_index_cursor_mut();
+                (cursor.record_payload(), index_info)
+            }
+        }
+    }
+
     pub fn as_index_cursor_mut(&mut self) -> (&mut dyn CursorTrait, &IndexInfo) {
         let (cursor, index_info) = match self {
             Self::BTree(cursor, index_info) => {

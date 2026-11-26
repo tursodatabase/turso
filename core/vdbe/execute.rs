@@ -7335,9 +7335,9 @@ pub fn op_idx_ge(
     }
 
     let pc = {
-        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
+        let (idx_payload, index_info) = get_cursor!(state, *cursor_id).index_record_payload();
 
-        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, idx_payload) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
@@ -7401,9 +7401,9 @@ pub fn op_idx_le(
     }
 
     let pc = {
-        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
+        let (idx_payload, index_info) = get_cursor!(state, *cursor_id).index_record_payload();
 
-        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, idx_payload) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
@@ -7450,9 +7450,9 @@ pub fn op_idx_gt(
     }
 
     let pc = {
-        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
+        let (idx_payload, index_info) = get_cursor!(state, *cursor_id).index_record_payload();
 
-        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, idx_payload) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
@@ -7499,9 +7499,9 @@ pub fn op_idx_lt(
     }
 
     let pc = {
-        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
+        let (idx_payload, index_info) = get_cursor!(state, *cursor_id).index_record_payload();
 
-        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, idx_payload) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
