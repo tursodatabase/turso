@@ -113,10 +113,22 @@ pub(crate) fn check_in_subquery_operator(
             rhs_operand,
         ]
     };
-    resolver
+    let choice = resolver
         .catalog
         .dialect
         .choose_operator("=", &operand_types)?;
+    // FIXME(registered-types): Only the comparison of an expression with an
+    // expression is cast, so an operand of an IN subquery that the choice says
+    // to cast is refused. The comparison of two values has no single place
+    // that all comparisons go through yet. Once it has, the subquery's result
+    // column is cast there.
+    if let OperatorChoice::Chosen(chosen) = &choice {
+        if chosen.cast_operands.iter().any(|cast| *cast) {
+            return Err(LimboError::ParseError(format!(
+                "cannot compare type {lhs_type} with type {rhs_type}"
+            )));
+        }
+    }
     Ok(())
 }
 
