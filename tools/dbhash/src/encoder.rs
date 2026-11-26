@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn test_float_nan() {
         let mut buf = Vec::new();
-        // NaN is not representable in NonNan, so from_f64(NaN) returns Null
+        // NaN is not representable in Double, so from_f64(NaN) returns Null
         encode_value(&Value::from_f64(f64::NAN), &mut buf);
         assert_eq!(buf, vec![b'0']);
     }

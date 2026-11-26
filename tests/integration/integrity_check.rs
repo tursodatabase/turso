@@ -17,6 +17,60 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use turso_core::{Numeric, Value};
 
+// SQLite treats every NaN encoding in a REAL field as NULL, including index keys.
+#[test]
+#[cfg(not(feature = "checksum"))]
+fn indexed_real_nan_is_null_for_reads_integrity_and_delete() {
+    for bits in [
+        0x7ff8_0000_0000_0000u64,
+        0xfff8_0000_0000_0001,
+        0x7ff0_0000_0000_0001,
+    ] {
+        for padding in [0, 10000] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nan.db");
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch("CREATE TABLE t(c TEXT, a REAL, b INTEGER); CREATE INDEX t_a ON t(a); CREATE INDEX t_ba ON t(b, a); CREATE INDEX t_ca ON t(c, a);").unwrap();
+                conn.execute("INSERT INTO t VALUES (?1, 1.25, 1)", ["x".repeat(padding)])
+                    .unwrap();
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            let positions: Vec<_> = bytes
+                .windows(8)
+                .enumerate()
+                .filter_map(|(i, b)| (b == 1.25f64.to_be_bytes()).then_some(i))
+                .collect();
+            assert_eq!(positions.len(), 4, "one table field and three index fields");
+            for position in positions {
+                bytes[position..position + 8].copy_from_slice(&bits.to_be_bytes());
+            }
+            std::fs::write(&path, bytes).unwrap();
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+            assert_eq!(run_integrity_check(&conn), "ok");
+            for access in [
+                "NOT INDEXED",
+                "INDEXED BY t_a",
+                "INDEXED BY t_ba",
+                "INDEXED BY t_ca",
+            ] {
+                let rows = crate::common::limbo_exec_rows(
+                    &conn,
+                    &format!("SELECT b FROM t {access} WHERE a IS NULL AND b = 1"),
+                );
+                assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+            }
+            conn.execute("DELETE FROM t WHERE b = 1").unwrap();
+            assert_eq!(run_integrity_check(&conn), "ok");
+            assert_eq!(
+                crate::common::limbo_exec_rows(&conn, "SELECT count(*) FROM t"),
+                vec![vec![rusqlite::types::Value::Integer(0)]]
+            );
+        }
+    }
+}
+
 #[test]
 fn test_integrity_check_strict_stored_types() {
     for (ty, value, expected) in [

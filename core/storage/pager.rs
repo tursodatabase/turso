@@ -1694,6 +1694,7 @@ impl SharedPagerState {
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
 pub struct Pager {
+    pub(crate) nan_policy: crate::types::NanPolicy,
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
@@ -2024,6 +2025,7 @@ impl Pager {
             RwLock::new(AllocatePage1State::Done)
         };
         Ok(Self {
+            nan_policy: crate::types::NanPolicy::Null,
             db_file,
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),

@@ -8,7 +8,7 @@ use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
-use crate::numeric::nonnan::NonNan;
+use crate::numeric::double::Double;
 use crate::numeric::Numeric;
 use crate::numeric::{format_float, IntegerText};
 use crate::pseudo::PseudoCursor;
@@ -803,12 +803,48 @@ impl<V: AsValueRef> AsValueRef for &V {
     }
 }
 
-impl Value {
-    pub const fn from_f64(f: f64) -> Self {
-        match NonNan::new(f) {
-            Some(nn) => Self::Numeric(Numeric::Float(nn)),
-            None => Self::Null,
+/// How a SQL dialect publishes and decodes a floating-point NaN.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NanPolicy {
+    #[default]
+    Null,
+    Preserve,
+}
+
+impl NanPolicy {
+    pub fn for_dialect(dialect: &dyn crate::Dialect) -> Self {
+        if dialect.nan_is_a_value() {
+            Self::Preserve
+        } else {
+            Self::Null
         }
+    }
+
+    #[inline]
+    pub fn normalize(self, value: &mut Value) {
+        if self == Self::Null && value.is_nan() {
+            *value = Value::Null;
+        }
+    }
+
+    #[inline]
+    pub fn decode(self, number: f64) -> ValueRef<'static> {
+        if self == Self::Null && number.is_nan() {
+            ValueRef::Null
+        } else {
+            ValueRef::from_f64(number)
+        }
+    }
+}
+
+impl Value {
+    /// Constructs a REAL without applying SQL dialect rules.
+    pub const fn from_f64(f: f64) -> Self {
+        Self::Numeric(Numeric::Float(Double::new(f)))
+    }
+
+    pub fn is_nan(&self) -> bool {
+        matches!(self, Self::Numeric(Numeric::Float(f)) if f.is_nan())
     }
 
     pub const fn from_i64(i: i64) -> Self {
@@ -1379,7 +1415,7 @@ impl std::ops::AddAssign<f64> for Value {
     fn add_assign(&mut self, rhs: f64) {
         let sum = (|| {
             let lhs_num = Numeric::from_value(&self)?;
-            let rhs_num = NonNan::new(rhs).map(Numeric::Float)?;
+            let rhs_num = Double::non_nan(rhs).map(Numeric::Float)?;
             lhs_num.checked_add(rhs_num)
         })();
 
@@ -1461,6 +1497,7 @@ mod immutable_record {
         //
         // payload is the std::vec::Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store std::vec::Vec<u8> as Value::Blob
         payload: Value,
+        nan_policy: NanPolicy,
     }
 
     // SAFETY: all ImmutableRecord instances are intended to be used in a single thread
@@ -1471,6 +1508,7 @@ mod immutable_record {
     impl Clone for ImmutableRecord {
         fn clone(&self) -> Self {
             Self {
+                nan_policy: self.nan_policy,
                 payload: self.payload.clone(),
             }
         }
@@ -1524,6 +1562,7 @@ mod immutable_record {
     #[derive(Clone)]
     pub struct ImmutableRecordRef<'a> {
         payload: ImmutableRecordRefPayload<'a>,
+        nan_policy: NanPolicy,
     }
 
     #[derive(Clone)]
@@ -1602,12 +1641,12 @@ mod immutable_record {
     }
 
     #[inline(always)]
-    fn iter(payload: &[u8]) -> Result<ValueIterator<'_>, LimboError> {
-        ValueIterator::new(payload)
+    fn iter(payload: &[u8], nan_policy: NanPolicy) -> Result<ValueIterator<'_>, LimboError> {
+        ValueIterator::new(payload).map(|iter| iter.with_nan_policy(nan_policy))
     }
 
-    fn values(payload: &[u8]) -> Result<Vec<ValueRef<'_>>> {
-        let iter = iter(payload)?;
+    fn values(payload: &[u8], nan_policy: NanPolicy) -> Result<Vec<ValueRef<'_>>> {
+        let iter = iter(payload, nan_policy)?;
         let values = iter.try_collect::<Result<_>>()??;
         Ok(values)
     }
@@ -1617,8 +1656,12 @@ mod immutable_record {
     /// inline capacity makes each move of the vector a larger copy.
     pub type InlineValues<'a> = SmallVec<[ValueRef<'a>; 8]>;
 
-    fn values_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
-        let mut iter = iter(payload)?;
+    fn values_range(
+        payload: &[u8],
+        nan_policy: NanPolicy,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<ValueRef<'_>>> {
+        let mut iter = iter(payload, nan_policy)?;
         let mut values = Vec::try_with_capacity_ext(range.end - range.start)?;
         if let Some(value) = iter.nth(range.start) {
             values.push(value?);
@@ -1637,10 +1680,11 @@ mod immutable_record {
 
     fn two_values(
         payload: &[u8],
+        nan_policy: NanPolicy,
         idx1: usize,
         idx2: usize,
     ) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
-        let mut iter = iter(payload)?;
+        let mut iter = iter(payload, nan_policy)?;
         let val1 = iter.nth(idx1);
         let val2 = iter.nth(idx2 - idx1 - 1);
         match (val1, val2) {
@@ -1651,11 +1695,12 @@ mod immutable_record {
 
     fn three_values(
         payload: &[u8],
+        nan_policy: NanPolicy,
         idx1: usize,
         idx2: usize,
         idx3: usize,
     ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
-        let mut iter = iter(payload)?;
+        let mut iter = iter(payload, nan_policy)?;
         let val1 = iter.nth(idx1);
         let val2 = iter.nth(idx2 - idx1 - 1);
         let val3 = iter.nth(idx3 - idx2 - 1);
@@ -1667,12 +1712,13 @@ mod immutable_record {
 
     fn four_values(
         payload: &[u8],
+        nan_policy: NanPolicy,
         idx1: usize,
         idx2: usize,
         idx3: usize,
         idx4: usize,
     ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
-        let mut iter = iter(payload)?;
+        let mut iter = iter(payload, nan_policy)?;
         let val1 = iter.nth(idx1);
         let val2 = iter.nth(idx2 - idx1 - 1);
         let val3 = iter.nth(idx3 - idx2 - 1);
@@ -1683,16 +1729,20 @@ mod immutable_record {
         }
     }
 
-    fn values_owned(payload: &[u8]) -> Result<Vec<Value>> {
-        let iter = iter(payload).expect("Failed to create payload iterator");
+    fn values_owned(payload: &[u8], nan_policy: NanPolicy) -> Result<Vec<Value>> {
+        let iter = iter(payload, nan_policy).expect("Failed to create payload iterator");
         let values = iter
             .map(|v| Ok::<_, LimboError>(v?.to_owned()?))
             .try_collect::<Result<_>>()??;
         Ok(values)
     }
 
-    fn values_owned_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<Value>> {
-        let mut iter = iter(payload).expect("Failed to create payload iterator");
+    fn values_owned_range(
+        payload: &[u8],
+        nan_policy: NanPolicy,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<Value>> {
+        let mut iter = iter(payload, nan_policy).expect("Failed to create payload iterator");
         let mut values = Vec::try_with_capacity_ext(range.end - range.start)?;
         if let Some(value) = iter.nth(range.start) {
             values.push(value?.to_owned()?);
@@ -1709,64 +1759,50 @@ mod immutable_record {
         Ok(values)
     }
 
-    fn contains_null(payload: &[u8]) -> Result<bool> {
-        let (header_size, header_varint_len) = read_varint(payload)?;
-        let header_size = header_size as usize;
-
-        if header_size > payload.len() || header_varint_len > payload.len() {
-            return Err(LimboError::Corrupt(
-                "Payload too small for indicated header size".into(),
-            ));
-        }
-
-        let mut header = &payload[header_varint_len..header_size];
-
-        while !header.is_empty() {
-            let (serial_type, bytes_read) = read_varint(header)?;
-            if serial_type == 0 {
+    fn contains_null(payload: &[u8], nan_policy: NanPolicy) -> Result<bool> {
+        for value in iter(payload, nan_policy)? {
+            if matches!(value?, ValueRef::Null) {
                 return Ok(true);
             }
-            header = &header[bytes_read..];
         }
-
         Ok(false)
     }
 
-    fn last_value(payload: &[u8]) -> Option<Result<ValueRef<'_>>> {
+    fn last_value(payload: &[u8], nan_policy: NanPolicy) -> Option<Result<ValueRef<'_>>> {
         if unlikely(payload.is_empty()) {
             return Some(Err(LimboError::InternalError(
                 "Record is invalidated".into(),
             )));
         }
-        let iter = match iter(payload) {
+        let iter = match iter(payload, nan_policy) {
             Ok(it) => it,
             Err(e) => return Some(Err(e)),
         };
         iter.last()
     }
 
-    fn first_value(payload: &[u8]) -> Result<ValueRef<'_>> {
+    fn first_value(payload: &[u8], nan_policy: NanPolicy) -> Result<ValueRef<'_>> {
         if unlikely(payload.is_empty()) {
             return Err(LimboError::InternalError("Record is invalidated".into()));
         }
-        match iter(payload)?.next() {
+        match iter(payload, nan_policy)?.next() {
             Some(v) => v,
             None => Err(LimboError::InternalError("Record has no columns".into())),
         }
     }
 
-    fn value(payload: &[u8], idx: usize) -> Result<ValueRef<'_>> {
+    fn value(payload: &[u8], nan_policy: NanPolicy, idx: usize) -> Result<ValueRef<'_>> {
         if unlikely(payload.is_empty()) {
             return Err(LimboError::InternalError("Record is invalidated".into()));
         }
-        let mut iter = iter(payload)?;
+        let mut iter = iter(payload, nan_policy)?;
         iter.nth(idx)
             .transpose()?
             .ok_or_else(|| LimboError::InternalError("Index out of bounds".into()))
     }
 
-    fn value_opt(payload: &[u8], idx: usize) -> Option<ValueRef<'_>> {
-        let mut iter = match iter(payload) {
+    fn value_opt(payload: &[u8], nan_policy: NanPolicy, idx: usize) -> Option<ValueRef<'_>> {
+        let mut iter = match iter(payload, nan_policy) {
             Ok(it) => it,
             Err(_) => {
                 mark_unlikely();
@@ -1782,8 +1818,10 @@ mod immutable_record {
         }
     }
 
-    fn column_count(payload: &[u8]) -> usize {
-        iter(payload).map(|it| it.count()).unwrap_or_default()
+    fn column_count(payload: &[u8], nan_policy: NanPolicy) -> usize {
+        iter(payload, nan_policy)
+            .map(|it| it.count())
+            .unwrap_or_default()
     }
 
     /// A spent record buffer, obtained by retiring a record ([ImmutableRecord::retire]).
@@ -1805,14 +1843,31 @@ mod immutable_record {
     }
 
     impl ImmutableRecord {
+        pub(crate) fn nan_policy(&self) -> NanPolicy {
+            self.nan_policy
+        }
+
+        pub(crate) fn copy_into(&self, buf: RecordBuf) -> Result<Self, TryReserveError> {
+            Ok(Self::copy_payload(self.get_payload(), buf)?.with_nan_policy(self.nan_policy))
+        }
+
+        pub(crate) fn set_nan_policy(&mut self, nan_policy: NanPolicy) {
+            self.nan_policy = nan_policy;
+        }
+
+        pub(crate) fn with_nan_policy(mut self, nan_policy: NanPolicy) -> Self {
+            self.nan_policy = nan_policy;
+            self
+        }
+
         // Don't use this in performance critical paths, prefer using `iter()` instead
         pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
-            values(self.get_payload())
+            values(self.get_payload(), self.nan_policy)
         }
 
         // Don't use this in performance critical paths, prefer using `iter()` instead
         pub fn get_values_range(&self, range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
-            values_range(self.get_payload(), range)
+            values_range(self.get_payload(), self.nan_policy, range)
         }
 
         // Idx values must be sorted ascending
@@ -1821,7 +1876,7 @@ mod immutable_record {
             idx1: usize,
             idx2: usize,
         ) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
-            two_values(self.get_payload(), idx1, idx2)
+            two_values(self.get_payload(), self.nan_policy, idx1, idx2)
         }
 
         // Idx values must be sorted ascending
@@ -1831,7 +1886,7 @@ mod immutable_record {
             idx2: usize,
             idx3: usize,
         ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
-            three_values(self.get_payload(), idx1, idx2, idx3)
+            three_values(self.get_payload(), self.nan_policy, idx1, idx2, idx3)
         }
 
         // Idx values must be sorted ascending
@@ -1842,22 +1897,22 @@ mod immutable_record {
             idx3: usize,
             idx4: usize,
         ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
-            four_values(self.get_payload(), idx1, idx2, idx3, idx4)
+            four_values(self.get_payload(), self.nan_policy, idx1, idx2, idx3, idx4)
         }
 
         // Don't use this in performance critical paths, prefer using `iter()` instead
         pub fn get_values_owned(&self) -> Result<Vec<Value>> {
-            values_owned(self.get_payload())
+            values_owned(self.get_payload(), self.nan_policy)
         }
 
         // Don't use this in performance critical paths, prefer using `iter()` instead
         pub fn get_values_owned_range(&self, range: std::ops::Range<usize>) -> Result<Vec<Value>> {
-            values_owned_range(self.get_payload(), range)
+            values_owned_range(self.get_payload(), self.nan_policy, range)
         }
 
         #[inline(always)]
         pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
-            iter(self.get_payload())
+            iter(self.get_payload(), self.nan_policy)
         }
 
         #[inline]
@@ -1865,42 +1920,45 @@ mod immutable_record {
         /// This is an optimization that only examines the header (serial types)
         /// without deserializing the data section.
         pub fn contains_null(&self) -> Result<bool> {
-            contains_null(self.get_payload())
+            contains_null(self.get_payload(), self.nan_policy)
         }
 
         #[inline]
         pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
-            last_value(self.get_payload())
+            last_value(self.get_payload(), self.nan_policy)
         }
 
         #[inline]
         pub fn first_value(&self) -> Result<ValueRef<'_>> {
-            first_value(self.get_payload())
+            first_value(self.get_payload(), self.nan_policy)
         }
 
         #[inline]
         pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
-            value(self.get_payload(), idx)
+            value(self.get_payload(), self.nan_policy, idx)
         }
 
         #[inline]
         pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
-            value_opt(self.get_payload(), idx)
+            value_opt(self.get_payload(), self.nan_policy, idx)
         }
 
         pub fn column_count(&self) -> usize {
-            column_count(self.get_payload())
+            column_count(self.get_payload(), self.nan_policy)
         }
     }
 
     impl<'a> ImmutableRecordRef<'a> {
+        pub(crate) fn nan_policy(&self) -> NanPolicy {
+            self.nan_policy
+        }
         #[inline(always)]
         pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
-            iter(self.get_payload())
+            iter(self.get_payload(), self.nan_policy)
         }
 
         pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
-            values(self.get_payload())
+            values(self.get_payload(), self.nan_policy)
         }
 
         /// Decodes all values, like `get_values`, without a heap allocation for
@@ -1908,7 +1966,7 @@ mod immutable_record {
         #[inline]
         pub fn get_values_inline(&self) -> Result<InlineValues<'_>> {
             let mut values = InlineValues::new();
-            for value in iter(self.get_payload())? {
+            for value in iter(self.get_payload(), self.nan_policy)? {
                 let value = value?;
                 // A failed allocation for a longer record is an error, as in `values`.
                 values.try_reserve(1).map_err(|_| LimboError::OutOfMemory)?;
@@ -1922,7 +1980,7 @@ mod immutable_record {
             idx1: usize,
             idx2: usize,
         ) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
-            two_values(self.get_payload(), idx1, idx2)
+            two_values(self.get_payload(), self.nan_policy, idx1, idx2)
         }
 
         pub fn get_three_values(
@@ -1931,30 +1989,30 @@ mod immutable_record {
             idx2: usize,
             idx3: usize,
         ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
-            three_values(self.get_payload(), idx1, idx2, idx3)
+            three_values(self.get_payload(), self.nan_policy, idx1, idx2, idx3)
         }
 
         pub fn get_values_owned(&self) -> Result<Vec<Value>> {
-            values_owned(self.get_payload())
+            values_owned(self.get_payload(), self.nan_policy)
         }
 
         #[inline]
         pub fn contains_null(&self) -> Result<bool> {
-            contains_null(self.get_payload())
+            contains_null(self.get_payload(), self.nan_policy)
         }
 
         #[inline]
         pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
-            last_value(self.get_payload())
+            last_value(self.get_payload(), self.nan_policy)
         }
 
         #[inline]
         pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
-            value_opt(self.get_payload(), idx)
+            value_opt(self.get_payload(), self.nan_policy, idx)
         }
 
         pub fn column_count(&self) -> usize {
-            column_count(self.get_payload())
+            column_count(self.get_payload(), self.nan_policy)
         }
     }
 
@@ -1963,6 +2021,7 @@ mod immutable_record {
             let mut payload = crate::alloc::vec![];
             payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
+                nan_policy: NanPolicy::Preserve,
                 payload: Value::Blob(payload),
             })
         }
@@ -1977,6 +2036,7 @@ mod immutable_record {
         /// An invalidated record backed by `buf`'s allocation.
         pub fn from_buf(buf: RecordBuf) -> Self {
             Self {
+                nan_policy: NanPolicy::Preserve,
                 payload: Value::Blob(buf.0),
             }
         }
@@ -1987,18 +2047,23 @@ mod immutable_record {
             let RecordBuf(mut buf) = buf;
             buf.try_extend(payload.iter().copied())?;
             Ok(Self {
+                nan_policy: NanPolicy::Preserve,
                 payload: Value::Blob(buf),
             })
         }
 
         pub const fn from_bin_record(payload: ValueBlob) -> Self {
             Self {
+                nan_policy: NanPolicy::Preserve,
                 payload: Value::Blob(payload),
             }
         }
 
         pub fn as_record_ref(&self) -> ImmutableRecordRef<'_> {
-            ImmutableRecordRef::from_bin_record(self.get_payload())
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Borrowed(self.get_payload()),
+                nan_policy: self.nan_policy,
+            }
         }
 
         pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
@@ -2076,6 +2141,7 @@ mod immutable_record {
                 "record sizing pass and writing pass disagree"
             );
             Ok(Self {
+                nan_policy: NanPolicy::Preserve,
                 payload: Value::Blob(buf),
             })
         }
@@ -2146,12 +2212,14 @@ mod immutable_record {
     impl<'a> ImmutableRecordRef<'a> {
         pub const fn from_bin_record(payload: &'a [u8]) -> Self {
             Self {
+                nan_policy: NanPolicy::Preserve,
                 payload: ImmutableRecordRefPayload::Borrowed(payload),
             }
         }
 
         pub(crate) fn from_owned_record(record: ImmutableRecord) -> ImmutableRecordRef<'static> {
             ImmutableRecordRef {
+                nan_policy: record.nan_policy,
                 payload: ImmutableRecordRefPayload::Owned(record.into_payload()),
             }
         }
@@ -2160,6 +2228,7 @@ mod immutable_record {
             payload: crate::alloc::ArcSlice<u8>,
         ) -> ImmutableRecordRef<'static> {
             ImmutableRecordRef {
+                nan_policy: NanPolicy::Preserve,
                 payload: ImmutableRecordRefPayload::Shared(payload),
             }
         }
@@ -2180,6 +2249,7 @@ mod immutable_record {
 
         pub fn reborrow(&self) -> ImmutableRecordRef<'_> {
             ImmutableRecordRef {
+                nan_policy: self.nan_policy,
                 payload: ImmutableRecordRefPayload::Borrowed(self.get_payload()),
             }
         }
@@ -2242,6 +2312,7 @@ impl Record {
 /// - **serial_typeN**: Encodes the type and size of column N's data
 /// - **dataN**: The actual data for column N (length determined by serial_typeN)
 pub struct ValueIterator<'a> {
+    nan_policy: NanPolicy,
     /// Reference to header section up to data offset
     header_section: Cell<&'a [u8]>,
     /// Reference to data section only
@@ -2249,6 +2320,14 @@ pub struct ValueIterator<'a> {
 }
 
 impl<'a> ValueIterator<'a> {
+    pub(crate) fn nan_policy(&self) -> NanPolicy {
+        self.nan_policy
+    }
+    pub(crate) fn with_nan_policy(mut self, nan_policy: NanPolicy) -> Self {
+        self.nan_policy = nan_policy;
+        self
+    }
+
     /// Creates a new payload iterator from a raw payload slice.
     ///
     /// # Arguments
@@ -2274,6 +2353,7 @@ impl<'a> ValueIterator<'a> {
         }
 
         Ok(Self {
+            nan_policy: NanPolicy::Preserve,
             header_section: Cell::new(&payload[header_varint_len..header_size]),
             data_section: Cell::new(&payload[header_size..]),
         })
@@ -2427,7 +2507,7 @@ impl<'a> Iterator for ValueIterator<'a> {
                 "Data section too small for indicated serial type size".into(),
             )));
         }
-        match read_value_serial_type(&data[data_offset..], last_serial_type) {
+        match read_value_serial_type(&data[data_offset..], last_serial_type, self.nan_policy) {
             Ok((value, _)) => Some(Ok(value)),
             Err(e) => {
                 mark_unlikely();
@@ -2502,7 +2582,7 @@ impl<'a> Iterator for ValueIterator<'a> {
 
         let data_section = self.data_section.get();
 
-        match read_value_serial_type(data_section, serial_type) {
+        match read_value_serial_type(data_section, serial_type, self.nan_policy) {
             Ok((value, n)) => {
                 self.data_section.set(&data_section[n..]);
                 Some(Ok(value))
@@ -2521,6 +2601,7 @@ impl<'a> FusedIterator for ValueIterator<'a> {}
 impl<'a> Clone for ValueIterator<'a> {
     fn clone(&self) -> Self {
         Self {
+            nan_policy: self.nan_policy,
             header_section: Cell::new(self.header_section.get()),
             data_section: Cell::new(self.data_section.get()),
         }
@@ -2528,11 +2609,9 @@ impl<'a> Clone for ValueIterator<'a> {
 }
 
 impl<'a> ValueRef<'a> {
-    pub fn from_f64(f: f64) -> Self {
-        match NonNan::new(f) {
-            Some(nn) => Self::Numeric(Numeric::Float(nn)),
-            None => Self::Null,
-        }
+    /// Constructs a REAL without applying SQL dialect rules.
+    pub const fn from_f64(f: f64) -> Self {
+        Self::Numeric(Numeric::Float(Double::new(f)))
     }
 
     pub fn from_i64(i: i64) -> Self {
@@ -2703,6 +2782,7 @@ pub type IndexKeyInfo = Vec<KeyInfo, DynAllocator>;
 /// whether the index includes a row ID, and the total number of columns
 /// in the index.
 pub struct IndexInfo {
+    pub nan_policy: NanPolicy,
     /// Specifies the sorting order (ascending or descending) for each column in the index.
     pub key_info: IndexKeyInfo,
     /// Indicates whether the index includes a row ID column.
@@ -2716,6 +2796,7 @@ pub struct IndexInfo {
 impl Default for IndexInfo {
     fn default() -> Self {
         Self {
+            nan_policy: NanPolicy::Preserve,
             key_info: Self::key_info_in(TursoAllocator),
             has_rowid: true,
             num_cols: 1,
@@ -2779,6 +2860,7 @@ impl IndexInfo {
         I: IntoIterator<Item = KeyInfo>,
     {
         Ok(Self {
+            nan_policy: NanPolicy::Preserve,
             key_info: Self::key_info_from_iter_in(key_info, alloc)?,
             has_rowid,
             num_cols,
@@ -3189,7 +3271,11 @@ where
     turso_debug_assert!(data_start + string_len <= left_packed.len());
 
     let serial_type = SerialType::try_from(first_serial_type)?;
-    let (lhs_value, _) = read_value(&left_packed[data_start..], serial_type)?;
+    let (lhs_value, _) = read_value(
+        &left_packed[data_start..],
+        serial_type,
+        index_info.nan_policy,
+    )?;
 
     let ValueRef::Text(lhs_text) = lhs_value else {
         return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
@@ -3318,7 +3404,8 @@ where
             SerialTypeKind::ConstInt1 => ValueRef::Numeric(Numeric::Integer(1)),
             SerialTypeKind::Null => ValueRef::Null,
             _ => {
-                let (value, field_size) = read_value(&left_packed[data_pos..], serial_type)?;
+                let (value, field_size) =
+                    read_value(&left_packed[data_pos..], serial_type, index_info.nan_policy)?;
                 data_pos += field_size;
                 value
             }
@@ -5169,6 +5256,21 @@ mod tests {
     }
 
     #[test]
+    fn a_nan_in_a_record_is_read_back_as_a_nan() {
+        let record = Record::new(vec![Value::from_f64(f64::NAN), Value::from_f64(1.5)]);
+        let mut buf = std::vec::Vec::new();
+        record.serialize(&mut buf);
+        let values = ImmutableRecordRef::from_bin_record(&buf)
+            .get_values_owned()
+            .unwrap();
+        assert!(matches!(
+            values[0],
+            Value::Numeric(Numeric::Float(f)) if f.is_nan()
+        ));
+        assert_eq!(values[1], Value::from_f64(1.5));
+    }
+
+    #[test]
     fn test_serialize_text() {
         let text = "hello";
         let record = Record::new(vec![Value::Text(Text::new(text))]);
@@ -5261,19 +5363,17 @@ mod tests {
     /// via partial_cmp returned None. The .unwrap() in Ord::cmp and
     /// the single-value compare would then panic.
     ///
-    /// Now Numeric::Float wraps NonNan, which rejects NaN at construction time.
-    /// This makes it impossible to represent NaN in a ValueRef, so partial_cmp
-    /// is total and can never return None for any representable value.
+    /// Now Numeric::Float wraps Double, whose order is total even for NaN, so
+    /// partial_cmp can never return None, including for a value made from NaN.
     #[test]
     fn test_valueref_partial_cmp_no_panic_on_nan() {
-        use crate::numeric::nonnan::NonNan;
+        use crate::numeric::double::Double;
 
-        // NonNan::new rejects NaN — this is the type-level guarantee that
-        // prevents the old panic. No ValueRef::Float(NAN) can be constructed.
-        assert!(NonNan::new(f64::NAN).is_none());
+        assert!(Double::non_nan(f64::NAN).is_none());
 
-        // from_f64(NAN) falls back to Null instead of storing a NaN float.
-        assert_eq!(ValueRef::from_f64(f64::NAN), ValueRef::Null);
+        assert!(
+            matches!(ValueRef::from_f64(f64::NAN), ValueRef::Numeric(Numeric::Float(f)) if f.is_nan())
+        );
 
         // Exercise every representable float edge case through partial_cmp,
         // Ord::cmp, and CollationSeq::compare — none of these can panic now.
@@ -5292,7 +5392,7 @@ mod tests {
             ValueRef::from_f64(f64::MIN_POSITIVE),
             ValueRef::from_f64(f64::INFINITY),
             ValueRef::from_f64(f64::NEG_INFINITY),
-            ValueRef::from_f64(f64::NAN), // becomes Null
+            ValueRef::from_f64(f64::NAN),
             ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
             ValueRef::Text(TextRef::new("", TextSubtype::Text)),
             ValueRef::Blob(&[1, 2, 3]),

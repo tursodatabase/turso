@@ -582,6 +582,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a REAL can be NaN.
+    ///
+    /// SQLite cannot: a result that is not a number is NULL, and the bits of a
+    /// NaN in a database file are read as NULL. So the SQLite dialect never
+    /// writes a NaN to a record, and reads one from a record as NULL.
+    /// PostgreSQL's float4 and float8 have NaN as a value.
+    fn nan_is_a_value(&self) -> bool {
+        false
+    }
+
     /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
     /// a table that has rows.
     ///

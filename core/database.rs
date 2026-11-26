@@ -3690,6 +3690,7 @@ impl Database {
             self.buffer_pool.clone(),
             self.pager_state.clone(),
         )?;
+        pager.nan_policy = crate::types::NanPolicy::for_dialect(self.dialect.as_ref());
         pager.set_authenticated_header(header)?;
         pager.enable_encryption(self.opts.enable_encryption);
         if self.initialized() {

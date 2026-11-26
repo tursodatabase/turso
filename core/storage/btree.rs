@@ -592,7 +592,8 @@ impl CursorContext {
             BTreeKey::IndexKey(record) => {
                 let payload = crate::types::value_blob_from_slice(record.get_payload())
                     .expect(crate::alloc::ALLOC_ERR_MSG);
-                let owned = ImmutableRecord::from_bin_record(payload);
+                let owned =
+                    ImmutableRecord::from_bin_record(payload).with_nan_policy(record.nan_policy());
                 CursorContextKey::IndexKeyRowId(ImmutableRecordRef::from_owned_record(owned))
             }
         };
@@ -1288,6 +1289,9 @@ impl BTreeNodeState {
 }
 
 impl BTreeCursor {
+    pub(crate) fn nan_policy(&self) -> crate::types::NanPolicy {
+        self.pager.nan_policy
+    }
     pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
         Self::new_with_index_info(pager, root_page, num_columns, None)
     }
@@ -1298,6 +1302,10 @@ impl BTreeCursor {
         _num_columns: usize,
         index_info: Option<Arc<IndexInfo>>,
     ) -> Self {
+        let mut index_info = index_info;
+        if let Some(info) = &mut index_info {
+            Arc::make_mut(info).nan_policy = pager.nan_policy;
+        }
         let valid_state = if root_page == 1 && !pager.db_initialized() {
             CursorValidState::Invalid
         } else {
@@ -6466,7 +6474,8 @@ impl BTreeCursor {
                 )?
             }
         };
-        self.reusable_immutable_record.replace(record);
+        self.reusable_immutable_record
+            .replace(record.with_nan_policy(self.pager.nan_policy));
         Ok(())
     }
 
