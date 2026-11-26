@@ -49,6 +49,9 @@ FAMILIES = [
         strpos substr substring upper""".split(), "bytea": "without"}),
     ("bytea", {"names": """btrim length ltrim octet_length position reverse rtrim substr
         substring""".split(), "bytea": "only"}),
+    ("datetime", {"names": """clock_timestamp date_part date_trunc extract now
+        statement_timestamp to_char to_timestamp transaction_timestamp""".split(),
+        "bytea": "all"}),
 ]
 
 

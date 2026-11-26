@@ -998,6 +998,43 @@ expect {
     6382|reverse|f|f|t|f|i|s|1|0|0|17|17|bytea_reverse
 }
 
+# The rows of pg_proc for the datetime functions match PostgreSQL 18.
+test pg-proc-datetime-rows-match-postgresql {
+    SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
+           proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
+           prorettype, prosrc
+    FROM pg_proc
+    WHERE oid IN (
+        1158, 1171, 1217, 1284, 1385, 1770, 1772, 1773, 1774, 1775, 1776, 1778, 2020, 2021, 2049, 2647,
+        2648, 2649, 6199, 6200, 6202, 6203
+    )
+    ORDER BY oid;
+}
+expect {
+    1158|to_timestamp|f|f|t|f|i|s|1|0|0|701|1184|float8_timestamptz
+    1171|date_part|f|f|t|f|s|s|1|0|0|25 1184|701|timestamptz_part
+    1217|date_trunc|f|f|t|f|s|s|1|0|0|25 1184|1184|timestamptz_trunc
+    1284|date_trunc|f|f|t|f|i|s|1|0|0|25 1184 25|1184|timestamptz_trunc_zone
+    1385|date_part|f|f|t|f|i|s|1|0|0|25 1083|701|time_part
+    1770|to_char|f|f|t|f|s|s|1|0|0|1184 25|25|timestamptz_to_char
+    1772|to_char|f|f|t|f|s|s|1|0|0|1700 25|25|numeric_to_char
+    1773|to_char|f|f|t|f|s|s|1|0|0|23 25|25|int4_to_char
+    1774|to_char|f|f|t|f|s|s|1|0|0|20 25|25|int8_to_char
+    1775|to_char|f|f|t|f|s|s|1|0|0|700 25|25|float4_to_char
+    1776|to_char|f|f|t|f|s|s|1|0|0|701 25|25|float8_to_char
+    1778|to_timestamp|f|f|t|f|s|s|1|0|0|25 25|1184|to_timestamp
+    2020|date_trunc|f|f|t|f|i|s|1|0|0|25 1114|1114|timestamp_trunc
+    2021|date_part|f|f|t|f|i|s|1|0|0|25 1114|701|timestamp_part
+    2049|to_char|f|f|t|f|s|s|1|0|0|1114 25|25|timestamp_to_char
+    2647|transaction_timestamp|f|f|t|f|s|s|1|0|0||1184|now
+    2648|statement_timestamp|f|f|t|f|s|s|1|0|0||1184|statement_timestamp
+    2649|clock_timestamp|f|f|t|f|v|s|1|0|0||1184|clock_timestamp
+    6199|extract|f|f|t|f|i|s|1|0|0|25 1082|1700|extract_date
+    6200|extract|f|f|t|f|i|s|1|0|0|25 1083|1700|extract_time
+    6202|extract|f|f|t|f|i|s|1|0|0|25 1114|1700|extract_timestamp
+    6203|extract|f|f|t|f|s|s|1|0|0|25 1184|1700|extract_timestamptz
+}
+
 test pg-object-opclass-is-read-only {
     CREATE ROLE reader_of_object_opclass_is_read_only_role;
     SET ROLE reader_of_object_opclass_is_read_only_role;
