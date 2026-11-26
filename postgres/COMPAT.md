@@ -189,7 +189,6 @@ text as PostgreSQL does (white space around the number, a sign, `0x`, `0o` and
 rounds a decimal half away from zero. A float8 is rounded the same way, where
 PostgreSQL rounds it half to even. Arithmetic on these types is 64-bit:
 `2147483647::int4 + 1` gives 2147483648, where PostgreSQL fails with 22003.
-On the wire, smallint is still described as int4.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.

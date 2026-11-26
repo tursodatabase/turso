@@ -736,6 +736,7 @@ enum BinaryEncoding {
     /// bytes as their text format.
     Text,
     Bool,
+    Int2,
     Int4,
     Int8,
     Float8,
@@ -748,6 +749,7 @@ impl BinaryEncoding {
         match *pg_type {
             Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(Self::Text),
             Type::BOOL => Some(Self::Bool),
+            Type::INT2 => Some(Self::Int2),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
             Type::FLOAT8 => Some(Self::Float8),
@@ -801,7 +803,9 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
 /// FIXME(pg-catalog): This hand-codes typarray of pg_type, and sends an array of any type it does not list as text[]. A lookup of typarray in a pg_type table replaces this.
 /// Map a scalar PG type to its array counterpart.
 fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
-    if *scalar == Type::INT4 {
+    if *scalar == Type::INT2 {
+        Type::INT2_ARRAY
+    } else if *scalar == Type::INT4 {
         Type::INT4_ARRAY
     } else if *scalar == Type::INT8 {
         Type::INT8_ARRAY
@@ -996,6 +1000,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
         Some(BinaryEncoding::Bytea) => Ok(Value::from_blob(bytes.to_vec())),
         Some(
             BinaryEncoding::Bool
+            | BinaryEncoding::Int2
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
             | BinaryEncoding::Float8,
@@ -1143,13 +1148,17 @@ fn encode_binary(
     text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
         (Text, _) => encode_text(encoder, val, text_type),
         (_, Value::Null) => encoder.encode_field(&None::<i8>),
         (Bool, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i != 0)),
+        (Int2, Value::Numeric(Integer(i))) => match i16::try_from(*i) {
+            Ok(i) => encoder.encode_field(&i),
+            Err(_) => return Err(binary_value_not_supported(pg_type)),
+        },
         (Int4, Value::Numeric(Integer(i))) => match i32::try_from(*i) {
             Ok(i) => encoder.encode_field(&i),
             Err(_) => return Err(binary_value_not_supported(pg_type)),
@@ -1158,10 +1167,10 @@ fn encode_binary(
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
-        (Bool | Int4 | Int8, Value::Numeric(Float(_)))
+        (Bool | Int2 | Int4 | Int8, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int2 | Int4 | Int8 | Float8, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1176,11 +1185,12 @@ fn binary_value_not_supported(pg_type: &Type) -> turso_core::LimboError {
     sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
 }
 
-/// FIXME(pg-catalog): This is a second hand-written map from type names to pg_type entries, besides `pg_type_oid` in postgres/frontend/catalog.rs, and the two disagree: this one sends smallint as int4, numeric without a precision as float8 and timetz as time, where pg_type has int2 (21), numeric (1700) and timetz (1266). A lookup in a pg_type table replaces this.
+/// FIXME(pg-catalog): This is a second hand-written map from type names to pg_type entries, besides `pg_type_oid` in postgres/frontend/catalog.rs, and the two disagree: this one sends numeric without a precision as float8 and timetz as time, where pg_type has numeric (1700) and timetz (1266). A lookup in a pg_type table replaces this.
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     let upper = type_str.to_uppercase();
     match upper.as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
+        "SMALLINT" | "INT2" => Type::INT2,
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
         "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
         | "DECIMAL" => Type::FLOAT8,
@@ -1604,8 +1614,9 @@ mod tests {
         )
         .unwrap();
         let conn = PgConnection::connect(&db).unwrap();
-        conn.execute("CREATE TABLE t (i int, b bigint)").unwrap();
-        conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
+        conn.execute("CREATE TABLE t (i int, b bigint, s smallint)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (42, 42, 42)").unwrap();
         // Each field is a 4-byte length followed by the value.
         for (sql, expected_type, binary, text) in [
             (
@@ -1619,6 +1630,18 @@ mod tests {
                 Type::INT4,
                 b"\0\0\0\x04\xff\xff\xff\xff",
                 b"\0\0\0\x02-1",
+            ),
+            (
+                "SELECT 42::int2",
+                Type::INT2,
+                b"\0\0\0\x02\0\x2a",
+                b"\0\0\0\x0242",
+            ),
+            (
+                "SELECT s FROM t",
+                Type::INT2,
+                b"\0\0\0\x02\0\x2a",
+                b"\0\0\0\x0242",
             ),
             (
                 "SELECT i FROM t",
@@ -2418,7 +2441,8 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("INTEGER"), Type::INT4);
         assert_eq!(sqlite_type_to_pg_type("INT"), Type::INT4);
         assert_eq!(sqlite_type_to_pg_type("INT4"), Type::INT4);
-        assert_eq!(sqlite_type_to_pg_type("SMALLINT"), Type::INT4);
+        assert_eq!(sqlite_type_to_pg_type("SMALLINT"), Type::INT2);
+        assert_eq!(sqlite_type_to_pg_type("INT2"), Type::INT2);
         assert_eq!(sqlite_type_to_pg_type("BIGINT"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("INT8"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT8);
@@ -2459,11 +2483,11 @@ mod tests {
         assert!(matches!(val, Value::Text(_)));
     }
 
-    /// Known gap: PostgreSQL 18 describes `5::int2` as int2 (oid 21) and
-    /// `1.5::numeric` as numeric (oid 1700). tursopg describes them as int4
-    /// and float8, so a client decodes the values with the wrong type.
+    /// Known gap: PostgreSQL 18 describes `1.5::numeric` as numeric (oid
+    /// 1700). tursopg describes it as float8, so a client decodes the value
+    /// with the wrong type.
     #[test]
-    fn smallint_and_numeric_result_column_oids_are_a_known_gap() {
+    fn numeric_result_column_oid_is_a_known_gap() {
         let (mut client, _conn) = copy_test_client();
         let events = client.simple_query("SELECT 5::int2, 1.5::numeric").unwrap();
         let oids: Vec<u32> = events
@@ -2476,6 +2500,6 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("{events:?}"));
         // PostgreSQL 18 sends [21, 1700].
-        assert_eq!(oids, [Type::INT4.oid(), Type::FLOAT8.oid()]);
+        assert_eq!(oids, [Type::INT2.oid(), Type::FLOAT8.oid()]);
     }
 }
