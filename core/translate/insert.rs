@@ -568,7 +568,6 @@ pub fn translate_insert(
         resolver,
         &mut values,
         body,
-        &columns,
         &table_references,
         namespace,
     )?;
@@ -2535,25 +2534,9 @@ fn init_source_emission<'a>(
     resolver: &Resolver,
     values: &mut Vec<Box<Expr>>,
     body: InsertBody,
-    columns: &'a [ast::Name],
     table_references: &TableReferences,
     namespace: NamespaceRef,
 ) -> Result<()> {
-    let required_column_count = if columns.is_empty() {
-        table.columns().iter().filter(|c| !c.is_generated()).count()
-    } else {
-        columns.len()
-    };
-    if !values.is_empty() {
-        // If we had a single tuple in VALUES, it was inserted into the values vector parameter.
-        if values.len() != required_column_count {
-            crate::bail_parse_error!(
-                "table {} has {required_column_count} columns but {} values were supplied",
-                table.get_name(),
-                values.len()
-            );
-        }
-    }
     // Check if INSERT triggers exist - if so, we need to use ephemeral table for VALUES with more than one row
     let has_insert_triggers = has_triggers_including_temp(
         resolver,
@@ -2605,13 +2588,6 @@ fn init_source_emission<'a>(
                         connection,
                     )
                 })?;
-                if num_result_cols != required_column_count {
-                    crate::bail_parse_error!(
-                        "table {} has {required_column_count} columns but {} values were supplied",
-                        table.get_name(),
-                        num_result_cols,
-                    );
-                }
 
                 program.emit_insn(Insn::EndCoroutine { yield_reg });
                 program.preassign_label_to_next_insn(jump_on_definition_label);
@@ -2929,6 +2905,14 @@ fn build_insertion<'a>(
         })
         .collect::<Vec<_>>();
 
+    if !columns.is_empty() && num_values != columns.len() {
+        crate::bail_parse_error!(
+            "table {} has {} columns but {} values were supplied",
+            &table.get_name(),
+            columns.len(),
+            num_values
+        );
+    }
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
         let num_storable_columns = table_columns
