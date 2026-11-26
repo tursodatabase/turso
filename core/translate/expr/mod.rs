@@ -97,7 +97,7 @@ pub(crate) use arrays::{
     emit_custom_type_encode_columns, ArrayInput,
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
-pub(crate) use binding::check_custom_types;
+pub(crate) use binding::choose_and_check_operators;
 pub use binding::{bind_and_rewrite_expr, bind_and_rewrite_expr_except, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;

@@ -1095,17 +1095,12 @@ expect {
     1
 }
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-equals-scalar-subquery-of-integer-column {
     SELECT count(*) FROM t WHERE o = (SELECT i FROM t);
 }
 expect {
     1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
 }
 
 @compat-gap "operator:oid = int4"

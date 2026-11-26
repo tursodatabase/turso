@@ -629,8 +629,19 @@ pub fn bind_and_rewrite_expr_except<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
-    read_literal_operands(top_level_expr, referenced_tables.as_deref(), resolver)?;
-    check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
+    choose_and_check_operators(top_level_expr, referenced_tables.as_deref(), resolver)
+}
+
+/// Casts the operands that the dialect's operators cast, then fails on what no
+/// operator runs.
+// FIXME(registered-types): The cast walks and the two check walks are one walk of a typed expression tree.
+pub(crate) fn choose_and_check_operators(
+    expr: &mut ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    read_literal_operands(expr, tables, resolver)?;
+    check_custom_types(expr, tables, resolver)
 }
 
 /// Fails when `expr` uses an operator that no function of its operands' types
@@ -639,7 +650,7 @@ pub fn bind_and_rewrite_expr_except<'a>(
 /// expression a statement binds, so it also catches what the planner never
 /// compiles, as in `WHERE 0 AND d COLLATE nocase = 'x'`. The operands are
 /// bound only once the binding walk is done, so these are further walks.
-pub(crate) fn check_custom_types(
+fn check_custom_types(
     expr: &ast::Expr,
     tables: Option<&TableReferences>,
     resolver: &Resolver<'_>,
