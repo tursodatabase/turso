@@ -14,15 +14,20 @@ pub trait YieldPointMarker: Copy + Debug {
     fn ordinal(self) -> u8;
 
     fn point(self) -> YieldPoint {
-        YieldPoint::new(self.ordinal(), Self::POINT_COUNT)
+        YieldPoint::new(
+            self.ordinal(),
+            Self::POINT_COUNT,
+            std::any::type_name::<Self>(),
+        )
     }
 }
 
 impl YieldPoint {
-    pub(crate) fn new(ordinal: u8, point_count: u8) -> Self {
+    pub(crate) fn new(ordinal: u8, point_count: u8, family: &'static str) -> Self {
         Self {
             ordinal,
             point_count,
+            family,
         }
     }
 }
