@@ -1,10 +1,10 @@
 ---
 name: self-review
-description: How to prepare a pull request and review it yourself before you publish it. Use when you start a fix, before you open or push a PR, or when asked to "review my PR" or "self-review". Covers comparing with SQLite and PostgreSQL, the test that fails without the fix, the risk check, and having a second session try to break the change.
+description: How to prepare a turso pull request and review it yourself before you publish it. Use when you start a fix, before you open or push a PR, or when the user asks you to "review my PR" or "self-review". Covers comparing with SQLite and PostgreSQL, the test that fails without the fix, the risk check, and a subagent that tries to break the change.
 ---
 # Self-review
 
-Most review rounds on a PR find the same things: a rule fixed in one path but not in the others, a test that passes without the fix, a wrong answer that SQLite or PostgreSQL would not give, a helper that already exists. Find these yourself first. Then the first review has nothing new to say.
+Review rounds on agent-written PRs find the same things again and again: a rule fixed in one path but not in the others, a test that passes without the fix, a result that SQLite or PostgreSQL would not give, a helper that already exists, a claim in the description that nothing ran. Find these yourself before you publish.
 
 ## Light or full pass
 
@@ -21,16 +21,16 @@ scripts/oracles.sh            # sqlite3 at our version, PostgreSQL in Docker
 scripts/oracles.sh --sources  # also clone both sources into ~/.cache/turso-oracles
 ```
 
-Run the `export` lines it prints: `PATH`, so `scripts/diff.sh` uses our sqlite3 version, and `PG_DSN` for PostgreSQL. Without Docker, set `PG_DSN` to any PostgreSQL server of the version in `postgres/version`. `scripts/oracles.sh --stop` removes the container.
+Run the `export` lines it prints: `PATH`, so `scripts/diff.sh` uses our sqlite3 version, and `PG_DSN` for PostgreSQL. PostgreSQL is needed only for changes to the PostgreSQL frontend (`postgres/`); without Docker, ask the user for a server of the version in `postgres/version` and set `PG_DSN` to it. `scripts/oracles.sh --stop` removes the container.
 
 ## 1. Before the fix
 
 - Reproduce the bug on `main` (for a `main` build next to your branch: `git worktree add ../turso-main origin/main`):
   - SQLite frontend: `scripts/diff.sh "SQL"` runs the SQL in `sqlite3` and `tursodb` and prints PASS, or FAIL with a diff.
   - PostgreSQL frontend: `psql "$PG_DSN" -c "SQL"` and `cargo run -q -p tursopg -- :memory: "SQL"`.
-- Do not trust your memory of what SQLite or PostgreSQL does. Run it. A different error message is not always a bug. A different result is.
+- Do not answer from what you remember SQLite or PostgreSQL does. Run it. A different error message is not always a bug. A different result is.
 - Read their source for the behaviour (`--sources` above; SQLite: `src/`, PostgreSQL: `src/backend/`). Find how it stores and converts the value. Do the same, not a different way that gives the same output on your example.
-- If neither SQLite, PostgreSQL nor current Turso behaviour decides the answer, stop and ask a maintainer. Do not pick it inside a fix.
+- If neither SQLite, PostgreSQL nor current Turso behaviour decides the answer, stop and ask the user. With no user to ask, leave it unfixed and say so in the PR. Do not decide it inside a fix.
 
 ## 2. The fix and its test
 
@@ -40,6 +40,7 @@ Run the `export` lines it prints: `PATH`, so `scripts/diff.sh` uses our sqlite3 
 - Before you write a helper, type or constant, search for code that already does the job, by what it does, not only by name. Reuse it or extend it. Delete the code you replace.
 - Keep the scope to the bug. PostgreSQL-only behaviour goes in `postgres/`, not in `core`. A fix for a rare case must not change code that every query runs through.
 - If a value is already wrong when it reaches your code, fix the code that produces it, not the code that reads it.
+- Do not change an existing test's expected output to make it pass, unless SQLite or PostgreSQL gives the new output. Show that output in the PR.
 - Write the test with the fix. Then prove that it fails without the fix: revert only the non-test change, run the test, see it fail, restore the change, see it pass. Use `.sqltest` files where you can (the `testing` skill says how to run them). A test that passes on `main` does not test this change.
 - The test uses the reported input, or a smaller input that still fails the same way.
 
@@ -56,19 +57,19 @@ For each area, ask if the change can reach it. If yes, run the check.
 | SQLite or PostgreSQL compatibility | Compare with them on the reported input and on its neighbours: NULL, empty, boundary values, signs, affinity, very large values. |
 | Speed of common queries | Does the change add work to code every query runs? Benchmark before and after. |
 
-## 4. Try to break it, in a second session (full pass only)
+## 4. Try to break it, in a subagent (full pass only)
 
-You know why the change is right, so you will not see where it is wrong. Give the job to a new Claude Code session, a subagent, or a colleague who has not seen your reasoning. Give it only:
+You wrote the change, so your context is full of reasons it is right, and you will not see where it is wrong. Spawn a fresh subagent, or start a new session. Do not fork this conversation: a fork has your reasoning. Give it only:
 
 - the diff (`git diff origin/main...HEAD`) and the PR description
 - a worktree with your branch, and one with `origin/main`
 - the commands from step 0 and 1, with your `PATH` and `PG_DSN` values
 
-Do not give it your notes, your plan or your explanation. Tell it:
+Do not give it your notes, your plan or your explanation. Give it this brief:
 
-> Find inputs on which the branch gives a wrong result. Do not review style or run the test suite. Say what must be true for the change to be right. List the other ways to reach the same code. Run each one on the branch, on `origin/main`, and on SQLite or PostgreSQL. Shrink each failure to the smallest input, then say which kinds of input fail. Stop any run that takes longer than 60 seconds. Report a failure only with the commands you ran.
+> Find inputs on which the branch gives a wrong result. Do not review style or run the test suite. Say what must be true for the change to be right. List the other ways to reach the same code. Run each one on the branch, on `origin/main`, and on SQLite or PostgreSQL; do not answer from memory. Shrink each failure to the smallest input, then say which kinds of input fail. Stop any run that takes longer than 60 seconds. Report a failure only with the commands you ran and their output.
 
-Read what it reports. A failure that `main` also has, in the same feature or in code you changed, belongs in this PR. A failure far from the change goes in a new issue that names its cause, not only its symptom.
+Check each failure it reports by running its commands yourself. A failure that `main` also has, in the same feature or in code you changed, belongs in this PR. A failure far from the change goes in a new issue that names its cause, not only its symptom.
 
 ## 5. Before you push
 
@@ -77,7 +78,10 @@ Read what it reports. A failure that `main` also has, in the same feature or in 
   - What one fact makes this change right? Show it with a command or cite `file:line`.
   - Does any comment say what the code does, instead of why? Delete it or fix it.
   - Does a skip, a catch-all or a default value hide a case the change knows is wrong?
-- Run what CI runs for the crates you changed, with the same flags (`.github/workflows/`): `cargo fmt`, clippy, and the tests near your change. Once, on the final tree.
+- Run what CI runs for the crates you changed, with the same flags (`.github/workflows/`): `cargo fmt`, clippy, and the tests near your change. Once, on the final tree (the fail-without-the-fix run in step 2 is separate).
 - In the PR description:
+  - state what you ran and what it printed. Do not call the change correct, safe or complete; the reviewer judges that from the evidence.
+  - the test's failure on `main` (the command and the failing line of output);
+  - the inputs you tried from step 2 and what each gave on your branch and on SQLite or PostgreSQL;
   - on a full pass, which risk areas from step 3 you checked, and which you could not and why;
-  - the weakest part of the change in one sentence: the input you are least sure of, the risk you could not check, or the choice a reviewer might dispute. A reviewer who is told where to look finds more, and sooner.
+  - the weakest part of the change in one sentence: the input you are least sure of, the risk you could not check, or the choice a reviewer might dispute.

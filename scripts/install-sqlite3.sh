@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # Portable script to download and extract SQLite3 binary
-# Works on Linux (x64), macOS (x64/arm64), and Windows (x64)
+# Works on Linux (x64), macOS (x64/arm64), and Windows (x64).
+# sqlite.org has no Linux arm64 binary, so on Linux arm64 it builds sqlite3 from
+# the source tarball (needs a C compiler and make).
 
 set -e
 
@@ -66,6 +68,9 @@ get_download_url() {
         linux-x64)
             echo "$base_url/sqlite-tools-linux-x64-$SQLITE_VERSION.zip"
             ;;
+        linux-arm64)
+            echo "$base_url/sqlite-autoconf-$SQLITE_VERSION.tar.gz"
+            ;;
         macos-x64|macos-arm64)
             # macOS uses a universal binary (works on both x64 and arm64)
             echo "$base_url/sqlite-tools-osx-x64-$SQLITE_VERSION.zip"
@@ -126,26 +131,33 @@ main() {
     tmp_dir="$(mktemp -d)"
     trap 'rm -rf "$tmp_dir"' EXIT
 
-    local zip_file="$tmp_dir/sqlite.zip"
+    local archive="$tmp_dir/${url##*/}"
 
     echo "Downloading SQLite3..."
     if command -v curl &> /dev/null; then
-        curl -fsSL -o "$zip_file" "$url"
+        curl -fsSL -o "$archive" "$url"
     elif command -v wget &> /dev/null; then
-        wget -q -O "$zip_file" "$url"
+        wget -q -O "$archive" "$url"
     else
         echo "Error: Neither curl nor wget found. Please install one of them." >&2
         exit 1
     fi
 
-    echo "Extracting SQLite3..."
-    if command -v unzip &> /dev/null; then
-        # -j: junk paths (don't create subdirectories)
-        # -o: overwrite without prompting
-        unzip -j -o "$zip_file" "*$binary_name" -d "$INSTALL_DIR"
+    if [ "$platform" = linux-arm64 ]; then
+        echo "Building SQLite3 from source..."
+        tar xzf "$archive" -C "$tmp_dir"
+        (cd "$tmp_dir/sqlite-autoconf-$SQLITE_VERSION" && ./configure >/dev/null && make -j"$(nproc)" sqlite3 >/dev/null)
+        cp "$tmp_dir/sqlite-autoconf-$SQLITE_VERSION/sqlite3" "$target_binary"
     else
-        echo "Error: unzip not found. Please install it." >&2
-        exit 1
+        echo "Extracting SQLite3..."
+        if command -v unzip &> /dev/null; then
+            # -j: junk paths (don't create subdirectories)
+            # -o: overwrite without prompting
+            unzip -j -o "$archive" "*$binary_name" -d "$INSTALL_DIR"
+        else
+            echo "Error: unzip not found. Please install it." >&2
+            exit 1
+        fi
     fi
 
     # Make binary executable (no-op on Windows, needed on Unix)
