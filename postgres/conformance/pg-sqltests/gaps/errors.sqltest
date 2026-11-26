@@ -335,17 +335,12 @@ test smallint-column-overflow {
 @sqlstate 22003
 expect error {}
 
-# PostgreSQL reads the number as numeric and refuses it for the bigint column.
-# tursopg reads a number above the range of bigint as a float.
-@compat-gap "type:int8"
 test bigint-column-overflow {
     CREATE TABLE t (n bigint);
     INSERT INTO t VALUES (9223372036854775808);
 }
 @sqlstate 22003
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # D-35: undefined table
 test undefined-table {
