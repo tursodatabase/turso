@@ -86,6 +86,8 @@ pub enum StatementStatusCounter {
     RowsRead,
     RowsWritten,
     /// Raw MvStore entries that MVCC cursors looked at. See [`crate::vdbe::metrics::CursorWork`].
+    /// This counter and the four after it are counted in debug builds only; they are zero
+    /// in release builds.
     MvccEntriesExamined,
     /// Raw B-tree rows that MVCC cursors looked at.
     BtreeRowsExamined,

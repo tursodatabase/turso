@@ -1,7 +1,9 @@
+#[cfg(debug_assertions)]
 use crate::sync::atomic::{AtomicU64, Ordering};
 use std::fmt;
 
-/// The work that the MVCC cursors of a statement did inside their operations.
+/// The work that the MVCC cursors of a statement did inside their operations. Counted in
+/// debug builds only; all zero in release builds.
 ///
 /// One cursor operation (a `Next` or a seek) can look at many entries that the
 /// transaction cannot see. The opcode counters of [`StatementMetrics`] count the
@@ -50,19 +52,65 @@ impl CursorWork {
 /// The live [`CursorWork`] counters of one statement. The statement shares them with
 /// each MVCC cursor that it opens.
 ///
+/// The counters exist in debug builds only. In release builds the type is empty, each
+/// increment compiles to nothing, and [`Self::get`] returns zeros.
+///
 /// Only the thread that steps the statement changes the counters, so an increment is a
 /// load and a store, not an atomic read-modify-write. The atomics only make the type
 /// `Sync`.
 #[derive(Debug, Default)]
 pub struct CursorWorkCounters {
+    #[cfg(debug_assertions)]
     mvcc_entries_examined: AtomicU64,
+    #[cfg(debug_assertions)]
     btree_rows_examined: AtomicU64,
+    #[cfg(debug_assertions)]
     mvcc_seeks: AtomicU64,
+    #[cfg(debug_assertions)]
     btree_seeks: AtomicU64,
+    #[cfg(debug_assertions)]
     visibility_checks: AtomicU64,
 }
 
+/// The handle to the [`CursorWorkCounters`] of a statement that the statement and its
+/// cursors keep. It is empty in release builds, so they allocate nothing for it.
+#[cfg(debug_assertions)]
+pub(crate) type CursorWorkHandle = crate::sync::Arc<CursorWorkCounters>;
+/// The handle to the [`CursorWorkCounters`] of a statement that the statement and its
+/// cursors keep. It is empty in release builds, so they allocate nothing for it.
+#[cfg(not(debug_assertions))]
+#[derive(Debug, Clone)]
+pub(crate) struct CursorWorkHandle;
+
+/// Makes counters for a new statement or cursor.
+pub(crate) fn new_cursor_work_handle() -> CursorWorkHandle {
+    #[cfg(debug_assertions)]
+    {
+        crate::sync::Arc::new(CursorWorkCounters::default())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        CursorWorkHandle
+    }
+}
+
+/// The counters that `handle` refers to.
+#[inline(always)]
+pub(crate) fn cursor_work(handle: &CursorWorkHandle) -> &CursorWorkCounters {
+    #[cfg(debug_assertions)]
+    {
+        handle
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let CursorWorkHandle = handle;
+        static NO_COUNTERS: CursorWorkCounters = CursorWorkCounters {};
+        &NO_COUNTERS
+    }
+}
+
 impl CursorWorkCounters {
+    #[cfg(debug_assertions)]
     #[inline]
     fn bump(counter: &AtomicU64) {
         counter.store(
@@ -71,38 +119,51 @@ impl CursorWorkCounters {
         );
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn mvcc_entry_examined(&self) {
+        #[cfg(debug_assertions)]
         Self::bump(&self.mvcc_entries_examined);
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn btree_row_examined(&self) {
+        #[cfg(debug_assertions)]
         Self::bump(&self.btree_rows_examined);
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn mvcc_seek(&self) {
+        #[cfg(debug_assertions)]
         Self::bump(&self.mvcc_seeks);
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn btree_seek(&self) {
+        #[cfg(debug_assertions)]
         Self::bump(&self.btree_seeks);
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn visibility_check(&self) {
+        #[cfg(debug_assertions)]
         Self::bump(&self.visibility_checks);
     }
 
+    /// The counts. All zero in release builds.
     pub fn get(&self) -> CursorWork {
-        CursorWork {
-            mvcc_entries_examined: self.mvcc_entries_examined.load(Ordering::Relaxed),
-            btree_rows_examined: self.btree_rows_examined.load(Ordering::Relaxed),
-            mvcc_seeks: self.mvcc_seeks.load(Ordering::Relaxed),
-            btree_seeks: self.btree_seeks.load(Ordering::Relaxed),
-            visibility_checks: self.visibility_checks.load(Ordering::Relaxed),
+        #[cfg(debug_assertions)]
+        {
+            CursorWork {
+                mvcc_entries_examined: self.mvcc_entries_examined.load(Ordering::Relaxed),
+                btree_rows_examined: self.btree_rows_examined.load(Ordering::Relaxed),
+                mvcc_seeks: self.mvcc_seeks.load(Ordering::Relaxed),
+                btree_seeks: self.btree_seeks.load(Ordering::Relaxed),
+                visibility_checks: self.visibility_checks.load(Ordering::Relaxed),
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            CursorWork::default()
         }
     }
 
@@ -111,16 +172,22 @@ impl CursorWorkCounters {
     }
 
     pub(crate) fn reset(&self) {
-        self.mvcc_entries_examined.store(0, Ordering::Relaxed);
-        self.btree_rows_examined.store(0, Ordering::Relaxed);
-        self.mvcc_seeks.store(0, Ordering::Relaxed);
-        self.btree_seeks.store(0, Ordering::Relaxed);
-        self.visibility_checks.store(0, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        for counter in [
+            &self.mvcc_entries_examined,
+            &self.btree_rows_examined,
+            &self.mvcc_seeks,
+            &self.btree_seeks,
+            &self.visibility_checks,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Sets one counter to zero. Ignores a counter that is not cursor work.
     pub(crate) fn reset_counter(&self, counter: crate::statement::StatementStatusCounter) {
         use crate::statement::StatementStatusCounter as C;
+        #[cfg(debug_assertions)]
         let counter = match counter {
             C::MvccEntriesExamined => &self.mvcc_entries_examined,
             C::BtreeRowsExamined => &self.btree_rows_examined,
@@ -135,7 +202,10 @@ impl CursorWorkCounters {
             | C::RowsRead
             | C::RowsWritten => return,
         };
+        #[cfg(debug_assertions)]
         counter.store(0, Ordering::Relaxed);
+        #[cfg(not(debug_assertions))]
+        let _: C = counter;
     }
 }
 

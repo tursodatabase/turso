@@ -18,7 +18,9 @@ use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
     SeekResult, Value, ValueRef,
 };
-use crate::vdbe::metrics::CursorWorkCounters;
+use crate::vdbe::metrics::{
+    cursor_work, new_cursor_work_handle, CursorWorkCounters, CursorWorkHandle,
+};
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
@@ -585,7 +587,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     mvcc_peek_epoch: u64,
     /// The work counters of the statement that opened the cursor.
     /// See [`crate::vdbe::metrics::CursorWork`].
-    work: Arc<CursorWorkCounters>,
+    work: CursorWorkHandle,
 }
 
 pub enum NextRowidResult {
@@ -655,12 +657,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
-            work: Arc::new(CursorWorkCounters::default()),
+            work: new_cursor_work_handle(),
         })
     }
 
     /// Counts the work of this cursor in `work`, the counters of the statement that opens it.
-    pub(crate) fn with_work_counters(mut self, work: Arc<CursorWorkCounters>) -> Self {
+    pub(crate) fn with_work_counters(mut self, work: CursorWorkHandle) -> Self {
         self.work = work;
         self
     }
@@ -671,13 +673,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let RowKey::Record(rec) = key else {
             return self.query_btree_version_is_valid(key);
         };
-        self.work.visibility_check();
+        cursor_work(&self.work).visibility_check();
         let valid = self.index_shadow_scan.btree_row_is_valid(
             &self.db,
             self.table_id,
             self.tx_id,
             rec,
-            &self.work,
+            cursor_work(&self.work),
         )?;
         // Debug-only cross-check: any scan divergence (e.g. a missed reset)
         // fails the test suite instead of shipping.
@@ -878,7 +880,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> Result<bool> {
-        self.work.visibility_check();
+        cursor_work(&self.work).visibility_check();
         self.db
             .query_btree_version_is_valid(self.table_id, key, self.tx_id)
     }
@@ -890,7 +892,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 self.table_id,
                 &mut self.table_iterator,
                 self.snapshot,
-                &self.work,
+                cursor_work(&self.work),
             ) {
                 Some((row_id, versions)) => CursorPeek::Row {
                     key: row_id.row_id,
@@ -902,7 +904,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 &mut self.index_iterator,
                 self.snapshot,
                 self.table_id,
-                &self.work,
+                cursor_work(&self.work),
             ) {
                 Some((row_id, versions)) => CursorPeek::Row {
                     key: row_id.row_id,
@@ -943,7 +945,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     dir,
                     self.snapshot,
                     &mut self.table_iterator,
-                    &self.work,
+                    cursor_work(&self.work),
                 )
                 .map(|(row_id, versions, _)| (row_id, versions)),
             RowKey::Record(current_key) => self.db.seek_index(
@@ -954,7 +956,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 dir,
                 self.snapshot,
                 &mut self.index_iterator,
-                &self.work,
+                cursor_work(&self.work),
             )?,
         };
         self.dual_peek.mvcc_peek = match found {
@@ -1007,7 +1009,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     // If the btree is uninitialized AND we should initialize, do the equivalent of rewind() to find the first valid row
                     if initialize && self.dual_peek.btree_uninitialized() {
                         return_if_io!(self.btree_cursor.rewind());
-                        self.work.btree_seek();
+                        cursor_work(&self.work).btree_seek();
                         self.btree_advance_state = Some(AdvanceBtreeState::RewindCheckBtreeKey);
                     } else {
                         self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
@@ -1096,7 +1098,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     // If the btree is uninitialized AND we should initialize, do the equivalent of last() to find the last valid row
                     if initialize && self.dual_peek.btree_uninitialized() {
                         return_if_io!(self.btree_cursor.last());
-                        self.work.btree_seek();
+                        cursor_work(&self.work).btree_seek();
                         self.btree_advance_state = Some(AdvanceBtreeState::RewindCheckBtreeKey);
                     } else {
                         self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
@@ -1165,7 +1167,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Get the current key from btree cursor
     fn get_btree_current_key(&mut self) -> Result<Option<RowKey>> {
-        self.work.btree_row_examined();
+        cursor_work(&self.work).btree_row_examined();
         match &self.mv_cursor_type {
             MvccCursorType::Table => {
                 let maybe_rowid = loop {
@@ -1276,7 +1278,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             match btree_seek_state {
                 SeekBtreeState::SeekBtree => {
                     let seek_result = return_if_io!(self.btree_cursor.seek(seek_key.clone(), op));
-                    self.work.btree_seek();
+                    cursor_work(&self.work).btree_seek();
 
                     match seek_result {
                         SeekResult::NotFound => {
@@ -1358,7 +1360,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         if self.table_iterator.is_some() || self.index_iterator.is_some() {
             return Ok(()); // Already initialized
         }
-        self.work.mvcc_seek();
+        cursor_work(&self.work).mvcc_seek();
         match &self.mv_cursor_type {
             MvccCursorType::Table => {
                 let start_rowid = RowID {
@@ -1432,7 +1434,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 self.table_id,
                 &mut self.table_iterator,
                 self.tx_id,
-                &self.work,
+                cursor_work(&self.work),
             ) {
                 Some(k) => {
                     tracing::trace!("last: mvcc_key: {:?}", k);
@@ -1449,7 +1451,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 self.table_id,
                 self.tx_id,
                 &mut self.index_iterator,
-                &self.work,
+                cursor_work(&self.work),
             )? {
                 Some(k) => {
                     self.dual_peek.mvcc_peek = CursorPeek::Row {
@@ -1805,7 +1807,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 direction,
                                 self.snapshot,
                                 &mut self.table_iterator,
-                                &self.work,
+                                cursor_work(&self.work),
                             );
 
                             // Set MVCC peek
@@ -1858,7 +1860,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 direction,
                                 self.snapshot,
                                 &mut self.index_iterator,
-                                &self.work,
+                                cursor_work(&self.work),
                             )?;
 
                             // Set MVCC peek
@@ -2131,7 +2133,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 IterationDirection::Forwards,
                 self.snapshot,
                 &mut self.table_iterator,
-                &self.work,
+                cursor_work(&self.work),
             );
 
             let mvcc_versions = match rowid {
@@ -2199,7 +2201,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
         // Check if row exists in B-tree
         let found = return_if_io!(self.btree_cursor.exists(key));
-        self.work.btree_seek();
+        cursor_work(&self.work).btree_seek();
 
         if found {
             // Found in B-tree, but need to verify it's not shadowed by MVCC tombstone
