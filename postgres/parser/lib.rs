@@ -11,6 +11,7 @@ use thiserror::Error;
 
 pub mod sqlstate;
 pub mod translator;
+mod type_name;
 
 /// The frontend function that the translator calls for `timestamp + interval`
 /// and `timestamp - interval` with an interval literal. Its arguments are the
@@ -149,6 +150,8 @@ impl FunctionTypeUse {
         }
     }
 }
+
+pub use type_name::{parse_type_name, WrittenTypeName};
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
