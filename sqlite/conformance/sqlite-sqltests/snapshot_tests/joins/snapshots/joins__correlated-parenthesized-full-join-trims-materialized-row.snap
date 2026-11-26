@@ -34,9 +34,9 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4        p5  comment
-   0  Init                0  77   0             0  Start at 77
+   0  Init                0  78   0             0  Start at 78
    1  OpenRead            0   2   0  k(2,B)     0  table=nested_correlated_outer, root=2, iDb=0
-   2  Rewind              0  76   0             0  Rewind table nested_correlated_outer
+   2  Rewind              0  77   0             0  Rewind table nested_correlated_outer
    3    BeginSubrtn       3   0   0             0  r[3]=NULL
    4    Null              0   1   0             0  r[1]=NULL
    5    OpenEphemeral     1   1   0             0  cursor=1 is_table=true
@@ -78,7 +78,7 @@ addr  opcode             p1  p2  p3  p4        p5  comment
   41    Next              4  37   0             1
   42    Null              0  21   0             0  r[21]=NULL
   43    Integer           1  22   0             0  r[22]=1; LIMIT counter
-  44    IfNot            22  72   0             0  if !r[22] goto 72
+  44    IfNot            22  73   0             0  if !r[22] goto 73
   45    OpenRead          5   3   0  k(2,B)     0  table=nested_correlated_anchor, root=3, iDb=0
   46    Null              0  24   0             0  r[24]=NULL
   47    OpenEphemeral     6   0   0             0  cursor=6 is_table=false
@@ -106,12 +106,13 @@ addr  opcode             p1  p2  p3  p4        p5  comment
   69    AggFinal          0  21   0  count      0  accum=r[21]
   70    Copy             21  20   0             0  r[20]=r[21]
   71    Copy             20   1   0             0  r[1]=r[20]
-  72    Return            3   0   1             0
-  73    Copy              1   2   0             0  r[2]=r[1]
-  74    ResultRow         2   1   0             0  output=r[2]
-  75  Next                0   3   0             1
-  76  Halt                0   0   0             0
-  77  Transaction         0   1   4             0  iDb=0 tx_mode=Read
-  78  Integer             1  25   0             0  r[25]=1
-  79  Integer             1  27   0             0  r[27]=1
-  80  Goto                0   1   0             0
+  72    DecrJumpZero     22  73   0             0  if (--r[22]==0) goto 73
+  73    Return            3   0   1             0
+  74    Copy              1   2   0             0  r[2]=r[1]
+  75    ResultRow         2   1   0             0  output=r[2]
+  76  Next                0   3   0             1
+  77  Halt                0   0   0             0
+  78  Transaction         0   1   4             0  iDb=0 tx_mode=Read
+  79  Integer             1  25   0             0  r[25]=1
+  80  Integer             1  27   0             0  r[27]=1
+  81  Goto                0   1   0             0

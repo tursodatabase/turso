@@ -13,7 +13,7 @@ use super::{
     select::first_aggregate_without_over_clause,
 };
 use crate::translate::expr::comparison_affinity;
-use crate::translate::expr::expr_type::{query_column_type, select_column_type};
+use crate::translate::expr::expr_type::query_column_type;
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
@@ -23,7 +23,7 @@ use crate::{
     },
     translate::{
         collate::in_subquery_collation,
-        compound_select::emit_program_for_compound_select,
+        compound_select::{emit_program_for_compound_select, set_select_plan_destination},
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
         },
@@ -38,8 +38,7 @@ use crate::{
         insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
         plan::{
-            plan_has_outer_scope_dependency, plan_is_correlated,
-            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
+            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, EvalAt, JoinInfo,
             JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
             WhereTerm,
@@ -840,7 +839,7 @@ fn get_subquery_parser<'a>(
                     unreachable!();
                 };
 
-                let plan = prepare_select_plan(
+                let mut plan = prepare_select_plan(
                     *subselect,
                     resolver,
                     program,
@@ -848,11 +847,6 @@ fn get_subquery_parser<'a>(
                     QueryDestination::ExistsSubqueryResult { result_reg },
                     connection,
                 )?;
-                let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
-                        "compound SELECT queries not supported yet in WHERE clause subqueries"
-                    );
-                };
                 // EXISTS only checks whether a row comes out, so ORDER BY and
                 // DISTINCT cannot change the result and SQLite drops them
                 // (select.c, "dropping superfluous ORDER BY"). Dropping them
@@ -863,23 +857,29 @@ fn get_subquery_parser<'a>(
                 // LIMIT and OFFSET stay: with DISTINCT gone they count plain
                 // rows, which matches SQLite. An OFFSET after DISTINCT ON
                 // counts groups, as in PostgreSQL, so that pair stays whole.
-                let offset_counts_distinct_on_groups =
-                    plan.offset.is_some() && plan.distinctness.is_distinct_on();
-                if !offset_counts_distinct_on_groups {
-                    plan.order_by.clear();
-                    plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
+                match &mut plan {
+                    Plan::Select(plan) => {
+                        let offset_counts_distinct_on_groups =
+                            plan.offset.is_some() && plan.distinctness.is_distinct_on();
+                        if !offset_counts_distinct_on_groups {
+                            plan.order_by.clear();
+                            plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
+                        }
+                    }
+                    Plan::CompoundSelect { order_by, .. } => *order_by = None,
+                    _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
                 }
-                let correlated = select_plan_has_outer_scope_dependency(&plan);
+                let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
-                    optimize_select_plan(&mut plan, resolver)?;
+                    optimize_subquery_plan(&mut plan, resolver)?;
                 }
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     same_query: None,
                     query_type: subquery_type,
                     state: SubqueryState::Unevaluated {
-                        plan: Some(Box::new(Plan::Select(plan))),
+                        plan: Some(Box::new(plan)),
                     },
                     correlated,
                     origin,
@@ -938,7 +938,7 @@ fn get_subquery_parser<'a>(
                 }) else {
                     unreachable!();
                 };
-                let plan = prepare_select_plan(
+                let mut plan = prepare_select_plan(
                     *subselect,
                     resolver,
                     program,
@@ -946,29 +946,25 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
-                        "compound SELECT queries not supported yet in WHERE clause subqueries"
-                    );
-                };
-                let correlated = select_plan_has_outer_scope_dependency(&plan);
+                let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
-                    optimize_select_plan(&mut plan, resolver)?;
+                    optimize_subquery_plan(&mut plan, resolver)?;
                 }
-                let reg_count = plan.result_columns.len();
+                let reg_count = plan.select_result_columns().len();
                 let reg_start = program.alloc_registers(reg_count);
 
+                // Like SQLite, a compound takes the affinity of its last SELECT.
                 let columns: Vec<_> = plan
-                    .result_columns
+                    .select_result_columns()
                     .iter()
                     .enumerate()
                     .map(|(i, result_col)| RowValueSubqueryColumn {
                         affinity: get_expr_affinity(
                             &result_col.expr,
-                            &ExprContext::new(Some(&plan.table_references), resolver),
+                            &ExprContext::new(Some(plan.select_table_references()), resolver),
                         ),
-                        expr_type: select_column_type(&plan, i, resolver),
+                        expr_type: query_column_type(&plan, i, resolver),
                     })
                     .collect();
                 if let [column] = columns.as_slice() {
@@ -983,20 +979,27 @@ fn get_subquery_parser<'a>(
                 );
 
                 // An aggregate without GROUP BY returns one row, so it needs no row count.
-                let is_single_row_aggregate = !plan.aggregates.is_empty()
-                    && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
-                    && plan.window.is_none();
+                let is_single_row_aggregate = matches!(&plan, Plan::Select(plan)
+                    if !plan.aggregates.is_empty()
+                        && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
+                        && plan.window.is_none());
                 let row_count_reg = (resolver
                     .catalog
                     .dialect
                     .rejects_scalar_subquery_with_several_rows()
                     && !is_single_row_aggregate)
                     .then(|| program.alloc_register());
-                plan.query_destination = QueryDestination::RowValueSubqueryResult {
-                    result_reg_start: reg_start,
-                    num_regs: reg_count,
-                    row_count_reg,
-                };
+                set_select_plan_destination(
+                    &mut plan,
+                    &QueryDestination::RowValueSubqueryResult {
+                        result_reg_start: reg_start,
+                        num_regs: reg_count,
+                        row_count_reg,
+                    },
+                );
+                let limit = plan
+                    .select_limit_mut()
+                    .expect("a scalar subquery is a SELECT");
 
                 let numeric =
                     |n: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_string())));
@@ -1008,7 +1011,7 @@ fn get_subquery_parser<'a>(
                 // Like SQLite, an existing LIMIT X becomes X != 0, with the 0 given NUMERIC
                 // affinity so that a text '0' also means no rows. Integer literals are folded here.
                 if row_count_reg.is_some() {
-                    plan.limit = Some(match plan.limit.take() {
+                    *limit = Some(match limit.take() {
                         None => numeric(2),
                         Some(expr) => match parse_signed_number(&expr) {
                             Ok(Value::Numeric(Numeric::Integer(v))) => {
@@ -1025,7 +1028,7 @@ fn get_subquery_parser<'a>(
                         },
                     });
                 } else {
-                    plan.limit = Some(match plan.limit.take() {
+                    *limit = Some(match limit.take() {
                         None => numeric(1),
                         Some(expr) => match parse_signed_number(&expr) {
                             Ok(Value::Numeric(Numeric::Integer(v))) => numeric((v != 0) as i64),
@@ -1073,7 +1076,7 @@ fn get_subquery_parser<'a>(
                         row_count_reg,
                     },
                     state: SubqueryState::Unevaluated {
-                        plan: Some(Box::new(Plan::Select(plan))),
+                        plan: Some(Box::new(plan)),
                     },
                     correlated,
                     origin: effective_origin,
@@ -1132,20 +1135,7 @@ fn get_subquery_parser<'a>(
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
-                    match &mut plan {
-                        Plan::Select(select_plan) => {
-                            optimize_select_plan(select_plan, resolver)?;
-                        }
-                        Plan::CompoundSelect {
-                            left, right_most, ..
-                        } => {
-                            optimize_select_plan(right_most, resolver)?;
-                            for (select_plan, _) in left.iter_mut() {
-                                optimize_select_plan(select_plan, resolver)?;
-                            }
-                        }
-                        _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
-                    }
+                    optimize_subquery_plan(&mut plan, resolver)?;
                 }
                 let result_columns = plan.select_result_columns();
                 let table_references = plan.select_table_references();
@@ -1272,6 +1262,23 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     })
+}
+
+/// Optimize each SELECT of a subquery plan.
+fn optimize_subquery_plan(plan: &mut Plan, resolver: &Resolver) -> Result<()> {
+    match plan {
+        Plan::Select(select_plan) => optimize_select_plan(select_plan, resolver),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            optimize_select_plan(right_most, resolver)?;
+            for (select_plan, _) in left.iter_mut() {
+                optimize_select_plan(select_plan, resolver)?;
+            }
+            Ok(())
+        }
+        _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
+    }
 }
 
 /// Recollect all aggregates after subquery planning.

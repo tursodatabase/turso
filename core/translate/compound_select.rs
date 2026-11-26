@@ -234,7 +234,9 @@ fn prepare_compound_select<'a>(
         | QueryDestination::EphemeralTable { .. }
         | QueryDestination::RecursiveCteQueue { .. }
         | QueryDestination::EphemeralIndex { .. } => Some(program.alloc_registers(num_result_cols)),
-        QueryDestination::ResultRows => None,
+        QueryDestination::ResultRows
+        | QueryDestination::ExistsSubqueryResult { .. }
+        | QueryDestination::RowValueSubqueryResult { .. } => None,
         other => {
             return Err(LimboError::InternalError(format!(
                 "Unexpected query destination: {other:?} for compound select"

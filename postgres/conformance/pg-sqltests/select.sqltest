@@ -2662,6 +2662,40 @@ test scalar-subquery-with-several-rows-in-delete-rejected {
 expect error {more than one row returned by a subquery used as an expression}
 
 @setup scalar_subquery
+test compound-scalar-subquery-with-several-rows-rejected {
+    SELECT (SELECT b FROM scalar_t WHERE a = 1 UNION SELECT 5);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test compound-scalar-subquery-with-limit-of-two-rejected {
+    SELECT (SELECT b FROM scalar_t UNION ALL SELECT b FROM scalar_u ORDER BY 1 LIMIT 2);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test compound-scalar-subquery-with-one-row {
+    SELECT (SELECT b FROM scalar_t WHERE a = 1 UNION SELECT 30);
+    SELECT (SELECT b FROM scalar_t UNION SELECT b FROM scalar_u ORDER BY 1 LIMIT 1);
+    SELECT (SELECT b FROM scalar_t EXCEPT SELECT b FROM scalar_t WHERE a < 3);
+    SELECT a, (SELECT b FROM scalar_t t2 WHERE t2.a = t.a UNION SELECT 0 ORDER BY 1 DESC LIMIT 1) FROM scalar_t t ORDER BY a;
+    SELECT EXISTS (SELECT b FROM scalar_t WHERE a = 9 UNION SELECT 30);
+    SELECT EXISTS (SELECT b FROM scalar_t EXCEPT SELECT b FROM scalar_t);
+}
+expect {
+    30
+    5
+    20
+    1|30
+    2|10
+    3|20
+    t
+    f
+}
+
+@setup scalar_subquery
 test scalar-subquery-with-one-row {
     SELECT (SELECT b FROM scalar_t LIMIT 1);
     SELECT (SELECT b FROM scalar_t ORDER BY b OFFSET 2);

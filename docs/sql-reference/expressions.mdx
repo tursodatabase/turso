@@ -278,7 +278,7 @@ WHERE id IN (SELECT user_id FROM orders WHERE total > 100);
 
 ## EXISTS Expression
 
-The EXISTS expression returns `1` if the subquery returns at least one row, and `0` otherwise.
+The EXISTS expression returns `1` if the subquery returns at least one row, and `0` otherwise. The subquery can be a compound SELECT, such as `EXISTS (SELECT 1 FROM a UNION SELECT 1 FROM b)`.
 
 ```sql
 [NOT] EXISTS (select-statement)
@@ -383,7 +383,7 @@ A subquery enclosed in parentheses that returns a single value can be used as an
 (select-statement)
 ```
 
-The subquery must return exactly one column. If the subquery returns no rows, the expression evaluates to NULL. If it returns more than one row, the expression uses the first row, as in SQLite. Through the PostgreSQL frontend, reading the value of a subquery that returns more than one row raises the error `more than one row returned by a subquery used as an expression` (SQLSTATE 21000), as PostgreSQL does. A subquery whose value is not read, such as one in a `CASE` branch that is not taken, raises no error. A view or a subquery in `FROM` computes each of its columns for each row, so a subquery in one of its columns raises the error even when the outer query does not read that column. PostgreSQL removes that column and raises no error.
+The subquery must return exactly one column. It can be a compound SELECT (`UNION`, `UNION ALL`, `INTERSECT` or `EXCEPT`); its `ORDER BY` and `LIMIT` apply to the whole compound. If the subquery returns no rows, the expression evaluates to NULL. If it returns more than one row, the expression uses the first row, as in SQLite. Through the PostgreSQL frontend, reading the value of a subquery that returns more than one row raises the error `more than one row returned by a subquery used as an expression` (SQLSTATE 21000), as PostgreSQL does. A subquery whose value is not read, such as one in a `CASE` branch that is not taken, raises no error. A view or a subquery in `FROM` computes each of its columns for each row, so a subquery in one of its columns raises the error even when the outer query does not read that column. PostgreSQL removes that column and raises no error.
 
 ```sql
 SELECT name,
