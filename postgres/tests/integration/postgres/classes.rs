@@ -1001,3 +1001,27 @@ fn schema_is_read_again_while_a_role_is_set() {
 
     conn.execute("SELECT x FROM t").unwrap();
 }
+
+#[turso_macros::test(mvcc)]
+fn long_relation_names_survive_schema_reload(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.inner().pragma_update("foreign_keys", "ON").unwrap();
+    for name in ["a".repeat(60), "é".repeat(30)] {
+        pg.execute(format!("CREATE TABLE \"{name}\" (x text PRIMARY KEY)"))
+            .unwrap();
+        pg.execute(format!(
+            "CREATE TABLE refs (x text REFERENCES \"{name}\"(x))"
+        ))
+        .unwrap();
+        pg.inner().force_reparse_schema_without_publish().unwrap();
+        let error = pg
+            .execute("INSERT INTO refs VALUES ('missing')")
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "23503");
+        pg.execute(format!("INSERT INTO \"{name}\" VALUES ('present')"))
+            .unwrap();
+        pg.execute("INSERT INTO refs VALUES ('present')").unwrap();
+        pg.execute("DROP TABLE refs").unwrap();
+        pg.execute(format!("DROP TABLE \"{name}\"")).unwrap();
+    }
+}

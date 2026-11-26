@@ -142,7 +142,7 @@ impl Dialect for PostgresDialect {
             return Ok(table);
         };
 
-        let parse_result = turso_pg_parser::parse(raw_sql).map_err(sql_parse_error)?;
+        let parse_result = turso_pg_parser::parse_stored_table(raw_sql).map_err(sql_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
@@ -166,7 +166,7 @@ impl Dialect for PostgresDialect {
             return canonical_table_sql_ast(self, sql);
         };
 
-        let parse_result = turso_pg_parser::parse(raw_sql).map_err(sql_parse_error)?;
+        let parse_result = turso_pg_parser::parse_stored_table(raw_sql).map_err(sql_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)

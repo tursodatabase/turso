@@ -155,6 +155,50 @@ pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     pg_query::parse(sql, pg_query::ParserOptions::DEFAULT).map_err(parse_error)
 }
 
+/// Parses a stored table definition without truncating engine relation names.
+pub fn parse_stored_table(sql: &str) -> Result<ParseResult, ParseError> {
+    let mut parsed = parse(sql)?;
+    for raw in &mut parsed.protobuf.stmts {
+        if let Some(node) = raw.stmt.as_mut() {
+            restore_stored_relation_names(sql, node)?;
+        }
+    }
+    Ok(parsed)
+}
+
+fn restore_stored_relation_names(
+    sql: &str,
+    node: &mut pg_query::protobuf::Node,
+) -> Result<(), ParseError> {
+    let (relation, children) = match &mut node.node {
+        Some(NodeEnum::CreateStmt(create)) => {
+            (create.relation.as_mut(), &mut create.table_elts[..])
+        }
+        Some(NodeEnum::ColumnDef(column)) => (None, &mut column.constraints[..]),
+        Some(NodeEnum::Constraint(constraint)) => (constraint.pktable.as_mut(), &mut [][..]),
+        _ => return Ok(()),
+    };
+    if let Some(relation) = relation {
+        // Namespace prefixes are added after PostgreSQL has checked the user
+        // name. Applying its identifier limit again can sever table/index and
+        // foreign-key references when loading a schema.
+        if relation.schemaname.is_empty()
+            && relation.relname.starts_with("__turso_ns")
+            && relation.location >= 0
+        {
+            let start = relation.location as usize;
+            let end = qualified_name_end(sql, start)?;
+            relation.relname = turso_ast::Name::from_string(&sql[start..end])
+                .as_str()
+                .to_string();
+        }
+    }
+    for child in children {
+        restore_stored_relation_names(sql, child)?;
+    }
+    Ok(())
+}
+
 /// The error for SQL that pg_query refuses. pg_query gives only the message
 /// of PostgreSQL's error, not its SQLSTATE, so the errors that PostgreSQL
 /// does not report as syntax errors are recognized by their message.
