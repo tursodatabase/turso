@@ -67,16 +67,16 @@ Rules that hold for all opcodes:
 | `SeekGT k` | none | `At (min key > k)`, else `Invalid` and jump |
 | `SeekLE k` / `SeekLT k` | none | `At (max key <= k)` / `(max key < k)`, else `Invalid` and jump |
 | `SeekRowid`, `NotExists` | table | hit: `At k`. Miss: `Seeked k` and jump |
-| `Found`, `NotFound`, `NoConflict` | index | match means some entry has the given prefix. Hit gives `At` some match (not always the first). Miss gives `Seeked key`. `NoConflict` also jumps when the key has a NULL, even if an entry matches |
+| `Found`, `NotFound`, `NoConflict` | index | match means some entry has the given prefix. Hit gives `Matched p`: the cursor is on some match, but a read or a move from it is Undefined (U2, U8), so the entry cannot be seen. Miss gives `Seeked key`. `NoConflict` also jumps when the key has a NULL, even if an entry matches |
 | `IdxGE/GT/LE/LT k` | position is `At` | jump if the entry compares `>=`, `>`, `<=`, `<` the prefix `k`. No state change. On a non-`At` position the model returns jump (Turso behaviour; SQLite asserts) |
 | `Column`, `RowId` | none | see section 1. Position unchanged |
 | `NullRow` | none | null-row flag set. Only `Column`, `RowId`, `Rewind`, `Last`, `Seek*`, `NotExists` may follow. `Next`, `Prev`, `Insert`, `Delete` after it are Undefined |
-| `NewRowid` | table | returns `r` with `r` not in the store and `r > max key`. WAL gives `max+1` (or 1). MVCC may give a larger value, because the allocator never reuses rowids. Position after it: Undefined. Only a no-seek `Insert` of `r` may follow |
+| `NewRowid` | table | returns `r` with `r` not in the store and `r > max key` (D6). Position after it: no position; a read is Undefined (U8). Only a no-seek `Insert` of `r` may follow |
 | `Insert k v` | see section 3 | store has `k -> v` (overwrite if present). Position: `At k` (**DECISION D1**) |
 | `Delete` | position is `At` | key removed. Position: `Gap(pred, succ)` (**DECISION D2**). `Column`/`RowId` before the next move: Undefined |
 | `IdxInsert key` | see section 3 | key added. A full-key duplicate is an error (unique check) or no-op, as the flags say. Position: `At key` |
 | `IdxDelete key` | none | key removed. Missing key is an error when P5 is set, else no-op. Position: Undefined |
-| `Count` | none | result is the number of entries. Position afterwards: Undefined |
+| `Count` | none | result is the number of entries. Position afterwards: none; a read or a move is Undefined (U2, U8) |
 | `Clear` | WAL only | store empty. Every cursor on the tree is `Invalid`. In MVCC the contract is "returns an error" (current limitation) |
 
 ## 2b. Index cursors and the other btree opcodes
@@ -86,20 +86,20 @@ may be NULL. Order: compare `cols` one by one (NULL is smallest, NULL equals NUL
 `rowid`. A prefix `p` is a list of values, at most as long as `cols`. `cmp_prefix k p`
 compares only the first `|p|` columns of `k`; equal prefix means equal. The position
 rules of section 1 are the same. Two more states: `Matched p` (a `Found`-style opcode hit:
-the cursor is on some entry with prefix `p`, not always the first; reads are
-Unspec and `Next`/`Prev` are illegal) and the seek token holds a prefix instead of a rowid.
+the cursor is on some entry with prefix `p`, not always the first; reads and
+`Next`/`Prev` are Undefined, so which entry it is cannot be seen) and the seek token holds a prefix instead of a rowid.
 
 | Opcode | Precondition | Result |
 |---|---|---|
 | `SeekGE p` / `SeekGT p` | none | first key with `cmp_prefix k p` `>= 0` / `> 0`; else `Invalid` and jump |
 | `SeekLE p` / `SeekLT p` | none | last key with `cmp_prefix k p` `<= 0` / `< 0`; else `Invalid` and jump |
 | `Found p` / `NotFound p` | none | some key has prefix `p`. `Found` jumps iff yes, `NotFound` iff no. Hit gives `Matched p`, miss gives `Seeked p` (token `p`) |
-| `NoConflict p` | none | if `p` has a NULL: jump, position Unspec. Else like `NotFound` |
+| `NoConflict p` | none | if `p` has a NULL: jump, no position (a read is Undefined, U8). Else like `NotFound` |
 | `IdxGE/GT/LE/LT p` | position is `At` | jump iff `cmp_prefix k p` is `>= 0`, `> 0`, `<= 0`, `< 0`. State unchanged. On `Invalid` the model jumps (Turso) |
 | `IdxInsert key use_seek` | full key not in the set; null-row clear | key added, position `At key`, all tokens cleared. Without `use_seek` it always seeks. With `use_seek` the cursor must hold the token for `key.cols`, unless `key.cols` has a NULL (Turso seeks then) |
-| `IdxDelete key` | key is in the set | key removed, position Unspec (`Lost`), all tokens cleared |
+| `IdxDelete key` | key is in the set | key removed, no position (`Lost`): a read or a move is Undefined (U2, U8). All tokens cleared |
 | `Delete` | position `At k`, `k` in the set | same as for tables: position `Gone k` |
-| `Column i`, `IdxRowId` | none | `cols[i]` and `rowid` of the entry at `At k`; NULL on `Invalid` or null-row; Unspec otherwise |
+| `Column i`, `IdxRowId` | none | `cols[i]` and `rowid` of the entry at `At k`; NULL on `Invalid` or null-row; Undefined (U8) at `Seeked`, `Matched`, `Gone` and `Lost` |
 | `SeekEnd` | none | position `Lost`, token "append": the next `Insert`/`IdxInsert` without a seek is legal iff its key is above every key in the store |
 | `Clear` | WAL only | store empty; every cursor on the tree (also ours) is `Invalid` |
 | `DeferredSeek idx tbl` | idx cursor `At k`; table has rowid `k.rowid` | table cursor behaves like `SeekRowid` hit, with no jump. A missing row is corruption: Undefined |
@@ -144,7 +144,7 @@ prefix, in index order, and `Next` moves along the index order, so for a `DESC` 
 moves to smaller values. `Seek*` and `Idx*` use this compare as in 2b.
 
 **Equality opcodes.** `Found`, `NotFound` and `NoConflict` test `cmp_prefix = 0` under the
-column collations. `DESC` does not matter. A hit lands on an arbitrary matching entry.
+column collations. `DESC` does not matter. A hit gives `Matched` (section 2b): the entry it lands on cannot be seen.
 
 **Same key.** Two full keys that are equal under the collations and have the same rowid are
 the same entry. A test must not `IdxInsert` a key that is equal to a stored key but is not
@@ -169,9 +169,13 @@ engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 | U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key | section 3 |
 | U6 | `IdxGE/GT/LE/LT` on a cursor whose entry was deleted (by itself or by another cursor) | SQLite asserts, `vdbe.c:7112` |
 | U7 | `IdxInsert` of a key that is in the index, `IdxDelete` of a key that is not, and the collation-equal variants of both (section 2c) | section 2c |
+| U8 | A read (`Column`, `RowId`, `IdxRowId`) at a position that is not defined: after `Count`, `SeekEnd`, `NewRowid`, an own `Delete`, `IdxDelete`, a seek that missed, `Found`, `NotFound`, `NoConflict` with a NULL | section 1 |
 
-Not Undefined, so not in this list: a read after `Count`, `IdxDelete` or `SeekEnd` has an
-open result (any entry or NULL) but never an error (N2, N7).
+The goal is that no op sequence has an open result: it has one defined result, or it is in
+this list. The entry that a `Found` hit lands on cannot be seen, because a read or a move
+from it is Undefined. One exception is open: `NewRowid` returns any rowid above every key
+(D6), and the engines differ (WAL returns a new rowid on each call even without an insert;
+MVCC never reuses a rowid). Pinning one rule is an open decision.
 
 ## 3. Insert seek contract
 
@@ -246,11 +250,9 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | O1 | ephemeral | `OpenDup` rejects index cursors |
 | OV1 | MVCC | Index: an equality-only prefix seek, then `Next`, skips overlay keys or ends early |
 | N1 | MVCC | `SeekRowid` or `NotExists` hit, then `Next`: rows are lost (overlay tests T1 to T4 show the cases) |
-| N2 | WAL | `Count`, then `RowId` or `Column`: overflow panic at `pager.rs:609` |
 | N4 | MVCC, checkpointed | `Delete` of a row written in this run, then `Next` or `Prev`: nothing is found |
 | N5 | WAL | `Prev` panics after a peer insert, when the only row was deleted |
 | N6 | WAL | Own delete and a peer insert, then `Next`: wrong row |
-| N7 | WAL | Index: `Last; SeekEnd; Observe` gives "Corrupt database" |
 | N9 | WAL | Index: a seek-positioned cursor loses its position on a peer write |
 | N10 | WAL | Index: an ended cursor finds a peer's new entry. It keeps its cell index: a failed seek on an empty index (one peer insert) and a `Next` past the last entry (two peer inserts) both show it |
 | N11 | WAL | Index: `Found` hit, then `IdxInsert` with `use_seek`: the new key goes before the match and the index is out of order. SQLite seeks again. The model still lets a hit set the token; it must not |
@@ -264,6 +266,7 @@ prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 | U5 | all | Undefined: an insert without the seek token of its key. No engine refuses it |
 | U6 | all | Undefined: `IdxGE/GT/LE/LT` after the entry was deleted (was N8; SQLite asserts, `vdbe.c:7112`). The engines compare the next entry or the end |
 | U7 | all | Undefined: `IdxInsert` of an existing key, `IdxDelete` of a missing key, and the collation-equal variants (section 2c). No engine refuses it |
+| U8 | all | Undefined: a read at an undefined position (was N2 and N7: WAL panics with an overflow after `Count`, and reports "Corrupt database" after `SeekEnd`). No engine refuses it |
 
 Not modelled: `DeferredSeek`, direction switches (D3), covered-chain drops in the overlay,
 a failed eq-only seek that leaves the cursor on a neighbour. An eq-only `SeekGE` for a key

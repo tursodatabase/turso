@@ -55,9 +55,6 @@ impl KnownGaps {
     /// MVCC: `Next` after `SeekRowid` or `NotExists` that hit does not find the next row.
     pub const N1: KnownGaps = KnownGaps(1 << 5);
 
-    /// WAL: `RowId` or `Column` after `Count` panics (arithmetic overflow in the pager).
-    /// The contract leaves the position after `Count` open, but not a panic.
-    pub const N2: KnownGaps = KnownGaps(1 << 6);
     /// WAL: `NewRowid` on a cursor with the null-row flag returns 1, a rowid that may be in
     /// use, and `Count` keeps the flag. SPEC section 2 makes both ops illegal
     /// after `NullRow`, so the model already keeps them out of every walk. The bit stays so
@@ -461,19 +458,10 @@ impl Gen {
             || (self.gaps.has(KnownGaps::D1) && self.scope.iter().any(mvcc_ckpt) && self.d1(op))
             || (self.gaps.has(KnownGaps::G4) && self.scope.iter().any(mvcc_ckpt) && self.g4(op))
             || (self.gaps.has(KnownGaps::N1) && self.scope.iter().any(mvcc) && self.n1(op))
-            || (self.gaps.has(KnownGaps::N2) && self.n2(op))
             || (self.gaps.has(KnownGaps::N3) && self.n3(op))
             || (self.gaps.has(KnownGaps::N5) && self.scope.iter().any(wal) && self.n5(op))
             || (self.gaps.has(KnownGaps::N6) && self.scope.iter().any(wal) && self.n6(op))
             || (self.gaps.has(KnownGaps::N4) && self.scope.iter().any(mvcc_ckpt) && self.n4(op))
-    }
-
-    /// N2: a read of a cursor whose position the model has lost (after `Count`).
-    fn n2(&self, op: &Op) -> bool {
-        let (Op::RowId(c) | Op::Column(c, _)) = *op else {
-            return false;
-        };
-        self.replay.st.curs[c].cpos == Pos::Lost
     }
 
     /// N3: `NewRowid` or `Count` on a cursor with the null-row flag.

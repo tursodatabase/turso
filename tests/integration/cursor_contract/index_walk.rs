@@ -71,17 +71,9 @@ impl IdxGaps {
     /// `RowData` mode: a read of a cursor with the null-row flag returns the real entry.
     pub const ROWDATA_NULL_ROW: IdxGaps = IdxGaps(1 << 3);
 
-    /// N7: a read (`Observe`, `Column`, `IdxRowId`) of a cursor right after `SeekEnd` fails
-    /// with "Corrupt database: Payload too small for indicated header size". The contract
-    /// leaves the position open, but not an error.
-    pub const N7_READ_AFTER_SEEK_END: IdxGaps = IdxGaps(1 << 4);
     /// IDX_G2_PEER_DELETE: a read of a cursor whose entry another cursor deleted. The contract
     /// (D5) says NULL. MVCC reads the deleted entry. The index twin of the table filter `G2`.
     pub const IDX_G2_PEER_DELETE: IdxGaps = IdxGaps(1 << 6);
-
-    /// IDX_N2_READ_AFTER_COUNT: WAL and ephemeral: a read of a cursor right after `Count` panics
-    /// with an arithmetic overflow. The index twin of the table gap N2.
-    pub const IDX_N2_READ_AFTER_COUNT: IdxGaps = IdxGaps(1 << 7);
 
     /// IDX_G3_PEER_WRITE_NULL_ROW: WAL: a write by another cursor clears the null-row flag, so
     /// the cursor reads the real entry. The index twin of the table filter `G3`. Blocks a write
@@ -146,14 +138,12 @@ impl IdxGaps {
         }
     }
 
-    pub const NAMES: [(&'static str, IdxGaps); 15] = [
+    pub const NAMES: [(&'static str, IdxGaps); 13] = [
         ("IDX_D1_MVCC_CKPT", IdxGaps::IDX_D1_MVCC_CKPT),
         ("IDX_END_INSERT", IdxGaps::IDX_END_INSERT),
         ("ROWDATA_IDX_INSERT", IdxGaps::ROWDATA_IDX_INSERT),
         ("ROWDATA_NULL_ROW", IdxGaps::ROWDATA_NULL_ROW),
-        ("N7", IdxGaps::N7_READ_AFTER_SEEK_END),
         ("IDX_G2_PEER_DELETE", IdxGaps::IDX_G2_PEER_DELETE),
-        ("IDX_N2_READ_AFTER_COUNT", IdxGaps::IDX_N2_READ_AFTER_COUNT),
         (
             "IDX_G3_PEER_WRITE_NULL_ROW",
             IdxGaps::IDX_G3_PEER_WRITE_NULL_ROW,
@@ -465,10 +455,6 @@ struct Gen {
     /// The last write of the cursor was an `IdxInsert` of a key above every key, and the
     /// cursor did not move since.
     appended: Vec<bool>,
-    /// The last move of the cursor was `SeekEnd`.
-    after_seek_end: Vec<bool>,
-    /// The last move of the cursor was `Count`.
-    after_count: Vec<bool>,
     /// The last write of the cursor was a `Delete` and it did not move since.
     own_deleted: Vec<bool>,
     /// Another cursor wrote to the index since the cursor moved the last time.
@@ -495,8 +481,6 @@ impl Gen {
             mode,
             after_insert: vec![false; nidx],
             appended: vec![false; nidx],
-            after_seek_end: vec![false; nidx],
-            after_count: vec![false; nidx],
             own_deleted: vec![false; nidx],
             peer_wrote: vec![false; nidx],
             peer_deleted: vec![false; nidx],
@@ -785,8 +769,6 @@ impl Gen {
         let keeps_position = matches!(op, IOp::NoConflict(_, p) if p.contains(&Val::Null));
         if moves && !keeps_position {
             self.peer_deleted[c] = false;
-            self.after_seek_end[c] = matches!(op, IOp::SeekEnd(_));
-            self.after_count[c] = matches!(op, IOp::Count(_));
             self.peer_wrote[c] = false;
             self.own_deleted[c] = matches!(op, IOp::Delete(_));
             let insert = match op {
@@ -836,13 +818,11 @@ impl Gen {
             || (self.gaps.has(IdxGaps::N12_WAL_DELETE_AFTER_PEER_DELETE)
                 && wal
                 && matches!(*op, IOp::Delete(c) if self.peer_deleted[c]))
-            || (self.gaps.has(IdxGaps::IDX_N2_READ_AFTER_COUNT) && self.idx_n2(op))
             || (self.gaps.has(IdxGaps::CL1_MVCC_EQUAL_KEY_REINSERT) && mvcc && self.cl1(op))
             || (self.gaps.has(IdxGaps::IDX_N6_WAL_OWN_DELETE_PEER_WRITE)
                 && wal
                 && matches!(*op, IOp::Next(c) | IOp::Prev(c)
                     if self.own_deleted[c] && self.peer_wrote[c]))
-            || (self.gaps.has(IdxGaps::N7_READ_AFTER_SEEK_END) && self.n7(op))
     }
 
     /// CL1: an `IdxInsert` of a key that is equal but not identical to a key that the index
@@ -929,18 +909,6 @@ impl Gen {
     fn idx_n4(&self, op: &IOp) -> bool {
         let IOp::Delete(c) = *op else { return false };
         matches!(&self.replay.st.icurs[c].icpos, IPos::At(k) if self.written.contains(k))
-    }
-
-    /// IDX_N2_READ_AFTER_COUNT: a read of a cursor right after `Count`.
-    fn idx_n2(&self, op: &IOp) -> bool {
-        matches!(*op, IOp::Observe(c) | IOp::Column(c, _) | IOp::IdxRowId(c)
-            if self.after_count[c])
-    }
-
-    /// N7: a read of a cursor right after `SeekEnd`.
-    fn n7(&self, op: &IOp) -> bool {
-        matches!(*op, IOp::Observe(c) | IOp::Column(c, _) | IOp::IdxRowId(c)
-            if self.after_seek_end[c])
     }
 
     /// IDX_D1_MVCC_CKPT: `Next` or `Prev` right after an `IdxInsert` of the same cursor.
@@ -1505,24 +1473,6 @@ mod tests {
         });
     }
 
-    /// IDX_N2, the index twin of the table gap N2: a read of a cursor after `Count`. The
-    /// position is open, but WAL and ephemeral panic with an arithmetic overflow.
-    ///
-    /// Fails today because of IDX_N2; see SPEC section 5b.
-    #[test]
-    fn known_bug_idx_n2_read_after_count_does_not_panic() {
-        known_bug("IDX_N2", "attempt to multiply with overflow", || {
-            use IOp::*;
-            agree(
-                &WAL,
-                &[(2, NUL, v(6))],
-                1,
-                &[Rewind(0), Count(0), IdxRowId(0)],
-            );
-            agree(&EPH, &[(2, NUL, v(6))], 1, &[Count(0), Observe(0)]);
-        });
-    }
-
     /// IDX_D1 and IDX_N4, the index twin of the table gap N4: `Delete` of an entry that an
     /// `IdxInsert` of this run wrote. MVCC with checkpointed entries loses the position, so
     /// `Next` after it finds nothing.
@@ -1571,24 +1521,6 @@ mod tests {
             let rows = [(1, v(1), v(1)), (2, v(5), v(5)), (3, v(9), v(9))];
             let ops = [SeekGE(1, vec![v(5)]), Delete(1), ins(0, 7, 0, 24), Prev(1)];
             agree(&WAL, &rows, 2, &ops);
-        });
-    }
-
-    /// N7: a read after `SeekEnd`. The position is open, but WAL and ephemeral fail with
-    /// "Corrupt database: Payload too small for indicated header size".
-    ///
-    /// Fails today because of N7; see SPEC section 5b.
-    #[test]
-    fn known_bug_n7_read_after_seek_end_does_not_fail() {
-        known_bug("N7", "Corrupt database", || {
-            use IOp::*;
-            agree(
-                &WAL,
-                &[(6, v(4), NUL)],
-                1,
-                &[Last(0), SeekEnd(0), Observe(0)],
-            );
-            agree(&EPH, &[(6, v(4), NUL)], 1, &[SeekEnd(0), Observe(0)]);
         });
     }
 

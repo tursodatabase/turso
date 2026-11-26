@@ -505,3 +505,106 @@ index_case!(
         rowid: 1,
     }]
 );
+
+// ---------------------------------------------------------------------------------------
+// U8: a read (`Column`, `RowId`, `IdxRowId`, `Observe`) needs a position that is on an
+// entry, on no entry, or on a row that a peer deleted. After `Count`, `SeekEnd`, `NewRowid`,
+// an own `Delete`, `IdxDelete`, a seek that missed, `Found`, `NotFound` and `NoConflict` with
+// a NULL the position is not defined, and the read is refused. `SeekEnd` is a no-op in
+// SQLite when the cursor is already on an entry, so no engine can define it.
+// ---------------------------------------------------------------------------------------
+
+table_case!(
+    known_bug_u8_read_after_count,
+    "U8",
+    1,
+    [Op::Rewind(0), Op::Count(0), Op::RowId(0)]
+);
+table_case!(
+    known_bug_u8_column_after_count,
+    "U8",
+    1,
+    [Op::Last(0), Op::Count(0), Op::Column(0, 1)]
+);
+table_case!(
+    known_bug_u8_read_after_new_rowid,
+    "U8",
+    1,
+    [Op::NewRowid(0), Op::RowId(0)]
+);
+table_case!(
+    known_bug_u8_read_after_delete,
+    "U8",
+    1,
+    [Op::SeekRowid(0, 20), Op::Delete(0), Op::RowId(0)]
+);
+table_case!(
+    known_bug_u8_read_after_seek_miss,
+    "U8",
+    1,
+    [Op::SeekRowid(0, 15), Op::Column(0, 1)]
+);
+index_case!(
+    known_bug_u8_idx_read_after_seek_end,
+    "U8",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::Last(0), IOp::SeekEnd(0), IOp::Observe(0)]
+);
+index_case!(
+    known_bug_u8_idx_read_after_seek_end_on_fresh_cursor,
+    "U8",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::SeekEnd(0), IOp::Observe(0)]
+);
+index_case!(
+    known_bug_u8_idx_read_after_count,
+    "U8",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::Rewind(0), IOp::Count(0), IOp::IdxRowId(0)]
+);
+index_case!(
+    known_bug_u8_idx_read_after_idx_delete,
+    "U8",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::Rewind(0), del(0, 1, 10, 1), IOp::Observe(0)]
+);
+index_case!(
+    known_bug_u8_idx_read_after_delete,
+    "U8",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::SeekGE(0, vec![v(1)]), IOp::Delete(0), IOp::Observe(0)]
+);
+index_case!(
+    known_bug_u8_idx_read_after_found,
+    "U8",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::Found(0, vec![v(1)]), IOp::Observe(0)]
+);
+index_case!(
+    known_bug_u8_idx_read_after_not_found,
+    "U8",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::NotFound(0, vec![v(9)]), IOp::Observe(0)]
+);
+index_case!(
+    known_bug_u8_idx_read_after_no_conflict_with_null,
+    "U8",
+    default_idef(),
+    index_rows(),
+    1,
+    [IOp::NoConflict(0, vec![Val::Null]), IOp::Observe(0)]
+);

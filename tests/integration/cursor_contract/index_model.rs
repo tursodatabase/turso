@@ -431,7 +431,12 @@ pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
                 },
             ))
         }
-        IMOp::IObserve => put(c.clone(), false),
+        // A read needs a defined position. At `Matched`, `Seeked`, `Gone` and `Lost` it is
+        // Undefined (U8).
+        IMOp::IObserve => match iread(d, s, &c) {
+            Spec::Unspec => None,
+            Spec::Is(_) => put(c.clone(), false),
+        },
     }
 }
 
@@ -1489,15 +1494,13 @@ mod tests {
             obs_of_run(1, &p),
             Some(vec![kobs(false, &k4()), iunspec(false), kobs(true, &k3())])
         );
+        // A read after `Delete` is Undefined (U8).
         let p = [
             a(0, ISeekGE(some_p(&[1, 2]))),
             a(0, IDelete),
             a(0, IObserve),
         ];
-        assert_eq!(
-            obs_of_run(1, &p),
-            Some(vec![kobs(false, &k3()), iunspec(false), iunspec(false)])
-        );
+        assert_eq!(obs_of_run(1, &p), None);
         // `Delete` needs a position on an entry.
         assert_eq!(obs_of_run(1, &[a(0, IDelete)]), None);
     }

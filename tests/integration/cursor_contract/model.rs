@@ -332,7 +332,11 @@ pub fn step(st: &State, a: &Action) -> Option<(State, MObs)> {
                 },
             ))
         }
-        MOp::Observe => put(c, false),
+        // A read needs a defined position. At `Seeked`, `Gone` and `Lost` it is Undefined (U8).
+        MOp::Observe => match read_row(s, &c) {
+            Spec::Unspec => None,
+            Spec::Is(_) => put(c, false),
+        },
     }
 }
 

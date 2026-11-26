@@ -946,24 +946,6 @@ mod tests {
         });
     }
 
-    /// N2: reading a cursor after `Count`. The position is open, but WAL panics with an
-    /// arithmetic overflow in `cell_table_leaf_read_header`.
-    ///
-    /// Fails today because of N2; see SPEC section 5b.
-    #[test]
-    fn known_bug_n2_read_after_count_does_not_panic() {
-        known_bug("N2", "attempt to multiply with overflow", || {
-            for ops in [
-                vec![Rewind(0), Count(0), RowId(0)],
-                vec![Last(0), Count(0), Column(0, 1)],
-            ] {
-                for (kind, layout, got) in run_all(ROWS, 1, &ops) {
-                    assert!(got.is_ok(), "{kind:?}/{layout:?} {ops:?}: {got:?}");
-                }
-            }
-        });
-    }
-
     /// N4: `Delete` of a row that an `Insert` wrote in this transaction (a new row or an
     /// update). MVCC with checkpointed rows loses the position: `Next` and `Prev` after the
     /// `Delete` find nothing.
