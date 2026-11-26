@@ -660,6 +660,24 @@ expect {
     1|5|new
 }
 
+# PostgreSQL matches a target term with COLLATE only to an index column of
+# the same collation, and "C" is not the default collation. Turso stores both
+# as the binary collation, so it rejects a COLLATE in the target.
+test table-upsert-target-with-collate-rejected {
+    CREATE TABLE upsert_c (id int PRIMARY KEY, n text, c text);
+    CREATE UNIQUE INDEX upsert_c_n_n ON upsert_c (n, n);
+    INSERT INTO upsert_c VALUES (1, 'x', 'old');
+    INSERT INTO upsert_c VALUES (2, 'x', 'z') ON CONFLICT (n COLLATE "C") DO UPDATE SET c = 'new';
+}
+expect error {}
+
+test table-upsert-target-with-collate-on-single-column-index-rejected {
+    CREATE TABLE upsert_c (id int PRIMARY KEY, n text UNIQUE, c text);
+    INSERT INTO upsert_c VALUES (1, 'x', 'old');
+    INSERT INTO upsert_c VALUES (2, 'x', 'z') ON CONFLICT (n COLLATE "POSIX") DO UPDATE SET c = 'new';
+}
+expect error {}
+
 test table-upsert-target-where-with-unknown-column-rejected {
     CREATE TABLE upsert_w (a int UNIQUE, c text);
     INSERT INTO upsert_w VALUES (1, 'old');

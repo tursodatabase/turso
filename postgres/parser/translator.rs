@@ -5543,6 +5543,17 @@ impl PostgreSQLTranslator {
                     .iter()
                     .map(|elem| match &elem.node {
                         Some(Node::IndexElem(idx_elem)) => {
+                            // FIXME(pg-collation): PostgreSQL matches a target term with
+                            // COLLATE only to an index column of that same collation
+                            // (infer_collation_opclass_match), and "default" and "C" are
+                            // different collations. Turso stores both as BINARY, so it cannot
+                            // tell them apart. Collation names in the index columns replace
+                            // this rejection.
+                            if !idx_elem.collation.is_empty() {
+                                return Err(ParseError::not_supported(
+                                    "a COLLATE in an ON CONFLICT target",
+                                ));
+                            }
                             reject_index_elem_clauses(idx_elem, "an ON CONFLICT target")?;
                             if idx_elem.name.is_empty() {
                                 return Err(ParseError::not_supported(
@@ -15051,6 +15062,14 @@ mod tests {
             "INSERT INTO t VALUES ('a') ON CONFLICT (a COLLATE \"en_US\") DO NOTHING",
             "COLLATE in an ON CONFLICT target",
         );
+        for collation in ["\"C\"", "\"POSIX\"", "ucs_basic", "\"default\""] {
+            assert_not_supported(
+                &format!(
+                    "INSERT INTO t VALUES ('a') ON CONFLICT (a COLLATE {collation}) DO NOTHING"
+                ),
+                "COLLATE in an ON CONFLICT target",
+            );
+        }
         assert_not_supported(
             "INSERT INTO t VALUES ('a') ON CONFLICT (a text_pattern_ops) DO NOTHING",
             "an operator class in an ON CONFLICT target",

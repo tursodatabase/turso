@@ -63,7 +63,7 @@ A target that is only `rowid` or the `INTEGER PRIMARY KEY` column targets the ro
 
 Names and functions in the target and in its `WHERE` clause must exist, and aggregate and window functions are not allowed, also in a term that no index column needs.
 
-With the PostgreSQL frontend, the target matches a unique index when the set of target columns is the set of index columns, as in PostgreSQL.
+With the PostgreSQL frontend, the target matches a unique index when the set of target columns is the set of index columns, as in PostgreSQL. The PostgreSQL frontend does not support `COLLATE` in a conflict target and returns SQLSTATE 0A000.
 
 For partial unique indexes (indexes with a `WHERE` clause), the conflict target must also include a `WHERE` clause that matches the index's condition.
 
