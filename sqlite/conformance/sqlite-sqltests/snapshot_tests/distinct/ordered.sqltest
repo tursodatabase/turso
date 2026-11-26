@@ -46,7 +46,7 @@ snapshot ordered-count-distinct {
 
 @setup schema
 snapshot ordered-join-outer-table {
-    SELECT DISTINCT t.a FROM t LEFT JOIN u ON u.id = t.b;
+    SELECT DISTINCT t.a FROM t LEFT JOIN u ON u.id = t.b WHERE u.x IS NULL OR u.x > 0;
 }
 
 @setup schema

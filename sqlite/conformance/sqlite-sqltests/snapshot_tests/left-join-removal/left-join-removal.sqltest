@@ -1,0 +1,93 @@
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, c TEXT);
+    CREATE TABLE a (
+        id INTEGER PRIMARY KEY,
+        y INTEGER,
+        u TEXT UNIQUE NOT NULL,
+        n INTEGER UNIQUE,
+        w INTEGER,
+        p INTEGER,
+        q INTEGER,
+        UNIQUE (p, q)
+    );
+    CREATE TABLE b (id INTEGER PRIMARY KEY, z INTEGER);
+    CREATE TABLE r (w INTEGER);
+}
+
+@setup schema
+snapshot unused-left-join-on-rowid {
+    SELECT t.c FROM t LEFT JOIN a ON a.id = t.x;
+}
+
+@setup schema
+snapshot unused-left-join-on-unique-nullable {
+    SELECT t.c FROM t LEFT JOIN a ON a.n = t.x;
+}
+
+@setup schema
+snapshot unused-left-join-on-multi-column-unique {
+    SELECT t.c FROM t LEFT JOIN a ON a.p = t.x AND a.q = t.id;
+}
+
+@setup schema
+snapshot unused-left-join-with-distinct {
+    SELECT DISTINCT t.c FROM t LEFT JOIN a ON a.w = t.x;
+}
+
+@setup schema
+snapshot unused-left-join-with-distinct-and-order-by {
+    SELECT DISTINCT t.c FROM t LEFT JOIN a ON a.w = t.x ORDER BY t.c;
+}
+
+@setup schema
+snapshot unused-left-join-chain {
+    SELECT t.c FROM t LEFT JOIN a ON a.id = t.x LEFT JOIN b ON b.id = a.y;
+}
+
+@setup schema
+snapshot unused-left-join-between-two-tables {
+    SELECT t.c, b.z FROM t LEFT JOIN a ON a.id = t.x LEFT JOIN b ON b.id = t.id;
+}
+
+@setup schema
+snapshot unused-left-join-before-full-join {
+    SELECT t.c, b.z FROM t LEFT JOIN a ON a.id = t.x FULL JOIN b ON b.id = t.x;
+}
+
+@setup schema
+snapshot unused-left-join-after-right-join {
+    SELECT b.z FROM b RIGHT JOIN t ON b.id = t.x LEFT JOIN a ON a.id = t.x;
+}
+
+@setup schema
+snapshot unused-left-join-in-from-subquery {
+    SELECT c FROM (SELECT t.c FROM t LEFT JOIN a ON a.id = t.x);
+}
+
+@setup schema
+snapshot unused-left-join-on-implicit-rowid {
+    SELECT t.c FROM t LEFT JOIN r ON r.rowid = t.x;
+}
+
+@setup schema
+snapshot unused-left-join-before-used-table-with-false-where {
+    SELECT t.c, b.z FROM t LEFT JOIN a ON a.id = t.x LEFT JOIN b ON b.id = t.id WHERE 0;
+}
+
+@setup schema
+snapshot unused-left-join-on-subquery-with-distinct {
+    SELECT DISTINCT t.c FROM t LEFT JOIN (SELECT w FROM a) s ON s.w = t.x;
+}
+
+@setup schema
+snapshot unused-left-join-on-table-function-with-distinct {
+    SELECT DISTINCT t.c FROM t LEFT JOIN generate_series(1, 3) g ON g.value = t.x;
+}
+
+@setup schema
+snapshot unused-left-join-in-update-from {
+    UPDATE t SET c = r.w FROM r LEFT JOIN a ON a.id = r.w WHERE t.id = r.rowid;
+}

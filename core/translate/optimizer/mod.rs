@@ -24,10 +24,11 @@ use crate::{
         ROWID_SENTINEL,
     },
     translate::{
+        collate::comparison_collation,
         expr::{
-            expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
-            expr_type::TypeEnv, expression_can_fail_on_input, runs_custom_type_function, walk_expr,
-            WalkControl,
+            as_binary_components, comparison_affinity, expr_references_any_subquery,
+            expr_references_outer_query, expr_references_subquery_id, expr_type::TypeEnv,
+            expression_can_fail_on_input, runs_custom_type_function, walk_expr, WalkControl,
         },
         insert::ROWID_COLUMN,
         optimizer::{
@@ -1170,6 +1171,140 @@ fn optimize_select_plan_form(
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
+/// Same as SQLite whereOmitNoopJoin.
+fn remove_unused_left_joins(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    if !plan.aggregates.is_empty() || plan.group_by.is_some() {
+        return Ok(());
+    }
+    let query_is_distinct = matches!(plan.distinctness, Distinctness::Distinct { .. });
+    for index in (1..plan.table_references.joined_tables().len()).rev() {
+        let table = &plan.table_references.joined_tables()[index];
+        let table_id = table.internal_id;
+        let is_plain_left_join = table
+            .join_info
+            .as_ref()
+            .is_some_and(|info| info.join_type == JoinType::LeftOuter);
+        if !is_plain_left_join
+            || left_join_table_is_used(plan, index)?
+            || !(query_is_distinct || on_clause_matches_one_row(plan, index, resolver)?)
+        {
+            continue;
+        }
+        plan.where_clause.retain(|term| {
+            term.origin.join_origin().map(JoinOrigin::right_table) != Some(table_id)
+        });
+        plan.table_references.joined_tables_mut().remove(index);
+        plan.join_order.retain(|member| member.table_id != table_id);
+        for member in &mut plan.join_order {
+            if member.original_idx > index {
+                member.original_idx -= 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn left_join_table_is_used(plan: &SelectPlan, index: usize) -> Result<bool> {
+    let table_id = plan.table_references.joined_tables()[index].internal_id;
+    let exprs = plan
+        .result_columns
+        .iter()
+        .map(|column| &column.expr)
+        .chain(plan.order_by.iter().map(|(expr, ..)| expr.as_ref()))
+        .chain(
+            plan.where_clause
+                .iter()
+                .filter(|term| {
+                    term.origin.join_origin().map(JoinOrigin::right_table) != Some(table_id)
+                })
+                .map(|term| &term.expr),
+        );
+    for expr in exprs {
+        let tables = table_mask_from_expr(
+            expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        if tables.get(index) {
+            return Ok(true);
+        }
+    }
+    let own_on_terms_have_subquery = plan.where_clause.iter().any(|term| {
+        term.origin.join_origin().map(JoinOrigin::right_table) == Some(table_id)
+            && expr_references_any_subquery(&term.expr)
+    });
+    let read_by_lateral_subquery = plan.table_references.joined_tables().iter().any(|other| {
+        other.join_info.as_ref().is_some_and(|info| info.lateral)
+            && match &other.table {
+                Table::FromClauseSubquery(subquery) => {
+                    subquery.plan.used_outer_query_ref_ids().contains(&table_id)
+                }
+                _ => false,
+            }
+    });
+    Ok(own_on_terms_have_subquery || read_by_lateral_subquery)
+}
+
+fn on_clause_matches_one_row(plan: &SelectPlan, index: usize, resolver: &Resolver) -> Result<bool> {
+    let table = &plan.table_references.joined_tables()[index];
+    if !matches!(table.table, Table::BTree(_)) {
+        return Ok(false);
+    }
+    let table_id = table.internal_id;
+    let ctx = ExprContext::new(Some(&plan.table_references), resolver);
+    let mut matched = Vec::new();
+    for term in &plan.where_clause {
+        let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? else {
+            continue;
+        };
+        if operator.as_ast_operator() != Some(ast::Operator::Equals) {
+            continue;
+        }
+        for (own, other) in [(lhs, rhs), (rhs, lhs)] {
+            let other_tables = table_mask_from_expr(
+                other,
+                &plan.table_references,
+                &plan.non_from_clause_subqueries,
+            )?;
+            if other_tables.get(index) {
+                continue;
+            }
+            let own_column = match own {
+                Expr::RowId { table, .. } if *table == table_id => return Ok(true),
+                Expr::Column {
+                    table,
+                    is_rowid_alias: true,
+                    ..
+                } if *table == table_id => return Ok(true),
+                Expr::Column { table, column, .. } if *table == table_id => *column,
+                _ => continue,
+            };
+            matched.push((
+                own_column,
+                comparison_collation(lhs, rhs, &ctx)?,
+                comparison_affinity(lhs, rhs, &ctx),
+            ));
+        }
+    }
+    Ok(resolver.with_schema(table.namespace.database_id, |schema| {
+        schema
+            .indices_including_backing(table.namespace.id, table.table.get_name())
+            .any(|index| {
+                index.unique
+                    && index.where_clause.is_none()
+                    && index.columns.iter().all(|index_column| {
+                        matched.iter().any(|(column, collation, affinity)| {
+                            *column == index_column.pos_in_table
+                                && *collation == index_column.collation
+                                && table.columns()[*column]
+                                    .comparison_affinity()
+                                    .index_affinity_ok(*affinity)
+                        })
+                    })
+            })
+    }))
+}
+
 /// SQLite removes DISTINCT in the same cases.
 fn distinct_is_redundant(plan: &SelectPlan, resolver: &Resolver) -> Result<bool> {
     let exprs: Vec<&ast::Expr> = match plan.aggregates.as_slice() {
@@ -1261,6 +1396,8 @@ fn simplify_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
             None => plan.distinctness = super::plan::Distinctness::NonDistinct,
         }
     }
+
+    remove_unused_left_joins(plan, resolver)?;
 
     // A rewrite can move MATCH terms out of a subquery, so do this after the
     // query form has been chosen.

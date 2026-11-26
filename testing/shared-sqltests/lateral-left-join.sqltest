@@ -18,6 +18,11 @@ setup t2-index {
     CREATE INDEX t2_a ON t2(a);
 }
 
+setup pk-table {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, c INT);
+    INSERT INTO u VALUES (1, 100), (2, 200);
+}
+
 @setup data
 test empty-subquery-gives-one-null-row-per-left-row {
     SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE false) AS s ON true ORDER BY 1;
@@ -590,4 +595,16 @@ expect {
     2|20|y
     2|30|z
     2|30|z
+}
+
+@setup data
+@setup pk-table
+test left-join-read-only-by-a-later-lateral-subquery {
+    SELECT t1.a, s.v FROM t1 LEFT JOIN u ON u.id = t1.a LEFT JOIN LATERAL (SELECT u.c AS v) AS s ON true ORDER BY 1;
+}
+expect {
+    1|100
+    2|200
+    3|
+    4|
 }
