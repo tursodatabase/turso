@@ -1095,6 +1095,22 @@ fn texts_compare_as_bytes(
             && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
 }
 
+/// Whether the affinity of a comparison leaves two texts as they are. Only a
+/// numeric affinity converts a text, and only a text that looks like a number.
+/// This is the test of [texts_compare_as_bytes] without its collation test.
+/// The comparison opcodes inline [texts_compare_as_bytes], and this function
+/// is separate so that their code does not change.
+#[inline]
+fn texts_keep_their_values(
+    lhs: &Value,
+    rhs: &Value,
+    flags: crate::vdbe::insn::CmpInsFlags,
+) -> bool {
+    !flags.get_affinity().is_numeric()
+        || (apply_numeric_affinity(lhs.as_value_ref(), false).is_none()
+            && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
+}
+
 /// The comparison opcodes for every operand pair that is not two integers, two
 /// texts compared by their bytes or two numbers compared by their numeric
 /// order: NULLs, affinity conversions, text collations and array comparison.
@@ -1125,6 +1141,17 @@ fn op_comparison_slow(
             }
             return Ok(InsnFunctionStepResult::Step);
         };
+    }
+
+    // Two texts that the affinity leaves as they are, for example with a
+    // NOCASE collation, compare with the collation. The general comparison
+    // at the end gives the same order, after conversions that change nothing.
+    if matches!((lhs_value, rhs_value), (Value::Text(_), Value::Text(_)))
+        && texts_keep_their_values(lhs_value, rhs_value, flags)
+    {
+        let order =
+            collation.compare_operands(lhs_value.as_value_ref(), rhs_value.as_value_ref())?;
+        take_jump_if!(comparison_matches_order(op, order));
     }
 
     match (lhs_value, rhs_value) {
