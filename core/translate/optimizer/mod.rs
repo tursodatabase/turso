@@ -1286,23 +1286,33 @@ fn on_clause_matches_one_row(plan: &SelectPlan, index: usize, resolver: &Resolve
             ));
         }
     }
-    Ok(resolver.with_schema(table.namespace.database_id, |schema| {
+    Ok(has_unique_index_with_columns(
+        table,
+        resolver,
+        |index_column| {
+            matched.iter().any(|(column, collation, affinity)| {
+                *column == index_column.pos_in_table
+                    && *collation == index_column.collation
+                    && table.columns()[*column]
+                        .comparison_affinity()
+                        .index_affinity_ok(*affinity)
+            })
+        },
+    ))
+}
+
+fn has_unique_index_with_columns(
+    table: &JoinedTable,
+    resolver: &Resolver,
+    column_ok: impl Fn(&IndexColumn) -> bool,
+) -> bool {
+    resolver.with_schema(table.namespace.database_id, |schema| {
         schema
             .indices_including_backing(table.namespace.id, table.table.get_name())
             .any(|index| {
-                index.unique
-                    && index.where_clause.is_none()
-                    && index.columns.iter().all(|index_column| {
-                        matched.iter().any(|(column, collation, affinity)| {
-                            *column == index_column.pos_in_table
-                                && *collation == index_column.collation
-                                && table.columns()[*column]
-                                    .comparison_affinity()
-                                    .index_affinity_ok(*affinity)
-                        })
-                    })
+                index.unique && index.where_clause.is_none() && index.columns.iter().all(&column_ok)
             })
-    }))
+    })
 }
 
 /// SQLite removes DISTINCT in the same cases.
@@ -1348,20 +1358,12 @@ fn distinct_is_redundant(plan: &SelectPlan, resolver: &Resolver) -> Result<bool>
             _ => {}
         }
     }
-    Ok(resolver.with_schema(table.namespace.database_id, |schema| {
-        schema
-            .indices_including_backing(table.namespace.id, table.table.get_name())
-            .any(|index| {
-                index.unique
-                    && index.where_clause.is_none()
-                    && index.columns.iter().all(|ic| {
-                        ic.expr.is_none()
-                            && btree.columns()[ic.pos_in_table].notnull()
-                            && selected.iter().any(|(pos, collation)| {
-                                *pos == ic.pos_in_table && *collation == ic.collation
-                            })
-                    })
-            })
+    Ok(has_unique_index_with_columns(table, resolver, |ic| {
+        ic.expr.is_none()
+            && btree.columns()[ic.pos_in_table].notnull()
+            && selected
+                .iter()
+                .any(|(pos, collation)| *pos == ic.pos_in_table && *collation == ic.collation)
     }))
 }
 
