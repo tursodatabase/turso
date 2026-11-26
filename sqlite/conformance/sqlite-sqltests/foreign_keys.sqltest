@@ -5398,3 +5398,22 @@ test fk-update-child-without-parent-fails {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+# Deleting a parent counts one violation per child row found through the
+# child index, because deleting each child row removes one.
+test fk-deferred-delete-parent-counts-each-indexed-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX c_pid ON c(pid);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1, 1), (2, 1);
+    BEGIN;
+    INSERT INTO c VALUES(4, 5);
+    DELETE FROM p WHERE id=1;
+    DELETE FROM c WHERE pid=1;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

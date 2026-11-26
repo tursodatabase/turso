@@ -970,21 +970,14 @@ fn emit_fk_parent_key_probe(
         Ok(())
     };
 
-    // Prefer an exact child index on (child_cols...). If the current row must
-    // be excluded, scan only the matching index range so the rowid can be
-    // checked before counting the match.
+    // Prefer an exact child index on (child_cols...) and visit each matching
+    // child row, because every child row adds or removes one violation.
     let idx = child_index_for_fk(resolver, database_id, fk_ref);
 
     if let Some(ix) = idx.as_ref() {
         let icur = open_read_index(program, ix, database_id);
         let probe = copy_with_affinity(program, parent_key_start, n_cols, ix, child_tbl);
-
-        if self_exclude_rowid.is_some() {
-            index_scan_match_any(program, icur, probe, n_cols, self_exclude_rowid, on_match)?;
-        } else {
-            // FOUND => on_match; NOT FOUND => no-op
-            index_probe(program, icur, probe, n_cols, on_match, |_p| Ok(()))?;
-        }
+        index_scan_match_any(program, icur, probe, n_cols, self_exclude_rowid, on_match)?;
     } else {
         // Table scan fallback
         table_scan_match_any(
@@ -1491,7 +1484,7 @@ pub(crate) fn fk_constraint_info(
 }
 
 /// Single FK existence check for NO ACTION/RESTRICT on DELETE.
-/// Raises a violation if any child row references the parent key.
+/// Raises a violation for each child row that references the parent key.
 /// For RESTRICT: emits immediate HALT
 /// For NO ACTION: increments FK violation counter (checked at statement/transaction end)
 #[allow(clippy::too_many_arguments)]
@@ -1550,17 +1543,7 @@ fn emit_fk_delete_parent_existence_check_single(
     if let Some(ref idx) = child_idx {
         let icur = open_read_index(program, idx, database_id);
         let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
-        index_probe(
-            program,
-            icur,
-            probe,
-            ncols,
-            |p| {
-                emit_violation(p)?;
-                Ok(())
-            },
-            |_p| Ok(()),
-        )?;
+        index_scan_match_any(program, icur, probe, ncols, None, emit_violation)?;
     } else {
         table_scan_match_any(
             program,
