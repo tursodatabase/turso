@@ -414,6 +414,24 @@ expect @tursopg error {
     type "pg_catalog.interval" is not supported
 }
 
+# Autofixer #12562: pg_class is also a composite row type. PostgreSQL's
+# record_in rejects '1' as a malformed record, so this returns false.
+# FIXME(pg-class): Flip this gap when the pg_class work registers relation
+# row types in pg_type and connects their field metadata to record_in.
+# Keep the test and its PostgreSQL result; remove @compat-gap and the
+# expect @tursopg block. See exec_pg_input_is_valid in frontend/functions.rs.
+@compat-gap "type:pg_class"
+test pg-input-is-valid-catalog-row-type {
+    SELECT pg_input_is_valid('1', 'pg_class');
+}
+expect {
+    f
+}
+@sqlstate 42704
+expect @tursopg error {
+    type "pg_class" does not exist
+}
+
 test pg-input-error-info-date-out-of-range {
     SELECT message, sql_error_code FROM pg_input_error_info('2024-02-30', 'date');
 }

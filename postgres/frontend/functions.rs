@@ -2274,6 +2274,14 @@ fn exec_pg_input_is_valid(
         Value::Null => return Ok(None),
         other => other.to_string(),
     };
+    // FIXME(pg-class): Catalog row types are missing from type lookup. PostgreSQL
+    // gives pg_class a composite row type whose INPUT is record_in, so
+    // pg_input_is_valid('1', 'pg_class') returns false for a malformed record.
+    // We instead raise 42704 before checking the input. The pg_class work must
+    // register relation row types in pg_type, expose their field types, and
+    // connect them to record_in. Then flip pg-input-is-valid-catalog-row-type
+    // in postgres/conformance/pg-sqltests/functions.sqltest: keep PostgreSQL's
+    // expected result and remove @compat-gap and the expect @tursopg block.
     let error = validate_pg_input(conn, &input, type_name.as_str())?;
     Ok(Some(Boolean(error.is_none())))
 }
