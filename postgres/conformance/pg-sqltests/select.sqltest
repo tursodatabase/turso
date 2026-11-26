@@ -1218,6 +1218,43 @@ expect {
     200
 }
 
+@setup having_t
+test having-without-group-by-with-an-aggregate-only-in-having {
+    SELECT 1 FROM t HAVING max(y) > 10;
+}
+expect {
+    1
+}
+
+@setup having_t
+test having-without-group-by-with-a-window-function-and-an-aggregate-only-in-having {
+    SELECT count(*) OVER () FROM t HAVING sum(x) > 0;
+}
+expect {
+    1
+}
+
+@setup having_t
+@compat-gap "syntax:having"
+test having-without-group-by-or-aggregate-in-a-query-with-a-table {
+    SELECT 1 FROM t HAVING 1 = 1;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    HAVING without GROUP BY in a query without aggregates is not supported
+}
+
+@setup having_t
+test having-without-group-by-with-a-window-function-over-an-aggregate {
+    SELECT sum(sum(x)) OVER () FROM t HAVING sum(x) > 0;
+}
+expect {
+    3
+}
+
 test having-without-group-by-keeps-one-group-for-an-empty-table {
     CREATE TABLE e (y int);
     SELECT count(*), max(y) FROM e HAVING true;
@@ -1232,9 +1269,9 @@ test having-without-group-by-or-aggregate-errors-instead-of-ignoring-having {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {
-    HAVING clause on a non-aggregate query
+    HAVING without GROUP BY in a query without aggregates is not supported
 }
 
 @setup having_t
@@ -1245,9 +1282,9 @@ test having-in-subquery-with-only-an-outer-aggregate-errors-instead-of-ignoring-
 expect {
     200
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {
-    HAVING clause on a non-aggregate query
+    HAVING without GROUP BY in a query without aggregates is not supported
 }
 
 # PostgreSQL sorts NULL as larger than every value: ASC puts NULLs last and

@@ -438,6 +438,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
     } else if msg.starts_with("there is no parameter $") {
         SQLSTATE_UNDEFINED_PARAMETER
     } else if msg == "subqueries in policies are not supported"
+        || msg == "HAVING without GROUP BY in a query without aggregates is not supported"
         || (msg.contains("DISTINCT ON") && msg.ends_with(" is not supported"))
     {
         SQLSTATE_FEATURE_NOT_SUPPORTED
@@ -728,6 +729,10 @@ mod tests {
             ),
             (
                 "subqueries in policies are not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "HAVING without GROUP BY in a query without aggregates is not supported",
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
             ),
             (

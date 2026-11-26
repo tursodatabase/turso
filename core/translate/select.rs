@@ -1127,6 +1127,10 @@ fn finish_select_plan(
         (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
     }
 
+    // plan_windows moves the aggregates into the plan it builds, so
+    // whether the query has aggregates is read before it runs.
+    let has_aggregates_before_windows = !plan.aggregates.is_empty();
+
     if !windows.is_empty() {
         plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
     }
@@ -1146,6 +1150,18 @@ fn finish_select_plan(
     // result-column subquery moves up to this query counts too.
     if only_subqueries_can_make_query_aggregate && !result_column_subqueries_moved_an_aggregate {
         crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+    }
+    // In a dialect where HAVING alone makes the query an aggregate
+    // query, the emitter still runs a query without aggregates one row
+    // at a time and would skip HAVING.
+    if having_without_group_by
+        && connection.dialect().having_makes_query_aggregate()
+        && !has_aggregates_before_windows
+        && plan.aggregates.is_empty()
+    {
+        crate::bail_parse_error!(
+            "HAVING without GROUP BY in a query without aggregates is not supported"
+        );
     }
 
     {
