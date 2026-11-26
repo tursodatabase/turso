@@ -8523,7 +8523,7 @@ fn validate_column_qualifiers(
     Ok(())
 }
 
-/// FIXME(pg-catalog): This hand-codes provolatile of the pg_proc functions behind pg_operator entries: timestamptz plus or minus interval is stable, and text || anynonarray is a stable SQL function that PostgreSQL inlines into a cast of the other operand to text, so it takes the volatility of that cast. It leaves out the comparisons of date and timestamp with timestamptz, which are stable. A lookup in pg_operator and pg_proc, with inlining of SQL functions, replaces this.
+/// FIXME(pg-catalog): This hand-codes provolatile of the pg_proc functions behind pg_operator entries: timestamptz plus or minus interval is stable, and text || anynonarray is a stable SQL function that PostgreSQL inlines into a cast of the other operand to text, so it takes the volatility of that cast. It leaves out the comparisons of date and timestamp with timestamptz, which are stable: date with timestamptz does not compare at all, and core refuses timestamp with timestamptz in `refuse_timestamp_timestamptz_comparison_in_schema_expr`, because this translator checks only CREATE TABLE and has no column types for ALTER TABLE ADD COLUMN or CREATE INDEX. A lookup in pg_operator and pg_proc, with inlining of SQL functions, replaces this.
 /// Whether operator `name` on operands of types `left` and `right` is immutable.
 fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
     use ExprType::*;
