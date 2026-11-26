@@ -39,6 +39,7 @@ use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+use crate::vdbe::metrics::CursorWorkCounters;
 use crate::Completion;
 use crate::File;
 use crate::IOExt;
@@ -6034,6 +6035,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         mv_store_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         snapshot: MvccReadSnapshot,
+        work: &CursorWorkCounters,
     ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_table_in_direction",
@@ -6044,6 +6046,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // to loop either until we find a row that is not deleted or until we reach the end of the table.
             let next_row = mv_store_iterator.next();
             let row = next_row?;
+            work.mvcc_entry_examined();
             if row.key().table_id != table_id {
                 // In case of table rows, we store the rows of all tables in a single map,
                 // so we must stop iteration if we reach a row that is on a different table.
@@ -6053,6 +6056,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
 
             // We found a row, let's check if it's visible to the transaction.
+            work.visibility_check();
             if let Some((row_id, versions, _)) =
                 self.find_last_visible_version(snapshot, &row, false)
             {
@@ -6067,11 +6071,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
         snapshot: MvccReadSnapshot,
         index_id: MVTableId,
+        work: &CursorWorkCounters,
     ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_index_in_direction",
         );
-        self.find_next_visible_index_row(snapshot, index_id, mv_store_iterator)
+        self.find_next_visible_index_row(snapshot, index_id, mv_store_iterator, work)
     }
 
     /// Whether a SkipMap chain must still participate in MVCC merge/shadow for `tx`.
@@ -6304,12 +6309,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         snapshot: MvccReadSnapshot,
         index_id: MVTableId,
         mut rows: I,
+        work: &CursorWorkCounters,
     ) -> Option<(RowID, RowVersions<A>)>
     where
         I: Iterator<Item = IndexRowEntry<'a, A>>,
     {
         loop {
             let row = rows.next()?;
+            work.mvcc_entry_examined();
+            work.visibility_check();
             if let Some(visible_row) = self.find_last_visible_index_version(snapshot, index_id, row)
             {
                 return Some(visible_row);
@@ -6323,15 +6331,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         mut rows: I,
         table_id: MVTableId,
         take_payload: bool,
+        work: &CursorWorkCounters,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)>
     where
         I: Iterator<Item = TableRowEntry<'a, A>>,
     {
         loop {
             let row = rows.next()?;
+            work.mvcc_entry_examined();
             if row.key().table_id != table_id {
                 return None;
             }
+            work.visibility_check();
             if let Some(visible_row) = self.find_last_visible_version(snapshot, &row, take_payload)
             {
                 return Some(visible_row);
@@ -6349,7 +6360,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         direction: IterationDirection,
         snapshot: MvccReadSnapshot,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
+        work: &CursorWorkCounters,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
+        work.mvcc_seek();
         let table_id = start.table_id;
         let iter_box = {
             let range = if eq_only {
@@ -6387,7 +6400,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .as_mut()
             .expect("table_iterator was assigned above if it was None");
 
-        self.find_next_visible_table_row(snapshot, mv_store_iterator, table_id, take_payload)
+        self.find_next_visible_table_row(snapshot, mv_store_iterator, table_id, take_payload, work)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6400,7 +6413,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         direction: IterationDirection,
         snapshot: MvccReadSnapshot,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
+        work: &CursorWorkCounters,
     ) -> Result<Option<(RowID, RowVersions<A>)>> {
+        work.mvcc_seek();
         let index_rows = self.get_or_create_index_rows(index_id)?;
         let index_rows = index_rows.value();
         let range = if eq_only {
@@ -6440,7 +6455,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mv_store_iterator = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above if it was None");
-        Ok(self.find_next_visible_index_row(snapshot, index_id, mv_store_iterator))
+        Ok(self.find_next_visible_index_row(snapshot, index_id, mv_store_iterator, work))
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
@@ -9201,7 +9216,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         tx_id: TxID,
+        work: &CursorWorkCounters,
     ) -> Option<RowKey> {
+        work.mvcc_seek();
         let tx = self
             .txs
             .get(&tx_id)
@@ -9219,6 +9236,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .expect("table_iterator was assigned above");
         loop {
             let entry = iter.next()?;
+            work.mvcc_entry_examined();
             // Rowid is not part of the table, therefore we already reached the end of the table.
             // NOTE: Shouldn't range already prevent this?
             tracing::trace!(
@@ -9231,6 +9249,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 tracing::trace!("get_last_table_rowid: reached end of table");
                 return None;
             }
+            work.visibility_check();
             if let Some(_visible_row) =
                 self.find_last_visible_version(MvccReadSnapshot::from(tx), &entry, false)
             {
@@ -9269,7 +9288,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index_id: MVTableId,
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
+        work: &CursorWorkCounters,
     ) -> Result<Option<RowKey>> {
+        work.mvcc_seek();
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         let iter_box = Box::new(index.iter().rev());
@@ -9283,7 +9304,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .expect("transaction should exist in txs map");
         let snapshot = MvccReadSnapshot::from(tx.value());
         Ok(self
-            .find_next_visible_index_row(snapshot, index_id, iter)
+            .find_next_visible_index_row(snapshot, index_id, iter, work)
             .map(|(row, _versions)| row.row_id))
     }
 

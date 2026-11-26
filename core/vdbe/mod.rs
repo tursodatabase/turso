@@ -58,7 +58,7 @@ use crate::{
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
-        metrics::StatementMetrics,
+        metrics::{CursorWorkCounters, StatementMetrics},
         vacuum::VacuumInPlaceOpContext,
     },
     ValueRef, WalAutoActions,
@@ -1178,6 +1178,9 @@ pub struct ProgramState {
     /// with `metrics()` or `with_metrics()`, or call `sync_step_counts`
     /// first.
     pub metrics: StatementMetrics,
+    /// Live work counters of the MVCC cursors that this statement opens. Read them with
+    /// `metrics()`. They are not in `metrics` itself.
+    pub(crate) cursor_work: Arc<CursorWorkCounters>,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaApplyState,
@@ -1348,6 +1351,7 @@ impl ProgramState {
             active_op_state: ActiveOpStateSlot::default(),
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
+            cursor_work: Arc::new(CursorWorkCounters::default()),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaApplyState::NotStarted,
@@ -1754,7 +1758,7 @@ impl ProgramState {
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
         );
-        if has_active_subprogram || self.has_pending_counts() {
+        if has_active_subprogram || self.has_pending_counts() || !self.cursor_work.is_zero() {
             f(&self.metrics())
         } else {
             f(&self.metrics)
@@ -1764,6 +1768,7 @@ impl ProgramState {
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
         self.pending_counts().add_to(&mut metrics);
+        metrics.cursor_work.merge(&self.cursor_work.get());
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
@@ -1773,6 +1778,7 @@ impl ProgramState {
     pub(crate) fn reset_metrics(&mut self) {
         self.sync_step_counts();
         self.metrics.reset();
+        self.cursor_work.reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -1790,6 +1796,13 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::Run => self.metrics.runs = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
+            crate::statement::StatementStatusCounter::MvccEntriesExamined
+            | crate::statement::StatementStatusCounter::BtreeRowsExamined
+            | crate::statement::StatementStatusCounter::MvccSeeks
+            | crate::statement::StatementStatusCounter::BtreeSeeks
+            | crate::statement::StatementStatusCounter::VisibilityChecks => {
+                self.cursor_work.reset_counter(counter)
+            }
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_stmt_status(counter);

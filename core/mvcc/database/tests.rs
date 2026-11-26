@@ -1629,12 +1629,24 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     // B-tree key 10: scan seeds at the first index key >= 10 (key 20), which is
     // ahead → row visible, predicate not evaluated.
     assert!(scan
-        .btree_row_is_valid(&store, table_id, reader_id, &idx_key(10))
+        .btree_row_is_valid(
+            &store,
+            table_id,
+            reader_id,
+            &idx_key(10),
+            &crate::vdbe::metrics::CursorWorkCounters::default(),
+        )
         .unwrap());
     // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
     // It must advance past it WITHOUT evaluating the shadow predicate.
     assert!(scan
-        .btree_row_is_valid(&store, table_id, reader_id, &idx_key(30))
+        .btree_row_is_valid(
+            &store,
+            table_id,
+            reader_id,
+            &idx_key(30),
+            &crate::vdbe::metrics::CursorWorkCounters::default(),
+        )
         .unwrap());
 
     let reader = store.txs.get(&reader_id).unwrap();
