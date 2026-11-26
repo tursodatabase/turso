@@ -2419,16 +2419,6 @@ fn hand_written_input_error(
 ) -> Option<Option<InputError>> {
     let trimmed = input.trim();
     Some(match typname {
-        "bool" => {
-            if parse_pg_bool(trimmed).is_some() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type boolean: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            }
-        }
         "float4" => float_input_error(input, "real", true),
         "float8" => float_input_error(input, "double precision", false),
         "numeric" => match trimmed.parse::<f64>() {

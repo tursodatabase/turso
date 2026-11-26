@@ -9,7 +9,7 @@
 //! `CastType`. cast_planning.rs finds the `CastType` of an expression.
 
 use crate::error::sqlstate_error;
-use crate::functions::{built_in_input_error, float8_text, parse_pg_bool};
+use crate::functions::{built_in_input_error, float8_text};
 use crate::pg_type::{parse_oid, type_input};
 use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
@@ -287,10 +287,6 @@ fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value
 fn to_bool(value: &Value) -> Result<Value> {
     match value {
         Value::Numeric(Numeric::Integer(n)) => Ok(Value::from_i64((*n != 0) as i64)),
-        Value::Text(text) => match parse_pg_bool(text.as_str()) {
-            Some(truth) => Ok(Value::from_i64(truth as i64)),
-            None => Err(input_error(text.as_str(), "boolean")),
-        },
         _ => Ok(value.clone()),
     }
 }
