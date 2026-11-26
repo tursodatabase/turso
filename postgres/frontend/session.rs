@@ -2667,6 +2667,30 @@ fn drop_schema_commands(
         ));
     }
 
+    // PostgreSQL drops a foreign key of another schema's table that
+    // references the schema, but a foreign key cannot be dropped from a
+    // table here, and one left behind would make every write to its table
+    // fail.
+    if let Some(namespace) = conn.qualifier(&name).map(|namespace| namespace.target.id) {
+        let dropped: Vec<Relation> = objects
+            .iter()
+            .filter_map(|object| match object {
+                SchemaObject::Table(table) => Some((namespace, table.clone())),
+                SchemaObject::View(_) | SchemaObject::Sequence(_) => None,
+            })
+            .collect();
+        if let Some((table, _)) = foreign_key_from_outside(&conn.current_schema(), &dropped) {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "cannot drop schema \"{name}\" because table \"{table}\" of another schema \
+                     has a foreign key referencing it"
+                ),
+                None,
+            ));
+        }
+    }
+
     let dropped_with_a_table = sequences_owned_by_tables(conn, &name, &objects);
     let mut commands: Vec<_> = views_of_other_schemas_that_read(conn, &name, &objects)
         .into_iter()
