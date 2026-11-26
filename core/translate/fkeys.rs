@@ -1929,21 +1929,15 @@ fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedNam
 /// Generate a DELETE statement AST for CASCADE DELETE:
 /// DELETE FROM child_table WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
 fn generate_cascade_delete_stmt(
-    child_table: &str,
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
     ast::Stmt::Delete {
         with: None,
-        tbl_name: qualified_table_name(child_table, db_name),
+        tbl_name: qualified_table_name(&fk_ref.child_table.name, db_name),
         indexed: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
-        ))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(fk_ref, ctx))),
         returning: vec![],
         truncate: false,
     }
@@ -1952,14 +1946,14 @@ fn generate_cascade_delete_stmt(
 /// Generate an UPDATE statement AST for SET NULL:
 /// UPDATE child_table SET fk_col1 = NULL, fk_col2 = NULL ... WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
 fn generate_set_null_stmt(
-    child_table: &str,
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause: fk_col1 = NULL, fk_col2 = NULL ...
-    let sets: Vec<ast::Set> = child_cols
+    let sets: Vec<ast::Set> = fk_ref
+        .fk
+        .child_columns
         .iter()
         .map(|col| ast::Set {
             col_names: vec![Name::from_string(col)],
@@ -1969,15 +1963,11 @@ fn generate_set_null_stmt(
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: qualified_table_name(child_table, db_name),
+        tbl_name: qualified_table_name(&fk_ref.child_table.name, db_name),
         indexed: None,
         sets,
         from: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
-        ))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(fk_ref, ctx))),
         returning: vec![],
     })
 }
@@ -1985,17 +1975,18 @@ fn generate_set_null_stmt(
 /// Generate an UPDATE statement AST for SET DEFAULT:
 /// UPDATE child_table SET fk_col1 = default1, fk_col2 = default2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
 fn generate_set_default_stmt(
-    child_table: &BTreeTable,
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause: if no default is defined for a column, we use NULL
-    let sets: Vec<ast::Set> = child_cols
+    let sets: Vec<ast::Set> = fk_ref
+        .fk
+        .child_columns
         .iter()
         .map(|col| {
-            let default_expr = child_table
+            let default_expr = fk_ref
+                .child_table
                 .get_column(col)
                 .and_then(|(_, c)| c.default.as_ref())
                 .map(|d| (**d).clone())
@@ -2010,15 +2001,11 @@ fn generate_set_default_stmt(
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: qualified_table_name(&child_table.name, db_name),
+        tbl_name: qualified_table_name(&fk_ref.child_table.name, db_name),
         indexed: None,
         sets,
         from: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
-        ))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(fk_ref, ctx))),
         returning: vec![],
     })
 }
@@ -2026,14 +2013,14 @@ fn generate_set_default_stmt(
 /// Generate an UPDATE statement AST for CASCADE UPDATE:
 /// UPDATE child_table SET fk_col1 = ?new1, fk_col2 = ?new2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
 fn generate_cascade_update_stmt(
-    child_table: &str,
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause
-    let sets: Vec<ast::Set> = child_cols
+    let sets: Vec<ast::Set> = fk_ref
+        .fk
+        .child_columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -2052,11 +2039,11 @@ fn generate_cascade_update_stmt(
         })
         .collect();
 
-    let where_clause = build_fk_match_where_clause(child_cols, parent_collations, ctx);
+    let where_clause = build_fk_match_where_clause(fk_ref, ctx);
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: qualified_table_name(child_table, db_name),
+        tbl_name: qualified_table_name(&fk_ref.child_table.name, db_name),
         indexed: None,
         sets,
         from: None,
@@ -2070,15 +2057,12 @@ fn generate_cascade_update_stmt(
 ///
 /// As in SQLite's `fkActionTrigger`, the parent key value is the left operand
 /// and has the parent column's collation, so the comparison uses it.
-fn build_fk_match_where_clause(
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
-    ctx: &FkSubprogramContext,
-) -> Expr {
-    turso_assert!(child_cols.len() == parent_collations.len());
+fn build_fk_match_where_clause(fk_ref: &ResolvedFkRef, ctx: &FkSubprogramContext) -> Expr {
+    let child_cols = &fk_ref.fk.child_columns;
+    turso_assert!(child_cols.len() == fk_ref.parent_collations.len());
     let mut conditions: Vec<Expr> = Vec::with_capacity(child_cols.len());
 
-    for (i, (col, collation)) in child_cols.iter().zip(parent_collations).enumerate() {
+    for (i, (col, collation)) in child_cols.iter().zip(&fk_ref.parent_collations).enumerate() {
         let param_idx = ctx.old_param_index(i);
         let parent_key = ast::Variable::for_column(
             u32::try_from(param_idx.get())
@@ -2133,13 +2117,7 @@ fn fire_fk_cascade_delete(
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_cascade_delete_stmt(
-        &fk_ref.child_table.name,
-        child_cols,
-        &fk_ref.parent_collations,
-        &subprog_ctx,
-        db_name.as_deref(),
-    );
+    let stmt = generate_cascade_delete_stmt(fk_ref, &subprog_ctx, db_name.as_deref());
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -2164,13 +2142,7 @@ fn fire_fk_set_null(
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_set_null_stmt(
-        &fk_ref.child_table.name,
-        child_cols,
-        &fk_ref.parent_collations,
-        &subprog_ctx,
-        db_name.as_deref(),
-    );
+    let stmt = generate_set_null_stmt(fk_ref, &subprog_ctx, db_name.as_deref());
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -2195,13 +2167,7 @@ fn fire_fk_set_default(
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_set_default_stmt(
-        &fk_ref.child_table,
-        child_cols,
-        &fk_ref.parent_collations,
-        &subprog_ctx,
-        db_name.as_deref(),
-    );
+    let stmt = generate_set_default_stmt(fk_ref, &subprog_ctx, db_name.as_deref());
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -2227,13 +2193,7 @@ fn fire_fk_cascade_update(
     let child_cols = &fk_ref.fk.child_columns;
     // CASCADE UPDATE needs new params for the SET clause
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);
-    let stmt = generate_cascade_update_stmt(
-        &fk_ref.child_table.name,
-        child_cols,
-        &fk_ref.parent_collations,
-        &subprog_ctx,
-        db_name.as_deref(),
-    );
+    let stmt = generate_cascade_update_stmt(fk_ref, &subprog_ctx, db_name.as_deref());
     emit_fk_action_subprogram(
         program,
         resolver,
