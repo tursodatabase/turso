@@ -18885,6 +18885,7 @@ pub fn op_hash_build(
 
     // Insert the rowid into the hash table
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
+        ht.check_join_keys(&op_state.key_values)?;
         let rowid = op_state.rowid.expect("rowid set");
         let pending = PendingHashInsert {
             key_values: std::mem::replace(&mut op_state.key_values, crate::alloc::vec![]),
@@ -19080,6 +19081,9 @@ pub fn op_hash_probe(
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     };
+    if partition_idx.is_none() {
+        hash_table.check_join_keys(&probe_keys)?;
+    }
 
     // For spilled hash tables, either buffer main-loop probe rows for grace
     // processing or probe a partition that grace logic already loaded.

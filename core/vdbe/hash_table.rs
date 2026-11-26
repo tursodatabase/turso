@@ -1156,6 +1156,16 @@ impl HashTable {
         }
     }
 
+    /// Fails where comparing `key_values` with `=` would fail, as `n = 'abc'`
+    /// does for a numeric `n`. The join compares keys by hash, which never
+    /// fails, so it checks them with this first.
+    pub fn check_join_keys(&self, key_values: &[Value]) -> Result<()> {
+        for (value, collation) in key_values.iter().zip(&self.collations) {
+            collation.check_operand(value.as_ref())?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn insert_pending(
         &mut self,
         pending: PendingHashInsert,

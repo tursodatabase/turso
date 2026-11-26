@@ -10,7 +10,9 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
-use crate::numeric::decimal::{numeric_compare, numeric_compare_operands, numeric_hash};
+use crate::numeric::decimal::{
+    numeric_check_operand, numeric_compare, numeric_compare_operands, numeric_hash,
+};
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
 use crate::vdbe::array::{array_values_from_blob, parse_text_array, parse_text_array_of_texts};
@@ -57,6 +59,16 @@ impl TypeOrdering {
         match self {
             Self::Numeric => numeric_compare_operands(left, right),
             _ => Ok(self.compare(left, right)),
+        }
+    }
+
+    /// Fails where [Self::compare_operands] would fail for `value` as either
+    /// side. A hash join checks its keys with it, because it compares them by
+    /// hash instead of with [Self::compare_operands].
+    pub fn check_operand(self, value: ValueRef) -> crate::Result<()> {
+        match self {
+            Self::Numeric => numeric_check_operand(value),
+            Self::Array | Self::TextArray => Ok(()),
         }
     }
 

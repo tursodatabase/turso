@@ -545,6 +545,28 @@ expect {
     3|NULL
 }
 
+test strict-numeric-hash-join-with-text-that-is-not-a-number-fails {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1.50);
+    CREATE TABLE s(y text) STRICT;
+    INSERT INTO s VALUES ('zz');
+    SELECT count(*) FROM t, s WHERE t.n = s.y;
+}
+expect error {
+    invalid input syntax for type numeric
+}
+
+test strict-numeric-hash-left-join-compares-only-rows-its-on-terms-keep {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1.50);
+    CREATE TABLE s(y text, k int) STRICT;
+    INSERT INTO s VALUES ('zz', 1), ('1.5', 2);
+    SELECT count(*) FROM t LEFT JOIN s ON s.k = 2 AND t.n = s.y;
+}
+expect {
+    1
+}
+
 test strict-uuid-cast-null {
     SELECT CAST(NULL AS uuid) IS NULL;
 }

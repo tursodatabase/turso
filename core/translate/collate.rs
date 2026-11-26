@@ -184,6 +184,15 @@ impl CollationSeq {
         }
     }
 
+    /// Fails where [Self::compare_operands] would fail for `value` as either
+    /// side.
+    pub fn check_operand(self, value: ValueRef) -> Result<()> {
+        match self {
+            Self::Type(ordering) => ordering.check_operand(value),
+            Self::Text(_) => Ok(()),
+        }
+    }
+
     /// Feeds `value` to `hasher` so that values that [Self::compare] calls
     /// equal hash the same. Integers hash like the equal REAL, so 10 and 10.0
     /// land in the same bucket.
