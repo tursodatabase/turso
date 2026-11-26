@@ -249,6 +249,32 @@ expect error {
     misuse of aggregate: max()
 }
 
+# SQLite checks a named window only where a function uses it, and a CTE only
+# where a FROM clause reads it.
+@cross-check-integrity
+test where_subquery_ignores_unused_window_and_cte {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE d > (SELECT 1 FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
+    SELECT d FROM y WHERE 1 OR (WITH c AS (SELECT nosuchfn(1)) SELECT 1);
+    SELECT d FROM y ORDER BY id, (SELECT 1 FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
+    SELECT 1 FROM y WINDOW w AS (ORDER BY nosuchfn(d)), w2 AS (PARTITION BY nosuchcol);
+}
+expect {
+    5
+    5
+    1
+}
+
+test select_checks_window_used_through_another_window {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT count(*) OVER w2 FROM y WINDOW w AS (ORDER BY nosuchfn(d)), w2 AS (w);
+}
+expect error {
+    no such function: nosuchfn
+}
+
 # Unary-plus on integer literals should still resolve as column index
 # references, matching SQLite behavior.
 # Fixes select1-4.9.2 in sqlite/conformance/upstream/all.test.
