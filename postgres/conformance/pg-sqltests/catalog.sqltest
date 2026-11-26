@@ -973,6 +973,31 @@ expect {
     3062|reverse|f|f|t|f|i|s|1|0|0|25|25|text_reverse
 }
 
+# The rows of pg_proc for the bytea functions match PostgreSQL 18.
+test pg-proc-bytea-rows-match-postgresql {
+    SELECT oid, proname, prokind, proleakproof, proisstrict, proretset, provolatile,
+           proparallel, procost::int, prorows::int, provariadic, proargtypes::text,
+           prorettype, prosrc
+    FROM pg_proc
+    WHERE oid IN (
+        720, 2010, 2012, 2013, 2014, 2015, 2085, 2086, 6195, 6196, 6382
+    )
+    ORDER BY oid;
+}
+expect {
+    720|octet_length|f|f|t|f|i|s|1|0|0|17|23|byteaoctetlen
+    2010|length|f|f|t|f|i|s|1|0|0|17|23|byteaoctetlen
+    2012|substring|f|f|t|f|i|s|1|0|0|17 23 23|17|bytea_substr
+    2013|substring|f|f|t|f|i|s|1|0|0|17 23|17|bytea_substr_no_len
+    2014|position|f|f|t|f|i|s|1|0|0|17 17|23|byteapos
+    2015|btrim|f|f|t|f|i|s|1|0|0|17 17|17|byteatrim
+    2085|substr|f|f|t|f|i|s|1|0|0|17 23 23|17|bytea_substr
+    2086|substr|f|f|t|f|i|s|1|0|0|17 23|17|bytea_substr_no_len
+    6195|ltrim|f|f|t|f|i|s|1|0|0|17 17|17|bytealtrim
+    6196|rtrim|f|f|t|f|i|s|1|0|0|17 17|17|byteartrim
+    6382|reverse|f|f|t|f|i|s|1|0|0|17|17|bytea_reverse
+}
+
 test pg-object-opclass-is-read-only {
     CREATE ROLE reader_of_object_opclass_is_read_only_role;
     SET ROLE reader_of_object_opclass_is_read_only_role;

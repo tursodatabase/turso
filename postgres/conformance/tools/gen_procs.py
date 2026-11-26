@@ -47,6 +47,8 @@ FAMILIES = [
     ("string", {"names": """btrim char_length character_length chr length lower lpad ltrim
         octet_length position quote_ident quote_literal repeat replace reverse rpad rtrim
         strpos substr substring upper""".split(), "bytea": "without"}),
+    ("bytea", {"names": """btrim length ltrim octet_length position reverse rtrim substr
+        substring""".split(), "bytea": "only"}),
 ]
 
 

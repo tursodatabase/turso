@@ -48,6 +48,7 @@ macro_rules! procs {
 /// provariadic, proargtypes, prorettype and prosrc.
 #[rustfmt::skip]
 pub(crate) const PROCS: &[Proc] = procs![
+    (720, "octet_length", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17], 23, "byteaoctetlen"),
     (753, "trunc", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[829], 829, "macaddr_trunc"),
     (849, "position", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[25, 25], 23, "textpos"),
     (868, "strpos", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[25, 25], 23, "textpos"),
@@ -106,7 +107,14 @@ pub(crate) const PROCS: &[Proc] = procs![
     (1732, "exp", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[1700], 1700, "numeric_exp"),
     (1734, "ln", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[1700], 1700, "numeric_ln"),
     (1736, "log", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[1700, 1700], 1700, "numeric_log"),
+    (2010, "length", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17], 23, "byteaoctetlen"),
+    (2012, "substring", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17, 23, 23], 17, "bytea_substr"),
+    (2013, "substring", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17, 23], 17, "bytea_substr_no_len"),
+    (2014, "position", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17, 17], 23, "byteapos"),
+    (2015, "btrim", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17, 17], 17, "byteatrim"),
     (2073, "substring", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[25, 25], 25, "textregexsubstr"),
+    (2085, "substr", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17, 23, 23], 17, "bytea_substr"),
+    (2086, "substr", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17, 23], 17, "bytea_substr_no_len"),
     (2087, "replace", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[25, 25, 25], 25, "replace_text"),
     (2100, "avg", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[20], 1700, "aggregate_dummy"),
     (2101, "avg", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[23], 1700, "aggregate_dummy"),
@@ -161,9 +169,12 @@ pub(crate) const PROCS: &[Proc] = procs![
     (3538, "string_agg", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[25, 25], 25, "aggregate_dummy"),
     (3545, "string_agg", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[17, 17], 17, "aggregate_dummy"),
     (3810, "pg_is_in_recovery", "f", false, true, false, "v", "s", 1.0, 0.0, 0, &[], 16, "pg_is_in_recovery"),
+    (6195, "ltrim", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17, 17], 17, "bytealtrim"),
+    (6196, "rtrim", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17, 17], 17, "byteartrim"),
     (6339, "random", "f", false, true, false, "v", "r", 1.0, 0.0, 0, &[23, 23], 23, "int4random"),
     (6340, "random", "f", false, true, false, "v", "r", 1.0, 0.0, 0, &[20, 20], 20, "int8random"),
     (6341, "random", "f", false, true, false, "v", "r", 1.0, 0.0, 0, &[1700, 1700], 1700, "numeric_random"),
+    (6382, "reverse", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17], 17, "bytea_reverse"),
     (6395, "max", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[17], 17, "aggregate_dummy"),
     (6396, "min", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[17], 17, "aggregate_dummy"),
 ];
