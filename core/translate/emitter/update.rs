@@ -768,10 +768,11 @@ fn emit_replace_delete<'a>(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
+                &t_ctx.resolver,
                 target_table.table.columns(),
                 target_table_cursor_id,
                 conflicting_rowid_reg,
-            ))
+            )?)
         } else {
             None
         };
