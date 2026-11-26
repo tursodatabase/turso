@@ -2774,6 +2774,42 @@ expect error {
     type "zz_dom_table" already exists
 }
 
+test a-table-may-not-share-its-name-with-a-type {
+    CREATE TYPE zz_tbl_type AS ENUM ('a');
+    CREATE TABLE zz_tbl_type (a int);
+}
+@sqlstate 42710
+expect error {
+    type "zz_tbl_type" already exists
+}
+
+test create-table-if-not-exists-does-not-skip-a-type-of-that-name {
+    CREATE DOMAIN zz_tbl_domain AS int;
+    CREATE TABLE IF NOT EXISTS zz_tbl_domain (a int);
+}
+@sqlstate 42710
+expect error {
+    type "zz_tbl_domain" already exists
+}
+
+test create-table-as-may-not-take-a-types-name {
+    CREATE TYPE zz_ctas_type AS ENUM ('a');
+    CREATE TABLE zz_ctas_type AS SELECT 1 AS a;
+}
+@sqlstate 42710
+expect error {
+    type "zz_ctas_type" already exists
+}
+
+test a-view-may-not-share-its-name-with-a-type {
+    CREATE TYPE zz_view_type AS ENUM ('a');
+    CREATE VIEW zz_view_type AS SELECT 1 AS a;
+}
+@sqlstate 42710
+expect error {
+    type "zz_view_type" already exists
+}
+
 # A table keeps the letter case of its quoted name.
 test a-type-may-not-share-its-quoted-name-with-a-table {
     CREATE TABLE "Zz_Ty_Quoted" (a int);
@@ -2784,6 +2820,16 @@ expect error {
     type "Zz_Ty_Quoted" already exists
 }
 
+# A sequence has no row type, but CREATE SEQUENCE checks the type names too.
+test a-sequence-may-not-share-its-name-with-a-type {
+    CREATE TYPE zz_seq_type AS ENUM ('a');
+    CREATE SEQUENCE zz_seq_type;
+}
+@sqlstate 42710
+expect error {
+    type "zz_seq_type" already exists
+}
+
 test a-type-may-share-its-name-with-a-sequence {
     CREATE SEQUENCE zz_type_seq;
     CREATE TYPE zz_type_seq AS ENUM ('a');
@@ -2791,6 +2837,52 @@ test a-type-may-share-its-name-with-a-sequence {
 }
 expect {
     a|1
+}
+
+test a-type-and-an-index-may-share-a-name {
+    CREATE TABLE zz_idx_table (a int);
+    CREATE INDEX zz_idx_first ON zz_idx_table (a);
+    CREATE TYPE zz_idx_first AS ENUM ('a');
+    CREATE TYPE zz_idx_second AS ENUM ('a');
+    CREATE INDEX zz_idx_second ON zz_idx_table (a);
+    SELECT relname FROM pg_class WHERE relname LIKE 'zz_idx_%' ORDER BY relname;
+}
+expect {
+    zz_idx_first
+    zz_idx_second
+    zz_idx_table
+}
+
+test rename-onto-a-types-name-is-an-error {
+    CREATE TYPE zz_rn_type AS ENUM ('a');
+    CREATE TABLE zz_rn_table3 (a int);
+    ALTER TABLE zz_rn_table3 RENAME TO zz_rn_type;
+}
+@sqlstate 42710
+expect error {
+    type "zz_rn_type" already exists
+}
+
+# Built-in types are in pg_catalog, not in public.
+test a-table-may-take-the-name-of-a-built-in-type {
+    CREATE TABLE text (a int);
+    SELECT relname FROM pg_class WHERE relname = 'text';
+}
+expect {
+    text
+}
+
+test a-table-in-another-schema-may-take-a-public-types-name {
+    CREATE TYPE zz_sp_type AS ENUM ('a');
+    CREATE SCHEMA zz_sp_schema;
+    SET search_path = zz_sp_schema;
+    CREATE TABLE zz_sp_type (a int);
+    CREATE TABLE public.zz_sp_other (b int);
+    SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'zz_sp_type';
+}
+expect {
+    zz_sp_schema
 }
 
 # pg_dump empties search_path and names the schema of every object.

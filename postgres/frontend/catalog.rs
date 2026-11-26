@@ -380,6 +380,44 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// PostgreSQL looks for a type of the relation's name before it makes
+    /// the relation's row type. It does so for a sequence too, which gets
+    /// no row type, but not for an index. Only CREATE gives the HINT; the
+    /// rename of the row type gives none.
+    fn check_relation_name_against_types(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceRef,
+        kind: RelationKind,
+        name: &str,
+        renaming: bool,
+    ) -> Result<()> {
+        let checks_types = match kind {
+            RelationKind::Table
+            | RelationKind::View
+            | RelationKind::MaterializedView
+            | RelationKind::Sequence => true,
+            RelationKind::Index => false,
+        };
+        if !checks_types || !holds_user_types(schema, namespace) {
+            return Ok(());
+        }
+        let Some(type_def) = schema
+            .get_type_def_unchecked(name)
+            .filter(|type_def| !type_def.is_builtin)
+        else {
+            return Ok(());
+        };
+        if type_def.name != name {
+            return Err(names_differ_only_in_case(&type_def.name, name));
+        }
+        let hint = (!renaming).then_some(
+            "A relation has an associated type of the same name, so you must use a name that \
+             doesn't conflict with any existing type.",
+        );
+        Err(crate::error::type_already_exists(name, hint))
+    }
+
     /// Tables, views and materialized views have a row type of their name.
     /// Sequences and indexes have none.
     fn check_type_name_against_relations(

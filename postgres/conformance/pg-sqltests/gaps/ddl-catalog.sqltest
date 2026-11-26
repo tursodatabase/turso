@@ -922,6 +922,51 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
+@compat-gap "syntax:quoted-identifier"
+test a-table-after-a-type-whose-name-differs-in-case {
+    CREATE TYPE level AS ENUM ('low');
+    CREATE TABLE "Level" (a int);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:quoted-identifier"
+test rename-onto-a-type-name-that-differs-in-case {
+    CREATE TYPE level AS ENUM ('low');
+    CREATE TABLE t (a int);
+    ALTER TABLE t RENAME TO "Level";
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# tursopg keeps only the lower-case name of a type, so it cannot tell that
+# the type is "Mood" and not mood.
+@compat-gap "syntax:quoted-identifier"
+test a-table-named-like-a-quoted-mixed-case-type {
+    CREATE TYPE "Mood" AS ENUM ('sad', 'happy');
+    CREATE TABLE mood (a int);
+}
+expect {
+}
+@sqlstate 42710
+expect @tursopg error {}
+
+@compat-gap "syntax:quoted-identifier"
+test a-quoted-table-named-like-the-same-quoted-type {
+    CREATE TYPE "Mood" AS ENUM ('sad', 'happy');
+    CREATE TABLE "Mood" (a int);
+}
+@sqlstate 42710
+expect error {
+    type "Mood" already exists
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 # E-85: table in a quoted non-ASCII schema
 @compat-gap "syntax:create-schema"
 test table-in-a-quoted-non-ascii-schema {

@@ -470,6 +470,28 @@ fn failed_drop_of_several_relations_drops_none() {
 }
 
 #[test]
+fn only_create_hints_that_a_relation_has_a_type_of_its_name() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TYPE ty AS ENUM ('a')").unwrap();
+    conn.execute("CREATE TABLE t1 (a int)").unwrap();
+
+    let error = conn.execute("CREATE TABLE ty (a int)").unwrap_err();
+    assert_eq!(error.sqlstate, "42710", "{error}");
+    assert_eq!(
+        error.hint.as_deref(),
+        Some(
+            "A relation has an associated type of the same name, so you must use a name that \
+             doesn't conflict with any existing type."
+        )
+    );
+    let error = conn.execute("ALTER TABLE t1 RENAME TO ty").unwrap_err();
+    assert_eq!(error.sqlstate, "42710", "{error}");
+    assert_eq!(error.message, "type \"ty\" already exists");
+    assert_eq!(error.hint, None);
+}
+
+#[test]
 fn refused_drop_leaves_the_sequence_and_the_other_default_working() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();

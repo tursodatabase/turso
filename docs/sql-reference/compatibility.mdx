@@ -108,16 +108,20 @@ Cancellation after commit does not undo the changes.
 
 The PostgreSQL frontend keeps the types of `CREATE TYPE ... AS ENUM` and
 `CREATE DOMAIN` in the public schema. As in PostgreSQL, a type cannot have the
-name of a table, view or materialized view of public. `CREATE TYPE` and
-`CREATE DOMAIN` with a name that has no schema fail with SQLSTATE 0A000
-(feature_not_supported) when the first schema of `search_path` is not public,
-because PostgreSQL creates the type in that schema. A name such as
-`public.mood` creates the type in public whatever `search_path` is.
+name of a table, view or materialized view of public, and a table, view,
+materialized view or sequence of public cannot have the name of a type. An index
+can. `CREATE TYPE` and `CREATE DOMAIN` with a name that has no schema fail
+with SQLSTATE 0A000 (feature_not_supported) when the first schema of
+`search_path` is not public, because PostgreSQL creates the type in that schema.
+A name such as `public.mood` creates the type in public whatever `search_path`
+is.
 
 The PostgreSQL frontend stores the name of a type in lower case, and finds types
 and relations by a name in any letter case. So a type and a relation whose
 names differ only in letter case, such as a table `"Mood"` and a type `mood`,
-are not supported: `CREATE TYPE` or `CREATE DOMAIN` fails with SQLSTATE 0A000.
+are not supported: the second `CREATE` fails with SQLSTATE 0A000. A table
+`mood` after `CREATE TYPE "Mood"` fails with SQLSTATE 42710
+(duplicate_object), because the stored type name is `mood`.
 
 ## See Also
 
