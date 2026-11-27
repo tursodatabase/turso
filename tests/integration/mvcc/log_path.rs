@@ -95,7 +95,7 @@ fn test_old_log_of_two_mvcc_databases_is_an_error() {
     for path in [&one, &two] {
         let err = try_open(path).map(|_| ()).unwrap_err();
         assert!(
-            matches!(&err, turso_core::LimboError::Corrupt(msg) if msg.contains("app.db-log")),
+            matches!(&err, turso_core::LimboError::InvalidArgument(msg) if msg.contains("app.db-log")),
             "{err:?}"
         );
         assert!(!sidecar(path, "-log").exists());

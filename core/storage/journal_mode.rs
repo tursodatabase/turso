@@ -145,7 +145,7 @@ pub fn find_logical_log_path(db_path: impl AsRef<Path>) -> Result<PathBuf> {
     if others.is_empty() {
         return Ok(old_log_path);
     }
-    Err(LimboError::Corrupt(format!(
+    Err(LimboError::InvalidArgument(format!(
         "the MVCC logical log {} was written by an older version, which used it for database {} and for {}. The log can hold commits of each of these databases. Move the other database files to a different directory, then open the database that owns the log",
         old_log_path.display(),
         db_path.display(),
