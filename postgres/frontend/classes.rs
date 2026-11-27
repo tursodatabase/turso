@@ -258,9 +258,6 @@ impl ClassCatalog {
         let mut catalog = Self::new(rows)?;
         let relations = RelationSchemas::new(schema);
         for (namespace, name) in relations.kinds.keys() {
-            if is_stored_catalog_table(*namespace, name) {
-                continue;
-            }
             if catalog.get_by_name(*namespace, name).is_none() {
                 return Err(LimboError::Corrupt(format!(
                     "relation \"{name}\" of namespace {} has no row in {CLASSES_TABLE_NAME}",
@@ -580,7 +577,9 @@ impl ClassCatalog {
 }
 
 /// Schema lookups built once per load or scan, rather than searching every
-/// relation and every index for each catalog row.
+/// relation and every index for each catalog row. The stored tables of the
+/// catalog tables and their indexes are the frontend's, not the user's, so
+/// they are not among the relations.
 struct RelationSchemas {
     kinds: HashMap<(NamespaceId, String), RelationKind>,
     index_columns: HashMap<(NamespaceId, String), (String, usize)>,
@@ -588,23 +587,32 @@ struct RelationSchemas {
 
 impl RelationSchemas {
     fn new(schema: &Schema) -> Self {
-        Self {
-            kinds: schema
-                .user_relations()
-                .into_iter()
-                .map(|(ns, name, kind)| ((ns, name), kind))
-                .collect(),
-            index_columns: schema
-                .namespace_ids()
-                .flat_map(|ns| {
-                    schema.indexes(ns).map(move |index| {
+        let index_columns: HashMap<(NamespaceId, String), (String, usize)> = schema
+            .namespace_ids()
+            .flat_map(|ns| {
+                schema
+                    .indexes(ns)
+                    .filter(move |index| !is_stored_catalog_table(ns, &index.table_name))
+                    .map(move |index| {
                         (
                             (ns, index.name.clone()),
                             (index.table_name.clone(), index.columns.len()),
                         )
                     })
-                })
-                .collect(),
+            })
+            .collect();
+        let kinds = schema
+            .user_relations()
+            .into_iter()
+            .filter(|(ns, name, kind)| match kind {
+                RelationKind::Index => index_columns.contains_key(&(*ns, name.clone())),
+                _ => !is_stored_catalog_table(*ns, name),
+            })
+            .map(|(ns, name, kind)| ((ns, name), kind))
+            .collect();
+        Self {
+            kinds,
+            index_columns,
         }
     }
 }
@@ -924,7 +932,7 @@ impl Catalog for PostgresCatalog {
             }
             CatalogCmd::DropIndex(index) => {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
-                    rows.dropped_relation(program, index.namespace, index.name);
+                    rows.dropped_relation(program, index.namespace, index.name)?;
                 }
             }
             CatalogCmd::CreateSequence(sequence) => {
@@ -941,7 +949,7 @@ impl Catalog for PostgresCatalog {
             }
             CatalogCmd::DropSequence(sequence) => {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
-                    rows.dropped_relation(program, sequence.namespace, sequence.name);
+                    rows.dropped_relation(program, sequence.namespace, sequence.name)?;
                 }
             }
             CatalogCmd::DropTable(table) => {
@@ -953,11 +961,11 @@ impl Catalog for PostgresCatalog {
                 // those of its indexes.
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
                     let table_oid = rows.oid_of(table.namespace, table.name);
-                    rows.dropped_relation(program, table.namespace, table.name);
+                    rows.dropped_relation(program, table.namespace, table.name)?;
                     for index in table.indexes {
-                        rows.dropped_relation(program, table.namespace, index);
+                        rows.dropped_relation(program, table.namespace, index)?;
                     }
-                    rows.dropped_rowid_primary_key_index(program, table.namespace, table_oid);
+                    rows.dropped_rowid_primary_key_index(program, table.namespace, table_oid)?;
                 }
             }
             CatalogCmd::CreateView(view) => {
@@ -992,7 +1000,7 @@ impl Catalog for PostgresCatalog {
             }
             CatalogCmd::DropView(view) => {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
-                    rows.dropped_relation(program, view.namespace, view.name);
+                    rows.dropped_relation(program, view.namespace, view.name)?;
                 }
             }
             CatalogCmd::RenameTable(table) => {
@@ -1052,7 +1060,7 @@ impl Catalog for PostgresCatalog {
                 }
                 refuse_changed_view_width(ctx.schema, column.namespace, column.name, column.table)?;
                 if ctx.origin != CmdOrigin::Engine && ctx.database_id == MAIN_DB_ID {
-                    emit_dropped_column_comments(program, ctx, column);
+                    emit_dropped_column_comments(program, ctx, column)?;
                 }
             }
             // A trigger has no class row, and neither has a virtual table,
@@ -1337,15 +1345,15 @@ fn emit_dropped_column_comments(
     program: &mut ProgramBuilder,
     ctx: &CmdContext<'_>,
     column: &DropColumn<'_>,
-) {
+) -> turso_core::Result<()> {
     // An engine table has no row and no comments.
     let Some(class) = class_catalog(ctx.schema)
         .and_then(|catalog| catalog.get_by_name(column.namespace, column.name))
     else {
-        return;
+        return Ok(());
     };
     let Some(table_before) = ctx.schema.get_btree_table(column.namespace, column.name) else {
-        return;
+        return Ok(());
     };
     let remaining = column.table.columns();
     let position = table_before
@@ -1360,7 +1368,7 @@ fn emit_dropped_column_comments(
         ctx.schema,
         class.oid,
         Dropped::Column(column_number),
-    );
+    )
 }
 
 /// Stores the new name of column `old_name` of `table` in the class rows
@@ -1451,15 +1459,21 @@ impl<'a> ClassRowWriter<'a> {
     }
 
     /// Deletes the class row of a relation that the statement drops.
-    fn dropped_relation(&self, program: &mut ProgramBuilder, namespace: NamespaceId, name: &str) {
+    fn dropped_relation(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> turso_core::Result<()> {
         // An engine relation has no row and nothing to do.
         let Some(class) =
             class_catalog(self.schema).and_then(|catalog| catalog.get_by_name(namespace, name))
         else {
-            return;
+            return Ok(());
         };
-        emit_delete_comments(program, self.schema, class.oid, Dropped::Relation);
-        emit_class_row_delete(program, &self.cursors, namespace, name)
+        emit_delete_comments(program, self.schema, class.oid, Dropped::Relation)?;
+        emit_class_row_delete(program, &self.cursors, namespace, name);
+        Ok(())
     }
 
     /// Deletes the class row of the primary key index of the rowid table
@@ -1469,16 +1483,17 @@ impl<'a> ClassRowWriter<'a> {
         program: &mut ProgramBuilder,
         namespace: NamespaceId,
         table_oid: i64,
-    ) {
+    ) -> turso_core::Result<()> {
         let Some(class) = class_catalog(self.schema).and_then(|catalog| {
             catalog
                 .indexes_of(table_oid)
                 .find(|class| class.engine_name.is_none())
         }) else {
-            return;
+            return Ok(());
         };
-        emit_delete_comments(program, self.schema, class.oid, Dropped::Relation);
+        emit_delete_comments(program, self.schema, class.oid, Dropped::Relation)?;
         emit_class_row_delete_rowid_primary_key_index(program, &self.cursors, namespace, table_oid);
+        Ok(())
     }
 
     /// Stores the new name of a relation. Its row keeps its oid and owner.
@@ -1720,8 +1735,9 @@ pub(crate) fn translate_access_statement(
                 else {
                     // Public catalogs already grant SELECT to every role,
                     // whether their rows are stored or virtual.
-                    if is_stored_catalog_table(*namespace, name)
-                        || (namespace.is_root() && name.eq_ignore_ascii_case("pg_class"))
+                    if namespace.is_root()
+                        && (name.eq_ignore_ascii_case("pg_description")
+                            || name.eq_ignore_ascii_case("pg_class"))
                     {
                         if !revoke && privileges.iter().all(|p| *p == ast::Privilege::Select) {
                             continue;

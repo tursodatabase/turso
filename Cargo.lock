@@ -7485,6 +7485,7 @@ dependencies = [
  "turso_ext",
  "turso_macros",
  "turso_pg",
+ "turso_pg_catalog",
  "turso_sdk_kit",
  "twox-hash",
  "zerocopy",

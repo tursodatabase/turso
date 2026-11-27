@@ -68,10 +68,13 @@ The PostgreSQL opening functions initialize the relation catalog before returnin
 the database, including for asynchronous server opens. Relations receive stable,
 persisted OIDs when created, and column `attrelid` values identify those relations.
 
-`pg_catalog.pg_description` is a table in the database file. `COMMENT ON`
+`pg_catalog.pg_description` has the 3,675 built-in comments of PostgreSQL 18,
+which come from the running binary and are not stored in the database file,
+and the comments that statements wrote, which are stored in the file. `COMMENT ON`
 stores the comment of a table, view, materialized view, index, sequence, table
-column or schema in it, in the transaction of the statement, and `COMMENT ON
-... IS NULL` deletes it. Dropping the relation, the column or the schema
+column or schema, in the transaction of the statement, and `COMMENT ON
+... IS NULL` removes it. `COMMENT ON` a built-in object, such as the schema
+`public`, fails with SQLSTATE 0A000, so its built-in comment stays. Dropping the relation, the column or the schema
 deletes its comments. `obj_description(oid, 'pg_class')`,
 `obj_description(oid, 'pg_namespace')` and `col_description(table_oid,
 column_number)` read them. `COMMENT ON` any other kind of object, such as a
@@ -82,7 +85,7 @@ INDEX` for the index of a `PRIMARY KEY` or `UNIQUE` constraint, such as
 0A000 in a column `DEFAULT`, in a `CHECK` constraint, in an index, and with an
 aggregate or window function in an argument, such as `obj_description(max(oid),
 'pg_class')`; an aggregate inside a subquery in the argument works. Only the owner of a relation or a superuser comments on it,
-and only a superuser comments on a schema. A new database has the default
+and only a superuser comments on a schema. A new database has the built-in
 `standard public schema` comment of `public`, so `pg_dump` does not emit an
 empty `COMMENT ON SCHEMA` statement for it. Every role reads `pg_description`,
 and no statement of a user writes it other than `COMMENT ON`.

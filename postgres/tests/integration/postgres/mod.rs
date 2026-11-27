@@ -1,6 +1,7 @@
 mod catalog;
 mod classes;
 mod copy;
+mod descriptions;
 mod dialect;
 mod domain;
 mod functions;

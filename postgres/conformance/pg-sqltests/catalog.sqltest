@@ -1909,6 +1909,78 @@ expect {
     2200|2615|0|standard public schema
 }
 
+test pg-description-has-the-builtin-comments-of-postgresql {
+    SELECT description FROM pg_description
+    WHERE objoid = 23 AND classoid = 1247 AND objsubid = 0;
+    SELECT description FROM pg_description
+    WHERE objoid = 11 AND classoid = 2615 AND objsubid = 0;
+    SELECT obj_description(11, 'pg_namespace');
+}
+expect {
+    -2 billion to 2 billion integer, 4-byte storage
+    system catalog schema
+    system catalog schema
+}
+
+test pg-description-has-builtin-and-user-comments-together {
+    CREATE TABLE described (a int, b int);
+    COMMENT ON TABLE described IS 'a table of mine';
+    COMMENT ON COLUMN described.b IS 'a column of mine';
+    SELECT d.objsubid, d.description FROM pg_description d
+    WHERE (d.objoid = 11 AND d.classoid = 2615)
+       OR (d.objoid = (SELECT oid FROM pg_class WHERE relname = 'described')
+           AND d.classoid = 1259)
+    ORDER BY d.objoid, d.objsubid;
+}
+expect {
+    0|system catalog schema
+    0|a table of mine
+    2|a column of mine
+}
+
+test pg-description-finds-a-user-comment-by-its-key {
+    CREATE TABLE keyed (a int, b int);
+    COMMENT ON COLUMN keyed.a IS 'first column';
+    COMMENT ON COLUMN keyed.b IS 'second column';
+    SELECT description FROM pg_description
+    WHERE objoid = (SELECT oid FROM pg_class WHERE relname = 'keyed')
+      AND classoid = 1259 AND objsubid = 2;
+}
+expect {
+    second column
+}
+
+test pg-description-joins-tables-to-their-comments {
+    CREATE TABLE joined_a (x int);
+    CREATE TABLE joined_b (x int);
+    CREATE TABLE joined_c (x int);
+    COMMENT ON TABLE joined_a IS 'first';
+    COMMENT ON TABLE joined_c IS 'third';
+    SELECT c.relname, d.description
+    FROM pg_class c
+    JOIN pg_description d ON d.objoid = c.oid AND d.classoid = 1259 AND d.objsubid = 0
+    WHERE c.relname IN ('joined_a', 'joined_b', 'joined_c')
+    ORDER BY c.relname;
+}
+expect {
+    joined_a|first
+    joined_c|third
+}
+
+@skip-if postgres "PostgreSQL replaces the built-in comment of the schema public"
+test comment-on-the-public-schema-is-refused {
+    COMMENT ON SCHEMA public IS 'mine';
+}
+@sqlstate 0A000
+expect error {COMMENT ON a built-in object is not supported}
+
+@skip-if postgres "PostgreSQL removes the built-in comment of the schema public"
+test comment-on-the-public-schema-is-null-is-refused {
+    COMMENT ON SCHEMA public IS NULL;
+}
+@sqlstate 0A000
+expect error {COMMENT ON a built-in object is not supported}
+
 test obj-description-reads-the-comment-of-the-public-schema {
     SELECT obj_description(oid, 'pg_namespace'), obj_description(oid, 'pg_class')
     FROM pg_namespace WHERE nspname = 'public';

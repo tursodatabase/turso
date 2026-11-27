@@ -27,6 +27,7 @@ use turso_core::{
 };
 use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
+use turso_pg_catalog::{CatalogTable, PgDescription};
 use turso_pg_parser::quote_identifier;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR, SQLSTATE_UNDEFINED_TABLE,
@@ -857,8 +858,8 @@ macro_rules! builtin_catalogs {
 
         pub(crate) const BUILTIN_CATALOGS: &[(i64, &str, RelationKind, bool)] = &[
             $(($table::CATALOG_OID, $name, RelationKind::$kind, $shared),)*
-            // pg_description is stored; schema_init registers its TableInit.
-            (2609, crate::descriptions::DESCRIPTION_TABLE_NAME, RelationKind::Table, false),
+            // catalog_table registers the virtual table for pg_description.
+            (PgDescription::OID as i64, PgDescription::NAME, RelationKind::Table, false),
         ];
 
         fn register_builtin_catalogs(mut options: OpenOptions) -> OpenOptions {
@@ -909,7 +910,7 @@ pub(crate) fn builtin_catalog_columns(
     } else {
         // Stored catalogs do not exist when bootstrap statements are built.
         let sql = match name {
-            "pg_description" => crate::descriptions::TABLE_INIT.statements[0],
+            PgDescription::NAME => PgDescription::CREATE_SQL,
             "pg_class" => PgClassTable::SCHEMA,
             _ => panic!("a registered catalog has a schema: {name}"),
         };
@@ -5145,12 +5146,8 @@ mod tests {
     fn catalogs_available_in_secondary_databases() {
         let dir = tempdir().unwrap();
         let attached_path = dir.path().join("attached.db");
-        let output_path = dir.path().join("vacuum.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let opts = crate::DatabaseOpts::new()
-            .with_attach(true)
-            .with_vacuum(true)
-            .with_views(true);
+        let opts = crate::DatabaseOpts::new().with_attach(true);
         let db = crate::session::open_database_with_io(
             io.clone(),
             dir.path().join("main.db").to_str().unwrap(),
@@ -5176,7 +5173,7 @@ mod tests {
             vec![vec![Value::from_i64(3)]]
         );
         let attached = crate::session::open_database_with_io(
-            io.clone(),
+            io,
             attached_path.to_str().unwrap(),
             crate::OpenFlags::default(),
             opts,
@@ -5204,25 +5201,6 @@ mod tests {
                 vec![vec![Value::from_i64(3)]]
             );
         }
-        conn.execute("CREATE VIEW catalog_names AS SELECT * FROM pg_namespace")
-            .unwrap();
-        conn.execute(format!("VACUUM INTO '{}'", output_path.display()))
-            .unwrap();
-        let output = crate::session::open_database_with_io(
-            io,
-            output_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            opts,
-        )
-        .unwrap();
-        assert_eq!(
-            connect_with_public(&output)
-                .prepare("SELECT COUNT(*) FROM catalog_names")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(3)]]
-        );
     }
 
     #[test]

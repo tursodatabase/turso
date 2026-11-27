@@ -22,10 +22,6 @@
 //! the engine that runs inside the statement that reads the catalog, on the
 //! same connection, so it sees the same transaction.
 
-// The list of catalogs is empty until the next change puts pg_description on
-// it, so most of this module has no caller yet.
-#![allow(dead_code)]
-
 use std::num::NonZero;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
@@ -42,12 +38,18 @@ use turso_core::{
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
-use turso_pg_catalog::{BuiltinRows, CatalogTable};
+use turso_pg_catalog::{BuiltinRows, CatalogTable, PgDescription};
 use turso_sqlite::SqliteDialect;
 
 /// Each catalog that the frontend serves from its built-in rows and its
 /// stored table.
-static CATALOG_TABLES: LazyLock<[Catalog; 0]> = LazyLock::new(|| []);
+static CATALOG_TABLES: LazyLock<[Catalog; 1]> = LazyLock::new(|| {
+    [
+        // COMMENT ON and the statements that drop an object with a comment
+        // write it.
+        Catalog::of::<PgDescription>(),
+    ]
+});
 
 /// Registers the virtual table of each catalog of [`CATALOG_TABLES`] as
 /// the overlay of its stored table.
@@ -649,7 +651,6 @@ fn key_of(value: &Value) -> Key {
 mod tests {
     use super::*;
     use turso_pg_catalog::PgCollation;
-    use turso_pg_catalog::PgDescription;
 
     #[test]
     fn the_stored_table_has_the_name_the_columns_and_the_indexes_of_the_catalog() {
@@ -720,5 +721,18 @@ mod tests {
         assert!(Catalog::of::<PgDescription>()
             .insert_statement(&row)
             .is_err());
+    }
+
+    /// A built-in object has an oid below `FirstNormalObjectId`, so a
+    /// comment on an object that a user creates never has the key of a
+    /// built-in comment.
+    #[test]
+    fn each_builtin_comment_names_a_builtin_object() {
+        for row in &turso_pg_catalog::PG_DESCRIPTION {
+            assert!(
+                i64::from(row.objoid) < crate::classes::FIRST_NORMAL_OBJECT_ID,
+                "{row:?}"
+            );
+        }
     }
 }
