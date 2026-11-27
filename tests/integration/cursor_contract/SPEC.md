@@ -220,8 +220,11 @@ The test models use the same step function. They differ from the model storage o
 store and the compare: a list of `(rowid, value)` and a list of `(cols, rowid)` with the
 compare of section 2c.
 
-`NewRowid` gives `max + 1`, or 1 for an empty table (D6). The model accepts it with an append
-token: the next no-seek `Insert` must be above every key.
+The model storage gives `max + 1` for `NewRowid`, or 1 for an empty table. This is a choice of
+the model, not a requirement: the contract is only the predicate of D6 (unused, and above every
+key). The test models check an engine's rowid against that predicate and never against
+`max + 1`. WAL and MVCC may return different values, and both are correct. The model accepts
+the rowid with an append token: the next no-seek `Insert` must be above every key.
 
 ## 3. Insert seek contract
 
