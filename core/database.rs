@@ -3726,16 +3726,18 @@ impl Database {
                         if let Some(page_size) =
                             self.pager_state.page_size().filter(|_| use_cached_header)
                         {
+                            let mut context = self.pager_state.verify_encryption_key(key)?;
                             // Before tursodatabase/turso#11874, every connect to an
-                            // initialized database read the 512-byte header here, before
-                            // `_init_nonblock` takes the page-1 read transaction. The
-                            // cached key check below does not need it, but keeping the
-                            // read makes the connection's first IO wait happen without
-                            // the WAL read lock, as it did before.
+                            // initialized database read the 512-byte header before
+                            // `_init_nonblock` takes the page-1 read transaction. The cached
+                            // key check above does not need it and stays first, so a wrong
+                            // key is still refused before any IO. Keeping the read makes the
+                            // connection's first IO wait happen without the WAL read lock,
+                            // as it did before. The check runs again when this state resumes
+                            // after the read; it has no side effects.
                             if self.initialized() {
                                 let _ = return_if_io!(self.read_db_header_buf(hdr_st));
                             }
-                            let mut context = self.pager_state.verify_encryption_key(key)?;
                             context.set_page_size(page_size);
                             let mut io_ctx = IOContext::default();
                             io_ctx.set_encryption(context);
