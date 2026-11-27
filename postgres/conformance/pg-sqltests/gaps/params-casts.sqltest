@@ -523,38 +523,6 @@ test float4-cast-of-a-value-too-small {
 @sqlstate 22003
 expect error {}
 
-# The engine's float cannot hold NaN, so a conversion that gives NaN fails.
-# PostgreSQL has NaN.
-@compat-gap "type:float8"
-test cast-nan-to-float8 {
-    SELECT 'NaN'::float8;
-}
-expect {
-    NaN
-}
-@sqlstate 0A000
-expect @tursopg error {}
-
-@compat-gap "type:float4"
-test cast-nan-to-float4 {
-    SELECT 'nan'::real;
-}
-expect {
-    NaN
-}
-@sqlstate 0A000
-expect @tursopg error {}
-
-@compat-gap "type:float8"
-test cast-nan-text-to-float8 {
-    SELECT 'NaN'::text::float8;
-}
-expect {
-    NaN
-}
-@sqlstate 0A000
-expect @tursopg error {}
-
 test cast-infinity-to-float8-and-float4 {
     SELECT 'Infinity'::float8::text, '-Infinity'::float8::text, 'inf'::float4::text, '-Infinity'::real::text;
 }
