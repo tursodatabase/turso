@@ -1,7 +1,7 @@
 # Cursor contract: B-tree and B-tree + MVCC overlay
 
 This file defines what each cursor opcode promises. The step function
-`core/storage/model/spec.rs` is the contract in code (section 2e). The reference models
+`core/storage/spec_model/spec.rs` is the contract in code (section 2e). The reference models
 (`model.rs`, `index_model.rs`) call it, and the test programs follow it. SQLite is the reference: `vdbe.c` and
 `btree.c` at master `9a938e2e8d`.
 
@@ -11,9 +11,9 @@ Status: draft. Every rule marked **DECISION** needs a human OK.
 
 | File | Purpose |
 |---|---|
-| `program.rs`, `index_program.rs`, `mod.rs` | Harness. Builds a VDBE program from a list of table or index operations, runs it on one engine, returns what each operation saw. Engines: WAL, MVCC, ephemeral, model (a `:model:` database, section 2e). Layouts: all in memory, checkpointed. |
-| `model.rs`, `index_model.rs` | Reference models: the table and index stores with their compare functions, on top of the step function `turso_core::storage::model::spec`. No database. |
-| `walk.rs`, `index_walk.rs` | Random walks. Generate operations, run them on all engines and on the model, compare, shrink a failure. Known bugs are filtered by name; `NO_FILTER=1` turns the filters off. |
+| `program.rs`, `index_program.rs`, `mod.rs` | Harness. Builds a VDBE program from a list of table or index operations, runs it on one engine, returns what each operation saw. Engines: WAL, MVCC, ephemeral, spec-model (a `:spec-model:` database, section 2e). Layouts: all in memory, checkpointed. |
+| `model.rs`, `index_model.rs` | Reference models: the table and index stores with their compare functions, on top of the step function `turso_core::storage::spec_model::spec`. No database. |
+| `walk.rs`, `index_walk.rs` | Random walks. Generate operations, run them on all engines and on the test model, compare, shrink a failure. Known bugs are filtered by name; `NO_FILTER=1` turns the filters off. |
 | `index_tests.rs`, `overlay_tests.rs`, `defined_tests.rs`, tests in `mod.rs` | Fixed scenarios. `defined_tests.rs` has the peer writes of section 1 and the `Found`-style seeks of section 2b. A test named `known_bug_*` asserts that a bug is still open (section 5b). `index_tests.rs::collation` has the scenarios of section 2c: DESC and NOCASE seeks, scans and range loops, `Found`, and the replacement of a key by a case variant. |
 
 Run: `cargo test -p core_tester --test integration_tests cursor_contract`. Walk parameters:
@@ -58,7 +58,7 @@ Rules that hold for all opcodes:
   `Invalid`. They return the row when the position is `At k`. At any other position the read
   is Undefined (U8).
 - Each opcode is either defined, or its precondition is violated. A violated
-  precondition is **Undefined**: the model has no result and the generator never emits it.
+  precondition is **Undefined**: the step function has no result and the generator never emits it.
   An engine must refuse an Undefined sequence in a debug build (section 2d). So an opcode is
   either supported or refused, and the translator never emits a refused one.
 
@@ -79,7 +79,7 @@ Rules that hold for all opcodes:
 | `SeekLE k` / `SeekLT k` | none | `At (max key <= k)` / `(max key < k)`, else `Invalid` and jump |
 | `SeekRowid`, `NotExists` | table | hit: `At k`. Miss: `Seeked k` and jump |
 | `Found`, `NotFound`, `NoConflict` | index | an eq-only `SeekGE` on the key as a prefix. Hit: `At` the first matching entry, forward direction, so a read and `Next` are defined and `Prev` is Undefined (U1). Miss: `Seeked key`, a read is Undefined (U8), `Next` goes to the first entry after the key. `NoConflict` also jumps when the key has a NULL, even if an entry matches, and then the cursor has no position |
-| `IdxGE/GT/LE/LT k` | position is `At` | jump if the entry compares `>=`, `>`, `<=`, `<` the prefix `k`. No state change. On a non-`At` position the model returns jump (Turso behaviour; SQLite asserts) |
+| `IdxGE/GT/LE/LT k` | position is `At` | jump if the entry compares `>=`, `>`, `<=`, `<` the prefix `k`. No state change. On a non-`At` position the step function returns jump (Turso behaviour; SQLite asserts) |
 | `Column`, `RowId` | none | see section 1. Position unchanged |
 | `NullRow` | none | null-row flag set. Only `Column`, `RowId`, `Next`, `Prev`, `Rewind`, `Last`, `Seek*`, `NotExists` may follow. `Next` and `Prev` find no row and do not jump (SQLite: `OP_Next` on an invalid cursor, used by LEFT JOIN loops); afterwards the cursor has no position. `Insert`, `Delete` after it are Undefined |
 | `NewRowid` | table | returns `r` with `r` not in the store and `r > max key` (D6). Position after it: no position; a read is Undefined (U8). Only a no-seek `Insert` of `r` may follow |
@@ -104,7 +104,7 @@ rules of section 1 are the same. The seek token holds a prefix instead of a rowi
 | `SeekLE p` / `SeekLT p` | none | last key with `cmp_prefix k p` `<= 0` / `< 0`; else `Invalid` and jump |
 | `Found p` / `NotFound p` | none | an eq-only `SeekGE p`. `Found` jumps iff some key has prefix `p`, `NotFound` iff none. Hit: `At` the first key with prefix `p`, direction forward, token `p` (a hit token allows an insert of the same whole key only, so with a prefix it allows nothing, U5). Miss: `Seeked p`, direction forward, token `p`; `Next` goes to the first key after `p` |
 | `NoConflict p` | none | if `p` has a NULL: jump, no position (a read is Undefined, U8). Else like `NotFound` |
-| `IdxGE/GT/LE/LT p` | position is `At` | jump iff `cmp_prefix k p` is `>= 0`, `> 0`, `<= 0`, `< 0`. State unchanged. On `Invalid` the model jumps (Turso) |
+| `IdxGE/GT/LE/LT p` | position is `At` | jump iff `cmp_prefix k p` is `>= 0`, `> 0`, `<= 0`, `< 0`. State unchanged. On `Invalid` the step function jumps (Turso) |
 | `IdxInsert key use_seek` | null-row clear | key added (an equal key is replaced, the new bytes win), position `At key`, all tokens cleared. Without `use_seek` it always seeks. With `use_seek` the cursor must hold the token for `key.cols`, unless `key.cols` has a NULL (Turso seeks then). A token of a hit allows only the same whole key |
 | `IdxDelete key` | with P5: key is in the set | key removed, no position (`Lost`): a read or a move is Undefined (U2, U8). All tokens cleared. Without P5 a missing key is a no-op, also with the position `Lost` |
 | `Delete` | position `At k`, `k` in the set | same as for tables: position `Gone k` |
@@ -122,8 +122,8 @@ may use any of them for a read and they must agree. `OpenDup`, `OpenEphemeral` a
 ## 2c. Column order and collation
 
 Each index column has a sort order (`ASC` or `DESC`) and a collation (`BINARY`, `NOCASE` or
-`RTRIM`). The columns have no declared type, so values keep their type. The model
-knows three value types: NULL, integer and text. Evidence: SQLite `vdbeaux.c`
+`RTRIM`). The columns have no declared type, so values keep their type. The test
+model knows three value types: NULL, integer and text. Evidence: SQLite `vdbeaux.c`
 (`sqlite3VdbeRecordCompareWithSkip`, `vdbeRecordCompareDebug`) and `vdbe.c`
 (`OP_Seek*`, `OP_Idx*`, `OP_Found`), checked with a test program on SQLite 3.54.1.
 
@@ -170,9 +170,9 @@ compound selects) stores only the columns. Two keys with equal columns are the s
 **Rule.** When an op violates its precondition, a debug build of the engine panics with a
 message that starts with `unsupported: U<n>: <why>`. It must be a panic, not an error:
 an error is a defined outcome (for example "UNIQUE constraint failed") that a caller can
-handle or ignore, and a panic cannot be mistaken for one. The model storage (section 2e)
-does this. A release build may do anything (for now). The model calls the op illegal (`step` returns `None`) and the generator
-never emits it. `undefined_tests.rs` checks both sides: the model says illegal, and every
+handle or ignore, and a panic cannot be mistaken for one. The spec-model storage (section
+2e) does this. A release build may do anything (for now). The step function calls the op illegal (`step` returns `None`) and the generator
+never emits it. `undefined_tests.rs` checks both sides: the test model says illegal, and every
 engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 
 | Id | Undefined sequence | Decision |
@@ -192,24 +192,24 @@ this list. `NewRowid` is defined by a predicate (D6): any rowid that is unused a
 above every key. SQLite documents only "not previously used as a key". A column with
 AUTOINCREMENT needs a stricter rule (never below an earlier rowid); it is not modelled.
 
-## 2e. Model storage
+## 2e. Spec-model storage
 
-`core/storage/model/` is the contract in code, for debug builds. `spec.rs` is a pure step
+`core/storage/spec_model/` is the contract in code, for debug builds. `spec.rs` is a pure step
 function: a cursor shape and an opcode give the new shape and the write, or the rule of
-section 2d. `cursor.rs` is `ModelCursor`, a `CursorTrait` implementation that keeps a tree in
+section 2d. `cursor.rs` is `SpecModelCursor`, a `CursorTrait` implementation that keeps a tree in
 a sorted collection (a map for a table, a sorted list of records for an index, ordered with
 the B-tree record compare) and does no I/O. An illegal opcode panics with
 `unsupported: U<n>: ...`.
 
-**The `:model:` database.** A database opened with the path `:model:` is like `:memory:`,
-but every tree is a model tree: user tables and indexes, `sqlite_schema` (root 1), the
+**The `:spec-model:` database.** A database opened with the path `:spec-model:` is like
+`:memory:`, but every tree is a spec-model tree: user tables and indexes, `sqlite_schema` (root 1), the
 backing trees of index methods, and the ephemeral trees of `OpenEphemeral`, `OpenAutoindex`
 and `OpenDup`. A release build refuses
 the path. `Database::new` picks the storage once, from the path
 (`storage::tree_store::tree_storage_for_path`). The pager of each connection then holds a
 `TreeStore`. The opcodes that open a cursor or create, destroy or clear a tree, and the
 transaction and savepoint entry points of the pager, ask it. The VDBE has no code for the
-model: every other call goes through `CursorTrait`. The pager still allocates the root
+spec-model: every other call goes through `CursorTrait`. The pager still allocates the root
 pages, keeps the header and takes the locks.
 
 A version of the database is an immutable map from root page to tree. A read transaction
@@ -218,26 +218,26 @@ to a tree copies that tree. Commit publishes the copy, rollback drops it. A save
 the statement savepoint) keeps the copy of its start, and a rollback to it puts that copy
 back. Temp tables stay on a real B-tree: the temp database has no tree store.
 
-**The model has the WAL rules only.** One write transaction runs at a time and a read
+**The spec-model has the WAL rules only.** One write transaction runs at a time and a read
 transaction sees the version it started with. MVCC (concurrent writers, row-level
 `WriteWriteConflict`, `BEGIN CONCURRENT`) is not modelled yet. The data structure would not
 change. Only the commit rule would: check the write set against the versions published since
 the snapshot. For now `PRAGMA journal_mode = 'mvcc'` does nothing, and the sqltest tests that
-need MVCC carry `@skip-if model` or `@skip-file-if model`.
+need MVCC carry `@skip-if spec-model` or `@skip-file-if spec-model`.
 
-These features return the error `unsupported in model storage: <feature>`: `ATTACH`,
+These features return the error `unsupported in spec-model storage: <feature>`: `ATTACH`,
 `VACUUM INTO`, `WITHOUT ROWID` tables, materialized views, the page pragmas `page_count`,
 `page_size`, `freelist_count`, `max_page_count`, and the encryption pragmas. `VACUUM` does
 nothing. `PRAGMA wal_checkpoint` copies only the pages, which hold no rows. `PRAGMA
 journal_mode` with a value does not change the mode; it returns the current mode. `integrity_check` checks the empty pages and returns
-`ok`. The sqltest runner opens `:model:` with `--model-storage` (`--backend rust`), and skips
+`ok`. The sqltest runner opens `:spec-model:` with `--spec-model` (`--backend rust`), and skips
 the tests that need a pre-built database file.
 
-A process that opened a model tree prints counters (trees, cursors, steps per opcode) to
+A process that opened a spec-model tree prints counters (trees, cursors, steps per opcode) to
 stderr at exit.
 
-**What the model cursor infers.** The cursor sees only the calls of `CursorTrait`. An opcode
-can make several calls, and it can make none. The model cursor maps calls to the ops of
+**What the spec-model cursor infers.** The cursor sees only the calls of `CursorTrait`. An opcode
+can make several calls, and it can make none. The spec-model cursor maps calls to the ops of
 `spec.rs`:
 
 - `seek_to_last` starts `NewRowid`. The reads and the random seeks after it are part of it,
@@ -266,21 +266,21 @@ What the cursor cannot see, and what it costs:
 | `IdxInsert` with `NO_OP_DUPLICATE` of a duplicate | the opcode stops after the seek | the position stays on the duplicate instead of no position |
 | U1 and U2 after an eq-only seek and an insert of the same key | two readings | refused only when both readings are illegal |
 
-The undefined tests mark these cases `model_gap`: the `:model:` engine must not refuse them,
-so that a better inference shows up. Every other undefined test requires the refusal from
-the `:model:` engine.
+The undefined tests mark these cases `spec_model_gap`: the `:spec-model:` engine must not
+refuse them, so that a better inference shows up. Every other undefined test requires the
+refusal from the `:spec-model:` engine.
 
 `spec::after_peer_write` gives the shape of the other cursors after a write (section 1).
-The model storage applies it lazily, when a cursor sees that the tree version moved.
+The spec-model storage applies it lazily, when a cursor sees that the tree version moved.
 
-The test models use the same step function. They differ from the model storage only in the
+The test models use the same step function. They differ from the spec-model storage only in the
 store and the compare: a list of `(rowid, value)` and a list of `(cols, rowid)` with the
 compare of section 2c.
 
-The model storage gives `max + 1` for `NewRowid`, or 1 for an empty table. This is a choice of
-the model, not a requirement: the contract is only the predicate of D6 (unused, and above every
+The spec-model storage gives `max + 1` for `NewRowid`, or 1 for an empty table. This is a
+choice of the spec-model, not a requirement: the contract is only the predicate of D6 (unused, and above every
 key). The test models check an engine's rowid against that predicate and never against
-`max + 1`. WAL and MVCC may return different values, and both are correct. The model accepts
+`max + 1`. WAL and MVCC may return different values, and both are correct. The step function accepts
 the rowid with an append token: the next no-seek `Insert` must be above every key.
 
 ## 3. Insert seek contract
@@ -294,7 +294,7 @@ caller must have left the cursor at a `Seeked k` or `At k` position for the same
 - It is also legal when the cursor is `At k` (an update in place), and when the cursor is in
   the gap of its own `Delete` of `k` (an `UPDATE` that deletes the row and inserts it again).
   The B-tree is then at the place of `k`.
-- The model keeps a seek token for this. Any other write by any cursor on the tree
+- The step function keeps a seek token for this. Any other write by any cursor on the tree
   clears the token.
 - MVCC ignores position, so a missing token only breaks WAL. The harness runs both and
   compares them. That is how a wrong token shows up.
