@@ -1191,6 +1191,7 @@ mod tests {
     use serde_json::json;
     use std::{
         env,
+        path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         thread::sleep,
         time::{Duration, Instant},
@@ -1569,12 +1570,17 @@ mod tests {
         host: String,
         db_prefix: String,
         server: Option<Child>,
-        _sync_dir_created_by_harness: Option<TempDir>,
+        _data_dir_created_by_harness: Option<TempDir>,
         client: Client,
     }
 
     impl TursoServer {
         pub async fn new() -> Result<Self> {
+            Self::new_with_ports(std::iter::repeat_with(random_port)).await
+        }
+
+        /// Like `new`, but a local server tries the ports from `ports` in order.
+        async fn new_with_ports(ports: impl Iterator<Item = u16>) -> Result<Self> {
             let client = Client::new();
 
             if env::var("LOCAL_SYNC_SERVER").is_err() {
@@ -1611,7 +1617,7 @@ mod tests {
                     host: format!("{name}--{name}--{name}.localhost"),
                     db_prefix: String::new(),
                     server: None,
-                    _sync_dir_created_by_harness: None,
+                    _data_dir_created_by_harness: None,
                     client,
                 })
             } else {
@@ -1621,6 +1627,15 @@ mod tests {
                     .is_ok()
                     .then(|| TempDir::new().context("failed to create --sync-dir tempdir"))
                     .transpose()?;
+                let dir_mode = sync_dir.is_some();
+                // In single-database mode the server opens a file in a tempdir
+                // instead of :memory:, so that the database path it reports
+                // tells this server apart from servers of other tests.
+                let data_dir = match sync_dir {
+                    Some(dir) => dir,
+                    None => TempDir::new().context("failed to create sync database tempdir")?,
+                };
+                let data_dir_path = data_dir.path().canonicalize()?;
 
                 // The random port can be unusable: Windows runners reserve
                 // large chunks of 10_000..=65_535 for Hyper-V (bind fails with
@@ -1631,13 +1646,16 @@ mod tests {
                 // fresh port instead.
                 const SPAWN_ATTEMPTS: u32 = 10;
                 const READY_TIMEOUT: Duration = Duration::from_secs(60);
-                for attempt in 1..=SPAWN_ATTEMPTS {
-                    let port: u16 = rand::rng().random_range(10_000..=65_535);
-
+                for (attempt, port) in (1..=SPAWN_ATTEMPTS).zip(ports) {
                     let mut args = vec!["--sync-server".to_string(), format!("0.0.0.0:{port}")];
-                    if let Some(dir) = &sync_dir {
+                    if dir_mode {
                         args.push("--sync-dir".to_string());
-                        args.push(dir.path().to_string_lossy().into_owned());
+                        args.push(data_dir.path().to_string_lossy().into_owned());
+                    } else {
+                        // One file per port: a child of an earlier attempt
+                        // can still hold its file open.
+                        let db_path = data_dir.path().join(format!("{port}.db"));
+                        args.push(db_path.to_string_lossy().into_owned());
                     }
 
                     // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
@@ -1658,21 +1676,42 @@ mod tests {
                     let started = Instant::now();
                     loop {
                         if client.get(&user_url).send().await.is_ok() {
-                            let db_prefix = if sync_dir.is_some() {
+                            let db_prefix = if dir_mode {
                                 format!("/db/{}", random_str().to_ascii_lowercase())
                             } else {
                                 String::new()
                             };
                             let db_url = format!("{user_url}{db_prefix}");
-                            return Ok(Self {
+                            let mut server = Self {
                                 user_url,
                                 db_url,
                                 host: String::new(),
                                 db_prefix,
                                 server: Some(child),
-                                _sync_dir_created_by_harness: sync_dir,
-                                client,
-                            });
+                                _data_dir_created_by_harness: None,
+                                client: client.clone(),
+                            };
+                            // When a server of another test already listens on
+                            // the port, it answers the GET above and the child
+                            // fails to bind and exits. Accept the server only
+                            // if its database is in this harness's directory.
+                            match server.main_db_file().await {
+                                Ok(file) if file.starts_with(&data_dir_path) => {
+                                    server._data_dir_created_by_harness = Some(data_dir);
+                                    return Ok(server);
+                                }
+                                Ok(file) => eprintln!(
+                                    "port {port} is served by another sync server with \
+                                     database {} (attempt {attempt}/{SPAWN_ATTEMPTS})",
+                                    file.display()
+                                ),
+                                Err(err) => eprintln!(
+                                    "cannot get the database of the sync server on port \
+                                     {port}: {err} (attempt {attempt}/{SPAWN_ATTEMPTS})"
+                                ),
+                            }
+                            // Dropping the server kills the child.
+                            break;
                         }
                         match child
                             .try_wait()
@@ -1709,6 +1748,20 @@ mod tests {
 
         pub fn db_url(&self) -> &str {
             &self.db_url
+        }
+
+        /// Returns the canonical path of the file that holds the main
+        /// database of the server.
+        async fn main_db_file(&self) -> Result<PathBuf> {
+            let rows = self.db_sql("PRAGMA database_list").await?;
+            let file = rows
+                .iter()
+                .find_map(|row| match row.as_slice() {
+                    [_, Value::Text(name), Value::Text(file)] if name == "main" => Some(file),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow!("no main database in {rows:?}"))?;
+            Ok(Path::new(file).canonicalize()?)
         }
 
         pub async fn db_sql(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
@@ -1767,6 +1820,10 @@ mod tests {
                 let _ = child.kill();
             }
         }
+    }
+
+    fn random_port() -> u16 {
+        rand::rng().random_range(10_000..=65_535)
     }
 
     async fn all_rows(mut rows: Rows) -> Result<Vec<Vec<Value>>> {
@@ -1912,6 +1969,19 @@ mod tests {
                 db.push().await.unwrap();
             }
         });
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_server_skips_a_port_served_by_another_server() {
+        let other = TursoServer::new().await.unwrap();
+        other.db_sql("CREATE TABLE t(x)").await.unwrap();
+        let other_port: u16 = other.user_url.rsplit(':').next().unwrap().parse().unwrap();
+
+        let ports = std::iter::once(other_port).chain(std::iter::repeat_with(random_port));
+        let server = TursoServer::new_with_ports(ports).await.unwrap();
+        assert_ne!(server.db_url(), other.db_url());
+        // The database of the new server is empty.
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
     }
 
     fn run_with_deadline<F, Fut>(worker_threads: usize, deadline: Duration, test: F)
