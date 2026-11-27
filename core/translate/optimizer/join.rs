@@ -393,10 +393,26 @@ pub(super) fn count_subquery_calls_for_plan(
                     .enumerate()
                     .skip(loop_index + 1)
                 {
+                    // A loop computes its seek keys before it reads a row, so
+                    // the subquery must run before a loop whose table a term
+                    // with the subquery constrains.
+                    let later_table_number = plan.data[later_loop].0;
+                    if constraints[later_table_number]
+                        .constraints
+                        .iter()
+                        .any(|constraint| {
+                            expr_references_subquery_id(
+                                &where_clause[constraint.where_clause_pos.0].expr,
+                                subquery_id,
+                            )
+                        })
+                    {
+                        break;
+                    }
                     // A semi/anti join loop cannot host the filter: inside an
                     // anti join loop, a failed filter looks like a missing
                     // match, which emits the outer row instead of rejecting it.
-                    let later_table = &joined_tables[plan.data[later_loop].0];
+                    let later_table = &joined_tables[later_table_number];
                     if later_table
                         .join_info
                         .as_ref()

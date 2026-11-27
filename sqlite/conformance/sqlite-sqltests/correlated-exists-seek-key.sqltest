@@ -1,0 +1,90 @@
+@database :memory:
+
+# A correlated EXISTS in a term that gives the seek key of a later loop must
+# run before that loop seeks. Here the scalar subquery on the left becomes a
+# grouped temporary index that the loop of o searches, and the EXISTS is part
+# of the search key.
+
+setup schema {
+    CREATE TABLE p (a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT, z TEXT, w INTEGER);
+    INSERT INTO t VALUES(331253, 'Xv', 'tA', -133126);
+}
+
+@setup schema
+test correlated-exists-seek-key-between {
+    SELECT 'q1' FROM t AS o
+    WHERE (SELECT AVG(y) FROM t AS i WHERE o.x = i.x)
+          BETWEEN (EXISTS (SELECT a FROM p WHERE p.a = o.w)) AND o.x;
+}
+expect {
+    q1
+}
+
+@setup schema
+test correlated-exists-seek-key-in-lower-bound {
+    SELECT 'q2' FROM t AS o
+    WHERE (SELECT AVG(y) FROM t AS i WHERE o.x = i.x)
+          BETWEEN o.z IN (EXISTS (SELECT a FROM p WHERE p.a = o.w AND o.y = p.b)) AND o.x;
+}
+expect {
+    q2
+}
+
+# The query from the differential fuzzer.
+@setup schema
+test correlated-exists-seek-key-fuzzer {
+    SELECT DISTINCT 587003.6675367993 AS expr0, CAST(- 718444 AS REAL) AS expr1
+    FROM t AS o
+    WHERE (SELECT AVG(y) FROM t AS i WHERE o.x = i.x)
+          BETWEEN o.z IN (EXISTS (SELECT a FROM p WHERE p.a = o.w AND o.y = p.b)) AND o.x
+    ORDER BY w ASC;
+}
+expect {
+    587003.667536799|-718444.0
+}
+
+setup rows {
+    CREATE TABLE p (a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT, z TEXT, w INTEGER);
+    INSERT INTO p VALUES(1, 'a'), (3, 'c');
+    INSERT INTO t VALUES(1, '1', 'a', 1), (2, '2', 'b', 2), (3, 'x', 'c', 3), (4, NULL, 'd', 4);
+}
+
+@setup rows
+test correlated-exists-seek-key-between-rows {
+    SELECT o.x FROM t AS o
+    WHERE (SELECT AVG(y) FROM t AS i WHERE o.x = i.x)
+          BETWEEN (EXISTS (SELECT a FROM p WHERE p.a = o.w)) AND o.x
+    ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+@setup rows
+test correlated-not-exists-seek-key-between-rows {
+    SELECT o.x FROM t AS o
+    WHERE (SELECT AVG(y) FROM t AS i WHERE o.x = i.x)
+          BETWEEN (NOT EXISTS (SELECT a FROM p WHERE p.a = o.w)) AND o.x
+    ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup rows
+test correlated-not-exists-seek-key-range-rows {
+    SELECT o.x FROM t AS o
+    WHERE (SELECT AVG(y) FROM t AS i WHERE o.x = i.x) >= (NOT EXISTS (SELECT a FROM p WHERE p.a = o.w))
+      AND (SELECT AVG(y) FROM t AS i WHERE o.x = i.x) <= o.x
+    ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
