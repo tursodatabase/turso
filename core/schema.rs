@@ -4633,7 +4633,9 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let (namespace, trigger_name) = self.demangle_name(name);
-                let trigger_name = trigger_name.to_string();
+                // The schema row keeps the case that CREATE TRIGGER gave the
+                // name. The schema looks up triggers by normalized name.
+                let trigger_name = normalize_ident(trigger_name);
                 if !namespace.is_root() {
                     self.add_namespace_of_object(namespace);
                 }

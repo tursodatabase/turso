@@ -782,7 +782,9 @@ fn emit_drop_view_row(
     });
     program.preassign_label_to_next_insn(loop_start_label);
 
-    // Column 0 is type, column 1 is name.
+    // Column 0 is type, column 1 is name. The name column keeps the case
+    // that CREATE VIEW gave the name, so compare it without case, as the
+    // deletes of the rows of tables and indexes do.
     let col0_reg = program.alloc_register();
     let col1_reg = program.alloc_register();
 
@@ -803,7 +805,7 @@ fn emit_drop_view_row(
         rhs: view_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
@@ -922,6 +924,7 @@ fn emit_delete_trigger_row(
         collation: CollationSeq::for_internal_values(),
     });
 
+    // The name column keeps the case that CREATE TRIGGER gave the name.
     let trigger_name_str_reg =
         program.emit_string8_new_reg(ctx.resolver.mangle_name(namespace, trigger.name));
     program.emit_insn(Insn::Ne {
@@ -929,7 +932,7 @@ fn emit_delete_trigger_row(
         rhs: trigger_name_str_reg,
         target_pc: skip_non_trigger_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NOCASE,
     });
 
     program.emit_insn(Insn::Delete {

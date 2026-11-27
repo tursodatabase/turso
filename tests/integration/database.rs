@@ -273,6 +273,82 @@ fn test_open_file_with_wrong_argument_count_in_schema() {
     }
 }
 
+/// The type, name and tbl_name of each row of sqlite_schema, read by SQLite.
+fn sqlite_schema_rows(path: &std::path::Path) -> Vec<(String, String, String)> {
+    let sqlite = rusqlite::Connection::open(path).unwrap();
+    let mut stmt = sqlite
+        .prepare("SELECT type, name, tbl_name FROM sqlite_schema ORDER BY rowid")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn sqlite_integrity_check(path: &std::path::Path) -> String {
+    let sqlite = rusqlite::Connection::open(path).unwrap();
+    sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// SQLite keeps the case that CREATE gave a name in the name and tbl_name
+/// columns of sqlite_schema. The tbl_name of a trigger is the table name as
+/// CREATE TRIGGER wrote it. Turso must find these rows when it drops or
+/// renames the objects.
+#[test]
+fn test_drop_and_rename_objects_of_sqlite_file_with_mixed_case_names() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("mixed_case.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            r#"CREATE TABLE "MixedCase"(a UNIQUE, b);
+               CREATE INDEX "MyIdx" ON mixedcase(b);
+               CREATE VIEW "MyView" AS SELECT a FROM "MixedCase";
+               CREATE TRIGGER "MyTrig" AFTER INSERT ON MIXEDCASE BEGIN SELECT 1; END;
+               CREATE TABLE "Other"(x UNIQUE);
+               CREATE TRIGGER "OtherTrig" AFTER INSERT ON OTHER BEGIN SELECT 1; END;
+               CREATE TABLE "Kept"(y);
+               CREATE TRIGGER "KeptTrig" AFTER INSERT ON "Kept" BEGIN SELECT 1; END;"#,
+        )
+        .unwrap();
+    drop(sqlite);
+
+    {
+        let db = crate::common::TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("DROP INDEX myidx").unwrap();
+        conn.execute("DROP VIEW myview").unwrap();
+        conn.execute("DROP TRIGGER mytrig").unwrap();
+        conn.execute("DROP TABLE OTHER").unwrap();
+        conn.execute("ALTER TABLE mixedcase RENAME TO newname")
+            .unwrap();
+        conn.execute("ALTER TABLE newname ADD COLUMN c").unwrap();
+        conn.execute("DROP TRIGGER KEPTTRIG").unwrap();
+        conn.execute("DROP TABLE kept").unwrap();
+    }
+
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        sqlite_schema_rows(&path),
+        vec![
+            (s("table"), s("newname"), s("newname")),
+            (s("index"), s("sqlite_autoindex_newname_1"), s("newname")),
+        ]
+    );
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let columns: i64 = sqlite
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('newname')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 3);
+    assert_eq!(sqlite_integrity_check(&path), "ok");
+}
+
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///

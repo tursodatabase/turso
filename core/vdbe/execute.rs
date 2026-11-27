@@ -11148,20 +11148,28 @@ pub fn op_function(
                     // Only the renamed table's own automatic indexes embed its
                     // name. Another table can share the prefix (`t` and `t_x`),
                     // so its `sqlite_autoindex_t_x_1` must stay untouched.
+                    // The old name comes from the statement, so compare it
+                    // with the `name` and `tbl_name` columns without case,
+                    // as SQLite does (`tbl_name=%Q COLLATE nocase` in
+                    // alter.c).
                     let renamed_autoindex = if normalize_ident(&tbl_name) == rename_from {
-                        crate::util::renamed_automatic_index_name(&name, &rename_from, &rename_to)
+                        crate::util::renamed_automatic_index_name(
+                            &normalize_ident(&name),
+                            &rename_from,
+                            &rename_to,
+                        )
                     } else {
                         None
                     };
                     let new_name = if let Some(index_name) = renamed_autoindex {
                         index_name
-                    } else if name == rename_from {
+                    } else if normalize_ident(&name) == rename_from {
                         rename_to.clone()
                     } else {
                         name
                     };
 
-                    let new_tbl_name = if tbl_name == rename_from {
+                    let new_tbl_name = if normalize_ident(&tbl_name) == rename_from {
                         rename_to.clone()
                     } else {
                         tbl_name
