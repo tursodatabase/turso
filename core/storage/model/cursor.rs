@@ -6,7 +6,7 @@
 //! starts. The calls inside that opcode are answered from the tree without a spec step, and
 //! the opcode is one spec step when it ends.
 
-use super::spec::{self, Op, Outcome, Pos, Shape, Token, Tree, Write};
+use super::spec::{self, Outcome, Pos, Tree, Write};
 use super::stats;
 use crate::storage::btree::{BTreeKey, CursorOpcode, CursorStep, CursorTrait};
 use crate::storage::pager::Pager;
@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
 /// The key of an entry: the rowid of a table row, or the whole record of an index entry.
 /// A seek key of an index is a record too, and can be shorter than an entry.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum Key {
     Rowid(i64),
     Record(ImmutableRecord),
@@ -53,18 +53,19 @@ enum Rows {
 /// A tree that a cursor and its `OpenDup` copies share.
 struct SharedTree {
     rows: Rows,
-    /// Goes up by one at each write. A cursor that saw an older value lost its position.
+    /// Goes up by one at each write. A cursor that saw an older value must catch up.
     version: u64,
-    /// The last write was a clear: the other cursors are at the end, not lost.
-    cleared_last: bool,
+    /// The version of the last clear, or 0.
+    last_clear: u64,
 }
+
+type Shape = spec::Shape<Key, Key>;
+type Op = spec::Op<Key, Key>;
 
 /// What the cursor knows about the opcode that runs now.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Pending {
     None,
-    /// The next seek is the seek of `Found`, `NotFound` or `NoConflict`.
-    Found,
     /// `NewRowid`: it reads the last rowid with `seek_to_last`, `rowid` and `next`.
     NewRowid,
     Insert {
@@ -79,7 +80,7 @@ enum Pending {
 impl Pending {
     /// The cursor calls of these opcodes are not opcodes of their own.
     fn is_internal(self) -> bool {
-        !matches!(self, Pending::None | Pending::Found)
+        self != Pending::None
     }
 }
 
@@ -95,7 +96,7 @@ pub struct ModelCursor {
     root: i64,
     /// The tree version after the last op of this cursor.
     seen: u64,
-    shape: Shape<Key>,
+    shape: Shape,
     pending: Pending,
     /// Where the calls inside a pending opcode put the cursor.
     scratch: Option<Key>,
@@ -140,7 +141,7 @@ impl ModelCursor {
         let tree = SharedTree {
             rows,
             version: 0,
-            cleared_last: false,
+            last_clear: 0,
         };
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -157,7 +158,7 @@ impl ModelCursor {
     }
 
     /// One spec step. An illegal op panics with `unsupported: U<n>: ...`.
-    fn run(&mut self, op: Op<Key>, value: Option<&ImmutableRecord>) -> bool {
+    fn run(&mut self, op: Op, value: Option<&ImmutableRecord>) -> bool {
         self.catch_up();
         stats::step(op.name());
         if self.recent.len() == RECENT {
@@ -187,36 +188,17 @@ impl ModelCursor {
         hit
     }
 
-    /// After a write by another cursor the position is lost (U9), or at the end after a clear.
-    /// With `TURSO_MODEL_PEER_RESTORE=1` the cursor keeps its position by key instead, like
-    /// SQLite's saved cursors, so that a run can go on past U9 and show the sequences after it.
+    /// After writes by other cursors the cursor keeps its position by key, or is at the end
+    /// after a clear (`spec::after_peer_write`).
     fn catch_up(&mut self) {
         let tree = self.tree.read();
         if self.seen == tree.version {
             return;
         }
+        let cleared = tree.last_clear > self.seen;
+        self.shape = spec::after_peer_write(&tree.rows, &self.shape, cleared);
         self.seen = tree.version;
         self.record = None;
-        if tree.cleared_last {
-            self.shape = Shape::ended();
-            return;
-        }
-        if super::peer_restore() {
-            let pos = match &self.shape.pos {
-                Pos::At(k) | Pos::Gone(k) if tree.rows.contains(k) => Pos::At(k.clone()),
-                Pos::At(k) | Pos::Gone(k) => Pos::Gone(k.clone()),
-                Pos::Invalid => Pos::Invalid,
-                Pos::Lost => Pos::Lost,
-                _ => Pos::Stale,
-            };
-            self.shape = Shape {
-                pos,
-                token: Token::None,
-                ..self.shape.clone()
-            };
-            return;
-        }
-        self.shape = Shape::stale();
     }
 
     /// The opcode noted before ended without the call that finishes it: an `IdxInsert` that
@@ -225,12 +207,18 @@ impl ModelCursor {
         let pending = std::mem::replace(&mut self.pending, Pending::None);
         let scratch = self.scratch.take();
         match pending {
-            Pending::None | Pending::Found | Pending::NewRowid => {}
+            Pending::None | Pending::NewRowid => {}
             Pending::IdxInsert { .. } => {
                 self.run(Op::InsertNoop, None);
             }
             Pending::IdxDelete => {
-                self.run(Op::IdxDelete(None), None);
+                self.run(
+                    Op::IdxDelete {
+                        key: None,
+                        must_exist: false,
+                    },
+                    None,
+                );
             }
             Pending::Insert { use_seek } => {
                 // The no-op check of an UPDATE found the same bytes and skipped the write.
@@ -265,13 +253,15 @@ impl ModelCursor {
     fn seek_key(&mut self, key: Key, op: SeekOp) -> SeekResult {
         self.catch_up();
         let hit = match self.pending {
-            Pending::Found => {
-                self.pending = Pending::None;
-                self.run(Op::Found(key), None)
-            }
             p if p.is_internal() => {
                 self.scratch = self.tree.read().rows.seek(&key, op);
                 self.scratch.is_some()
+            }
+            // On an index an eq-only `SeekGE` is also the seek of `Found`, `NotFound` and
+            // `NoConflict`: the model cannot tell them apart, so it gives every such seek the
+            // rules of `Found`.
+            _ if matches!(key, Key::Record(_)) && op == (SeekOp::GE { eq_only: true }) => {
+                self.run(Op::Found(key), None)
             }
             _ => self.run(Op::Seek(key, op), None),
         };
@@ -283,7 +273,7 @@ impl ModelCursor {
     }
 
     /// `Next` and `Prev` as one opcode.
-    fn advance(&mut self, op: Op<Key>) -> CursorStep {
+    fn advance(&mut self, op: Op) -> CursorStep {
         self.finish_pending();
         self.run(op, None);
         if self.shape.on_entry() {
@@ -301,7 +291,9 @@ impl ModelCursor {
 impl SharedTree {
     fn apply(&mut self, w: Write<Key>, value: Option<&ImmutableRecord>) {
         self.version += 1;
-        self.cleared_last = matches!(w, Write::Clear);
+        if matches!(w, Write::Clear) {
+            self.last_clear = self.version;
+        }
         match (&mut self.rows, w) {
             (Rows::Table(map), Write::Put(Key::Rowid(r))) => {
                 // No value: an `Insert` that kept the same bytes.
@@ -359,6 +351,7 @@ fn rowid_of(key: &Key) -> i64 {
 
 impl Tree for Rows {
     type Key = Key;
+    type Probe = Key;
 
     fn first(&self) -> Option<Key> {
         match self {
@@ -446,21 +439,6 @@ impl Tree for Rows {
                 let k = record_of(k);
                 rows.iter()
                     .any(|s| cmp(info, s, k, Ordering::Equal).is_eq())
-            }
-        }
-    }
-
-    fn single_match(&self, key: &Key) -> bool {
-        match self {
-            Rows::Table(_) => true,
-            Rows::Index(info, _) => {
-                if !info.is_unique {
-                    return false;
-                }
-                let n = info.num_cols - usize::from(info.has_rowid);
-                let key = record_of(key);
-                let values = key.get_values().expect("model: a key record is readable");
-                values.len() >= n && values[..n].iter().all(|v| !matches!(v, ValueRef::Null))
             }
         }
     }
@@ -591,7 +569,13 @@ impl CursorTrait for ModelCursor {
         if self.pending == Pending::IdxDelete {
             self.pending = Pending::None;
             let key = self.scratch.take();
-            self.run(Op::IdxDelete(key), None);
+            self.run(
+                Op::IdxDelete {
+                    key,
+                    must_exist: false,
+                },
+                None,
+            );
         } else {
             self.finish_pending();
             self.run(Op::Delete, None);
@@ -709,10 +693,7 @@ impl CursorTrait for ModelCursor {
     fn note_opcode(&mut self, op: CursorOpcode) {
         self.finish_pending();
         match op {
-            CursorOpcode::Found | CursorOpcode::NoConflict { has_null: false } => {
-                self.pending = Pending::Found;
-            }
-            CursorOpcode::NoConflict { has_null: true } => {
+            CursorOpcode::NoConflictNull => {
                 self.run(Op::NoConflictNull, None);
             }
             CursorOpcode::NewRowid => {

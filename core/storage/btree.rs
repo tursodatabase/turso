@@ -721,17 +721,14 @@ impl CursorStep {
 }
 
 /// An opcode that is about to call a cursor. Some facts of the cursor contract belong to the
-/// opcode and not to the cursor calls: `Found` and an eq-only `SeekGE` make the same `seek`
-/// call. Debug builds tell the cursor with [CursorTrait::note_opcode].
+/// opcode and not to the cursor calls: `IdxInsert` makes a seek, a read and an insert, and
+/// `NoConflict` with a NULL makes no call. Debug builds tell the cursor with
+/// [CursorTrait::note_opcode].
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorOpcode {
-    /// `Found` or `NotFound`.
-    Found,
-    /// `NoConflict`. With a NULL in the key it jumps and does not seek.
-    NoConflict {
-        has_null: bool,
-    },
+    /// `NoConflict` with a NULL in the key: it jumps and does not seek.
+    NoConflictNull,
     NewRowid,
     /// `Insert`. Without `REQUIRE_SEEK` it does not seek.
     Insert {

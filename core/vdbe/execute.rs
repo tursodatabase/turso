@@ -13627,15 +13627,9 @@ pub fn op_no_conflict(
                     }),
                 };
 
-                #[cfg(debug_assertions)]
-                note_cursor_opcode(
-                    state,
-                    *cursor_id,
-                    CursorOpcode::NoConflict {
-                        has_null: contains_nulls,
-                    },
-                );
                 if contains_nulls {
+                    #[cfg(debug_assertions)]
+                    note_cursor_opcode(state, *cursor_id, CursorOpcode::NoConflictNull);
                     state.pc = target_pc.as_offset_int();
                     state.active_op_state.clear();
                     return Ok(InsnFunctionStepResult::Step);
@@ -16768,8 +16762,6 @@ pub fn op_found(
     };
 
     let not = matches!(insn, Insn::NotFound { .. });
-    #[cfg(debug_assertions)]
-    note_cursor_opcode(state, *cursor_id, CursorOpcode::Found);
 
     let record_source = if *num_regs == 0 {
         RecordSource::Packed {
