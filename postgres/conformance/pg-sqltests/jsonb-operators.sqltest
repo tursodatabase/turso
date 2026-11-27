@@ -9,6 +9,11 @@
 
 @database :memory:
 
+setup t_id_s_n_arr_ia_j_ok_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
+    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
+}
+
 setup items_with_jsonb_rows {
     CREATE TABLE items (id int PRIMARY KEY, data jsonb);
     INSERT INTO items VALUES
@@ -718,6 +723,14 @@ test of-a-json-boolean-is-the-text-true {
 }
 expect {
     true|f
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test jsonb-arrow-key-output {
+    SELECT j -> 'a' FROM t WHERE id = 1;
+}
+expect {
+    {"b": 1}
 }
 
 # Known differences of @> and <@

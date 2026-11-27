@@ -303,15 +303,6 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-39: jsonb -> key output
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test jsonb-arrow-key-output {
-    SELECT j -> 'a' FROM t WHERE id = 1;
-}
-expect {
-    {"b": 1}
-}
-
 # B-40: jsonb ->> key output
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test jsonb-double-arrow-key-output {
