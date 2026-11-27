@@ -87,13 +87,21 @@ enum RewindState {
 enum NextState {
     AdvanceUnitialized,
     CheckNeedsAdvance,
-    Advance,
+    /// Advance the B-tree side if `btree`, then the MVCC side if `mvcc`.
+    Advance {
+        mvcc: bool,
+        btree: bool,
+    },
 }
 #[derive(Debug, Clone, Copy)]
 enum PrevState {
     AdvanceUnitialized,
     CheckNeedsAdvance,
-    Advance,
+    /// Advance the B-tree side if `btree`, then the MVCC side if `mvcc`.
+    Advance {
+        mvcc: bool,
+        btree: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1525,10 +1533,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             if matches!(self.current_pos, CursorPosition::BeforeFirst) {
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
-                    // Initialize MVCC iterator and get first peek
-                    self.mvcc_peek_epoch = self.mvcc_rows_epoch();
-                    self.init_mvcc_iterator_forward()?;
-                    self.advance_mvcc_iterator();
                     self.state
                         .replace(MvccLazyCursorState::Next(NextState::AdvanceUnitialized));
                 } else {
@@ -1548,6 +1552,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccLazyCursorState::Next(NextState::AdvanceUnitialized)
         ) {
             return_if_io!(self.advance_btree_forward());
+            // Initialize MVCC iterator and get first peek, after the B-tree
+            // advance, for the reason given at the end of this function.
+            self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+            self.init_mvcc_iterator_forward()?;
+            self.advance_mvcc_iterator();
             self.state
                 .replace(MvccLazyCursorState::Next(NextState::CheckNeedsAdvance));
         }
@@ -1586,24 +1595,32 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 }
             };
 
-            // Advance cursors as needed and update peek state
-            let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Forwards)?;
-            if need_advance_mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
-                self.advance_mvcc_iterator();
-            }
-            let need_advance_btree = need_advance_btree || self.btree_peek_is_shadowed()?;
-            if need_advance_btree && !self.dual_peek.btree_exhausted() {
-                self.state
-                    .replace(MvccLazyCursorState::Next(NextState::Advance));
+            let need_advance_btree = (need_advance_btree || self.btree_peek_is_shadowed()?)
+                && !self.dual_peek.btree_exhausted();
+            self.state
+                .replace(MvccLazyCursorState::Next(NextState::Advance {
+                    mvcc: need_advance_mvcc,
+                    btree: need_advance_btree,
+                }));
+            if need_advance_btree {
                 inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance);
             }
         }
 
-        if matches!(
-            self.state.as_ref().expect("next state is not initialized"),
-            MvccLazyCursorState::Next(NextState::Advance)
-        ) {
+        let Some(MvccLazyCursorState::Next(NextState::Advance { mvcc, btree })) = self.state else {
+            panic!("invalid next state: {:?}", self.state);
+        };
+        if btree {
             return_if_io!(self.advance_btree_forward());
+        }
+        // The MVCC side moves after the B-tree side, in the same call as the
+        // merge of the two peeks. The B-tree advance can stop for I/O, and
+        // during the stop this connection can change MVCC rows, for example
+        // with ROLLBACK TO. An MVCC peek taken before the stop can be a row
+        // that is gone.
+        let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Forwards)?;
+        if mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
+            self.advance_mvcc_iterator();
         }
 
         self.refresh_current_position(IterationDirection::Forwards);
@@ -1677,24 +1694,28 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 }
             };
 
-            // Advance cursors as needed and update peek state
-            let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Backwards)?;
-            if need_advance_mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
-                self.advance_mvcc_iterator();
-            }
-            let need_advance_btree = need_advance_btree || self.btree_peek_is_shadowed()?;
-            if need_advance_btree && !self.dual_peek.btree_exhausted() {
-                self.state
-                    .replace(MvccLazyCursorState::Prev(PrevState::Advance));
+            let need_advance_btree = (need_advance_btree || self.btree_peek_is_shadowed()?)
+                && !self.dual_peek.btree_exhausted();
+            self.state
+                .replace(MvccLazyCursorState::Prev(PrevState::Advance {
+                    mvcc: need_advance_mvcc,
+                    btree: need_advance_btree,
+                }));
+            if need_advance_btree {
                 inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance);
             }
         }
 
-        if matches!(
-            self.state.as_ref().expect("prev state is not initialized"),
-            MvccLazyCursorState::Prev(PrevState::Advance)
-        ) {
+        let Some(MvccLazyCursorState::Prev(PrevState::Advance { mvcc, btree })) = self.state else {
+            panic!("invalid prev state: {:?}", self.state);
+        };
+        if btree {
             return_if_io!(self.advance_btree_backward());
+        }
+        // The MVCC side moves after the B-tree side, as in next().
+        let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Backwards)?;
+        if mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
+            self.advance_mvcc_iterator();
         }
         self.refresh_current_position(IterationDirection::Backwards);
         self.invalidate_record();

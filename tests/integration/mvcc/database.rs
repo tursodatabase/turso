@@ -6913,6 +6913,104 @@ fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
     }
 }
 
+/// A scan that stops inside a step, at `point`, must follow a `ROLLBACK TO` of
+/// its own transaction that runs on the same connection during the stop. Rows
+/// 10, 30 and 50 are in the B-tree. The rolled-back rows (20 and 40) are in
+/// MVCC memory only: they are not returned, and the scan does not end early.
+#[test]
+fn test_scan_stopped_inside_step_follows_rollback_to() {
+    for (scan_sql, savepoint_rows, rows_before_stop, point, expected) in [
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            "(20,1),(40,1)",
+            1,
+            CursorYieldPoint::NextBtreeAdvance,
+            vec![10, 30, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            "(20,1),(40,1)",
+            1,
+            CursorYieldPoint::AdvanceBtreeForwardProgress,
+            vec![10, 30, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k >= 1",
+            "(20,1),(40,1)",
+            1,
+            CursorYieldPoint::NextBtreeAdvance,
+            vec![10, 30, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1 ORDER BY id DESC",
+            "(20,1),(40,1)",
+            1,
+            CursorYieldPoint::PrevBtreeAdvance,
+            vec![50, 30, 10],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1 ORDER BY id DESC",
+            "(20,1),(40,1)",
+            1,
+            CursorYieldPoint::AdvanceBtreeBackwardProgress,
+            vec![50, 30, 10],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k <= 1 ORDER BY k DESC",
+            "(20,1),(40,1)",
+            1,
+            CursorYieldPoint::PrevBtreeAdvance,
+            vec![50, 30, 10],
+        ),
+        (
+            "SELECT id FROM t NOT INDEXED ORDER BY id DESC",
+            "(20,1),(40,1)",
+            1,
+            CursorYieldPoint::PrevBtreeAdvance,
+            vec![50, 30, 10],
+        ),
+    ] {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_k ON t(k)").unwrap();
+        conn.execute("INSERT INTO t VALUES (10,1),(30,1),(50,1)")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES {savepoint_rows}"))
+            .unwrap();
+
+        let mut scan = conn.prepare(scan_sql).unwrap();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut stopped = false;
+        loop {
+            if !stopped && ids.len() == rows_before_stop {
+                conn.set_yield_injector(Some(FixedYieldInjector::new([point.point()])));
+                let result = scan.step().unwrap();
+                conn.set_yield_injector(None);
+                assert!(
+                    matches!(result, StepResult::Yield),
+                    "{scan_sql} {point:?}: {result:?}"
+                );
+                conn.execute("ROLLBACK TO s").unwrap();
+                stopped = true;
+            }
+            match scan.step().unwrap() {
+                StepResult::Row => ids.push(scan.row().unwrap().get::<i64>(0).unwrap()),
+                StepResult::IO => scan.get_pager().io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        assert_eq!(ids, expected, "{scan_sql} {point:?}");
+    }
+}
+
 /// Steps `scan_sql` on `conn` and runs `write_sql` on `writer` once the scan has
 /// returned `rows_before_write` rows. Returns the rows, with columns joined by `|`.
 fn scan_with_write_after_rows(
