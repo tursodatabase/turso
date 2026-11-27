@@ -127,6 +127,8 @@ pub enum ExtFunc {
         /// Whether a call also gets the type name of each argument, such as
         /// `boolean[]`, as one more text argument per argument, after them.
         receives_argument_types: bool,
+        /// Types to which the dialect converts arguments before the call.
+        parameter_types: Option<&'static [&'static str]>,
         /// FIXME(pg-catalog): HACK. Set only by
         /// `ExternalFunc::checking_argument_types`, for
         /// pg_timestamp_plus_interval and date_trunc. Called at compile time
@@ -203,6 +205,15 @@ impl ExtFunc {
             Self::Scalar { argc, .. }
             | Self::Aggregate { argc, .. }
             | Self::NativeAggregate { argc, .. } => vec![*argc],
+        }
+    }
+
+    pub fn parameter_types(&self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::NativeScalar {
+                parameter_types, ..
+            } => *parameter_types,
+            _ => None,
         }
     }
 

@@ -1,9 +1,9 @@
 use crate::{turso_debug_assert, types::AsValueRef, Value, ValueRef};
 
 pub mod decimal;
-pub mod nonnan;
+pub mod double;
 
-use nonnan::NonNan;
+use double::Double;
 
 // TODO: Remove when https://github.com/rust-lang/libs-team/issues/230 is available
 trait SaturatingShl {
@@ -43,7 +43,7 @@ impl SaturatingShr for i64 {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Numeric {
     Integer(i64),
-    Float(NonNan),
+    Float(Double),
 }
 
 impl Numeric {
@@ -253,14 +253,7 @@ impl Ord for Numeric {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
             (Numeric::Integer(a), Numeric::Integer(b)) => a.cmp(b),
-            (Numeric::Float(a), Numeric::Float(b)) => {
-                let fa: f64 = (*a).into();
-                let fb: f64 = (*b).into();
-                // NonNan guarantees no NaN, so partial_cmp always returns Some.
-                // SQLite's float-vs-float uses raw IEEE 754 < and > operators,
-                // which both return false for NaN, resulting in "equal".
-                fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
-            }
+            (Numeric::Float(a), Numeric::Float(b)) => a.cmp(b),
             (Numeric::Integer(int), Numeric::Float(float)) => {
                 sqlite_int_float_cmp(*int, f64::from(*float))
             }
@@ -273,14 +266,13 @@ impl Ord for Numeric {
 
 /// Compare an integer and a float following SQLite semantics.
 ///
-/// SQLite treats NaN as NULL, so int > NaN. In practice, NonNan prevents NaN
-/// from appearing in Numeric::Float, but we check defensively.
+/// NaN is greater than every number, as PostgreSQL orders it. SQLite never
+/// holds a NaN, so its comparisons do not reach this case.
 ///
 /// See sqlite3IntFloatCompare in src/vdbeaux.c.
 fn sqlite_int_float_cmp(int_val: i64, float_val: f64) -> std::cmp::Ordering {
     if float_val.is_nan() {
-        // NaN is treated as NULL; all integers are greater than NULL
-        return std::cmp::Ordering::Greater;
+        return std::cmp::Ordering::Less;
     }
 
     if float_val < -9_223_372_036_854_775_808.0 {
@@ -569,10 +561,10 @@ pub fn str_to_i64_checked(input: impl AsRef<str>) -> Result<i64, IntOverflow> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum StrToF64 {
-    Fractional(NonNan),
-    Decimal(NonNan),
-    FractionalPrefix(NonNan),
-    DecimalPrefix(NonNan),
+    Fractional(Double),
+    Decimal(Double),
+    FractionalPrefix(Double),
+    DecimalPrefix(Double),
 }
 
 impl From<StrToF64> for f64 {
@@ -736,8 +728,8 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         }
     }
 
-    let result = NonNan::new(f64::from(result) * sign)
-        .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
+    let result = Double::non_nan(f64::from(result) * sign)
+        .unwrap_or_else(|| Double::non_nan(sign * f64::INFINITY).unwrap());
 
     if !valid_exponent || pos < input.len() {
         if is_fractional {
@@ -803,7 +795,7 @@ enum FloatParts {
 
 fn decompose_float(v: f64, precision: usize) -> FloatParts {
     if v.is_nan() {
-        return FloatParts::Special("".to_string());
+        return FloatParts::Special("NaN".to_string());
     }
 
     if v.is_infinite() {

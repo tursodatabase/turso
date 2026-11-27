@@ -7486,6 +7486,7 @@ dependencies = [
  "turso_macros",
  "turso_pg",
  "turso_sdk_kit",
+ "turso_sqlite",
  "twox-hash",
  "zerocopy",
 ]

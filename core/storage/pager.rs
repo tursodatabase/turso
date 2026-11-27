@@ -1694,6 +1694,7 @@ impl SharedPagerState {
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
 pub struct Pager {
+    pub(crate) nan_policy: crate::types::NanPolicy,
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
@@ -2017,6 +2018,7 @@ impl Pager {
         page_cache: PageCache,
         buffer_pool: Arc<BufferPool>,
         shared: Arc<SharedPagerState>,
+        nan_policy: crate::types::NanPolicy,
     ) -> Result<Self> {
         let allocate_page1_state = if shared.init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
@@ -2024,6 +2026,7 @@ impl Pager {
             RwLock::new(AllocatePage1State::Done)
         };
         Ok(Self {
+            nan_policy,
             db_file,
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
@@ -4034,6 +4037,7 @@ impl Pager {
             PageCache::new(cache_capacity),
             buffer_pool,
             shared,
+            crate::types::NanPolicy::Null,
         )
         .unwrap()
     }
@@ -6806,6 +6810,7 @@ mod tests {
                 PageCache::new(cache_capacity),
                 buffer_pool,
                 shared,
+                crate::types::NanPolicy::Null,
             )
             .unwrap(),
         );
@@ -7001,6 +7006,7 @@ mod ptrmap_tests {
             PageCache::new(sz as usize),
             buffer_pool,
             shared,
+            crate::types::NanPolicy::Null,
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();
@@ -7060,6 +7066,7 @@ mod ptrmap_tests {
             PageCache::new(4),
             buffer_pool,
             Arc::new(SharedPagerState::new(Some(default_page1(None)))),
+            crate::types::NanPolicy::Null,
         )
         .unwrap();
 

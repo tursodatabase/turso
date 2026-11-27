@@ -77,7 +77,13 @@ fn test_logical_log_read() {
         .unwrap()
         .unwrap();
     let record = ImmutableRecordRef::from_bin_record(row.payload());
-    let foo = record.iter().unwrap().next().unwrap().unwrap();
+    let foo = record
+        .decode(turso_core::types::NanPolicy::Null)
+        .iter()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
     let ValueRef::Text(foo) = foo else {
         unreachable!()
     };
@@ -150,7 +156,13 @@ fn test_logical_log_read_multiple_transactions() {
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         let row = mvcc_store.read(tx, rowid).unwrap().unwrap();
         let record = ImmutableRecordRef::from_bin_record(row.payload());
-        let foo = record.iter().unwrap().next().unwrap().unwrap();
+        let foo = record
+            .decode(turso_core::types::NanPolicy::Null)
+            .iter()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
         let ValueRef::Text(foo) = foo else {
             unreachable!()
         };
@@ -267,7 +279,13 @@ fn test_logical_log_read_fuzz() {
     for present_rowid in present_rowids {
         let row = mvcc_store.read(tx, &present_rowid).unwrap().unwrap();
         let record = ImmutableRecordRef::from_bin_record(row.payload());
-        let foo = record.iter().unwrap().next().unwrap().unwrap();
+        let foo = record
+            .decode(turso_core::types::NanPolicy::Null)
+            .iter()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
         let ValueRef::Text(foo) = foo else {
             unreachable!()
         };
@@ -339,7 +357,8 @@ fn test_logical_log_read_table_and_index_rows() {
         .expect("Index should exist");
     // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
     let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);
-    let index_info = Arc::new(IndexInfo::new_from_index(index).unwrap());
+    let index_info =
+        Arc::new(IndexInfo::new_from_index(index, turso_core::types::NanPolicy::Null).unwrap());
 
     // Verify table rows can be read
     let tx = mvcc_store.begin_tx(pager).unwrap();
@@ -349,7 +368,10 @@ fn test_logical_log_read_table_and_index_rows() {
             .unwrap()
             .expect("Table row should exist");
         let record = ImmutableRecordRef::from_bin_record(row.payload());
-        let values = record.get_values().unwrap();
+        let values = record
+            .decode(turso_core::types::NanPolicy::Null)
+            .get_values()
+            .unwrap();
         let data_value = values.get(1).expect("Should have data column");
         let ValueRef::Text(data_text) = data_value else {
             panic!("Data column should be text");
@@ -400,7 +422,10 @@ fn test_logical_log_read_table_and_index_rows() {
             panic!("Index row should have a record row_id");
         };
         let record = sortable_key.key.clone();
-        let values = record.get_values().unwrap();
+        let values = record
+            .decode(turso_core::types::NanPolicy::Null)
+            .get_values()
+            .unwrap();
         assert_eq!(
             values.len(),
             2,

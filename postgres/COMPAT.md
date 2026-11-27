@@ -73,7 +73,7 @@ Basics not enumerated by the official feature matrix.
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE and AND CHAIN are rejected. READ ONLY and READ WRITE are enforced, on BEGIN and on SET TRANSACTION; switching a READ ONLY transaction to READ WRITE after its first query is rejected with SQLSTATE 25001 like PostgreSQL. A statement error aborts the transaction but keeps its savepoints, so ROLLBACK TO recovers it; a failed COMMIT rolls the transaction back and returns the connection to idle |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
-| Casts (`expr::type`, CAST) | 🟡 Partial | Also `int4(x)`-style cast functions. Casts to and from int2, int4, int8, float4, float8, bool and text follow `pg_cast`, which lists them: a pair PostgreSQL has no cast for fails with 42846. A cast to uuid gives a value of the uuid type, and fails with 22P02 when the text is not a UUID. A value written to a column by INSERT, UPDATE, ON CONFLICT DO UPDATE, a default or a stored generated column is converted to the column type as an assignment cast, and fails with 42804 when PostgreSQL has no assignment cast. CREATE TABLE and ALTER TABLE ADD COLUMN refuse a column default with no assignment cast to the column type, with 42804 and PostgreSQL's message, which names a real or numeric column as double precision. ADD COLUMN writes a default of another type, converted, into the rows that exist. A value is converted before NOT NULL is checked. Floats round to an integer half to even. A numeric literal and a numeric with a type modifier round half away from zero, as in PostgreSQL. A numeric column without a type modifier and numeric arithmetic are REAL, so they round half to even: 4.5 in a `numeric` column cast or written to an integer is 4, where PostgreSQL gives 5. The range of the target is checked. A float8 cast or written to text is in PostgreSQL's form, such as `3` and `1e+20`. The casts of date, json, jsonb, uuid, bytea, inet, cidr, macaddr, oid and the reg types, arrays, enums and domains are not in `pg_cast` yet: the engine decides them by its own rules, which accept some casts PostgreSQL refuses (`types/cast-matrix.sqltest` has a gap test for each). A cast of another built-in type, such as point or xid, fails with 0A000. Not covered: bytea, which is not a registered type yet, so its casts are not in `pg_cast` and a text literal is not read as bytea input; casts to numeric, which is a REAL when it has no type modifier; float4, which is kept as the float8 with the same digits, so `0.1::float4::float8` is 0.1; `'NaN'`, which the engine's float cannot hold: a cast or a write that gives NaN fails with 0A000, where PostgreSQL stores NaN; a numeric without a type modifier cast to text, which is in the form of a float8, so `1.0::numeric::text` is `1`; a text too small for a float, such as `'1e-400'::float8`, which reads as 0; the `castfunc` of a `pg_cast` row, which is 0; implicit casts in expressions (operator and function arguments, CASE, UNION); and the date type, which is unsupported. |
+| Casts (`expr::type`, CAST) | 🟡 Partial | Also `int4(x)`-style cast functions. Casts to and from int2, int4, int8, float4, float8, bool and text follow `pg_cast`, which lists them: a pair PostgreSQL has no cast for fails with 42846. A cast to uuid gives a value of the uuid type, and fails with 22P02 when the text is not a UUID. A value written to a column by INSERT, UPDATE, ON CONFLICT DO UPDATE, a default or a stored generated column is converted to the column type as an assignment cast, and fails with 42804 when PostgreSQL has no assignment cast. CREATE TABLE and ALTER TABLE ADD COLUMN refuse a column default with no assignment cast to the column type, with 42804 and PostgreSQL's message, which names a real or numeric column as double precision. ADD COLUMN writes a default of another type, converted, into the rows that exist. A value is converted before NOT NULL is checked. Floats round to an integer half to even. A numeric literal and a numeric with a type modifier round half away from zero, as in PostgreSQL. A numeric column without a type modifier and numeric arithmetic are REAL, so they round half to even: 4.5 in a `numeric` column cast or written to an integer is 4, where PostgreSQL gives 5. The range of the target is checked. A float8 cast or written to text is in PostgreSQL's form, such as `3` and `1e+20`. The casts of date, json, jsonb, uuid, bytea, inet, cidr, macaddr, oid and the reg types, arrays, enums and domains are not in `pg_cast` yet: the engine decides them by its own rules, which accept some casts PostgreSQL refuses (`types/cast-matrix.sqltest` has a gap test for each). A cast of another built-in type, such as point or xid, fails with 0A000. Not covered: bytea, which is not a registered type yet, so its casts are not in `pg_cast` and a text literal is not read as bytea input; casts to numeric, which is a REAL when it has no type modifier; `NaN` cast to numeric, which is still the engine's REAL; a numeric without a type modifier cast to text, which is in the form of a float8, so `1.0::numeric::text` is `1`; the `castfunc` of a `pg_cast` row, which is 0; implicit casts in expressions (operator and function arguments, CASE, UNION); and the date type, which is unsupported. |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
 | Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO [ESCAPE], `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC is rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. SIMILAR TO converts its pattern to a regex the way `similar_to_escape()` does. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE, and SIMILAR TO needs a string-literal pattern and ESCAPE. A comparison, an arithmetic or a bit operator fails with 42883 when `pg_operator` has no row for operands of these kinds of types: see `pg_operator` in the Backend section |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
@@ -163,9 +163,9 @@ numeric and is false, while `1 IN ('1.5', 2)` fails with 22P02. A value that
 reads a column is compared with the left side alone. The implicit casts of that choice are the
 rows of `pg_cast` between the types that `pg_operator` has rows for, written
 in the frontend.
-A literal next to a numeric or a double precision that the engine stores as a double, and that a double does not keep exactly (`n = '9007199254740993'`), fails with 0A000, where PostgreSQL compares all the digits of a numeric. Still different from PostgreSQL: a literal next to an integer that has no registered type, such as an integer written in the statement or the result of a function, is checked
+A literal next to a numeric that the engine stores as a double, and that a double does not keep exactly (`n = '9007199254740993'`), fails with 0A000, where PostgreSQL compares all the digits of a numeric. Still different from PostgreSQL: a literal next to an integer that has no registered type, such as an integer written in the statement or the result of a function, is checked
 against the range of bigint, a literal that is NaN, an infinity or a numeric past the range
-of a double next to a real, a double precision or a numeric is compared as text, `x IS DISTINCT FROM y` does not choose an operator unless an operand is a string literal, and `-'1'` is -1 where PostgreSQL fails with 42725.
+of a double next to a numeric is compared as text, `x IS DISTINCT FROM y` does not choose an operator unless an operand is a string literal, and `-'1'` is -1 where PostgreSQL fails with 42725.
 `pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
@@ -206,7 +206,7 @@ written in the statement and the result of a function have no registered type:
 next to a smallint, integer or bigint they count as an integer, or as a bigint
 when the value is outside the range of integer, and two of them are added as
 64-bit integers, so `2147483647 + 1` gives 2147483648 where PostgreSQL fails.
-`pg_input_is_valid`, `to_char` (numeric; other argument types fail with
+`pg_input_is_valid`, `to_char` (numeric; NaN and other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.
 `date_trunc(text, timestamp)` and `date_trunc(text, timestamptz)` for the units
@@ -271,6 +271,27 @@ numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
+
+float4 and float8 are registered types. Their INPUT functions read text for
+casts, typed parameters, literal checks, `pg_input_is_valid` and
+`pg_input_error_info`. A float4 INPUT reads directly at single precision;
+it does not round through float8 first. Integer casts to float4 also round
+directly to single precision. Float INPUT accepts hexadecimal significands
+and binary exponents, such as `0x1.8p2`. Direct calls to the float arithmetic
+functions and `sqrt` convert arguments to their declared parameter types:
+unknown strings use INPUT, and typed arguments require an implicit cast.
+A column stores the 8 bytes of the
+float, so NaN, the infinities and -0 are kept, and a float4 is rounded to
+single precision. NaN is a value of the engine, and equals itself and sorts
+after every number, as in PostgreSQL. A value is written as PostgreSQL's float
+output writes it (`1e+20`, `-0`, `Infinity`). `+ - * /` and `-x` run
+`float4pl` and the other functions of PostgreSQL: they fail with 22003 on an
+overflow or an underflow, and with 22012 on a division by zero. `abs`, `round`,
+`sqrt`, `exp`, `ln`, `trunc`, `sum`, `avg` and `total` pass on a NaN. Still
+different from PostgreSQL: a function of a float has no registered result
+type, so its result is written as a plain REAL (`abs('-Infinity'::float8)` is
+`inf`), and `round` rounds half away from zero. `sqrt` rejects a negative
+argument with 2201F and preserves a NaN argument. `sum` and `avg` return a REAL, not a float8.
 
 A comparison, `AND`, `OR`, `NOT`, `IS` tests, `IN`, `BETWEEN`, `LIKE`, `EXISTS`,
 the regular expression operators, `= ANY(array)`, `@>`, `<@`, `&&` and the

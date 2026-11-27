@@ -114,6 +114,14 @@ impl Dialect for PostgresDialect {
         turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
     }
 
+    fn validate_attach(&self) -> Result<()> {
+        Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "ATTACH and DETACH are not supported by the PostgreSQL frontend",
+            None,
+        ))
+    }
+
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(turso_sqlite::SqliteDialect)
     }
@@ -260,10 +268,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        // random() is a native function (see functions.rs) because it returns
-        // a double, not SQLite's integer. Skipping the builtin lets that one
-        // be found.
-        if name.eq_ignore_ascii_case("random") {
+        // These functions use PostgreSQL result or domain rules. Let the
+        // registered functions in functions.rs supply them.
+        if name.eq_ignore_ascii_case("random") || name.eq_ignore_ascii_case("sqrt") {
             return Ok(None);
         }
         turso_core::dialect::resolve_builtin_function(name, arg_count)
@@ -303,7 +310,14 @@ impl Dialect for PostgresDialect {
     }
 
     fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
-        let names: Vec<&str> = operand_types.iter().map(String::as_str).collect();
+        let names: Vec<&str> = operand_types
+            .iter()
+            .map(|name| match name.as_str() {
+                "float4" => "real",
+                "float8" => "double precision",
+                other => other,
+            })
+            .collect();
         crate::functions::undefined_operator_of(op, &names)
     }
 
@@ -315,6 +329,16 @@ impl Dialect for PostgresDialect {
         context: turso_core::dialect::CastContext,
     ) -> Result<turso_core::dialect::CastDecision> {
         crate::cast_planning::apply_cast(operand, source, target, context)
+    }
+
+    fn coerce_function_arguments(
+        &self,
+        name: &str,
+        arguments: &[&turso_core::ast::Expr],
+        sources: &[turso_core::dialect::CastSource],
+        targets: &[turso_core::dialect::TypeRef],
+    ) -> Result<Vec<turso_core::ast::Expr>> {
+        crate::cast_planning::coerce_function_arguments(name, arguments, sources, targets)
     }
 
     fn check_column_default(
@@ -499,6 +523,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn sum_counts_infinite_inputs(&self) -> bool {
+        true
+    }
+
+    fn nan_is_a_value(&self) -> bool {
         true
     }
 
@@ -4710,6 +4738,189 @@ mod tests {
     }
 
     #[test]
+    fn nan_survives_postgres_registers_and_sorting() {
+        use turso_core::function::ExternalFunc;
+        use turso_core::native_ext::FunctionArity;
+        let db = Database::open(
+            Arc::new(turso_core::MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(PostgresDialect)).extension_function(
+                ExternalFunc::new_native_scalar(
+                    "test_nan".into(),
+                    FunctionArity::Exact(0),
+                    false,
+                    TestNan,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let rows = conn
+            .prepare("SELECT test_nan(), test_nan() IS NULL")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert!(rows[0][0].is_nan());
+        assert_eq!(rows[0][1], Value::from_i64(0));
+
+        // UNION and ORDER BY encode and decode temporary records. The NaN
+        // must survive both routes and sort after finite numbers.
+        for sql in [
+            "SELECT $1 AS v UNION ALL SELECT $2 ORDER BY v",
+            "SELECT $1 AS v UNION SELECT $2 ORDER BY v",
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.bind_at(
+                std::num::NonZeroUsize::new(1).unwrap(),
+                Value::from_f64(f64::NAN),
+            )
+            .unwrap();
+            stmt.bind_at(
+                std::num::NonZeroUsize::new(2).unwrap(),
+                Value::from_f64(1.5),
+            )
+            .unwrap();
+            let rows = stmt.run_collect_rows().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::from_f64(1.5));
+            assert!(rows[1][0].is_nan(), "{sql}: {rows:?}");
+        }
+        for bits in [
+            0xfff8_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+            0x7fff_ffff_ffff_ffff,
+        ] {
+            for (direction, expected) in [("ASC", [0, 1, 2]), ("DESC", [1, 2, 0])] {
+                let sql = format!("SELECT id FROM (SELECT $1 AS v, 2 AS id UNION ALL SELECT $2, 1 UNION ALL SELECT $3, 0) AS t ORDER BY v {direction}, id");
+                let mut stmt = conn.prepare(&sql).unwrap();
+                for (index, value) in [f64::from_bits(bits), f64::NAN, f64::INFINITY]
+                    .into_iter()
+                    .enumerate()
+                {
+                    stmt.bind_at(
+                        std::num::NonZeroUsize::new(index + 1).unwrap(),
+                        Value::from_f64(value),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    expected.map(|id| vec![Value::from_i64(id)])
+                );
+            }
+            for sql in [
+                "SELECT count(*) FROM (SELECT $1 AS v UNION SELECT $2) AS t",
+                "SELECT ARRAY[$1] = ARRAY[$2]",
+                "SELECT ARRAY[$1] <> ARRAY[NULL]",
+            ] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                stmt.bind_at(
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                    Value::from_f64(f64::from_bits(bits)),
+                )
+                .unwrap();
+                if sql.contains("$2") {
+                    stmt.bind_at(
+                        std::num::NonZeroUsize::new(2).unwrap(),
+                        Value::from_f64(f64::NAN),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    vec![vec![Value::from_i64(1)]],
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn array_orderings_survive_postgres_schema_reload() {
+        use std::num::NonZeroUsize;
+        use turso_core::types::ImmutableRecord;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("array-orderings.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let array = |value| {
+            Value::Blob(
+                ImmutableRecord::from_values(&[value], 1)
+                    .unwrap()
+                    .into_payload(),
+            )
+        };
+        let nan = array(Value::from_f64(f64::NAN));
+        let null = array(Value::Null);
+        for reopen in [false, true] {
+            let db = crate::session::open_database_with_io(
+                io.clone(),
+                path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_custom_types(true),
+            )
+            .unwrap();
+            let conn = connect_with_public(&db);
+            if !reopen {
+                conn.execute("CREATE TABLE t(a integer[])").unwrap();
+                conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+            }
+            let schema = conn.current_schema();
+            let namespace = schema.namespace_named("public").unwrap();
+            let index = schema.get_index(namespace, "t", "t_a").unwrap();
+            // Index metadata must select the same array order after reloading SQL.
+            assert_eq!(
+                index.columns[0]
+                    .collation
+                    .compare(nan.as_ref(), null.as_ref()),
+                std::cmp::Ordering::Less,
+            );
+            // A bound blob bypasses array construction. Its elements still use
+            // the order selected by the expression's type.
+            for (sql, expected) in [
+                ("SELECT $1 <> ARRAY[NULL]", 1),
+                (
+                    "SELECT count(DISTINCT a) FROM (VALUES ($1), (ARRAY[NULL])) AS t(a)",
+                    2,
+                ),
+            ] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                stmt.bind_at(NonZeroUsize::new(1).unwrap(), nan.clone())
+                    .unwrap();
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    vec![vec![Value::from_i64(expected)]],
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestNan;
+
+    impl turso_core::native_ext::ScalarFunction for TestNan {
+        type Call = Self;
+        fn create_call(&self) -> Result<Self> {
+            Ok(*self)
+        }
+    }
+
+    impl turso_core::native_ext::ScalarCall for TestNan {
+        type Output = f64;
+        fn step(
+            &mut self,
+            _context: &ScalarFuncContext<'_>,
+            _args: &[Register],
+        ) -> turso_core::types::IOResultOr<f64> {
+            Ok(IOResult::Done(f64::NAN))
+        }
+    }
+
+    #[test]
     fn dialect_parse_preserves_explain_command() {
         use turso_core::ast::{Cmd, EqpFormat};
 
@@ -5000,13 +5211,51 @@ mod tests {
     }
 
     #[test]
-    fn catalogs_available_in_secondary_databases() {
+    fn postgres_rejects_attach_before_opening_the_target() {
+        for enabled in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("must-not-exist.db");
+            let db = crate::session::open_database_with_io(
+                Arc::new(turso_core::MemoryIO::new()),
+                ":memory:",
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_attach(enabled),
+            )
+            .unwrap();
+            let conn = connect_with_public(&db);
+            for sql in [
+                format!("ATTACH '{}' AS aux", path.display()),
+                "ATTACH ':memory:' AS aux".to_string(),
+            ] {
+                let error = conn
+                    .execute(&sql)
+                    .expect_err("PostgreSQL must reject ATTACH");
+                assert_eq!(
+                    crate::error::sqlstate(&error),
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    "{error}"
+                );
+                assert!(!path.exists());
+            }
+            let mut state = turso_core::attach::AttachDatabaseState::Start;
+            let error = match conn.attach_database(path.to_str().unwrap(), "aux", &mut state) {
+                Err(error) => error,
+                Ok(_) => panic!("the connection API must reject ATTACH before opening the file"),
+            };
+            assert_eq!(
+                crate::error::sqlstate(&error),
+                SQLSTATE_FEATURE_NOT_SUPPORTED
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn catalogs_available_in_temporary_and_vacuum_databases() {
         let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
         let output_path = dir.path().join("vacuum.db");
         let io = Arc::new(PlatformIO::new().unwrap());
         let opts = crate::DatabaseOpts::new()
-            .with_attach(true)
             .with_vacuum(true)
             .with_views(true);
         let db = crate::session::open_database_with_io(
@@ -5017,37 +5266,6 @@ mod tests {
         )
         .unwrap();
         let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        // The relation catalog covers only the main database.
-        let err = conn.execute("CREATE TABLE aux.other (v INT)").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("relations in an attached database is not supported"),
-            "{err}"
-        );
-        assert_eq!(
-            conn.prepare("SELECT COUNT(*) FROM aux.pg_namespace")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(3)]]
-        );
-        let attached = crate::session::open_database_with_io(
-            io.clone(),
-            attached_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            opts,
-        )
-        .unwrap();
-        assert_eq!(
-            connect_with_public(&attached)
-                .prepare("SELECT COUNT(*) FROM pg_namespace")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(3)]]
-        );
         for temp_store in ["MEMORY", "FILE"] {
             let temp_conn = connect_with_public(&db);
             temp_conn
@@ -5080,202 +5298,6 @@ mod tests {
                 .run_collect_rows()
                 .unwrap(),
             vec![vec![Value::from_i64(3)]]
-        );
-    }
-
-    #[test]
-    fn indexes_of_an_attached_database_cannot_be_created_or_dropped() {
-        let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        let opts = crate::DatabaseOpts::new().with_attach(true);
-        // A file of the PostgreSQL dialect keeps its tables in schemas, which
-        // a statement cannot name through an attached database. A file of
-        // the SQLite dialect keeps them where `aux.other` finds them.
-        {
-            let attached = Database::open_file_with_flags(
-                io.clone(),
-                attached_path.to_str().unwrap(),
-                crate::OpenFlags::default(),
-                opts,
-                None,
-                Arc::new(SqliteDialect),
-            )
-            .unwrap();
-            let conn = attached
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
-            conn.execute("CREATE TABLE other (v INT, w INT)").unwrap();
-            conn.execute("CREATE INDEX other_v ON other (v)").unwrap();
-            conn.close().unwrap();
-        }
-        let db = crate::session::open_database_with_io(
-            io,
-            dir.path().join("main.db").to_str().unwrap(),
-            crate::OpenFlags::default(),
-            opts,
-        )
-        .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        // The relation catalog covers only the main database.
-        for sql in [
-            "CREATE INDEX other_w ON aux.other (w)",
-            "DROP INDEX aux.other_v",
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("relations in an attached database is not supported"),
-                "{sql}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn sequences_and_tables_of_an_attached_database_cannot_be_created_or_dropped() {
-        let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        // `aux.name` finds only objects that are in no schema, which a file
-        // made with the SQLite dialect has.
-        {
-            let attached = Database::open_file_with_flags(
-                io.clone(),
-                attached_path.to_str().unwrap(),
-                crate::OpenFlags::default(),
-                crate::DatabaseOpts::new().with_mvcc(true),
-                None,
-                Arc::new(SqliteDialect),
-            )
-            .unwrap();
-            let conn = attached
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
-                .unwrap();
-            conn.execute("CREATE SEQUENCE s").unwrap();
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        }
-        let db = crate::session::open_database_with_io(
-            io,
-            dir.path().join("main.db").to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_attach(true),
-        )
-        .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        for sql in [
-            "CREATE SEQUENCE aux.other",
-            "DROP SEQUENCE aux.s",
-            "DROP TABLE aux.t",
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("relations in an attached database is not supported"),
-                "{sql}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn owner_column_of_a_sequence_of_an_attached_database_cannot_be_changed() {
-        let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        {
-            let attached = Database::open_file_with_flags(
-                io.clone(),
-                attached_path.to_str().unwrap(),
-                crate::OpenFlags::default(),
-                crate::DatabaseOpts::new().with_mvcc(true),
-                None,
-                Arc::new(SqliteDialect),
-            )
-            .unwrap();
-            let conn = attached
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
-                .unwrap();
-            conn.execute("CREATE SEQUENCE s").unwrap();
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        }
-        let db = crate::session::open_database_with_io(
-            io,
-            dir.path().join("main.db").to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_attach(true),
-        )
-        .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        for sql in [
-            "ALTER SEQUENCE aux.s OWNED BY aux.t.v",
-            "ALTER SEQUENCE aux.s OWNED BY NONE",
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("relations in an attached database is not supported"),
-                "{sql}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn views_of_an_attached_database_cannot_be_created_or_dropped() {
-        let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        {
-            let attached = Database::open(
-                io.clone(),
-                attached_path.to_str().unwrap(),
-                turso_core::OpenOptions::new(Arc::new(turso_sqlite::SqliteDialect))
-                    .db_opts(crate::DatabaseOpts::new().with_mvcc(true)),
-            )
-            .unwrap();
-            let conn = attached
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("CREATE VIEW existing AS SELECT 1 AS one")
-                .unwrap();
-            conn.close().unwrap();
-        }
-        let db = crate::session::open_database_with_io(
-            io,
-            dir.path().join("main.db").to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_attach(true),
-        )
-        .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        for sql in [
-            "CREATE VIEW aux.added AS SELECT 2 AS two",
-            "DROP VIEW aux.existing",
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("relations in an attached database is not supported"),
-                "{sql}: {err}"
-            );
-        }
-        assert_eq!(
-            conn.prepare("SELECT name FROM aux.sqlite_schema WHERE type = 'view'")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::build_text("existing")]]
         );
     }
 

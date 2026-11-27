@@ -1,7 +1,10 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::{sqlstate_error, sqlstate_error_with_hint};
-use crate::pg_type::{built_in_type_named, lookup_type_name, type_input, NamedTypeKind};
+use crate::pg_type::{
+    built_in_type_named, float4_arithmetic, float4_negate, float8_arithmetic, float8_negate,
+    lookup_type_name, type_input, FloatOp, NamedTypeKind,
+};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
 use std::collections::HashSet;
@@ -20,11 +23,12 @@ use turso_core::{
 use turso_pg_parser::datetime_unit::DatetimeUnit;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
-    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_INVALID_ARGUMENT_FOR_POWER_FUNCTION, SQLSTATE_INVALID_DATETIME_FORMAT,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -33,21 +37,22 @@ use turso_pg_parser::sqlstate::{
 /// the body returns.
 macro_rules! scalar_functions {
     ($options:expr, |$context:ident, $connection:ident, $args:ident| {
-        $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
+        $($($name:literal)|+ ($arity:expr, $deterministic:expr $(; $parameters:expr)?) => $body:expr,)*
     }) => {{
         let mut options = $options;
-        $($(
+        $(
+            let parameter_types: Option<&'static [&'static str]> = None $(.or(Some($parameters)))?;
+            $(
             #[allow(unused_variables)]
             let step = |$context: &ScalarFuncContext<'_>, $args: &[Register]| -> Result<_> {
                 let $connection = $context.connection;
                 Ok($body)
             };
-            options = options.extension_function(pg_scalar_function(
-                $name,
-                $arity,
-                $deterministic,
-                step,
-            ));
+            let function = pg_scalar_function($name, $arity, $deterministic, step);
+            let function = if let Some(types) = parameter_types {
+                function.with_parameter_types(types)
+            } else { function };
+            options = options.extension_function(function);
         )+)*
         options
     }};
@@ -441,6 +446,32 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
+        "float4pl"(FunctionArity::Exact(2), true; &["float4", "float4"]) => {
+            float4_arithmetic(args, FloatOp::Add)?
+        },
+        "float4mi"(FunctionArity::Exact(2), true; &["float4", "float4"]) => {
+            float4_arithmetic(args, FloatOp::Subtract)?
+        },
+        "float4mul"(FunctionArity::Exact(2), true; &["float4", "float4"]) => {
+            float4_arithmetic(args, FloatOp::Multiply)?
+        },
+        "float4div"(FunctionArity::Exact(2), true; &["float4", "float4"]) => {
+            float4_arithmetic(args, FloatOp::Divide)?
+        },
+        "float4um"(FunctionArity::Exact(1), true; &["float4"]) => float4_negate(args),
+        "float8pl"(FunctionArity::Exact(2), true; &["float8", "float8"]) => {
+            float8_arithmetic(args, FloatOp::Add)?
+        },
+        "float8mi"(FunctionArity::Exact(2), true; &["float8", "float8"]) => {
+            float8_arithmetic(args, FloatOp::Subtract)?
+        },
+        "float8mul"(FunctionArity::Exact(2), true; &["float8", "float8"]) => {
+            float8_arithmetic(args, FloatOp::Multiply)?
+        },
+        "float8div"(FunctionArity::Exact(2), true; &["float8", "float8"]) => {
+            float8_arithmetic(args, FloatOp::Divide)?
+        },
+        "float8um"(FunctionArity::Exact(1), true; &["float8"]) => float8_negate(args),
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
@@ -475,6 +506,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             0i64
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
+        "sqrt"(FunctionArity::Exact(1), true; &["float8"]) => exec_sqrt(args)?,
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
@@ -882,6 +914,24 @@ fn unrecognized_parameter(name: &str) -> LimboError {
         format!("unrecognized configuration parameter \"{name}\""),
         None,
     )
+}
+
+/// Rejects a negative argument before evaluating the square root. A NaN
+/// argument remains a value; it is not a domain error.
+fn exec_sqrt(args: &[Register]) -> Result<Option<f64>> {
+    let number = match args[0].get_value() {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Float(number)) => f64::from(*number),
+        other => unreachable!("sqrt receives a converted float8, got {other:?}"),
+    };
+    if number < 0.0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+            "cannot take square root of a negative number",
+            None,
+        ));
+    }
+    Ok(Some(number.sqrt()))
 }
 
 /// Turns 64 random bits into a number in [0, 1). A double holds 53 bits of
@@ -1339,8 +1389,11 @@ fn text_array_elements(func: &str, value: &Value) -> Result<Option<Vec<Option<St
                 )
             })?
         }
-        Value::Blob(_) => turso_core::array_values_from_any(value)
-            .ok_or_else(|| undefined_function(func, &["jsonb", "bytea"]))?,
+        Value::Blob(_) => turso_core::array_values_from_any(
+            turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+            value,
+        )
+        .ok_or_else(|| undefined_function(func, &["jsonb", "bytea"]))?,
         Value::Numeric(_) => return Err(undefined_function(func, &["jsonb", pg_type_name(value)])),
     };
     elements
@@ -1497,14 +1550,20 @@ fn exec_jsonb_contains(json: &Value, template: &Value) -> Result<Option<bool>> {
                 Ok((json, template)) => Ok(Some(json_document_contains(&json, &template))),
                 // `{a}` is an array, not JSON. A JSON object such as `{"a":1}`
                 // is not an array, so a jsonb value keeps the JSON error.
-                Err(error) => turso_core::array_contains_all(json, template)
-                    .map(Some)
-                    .ok_or(error),
+                Err(error) => turso_core::array_contains_all(
+                    turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+                    json,
+                    template,
+                )
+                .map(Some)
+                .ok_or(error),
             }
         }
-        _ if holds_array(json) || holds_array(template) => {
-            Ok(turso_core::array_contains_all(json, template))
-        }
+        _ if holds_array(json) || holds_array(template) => Ok(turso_core::array_contains_all(
+            turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+            json,
+            template,
+        )),
         // A number or a bytea has no @> for jsonb in PostgreSQL.
         _ => Err(undefined_operator(
             pg_type_name(json),
@@ -1517,7 +1576,12 @@ fn exec_jsonb_contains(json: &Value, template: &Value) -> Result<Option<bool>> {
 /// Whether `value` is a blob that holds an array. An array is stored as a
 /// blob, and a bytea is a blob too.
 fn holds_array(value: &Value) -> bool {
-    matches!(value, Value::Blob(_)) && turso_core::array_values_from_any(value).is_some()
+    matches!(value, Value::Blob(_))
+        && turso_core::array_values_from_any(
+            turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+            value,
+        )
+        .is_some()
 }
 
 /// A JSON value as jsonb compares it. A number is its exact decimal value, so
@@ -1780,7 +1844,9 @@ impl JsonElement {
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
-            "integer" | "smallint" | "bigint" | "real" | "numeric" => Self::Number,
+            "integer" | "smallint" | "bigint" | "real" | "float4" | "float8" | "numeric" => {
+                Self::Number
+            }
             "json" | "jsonb" => Self::Json,
             // A cast to bytea is a cast to blob, so a blob is a bytea.
             "bytea" | "blob" => Self::Bytea,
@@ -1803,8 +1869,11 @@ fn write_json_array_level(
     level: usize,
     json: &mut String,
 ) -> Result<()> {
-    let elements = turso_core::array_values_from_any(array)
-        .ok_or_else(|| undefined_function("array_to_json", &[pg_type_name(array)]))?;
+    let elements = turso_core::array_values_from_any(
+        turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+        array,
+    )
+    .ok_or_else(|| undefined_function("array_to_json", &[pg_type_name(array)]))?;
     json.push('[');
     for (i, element) in elements.iter().enumerate() {
         if i > 0 {
@@ -1864,19 +1933,132 @@ fn write_json_string(text: &str, json: &mut String) {
 /// the same number, in scientific notation when the exponent is below -4 or
 /// 15 or more, as in `1e+20` and `1e-05`.
 pub(crate) fn float8_text(value: f64) -> String {
-    if value.is_infinite() {
-        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    if let Some(text) = float_special_text(value) {
+        return text;
     }
-    let scientific = format!("{value:e}");
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("scientific notation has an exponent");
-    let exponent: i32 = exponent.parse().expect("the exponent is a number");
-    if (-4..15).contains(&exponent) {
-        format!("{value}")
+    float_text(&shortest_f64(value), -4..15)
+}
+
+/// A float4 in PostgreSQL's text form, like [float8_text] for the digits of a
+/// float4, in scientific notation when the exponent is below -4 or 6 or more,
+/// as in `1e+06`.
+pub(crate) fn float4_text(value: f32) -> String {
+    if let Some(text) = float_special_text(f64::from(value)) {
+        return text;
+    }
+    float_text(&shortest_f32(value), -4..6)
+}
+
+fn float_special_text(value: f64) -> Option<String> {
+    if value.is_nan() {
+        return Some("NaN".to_string());
+    }
+    if value.is_infinite() {
+        return Some(if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string());
+    }
+    None
+}
+
+/// The shortest text that reads back as `value`, as PostgreSQL's float output
+/// writes it. PostgreSQL uses the Ryu algorithm and does not accept a text
+/// that is exactly halfway to the next float, which the algorithm of the `ryu`
+/// crate accepts when the float's last bit is zero. So 1e23, which is such a
+/// text, is written as 9.999999999999999e+22. When the shortest text is
+/// halfway, the next one that is not is used.
+macro_rules! shortest_text {
+    ($name:ident, $float:ty) => {
+        fn $name(value: $float) -> String {
+            let ryu_text = ryu::Buffer::new().format_finite(value).to_string();
+            let (sign, digits, exponent) = decimal_digits(&ryu_text);
+            if digits == "0" || !is_halfway::<$float>(&digits, exponent, value.abs()) {
+                return ryu_text;
+            }
+            for count in digits.len() + 1..=17 {
+                let text = format!("{:.*e}", count - 1, value.abs());
+                let (_, longer, longer_exponent) = decimal_digits(&text);
+                if text.parse::<$float>() == Ok(value.abs())
+                    && !is_halfway::<$float>(&longer, longer_exponent, value.abs())
+                {
+                    return format!("{sign}{text}");
+                }
+            }
+            ryu_text
+        }
+    };
+}
+
+shortest_text!(shortest_f64, f64);
+shortest_text!(shortest_f32, f32);
+
+/// Whether the number `digits` (with its first digit at the power of ten
+/// `exponent`) only reads back as `value` because a number halfway between two
+/// floats goes to the one with an even last bit: a little more or a little
+/// less than it reads as another float.
+fn is_halfway<F: std::str::FromStr + PartialEq + Copy>(
+    digits: &str,
+    exponent: i32,
+    value: F,
+) -> bool {
+    let Ok(number) = digits.parse::<u128>() else {
+        return false;
+    };
+    let scale = exponent - (digits.len() as i32 - 1) - 20;
+    let above = format!("{number}{}1e{scale}", "0".repeat(19));
+    let below = format!("{}{}e{scale}", number - 1, "9".repeat(20));
+    above.parse::<F>().ok() != Some(value) || below.parse::<F>().ok() != Some(value)
+}
+
+/// The sign, the digits without leading and trailing zeros, and the power of
+/// ten of the first digit, of a number written by `ryu` or by `{:e}`.
+fn decimal_digits(text: &str) -> (&'static str, String, i32) {
+    let (sign, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text),
+    };
+    let (mantissa, exponent) = match unsigned.split_once('e') {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().expect("a number")),
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = format!("{whole}{fraction}");
+    let leading_zeros = all_digits.len() - all_digits.trim_start_matches('0').len();
+    let digits = all_digits.trim_start_matches('0').trim_end_matches('0');
+    if digits.is_empty() {
+        return (sign, "0".to_string(), 0);
+    }
+    let exponent = whole.len() as i32 - 1 - leading_zeros as i32 + exponent;
+    (sign, digits.to_string(), exponent)
+}
+
+/// Writes the number in `text` in decimal notation when its exponent is in
+/// `plain_exponents` and in scientific notation otherwise.
+fn float_text(text: &str, plain_exponents: std::ops::Range<i32>) -> String {
+    let (sign, digits, exponent) = decimal_digits(text);
+    if digits == "0" {
+        return format!("{sign}0");
+    }
+    if plain_exponents.contains(&exponent) {
+        let point = exponent + 1;
+        if point <= 0 {
+            format!("{sign}0.{}{digits}", "0".repeat(-point as usize))
+        } else if digits.len() as i32 <= point {
+            format!(
+                "{sign}{digits}{}",
+                "0".repeat(point as usize - digits.len())
+            )
+        } else {
+            let (whole, fraction) = digits.split_at(point as usize);
+            format!("{sign}{whole}.{fraction}")
+        }
     } else {
-        let sign = if exponent < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exponent.abs())
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        let (first, rest) = digits.split_at(1);
+        let mantissa = if rest.is_empty() {
+            first.to_string()
+        } else {
+            format!("{first}.{rest}")
+        };
+        format!("{sign}{mantissa}e{exponent_sign}{:02}", exponent.abs())
     }
 }
 
@@ -2276,6 +2458,13 @@ fn exec_to_char(value: &Value, format: &str) -> Result<Option<String>> {
         },
         _ => return Err(to_char_not_supported()),
     };
+    if num.is_nan() {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "to_char does not support NaN",
+            None,
+        ));
+    }
     Ok(Some(pg_to_char_numeric(num, format)))
 }
 
@@ -2455,8 +2644,6 @@ fn hand_written_input_error(
 ) -> Option<Option<InputError>> {
     let trimmed = input.trim();
     Some(match typname {
-        "float4" => float_input_error(input, "real", true),
-        "float8" => float_input_error(input, "double precision", false),
         "numeric" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_nan() || v.is_infinite() => Some((
                 format!("invalid input syntax for type numeric: \"{input}\""),
@@ -2571,31 +2758,6 @@ fn hand_written_input_error(
         }
         _ => return None,
     })
-}
-
-/// The error of text that is not a float8 or float4, or is too large for it.
-/// `inf` and `infinity` are valid, with or without a sign, in any case.
-fn float_input_error(input: &str, type_name: &str, single: bool) -> Option<(String, String)> {
-    let trimmed = input.trim();
-    let is_infinity_word = matches!(
-        trimmed
-            .trim_start_matches(['+', '-'])
-            .to_ascii_lowercase()
-            .as_str(),
-        "inf" | "infinity"
-    );
-    match trimmed.parse::<f64>() {
-        Ok(_) if is_infinity_word => None,
-        Ok(v) if v.is_infinite() || (single && (v as f32).is_infinite()) => Some((
-            format!("value \"{input}\" is out of range for type {type_name}"),
-            "22003".to_string(),
-        )),
-        Ok(_) => None,
-        Err(_) => Some((
-            format!("invalid input syntax for type {type_name}: \"{input}\""),
-            "22P02".to_string(),
-        )),
-    }
 }
 
 /// The value of a PostgreSQL boolean literal such as 'yes', 'off' or 'tr',
@@ -2828,14 +2990,15 @@ mod tests {
     }
 
     #[test]
-    fn array_to_json_writes_infinite_floats_as_strings() {
+    fn array_to_json_writes_nonfinite_floats_as_strings() {
         let record = turso_core::types::ImmutableRecord::from_values(
             &[
                 Value::from_f64(f64::INFINITY),
                 Value::from_f64(f64::NEG_INFINITY),
+                Value::from_f64(f64::NAN),
                 Value::from_f64(1.5),
             ],
-            3,
+            4,
         )
         .unwrap();
         let layout = JsonArrayLayout {
@@ -2845,12 +3008,15 @@ mod tests {
         };
         let mut json = String::new();
         write_json_array(&Value::Blob(record.as_blob().clone()), &layout, &mut json).unwrap();
-        assert_eq!(json, r#"["Infinity","-Infinity",1.5]"#);
+        assert_eq!(json, r#"["Infinity","-Infinity","NaN",1.5]"#);
     }
 
     #[test]
     fn float8_text_is_postgres_float8_output() {
         for (value, text) in [
+            (f64::NAN, "NaN"),
+            (f64::from_bits(0xfff8_0000_0000_0001), "NaN"),
+            (f64::from_bits(0x7ff0_0000_0000_0001), "NaN"),
             (1.0, "1"),
             (-0.0, "-0"),
             (0.1 + 0.2, "0.30000000000000004"),
@@ -2861,8 +3027,33 @@ mod tests {
             (1e20, "1e+20"),
             (-1.25e300, "-1.25e+300"),
             (f64::MAX, "1.7976931348623157e+308"),
+            (900719925474099.2, "900719925474099.2"),
+            (36028797002186752.0, "3.6028797002186752e+16"),
+            (1e22, "1e+22"),
+            (1e23, "9.999999999999999e+22"),
+            (2e23, "1.9999999999999998e+23"),
+            (8.41e21, "8.409999999999999e+21"),
+            (5e-324, "5e-324"),
         ] {
             assert_eq!(float8_text(value), text, "{value:e}");
+        }
+    }
+
+    #[test]
+    fn float4_text_is_postgres_float4_output() {
+        for (value, text) in [
+            (0.1, "0.1"),
+            (-0.0, "-0"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (999999.0, "999999"),
+            (1000000.0, "1e+06"),
+            (1234567.0, "1.234567e+06"),
+            (16777216.0, "1.6777216e+07"),
+            (3.4028235e38, "3.4028235e+38"),
+            (1e-45, "1e-45"),
+        ] {
+            assert_eq!(float4_text(value), text, "{value:e}");
         }
     }
 }

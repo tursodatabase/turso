@@ -1,6 +1,98 @@
 use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
+#[test]
+fn postgres_cannot_attach_a_sqlite_database() {
+    use std::sync::Arc;
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenOptions, SessionRole};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sqlite.db");
+    {
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE t(a REAL, b INTEGER); CREATE INDEX t_a ON t(a); \
+             INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);",
+            )
+            .unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let db = Database::open(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true)),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(format!("ATTACH '{}' AS aux", path.display()))
+        .expect_err("a PostgreSQL connection must not attach a SQLite file");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    assert_eq!(sqlite.execute("DELETE FROM t WHERE b = 1", []).unwrap(), 1);
+}
+
+#[test]
+fn sqlite_attach_requires_a_sqlite_database() {
+    use std::sync::Arc;
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenOptions, SessionRole};
+
+    let dir = tempfile::tempdir().unwrap();
+    let pg_path = dir.path().join("postgres.db");
+    {
+        let db = Database::open(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            pg_path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(turso_pg::PostgresDialect)),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.set_search_path(Some(vec!["public".to_string()]));
+        conn.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN w INTEGER").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    let db = Database::open(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        OpenOptions::new(Arc::new(turso_sqlite::SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true)),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(format!("ATTACH '{}' AS aux", pg_path.display()))
+        .expect_err("a SQLite connection must not attach a PostgreSQL file");
+
+    let sqlite_path = dir.path().join("sqlite.db");
+    {
+        let sqlite = rusqlite::Connection::open(&sqlite_path).unwrap();
+        sqlite
+            .execute_batch("CREATE TABLE t(v); INSERT INTO t VALUES(7)")
+            .unwrap();
+    }
+    conn.execute(format!("ATTACH '{}' AS aux", sqlite_path.display()))
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT v FROM aux.t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(7)]],
+    );
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_ctes_ignore_search_path(db: TempDatabase) {
     let conn = db.connect_postgres();
@@ -1882,15 +1974,15 @@ fn test_postgres_window_avg_partition(db: TempDatabase) {
 }
 
 // PostgreSQL rejects `1e308::float8 * 10` as an overflow, so its results
-// below come from the same rows written with 'Infinity'::float8. NaN is
-// returned as NULL.
+// below come from the same rows written with 'Infinity'::float8. A frame
+// with both positive and negative infinity produces NaN.
 #[turso_macros::test(mvcc)]
 fn test_postgres_window_sum_avg_are_finite_after_infinite_values_leave_frame(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE t (n int, x float8)").unwrap();
     conn.execute(
-        "INSERT INTO t VALUES (1, 1e308::float8 * 10), (2, 1), (3, 2), (4, 4), \
-         (5, -1e308::float8 * 10), (6, 1e308::float8 * 10), (7, 8)",
+        "INSERT INTO t VALUES (1, 'Infinity'::float8), (2, 1), (3, 2), (4, 4), \
+         (5, '-Infinity'::float8), (6, 'Infinity'::float8), (7, 8)",
     )
     .unwrap();
 
@@ -1914,7 +2006,7 @@ fn test_postgres_window_sum_avg_are_finite_after_infinite_values_leave_frame(db:
             "3|3.0|1.5",
             "4|6.0|3.0",
             "5|-Inf|-Inf",
-            "6||",
+            "6|NaN|NaN",
             "7|Inf|Inf",
         ]
     );
@@ -3998,7 +4090,7 @@ fn test_pg_input_error_info_float_overflow(db: TempDatabase) {
     let row = rows.row().unwrap();
     assert_eq!(
         row.get_value(0).to_string(),
-        "value \"1e400\" is out of range for type real"
+        "\"1e400\" is out of range for type real"
     );
     assert_eq!(row.get_value(1).to_string(), "22003");
     drop(rows);
@@ -4014,7 +4106,7 @@ fn test_pg_input_error_info_float_overflow(db: TempDatabase) {
     let row = rows.row().unwrap();
     assert_eq!(
         row.get_value(0).to_string(),
-        "value \"1e4000\" is out of range for type double precision"
+        "\"1e4000\" is out of range for type double precision"
     );
     assert_eq!(row.get_value(1).to_string(), "22003");
     drop(rows);

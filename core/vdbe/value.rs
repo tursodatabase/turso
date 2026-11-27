@@ -323,7 +323,7 @@ impl Value {
             Value::Numeric(Numeric::Integer(v)) => {
                 Value::from_i64(v.checked_abs().ok_or_else(|| LimboError::IntegerOverflow)?)
             }
-            Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
+            Value::Numeric(Numeric::Float(float)) => Value::from_f64(f64::from(*float).abs()),
             _ => {
                 let s = match self {
                     Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
@@ -1159,11 +1159,7 @@ impl Value {
             _ => unreachable!("Unexpected mathematical unary function {:?}", function),
         };
 
-        if result.is_nan() {
-            Value::Null
-        } else {
-            Value::from_f64(result)
-        }
+        Value::from_f64(result)
     }
 
     pub fn exec_math_binary(
@@ -1205,11 +1201,7 @@ impl Value {
             _ => unreachable!("Unexpected mathematical binary function {:?}", function),
         };
 
-        Ok(if result.is_nan() {
-            Value::Null
-        } else {
-            Value::from_f64(result)
-        })
+        Ok(Value::from_f64(result))
     }
 
     /// Mirrors SQLite's logFunc: log(X) calls log10 directly, and log(B,X)
@@ -4320,5 +4312,50 @@ mod tests {
             allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
+    }
+
+    fn nan() -> Value {
+        Value::from_f64(f64::NAN)
+    }
+
+    #[test]
+    fn a_function_passes_on_a_nan_it_is_given() {
+        use crate::function::MathFunc;
+        assert!(nan().exec_abs().unwrap().is_nan());
+        assert!(nan().exec_round(None).is_nan());
+        for function in [
+            MathFunc::Sqrt,
+            MathFunc::Exp,
+            MathFunc::Ln,
+            MathFunc::Trunc,
+            MathFunc::Floor,
+            MathFunc::Sin,
+        ] {
+            assert!(nan().exec_math_unary(&function).is_nan(), "{function:?}");
+        }
+        assert!(nan().exec_math_log(None).is_nan());
+        assert!(nan()
+            .exec_math_binary(&Value::from_f64(2.0), &MathFunc::Pow, false)
+            .unwrap()
+            .is_nan());
+        assert!(Value::from_f64(2.0)
+            .exec_math_binary(&nan(), &MathFunc::Pow, false)
+            .unwrap()
+            .is_nan());
+    }
+
+    #[test]
+    fn a_function_that_makes_a_nan_leaves_dialect_rules_to_the_caller() {
+        use crate::function::MathFunc;
+        assert!(Value::from_f64(-1.0)
+            .exec_math_unary(&MathFunc::Sqrt)
+            .is_nan());
+        assert!(Value::from_f64(2.0)
+            .exec_math_unary(&MathFunc::Acos)
+            .is_nan());
+        assert!(Value::from_f64(-1.0)
+            .exec_math_binary(&Value::from_f64(0.5), &MathFunc::Pow, false)
+            .unwrap()
+            .is_nan());
     }
 }

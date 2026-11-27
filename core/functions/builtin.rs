@@ -461,6 +461,7 @@ pub fn call_builtin_scalar(
     args: &[Register],
 ) -> crate::Result<Value> {
     let connection = context.connection;
+    let nan_policy = connection.nan_policy();
     match func {
         ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => {
             unreachable!("desugared to dedicated instructions, not Function")
@@ -837,7 +838,8 @@ pub fn call_builtin_scalar(
                 let columns_json_array = json::jsonb::Jsonb::from_str(columns_str.as_str())?;
                 let columns_len = columns_json_array.array_len()?;
 
-                let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
+                let mut payload_iterator =
+                    ValueIterator::new(bin_record.as_slice(), connection.nan_policy())?;
 
                 let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
                 for i in 0..columns_len {
@@ -1161,23 +1163,24 @@ pub fn call_builtin_scalar(
         }
         ScalarFunc::ArrayAppend => {
             check_arg_count(args, 2)?;
-            exec_array_append(args[0].get_value(), args[1].get_value())
+            exec_array_append(nan_policy, args[0].get_value(), args[1].get_value())
         }
         ScalarFunc::ArrayPrepend => {
             check_arg_count(args, 2)?;
-            exec_array_prepend(args[1].get_value(), args[0].get_value())
+            exec_array_prepend(nan_policy, args[1].get_value(), args[0].get_value())
         }
         ScalarFunc::ArrayCat => {
             check_arg_count(args, 2)?;
-            exec_array_cat(args[0].get_value(), args[1].get_value())
+            exec_array_cat(nan_policy, args[0].get_value(), args[1].get_value())
         }
         ScalarFunc::ArrayRemove => {
             check_arg_count(args, 2)?;
-            exec_array_remove(args[0].get_value(), args[1].get_value())
+            exec_array_remove(nan_policy, args[0].get_value(), args[1].get_value())
         }
         ScalarFunc::ArrayContains => {
             check_arg_count(args, 2)?;
             Ok(exec_array_contains(
+                nan_policy,
                 args[0].get_value(),
                 args[1].get_value(),
             ))
@@ -1185,6 +1188,7 @@ pub fn call_builtin_scalar(
         ScalarFunc::ArrayPosition => {
             check_arg_count(args, 2)?;
             Ok(exec_array_position(
+                nan_policy,
                 args[0].get_value(),
                 args[1].get_value(),
             ))
@@ -1196,7 +1200,7 @@ pub fn call_builtin_scalar(
                 1
             };
             Ok(
-                match compute_array_length_at_dim(args[0].get_value(), dim) {
+                match compute_array_length_at_dim(nan_policy, args[0].get_value(), dim) {
                     Some(count) => Value::from_i64(count),
                     None => Value::Null,
                 },
@@ -1205,6 +1209,7 @@ pub fn call_builtin_scalar(
         ScalarFunc::ArraySlice => {
             check_arg_count(args, 3)?;
             exec_array_slice(
+                nan_policy,
                 args[0].get_value(),
                 args[1].get_value(),
                 args[2].get_value(),
@@ -1225,6 +1230,7 @@ pub fn call_builtin_scalar(
                 None
             };
             Ok(exec_array_to_string(
+                nan_policy,
                 args[0].get_value(),
                 args[1].get_value(),
                 null_str,
@@ -1232,11 +1238,16 @@ pub fn call_builtin_scalar(
         }
         ScalarFunc::ArrayOverlap => {
             check_arg_count(args, 2)?;
-            Ok(exec_array_overlap(args[0].get_value(), args[1].get_value()))
+            Ok(exec_array_overlap(
+                nan_policy,
+                args[0].get_value(),
+                args[1].get_value(),
+            ))
         }
         ScalarFunc::ArrayContainsAll => {
             check_arg_count(args, 2)?;
             Ok(exec_array_contains_all(
+                nan_policy,
                 args[0].get_value(),
                 args[1].get_value(),
             ))

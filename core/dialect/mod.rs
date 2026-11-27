@@ -123,6 +123,7 @@ impl dyn Dialect {
     pub fn new_schema(&self, enable_custom_types: bool) -> Result<Schema> {
         Ok(self
             .schema_builder(enable_custom_types)?
+            .array_orderings(crate::types::NanPolicy::for_dialect(self))
             .supports_namespaces(self.supports_namespaces())
             .default_namespaces(self.default_namespaces())
             .build())
@@ -512,6 +513,11 @@ pub trait Dialect: Send + Sync + 'static {
         &[]
     }
 
+    /// Checks whether this dialect permits ATTACH and DETACH.
+    fn validate_attach(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether `PRAGMA capture_data_changes_conn` may create its change
     /// tables in a database of this dialect.
     ///
@@ -579,6 +585,16 @@ pub trait Dialect: Send + Sync + 'static {
     /// infinite value leaves, the total is `Inf - Inf`, which is NaN, and
     /// the result stays NULL.
     fn sum_counts_infinite_inputs(&self) -> bool {
+        false
+    }
+
+    /// Whether a REAL can be NaN.
+    ///
+    /// SQLite cannot: a result that is not a number is NULL, and the bits of a
+    /// NaN in a database file are read as NULL. So the SQLite dialect never
+    /// writes a NaN to a record, and reads one from a record as NULL.
+    /// PostgreSQL's float4 and float8 have NaN as a value.
+    fn nan_is_a_value(&self) -> bool {
         false
     }
 
@@ -714,6 +730,31 @@ pub trait Dialect: Send + Sync + 'static {
         _context: CastContext,
     ) -> Result<CastDecision> {
         Ok(CastDecision::EngineRules)
+    }
+
+    /// Converts arguments to the declared parameter types of a scalar
+    /// function. SQLite applies its ordinary casts; other dialects can
+    /// restrict implicit conversions and use their type input functions.
+    fn coerce_function_arguments(
+        &self,
+        _name: &str,
+        arguments: &[&ast::Expr],
+        _sources: &[CastSource],
+        targets: &[TypeRef],
+    ) -> Result<Vec<ast::Expr>> {
+        assert_eq!(arguments.len(), targets.len());
+        Ok(arguments
+            .iter()
+            .zip(targets)
+            .map(|(argument, target)| ast::Expr::Cast {
+                expr: Box::new((*argument).clone()),
+                type_name: Some(ast::Type {
+                    name: target.name().to_string(),
+                    size: None,
+                    array_dimensions: target.array_dimensions,
+                }),
+            })
+            .collect())
     }
 
     /// Whether a statement converts the new values of a row to the types of

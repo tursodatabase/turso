@@ -580,9 +580,20 @@ pub fn emit_aggregate_final(
         program.preassign_label_to_next_insn(end);
         open_aggregate_sorter(program, tables, resolver, aggregate)?;
     }
+    let collation = match aggregate.func {
+        AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            Some(ordered_set_collation(
+                &aggregate.func,
+                &aggregate.args[0],
+                &ExprContext::new(Some(tables), resolver),
+            )?)
+        }
+        _ => None,
+    };
     program.emit_insn(Insn::AggFinal {
         register: target_register,
         func: AccumulatorFunc::Agg(aggregate.func.clone()),
+        collation,
     });
     Ok(())
 }
@@ -1000,8 +1011,7 @@ pub fn translate_aggregation_step(
 }
 
 /// The collation an ordered-set aggregate (mode, percentile) sorts its values
-/// with. The aggregate keeps it in its state as [CollationSeq::to_bits] until
-/// it sorts at finalize, and a custom collation has no bits.
+/// with.
 fn ordered_set_collation(
     func: &AggFunc,
     expr: &ast::Expr,

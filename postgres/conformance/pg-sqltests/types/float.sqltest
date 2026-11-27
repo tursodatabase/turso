@@ -1,0 +1,440 @@
+# float4 and float8: reading text, keeping NaN, infinity and negative zero,
+# range errors, and the order of floats. A value is written as text or as a
+# number to a column of the type, without a cast.
+
+@database :memory:
+
+test float4-input-rounds-text-directly-to-single-precision {
+    SELECT '1.0000000596046448'::float4,
+           ('1.0000000596046448'::float8)::float4;
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('1.0000000596046448');
+    SELECT x FROM t;
+}
+expect {
+    1.0000001|1
+    1.0000001
+}
+
+test float-input-validation-resolves-the-registered-type {
+    SELECT pg_input_is_valid(' NaN ', 'pg_catalog.float4'),
+           pg_input_is_valid('-Infinity', 'double precision'),
+           pg_input_is_valid('-0', 'real');
+    SELECT pg_input_is_valid('1e39', 'real'),
+           pg_input_is_valid('1e39', 'float8'),
+           pg_input_is_valid('1e-46', 'float4'),
+           pg_input_is_valid('1e-46', 'pg_catalog.float8');
+    SELECT pg_input_is_valid('1e-400', 'double precision'),
+           pg_input_is_valid('abc', 'float4');
+}
+expect {
+    t|t|t
+    f|t|f|t
+    f|f
+}
+
+test float-input-error-info-uses-the-types-input-errors {
+    SELECT message, sql_error_code
+    FROM pg_input_error_info('1e-46', 'pg_catalog.float4');
+    SELECT message, sql_error_code
+    FROM pg_input_error_info('1e-400', 'double precision');
+    SELECT message, sql_error_code
+    FROM pg_input_error_info('abc', 'real');
+}
+expect {
+    "1e-46" is out of range for type real|22003
+    "1e-400" is out of range for type double precision|22003
+    invalid input syntax for type real: "abc"|22P02
+}
+
+test float8-keeps-nan {
+    CREATE TABLE t (id int, x float8);
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'nan'), (3, ' NaN ');
+    SELECT id, x, x IS NULL FROM t ORDER BY id;
+}
+expect {
+    1|NaN|f
+    2|NaN|f
+    3|NaN|f
+}
+
+test float8-reads-infinity {
+    CREATE TABLE t (id int, x float8);
+    INSERT INTO t VALUES (1, 'Infinity'), (2, 'inf'), (3, '-inf'), (4, '+Infinity'), (5, '-Infinity');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|Infinity
+    2|Infinity
+    3|-Infinity
+    4|Infinity
+    5|-Infinity
+}
+
+test float8-keeps-negative-zero {
+    CREATE TABLE t (id int, x float8);
+    INSERT INTO t VALUES (1, '-0'), (2, 0);
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|-0
+    2|0
+}
+
+test float8-reads-exponents-and-spaces {
+    CREATE TABLE t (id int, x float8);
+    INSERT INTO t VALUES (1, '1e3'), (2, '  1.5  ');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|1000
+    2|1.5
+}
+
+test float4-keeps-nan-infinity-and-negative-zero {
+    CREATE TABLE t (id int, x float4);
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-0');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|NaN
+    2|Infinity
+    3|-0
+}
+
+# A float4 has about 7 digits. The text that it reads back has the fewest
+# digits that give the same float4.
+test float4-keeps-seven-digits {
+    CREATE TABLE t (id int, x float4);
+    INSERT INTO t VALUES (1, 0.1), (2, 16777217), (3, 123456789), (4, '3.4028235e38'), (5, 1e-45);
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|0.1
+    2|1.6777216e+07
+    3|1.2345679e+08
+    4|3.4028235e+38
+    5|1e-45
+}
+
+test float4-is-less-exact-than-float8 {
+    CREATE TABLE t (a float4, b float8);
+    INSERT INTO t VALUES (0.1, 0.1);
+    SELECT a, b, a = b, a > b, a < b FROM t;
+}
+expect {
+    0.1|0.1|f|t|f
+}
+
+test float4-refuses-a-number-out-of-range {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('1e39');
+}
+@sqlstate 22003
+expect error {
+    "1e39" is out of range for type real
+}
+
+test float8-refuses-a-number-out-of-range {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1e400');
+}
+@sqlstate 22003
+expect error {
+    "1e400" is out of range for type double precision
+}
+
+test float8-refuses-a-number-that-is-too-small {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1e-400');
+}
+@sqlstate 22003
+expect error {
+    "1e-400" is out of range for type double precision
+}
+
+test float8-refuses-text-that-is-not-a-number {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type double precision: "abc"
+}
+
+test float4-refuses-text-that-is-not-a-number {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type real: "abc"
+}
+
+test float8-refuses-empty-text {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type double precision: ""
+}
+
+setup float8_table {
+    CREATE TABLE t (id int, x float8);
+}
+
+@setup float8_table
+test float8-sorts-nan-after-every-number {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    -Infinity
+    -2.5
+    1.5
+    Infinity
+    NaN
+    NaN
+}
+
+@setup float8_table
+test float8-sorts-nan-first-in-descending-order {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT x FROM t ORDER BY x DESC;
+}
+expect {
+    NaN
+    NaN
+    Infinity
+    1.5
+    -2.5
+    -Infinity
+}
+
+@setup float8_table
+test float8-nan-equals-nan {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT id FROM t WHERE x = x ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+}
+
+@setup float8_table
+test float8-nan-is-greater-than-infinity {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT id FROM t WHERE x > 'Infinity' ORDER BY id;
+}
+expect {
+    1
+    6
+}
+
+@setup float8_table
+test float8-everything-else-is-less-than-nan {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT id FROM t WHERE x < 'NaN' ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+    5
+}
+
+@setup float8_table
+test float8-distinct-merges-nans {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT count(*) FROM (SELECT DISTINCT x FROM t) d;
+}
+expect {
+    5
+}
+
+@setup float8_table
+test float8-group-by-merges-nans {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT x, count(*) FROM t GROUP BY x ORDER BY x;
+}
+expect {
+    -Infinity|1
+    -2.5|1
+    1.5|1
+    Infinity|1
+    NaN|2
+}
+
+@setup float8_table
+test float8-max-is-nan {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT max(x), min(x) FROM t;
+}
+expect {
+    NaN|-Infinity
+}
+
+@setup float8_table
+test float8-join-matches-nan-with-nan {
+    INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
+    SELECT a.id, b.id FROM t a JOIN t b ON a.x = b.x WHERE a.id < b.id ORDER BY 1, 2;
+}
+expect {
+    1|6
+}
+
+setup zeros {
+    CREATE TABLE t (id int, x float8);
+    INSERT INTO t VALUES (1, '-0'), (2, 0), (3, '-0'), (4, 1);
+}
+
+@setup zeros
+test float8-negative-zero-equals-zero {
+    SELECT id FROM t WHERE x = 0 ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup zeros
+test float8-negative-zero-equals-negative-zero-text {
+    SELECT id FROM t WHERE x = '-0' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup zeros
+test float8-distinct-merges-zeros {
+    SELECT count(*) FROM (SELECT DISTINCT x FROM t) d;
+}
+expect {
+    2
+}
+
+@setup zeros
+test float8-group-by-merges-zeros {
+    SELECT count(*) FROM t GROUP BY x ORDER BY 1;
+}
+expect {
+    1
+    3
+}
+
+@setup zeros
+test float8-sorts-zeros-as-equal {
+    SELECT x, id FROM t WHERE id IN (1, 2) ORDER BY x, id;
+}
+expect {
+    -0|1
+    0|2
+}
+
+test float8-unique-index-refuses-a-second-nan {
+    CREATE TABLE t (x float8 UNIQUE);
+    INSERT INTO t VALUES ('NaN');
+    INSERT INTO t VALUES ('NaN');
+}
+@sqlstate 23505
+expect error {
+    duplicate key value violates unique constraint "t_x_key"
+}
+
+test float8-unique-index-refuses-zero-after-negative-zero {
+    CREATE TABLE t (x float8 UNIQUE);
+    INSERT INTO t VALUES ('-0');
+    INSERT INTO t VALUES (0);
+}
+@sqlstate 23505
+expect error {
+    duplicate key value violates unique constraint "t_x_key"
+}
+
+test float8-index-orders-nan-last {
+    CREATE TABLE t (x float8);
+    CREATE INDEX t_x ON t (x);
+    INSERT INTO t VALUES ('NaN'), (1.5), ('-Infinity'), ('Infinity'), (-2.5);
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    -Infinity
+    -2.5
+    1.5
+    Infinity
+    NaN
+}
+
+# 1e23 is exactly halfway to the float below it, which PostgreSQL does not
+# take as the shortest text.
+test float8-writes-a-number-halfway-to-the-next-float-with-more-digits {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1e23');
+    SELECT x FROM t;
+}
+expect {
+    9.999999999999999e+22
+}
+
+test float4-integer-conversion-rounds-once {
+    SELECT ('9007199791611905'::bigint::float4)::float8::bigint,
+           ('-9007199791611905'::bigint::float4)::float8::bigint,
+           ('9007199791611905'::bigint::float8::float4)::float8::bigint;
+    CREATE TABLE t (v float4);
+    INSERT INTO t VALUES ('9007199791611905'::bigint);
+    SELECT v::float8::bigint FROM t;
+    UPDATE t SET v = '-9007199791611905'::bigint;
+    SELECT v::float8::bigint FROM t;
+}
+expect {
+    9007200328482816|-9007200328482816|9007199254740992
+    9007200328482816
+    -9007200328482816
+}
+
+test float-input-hexadecimal-significands-and-exponents {
+    SELECT '0x1p2'::float4, '-0X1.8P+2'::float8, '0x10'::float8,
+           '0x.8p-1'::float4, '-0x0p99999'::float8;
+    SELECT '0x1.00000100000001p0'::float4,
+           ('0x1.00000100000001p0'::float8)::float4;
+    CREATE TABLE t (v float4);
+    INSERT INTO t VALUES ('0x1.8p1');
+    SELECT v, v = '0x3' FROM t;
+    SELECT pg_input_is_valid('0x1p2', 'float4'),
+           pg_input_is_valid('0x1p-149', 'float4'),
+           pg_input_is_valid('0x1p-1074', 'float8');
+}
+expect {
+    4|-6|16|0.25|-0
+    1.0000001|1
+    3|t
+    t|t|t
+}
+
+test float-hex-input-range-and-syntax-errors {
+    SELECT pg_input_is_valid('0x1p128', 'float4'),
+           pg_input_is_valid('0x1p-150', 'float4'),
+           pg_input_is_valid('0x1p1024', 'float8'),
+           pg_input_is_valid('0x1p-1075', 'float8');
+    SELECT pg_input_is_valid('0x', 'float8'),
+           pg_input_is_valid('0x.p1', 'float4'),
+           pg_input_is_valid('0x1p', 'float4'),
+           pg_input_is_valid('0x1p2garbage', 'float8'),
+           pg_input_is_valid('0x1_0', 'float8');
+    SELECT sql_error_code FROM pg_input_error_info('0x1p128', 'float4');
+    SELECT sql_error_code FROM pg_input_error_info('0x1p-1075', 'float8');
+}
+expect {
+    f|f|f|f
+    f|f|f|f|f
+    22003
+    22003
+}

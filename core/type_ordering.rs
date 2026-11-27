@@ -16,57 +16,183 @@ use crate::types::AsValueRef;
 use crate::vdbe::array::{array_values_from_blob, parse_text_array, parse_text_array_of_texts};
 use crate::{Value, ValueRef};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum TypeOrdering {
-    Numeric,
-    /// Arrays whose elements are not texts, such as `integer[]`. An array in
-    /// text form is read with numbers for its elements.
-    Array,
-    /// Arrays whose elements are texts, such as `text[]`. An array in text
-    /// form is read with texts for its elements, so `{1}` and `{1.0}` differ.
-    TextArray,
+/// One order of a type. Two handles are equal when they refer to the same definition.
+#[derive(Clone, Copy)]
+pub struct TypeOrdering(&'static OrderingDef);
+
+/// How a type compares and hashes its values.
+///
+/// `compare` orders every pair of values, including NULL and values that are
+/// not of the type, and never fails. Values that compare equal hash alike.
+/// A type can only use functions of this shape, so no SQL function can become
+/// a comparison. These are what a future CREATE OPERATOR CLASS would choose from.
+pub struct OrderingDef {
+    pub name: &'static str,
+    pub compare: fn(ValueRef, ValueRef) -> Ordering,
+    /// Orders comparison operands. Without it, `compare` does.
+    pub compare_operands: Option<OperandComparison>,
+    pub hash: fn(ValueRef, &mut dyn Hasher),
 }
 
+pub type OperandComparison = fn(ValueRef, ValueRef) -> crate::Result<Ordering>;
+
+static NUMERIC_DEF: OrderingDef = OrderingDef {
+    name: "numeric",
+    compare: numeric_compare,
+    compare_operands: Some(numeric_compare_operands),
+    hash: numeric_hash_dyn,
+};
+
+static ARRAY_NULL_DEF: OrderingDef = OrderingDef {
+    name: "array",
+    compare: array_compare::<false>,
+    compare_operands: None,
+    hash: array_hash::<false>,
+};
+
+static TEXT_ARRAY_NULL_DEF: OrderingDef = OrderingDef {
+    name: "text_array",
+    compare: text_array_compare::<false>,
+    compare_operands: None,
+    hash: text_array_hash::<false>,
+};
+
+static ARRAY_PRESERVE_DEF: OrderingDef = OrderingDef {
+    name: "array",
+    compare: array_compare::<true>,
+    compare_operands: None,
+    hash: array_hash::<true>,
+};
+
+static TEXT_ARRAY_PRESERVE_DEF: OrderingDef = OrderingDef {
+    name: "text_array",
+    compare: text_array_compare::<true>,
+    compare_operands: None,
+    hash: text_array_hash::<true>,
+};
+
 impl TypeOrdering {
-    pub const ALL: [Self; 3] = [Self::Numeric, Self::Array, Self::TextArray];
-
-    /// The name EXPLAIN shows for the order.
+    pub const NUMERIC: Self = Self(&NUMERIC_DEF);
+    /// An array order with the database's rule for encoded NaN elements.
+    pub const fn array(policy: crate::types::NanPolicy) -> Self {
+        match policy {
+            crate::types::NanPolicy::Null => Self(&ARRAY_NULL_DEF),
+            crate::types::NanPolicy::Preserve => Self(&ARRAY_PRESERVE_DEF),
+        }
+    }
+    /// A text-array order with the database's rule for encoded NaN elements.
+    pub const fn text_array(policy: crate::types::NanPolicy) -> Self {
+        match policy {
+            crate::types::NanPolicy::Null => Self(&TEXT_ARRAY_NULL_DEF),
+            crate::types::NanPolicy::Preserve => Self(&TEXT_ARRAY_PRESERVE_DEF),
+        }
+    }
+    pub fn is_array(self) -> bool {
+        [
+            Self::array(crate::types::NanPolicy::Null),
+            Self::array(crate::types::NanPolicy::Preserve),
+            Self::text_array(crate::types::NanPolicy::Null),
+            Self::text_array(crate::types::NanPolicy::Preserve),
+        ]
+        .contains(&self)
+    }
+    pub const fn new(def: &'static OrderingDef) -> Self {
+        Self(def)
+    }
     pub const fn name(self) -> &'static str {
-        match self {
-            Self::Numeric => "numeric",
-            Self::Array => "array",
-            Self::TextArray => "text_array",
-        }
+        self.0.name
     }
-
     pub fn compare(self, left: ValueRef, right: ValueRef) -> Ordering {
-        match self {
-            Self::Numeric => numeric_compare(left, right),
-            Self::Array => ArraySortKey::of(left, parse_text_array)
-                .cmp(&ArraySortKey::of(right, parse_text_array)),
-            Self::TextArray => ArraySortKey::of(left, parse_text_array_of_texts)
-                .cmp(&ArraySortKey::of(right, parse_text_array_of_texts)),
-        }
+        (self.0.compare)(left, right)
     }
-
-    /// Orders the two sides of a comparison operator, such as `n = 'abc'`.
-    /// Unlike [Self::compare], it fails when a numeric is compared with a
-    /// value that is not a number, as in PostgreSQL. The other orders never
-    /// fail.
     pub fn compare_operands(self, left: ValueRef, right: ValueRef) -> crate::Result<Ordering> {
-        match self {
-            Self::Numeric => numeric_compare_operands(left, right),
-            _ => Ok(self.compare(left, right)),
+        match self.0.compare_operands {
+            Some(compare) => compare(left, right),
+            None => Ok(self.compare(left, right)),
         }
     }
-
     pub fn hash<H: Hasher>(self, value: ValueRef, state: &mut H) {
-        match self {
-            Self::Numeric => numeric_hash(value, state),
-            Self::Array => ArraySortKey::of(value, parse_text_array).hash(state),
-            Self::TextArray => ArraySortKey::of(value, parse_text_array_of_texts).hash(state),
-        }
+        (self.0.hash)(value, state)
     }
+}
+
+impl PartialEq for TypeOrdering {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for TypeOrdering {}
+
+impl Hash for TypeOrdering {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::ptr::from_ref(self.0).hash(state)
+    }
+}
+
+impl PartialOrd for TypeOrdering {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TypeOrdering {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .name
+            .cmp(other.0.name)
+            .then_with(|| std::ptr::from_ref(self.0).cmp(&std::ptr::from_ref(other.0)))
+    }
+}
+impl std::fmt::Debug for TypeOrdering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.name)
+    }
+}
+
+fn numeric_hash_dyn(value: ValueRef, mut state: &mut dyn Hasher) {
+    numeric_hash(value, &mut state)
+}
+
+fn array_compare<const PRESERVE: bool>(left: ValueRef, right: ValueRef) -> Ordering {
+    let policy = if PRESERVE {
+        crate::types::NanPolicy::Preserve
+    } else {
+        crate::types::NanPolicy::Null
+    };
+    ArraySortKey::of(policy, left, parse_text_array).cmp(&ArraySortKey::of(
+        policy,
+        right,
+        parse_text_array,
+    ))
+}
+fn array_hash<const PRESERVE: bool>(value: ValueRef, mut state: &mut dyn Hasher) {
+    let policy = if PRESERVE {
+        crate::types::NanPolicy::Preserve
+    } else {
+        crate::types::NanPolicy::Null
+    };
+    ArraySortKey::of(policy, value, parse_text_array).hash(&mut state)
+}
+fn text_array_compare<const PRESERVE: bool>(left: ValueRef, right: ValueRef) -> Ordering {
+    let policy = if PRESERVE {
+        crate::types::NanPolicy::Preserve
+    } else {
+        crate::types::NanPolicy::Null
+    };
+    ArraySortKey::of(policy, left, parse_text_array_of_texts).cmp(&ArraySortKey::of(
+        policy,
+        right,
+        parse_text_array_of_texts,
+    ))
+}
+fn text_array_hash<const PRESERVE: bool>(value: ValueRef, mut state: &mut dyn Hasher) {
+    let policy = if PRESERVE {
+        crate::types::NanPolicy::Preserve
+    } else {
+        crate::types::NanPolicy::Null
+    };
+    ArraySortKey::of(policy, value, parse_text_array_of_texts).hash(&mut state)
 }
 
 /// NULL first; then arrays, element by element and then shorter first; then
@@ -80,10 +206,14 @@ enum ArraySortKey<'a> {
 
 impl<'a> ArraySortKey<'a> {
     /// `parse_text` reads an array in text form.
-    fn of(value: ValueRef<'a>, parse_text: fn(&str) -> Option<Vec<Value>>) -> Self {
+    fn of(
+        nan_policy: crate::types::NanPolicy,
+        value: ValueRef<'a>,
+        parse_text: fn(&str) -> Option<Vec<Value>>,
+    ) -> Self {
         let elements = match value {
             ValueRef::Null => return Self::Null,
-            ValueRef::Blob(blob) => array_values_from_blob(blob).ok(),
+            ValueRef::Blob(blob) => array_values_from_blob(nan_policy, blob).ok(),
             ValueRef::Text(text) => parse_text(text.as_str()),
             ValueRef::Numeric(_) => None,
         };
@@ -158,9 +288,7 @@ fn hash_sqlite_value<H: Hasher>(value: ValueRef, state: &mut H) {
                 Numeric::Integer(i) => i as f64,
                 Numeric::Float(f) => f64::from(f),
             };
-            // -0.0 equals 0.0 but has other bits.
-            let real = if real == 0.0 { 0.0 } else { real };
-            real.to_bits().hash(state);
+            crate::Double::new(real).canonical_bits().hash(state);
         }
         ValueRef::Text(text) => {
             2u8.hash(state);
@@ -213,9 +341,74 @@ mod tests {
     }
 
     #[test]
+    fn nan_representations_compare_and_hash_alike_in_arrays() {
+        let array = |value| {
+            Value::Blob(
+                crate::types::ImmutableRecord::from_values(&[value], 1)
+                    .unwrap()
+                    .into_payload(),
+            )
+        };
+        let nans: Vec<_> = [
+            0x7ff8_0000_0000_0000u64,
+            0xfff8_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+            0x7fff_ffff_ffff_ffff,
+        ]
+        .into_iter()
+        .map(|bits| array(Value::from_f64(f64::from_bits(bits))))
+        .collect();
+        for ordering in [
+            TypeOrdering::array(crate::types::NanPolicy::Preserve),
+            TypeOrdering::text_array(crate::types::NanPolicy::Preserve),
+        ] {
+            assert_order(
+                ordering,
+                &[
+                    &[array(Value::from_f64(f64::INFINITY))],
+                    &nans,
+                    &[array(Value::Null)],
+                ],
+            );
+        }
+        for ordering in [
+            TypeOrdering::array(crate::types::NanPolicy::Null),
+            TypeOrdering::text_array(crate::types::NanPolicy::Null),
+        ] {
+            let null = array(Value::Null);
+            for nan in &nans {
+                assert_eq!(
+                    ordering.compare(nan.as_value_ref(), null.as_value_ref()),
+                    Ordering::Equal
+                );
+                assert_eq!(hash_of(ordering, nan), hash_of(ordering, &null));
+            }
+        }
+    }
+
+    #[test]
+    fn two_orders_are_the_same_when_they_have_the_same_definition() {
+        static FIRST: OrderingDef = OrderingDef {
+            name: "same_name",
+            compare: |_, _| Ordering::Equal,
+            compare_operands: None,
+            hash: |_, _| {},
+        };
+        static SECOND: OrderingDef = OrderingDef {
+            name: "same_name",
+            compare: |_, _| Ordering::Equal,
+            compare_operands: None,
+            hash: |_, _| {},
+        };
+        assert_eq!(TypeOrdering::new(&FIRST), TypeOrdering::new(&FIRST));
+        assert_ne!(TypeOrdering::new(&FIRST), TypeOrdering::new(&SECOND));
+        assert_ne!(TypeOrdering::new(&FIRST), TypeOrdering::NUMERIC);
+    }
+
+    #[test]
     fn array_order_compares_elements_then_length() {
         assert_order(
-            TypeOrdering::Array,
+            TypeOrdering::array(crate::types::NanPolicy::Preserve),
             &[
                 &[Value::Null],
                 &[Value::from_text("{}")],
@@ -236,7 +429,7 @@ mod tests {
     #[test]
     fn numeric_order_is_the_numeric_types_order() {
         assert_order(
-            TypeOrdering::Numeric,
+            TypeOrdering::NUMERIC,
             &[
                 &[Value::Null],
                 &[int(-1)],
@@ -246,6 +439,36 @@ mod tests {
                     Value::from_f64(1.5),
                 ],
                 &[Value::from_text("abc")],
+            ],
+        );
+    }
+    static BY_SIZE: OrderingDef = OrderingDef {
+        name: "by_size",
+        compare: |left, right| size_of(left).cmp(&size_of(right)),
+        compare_operands: None,
+        hash: |value, mut state| size_of(value).hash(&mut state),
+    };
+
+    fn size_of(value: ValueRef) -> usize {
+        match value {
+            ValueRef::Text(text) => text.as_str().len(),
+            ValueRef::Blob(blob) => blob.len(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn an_order_made_from_a_definition_compares_and_hashes_with_it() {
+        let ordering = TypeOrdering::new(&BY_SIZE);
+        assert_eq!(ordering.name(), "by_size");
+        assert_ne!(ordering, TypeOrdering::NUMERIC);
+        assert_eq!(ordering, TypeOrdering::new(&BY_SIZE));
+        assert_order(
+            ordering,
+            &[
+                &[Value::Null, int(7)],
+                &[Value::from_text("a"), Value::from_text("b")],
+                &[Value::from_text("zz")],
             ],
         );
     }

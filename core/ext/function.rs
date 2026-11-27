@@ -31,11 +31,31 @@ impl ExternalFunc {
                 deterministic,
                 return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 receives_argument_types: false,
+                parameter_types: None,
                 check_argument_types: None,
                 returns_argument_type: None,
                 function: Arc::new(function),
             },
         })
+    }
+
+    /// Declares the parameter types of a fixed-arity function. The planner
+    /// asks the dialect to convert arguments before invoking the function.
+    pub fn with_parameter_types(mut self, types: &'static [&'static str]) -> Self {
+        let ExtFunc::NativeScalar {
+            arity,
+            parameter_types,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native scalar function can declare parameter types");
+        };
+        assert!(
+            matches!(arity, FunctionArity::Exact(n) if *n == types.len()),
+            "one parameter type per argument of a fixed-arity function"
+        );
+        *parameter_types = Some(types);
+        self
     }
 
     /// Makes each call also get the type name of each argument, such as
@@ -165,7 +185,7 @@ impl ExtFunc {
 
     pub(crate) fn step_aggregate(
         &self,
-        registers: &mut [Register],
+        registers: &mut crate::vdbe::registers::Registers,
         acc_reg: usize,
         start_reg: usize,
     ) -> IOResultOr<()> {
@@ -175,10 +195,14 @@ impl ExtFunc {
                     .iter()
                     .map(|arg| arg.get_value().try_clone())
                     .collect::<Result<Vec<_>, _>>()?;
-                crate::native_ext::step_aggregate(&mut registers[acc_reg], function.as_ref(), &args)
+                crate::native_ext::step_aggregate(
+                    &mut registers.write(acc_reg),
+                    function.as_ref(),
+                    &args,
+                )
             }
             Self::Aggregate { .. } => {
-                let aggregate = self.c_aggregate(&mut registers[acc_reg]).clone();
+                let aggregate = self.c_aggregate(&mut registers.write(acc_reg)).clone();
                 let args: Vec<_> = registers[start_reg..start_reg + aggregate.argc]
                     .iter()
                     .map(|arg| arg.get_value().to_ffi())
@@ -200,7 +224,7 @@ impl ExtFunc {
                     if let Some(destructor) = aggregate.aggregate_destructor {
                         unsafe { destructor(aggregate.state as usize) };
                     }
-                    registers[acc_reg].set_null();
+                    registers.set_null(acc_reg);
                     return Err(err.into());
                 }
                 Ok(IOResult::Done(()))

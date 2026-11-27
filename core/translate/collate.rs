@@ -27,7 +27,6 @@ use crate::{
     },
     type_ordering::TypeOrdering,
     types::ValueRef,
-    vdbe::hash_table::normalized_f64_bits,
     LimboError, Numeric, Result,
 };
 
@@ -90,60 +89,6 @@ impl CollationSeq {
     /// comparison look different in the code.
     pub const fn for_internal_values() -> Self {
         Self::BINARY
-    }
-
-    /// The value [Self::to_bits] never returns for a built-in or locale
-    /// collation, so stored bits can use it for "no collation".
-    pub const NO_COLLATION_BITS: u16 = 0;
-
-    /// A compact number for the collation, for storing it in column flags and
-    /// aggregate state. A custom collation has none and gets
-    /// [Self::NO_COLLATION_BITS].
-    #[inline]
-    pub const fn to_bits(self) -> u16 {
-        match self {
-            Self::Text(TextCollation::Binary) => 1,
-            Self::Text(TextCollation::NoCase) => 2,
-            Self::Text(TextCollation::Rtrim) => 3,
-            Self::Text(TextCollation::Locale(id)) => id.to_bits(),
-            Self::Text(TextCollation::Custom(_)) => Self::NO_COLLATION_BITS,
-            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering as u16,
-        }
-    }
-
-    /// Type orderings take the numbers from here up to the first number of a
-    /// locale collation.
-    const FIRST_TYPE_ORDERING_BITS: u16 = 4;
-
-    /// The collation [Self::to_bits] turned into `bits`. Any other value,
-    /// including [Self::NO_COLLATION_BITS], is an error.
-    pub fn from_bits(bits: u16) -> Result<Self> {
-        match bits {
-            1 => Ok(Self::BINARY),
-            2 => Ok(Self::NOCASE),
-            3 => Ok(Self::RTRIM),
-            bits if (Self::FIRST_TYPE_ORDERING_BITS..LocaleCollationId::FIRST_STORAGE_BIT)
-                .contains(&bits) =>
-            {
-                let ordering = TypeOrdering::ALL
-                    .get(usize::from(bits - Self::FIRST_TYPE_ORDERING_BITS))
-                    .ok_or_else(|| {
-                        LimboError::InternalError(format!("no collation has the number {bits}"))
-                    })?;
-                Ok(Self::Type(*ordering))
-            }
-            bits if bits >= LocaleCollationId::FIRST_STORAGE_BIT
-                && LocaleCollationRegistry::global()
-                    .is_registered(LocaleCollationId::from_bits(bits)) =>
-            {
-                Ok(Self::Text(TextCollation::Locale(
-                    LocaleCollationId::from_bits(bits),
-                )))
-            }
-            bits => Err(LimboError::InternalError(format!(
-                "no collation has the number {bits}"
-            ))),
-        }
     }
 
     #[inline]
@@ -209,7 +154,7 @@ impl CollationSeq {
                 let f = i as f64;
                 if (f as i64) == i && f.is_finite() {
                     hasher.write_u8(FLOAT_HASH);
-                    hasher.write(&normalized_f64_bits(f).to_le_bytes());
+                    hasher.write(&crate::Double::new(f).canonical_bits().to_le_bytes());
                 } else {
                     // The REAL would lose precision, so no REAL can equal this integer.
                     hasher.write_u8(INT_HASH);
@@ -218,7 +163,7 @@ impl CollationSeq {
             }
             ValueRef::Numeric(Numeric::Float(f)) => {
                 hasher.write_u8(FLOAT_HASH);
-                hasher.write(&normalized_f64_bits(f64::from(f)).to_le_bytes());
+                hasher.write(&f.canonical_bits().to_le_bytes());
             }
             ValueRef::Text(text) => {
                 hasher.write_u8(TEXT_HASH);
@@ -370,24 +315,13 @@ impl std::fmt::Display for CollationSeq {
 pub struct LocaleCollationId(u16);
 
 impl LocaleCollationId {
-    const FIRST_STORAGE_BIT: u16 =
-        CollationSeq::FIRST_TYPE_ORDERING_BITS + TypeOrdering::ALL.len() as u16;
-
     fn from_index(index: usize) -> Result<Self> {
-        if index > (u16::MAX - Self::FIRST_STORAGE_BIT) as usize {
+        if index > u16::MAX as usize {
             return Err(crate::LimboError::ParseError(
                 "too many locale collation sequences".to_string(),
             ));
         }
         Ok(Self(index as u16))
-    }
-
-    const fn from_bits(bits: u16) -> Self {
-        Self(bits - Self::FIRST_STORAGE_BIT)
-    }
-
-    const fn to_bits(self) -> u16 {
-        self.0 + Self::FIRST_STORAGE_BIT
     }
 }
 
@@ -460,10 +394,6 @@ impl LocaleCollationRegistry {
                 .expect("Vec collation key sink should be infallible");
             key
         })
-    }
-
-    fn is_registered(&self, id: LocaleCollationId) -> bool {
-        (id.0 as usize) < self.collations.read().len()
     }
 
     fn name(&self, id: LocaleCollationId) -> String {
@@ -786,10 +716,8 @@ fn common_ordering(
         }
     }
     match (found, array_of_unknown_elements) {
-        (None, Some(_)) => Ok(Some(TypeOrdering::Array)),
-        (Some((other, other_ty)), Some(array_ty))
-            if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) =>
-        {
+        (None, Some(_)) => Ok(Some(schema.array_ordering(false))),
+        (Some((other, other_ty)), Some(array_ty)) if !other.is_array() => {
             Err(cannot_compare(other_ty, array_ty))
         }
         (found, _) => Ok(found.map(|(ordering, _)| ordering)),
@@ -1490,24 +1418,39 @@ mod tests {
     }
 
     #[test]
-    fn collation_bits_round_trip_and_unknown_bits_are_an_error() {
-        let locale = CollationSeq::new("fr-FR").unwrap();
-        for collation in [
-            CollationSeq::BINARY,
-            CollationSeq::NOCASE,
-            CollationSeq::RTRIM,
-            locale,
-        ]
-        .into_iter()
-        .chain(TypeOrdering::ALL.map(CollationSeq::Type))
-        {
-            assert_eq!(
-                CollationSeq::from_bits(collation.to_bits()).unwrap(),
-                collation
-            );
+    fn array_ordering_survives_schema_clone() {
+        use crate::alloc::TryClone;
+        use crate::types::{ImmutableRecord, NanPolicy};
+        use crate::Value;
+        use std::hash::{DefaultHasher, Hasher};
+
+        let nan = ImmutableRecord::from_values(&[Value::from_f64(f64::NAN)], 1).unwrap();
+        let null = ImmutableRecord::from_values(&[Value::Null], 1).unwrap();
+        let nan = ValueRef::Blob(nan.get_payload());
+        let null = ValueRef::Blob(null.get_payload());
+        for policy in [NanPolicy::Null, NanPolicy::Preserve] {
+            let schema = crate::schema::SchemaBuilder::new()
+                .unwrap()
+                .array_orderings(policy)
+                .build();
+            let cloned = schema.try_clone().unwrap();
+            for text in [false, true] {
+                let original = CollationSeq::Type(schema.array_ordering(text));
+                let restored = CollationSeq::Type(cloned.array_ordering(text));
+                assert_eq!(restored, original);
+                assert_eq!(
+                    restored.compare(nan, null).is_eq(),
+                    policy == NanPolicy::Null
+                );
+                for value in [nan, null] {
+                    let mut before = DefaultHasher::new();
+                    let mut after = DefaultHasher::new();
+                    original.hash_value(value, &mut before);
+                    restored.hash_value(value, &mut after);
+                    assert_eq!(before.finish(), after.finish());
+                }
+            }
         }
-        assert!(CollationSeq::from_bits(CollationSeq::NO_COLLATION_BITS).is_err());
-        assert!(CollationSeq::from_bits(u16::MAX).is_err());
     }
 
     #[test]

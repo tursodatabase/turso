@@ -218,6 +218,10 @@ impl SortableIndexKey {
         })
     }
 
+    pub(super) fn decoded(&self) -> crate::types::DecodedRecord<'_> {
+        self.key.decode(self.metadata.nan_policy)
+    }
+
     /// Always inlined, so that the skip list loops compare two keys whose
     /// first columns are different integers without a call.
     #[inline(always)]
@@ -279,8 +283,12 @@ impl SortableIndexKey {
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
 
-        let mut lhs = self.key.iter()?;
-        let mut rhs = other.key.iter()?;
+        let mut lhs = self.decoded().iter()?;
+        assert_eq!(
+            self.metadata.nan_policy, other.metadata.nan_policy,
+            "keys belong to different database dialects"
+        );
+        let mut rhs = other.key.decode(self.metadata.nan_policy).iter()?;
 
         for i in 0..num_cols {
             // Two integers compare by value under every text collation, and
@@ -341,7 +349,7 @@ impl SortableIndexKey {
     /// Check if the index key contains any NULL values (excluding the rowid column).
     /// In SQLite, NULLs don't violate UNIQUE constraints, so we skip conflict checks for NULL keys.
     pub fn contains_null(&self, num_indexed_cols: usize) -> Result<bool> {
-        let mut iter = self.key.iter()?;
+        let mut iter = self.decoded().iter()?;
         // Only check the indexed columns, not the rowid at the end
         for _ in 0..num_indexed_cols {
             if let Some(value) = iter.next() {
@@ -357,8 +365,12 @@ impl SortableIndexKey {
     /// Used for UNIQUE index conflict detection where we need to compare only
     /// the indexed columns, not the rowid suffix.
     pub fn matches_prefix(&self, other: &Self, num_cols: usize) -> Result<bool> {
-        let mut lhs = self.key.iter()?;
-        let mut rhs = other.key.iter()?;
+        let mut lhs = self.decoded().iter()?;
+        assert_eq!(
+            self.metadata.nan_policy, other.metadata.nan_policy,
+            "keys belong to different database dialects"
+        );
+        let mut rhs = other.key.decode(self.metadata.nan_policy).iter()?;
 
         for i in 0..num_cols {
             let lhs_value = match lhs.next() {
@@ -890,7 +902,9 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: Concurre
         let values = match &record_values {
             Some(values) => values,
             None => record_values.insert(
-                ImmutableRecordRef::from_bin_record(row_version.payload(id)).get_values_owned()?,
+                ImmutableRecordRef::from_bin_record(row_version.payload(id))
+                    .decode(connection.nan_policy())
+                    .get_values_owned()?,
             ),
         };
         let physical_column = table.logical_to_physical_column(logical_column);
@@ -9958,7 +9972,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .all_indexes()
                     .find(|idx| idx.root_page == root_page)
                     .map(|idx| {
-                        IndexInfo::new_from_index_in(idx.as_ref(), self.alloc.clone()).map(Arc::new)
+                        IndexInfo::new_from_index_in(
+                            idx.as_ref(),
+                            connection.nan_policy(),
+                            self.alloc.clone(),
+                        )
+                        .map(Arc::new)
                     })
                     .transpose()
             };

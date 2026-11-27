@@ -830,6 +830,7 @@ pub struct Database<
     /// and shared by all connections because the parsed [`Schema`] is
     /// shared per database.
     dialect: Arc<dyn Dialect>,
+    nan_policy: crate::types::NanPolicy,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
@@ -987,6 +988,7 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
+            nan_policy: crate::types::NanPolicy::for_dialect(dialect.as_ref()),
             dialect,
             io: io.clone(),
             open_flags: flags,
@@ -3677,6 +3679,7 @@ impl Database {
             PageCache::default(),
             self.buffer_pool.clone(),
             self.pager_state.clone(),
+            self.nan_policy(),
         )?;
         pager.set_authenticated_header(header)?;
         pager.enable_encryption(self.opts.enable_encryption);
@@ -4019,6 +4022,11 @@ impl Database {
         self.with_schema_mut(|schema| schema.register_internal_vtab(table))
     }
 
+    /// The NaN rule fixed when the database was opened.
+    pub(crate) fn nan_policy(&self) -> crate::types::NanPolicy {
+        self.nan_policy
+    }
+
     /// The SQL dialect this database was opened with.
     pub fn dialect(&self) -> Arc<dyn Dialect> {
         self.dialect.clone()
@@ -4282,6 +4290,7 @@ mod database_tests {
                 crate::storage::page_cache::PageCache::default(),
                 db.buffer_pool.clone(),
                 db.pager_state.clone(),
+                crate::types::NanPolicy::for_dialect(db.dialect.as_ref()),
             )
             .unwrap();
             assert!(!pager.is_authenticated());

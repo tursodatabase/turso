@@ -4174,6 +4174,7 @@ mod tests {
                 true,
                 2,
                 true,
+                crate::types::NanPolicy::Null,
             )
             .unwrap(),
         );

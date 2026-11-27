@@ -1009,7 +1009,11 @@ pub fn validate_serial_type(value: u64) -> Result<()> {
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]
-pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRef<'a>, usize)> {
+pub fn read_value<'a>(
+    buf: &'a [u8],
+    serial_type: SerialType,
+    nan_policy: crate::types::NanPolicy,
+) -> Result<(ValueRef<'a>, usize)> {
     match serial_type.kind() {
         SerialTypeKind::Null => Ok((ValueRef::Null, 0)),
         SerialTypeKind::I8 => {
@@ -1105,7 +1109,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 .get(..8)
                 .and_then(|s| s.try_into().ok())
                 .ok_or_else(|| LimboError::Corrupt("Invalid BEFloat64 value".into()))?;
-            Ok((ValueRef::from_f64(f64::from_be_bytes(*bytes)), 8))
+            Ok((nan_policy.decode(f64::from_be_bytes(*bytes)), 8))
         }
         SerialTypeKind::ConstInt0 => Ok((ValueRef::Numeric(Numeric::Integer(0)), 0)),
         SerialTypeKind::ConstInt1 => Ok((ValueRef::Numeric(Numeric::Integer(1)), 0)),
@@ -1139,6 +1143,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
 pub fn read_value_serial_type<'a>(
     buf: &'a [u8],
     serial_type: u64,
+    nan_policy: crate::types::NanPolicy,
 ) -> Result<(ValueRef<'a>, usize)> {
     match serial_type {
         0 => Ok((ValueRef::Null, 0)),
@@ -1225,7 +1230,7 @@ pub fn read_value_serial_type<'a>(
                 crate::bail_corrupt_error!("Invalid 8-byte float");
             }
             Ok((
-                ValueRef::from_f64(f64::from_be_bytes([
+                nan_policy.decode(f64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
@@ -2457,7 +2462,7 @@ mod tests {
         #[case] serial_type: SerialType,
         #[case] expected: Value,
     ) {
-        let result = read_value(buf, serial_type).unwrap();
+        let result = read_value(buf, serial_type, crate::types::NanPolicy::Null).unwrap();
         assert_eq!(
             result.0.to_owned().expect(crate::alloc::ALLOC_ERR_MSG),
             expected
@@ -2512,8 +2517,8 @@ mod tests {
     #[test]
     fn test_text_decoders_reject_invalid_utf8() {
         for result in [
-            read_value(&[0xff], SerialType::text(1)),
-            read_value_serial_type(&[0xff], 15),
+            read_value(&[0xff], SerialType::text(1), crate::types::NanPolicy::Null),
+            read_value_serial_type(&[0xff], 15, crate::types::NanPolicy::Null),
         ] {
             assert!(
                 matches!(

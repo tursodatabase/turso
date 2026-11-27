@@ -398,7 +398,7 @@ expect {
 expect @tursopg error {}
 
 # C-30: real 'NaN': raw value, inside json_build_object
-@compat-gap "type:float4"
+@compat-gap "function:json_build_object"
 test real-nan-raw-value-inside-json-build-object {
     CREATE TABLE t (v real);
     INSERT INTO t VALUES ('NaN');
@@ -407,11 +407,11 @@ test real-nan-raw-value-inside-json-build-object {
 expect {
     NaN|{"v" : "NaN"}
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {}
 
 # C-31: numeric 'NaN': raw value, inside json_build_object
-@compat-gap "type:numeric"
+@compat-gap "function:json_build_object"
 test numeric-nan-raw-value-inside-json-build-object {
     CREATE TABLE t (v numeric);
     INSERT INTO t VALUES ('NaN');
@@ -420,11 +420,11 @@ test numeric-nan-raw-value-inside-json-build-object {
 expect {
     NaN|{"v" : "NaN"}
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {}
 
 # C-32: double precision 'Infinity': raw value, inside json_build_object
-@compat-gap "type:float8"
+@compat-gap "function:json_build_object"
 test double-precision-infinity-raw-value-inside-json {
     CREATE TABLE t (v double precision);
     INSERT INTO t VALUES ('Infinity');

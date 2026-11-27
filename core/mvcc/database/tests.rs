@@ -243,6 +243,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
             false,
             1,
             false,
+            crate::types::NanPolicy::Null,
         )
         .unwrap(),
     );
@@ -254,6 +255,57 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     alloc.fail_allocations(false);
     let key = SortableIndexKey::new_from_payload_in(record_ref, index_info, alloc).unwrap();
     assert_eq!(key.key.get_payload(), record.get_payload());
+}
+
+#[test]
+fn index_key_nan_decoding_follows_its_owner() {
+    use crate::types::{KeyInfo, NanPolicy};
+    for policy in [NanPolicy::Null, NanPolicy::Preserve] {
+        let metadata = Arc::new(
+            IndexInfo::new(
+                [KeyInfo {
+                    sort_order: crate::ast::SortOrder::Asc,
+                    collation: crate::CollationSeq::BINARY,
+                    nulls_order: None,
+                }; 3],
+                true,
+                3,
+                false,
+                policy,
+            )
+            .unwrap(),
+        );
+        let key = |value| {
+            let record =
+                ImmutableRecord::from_values(&[Value::from_i64(1), value, Value::from_i64(7)], 3)
+                    .unwrap();
+            SortableIndexKey::new_from_payload_in(
+                record.get_payload(),
+                metadata.clone(),
+                TursoAllocator,
+            )
+            .unwrap()
+        };
+        for bits in [
+            0x7ff8_0000_0000_0000,
+            0xfff8_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+        ] {
+            let nan = key(Value::from_f64(f64::from_bits(bits)));
+            let null = key(Value::Null);
+            let inf = key(Value::from_f64(f64::INFINITY));
+            if policy == NanPolicy::Null {
+                assert_eq!(nan, null);
+                assert!(nan < inf);
+                assert!(nan.contains_null(2).unwrap());
+            } else {
+                assert!(nan > inf);
+                assert_ne!(nan, null);
+                assert!(!nan.contains_null(2).unwrap());
+                assert_eq!(nan, key(Value::from_f64(f64::NAN)));
+            }
+        }
+    }
 }
 
 /// `SortableIndexKey` compares two integers, and two texts under BINARY,
@@ -321,6 +373,7 @@ fn index_key_order_matches_compare_immutable() {
                 true,
                 num_cols,
                 false,
+                crate::types::NanPolicy::Null,
             )
             .unwrap(),
         )
@@ -331,8 +384,16 @@ fn index_key_order_matches_compare_immutable() {
     };
     let expected = |lhs: &SortableIndexKey, rhs: &SortableIndexKey| {
         let num_cols = lhs.metadata.num_cols.min(rhs.metadata.num_cols);
-        let lhs_values = lhs.key.get_values().unwrap();
-        let rhs_values = rhs.key.get_values().unwrap();
+        let lhs_values = lhs
+            .key
+            .decode(crate::types::NanPolicy::Null)
+            .get_values()
+            .unwrap();
+        let rhs_values = rhs
+            .key
+            .decode(crate::types::NanPolicy::Null)
+            .get_values()
+            .unwrap();
         compare_immutable(
             &lhs_values[..num_cols],
             &rhs_values[..num_cols],
@@ -386,6 +447,7 @@ fn index_key_compare_reports_corrupt_values() {
             false,
             1,
             false,
+            crate::types::NanPolicy::Null,
         )
         .unwrap(),
     );
@@ -1577,6 +1639,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
             false,
             1,
             false,
+            crate::types::NanPolicy::Null,
         )
         .unwrap(),
     );
@@ -2507,7 +2570,8 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         pager.as_ref(),
     )
     .unwrap();
-    let index_info = Arc::new(IndexInfo::new_from_index(&index).unwrap());
+    let index_info =
+        Arc::new(IndexInfo::new_from_index(&index, crate::types::NanPolicy::Null).unwrap());
     let record = ImmutableRecord::from_values(
         &[Value::from_i64(interior_key), Value::from_i64(interior_key)],
         2,

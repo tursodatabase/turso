@@ -248,7 +248,10 @@ fn parse_spilled_delta(
         offset += payload_len;
         let mut record = ImmutableRecord::new(payload_len)?;
         record.start_serialization(payload)?;
-        let mut values = record.get_values_owned()?;
+        // Spilling must preserve the values captured from SQL registers.
+        let mut values = record
+            .decode(crate::types::NanPolicy::Preserve)
+            .get_values_owned()?;
         if values.len() < 3 {
             return Err(LimboError::Corrupt(
                 "materialized-view delta record lacks table identity, rowid, or weight".to_string(),

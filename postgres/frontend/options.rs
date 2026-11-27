@@ -121,7 +121,11 @@ impl VirtualTableCursor for TwoColumnCursor {
 }
 
 pub(crate) fn append_options(input: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
-    let values = array_values_from_any(input).ok_or_else(|| {
+    let values = array_values_from_any(
+        turso_core::types::NanPolicy::for_dialect(&crate::PostgresDialect),
+        input,
+    )
+    .ok_or_else(|| {
         LimboError::InvalidArgument("pg_options_to_table requires a text array".into())
     })?;
     for value in values {

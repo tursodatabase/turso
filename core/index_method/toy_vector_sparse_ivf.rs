@@ -162,22 +162,30 @@ fn parse_stat_row(record: Option<&ImmutableRecord>) -> Result<ComponentStat> {
             "stats index corrupted: expected row".to_string(),
         ));
     };
-    let ValueRef::Numeric(Numeric::Integer(position)) = record.get_value(0)? else {
+    let ValueRef::Numeric(Numeric::Integer(position)) =
+        record.decode(crate::types::NanPolicy::Null).get_value(0)?
+    else {
         return Err(LimboError::Corrupt(
             "stats index corrupted: expected integer".to_string(),
         ));
     };
-    let ValueRef::Numeric(Numeric::Integer(cnt)) = record.get_value(1)? else {
+    let ValueRef::Numeric(Numeric::Integer(cnt)) =
+        record.decode(crate::types::NanPolicy::Null).get_value(1)?
+    else {
         return Err(LimboError::Corrupt(
             "stats index corrupted: expected integer".to_string(),
         ));
     };
-    let ValueRef::Numeric(Numeric::Float(min)) = record.get_value(2)? else {
+    let ValueRef::Numeric(Numeric::Float(min)) =
+        record.decode(crate::types::NanPolicy::Null).get_value(2)?
+    else {
         return Err(LimboError::Corrupt(
             "stats index corrupted: expected float".to_string(),
         ));
     };
-    let ValueRef::Numeric(Numeric::Float(max)) = record.get_value(3)? else {
+    let ValueRef::Numeric(Numeric::Float(max)) =
+        record.decode(crate::types::NanPolicy::Null).get_value(3)?
+    else {
         return Err(LimboError::Corrupt(
             "stats index corrupted: expected float".to_string(),
         ));
@@ -202,17 +210,23 @@ fn parse_inverted_index_row(record: Option<&ImmutableRecord>) -> Result<Componen
             "inverted index corrupted: expected row".to_string(),
         ));
     };
-    let ValueRef::Numeric(Numeric::Integer(position)) = record.get_value(0)? else {
+    let ValueRef::Numeric(Numeric::Integer(position)) =
+        record.decode(crate::types::NanPolicy::Null).get_value(0)?
+    else {
         return Err(LimboError::Corrupt(
             "inverted index corrupted: expected integer".to_string(),
         ));
     };
-    let ValueRef::Numeric(Numeric::Float(sum)) = record.get_value(1)? else {
+    let ValueRef::Numeric(Numeric::Float(sum)) =
+        record.decode(crate::types::NanPolicy::Null).get_value(1)?
+    else {
         return Err(LimboError::Corrupt(
             "inverted index corrupted: expected float".to_string(),
         ));
     };
-    let ValueRef::Numeric(Numeric::Integer(rowid)) = record.get_value(2)? else {
+    let ValueRef::Numeric(Numeric::Integer(rowid)) =
+        record.decode(crate::types::NanPolicy::Null).get_value(2)?
+    else {
         return Err(LimboError::Corrupt(
             "inverted index corrupted: expected integer".to_string(),
         ));
@@ -1551,7 +1565,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     let record = return_if_io!(main.record());
                     if let Some(record) = record {
                         let column_idx = self.configuration.columns[0].pos_in_table;
-                        let ValueRef::Blob(data) = record.get_value(column_idx)? else {
+                        let ValueRef::Blob(data) = record
+                            .decode(crate::types::NanPolicy::Null)
+                            .get_value(column_idx)?
+                        else {
                             return Err(LimboError::InternalError(
                                 "table column value must be sparse vector".to_string(),
                             )

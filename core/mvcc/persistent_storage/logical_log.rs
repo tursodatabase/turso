@@ -236,13 +236,15 @@
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
 
+#[cfg(test)]
+use crate::alloc::TursoAllocator;
 use crate::io::{FileSyncType, SharedBufferData};
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
 use crate::types::IOResultOr;
 use crate::{
-    alloc::{ConcurrentAllocator, TursoAllocator},
+    alloc::ConcurrentAllocator,
     io::{start_in_group, CompletionGroup, ReadComplete},
     io_yield_one,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -3467,6 +3469,7 @@ impl StreamingLogicalLogReader {
         })))
     }
 
+    #[cfg(test)]
     pub(crate) fn parsed_op_to_streaming(
         &self,
         parsed_op: ParsedOp,
@@ -6548,6 +6551,7 @@ mod tests {
                 true,
                 2,
                 false,
+                crate::types::NanPolicy::Null,
             )
             .unwrap(),
         )
