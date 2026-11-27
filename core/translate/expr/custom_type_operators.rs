@@ -14,6 +14,11 @@ use crate::translate::expr::expr_type::{
     BuiltinType, ColumnCustomType, ExprType, TypeEnv,
 };
 
+/// The operators that only the dialect decides: the signatures of a custom type
+/// have none for them, so the engine runs them unless the dialect chooses a
+/// function.
+const DIALECT_ONLY_OPERATORS: [&str; 1] = ["||"];
+
 /// The function that runs the operator expression `expr`, such as `a + b` or
 /// `-a`, for code that has not computed the operands' types yet. See
 /// [find_operator_call].
@@ -517,6 +522,9 @@ pub(super) fn find_operator_call(
     if let Some(call) = call_the_dialect_chose(op, &operands, env)? {
         return Ok(Some(call));
     }
+    if DIALECT_ONLY_OPERATORS.contains(&op) {
+        return Ok(None);
+    }
     let found = custom_types
         .iter()
         .flat_map(|ty| {
@@ -614,7 +622,10 @@ fn decided_operator<'a>(
         ),
         _ => return None,
     };
-    assert!(known.contains(&op), "custom types do not decide {op}");
+    assert!(
+        known.contains(&op) || DIALECT_ONLY_OPERATORS.contains(&op),
+        "custom types do not decide {op}"
+    );
     Some((op, operands))
 }
 
@@ -630,6 +641,7 @@ fn binary_symbol(op: &ast::Operator) -> Option<&'static str> {
         Operator::BitwiseOr => "|",
         Operator::LeftShift => "<<",
         Operator::RightShift => ">>",
+        Operator::Concat => "||",
         _ => return None,
     })
 }
