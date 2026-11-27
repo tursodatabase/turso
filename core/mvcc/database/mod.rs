@@ -103,6 +103,15 @@ impl CheckpointReadLockState {
     }
 }
 
+/// Holds `MvStore::blocking_checkpoint_lock` in read mode and releases it when dropped.
+pub(crate) struct CheckpointReadGuard(Arc<TursoRwLock>);
+
+impl Drop for CheckpointReadGuard {
+    fn drop(&mut self) {
+        self.0.unlock();
+    }
+}
+
 /// Convert a sequence backing-table row into the exclusive upper bound used by
 /// sync scans. This is intentionally tailored to ascending non-CYCLE sequences,
 /// which is the shape used by AUTOINCREMENT CDC ids.
@@ -6503,6 +6512,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(CheckpointReadLockState::Held)
     }
 
+    /// Try to take the blocking checkpoint lock in read mode for work that is not
+    /// an MVCC transaction, and hold it until the returned guard is dropped.
+    ///
+    /// Returns `None` in passive checkpoint mode, where checkpoints do not take
+    /// the lock, and `Busy` while a blocking checkpoint holds it.
+    pub(crate) fn try_checkpoint_read_guard(&self) -> Result<Option<CheckpointReadGuard>> {
+        if self.experimental_mvcc_passive_checkpoint {
+            return Ok(None);
+        }
+        if !self.blocking_checkpoint_lock.read() {
+            return Err(LimboError::Busy);
+        }
+        Ok(Some(CheckpointReadGuard(
+            self.blocking_checkpoint_lock.clone(),
+        )))
+    }
+
     /// Release a checkpoint gate acquired by
     /// `try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin` before MVCC
     /// has adopted it.
@@ -8372,17 +8398,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Truncate checkpoints hold the write side for the whole pass; pin a read
         // guard so inline GC cannot race them. Passive checkpoints use the publish
         // drain bit instead, so skip the lifetime-style pin here.
-        let _ckpt_guard = if self.experimental_mvcc_passive_checkpoint {
-            None
-        } else if self.blocking_checkpoint_lock.read() {
-            struct CheckpointReadGuard<'a>(&'a TursoRwLock);
-            impl Drop for CheckpointReadGuard<'_> {
-                fn drop(&mut self) {
-                    self.0.unlock();
-                }
-            }
-            Some(CheckpointReadGuard(&self.blocking_checkpoint_lock))
-        } else {
+        let Ok(_ckpt_guard) = self.try_checkpoint_read_guard() else {
             return 0;
         };
 
