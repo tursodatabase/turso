@@ -21,7 +21,7 @@
 //! own name, like an AUTOINCREMENT table's watermark. Row-level security
 //! policies take their oids from the same counter.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use turso_core::alloc::TryClone;
@@ -247,6 +247,7 @@ pub(crate) struct ClassCatalog {
     by_oid: BTreeMap<i64, RelationClass>,
     oids_by_engine_name: HashMap<(NamespaceId, String), i64>,
     oids_by_relname: HashMap<(NamespaceId, String), i64>,
+    index_oids_by_table: HashMap<i64, BTreeSet<i64>>,
 }
 
 impl ClassCatalog {
@@ -255,8 +256,8 @@ impl ClassCatalog {
     /// row.
     pub(crate) fn build(schema: &Schema, rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::new(rows)?;
-        let relations = schema.user_relations();
-        for (namespace, name, _) in &relations {
+        let relations = RelationSchemas::new(schema);
+        for (namespace, name) in relations.kinds.keys() {
             if is_stored_catalog_table(*namespace, name) {
                 continue;
             }
@@ -295,7 +296,7 @@ impl ClassCatalog {
     fn relation_metadata(
         &self,
         schema: &Schema,
-        relations: &[(NamespaceId, String, RelationKind)],
+        relations: &RelationSchemas,
         class: &RelationClass,
     ) -> turso_core::Result<(usize, bool, usize)> {
         let invalid = || {
@@ -309,11 +310,8 @@ impl ClassCatalog {
         }
         let (natts, has_index, checks) = {
             if let Some(name) = &class.engine_name {
-                if !relations.iter().any(|(namespace, relation_name, kind)| {
-                    *namespace == class.relnamespace
-                        && relation_name == name
-                        && *kind == class.relkind
-                }) {
+                if relations.kinds.get(&(class.relnamespace, name.clone())) != Some(&class.relkind)
+                {
                     return Err(invalid());
                 }
             } else if class.relkind != RelationKind::Index {
@@ -363,12 +361,14 @@ impl ClassCatalog {
                         .get_btree_table(class.relnamespace, &table_class.relname)
                         .ok_or_else(invalid)?;
                     let count = if let Some(name) = &class.engine_name {
-                        schema
-                            .get_indices(class.relnamespace, &table_class.relname)
-                            .find(|index| index.name == *name)
-                            .ok_or_else(invalid)?
-                            .columns
-                            .len()
+                        let (table_name, count) = relations
+                            .index_columns
+                            .get(&(class.relnamespace, name.clone()))
+                            .ok_or_else(invalid)?;
+                        if table_name != &table.name {
+                            return Err(invalid());
+                        }
+                        *count
                     } else {
                         if table.get_rowid_alias_column().is_none()
                             || self
@@ -415,7 +415,7 @@ impl ClassCatalog {
 
     /// Public pg_class rows from persistent identities and this schema snapshot.
     pub(crate) fn rows(&self, schema: &Schema) -> Vec<Vec<Value>> {
-        let relations = schema.user_relations();
+        let relations = RelationSchemas::new(schema);
         self.classes()
             // CTAS allocates its identity before running the source query, but
             // publishes its schema entry afterwards. Like PostgreSQL, that
@@ -424,11 +424,8 @@ impl ClassCatalog {
             .filter(|class| {
                 class.oid < FIRST_NORMAL_OBJECT_ID
                     || class.engine_name.as_ref().is_none_or(|name| {
-                        relations.iter().any(|(namespace, relation_name, kind)| {
-                            *namespace == class.relnamespace
-                                && relation_name == name
-                                && *kind == class.relkind
-                        })
+                        relations.kinds.get(&(class.relnamespace, name.clone()))
+                            == Some(&class.relkind)
                     })
             })
             .map(|class| {
@@ -481,9 +478,11 @@ impl ClassCatalog {
     /// The rows of the indexes of the table with oid `table_oid`, ordered by
     /// oid.
     pub(crate) fn indexes_of(&self, table_oid: i64) -> impl Iterator<Item = &RelationClass> {
-        self.by_oid.values().filter(move |class| {
-            class.relkind == RelationKind::Index && class.relindrelid == table_oid
-        })
+        self.index_oids_by_table
+            .get(&table_oid)
+            .into_iter()
+            .flatten()
+            .map(|oid| self.by_oid.get(oid).expect("indexed class exists"))
     }
 
     /// The relations the table with oid `table_oid` owns: the sequences of
@@ -528,6 +527,13 @@ impl ClassCatalog {
                 "relation {engine_name} already has a class row"
             );
         }
+        if class.relkind == RelationKind::Index {
+            assert!(self
+                .index_oids_by_table
+                .entry(class.relindrelid)
+                .or_default()
+                .insert(class.oid));
+        }
         self.by_oid.insert(class.oid, class);
     }
 
@@ -541,6 +547,16 @@ impl ClassCatalog {
 
     fn remove_by_oid(&mut self, oid: i64) -> Option<RelationClass> {
         let class = self.by_oid.remove(&oid)?;
+        if class.relkind == RelationKind::Index {
+            let indexes = self
+                .index_oids_by_table
+                .get_mut(&class.relindrelid)
+                .expect("index has a table entry");
+            assert!(indexes.remove(&oid));
+            if indexes.is_empty() {
+                self.index_oids_by_table.remove(&class.relindrelid);
+            }
+        }
         self.oids_by_relname
             .remove(&(class.relnamespace, class.relname.clone()));
         if let Some(engine_name) = &class.engine_name {
@@ -548,6 +564,36 @@ impl ClassCatalog {
                 .remove(&(class.relnamespace, engine_name.clone()));
         }
         Some(class)
+    }
+}
+
+/// Schema lookups built once per load or scan, rather than searching every
+/// relation and every index for each catalog row.
+struct RelationSchemas {
+    kinds: HashMap<(NamespaceId, String), RelationKind>,
+    index_columns: HashMap<(NamespaceId, String), (String, usize)>,
+}
+
+impl RelationSchemas {
+    fn new(schema: &Schema) -> Self {
+        Self {
+            kinds: schema
+                .user_relations()
+                .into_iter()
+                .map(|(ns, name, kind)| ((ns, name), kind))
+                .collect(),
+            index_columns: schema
+                .namespace_ids()
+                .flat_map(|ns| {
+                    schema.indexes(ns).map(move |index| {
+                        (
+                            (ns, index.name.clone()),
+                            (index.table_name.clone(), index.columns.len()),
+                        )
+                    })
+                })
+                .collect(),
+        }
     }
 }
 
