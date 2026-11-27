@@ -2875,6 +2875,26 @@ expect {
     {"id":1,"s":"a"}|{"id":1,"label":"a"}
 }
 
+test to-json-of-a-row-that-an-outer-join-leaves-out-is-null {
+    CREATE TABLE to_json_outer (id int, v text);
+    INSERT INTO to_json_outer VALUES (1, NULL);
+    SELECT to_json(b) IS NULL, to_jsonb(b) IS NULL, row_to_json(b) IS NULL, to_json(b.*) IS NULL,
+           (SELECT to_json(b)) IS NULL
+    FROM to_json_outer a LEFT JOIN to_json_outer b ON false;
+}
+expect {
+    t|t|t|t|t
+}
+
+test to-json-of-a-row-of-nulls-that-an-outer-join-finds {
+    CREATE TABLE to_json_nulls (id int, v text);
+    INSERT INTO to_json_nulls VALUES (NULL, NULL);
+    SELECT to_json(b) FROM to_json_nulls a LEFT JOIN to_json_nulls b ON true;
+}
+expect {
+    {"id":null,"v":null}
+}
+
 test row-to-json-of-a-number {
     SELECT row_to_json(1);
 }

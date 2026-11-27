@@ -46,10 +46,29 @@ use crate::{
 };
 use std::{cell::Cell, ops::Range, sync::Arc};
 
-/// The columns of a row that an argument of a function call names, each
-/// with its name and the expression that reads it. See
+/// The row of a table that an argument of a function call names. See
 /// [`Dialect::takes_row_arguments`].
-pub type RowColumns = Vec<(String, Box<ast::Expr>)>;
+pub struct RowArgument {
+    /// The columns of the row, each with its name and the expression that
+    /// reads it.
+    pub columns: Vec<(String, Box<ast::Expr>)>,
+    /// How to tell that the row is missing: an outer join found no row for
+    /// the table, so the row is NULL, which a row whose columns are all NULL
+    /// is not.
+    pub presence: RowPresence,
+}
+
+/// Whether the row of a [`RowArgument`] can be missing, and how to tell.
+pub enum RowPresence {
+    /// The row is always there: no outer join can leave it out.
+    Always,
+    /// The row can be missing, and this expression is NULL exactly when it
+    /// is: the rowid of the table.
+    NullWhenMissing(Box<ast::Expr>),
+    /// The row can be missing, and nothing tells when: the table has no
+    /// rowid, as a subquery or a view in FROM has none.
+    Unknown,
+}
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
@@ -633,7 +652,7 @@ pub trait Dialect: Send + Sync + 'static {
         &self,
         name: &str,
         args: &[Box<ast::Expr>],
-        rows: Vec<Option<RowColumns>>,
+        rows: Vec<Option<RowArgument>>,
     ) -> Result<ast::Expr> {
         let _ = (args, rows);
         unreachable!("{name} takes no row arguments in this dialect")

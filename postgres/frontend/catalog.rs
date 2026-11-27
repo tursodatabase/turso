@@ -546,7 +546,7 @@ impl Dialect for PostgresDialect {
         &self,
         name: &str,
         args: &[Box<ast::Expr>],
-        rows: Vec<Option<turso_core::dialect::RowColumns>>,
+        rows: Vec<Option<turso_core::dialect::RowArgument>>,
     ) -> turso_core::Result<ast::Expr> {
         crate::functions::expand_record_call(name, args, rows)
     }

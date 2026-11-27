@@ -1468,6 +1468,21 @@ pub(super) fn expand_table_star(
     table_name: &str,
     long_names: bool,
 ) -> crate::Result<()> {
+    if !append_table_star(table_references, out_columns, table_name, long_names)? {
+        crate::bail_parse_error!("no such table: {}", table_name);
+    }
+    Ok(())
+}
+
+/// Appends the columns of `<table_name>.*` to `out_columns`, as
+/// [expand_table_star] does, and returns false when no table of the query
+/// has that name.
+pub(crate) fn append_table_star(
+    table_references: &mut TableReferences,
+    out_columns: &mut Vec<ResultSetColumn>,
+    table_name: &str,
+    long_names: bool,
+) -> crate::Result<bool> {
     let normalized_name = crate::util::normalize_ident(table_name);
     let tables = table_references.joined_tables();
 
@@ -1524,7 +1539,7 @@ pub(super) fn expand_table_star(
         }
     }
     if matching_columns.is_empty() {
-        crate::bail_parse_error!("no such table: {}", table_name);
+        return Ok(false);
     }
 
     let mut used_columns = Vec::new();
@@ -1563,7 +1578,7 @@ pub(super) fn expand_table_star(
     for (table_id, column_index) in used_columns {
         table_references.mark_column_used(table_id, column_index);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The name SQLite gives the FROM item `table` in `<tbl>.*` and in the saved

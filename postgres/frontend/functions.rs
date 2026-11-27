@@ -12,7 +12,7 @@ use turso_core::security::roles::RoleId;
 
 use crate::roles::{connection_roles, RoleCatalog};
 use turso_core::ast;
-use turso_core::dialect::{RowColumns, ScalarFuncContext};
+use turso_core::dialect::{RowArgument, RowPresence, ScalarFuncContext};
 use turso_core::types::IOResultOr;
 use turso_core::{
     exec_temporal_encode, Connection, Decimal, ExternalFunc, IOResult, LimboError, Numeric,
@@ -1854,20 +1854,40 @@ fn pretty_argument(pretty: Option<&Value>) -> Result<Option<bool>> {
 pub(crate) fn expand_record_call(
     name: &str,
     args: &[Box<ast::Expr>],
-    rows: Vec<Option<RowColumns>>,
+    rows: Vec<Option<RowArgument>>,
 ) -> Result<ast::Expr> {
     let mut rows = rows.into_iter();
-    let (Some(Some(columns)), pretty) = (rows.next(), args.get(1)) else {
+    let (Some(Some(row)), pretty) = (rows.next(), args.get(1)) else {
         return Err(undefined_function(name, &vec!["record"; args.len()]));
     };
     if rows.any(|row| row.is_some()) || (name != "row_to_json" && args.len() > 1) {
         return Err(undefined_function(name, &vec!["record"; args.len()]));
     }
+    let number = |n: &str| ast::Expr::Literal(ast::Literal::Numeric(n.into()));
     let pretty = pretty
         .map(|pretty| (**pretty).clone())
-        .unwrap_or_else(|| ast::Expr::Literal(ast::Literal::Numeric("0".into())));
-    let mut record_args = vec![pretty];
-    for (column, value) in columns {
+        .unwrap_or_else(|| number("0"));
+    // A row that an outer join left out is NULL, so the result is NULL then.
+    let present = match row.presence {
+        RowPresence::Always => number("1"),
+        RowPresence::NullWhenMissing(marker) => *marker,
+        // FIXME(pg-record): A subquery, a view or a table without a rowid on the
+        // side of an outer join that can be missing has nothing that tells a
+        // missing row from a row of NULLs. A record type, which the join sets
+        // to NULL as a whole, replaces this error.
+        RowPresence::Unknown => {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "{name}() of the row of a subquery, a view or a table without a rowid \
+                     that an outer join can leave out is not supported"
+                ),
+                None,
+            ))
+        }
+    };
+    let mut record_args = vec![pretty, present];
+    for (column, value) in row.columns {
         let column = column.replace('\'', "''");
         record_args.push(ast::Expr::Literal(ast::Literal::String(format!(
             "'{column}'"
@@ -1895,20 +1915,24 @@ fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
     }
 }
 
-/// `pg_record_to_json(pretty, name1, value1, name2, value2, ...)`: a JSON
-/// object with a field for each column of a row, as PostgreSQL writes a
-/// record: `{"id":1,"s":"a"}`, with a line feed and a space after each comma
-/// when `pretty` is true. Each value is written by its type, as to_json()
-/// writes it. After the arguments come their type names.
+/// `pg_record_to_json(pretty, present, name1, value1, name2, value2, ...)`:
+/// a JSON object with a field for each column of a row, as PostgreSQL writes
+/// a record: `{"id":1,"s":"a"}`, with a line feed and a space after each
+/// comma when `pretty` is true. Each value is written by its type, as
+/// to_json() writes it. The result is NULL when `present` is NULL: an outer
+/// join left the row out. After the arguments come their type names.
 fn exec_record_to_json(args: &[Register]) -> Result<Option<Json>> {
     let (args, types) = args.split_at(args.len() / 2);
     let Some(pretty) = pretty_argument(Some(args[0].get_value()))? else {
         return Ok(None);
     };
+    if matches!(args[1].get_value(), Value::Null) {
+        return Ok(None);
+    }
     let mut json = String::from("{");
-    for (i, (field, field_type)) in args[1..]
+    for (i, (field, field_type)) in args[2..]
         .chunks_exact(2)
-        .zip(types[1..].chunks_exact(2))
+        .zip(types[2..].chunks_exact(2))
         .enumerate()
     {
         if i > 0 {

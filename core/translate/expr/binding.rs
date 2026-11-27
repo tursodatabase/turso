@@ -1,13 +1,14 @@
 use super::*;
-use crate::dialect::RowColumns;
+use crate::dialect::{RowArgument, RowPresence};
 use crate::namespace::NamespaceRef;
 use crate::schema::{
     SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
 };
 use crate::translate::catalog::CatalogContext;
 use crate::translate::plan::{
-    is_schema_table, merge_columns, resolve_unqualified_column_except, unqualified_column_sources,
-    ColumnLookup, OuterQueryReference, ResolvedColumn,
+    alias_or_stored_name, append_table_star, is_schema_table, merge_columns,
+    resolve_unqualified_column_except, unqualified_column_sources, ColumnLookup, JoinType,
+    JoinedTable, OuterQueryReference, ResolvedColumn,
 };
 
 /// The precedence of binding identifiers to columns.
@@ -672,14 +673,15 @@ fn row_argument_expansion(
         .map(Some)
 }
 
-/// The columns of the row that `arg` names: the row of table `t` for `t.*`,
-/// and for `t` when no column of the query has that name. The tables of the
-/// query come before the tables of the queries around it.
+/// The row that `arg` names: the row of table `t` for `t.*`, and for `t` when
+/// no column of the query has that name. A table of the query is found as
+/// `SELECT t.*` finds it, so a name that two tables have is ambiguous. The
+/// tables of the queries around it come after.
 fn named_row(
     arg: &ast::Expr,
     tables: &mut TableReferences,
     excluded: &[TableInternalId],
-) -> Result<Option<RowColumns>> {
+) -> Result<Option<RowArgument>> {
     let (identifier, is_star) = match arg {
         Expr::Qualified(table, column) if column.as_str() == "*" => (table, true),
         Expr::Id(table) => (table, false),
@@ -693,26 +695,54 @@ fn named_row(
     {
         return Ok(None);
     }
-    let joined = tables
+    let excluded_has_name = tables
         .joined_tables()
         .iter()
-        .find(|table| table.identifier == identifier && !excluded.contains(&table.internal_id))
-        .map(|table| (table.internal_id, table.columns().to_vec()));
-    let found = joined.or_else(|| {
-        tables
-            .outer_query_refs()
+        .any(|table| excluded.contains(&table.internal_id) && table.identifier == identifier);
+    let mut star = Vec::new();
+    if !excluded_has_name && append_table_star(tables, &mut star, &identifier, false)? {
+        let joined = tables.joined_tables();
+        let index = joined
             .iter()
-            .find(|table| table.identifier == identifier)
-            .map(|table| (table.internal_id, table.table.columns().to_vec()))
-    });
-    let Some((internal_id, columns)) = found else {
+            .position(|table| alias_or_stored_name(table) == identifier);
+        let presence = match index {
+            Some(index) if may_be_null_extended(joined, index) => {
+                row_presence(&joined[index].table, joined[index].internal_id)
+            }
+            Some(_) => RowPresence::Always,
+            // A table inside a parenthesized join.
+            None => RowPresence::Unknown,
+        };
+        let columns = star
+            .into_iter()
+            .map(|column| {
+                let name = column
+                    .alias
+                    .expect("a column of a qualified star has a name");
+                (name, Box::new(column.expr))
+            })
+            .collect();
+        return Ok(Some(RowArgument { columns, presence }));
+    }
+    let Some(outer) = tables
+        .outer_query_refs()
+        .iter()
+        .find(|table| table.identifier == identifier)
+    else {
         if is_star {
             crate::bail_parse_error!("no such table: {}", identifier);
         }
         return Ok(None);
     };
-    let mut row = Vec::with_capacity(columns.len());
-    for (index, column) in columns.iter().enumerate() {
+    let (internal_id, table) = (outer.internal_id, outer.table.clone());
+    let presence = match &outer.join_info {
+        Some(join) if matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter) => {
+            row_presence(&table, internal_id)
+        }
+        _ => RowPresence::Always,
+    };
+    let mut columns = Vec::new();
+    for (index, column) in table.columns().iter().enumerate() {
         if column.hidden() {
             continue;
         }
@@ -720,7 +750,7 @@ fn named_row(
             .name
             .clone()
             .unwrap_or_else(|| format!("column{}", index + 1));
-        row.push((
+        columns.push((
             name,
             Box::new(Expr::Column {
                 database: None,
@@ -731,7 +761,37 @@ fn named_row(
         ));
         tables.mark_column_used(internal_id, index);
     }
-    Ok(Some(row))
+    Ok(Some(RowArgument { columns, presence }))
+}
+
+/// Whether an outer join can leave out the row of the table at `index` of
+/// `tables`: the table is the right side of a LEFT or FULL JOIN, or the left
+/// side of a later RIGHT or FULL JOIN.
+fn may_be_null_extended(tables: &[JoinedTable], index: usize) -> bool {
+    let join_type = |table: &JoinedTable| table.join_info.as_ref().map(|join| join.join_type);
+    matches!(
+        join_type(&tables[index]),
+        Some(JoinType::LeftOuter | JoinType::FullOuter)
+    ) || tables[index + 1..].iter().any(|table| {
+        matches!(
+            join_type(table),
+            Some(JoinType::RightOuter | JoinType::FullOuter)
+        )
+    })
+}
+
+/// How to tell that the row of `table`, which an outer join can leave out, is
+/// missing: its rowid is NULL then.
+fn row_presence(table: &Table, internal_id: TableInternalId) -> RowPresence {
+    match table {
+        Table::BTree(btree) if btree.has_rowid => {
+            RowPresence::NullWhenMissing(Box::new(Expr::RowId {
+                database: None,
+                table: internal_id,
+            }))
+        }
+        _ => RowPresence::Unknown,
+    }
 }
 
 /// Fails when `expr` uses an operator that no function of its operands' types
