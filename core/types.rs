@@ -828,11 +828,9 @@ impl NanPolicy {
 }
 
 impl Value {
+    /// Constructs a REAL without applying SQL dialect rules.
     pub const fn from_f64(f: f64) -> Self {
-        match Double::non_nan(f) {
-            Some(nn) => Self::Numeric(Numeric::Float(nn)),
-            None => Self::Null,
-        }
+        Self::Numeric(Numeric::Float(Double::new(f)))
     }
 
     pub fn is_nan(&self) -> bool {
@@ -2556,9 +2554,15 @@ impl<'a> Clone for ValueIterator<'a> {
 }
 
 impl<'a> ValueRef<'a> {
-    pub fn from_f64(f: f64) -> Self {
-        match Double::non_nan(f) {
-            Some(nn) => Self::Numeric(Numeric::Float(nn)),
+    /// Constructs a REAL without applying SQL dialect rules.
+    pub const fn from_f64(f: f64) -> Self {
+        Self::Numeric(Numeric::Float(Double::new(f)))
+    }
+
+    /// Reads the 8 bytes of a REAL in a record.
+    pub const fn from_record_real(bytes: [u8; 8]) -> Self {
+        match Double::non_nan(f64::from_be_bytes(bytes)) {
+            Some(real) => Self::Numeric(Numeric::Float(real)),
             None => Self::Null,
         }
     }
@@ -5289,19 +5293,17 @@ mod tests {
     /// via partial_cmp returned None. The .unwrap() in Ord::cmp and
     /// the single-value compare would then panic.
     ///
-    /// Now Numeric::Float wraps Double, which rejects NaN at construction time.
-    /// This makes it impossible to represent NaN in a ValueRef, so partial_cmp
-    /// is total and can never return None for any representable value.
+    /// Now Numeric::Float wraps Double, whose order is total even for NaN, so
+    /// partial_cmp can never return None, including for a value made from NaN.
     #[test]
     fn test_valueref_partial_cmp_no_panic_on_nan() {
         use crate::numeric::double::Double;
 
-        // Double::non_nan rejects NaN — this is the type-level guarantee that
-        // prevents the old panic. No ValueRef::Float(NAN) can be constructed.
         assert!(Double::non_nan(f64::NAN).is_none());
 
-        // from_f64(NAN) falls back to Null instead of storing a NaN float.
-        assert_eq!(ValueRef::from_f64(f64::NAN), ValueRef::Null);
+        assert!(
+            matches!(ValueRef::from_f64(f64::NAN), ValueRef::Numeric(Numeric::Float(f)) if f.is_nan())
+        );
 
         // Exercise every representable float edge case through partial_cmp,
         // Ord::cmp, and CollationSeq::compare — none of these can panic now.
@@ -5320,7 +5322,7 @@ mod tests {
             ValueRef::from_f64(f64::MIN_POSITIVE),
             ValueRef::from_f64(f64::INFINITY),
             ValueRef::from_f64(f64::NEG_INFINITY),
-            ValueRef::from_f64(f64::NAN), // becomes Null
+            ValueRef::from_f64(f64::NAN),
             ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
             ValueRef::Text(TextRef::new("", TextSubtype::Text)),
             ValueRef::Blob(&[1, 2, 3]),

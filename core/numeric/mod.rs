@@ -107,7 +107,7 @@ impl Numeric {
                 None => Numeric::Float(lhs.into()).checked_add(Numeric::Float(rhs.into())),
                 Some(i) => Some(Numeric::Integer(i)),
             },
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs + rhs).map(Numeric::Float),
+            (Numeric::Float(lhs), Numeric::Float(rhs)) => Some(Numeric::Float(lhs + rhs)),
             (f @ Numeric::Float(_), Numeric::Integer(i))
             | (Numeric::Integer(i), f @ Numeric::Float(_)) => {
                 f.checked_add(Numeric::Float(i.into()))
@@ -118,7 +118,7 @@ impl Numeric {
     #[inline]
     pub fn checked_sub(self, rhs: Self) -> Option<Self> {
         match (self, rhs) {
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs - rhs).map(Numeric::Float),
+            (Numeric::Float(lhs), Numeric::Float(rhs)) => Some(Numeric::Float(lhs - rhs)),
             (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_sub(rhs) {
                 None => Numeric::Float(lhs.into()).checked_sub(Numeric::Float(rhs.into())),
                 Some(i) => Some(Numeric::Integer(i)),
@@ -131,7 +131,7 @@ impl Numeric {
     #[inline]
     pub fn checked_mul(self, rhs: Self) -> Option<Self> {
         match (self, rhs) {
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs * rhs).map(Numeric::Float),
+            (Numeric::Float(lhs), Numeric::Float(rhs)) => Some(Numeric::Float(lhs * rhs)),
             (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_mul(rhs) {
                 None => Numeric::Float(lhs.into()).checked_mul(Numeric::Float(rhs.into())),
                 Some(i) => Some(Numeric::Integer(i)),
@@ -146,10 +146,9 @@ impl Numeric {
     #[inline]
     pub fn checked_div(self, rhs: Self) -> Option<Self> {
         match (self, rhs) {
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => match lhs / rhs {
-                Some(v) if rhs != 0.0 => Some(Numeric::Float(v)),
-                _ => None,
-            },
+            (Numeric::Float(lhs), Numeric::Float(rhs)) => {
+                (rhs != 0.0).then(|| Numeric::Float(lhs / rhs))
+            }
             (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_div(rhs) {
                 None => Numeric::Float(lhs.into()).checked_div(Numeric::Float(rhs.into())),
                 Some(v) => Some(Numeric::Integer(v)),
@@ -253,14 +252,7 @@ impl Ord for Numeric {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
             (Numeric::Integer(a), Numeric::Integer(b)) => a.cmp(b),
-            (Numeric::Float(a), Numeric::Float(b)) => {
-                let fa: f64 = (*a).into();
-                let fb: f64 = (*b).into();
-                // Double guarantees no NaN, so partial_cmp always returns Some.
-                // SQLite's float-vs-float uses raw IEEE 754 < and > operators,
-                // which both return false for NaN, resulting in "equal".
-                fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
-            }
+            (Numeric::Float(a), Numeric::Float(b)) => a.cmp(b),
             (Numeric::Integer(int), Numeric::Float(float)) => {
                 sqlite_int_float_cmp(*int, f64::from(*float))
             }
@@ -273,14 +265,13 @@ impl Ord for Numeric {
 
 /// Compare an integer and a float following SQLite semantics.
 ///
-/// SQLite treats NaN as NULL, so int > NaN. In practice, Double prevents NaN
-/// from appearing in Numeric::Float, but we check defensively.
+/// NaN is greater than every number, as PostgreSQL orders it. SQLite never
+/// holds a NaN, so its comparisons do not reach this case.
 ///
 /// See sqlite3IntFloatCompare in src/vdbeaux.c.
 fn sqlite_int_float_cmp(int_val: i64, float_val: f64) -> std::cmp::Ordering {
     if float_val.is_nan() {
-        // NaN is treated as NULL; all integers are greater than NULL
-        return std::cmp::Ordering::Greater;
+        return std::cmp::Ordering::Less;
     }
 
     if float_val < -9_223_372_036_854_775_808.0 {
@@ -803,7 +794,7 @@ enum FloatParts {
 
 fn decompose_float(v: f64, precision: usize) -> FloatParts {
     if v.is_nan() {
-        return FloatParts::Special("".to_string());
+        return FloatParts::Special("NaN".to_string());
     }
 
     if v.is_infinite() {
