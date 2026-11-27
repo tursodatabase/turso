@@ -28,7 +28,8 @@ use turso_core::{
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE,
-    SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_READ_ONLY_SQL_TRANSACTION,
+    SQLSTATE_UNDEFINED_OBJECT,
 };
 
 use crate::catalog::{pg_role_by_name, PgRole, PG_DATABASE_OWNER_NAME};
@@ -362,7 +363,7 @@ fn resolve_role_name(roles: &RoleCatalog, name: &str) -> turso_core::Result<Name
     })
 }
 
-fn role_does_not_exist(name: &str) -> LimboError {
+pub(crate) fn role_does_not_exist(name: &str) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_OBJECT,
         format!("role \"{name}\" does not exist"),
@@ -397,8 +398,10 @@ struct Cursors {
 /// Opens [`Cursors`] for writing the membership table of `schema`.
 fn open_cursors(program: &mut ProgramBuilder, schema: &Schema) -> turso_core::Result<Cursors> {
     let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME) else {
-        return Err(LimboError::ParseError(
-            "the database has no role membership table".to_string(),
+        return Err(sqlstate_error(
+            SQLSTATE_READ_ONLY_SQL_TRANSACTION,
+            "the database has no role membership table",
+            None,
         ));
     };
     let role_member_index = schema

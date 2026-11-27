@@ -464,6 +464,11 @@ fn resolve_func_return_type(
         }
         ResultType::Declared(ReturnType::Array) => Ok(CheckExprType::Any),
         ResultType::FirstArgument => Ok(first_argument()?.unwrap_or(CheckExprType::Any)),
+        ResultType::Argument(index) => Ok(args
+            .get(index)
+            .map(|arg| type_of(arg))
+            .transpose()?
+            .unwrap_or(CheckExprType::Any)),
         ResultType::OneOfTheArguments => common_check_type(args.iter().map(|arg| type_of(arg))),
         ResultType::OneOfTheIifValues => {
             common_check_type(iif_values(args).map(|arg| type_of(arg)))
@@ -1467,6 +1472,27 @@ pub fn translate_create_table(
         0,
         resolver.catalog.dialect.supports_namespaces(),
     )?;
+    // FIXME(pg-catalog): HACK. See refuse_timestamp_timestamptz_comparison_in_schema_expr.
+    for column in table.columns() {
+        if let crate::schema::GeneratedType::Virtual { expr, .. }
+        | crate::schema::GeneratedType::Stored { expr, .. } = column.generated_type()
+        {
+            crate::translate::collate::refuse_timestamp_timestamptz_comparison_in_schema_expr(
+                expr,
+                &table,
+                resolver,
+                crate::translate::collate::GENERATION_EXPRESSION_NOT_IMMUTABLE,
+            )?;
+        }
+    }
+    // The schema of the table's database does the same when it loads the
+    // table, so the catalog sees the table as a later statement will.
+    resolver.with_schema(database_id, |schema| {
+        table.resolve_types_and_domains(schema)
+    })?;
+    for column in table.columns() {
+        check_default_type(column, resolver)?;
+    }
     let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
@@ -1519,11 +1545,6 @@ pub fn translate_create_table(
     } else {
         TableText::Statement(input)
     };
-    // The schema of the table's database does the same when it loads the
-    // table, so the catalog sees the table as a later statement will.
-    resolver.with_schema(database_id, |schema| {
-        table.resolve_types_and_domains(schema)
-    })?;
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -1572,6 +1593,28 @@ pub fn translate_create_table(
         }
     }
 
+    // For CTAS, fill the new table from the SELECT before the in-memory
+    // schema changes, as SQLite does. The SELECT can fail, and a statement
+    // rollback undoes only the pages: it does not undo SetCookie and
+    // ParseSchema in the in-memory schema.
+    if let Some(info) = ctas_info {
+        let col_count = match &body {
+            ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns.len(),
+            _ => unreachable!("CTAS body was converted to ColumnsAndConstraints above"),
+        };
+        emit_ctas_insert(
+            program,
+            resolver,
+            info.plan,
+            &body,
+            table_root_reg,
+            col_count,
+            database_id,
+            &normalized_tbl_name,
+            connection,
+        )?;
+    }
+
     program.preassign_label_to_next_insn(parse_schema_label);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
@@ -1604,26 +1647,34 @@ pub fn translate_create_table(
         trigger_target_database_id: None,
     });
 
-    // For CTAS, emit bytecode to populate the new table from the SELECT
-    if let Some(info) = ctas_info {
-        let col_count = match &body {
-            ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns.len(),
-            _ => unreachable!("CTAS body was converted to ColumnsAndConstraints above"),
-        };
-        emit_ctas_insert(
-            program,
-            resolver,
-            info.plan,
-            &body,
-            table_root_reg,
-            col_count,
-            database_id,
-            &normalized_tbl_name,
-            connection,
-        )?;
-    }
-
     Ok(())
+}
+
+/// Asks the dialect whether the DEFAULT of `column` can be written to it.
+pub(crate) fn check_default_type(column: &Column, resolver: &Resolver) -> Result<()> {
+    let Some(default) = column.default.as_deref() else {
+        return Ok(());
+    };
+    if column.ty_str.is_empty() {
+        return Ok(());
+    }
+    let source = || {
+        crate::translate::expr::expr_type::cast_source_of(
+            default,
+            &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+            resolver.schema(),
+        )
+    };
+    let column_type = crate::translate::expr::expr_type::type_ref_of_name(
+        &column.ty_str,
+        column.array_dimensions(),
+        resolver.schema(),
+    );
+    resolver.catalog.dialect.check_column_default(
+        column.name.as_deref().unwrap_or_default(),
+        &source,
+        &column_type,
+    )
 }
 
 /// Translates `CREATE SCHEMA name`: a new namespace of the main
@@ -3216,6 +3267,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         stored_form_sorts_in_value_order: _,
         is_type_of_conditions: _,
         casts_to_numbers_and_booleans: _,
+        can_be_rowid_alias: _,
         sql: _,
         domain_checks,
         kind,

@@ -18,7 +18,7 @@ pub struct ExitArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct OpenArgs {
-    /// Path to open database
+    /// Path or file: URI of the database to open
     #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
     pub path: String,
     // TODO see how to have this completed with the output of List Vfs function
@@ -163,6 +163,7 @@ pub struct HeadersArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CloneArgs {
+    /// Path or file: URI of the new database
     pub output_file: String,
 }
 

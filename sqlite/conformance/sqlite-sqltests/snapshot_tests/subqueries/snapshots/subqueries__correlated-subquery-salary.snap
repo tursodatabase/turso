@@ -18,9 +18,10 @@ info:
 ---
 QUERY PLAN
 |--SCAN employees AS e
+|--MATERIALIZE scalar_subquery_t2
+|  |--SCAN employees AS e2
+|  `--USE SORTER FOR GROUP BY
 `--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?)
-   |--SCAN employees AS e2
-   `--USE SORTER FOR GROUP BY
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4              p5  comment

@@ -1,0 +1,2693 @@
+# Who decides each cast, and what it decides. A cast between two of the types
+# int2, int4, int8, float4, float8, numeric, text, bool, timestamp and
+# timestamptz follows pg_cast. The engine decides the casts of date, json,
+# jsonb, uuid, bytea, inet, cidr, macaddr, oid, arrays, enums and domains by
+# its own rules, and where those differ from PostgreSQL the test is a gap
+# test. A cast of any other built-in type fails with 0A000.
+#
+# A test selects the value the cast gives. A cast to float4 or float8 selects
+# the text of the value, because a float prints differently on the wire.
+
+@database :memory:
+
+# A cast written in the statement, between each pair of the types of pg_cast.
+
+test cast-int2-to-int2 {
+    SELECT (5::int2)::int2;
+}
+expect {
+    5
+}
+
+test cast-int2-to-int4 {
+    SELECT (5::int2)::int4;
+}
+expect {
+    5
+}
+
+test cast-int2-to-int8 {
+    SELECT (5::int2)::int8;
+}
+expect {
+    5
+}
+
+test cast-int2-to-float4 {
+    SELECT (5::int2)::float4::text;
+}
+expect {
+    5
+}
+
+test cast-int2-to-float8 {
+    SELECT (5::int2)::float8::text;
+}
+expect {
+    5
+}
+
+@compat-gap "cast:int2 -> numeric"
+test cast-int2-to-numeric {
+    SELECT (5::int2)::numeric;
+}
+expect {
+    5
+}
+expect @tursopg {
+    5.0
+}
+
+test cast-int2-to-text {
+    SELECT (5::int2)::text;
+}
+expect {
+    5
+}
+
+test cast-int2-to-bool {
+    SELECT (5::int2)::bool;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-int2-to-timestamp {
+    SELECT (5::int2)::timestamp;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-int2-to-timestamptz {
+    SELECT (5::int2)::timestamptz;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-int4-to-int2 {
+    SELECT (7)::int2;
+}
+expect {
+    7
+}
+
+test cast-int4-to-int4 {
+    SELECT (7)::int4;
+}
+expect {
+    7
+}
+
+test cast-int4-to-int8 {
+    SELECT (7)::int8;
+}
+expect {
+    7
+}
+
+test cast-int4-to-float4 {
+    SELECT (7)::float4::text;
+}
+expect {
+    7
+}
+
+test cast-int4-to-float8 {
+    SELECT (7)::float8::text;
+}
+expect {
+    7
+}
+
+@compat-gap "cast:int4 -> numeric"
+test cast-int4-to-numeric {
+    SELECT (7)::numeric;
+}
+expect {
+    7
+}
+expect @tursopg {
+    7.0
+}
+
+test cast-int4-to-text {
+    SELECT (7)::text;
+}
+expect {
+    7
+}
+
+test cast-int4-to-bool {
+    SELECT (7)::bool;
+}
+expect {
+    t
+}
+
+test cast-int4-to-timestamp {
+    SELECT (7)::timestamp;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-int4-to-timestamptz {
+    SELECT (7)::timestamptz;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-int8-to-int2 {
+    SELECT (9::int8)::int2;
+}
+expect {
+    9
+}
+
+test cast-int8-to-int4 {
+    SELECT (9::int8)::int4;
+}
+expect {
+    9
+}
+
+test cast-int8-to-int8 {
+    SELECT (9::int8)::int8;
+}
+expect {
+    9
+}
+
+test cast-int8-to-float4 {
+    SELECT (9::int8)::float4::text;
+}
+expect {
+    9
+}
+
+test cast-int8-to-float8 {
+    SELECT (9::int8)::float8::text;
+}
+expect {
+    9
+}
+
+@compat-gap "cast:int8 -> numeric"
+test cast-int8-to-numeric {
+    SELECT (9::int8)::numeric;
+}
+expect {
+    9
+}
+expect @tursopg {
+    9.0
+}
+
+test cast-int8-to-text {
+    SELECT (9::int8)::text;
+}
+expect {
+    9
+}
+
+test cast-int8-to-bool {
+    SELECT (9::int8)::bool;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-int8-to-timestamp {
+    SELECT (9::int8)::timestamp;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-int8-to-timestamptz {
+    SELECT (9::int8)::timestamptz;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-float4-to-int2 {
+    SELECT (3.5::float4)::int2;
+}
+expect {
+    4
+}
+
+test cast-float4-to-int4 {
+    SELECT (3.5::float4)::int4;
+}
+expect {
+    4
+}
+
+test cast-float4-to-int8 {
+    SELECT (3.5::float4)::int8;
+}
+expect {
+    4
+}
+
+test cast-float4-to-float4 {
+    SELECT (3.5::float4)::float4::text;
+}
+expect {
+    3.5
+}
+
+test cast-float4-to-float8 {
+    SELECT (3.5::float4)::float8::text;
+}
+expect {
+    3.5
+}
+
+test cast-float4-to-numeric {
+    SELECT (3.5::float4)::numeric;
+}
+expect {
+    3.5
+}
+
+test cast-float4-to-text {
+    SELECT (3.5::float4)::text;
+}
+expect {
+    3.5
+}
+
+test cast-float4-to-bool {
+    SELECT (3.5::float4)::bool;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-float4-to-timestamp {
+    SELECT (3.5::float4)::timestamp;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-float4-to-timestamptz {
+    SELECT (3.5::float4)::timestamptz;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-float8-to-int2 {
+    SELECT (2.5::float8)::int2;
+}
+expect {
+    2
+}
+
+test cast-float8-to-int4 {
+    SELECT (2.5::float8)::int4;
+}
+expect {
+    2
+}
+
+test cast-float8-to-int8 {
+    SELECT (2.5::float8)::int8;
+}
+expect {
+    2
+}
+
+test cast-float8-to-float4 {
+    SELECT (2.5::float8)::float4::text;
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-float8 {
+    SELECT (2.5::float8)::float8::text;
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-numeric {
+    SELECT (2.5::float8)::numeric;
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-text {
+    SELECT (2.5::float8)::text;
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-bool {
+    SELECT (2.5::float8)::bool;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-float8-to-timestamp {
+    SELECT (2.5::float8)::timestamp;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-float8-to-timestamptz {
+    SELECT (2.5::float8)::timestamptz;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-numeric-to-int2 {
+    SELECT (2.5)::int2;
+}
+expect {
+    3
+}
+
+test cast-numeric-to-int4 {
+    SELECT (2.5)::int4;
+}
+expect {
+    3
+}
+
+test cast-numeric-to-int8 {
+    SELECT (2.5)::int8;
+}
+expect {
+    3
+}
+
+test cast-numeric-to-float4 {
+    SELECT (2.5)::float4::text;
+}
+expect {
+    2.5
+}
+
+test cast-numeric-to-float8 {
+    SELECT (2.5)::float8::text;
+}
+expect {
+    2.5
+}
+
+test cast-numeric-to-numeric {
+    SELECT (2.5)::numeric;
+}
+expect {
+    2.5
+}
+
+test cast-numeric-to-text {
+    SELECT (2.5)::text;
+}
+expect {
+    2.5
+}
+
+test cast-numeric-to-bool {
+    SELECT (2.5)::bool;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-numeric-to-timestamp {
+    SELECT (2.5)::timestamp;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-numeric-to-timestamptz {
+    SELECT (2.5)::timestamptz;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-text-to-int2 {
+    SELECT ('1'::text)::int2;
+}
+expect {
+    1
+}
+
+test cast-text-to-int4 {
+    SELECT ('1'::text)::int4;
+}
+expect {
+    1
+}
+
+test cast-text-to-int8 {
+    SELECT ('1'::text)::int8;
+}
+expect {
+    1
+}
+
+test cast-text-to-float4 {
+    SELECT ('1'::text)::float4::text;
+}
+expect {
+    1
+}
+
+test cast-text-to-float8 {
+    SELECT ('1'::text)::float8::text;
+}
+expect {
+    1
+}
+
+@compat-gap "cast:text -> numeric"
+test cast-text-to-numeric {
+    SELECT ('1'::text)::numeric;
+}
+expect {
+    1
+}
+expect @tursopg {
+    1.0
+}
+
+test cast-text-to-text {
+    SELECT ('1'::text)::text;
+}
+expect {
+    1
+}
+
+test cast-text-to-bool {
+    SELECT ('1'::text)::bool;
+}
+expect {
+    t
+}
+
+test cast-text-to-timestamp {
+    SELECT ('1'::text)::timestamp;
+}
+@sqlstate 22007
+expect error {}
+
+test cast-text-to-timestamptz {
+    SELECT ('1'::text)::timestamptz;
+}
+@sqlstate 22007
+expect error {}
+
+test cast-bool-to-int2 {
+    SELECT (true)::int2;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-bool-to-int4 {
+    SELECT (true)::int4;
+}
+expect {
+    1
+}
+
+test cast-bool-to-int8 {
+    SELECT (true)::int8;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-bool-to-float4 {
+    SELECT (true)::float4::text;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-bool-to-float8 {
+    SELECT (true)::float8::text;
+}
+@sqlstate 42846
+expect error {}
+
+@compat-gap "cast:bool -> numeric"
+test cast-bool-to-numeric {
+    SELECT (true)::numeric;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    1.0
+}
+
+test cast-bool-to-text {
+    SELECT (true)::text;
+}
+expect {
+    true
+}
+
+test cast-bool-to-bool {
+    SELECT (true)::bool;
+}
+expect {
+    t
+}
+
+test cast-bool-to-timestamp {
+    SELECT (true)::timestamp;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-bool-to-timestamptz {
+    SELECT (true)::timestamptz;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamp-to-int2 {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::int2;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamp-to-int4 {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::int4;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamp-to-int8 {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::int8;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamp-to-float4 {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::float4::text;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamp-to-float8 {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::float8::text;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamp-to-numeric {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::numeric;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamp-to-text {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::text;
+}
+expect {
+    2020-01-02 03:04:05
+}
+
+test cast-timestamp-to-bool {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::bool;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamp-to-timestamp {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::timestamp;
+}
+expect {
+    2020-01-02 03:04:05
+}
+
+test cast-timestamp-to-timestamptz {
+    SELECT ('2020-01-02 03:04:05'::timestamp)::timestamptz;
+}
+expect {
+    2020-01-02 03:04:05+00
+}
+
+test cast-timestamptz-to-int2 {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::int2;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamptz-to-int4 {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::int4;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamptz-to-int8 {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::int8;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamptz-to-float4 {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::float4::text;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamptz-to-float8 {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::float8::text;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamptz-to-numeric {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::numeric;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamptz-to-text {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::text;
+}
+expect {
+    2020-01-02 03:04:05+00
+}
+
+test cast-timestamptz-to-bool {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::bool;
+}
+@sqlstate 42846
+expect error {}
+
+test cast-timestamptz-to-timestamp {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::timestamp;
+}
+expect {
+    2020-01-02 03:04:05
+}
+
+test cast-timestamptz-to-timestamptz {
+    SELECT ('2020-01-02 03:04:05+00'::timestamptz)::timestamptz;
+}
+expect {
+    2020-01-02 03:04:05+00
+}
+
+# A cast written in the statement, from and to the types the engine decides.
+
+test cast-text-literal-to-date {
+    SELECT '2020-01-02'::date;
+}
+expect {
+    2020-01-02
+}
+
+test cast-date-to-text {
+    SELECT '2020-01-02'::date::text;
+}
+expect {
+    2020-01-02
+}
+
+test cast-date-to-int4 {
+    SELECT '2020-01-02'::date::int4;
+}
+@sqlstate 42846
+expect error {}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date {
+    SELECT 5::date;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "cast:bool -> date"
+test cast-bool-to-date {
+    SELECT true::date;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22007
+expect @tursopg error {}
+
+test cast-text-literal-to-json {
+    SELECT '1'::json;
+}
+expect {
+    1
+}
+
+test cast-json-to-text {
+    SELECT '1'::json::text;
+}
+expect {
+    1
+}
+
+@compat-gap "cast:json -> int4"
+test cast-json-to-int4 {
+    SELECT '1'::json::int4;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    1
+}
+
+@compat-gap "cast:int4 -> json"
+test cast-int4-to-json {
+    SELECT 5::json;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    5
+}
+
+@compat-gap "cast:bool -> json"
+test cast-bool-to-json {
+    SELECT true::json;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    true
+}
+
+test cast-text-literal-to-jsonb {
+    SELECT '1'::jsonb;
+}
+expect {
+    1
+}
+
+test cast-jsonb-to-text {
+    SELECT '1'::jsonb::text;
+}
+expect {
+    1
+}
+
+test cast-jsonb-to-int4 {
+    SELECT '1'::jsonb::int4;
+}
+expect {
+    1
+}
+
+@compat-gap "cast:int4 -> jsonb"
+test cast-int4-to-jsonb {
+    SELECT 5::jsonb;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    5
+}
+
+@compat-gap "cast:bool -> jsonb"
+test cast-bool-to-jsonb {
+    SELECT true::jsonb;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    true
+}
+
+test cast-text-literal-to-uuid {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test cast-uuid-to-text {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::text;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+@compat-gap "cast:uuid -> int4"
+test cast-uuid-to-int4 {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::int4;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+@compat-gap "cast:int4 -> uuid"
+test cast-int4-to-uuid {
+    SELECT 5::uuid;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+@compat-gap "cast:bool -> uuid"
+test cast-bool-to-uuid {
+    SELECT true::uuid;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+@compat-gap "type:bytea"
+test cast-text-literal-to-bytea {
+    SELECT '\x6162'::bytea;
+}
+expect {
+    \x6162
+}
+expect @tursopg {
+    \x5c7836313632
+}
+
+test cast-bytea-to-text {
+    SELECT '\x6162'::bytea::text;
+}
+expect {
+    \x6162
+}
+
+@compat-gap "cast:bytea -> int4"
+test cast-bytea-to-int4 {
+    SELECT '\x6162'::bytea::int4;
+}
+expect {
+    24930
+}
+expect @tursopg {
+    0
+}
+
+@compat-gap "cast:int4 -> bytea"
+test cast-int4-to-bytea {
+    SELECT 5::bytea;
+}
+expect {
+    \x00000005
+}
+expect @tursopg {
+    \x35
+}
+
+@compat-gap "cast:bool -> bytea"
+test cast-bool-to-bytea {
+    SELECT true::bytea;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    \x31
+}
+
+test cast-text-literal-to-inet {
+    SELECT '10.0.0.1'::inet;
+}
+expect {
+    10.0.0.1
+}
+
+@compat-gap "cast:inet -> text"
+test cast-inet-to-text {
+    SELECT '10.0.0.1'::inet::text;
+}
+expect {
+    10.0.0.1/32
+}
+expect @tursopg {
+    10.0.0.1
+}
+
+@compat-gap "cast:inet -> int4"
+test cast-inet-to-int4 {
+    SELECT '10.0.0.1'::inet::int4;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+@compat-gap "cast:int4 -> inet"
+test cast-int4-to-inet {
+    SELECT 5::inet;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    5
+}
+
+@compat-gap "cast:bool -> inet"
+test cast-bool-to-inet {
+    SELECT true::inet;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    true
+}
+
+test cast-text-literal-to-cidr {
+    SELECT '10.0.0.0/8'::cidr;
+}
+expect {
+    10.0.0.0/8
+}
+
+test cast-cidr-to-text {
+    SELECT '10.0.0.0/8'::cidr::text;
+}
+expect {
+    10.0.0.0/8
+}
+
+@compat-gap "cast:cidr -> int4"
+test cast-cidr-to-int4 {
+    SELECT '10.0.0.0/8'::cidr::int4;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+@compat-gap "cast:int4 -> cidr"
+test cast-int4-to-cidr {
+    SELECT 5::cidr;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    5
+}
+
+@compat-gap "cast:bool -> cidr"
+test cast-bool-to-cidr {
+    SELECT true::cidr;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    true
+}
+
+test cast-text-literal-to-macaddr {
+    SELECT '08:00:2b:01:02:03'::macaddr;
+}
+expect {
+    08:00:2b:01:02:03
+}
+
+test cast-macaddr-to-text {
+    SELECT '08:00:2b:01:02:03'::macaddr::text;
+}
+expect {
+    08:00:2b:01:02:03
+}
+
+@compat-gap "cast:macaddr -> int4"
+test cast-macaddr-to-int4 {
+    SELECT '08:00:2b:01:02:03'::macaddr::int4;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+@compat-gap "cast:int4 -> macaddr"
+test cast-int4-to-macaddr {
+    SELECT 5::macaddr;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    5
+}
+
+@compat-gap "cast:bool -> macaddr"
+test cast-bool-to-macaddr {
+    SELECT true::macaddr;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    true
+}
+
+# Enums.
+
+test cast-text-literal-to-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 'happy'::mood;
+}
+expect {
+    happy
+}
+
+test cast-enum-to-text {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 'happy'::mood::text;
+}
+expect {
+    happy
+}
+
+test cast-text-to-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 'happy'::text::mood;
+}
+expect {
+    happy
+}
+
+test cast-bad-text-literal-to-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 'nope'::mood;
+}
+@sqlstate 22P02
+expect error {}
+
+test cast-enum-to-int4 {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 'happy'::mood::int4;
+}
+@sqlstate 42846
+expect error {}
+
+@compat-gap "cast:int4 -> anyenum"
+test cast-int4-to-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 1::mood;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+# Domains.
+
+test cast-int4-to-domain {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    SELECT 5::posint;
+}
+expect {
+    5
+}
+
+test cast-text-literal-to-domain {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    SELECT '5'::posint;
+}
+expect {
+    5
+}
+
+test cast-numeric-to-domain-over-int4 {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    SELECT 2.5::posint;
+}
+expect {
+    3
+}
+
+test cast-bool-to-domain-over-int4 {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    SELECT true::posint;
+}
+expect {
+    1
+}
+
+test cast-to-domain-checks-its-constraint {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    SELECT (-1)::posint;
+}
+@sqlstate 23514
+expect error {}
+
+test cast-domain-to-text {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    SELECT 5::posint::text;
+}
+expect {
+    5
+}
+
+test cast-domain-to-int8 {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    SELECT 5::posint::int8;
+}
+expect {
+    5
+}
+
+test cast-domain-over-int4-to-bool {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    SELECT 5::posint::bool;
+}
+expect {
+    t
+}
+
+# Arrays.
+
+test cast-text-literal-to-int4-array {
+    SELECT '{1,2}'::int[];
+}
+expect {
+    {1,2}
+}
+
+test cast-int4-array-to-text-array {
+    SELECT ARRAY[1,2]::text[];
+}
+expect {
+    {1,2}
+}
+
+@compat-gap "cast:_int4 -> text"
+test cast-int4-array-to-text {
+    SELECT ARRAY[1,2]::text = '{1,2}';
+}
+expect {
+    t
+}
+expect @tursopg {
+    f
+}
+
+@compat-gap "cast:_int4 -> int4"
+test cast-int4-array-to-int4 {
+    SELECT ARRAY[1,2]::int;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "cast:int4 -> _int4"
+test cast-int4-to-int4-array {
+    SELECT 5::int[];
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+# oid and the types that are an oid.
+
+test cast-int4-to-oid {
+    SELECT 1::oid;
+}
+expect {
+    1
+}
+
+test cast-oid-to-int4 {
+    SELECT 1::oid::int4;
+}
+expect {
+    1
+}
+
+test cast-int4-to-regclass-to-oid {
+    SELECT 1::regclass::oid;
+}
+expect {
+    1
+}
+
+test cast-text-literal-to-regproc {
+    SELECT '5'::regproc;
+}
+expect {
+    5
+}
+
+# A type keeps its identity on the way to a cast, whatever name it is written
+# with and whatever it is named.
+
+test enum-named-like-a-built-in-type-is-cast-and-written {
+    CREATE TYPE public.tid AS ENUM ('a', 'b');
+    CREATE TABLE t (c public.tid);
+    INSERT INTO t VALUES ('a'), ('b'::public.tid);
+    SELECT c, c::text, 'b'::public.tid FROM t ORDER BY 1;
+}
+expect {
+    a|a|b
+    b|b|b
+}
+
+test domain-column-is-cast-as-its-base-type {
+    CREATE DOMAIN posint AS bigint CHECK (VALUE > 0);
+    CREATE TABLE t (c posint);
+    INSERT INTO t VALUES (3000000000);
+    SELECT c::int8, c::text FROM t;
+    SELECT c::int4 FROM t;
+}
+@sqlstate 22003
+expect error {}
+
+test domain-column-over-smallint-has-no-cast-to-boolean {
+    CREATE DOMAIN small AS smallint;
+    CREATE TABLE t (c small);
+    INSERT INTO t VALUES (1);
+    SELECT c::boolean FROM t;
+}
+@sqlstate 42846
+expect error {}
+
+test array-of-a-registered-type-is-cast-and-written {
+    CREATE TABLE t (b bigint[], u uuid[]);
+    INSERT INTO t VALUES (ARRAY[1, 3000000000], ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid]);
+    SELECT b, b::text[], u FROM t;
+}
+expect {
+    {1,3000000000}|{1,3000000000}|{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}
+}
+
+test registered-column-types-are-cast-by-their-type {
+    CREATE TABLE t (b bigint, s smallint, bo boolean, ts timestamp, u uuid);
+    INSERT INTO t VALUES (9, 5, true, '2020-01-02 03:04:05', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT b::int4, b::int2, s::int8, s::text, bo::int4, bo::text, ts::text, u::text FROM t;
+}
+expect {
+    9|9|5|5|1|true|2020-01-02 03:04:05|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test bigint-column-out-of-the-range-of-int4 {
+    CREATE TABLE t (b bigint);
+    INSERT INTO t VALUES (3000000000);
+    SELECT b::int4 FROM t;
+}
+@sqlstate 22003
+expect error {}
+
+test smallint-and-bigint-columns-have-no-cast-to-boolean {
+    CREATE TABLE t (s smallint);
+    INSERT INTO t VALUES (1);
+    SELECT s::boolean FROM t;
+}
+@sqlstate 42846
+expect error {}
+
+test boolean-column-has-no-cast-to-bigint {
+    CREATE TABLE t (bo boolean);
+    INSERT INTO t VALUES (true);
+    SELECT bo::int8 FROM t;
+}
+@sqlstate 42846
+expect error {}
+
+test timestamp-column-has-no-cast-to-integer {
+    CREATE TABLE t (ts timestamp);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05');
+    SELECT ts::int4 FROM t;
+}
+@sqlstate 42846
+expect error {}
+
+test registered-columns-written-to-columns-of-other-types {
+    CREATE TABLE s (b bigint, sm smallint, bo boolean);
+    INSERT INTO s VALUES (9, 5, true);
+    CREATE TABLE t (i int, x text, b2 bigint);
+    INSERT INTO t SELECT b, bo, sm FROM s;
+    SELECT i, x, b2 FROM t;
+}
+expect {
+    9|true|5
+}
+
+test boolean-column-written-to-a-bigint-column {
+    CREATE TABLE s (bo boolean);
+    INSERT INTO s VALUES (true);
+    CREATE TABLE t (b bigint);
+    INSERT INTO t SELECT bo FROM s;
+}
+@sqlstate 42804
+expect error {}
+
+# Built-in types that tursopg cannot cast.
+
+@compat-gap "type:point"
+test cast-text-literal-to-point {
+    SELECT '(1,2)'::point;
+}
+expect {
+    (1,2)
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:xid"
+test cast-text-literal-to-xid {
+    SELECT '1'::xid;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "cast:int4 -> point"
+test cast-int4-to-point {
+    SELECT 5::point;
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# A value written to a column, between each pair of the types of pg_cast.
+
+test assign-int2-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+
+test assign-int2-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+
+test assign-int2-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+
+test assign-int2-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c::text FROM t;
+}
+expect {
+    5
+}
+
+test assign-int2-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c::text FROM t;
+}
+expect {
+    5
+}
+
+@compat-gap "cast:int2 -> numeric"
+test assign-int2-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+expect @tursopg {
+    5.0
+}
+
+test assign-int2-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+
+test assign-int2-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-int2-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-int2-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES (5::int2);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-int4-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES (7);
+    SELECT c FROM t;
+}
+expect {
+    7
+}
+
+test assign-int4-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES (7);
+    SELECT c FROM t;
+}
+expect {
+    7
+}
+
+test assign-int4-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES (7);
+    SELECT c FROM t;
+}
+expect {
+    7
+}
+
+test assign-int4-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES (7);
+    SELECT c::text FROM t;
+}
+expect {
+    7
+}
+
+test assign-int4-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES (7);
+    SELECT c::text FROM t;
+}
+expect {
+    7
+}
+
+@compat-gap "cast:int4 -> numeric"
+test assign-int4-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES (7);
+    SELECT c FROM t;
+}
+expect {
+    7
+}
+expect @tursopg {
+    7.0
+}
+
+test assign-int4-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (7);
+    SELECT c FROM t;
+}
+expect {
+    7
+}
+
+test assign-int4-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES (7);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-int4-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES (7);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-int4-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES (7);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-int8-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c FROM t;
+}
+expect {
+    9
+}
+
+test assign-int8-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c FROM t;
+}
+expect {
+    9
+}
+
+test assign-int8-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c FROM t;
+}
+expect {
+    9
+}
+
+test assign-int8-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c::text FROM t;
+}
+expect {
+    9
+}
+
+test assign-int8-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c::text FROM t;
+}
+expect {
+    9
+}
+
+@compat-gap "cast:int8 -> numeric"
+test assign-int8-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c FROM t;
+}
+expect {
+    9
+}
+expect @tursopg {
+    9.0
+}
+
+test assign-int8-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c FROM t;
+}
+expect {
+    9
+}
+
+test assign-int8-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-int8-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-int8-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES (9::int8);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-float4-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c FROM t;
+}
+expect {
+    4
+}
+
+test assign-float4-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c FROM t;
+}
+expect {
+    4
+}
+
+test assign-float4-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c FROM t;
+}
+expect {
+    4
+}
+
+test assign-float4-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c::text FROM t;
+}
+expect {
+    3.5
+}
+
+test assign-float4-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c::text FROM t;
+}
+expect {
+    3.5
+}
+
+test assign-float4-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c FROM t;
+}
+expect {
+    3.5
+}
+
+test assign-float4-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c FROM t;
+}
+expect {
+    3.5
+}
+
+test assign-float4-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-float4-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-float4-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES (3.5::float4);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-float8-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c FROM t;
+}
+expect {
+    2
+}
+
+test assign-float8-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c FROM t;
+}
+expect {
+    2
+}
+
+test assign-float8-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c FROM t;
+}
+expect {
+    2
+}
+
+test assign-float8-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c::text FROM t;
+}
+expect {
+    2.5
+}
+
+test assign-float8-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c::text FROM t;
+}
+expect {
+    2.5
+}
+
+test assign-float8-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c FROM t;
+}
+expect {
+    2.5
+}
+
+test assign-float8-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c FROM t;
+}
+expect {
+    2.5
+}
+
+test assign-float8-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-float8-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-float8-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES (2.5::float8);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-numeric-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES (2.5);
+    SELECT c FROM t;
+}
+expect {
+    3
+}
+
+test assign-numeric-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES (2.5);
+    SELECT c FROM t;
+}
+expect {
+    3
+}
+
+test assign-numeric-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES (2.5);
+    SELECT c FROM t;
+}
+expect {
+    3
+}
+
+test assign-numeric-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES (2.5);
+    SELECT c::text FROM t;
+}
+expect {
+    2.5
+}
+
+test assign-numeric-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES (2.5);
+    SELECT c::text FROM t;
+}
+expect {
+    2.5
+}
+
+test assign-numeric-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES (2.5);
+    SELECT c FROM t;
+}
+expect {
+    2.5
+}
+
+test assign-numeric-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (2.5);
+    SELECT c FROM t;
+}
+expect {
+    2.5
+}
+
+test assign-numeric-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES (2.5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-numeric-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES (2.5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-numeric-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES (2.5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c::text FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c::text FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c FROM t;
+}
+expect {
+    1
+}
+
+test assign-text-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-text-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES ('1'::text);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-bool-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-bool-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-bool-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-bool-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES (true);
+    SELECT c::text FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-bool-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES (true);
+    SELECT c::text FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-bool-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-bool-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+expect {
+    true
+}
+
+test assign-bool-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+expect {
+    t
+}
+
+test assign-bool-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-bool-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamp-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamp-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamp-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamp-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c::text FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamp-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c::text FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamp-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamp-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c FROM t;
+}
+expect {
+    2020-01-02 03:04:05
+}
+
+test assign-timestamp-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamp-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c FROM t;
+}
+expect {
+    2020-01-02 03:04:05
+}
+
+test assign-timestamp-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05'::timestamp);
+    SELECT c FROM t;
+}
+expect {
+    2020-01-02 03:04:05+00
+}
+
+test assign-timestamptz-to-int2-column {
+    CREATE TABLE t (c int2);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamptz-to-int4-column {
+    CREATE TABLE t (c int4);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamptz-to-int8-column {
+    CREATE TABLE t (c int8);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamptz-to-float4-column {
+    CREATE TABLE t (c float4);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c::text FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamptz-to-float8-column {
+    CREATE TABLE t (c float8);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c::text FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamptz-to-numeric-column {
+    CREATE TABLE t (c numeric);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamptz-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c FROM t;
+}
+expect {
+    2020-01-02 03:04:05+00
+}
+
+test assign-timestamptz-to-bool-column {
+    CREATE TABLE t (c bool);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-timestamptz-to-timestamp-column {
+    CREATE TABLE t (c timestamp);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c FROM t;
+}
+expect {
+    2020-01-02 03:04:05
+}
+
+test assign-timestamptz-to-timestamptz-column {
+    CREATE TABLE t (c timestamptz);
+    INSERT INTO t VALUES ('2020-01-02 03:04:05+00'::timestamptz);
+    SELECT c FROM t;
+}
+expect {
+    2020-01-02 03:04:05+00
+}
+
+# A value written to a column, from and to the types the engine decides.
+
+test assign-text-literal-to-date-column {
+    CREATE TABLE t (c date);
+    INSERT INTO t VALUES ('2020-01-02');
+    SELECT c FROM t;
+}
+expect {
+    2020-01-02
+}
+
+@compat-gap "cast:int4 -> date"
+test assign-int4-to-date-column {
+    CREATE TABLE t (c date);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "cast:date -> int4"
+test assign-date-to-int4-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('2020-01-02'::date);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+test assign-date-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('2020-01-02'::date);
+    SELECT c FROM t;
+}
+expect {
+    2020-01-02
+}
+
+test assign-text-literal-to-json-column {
+    CREATE TABLE t (c json);
+    INSERT INTO t VALUES ('1');
+    SELECT c FROM t;
+}
+expect {
+    1
+}
+
+@compat-gap "cast:int4 -> json"
+test assign-int4-to-json-column {
+    CREATE TABLE t (c json);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    5
+}
+
+test assign-json-to-int4-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('1'::json);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-json-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('1'::json);
+    SELECT c FROM t;
+}
+expect {
+    1
+}
+
+test assign-text-literal-to-jsonb-column {
+    CREATE TABLE t (c jsonb);
+    INSERT INTO t VALUES ('1');
+    SELECT c FROM t;
+}
+expect {
+    1
+}
+
+@compat-gap "cast:int4 -> jsonb"
+test assign-int4-to-jsonb-column {
+    CREATE TABLE t (c jsonb);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    5
+}
+
+test assign-jsonb-to-int4-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('1'::jsonb);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-jsonb-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('1'::jsonb);
+    SELECT c FROM t;
+}
+expect {
+    1
+}
+
+test assign-text-literal-to-uuid-column {
+    CREATE TABLE t (c uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT c FROM t;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+@compat-gap "cast:int4 -> uuid"
+test assign-int4-to-uuid-column {
+    CREATE TABLE t (c uuid);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+@compat-gap "cast:uuid -> int4"
+test assign-uuid-to-int4-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+test assign-uuid-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT c FROM t;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+@compat-gap "type:bytea"
+test assign-text-literal-to-bytea-column {
+    CREATE TABLE t (c bytea);
+    INSERT INTO t VALUES ('\x6162');
+    SELECT c FROM t;
+}
+expect {
+    \x6162
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+@compat-gap "cast:int4 -> bytea"
+test assign-int4-to-bytea-column {
+    CREATE TABLE t (c bytea);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+@compat-gap "cast:bytea -> int4"
+test assign-bytea-to-int4-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('\x6162'::bytea);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+@compat-gap "cast:bytea -> text"
+test assign-bytea-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('\x6162'::bytea);
+    SELECT c FROM t;
+}
+expect {
+    \x6162
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+test assign-text-literal-to-inet-column {
+    CREATE TABLE t (c inet);
+    INSERT INTO t VALUES ('10.0.0.1');
+    SELECT c FROM t;
+}
+expect {
+    10.0.0.1
+}
+
+@compat-gap "cast:int4 -> inet"
+test assign-int4-to-inet-column {
+    CREATE TABLE t (c inet);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+test assign-inet-to-int4-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('10.0.0.1'::inet);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+@compat-gap "cast:inet -> text"
+test assign-inet-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('10.0.0.1'::inet);
+    SELECT c FROM t;
+}
+expect {
+    10.0.0.1/32
+}
+expect @tursopg {
+    10.0.0.1
+}
+
+test assign-text-literal-to-cidr-column {
+    CREATE TABLE t (c cidr);
+    INSERT INTO t VALUES ('10.0.0.0/8');
+    SELECT c FROM t;
+}
+expect {
+    10.0.0.0/8
+}
+
+@compat-gap "cast:int4 -> cidr"
+test assign-int4-to-cidr-column {
+    CREATE TABLE t (c cidr);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    5
+}
+
+test assign-cidr-to-int4-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('10.0.0.0/8'::cidr);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-cidr-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('10.0.0.0/8'::cidr);
+    SELECT c FROM t;
+}
+expect {
+    10.0.0.0/8
+}
+
+test assign-text-literal-to-macaddr-column {
+    CREATE TABLE t (c macaddr);
+    INSERT INTO t VALUES ('08:00:2b:01:02:03');
+    SELECT c FROM t;
+}
+expect {
+    08:00:2b:01:02:03
+}
+
+@compat-gap "cast:int4 -> macaddr"
+test assign-int4-to-macaddr-column {
+    CREATE TABLE t (c macaddr);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    5
+}
+
+test assign-macaddr-to-int4-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('08:00:2b:01:02:03'::macaddr);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+
+test assign-macaddr-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('08:00:2b:01:02:03'::macaddr);
+    SELECT c FROM t;
+}
+expect {
+    08:00:2b:01:02:03
+}
+
+# A value written to a column of an enum, a domain or an array type.
+
+test assign-text-literal-to-enum-column {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE TABLE t (c mood);
+    INSERT INTO t VALUES ('happy');
+    SELECT c FROM t;
+}
+expect {
+    happy
+}
+
+@compat-gap "cast:int4 -> anyenum"
+test assign-int4-to-enum-column {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE TABLE t (c mood);
+    INSERT INTO t VALUES (1);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+test assign-enum-to-text-column {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES ('happy'::mood);
+    SELECT c FROM t;
+}
+expect {
+    happy
+}
+
+@compat-gap "cast:anyenum -> int4"
+test assign-enum-to-int4-column {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES ('happy'::mood);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+test assign-int4-to-domain-column {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    CREATE TABLE t (c posint);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+
+test assign-text-literal-to-domain-column {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    CREATE TABLE t (c posint);
+    INSERT INTO t VALUES ('7');
+    SELECT c FROM t;
+}
+expect {
+    7
+}
+
+@compat-gap "cast:bool -> int4"
+test assign-bool-to-domain-over-int4-column {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    CREATE TABLE t (c posint);
+    INSERT INTO t VALUES (true);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    1
+}
+
+test assign-domain-to-int4-column {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES (5::posint);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+
+test assign-domain-to-text-column {
+    CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (5::posint);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+
+test assign-text-literal-to-int4-array-column {
+    CREATE TABLE t (c int[]);
+    INSERT INTO t VALUES ('{1,2}');
+    SELECT c FROM t;
+}
+expect {
+    {1,2}
+}
+
+test assign-int4-array-to-int4-array-column {
+    CREATE TABLE t (c int[]);
+    INSERT INTO t VALUES (ARRAY[3,4]);
+    SELECT c FROM t;
+}
+expect {
+    {3,4}
+}
+
+@compat-gap "cast:int4 -> _int4"
+test assign-int4-to-int4-array-column {
+    CREATE TABLE t (c int[]);
+    INSERT INTO t VALUES (5);
+    SELECT c FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+@compat-gap "cast:_int4 -> text"
+test assign-int4-array-to-text-column {
+    CREATE TABLE t (c text);
+    INSERT INTO t VALUES (ARRAY[1,2]);
+    SELECT c FROM t;
+}
+expect {
+    {1,2}
+}
+@sqlstate 23000
+expect @tursopg error {}

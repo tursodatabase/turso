@@ -32,7 +32,7 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
-    vdbe::insn::Insn,
+    vdbe::{insn::Insn, BranchOffset},
     HashMap, HashSet, Result,
 };
 use tracing::{instrument, Level};
@@ -64,12 +64,12 @@ fn emit_program_for_select_with_inputs(
 ) -> Result<()> {
     let result_cols_start = program.with_scoped_result_cols_start(|program| {
         // Boxed to keep ~960 B off the prepare-path stack; see TranslateCtx size.
-        let mut t_ctx = Box::new(TranslateCtx::new(
+        let mut t_ctx = TranslateCtx::new_boxed(
             program,
             resolver.fork_with_expr_cache(),
             plan.table_references.joined_tables().len(),
             false,
-        ));
+        );
         t_ctx.materialized_build_inputs = materialized_build_inputs;
         emit_query(program, &mut plan, &mut t_ctx)
     })?;
@@ -80,6 +80,12 @@ fn emit_program_for_select_with_inputs(
     Ok(())
 }
 
+/// Emits a SELECT query.
+///
+/// This function is on the stack one time for each level of nested FROM
+/// clause subqueries. The work after the subqueries is in [emit_query_loops],
+/// which is not inlined, so that its values are not in this frame while the
+/// subqueries are emitted.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_query<'a>(
     program: &mut ProgramBuilder,
@@ -103,21 +109,48 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
-        init_limit(
-            program,
-            t_ctx,
-            &plan.limit,
-            &plan.offset,
-            after_main_loop_label,
-        )?;
-        let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
-        program.preassign_label_to_next_insn(after_main_loop_label);
-        return Ok(reg_result_cols_start);
+        return emit_values_query(program, plan, t_ctx, after_main_loop_label);
     }
 
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
+    emit_query_loops(program, plan, t_ctx, after_main_loop_label)
+}
+
+/// Emits a query that has a VALUES clause.
+#[inline(never)]
+fn emit_values_query<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a mut SelectPlan,
+    t_ctx: &mut TranslateCtx<'a>,
+    after_main_loop_label: BranchOffset,
+) -> Result<usize> {
+    init_limit(
+        program,
+        t_ctx,
+        &plan.limit,
+        &plan.offset,
+        after_main_loop_label,
+    )?;
+    let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
+    program.preassign_label_to_next_insn(after_main_loop_label);
+    Ok(reg_result_cols_start)
+}
+
+/// Emits the loops of a query and the work after them, after the FROM clause
+/// subqueries of the query are emitted.
+///
+/// [emit_query] is on the stack one time for each level of nested FROM clause
+/// subqueries. This function is not inlined, so that its values are not in
+/// that frame while the subqueries are emitted.
+#[inline(never)]
+fn emit_query_loops<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a mut SelectPlan,
+    t_ctx: &mut TranslateCtx<'a>,
+    after_main_loop_label: BranchOffset,
+) -> Result<usize> {
     let has_group_by_exprs = plan
         .group_by
         .as_ref()
@@ -184,6 +217,7 @@ pub fn emit_query<'a>(
             &plan.table_references,
             has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
+            plan.limit.is_some(),
             &plan.aggregates,
         )?;
     }

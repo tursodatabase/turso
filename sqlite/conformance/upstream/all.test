@@ -556,7 +556,7 @@ set test_files {
   subjournal           fail
   subquery             fail
   subquery2            pass
-  subselect            fail
+  subselect            pass
   substr               pass
   subtype1             fail
   swarmvtab            fail
@@ -641,7 +641,7 @@ set test_files {
   tkt1443              pass
   tkt1444              pass
   tkt1449              pass
-  tkt1473              fail
+  tkt1473              pass
   tkt1501              pass
   tkt1512              fail
   tkt1514              fail
@@ -662,7 +662,7 @@ set test_files {
   tkt2409              fail
   tkt2450              pass
   tkt2565              fail
-  tkt2640              fail
+  tkt2640              pass
   tkt2643              pass
   tkt2686              pass
   tkt2767              pass

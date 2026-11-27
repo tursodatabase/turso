@@ -11,14 +11,13 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, PgConnection,
+    split_statements, sql_parse_error, sqlstate_error, type_input, PgConnection,
     StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_PROTOCOL_VIOLATION,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
 };
 use turso_pg_parser::ParseResult;
 
@@ -46,7 +45,7 @@ use pgwire::messages::response::{
     EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
-use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -182,8 +181,99 @@ impl PgWireServerHandlers for TursoPgFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(NoopHandler)
+        Arc::new(UtcOnlyStartupHandler)
     }
+}
+
+/// Accepts a connection like `NoopHandler`, except when the startup packet
+/// asks for a session time zone other than UTC.
+struct UtcOnlyStartupHandler;
+
+#[async_trait]
+impl StartupHandler for UtcOnlyStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let PgWireFrontendMessage::Startup(startup) = &message {
+            // PostgreSQL gives the TimeZone parameter priority over `options`.
+            // Refusing any non-UTC zone needs no precedence rule.
+            let non_utc = startup
+                .parameters
+                .iter()
+                .flat_map(|(name, value)| -> Vec<&str> {
+                    if name.eq_ignore_ascii_case("timezone") {
+                        vec![value.as_str()]
+                    } else if name == "options" {
+                        time_zones_in_options(value)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .find(|zone| !is_utc(zone));
+            if let Some(zone) = non_utc {
+                let mut info = ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    SQLSTATE_FEATURE_NOT_SUPPORTED.to_owned(),
+                    format!(
+                        "time zone \"{}\" is not supported; tursopg supports only UTC",
+                        error_field_value(zone)
+                    ),
+                );
+                info.hint = Some(
+                    "Set the TimeZone connection parameter to UTC (in psql, PGTZ=UTC). Times with time zone are then shown in UTC."
+                        .to_owned(),
+                );
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+        }
+        NoopHandler.on_startup(client, message).await
+    }
+}
+
+/// Every time zone that the `options` startup parameter sets, with
+/// `-c TimeZone=x`, `-cTimeZone=x` or `--TimeZone=x`.
+fn time_zones_in_options(options: &str) -> Vec<&str> {
+    let mut zones = Vec::new();
+    let mut words = options.split_whitespace();
+    while let Some(word) = words.next() {
+        let setting = if word == "-c" {
+            words.next()
+        } else {
+            word.strip_prefix("-c").or_else(|| word.strip_prefix("--"))
+        };
+        if let Some((name, value)) = setting.and_then(|setting| setting.split_once('=')) {
+            if name.eq_ignore_ascii_case("timezone") {
+                zones.push(value);
+            }
+        }
+    }
+    zones
+}
+
+/// Whether `zone` names UTC exactly.
+fn is_utc(zone: &str) -> bool {
+    const UTC_NAMES: [&str; 11] = [
+        "utc",
+        "etc/utc",
+        "gmt",
+        "etc/gmt",
+        "uct",
+        "universal",
+        "zulu",
+        "+00",
+        "+00:00",
+        "00:00",
+        "0",
+    ];
+    let zone = zone.trim();
+    UTC_NAMES.iter().any(|name| zone.eq_ignore_ascii_case(name))
 }
 
 #[async_trait]
@@ -650,6 +740,7 @@ enum BinaryEncoding {
     /// bytes as their text format.
     Text,
     Bool,
+    Int2,
     Int4,
     Int8,
     Float8,
@@ -662,6 +753,7 @@ impl BinaryEncoding {
         match *pg_type {
             Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(Self::Text),
             Type::BOOL => Some(Self::Bool),
+            Type::INT2 => Some(Self::Int2),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
             Type::FLOAT8 => Some(Self::Float8),
@@ -715,7 +807,9 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
 /// FIXME(pg-catalog): This hand-codes typarray of pg_type, and sends an array of any type it does not list as text[]. A lookup of typarray in a pg_type table replaces this.
 /// Map a scalar PG type to its array counterpart.
 fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
-    if *scalar == Type::INT4 {
+    if *scalar == Type::INT2 {
+        Type::INT2_ARRAY
+    } else if *scalar == Type::INT4 {
         Type::INT4_ARRAY
     } else if *scalar == Type::INT8 {
         Type::INT8_ARRAY
@@ -910,6 +1004,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
         Some(BinaryEncoding::Bytea) => Ok(Value::from_blob(bytes.to_vec())),
         Some(
             BinaryEncoding::Bool
+            | BinaryEncoding::Int2
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
             | BinaryEncoding::Float8,
@@ -928,15 +1023,11 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         ))))
     })?;
 
+    if let Some(read) = type_input(i64::from(pg_type.oid())) {
+        return read(text).map_err(|error| pg_error(error.into()));
+    }
+
     match *pg_type {
-        Type::INT2 | Type::INT4 | Type::INT8 => {
-            let i: i64 = text.parse().map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&format!(
-                    "invalid integer parameter: {e}"
-                ))))
-            })?;
-            Ok(Value::from_i64(i))
-        }
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
                 PgWireError::UserError(Box::new(error_info(&format!(
@@ -945,13 +1036,6 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             })?;
             Ok(Value::from_f64(f))
         }
-        Type::BOOL => match parse_pg_bool(text) {
-            Some(truth) => Ok(Value::from_i64(i64::from(truth))),
-            None => Err(wire_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!("invalid input syntax for type boolean: \"{text}\""),
-            )),
-        },
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
@@ -1055,13 +1139,17 @@ fn encode_binary(
     text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
         (Text, _) => encode_text(encoder, val, text_type),
         (_, Value::Null) => encoder.encode_field(&None::<i8>),
         (Bool, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i != 0)),
+        (Int2, Value::Numeric(Integer(i))) => match i16::try_from(*i) {
+            Ok(i) => encoder.encode_field(&i),
+            Err(_) => return Err(binary_value_not_supported(pg_type)),
+        },
         (Int4, Value::Numeric(Integer(i))) => match i32::try_from(*i) {
             Ok(i) => encoder.encode_field(&i),
             Err(_) => return Err(binary_value_not_supported(pg_type)),
@@ -1070,10 +1158,10 @@ fn encode_binary(
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
-        (Bool | Int4 | Int8, Value::Numeric(Float(_)))
+        (Bool | Int2 | Int4 | Int8, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int2 | Int4 | Int8 | Float8, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1088,11 +1176,12 @@ fn binary_value_not_supported(pg_type: &Type) -> turso_core::LimboError {
     sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
 }
 
-/// FIXME(pg-catalog): This is a second hand-written map from type names to pg_type entries, besides `pg_type_oid` in postgres/frontend/catalog.rs, and the two disagree: this one sends smallint as int4, numeric without a precision as float8 and timetz as time, where pg_type has int2 (21), numeric (1700) and timetz (1266). A lookup in a pg_type table replaces this.
+/// FIXME(pg-catalog): This is a second hand-written map from type names to pg_type entries, besides `pg_type_oid` in postgres/frontend/catalog.rs, and the two disagree: this one sends numeric without a precision as float8 and timetz as time, where pg_type has numeric (1700) and timetz (1266). A lookup in a pg_type table replaces this.
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     let upper = type_str.to_uppercase();
     match upper.as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
+        "SMALLINT" | "INT2" => Type::INT2,
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
         "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
         | "DECIMAL" => Type::FLOAT8,
@@ -1208,6 +1297,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turso_pg_parser::sqlstate::SQLSTATE_INVALID_TEXT_REPRESENTATION;
 
     use turso_pg_client::{BackendEvent, ConnParams, PgConn};
 
@@ -1516,10 +1606,9 @@ mod tests {
         )
         .unwrap();
         let conn = PgConnection::connect(&db).unwrap();
-        conn.execute("CREATE TABLE t (i int, b bigint)").unwrap();
-        conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
-        conn.execute("CREATE TABLE o (i int)").unwrap();
-        conn.execute("INSERT INTO o VALUES (3000000000)").unwrap();
+        conn.execute("CREATE TABLE t (i int, b bigint, s smallint)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (42, 42, 42)").unwrap();
         // Each field is a 4-byte length followed by the value.
         for (sql, expected_type, binary, text) in [
             (
@@ -1533,6 +1622,18 @@ mod tests {
                 Type::INT4,
                 b"\0\0\0\x04\xff\xff\xff\xff",
                 b"\0\0\0\x02-1",
+            ),
+            (
+                "SELECT 42::int2",
+                Type::INT2,
+                b"\0\0\0\x02\0\x2a",
+                b"\0\0\0\x0242",
+            ),
+            (
+                "SELECT s FROM t",
+                Type::INT2,
+                b"\0\0\0\x02\0\x2a",
+                b"\0\0\0\x0242",
             ),
             (
                 "SELECT i FROM t",
@@ -1605,7 +1706,10 @@ mod tests {
             }
         }
         // A value that the column's binary type cannot hold is refused.
-        for sql in ["SELECT i FROM o", "SELECT 1 UNION ALL SELECT 12.5"] {
+        for sql in [
+            "SELECT abs(i) * 100000000 FROM t",
+            "SELECT 1 UNION ALL SELECT 12.5",
+        ] {
             let mut stmt = conn.prepare(sql).unwrap();
             let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary).unwrap());
             let Err(error) = execute_query(&mut stmt, fields) else {
@@ -1881,9 +1985,12 @@ mod tests {
         assert_ne!(first[0], second[0], "COMMIT ends the transaction");
     }
 
-    // 3000000000 doesn't fit the int4 column, so the second row is refused
-    // after the first row is inserted.
-    const INSERT_RETURNING_MISFIT: &str = "INSERT INTO r VALUES (1), (3000000000) RETURNING i";
+    // The result of abs() has no registered type, so the product is not
+    // checked against the range of int4 but is described as int4.
+    // 4000000000 doesn't fit it, so the second row is refused after the first
+    // row is inserted.
+    const INSERT_RETURNING_MISFIT: &str =
+        "INSERT INTO r VALUES (1), (2) RETURNING abs(i) * 2000000000";
 
     #[test]
     fn a_refused_returning_row_rolls_back_the_insert() {
@@ -1923,6 +2030,60 @@ mod tests {
             events.push(client.read_event().unwrap());
         }
         events
+    }
+
+    #[test]
+    fn a_text_parameter_with_a_fraction_cast_to_an_integer_fails() {
+        let (mut client, _conn) = copy_test_client();
+        let events = execute_with_text_parameter(&mut client, "SELECT $1::int", "2.5");
+        assert_eq!(
+            error_sqlstate(&events),
+            Some(SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_parameter_with_a_fraction_written_to_an_integer_column_fails() {
+        let (mut client, _conn) = copy_test_client();
+        client
+            .simple_query("CREATE TABLE fraction (n int)")
+            .unwrap();
+        let events =
+            execute_with_text_parameter(&mut client, "INSERT INTO fraction VALUES ($1)", "2.5");
+        assert_eq!(
+            error_sqlstate(&events),
+            Some(SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            "{events:?}"
+        );
+        assert_row_count(&mut client, "fraction", "0");
+    }
+
+    /// Sends Parse, Bind with the one parameter `parameter` in text format,
+    /// Execute and Sync, and returns the events up to ReadyForQuery.
+    fn execute_with_text_parameter(
+        client: &mut PgConn,
+        sql: &str,
+        parameter: &str,
+    ) -> Vec<BackendEvent> {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(b"\0\0\0");
+        client.write_message(b'P', &parse).unwrap();
+        let mut bind = b"\0\0\0\0\0\x01".to_vec();
+        bind.extend_from_slice(&(parameter.len() as u32).to_be_bytes());
+        bind.extend_from_slice(parameter.as_bytes());
+        bind.extend_from_slice(b"\0\0");
+        client.write_message(b'B', &bind).unwrap();
+        client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+        sync_and_read(client)
+    }
+
+    fn error_sqlstate(events: &[BackendEvent]) -> Option<&str> {
+        events.iter().find_map(|event| match event {
+            BackendEvent::ErrorResponse(fields) => fields.get(&b'C').map(String::as_str),
+            _ => None,
+        })
     }
 
     /// Checks that Execute got 0A000 and no rows, followed by ReadyForQuery
@@ -2163,6 +2324,30 @@ mod tests {
     }
 
     #[test]
+    fn test_pg_bytes_to_value_integer_reads_text_as_postgres_does() {
+        for (text, expected) in [(" 42 ", 42), ("+7", 7), ("0x1F", 31), ("1_000", 1000)] {
+            for pg_type in [Type::INT2, Type::INT4, Type::INT8] {
+                let val = pg_bytes_to_value(text.as_bytes(), &pg_type).unwrap();
+                assert_eq!(val, Value::from_i64(expected), "{text:?} as {pg_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_integer_outside_the_range_of_its_type() {
+        for (text, pg_type) in [
+            ("32768", Type::INT2),
+            ("-2147483649", Type::INT4),
+            ("9223372036854775808", Type::INT8),
+        ] {
+            let Err(error) = pg_bytes_to_value(text.as_bytes(), &pg_type) else {
+                panic!("{text:?} as {pg_type}: no error");
+            };
+            assert_eq!(sqlstate(error), "22003", "{text:?} as {pg_type}");
+        }
+    }
+
+    #[test]
     fn test_pg_bytes_to_value_float() {
         let val = pg_bytes_to_value(b"3.25", &Type::FLOAT8).unwrap();
         assert_eq!(val, Value::from_f64(3.25));
@@ -2237,8 +2422,16 @@ mod tests {
 
     #[test]
     fn test_pg_bytes_to_value_integer_parse_error() {
-        let result = pg_bytes_to_value(b"not_a_number", &Type::INT4);
-        assert!(result.is_err());
+        for text in ["not_a_number", "1.5", "1e2", ""] {
+            let Err(error) = pg_bytes_to_value(text.as_bytes(), &Type::INT4) else {
+                panic!("{text:?}: no error");
+            };
+            assert_eq!(
+                sqlstate(error),
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
@@ -2297,7 +2490,8 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("INTEGER"), Type::INT4);
         assert_eq!(sqlite_type_to_pg_type("INT"), Type::INT4);
         assert_eq!(sqlite_type_to_pg_type("INT4"), Type::INT4);
-        assert_eq!(sqlite_type_to_pg_type("SMALLINT"), Type::INT4);
+        assert_eq!(sqlite_type_to_pg_type("SMALLINT"), Type::INT2);
+        assert_eq!(sqlite_type_to_pg_type("INT2"), Type::INT2);
         assert_eq!(sqlite_type_to_pg_type("BIGINT"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("INT8"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT8);
@@ -2338,11 +2532,11 @@ mod tests {
         assert!(matches!(val, Value::Text(_)));
     }
 
-    /// Known gap: PostgreSQL 18 describes `5::int2` as int2 (oid 21) and
-    /// `1.5::numeric` as numeric (oid 1700). tursopg describes them as int4
-    /// and float8, so a client decodes the values with the wrong type.
+    /// Known gap: PostgreSQL 18 describes `1.5::numeric` as numeric (oid
+    /// 1700). tursopg describes it as float8, so a client decodes the value
+    /// with the wrong type.
     #[test]
-    fn smallint_and_numeric_result_column_oids_are_a_known_gap() {
+    fn numeric_result_column_oid_is_a_known_gap() {
         let (mut client, _conn) = copy_test_client();
         let events = client.simple_query("SELECT 5::int2, 1.5::numeric").unwrap();
         let oids: Vec<u32> = events
@@ -2355,6 +2549,6 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("{events:?}"));
         // PostgreSQL 18 sends [21, 1700].
-        assert_eq!(oids, [Type::INT4.oid(), Type::FLOAT8.oid()]);
+        assert_eq!(oids, [Type::INT2.oid(), Type::FLOAT8.oid()]);
     }
 }

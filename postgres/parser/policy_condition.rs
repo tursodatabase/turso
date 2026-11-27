@@ -151,10 +151,16 @@ fn deparse_expr(expr: &Node) -> Result<String, ParseError> {
     }));
     let sql = select
         .deparse(pg_query::DeparseOptions::default())
-        .map_err(|e| ParseError::ParseError(e.to_string()))?;
+        // pg_query fails to deparse only a node that it does not support.
+        .map_err(|e| {
+            ParseError::sqlstate(
+                crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                e.to_string(),
+            )
+        })?;
     sql.strip_prefix("SELECT ")
         .map(str::to_string)
         .ok_or_else(|| {
-            ParseError::ParseError(format!("unexpected deparse of an expression: {sql}"))
+            ParseError::internal_error(format!("unexpected deparse of an expression: {sql}"))
         })
 }

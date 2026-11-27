@@ -9,6 +9,7 @@ use crate::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
+use crate::dialect::{CastSource, EngineType, OperandType, TypeIdentity, TypeRef};
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
@@ -264,14 +265,14 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
-    fn tables(&self) -> Option<&TableReferences> {
+    pub(super) fn tables(&self) -> Option<&TableReferences> {
         match self {
             Self::Statement { tables, .. } => *tables,
             Self::Table { .. } | Self::TypeBody { .. } => None,
         }
     }
 
-    fn resolver(&self) -> Option<&Resolver<'a>> {
+    pub(super) fn resolver(&self) -> Option<&Resolver<'a>> {
         match self {
             Self::Statement { resolver, .. } => Some(resolver),
             Self::Table { .. } | Self::TypeBody { .. } => None,
@@ -870,6 +871,12 @@ fn binary_type(
             if rhs.is_array() {
                 return rhs;
             }
+            // `||` of two blobs is a blob at runtime (`Value::exec_concat`).
+            if matches!(lhs, ExprType::Builtin(BuiltinType::Blob))
+                && matches!(rhs, ExprType::Builtin(BuiltinType::Blob))
+            {
+                return rhs;
+            }
             ExprType::Builtin(BuiltinType::Text)
         }
         // `->` gives the JSON text of what it extracts, or NULL (SQLite's
@@ -1124,6 +1131,14 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
     match result_type {
         ResultType::Declared(return_type) => declared_return_type(return_type, args, env),
         ResultType::FirstArgument => first_argument().unwrap_or(any),
+        // PostgreSQL resolves a domain argument as its base type.
+        ResultType::Argument(index) => args.get(index).map_or(any, |arg| {
+            let ty = type_of(arg, env);
+            match env.resolver() {
+                Some(resolver) => without_domain(ty, resolver.schema()),
+                None => ty,
+            }
+        }),
         ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheFirstAndThirdArguments => {
@@ -1255,6 +1270,149 @@ pub(crate) fn common_type<'e>(
     env: &TypeEnv,
 ) -> ExprType {
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+}
+
+/// The type of the operand `expr`, whose type is `ty`, as a dialect sees it.
+/// A plain type is only named for a value whose type is declared (see
+/// [reads_only_declared_types]).
+pub(super) fn dialect_operand_type(expr: &ast::Expr, ty: ExprType, env: &TypeEnv) -> OperandType {
+    let schema = env.schema();
+    let (element, dimensions) = match without_domain(ty, schema) {
+        ExprType::Array {
+            element,
+            dimensions,
+        } => (without_domain(*element, schema), dimensions),
+        scalar => (scalar, 0),
+    };
+    let registered = |name: &str| {
+        OperandType::Registered(ast::Type {
+            name: name.to_string(),
+            size: None,
+            array_dimensions: dimensions,
+        })
+    };
+    let engine = |ty| OperandType::Engine {
+        ty,
+        array_dimensions: dimensions,
+    };
+    match element {
+        ExprType::Untyped => match without_wrappers(expr) {
+            ast::Expr::Literal(ast::Literal::String(text)) => {
+                OperandType::StringLiteral(super::sanitize_string(text))
+            }
+            _ => OperandType::Untyped,
+        },
+        ExprType::Builtin(BuiltinType::Any) => OperandType::Untyped,
+        ExprType::Custom { type_def, .. } => registered(&type_def.name),
+        ExprType::Builtin(BuiltinType::Boolean) => match schema.type_of_conditions() {
+            Some(type_def) => registered(&type_def.name),
+            None => engine(EngineType::Integer),
+        },
+        ExprType::Builtin(builtin) if reads_only_declared_types(expr, env) => {
+            engine(match builtin {
+                BuiltinType::Integer | BuiltinType::Boolean => EngineType::Integer,
+                BuiltinType::Real => EngineType::Real,
+                BuiltinType::Decimal => EngineType::Decimal,
+                BuiltinType::Numeric => EngineType::Number,
+                BuiltinType::Text => EngineType::Text,
+                BuiltinType::Blob => EngineType::Blob,
+                BuiltinType::Any => return OperandType::Untyped,
+            })
+        }
+        _ => OperandType::Unnamed,
+    }
+}
+
+/// FIXME(registered-types): The catalog tables declare some columns with another type than PostgreSQL (a boolean as INTEGER, a regproc as TEXT), and a subquery column does not say what type it has. So an operand that reads any of them is not checked. Once types are registered, every column and subquery column has its own type and this function goes away.
+/// Whether every value that `expr` reads has a declared type. A column of a
+/// table that is not STRICT, such as a virtual table, may hold any value, and
+/// the type of a subquery's column does not say where its values come from.
+fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    let mut declared = true;
+    let _ = super::walk_expr(
+        expr,
+        &mut |expr: &ast::Expr| -> Result<super::WalkControl> {
+            declared &= match expr {
+                ast::Expr::Column { table, .. } => env
+                    .tables()
+                    .and_then(|tables| tables.find_table_by_internal_id(*table))
+                    .is_some_and(|(_, table)| table.is_strict()),
+                ast::Expr::SubqueryResult { .. }
+                | ast::Expr::Subquery(_)
+                | ast::Expr::Register { .. } => false,
+                _ => true,
+            };
+            Ok(super::WalkControl::Continue)
+        },
+    );
+    declared
+}
+
+/// The source of a value read from `column`.
+pub(crate) fn cast_source_of_column_type(column: &Column, schema: &Schema) -> CastSource {
+    if column.ty_str.is_empty() {
+        return CastSource::Unnamed;
+    }
+    CastSource::Typed(type_ref_of_name(
+        &column.ty_str,
+        column.array_dimensions(),
+        schema,
+    ))
+}
+
+/// The source of a value that is the result of `expr`, as a dialect sees it.
+/// A parameter has no type of its own, as a string literal has none.
+pub(crate) fn cast_source_of(expr: &ast::Expr, env: &TypeEnv, schema: &Schema) -> CastSource {
+    let ty = type_of(expr, env);
+    let is_parameter = matches!(without_wrappers(expr), ast::Expr::Variable(_));
+    if is_parameter && matches!(ty, ExprType::Builtin(BuiltinType::Any)) {
+        return CastSource::Untyped;
+    }
+    dialect_cast_source(ty, schema)
+}
+
+/// The type of a cast operand as a dialect sees it.
+pub(crate) fn dialect_cast_source(ty: ExprType, schema: &Schema) -> CastSource {
+    let typed = |identity, array_dimensions| {
+        CastSource::Typed(TypeRef {
+            identity,
+            array_dimensions,
+        })
+    };
+    let named = |name: &str| typed(TypeIdentity::Name(name.to_string()), 0);
+    match without_domain(ty, schema) {
+        ExprType::Untyped => CastSource::Untyped,
+        // A value of any kind, such as the result of most functions.
+        ExprType::Builtin(BuiltinType::Any) => CastSource::Unnamed,
+        ExprType::Builtin(BuiltinType::Decimal | BuiltinType::Numeric) => named("NUMERIC"),
+        ExprType::Builtin(BuiltinType::Boolean) => match schema.type_of_conditions() {
+            Some(type_def) => typed(TypeIdentity::Registered(Arc::clone(type_def)), 0),
+            None => named(BuiltinType::Boolean.sqlite_name()),
+        },
+        ExprType::Builtin(builtin) => named(builtin.sqlite_name()),
+        ExprType::Custom { type_def, .. } => typed(TypeIdentity::Registered(type_def), 0),
+        ExprType::Array {
+            element,
+            dimensions,
+        } => match dialect_cast_source(*element, schema) {
+            CastSource::Typed(element) => typed(element.identity, dimensions),
+            other => other,
+        },
+        _ => CastSource::Unnamed,
+    }
+}
+
+/// The type written as `name`, with `array_dimensions` dimensions: the
+/// registered type of that name when the schema has one.
+pub(crate) fn type_ref_of_name(name: &str, array_dimensions: u32, schema: &Schema) -> TypeRef {
+    let identity = match schema.get_type_def_unchecked(name) {
+        Some(type_def) => TypeIdentity::Registered(Arc::clone(type_def)),
+        None => TypeIdentity::Name(name.to_string()),
+    };
+    TypeRef {
+        identity,
+        array_dimensions,
+    }
 }
 
 fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {

@@ -1,0 +1,1348 @@
+@database :memory:
+
+# An operator runs only when pg_operator has a row for the types of its
+# operands. PostgreSQL fails with 42883 otherwise.
+
+setup operands {
+    CREATE TABLE operands (
+        i integer, i2 smallint, i8 bigint, n numeric, f double precision,
+        s text, v varchar(20), b boolean, d date, ts timestamp,
+        tz timestamptz, u uuid
+    );
+    INSERT INTO operands VALUES (
+        1, 2, 3, 4.5, 5.5, '1', '1', true, '2024-01-05', '2024-01-05 10:00:00',
+        '2024-01-05 10:00:00+00', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'
+    );
+}
+
+@setup operands
+test text-equals-integer-errors {
+    SELECT s = 1 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test integer-less-than-text-errors {
+    SELECT i < s FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer < text
+}
+
+@setup operands
+test bigint-equals-text-errors {
+    SELECT i8 = s FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: bigint = text
+}
+
+@setup operands
+test varchar-equals-integer-errors {
+    SELECT v = 1 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: character varying = integer
+}
+
+test boolean-equals-integer-errors {
+    SELECT true = 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: boolean = integer
+}
+
+@setup operands
+test integer-greater-than-boolean-errors {
+    SELECT i > b FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer > boolean
+}
+
+@setup operands
+test timestamptz-greater-than-integer-errors {
+    SELECT tz > 5 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp with time zone > integer
+}
+
+@setup operands
+test timestamp-equals-text-errors {
+    SELECT ts = s FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+
+@setup operands
+test date-not-equal-to-boolean-errors {
+    SELECT d <> b FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: date <> boolean
+}
+
+@setup operands
+test uuid-equals-integer-errors {
+    SELECT u = 1 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: uuid = integer
+}
+
+@setup operands
+test uuid-less-than-varchar-errors {
+    SELECT u < v FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: uuid < character varying
+}
+
+# BETWEEN compares with >= and then <=.
+@setup operands
+test text-between-integers-errors {
+    SELECT s BETWEEN 1 AND 2 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text >= integer
+}
+
+# IN compares with = for each value.
+@setup operands
+test text-in-a-list-of-integers-errors {
+    SELECT s IN (1, 2) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+# The operator is refused when the statement is planned, so a condition that
+# no row reaches fails too.
+@setup operands
+test operator-that-no-row-reaches-errors {
+    SELECT i FROM operands WHERE false AND s = 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test join-on-text-and-integer-errors {
+    SELECT 1 FROM operands a JOIN operands b ON a.s = b.i;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test update-where-text-equals-integer-errors {
+    UPDATE operands SET i = 2 WHERE s = 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test varchar-plus-integer-errors {
+    SELECT v + 1 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: character varying \+ integer
+}
+
+@setup operands
+test boolean-plus-integer-errors {
+    SELECT b + 1 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: boolean \+ integer
+}
+
+@setup operands
+test boolean-plus-string-literal-errors {
+    SELECT b + '1' FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: boolean \+ unknown
+}
+
+@setup operands
+test date-plus-date-errors {
+    SELECT d + d FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: date \+ date
+}
+
+@setup operands
+test timestamp-times-integer-errors {
+    SELECT ts * 2 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone \* integer
+}
+
+@setup operands
+test integer-bitwise-and-boolean-errors {
+    SELECT i & b FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer & boolean
+}
+
+@setup operands
+test negated-date-errors {
+    SELECT -d FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: - date
+}
+
+@setup operands
+test bitwise-not-of-boolean-errors {
+    SELECT ~b FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: ~ boolean
+}
+
+# A string literal takes the type of the other operand.
+@setup operands
+test string-literal-is-compared-as-the-other-operand {
+    SELECT i = '1', s = '1', b = 'yes', d = '2024-01-05', tz > '2020-01-01',
+           u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'
+    FROM operands;
+}
+expect {
+    t|t|t|t|t|t
+}
+
+# Next to a number, a string literal is read as the type of the number.
+test string-literal-next-to-an-integer-is-an-integer {
+    SELECT 1 = '1', 1 = ' 1 ', 2 < '10', '3' > 2, '2' + 1, 7 - '3', 1.5 = '1.50', 1.5 + '1';
+}
+expect {
+    t|t|t|t|3|4|t|2.5
+}
+
+@setup operands
+test string-literal-next-to-a-number-column-is-read-as-its-type {
+    SELECT i = '1', i + '1', i IN (5, '1'), i BETWEEN '0' AND '9', i2 = '2', i8 + '1',
+           n = '4.50', f > '5'
+    FROM operands;
+}
+expect {
+    t|2|t|t|t|4|t|t
+}
+
+test string-literal-that-is-not-an-integer-errors {
+    SELECT 1 = 'a';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "a"
+}
+
+test string-literal-with-a-fraction-next-to-an-integer-errors {
+    SELECT 1 = '1.5';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+test string-literal-plus-an-integer-errors {
+    SELECT 'a' + 1;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "a"
+}
+
+@setup operands
+test string-literal-compared-with-a-bigint-column-errors {
+    SELECT i8 = 'abc' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "abc"
+}
+
+@setup operands
+test string-literal-out-of-the-range-of-smallint-errors {
+    SELECT i2 = '99999' FROM operands;
+}
+@sqlstate 22003
+expect error {
+    value "99999" is out of range for type smallint
+}
+
+@setup operands
+test string-literal-added-to-a-double-precision-column-errors {
+    SELECT f + 'abc' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type double precision: "abc"
+}
+
+# PostgreSQL reads the literal when it plans the statement, so a value that
+# no row reaches fails too.
+@setup operands
+test string-literal-in-an-in-list-that-is-not-an-integer-errors {
+    SELECT i IN (1, 'x') FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+# PostgreSQL gives the values of an IN list that read no column one type
+# together with the left side. A value that reads a column is compared with
+# the left side alone.
+@setup operands
+test in-list-reads-a-string-literal-as-the-widest-number-type {
+    SELECT 1 IN ('1.5', 1.5);
+    SELECT '1.5' IN (1, 2.5);
+    SELECT i IN ('1.5', 1.5) FROM operands;
+    SELECT i IN ('1.5', 1.5, n) FROM operands;
+    SELECT i NOT IN ('1.5', 1.5) FROM operands;
+    SELECT i IN (i8, '1.5', 1.5) FROM operands;
+}
+expect {
+    f
+    f
+    f
+    f
+    t
+    f
+}
+
+@setup operands
+test in-list-reads-a-string-literal-as-the-type-of-the-left-side {
+    SELECT 1 IN ('2', 3);
+    SELECT n IN ('4.50', 1) FROM operands;
+    SELECT f IN ('5.5', 2) FROM operands;
+}
+expect {
+    f
+    t
+    t
+}
+
+@setup operands
+test in-list-with-one-value-reads-the-literal-as-the-type-of-the-left-side {
+    SELECT 1 IN ('1.5');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+@setup operands
+test in-list-literal-next-to-a-number-of-the-left-type-errors {
+    SELECT 1 IN ('1.5', 2);
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+@setup operands
+test in-list-literal-that-is-not-a-number-errors-as-the-common-type {
+    SELECT 1 IN ('a', 1.5);
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type numeric: "a"
+}
+
+@setup operands
+test in-list-value-that-reads-a-column-is-compared-with-the-left-side-alone {
+    SELECT i IN ('1.5', n) FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+@setup operands
+test in-list-without-a-common-type-compares-each-value {
+    SELECT s IN ('a', 1) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test not-in-list-names-the-not-equals-operator {
+    SELECT s NOT IN (1, 2) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text <> integer
+}
+
+@setup operands
+test in-list-with-a-null-reads-a-string-literal-as-the-left-type {
+    SELECT 1 IN (NULL, '1.5');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+@setup operands
+test string-literal-with-the-digits-a-double-keeps-is-compared-as-a-number {
+    CREATE TABLE doubles (n numeric, r double precision);
+    INSERT INTO doubles VALUES (0.1, 0.1);
+    SELECT n = '0.1', r = '0.1', n < '0.2' FROM doubles;
+    SELECT n = '9007199254740992' FROM doubles;
+}
+expect {
+    t|t|t
+    f
+}
+
+@compat-gap "type:numeric"
+@setup operands
+test string-literal-with-more-digits-than-a-double-next-to-a-numeric-column-errors {
+    CREATE TABLE doubles (n numeric);
+    INSERT INTO doubles VALUES (9007199254740992);
+    SELECT n = '9007199254740993' FROM doubles;
+}
+expect {
+    f
+}
+@sqlstate 0A000
+expect @tursopg error {
+    has more digits than a double keeps
+}
+
+@setup operands
+test string-literal-with-more-digits-than-a-double-next-to-a-registered-numeric-column {
+    CREATE TABLE exact (n numeric(20, 0));
+    INSERT INTO exact VALUES (9007199254740992);
+    SELECT n = '9007199254740993', n < '9007199254740993' FROM exact;
+}
+expect {
+    f|t
+}
+
+@setup operands
+test string-literal-in-a-between-that-is-not-an-integer-errors {
+    SELECT i BETWEEN 0 AND 'x' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+@setup operands
+test string-literal-compared-with-an-indexed-integer-column-uses-the-value {
+    CREATE INDEX operands_i ON operands (i);
+    INSERT INTO operands (i) VALUES (10), (11);
+    SELECT i FROM operands WHERE i = '10';
+    SELECT count(*) FROM operands WHERE i > '9';
+}
+expect {
+    10
+    2
+}
+
+@setup operands
+test string-literal-out-of-the-range-of-integer-errors {
+    SELECT i = '9999999999' FROM operands;
+}
+@sqlstate 22003
+expect error {
+    value "9999999999" is out of range for type integer
+}
+
+@setup operands
+test string-literal-in-a-case-that-is-not-an-integer-errors {
+    SELECT CASE i WHEN 'x' THEN 1 ELSE 0 END FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+# Number types are compared and computed with each other.
+@setup operands
+test number-types-have-operators-with-each-other {
+    SELECT i = i8, i2 < i, i8 > n, n < f, i + i2, i8 * i, i2 - i8, n + i, f > i
+    FROM operands;
+}
+expect {
+    f|f|f|t|3|3|-1|5.5|t
+}
+
+@setup operands
+test text-and-varchar-are-compared {
+    SELECT s = v, v < s, v = 'x' FROM operands;
+}
+expect {
+    t|f|f
+}
+
+@setup operands
+test uuid-is-compared-with-a-uuid {
+    SELECT u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid,
+           u = CAST('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' AS uuid),
+           u = gen_random_uuid(),
+           u IN (gen_random_uuid())
+    FROM operands;
+}
+expect {
+    t|f|f|f
+}
+
+@setup operands
+test date-has-arithmetic-with-integers {
+    SELECT d + 1, d - 1, d - '2024-01-01'::date, 1 + d FROM operands;
+}
+expect {
+    2024-01-06|2024-01-04|4|2024-01-06
+}
+
+@setup operands
+test boolean-is-compared-with-a-condition {
+    SELECT b = (i < 2), b > (i > 2), b <> false FROM operands;
+}
+expect {
+    t|t|t
+}
+
+@setup operands
+test timestamps-are-compared-with-their-own-type {
+    SELECT tz = now(), ts < localtimestamp, d <= current_date, tz BETWEEN tz AND now()
+    FROM operands;
+}
+expect {
+    f|t|t|t
+}
+
+# tursopg does not check an operand that is a subquery, or that reads a
+# column of a subquery or of a catalog table.
+@compat-gap "operator:text = int4"
+@setup operands
+test text-equals-integer-subquery-errors {
+    SELECT s = (SELECT 1) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+expect @tursopg {
+    t
+}
+
+# The catalog tables of tursopg declare some columns with another type than
+# PostgreSQL, so their operators are not checked.
+test catalog-columns-are-compared-with-values-of-their-type {
+    SELECT count(*) FROM pg_attribute
+    WHERE attnotnull = true AND attisdropped = false AND attnum = 0;
+}
+expect {
+    0
+}
+
+# A string literal that PostgreSQL reads as NaN, an infinity or a huge
+# numeric next to a number is a value, not an error.
+@setup operands
+test nan-literal-next-to-numbers-is-not-an-error {
+    SELECT n = 'NaN', f = 'NaN', f = 'Infinity', f = '-Infinity', 1.5 = 'NaN', 1.5 = 'Infinity', n = '1e400' FROM operands;
+}
+expect {
+    f|f|f|f|f|f|f
+}
+
+@setup operands
+test hex-and-underscore-literals-next-to-an-integer-are-not-an-error {
+    SELECT i = '0x10', i = '1_000' FROM operands;
+}
+expect {
+    f|f
+}
+
+@setup operands
+test hex-octal-binary-and-underscore-literals-next-to-an-integer-are-read-as-numbers {
+    SELECT i = '0x1', i2 = '0b10', i8 = '0o3', i + '0x10', 16 = '0x10', 1000 = '1_000' FROM operands;
+}
+expect {
+    t|t|t|17|t|t
+}
+
+@setup operands
+test unary-minus-of-boolean-errors {
+    SELECT -b FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: - boolean
+}
+
+@setup operands
+test nan-literal-next-to-an-integer-errors {
+    SELECT i = 'NaN' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "NaN"
+}
+
+@setup operands
+test case-with-a-base-reads-the-literal-of-a-when {
+    SELECT CASE i WHEN '1' THEN 'one' ELSE 'other' END FROM operands;
+}
+expect {
+    one
+}
+
+@setup operands
+test case-with-a-base-refuses-a-literal-that-is-not-a-number {
+    SELECT CASE i WHEN 'x' THEN 'one' ELSE 'other' END FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+@setup operands
+test case-with-a-base-refuses-text-and-integer {
+    SELECT CASE s WHEN 1 THEN 'one' ELSE 'other' END FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test distinct-from-reads-the-literal {
+    SELECT i IS DISTINCT FROM '1', i IS NOT DISTINCT FROM '1' FROM operands;
+}
+expect {
+    f|t
+}
+
+@setup operands
+test distinct-from-refuses-a-literal-that-is-not-a-number {
+    SELECT i IS DISTINCT FROM 'x' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+@setup operands
+test nullif-refuses-text-and-integer {
+    SELECT NULLIF(s, 1) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test nullif-reads-the-literal {
+    SELECT NULLIF(i, '2'), NULLIF(i, '1') IS NULL FROM operands;
+}
+expect {
+    1|t
+}
+
+@setup operands
+test nullif-refuses-a-literal-that-is-not-a-number {
+    SELECT NULLIF(i, 'x') FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+@setup operands
+test row-values-compare-each-pair {
+    SELECT (i, s) = ('1', '1'), (i, i8) < ('2', '1') FROM operands;
+}
+expect {
+    t|t
+}
+
+@setup operands
+test row-values-refuse-a-pair-that-is-text-and-integer {
+    SELECT (i, s) = (1, 1) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test row-values-refuse-a-literal-that-is-not-a-number {
+    SELECT (i, 1) = ('a', 1) FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "a"
+}
+
+@setup operands
+test in-subquery-compares-integer-and-smallint {
+    SELECT i IN (SELECT i2 FROM operands) FROM operands;
+}
+expect {
+    f
+}
+
+@setup operands
+test in-subquery-refuses-integer-and-selected-text {
+    SELECT i IN (SELECT 'a') FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer = text
+}
+
+@setup operands
+test in-subquery-refuses-text-and-integer {
+    SELECT s IN (SELECT i FROM operands) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+# Core's operator signatures decide the arithmetic and bit operators of a
+# date and of a numeric with a precision. pg_operator decides every comparison.
+
+setup registered {
+    CREATE TABLE registered (d date, n numeric(10, 2), f double precision, i integer, u uuid);
+}
+
+@setup registered
+test date-plus-uuid-errors {
+    SELECT d + u FROM registered;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: date \+ uuid
+}
+
+@setup registered
+test numeric-bit-and-errors {
+    SELECT n & 1 FROM registered;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: numeric & integer
+}
+
+@setup registered
+test date-less-than-integer-errors {
+    SELECT d < 1 FROM registered;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: date < integer
+}
+
+@setup registered
+test numeric-modulo-double-precision-errors {
+    SELECT n % f FROM registered;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: numeric % double precision
+}
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: numeric % real
+}
+
+# tursopg gives the type text to a jsonb or inet value that a cast returns.
+# Those types have a `+` or a `-`, so tursopg does not refuse the arithmetic
+# of text.
+@compat-gap "operator:text + int4"
+@setup operands
+test text-plus-integer-errors {
+    SELECT s + 1 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text \+ integer
+}
+expect @tursopg {
+    2
+}
+
+# tursopg does not know the implicit casts of PostgreSQL, so it runs an
+# operator on two number types when pg_operator has it for any number types.
+@compat-gap "operator:float8 % int4"
+@setup operands
+test double-precision-modulo-integer-errors {
+    SELECT f % 2 FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: double precision % integer
+}
+expect @tursopg {
+    1.0
+}
+
+# tursopg gives the type text to a uuid that a cast returns, so it compares a
+# uuid with text.
+@compat-gap "operator:uuid = text"
+@setup operands
+test uuid-equals-text-errors {
+    SELECT u = s FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: uuid = text
+}
+expect @tursopg {
+    f
+}
+
+# An oid has comparisons and no arithmetic. An integer converts to oid, and
+# an oid converts to no other type, so an integer next to an oid is read as
+# an oid.
+
+setup oid_operands {
+    CREATE TABLE oid_operands (
+        o oid, o2 oid, i integer, i2 smallint, i8 bigint, n numeric,
+        f double precision, s text
+    );
+    INSERT INTO oid_operands VALUES (3000000000, 5, 5, 5, 5, 5.5, 5.5, '5');
+}
+
+@setup oid_operands
+test oid-compares-with-oid {
+    SELECT o = o, o <> o2, o < o2, o > o2, o <= o2, o >= o2 FROM oid_operands;
+}
+expect {
+    t|t|f|t|f|t
+}
+
+@setup oid_operands
+test oid-compares-with-integers {
+    SELECT o2 = i, i = o2, o > i, o2 < 6 FROM oid_operands;
+}
+expect {
+    t|t|t|t
+}
+
+@setup oid_operands
+test oid-compares-with-smallint {
+    SELECT o2 = i2, i2 <> o2 FROM oid_operands;
+}
+expect {
+    t|f
+}
+
+@setup oid_operands
+test oid-compares-with-bigint {
+    SELECT o2 <= i8, i8 >= o2 FROM oid_operands;
+}
+expect {
+    t|t
+}
+
+test oid-compares-with-negative-integer {
+    SELECT 4294967295::oid = -1, -1 = 4294967295::oid, 4294967295::oid > -1, -1 >= 4294967295::oid,
+        4294967291::oid = (-5)::int2, 2147483648::oid < (-2147483647)::int4;
+}
+expect {
+    t|t|f|t|t|t
+}
+
+test oid-in-list-with-negative-integer {
+    SELECT 4294967295::oid IN (-1, 5), 4294967295::oid NOT IN (-1, 5), 4294967295::oid BETWEEN -2 AND -1;
+}
+expect {
+    t|f|t
+}
+
+test oid-compares-with-negative-bigint-errors {
+    SELECT 4294967295::oid = (-1)::int8;
+}
+@sqlstate 22003
+expect error {
+    OID out of range
+}
+
+# FIXME(registered-types): the comparisons below that tursopg refuses have no
+# single place that every comparison goes through, so the integer next to an
+# oid is cast only where the engine builds the comparison from two expressions.
+
+setup oid_paths {
+    CREATE TABLE t (o oid, i int4);
+    INSERT INTO t VALUES (4294967295, -1);
+    CREATE TABLE t2 (o int4);
+    INSERT INTO t2 VALUES (-1);
+}
+
+@setup oid_paths
+test oid-is-distinct-from-negative-integer {
+    SELECT count(*) FROM t WHERE o IS DISTINCT FROM -1;
+}
+expect {
+    0
+}
+
+@setup oid_paths
+test oid-is-not-distinct-from-integer-column {
+    SELECT count(*) FROM t WHERE o IS NOT DISTINCT FROM i;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-between-negative-integers {
+    SELECT count(*) FROM t WHERE o BETWEEN -1 AND -1;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-case-base-with-negative-integer {
+    SELECT CASE o WHEN -1 THEN 1 ELSE 0 END FROM t;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-nullif-with-negative-integer {
+    SELECT count(*) FROM t WHERE NULLIF(o, -1) IS NULL;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-joins-on-integer-column {
+    SELECT count(*) FROM t JOIN t2 ON t.o = t2.o;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-row-equals-row-with-negative-integer {
+    SELECT count(*) FROM t WHERE (o, 1) = (-1, 1);
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-row-in-list-with-negative-integer {
+    SELECT count(*) FROM t WHERE (o, 1) IN ((-1, 1));
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-row-in-list-of-two-rows {
+    SELECT count(*) FROM t WHERE (o, 1) IN ((5, 1), (-1, 1));
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-equals-any-of-integers {
+    SELECT count(*) FROM t WHERE o = ANY (ARRAY[-1]);
+}
+expect {
+    1
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-in-subquery-of-integer-column {
+    SELECT count(*) FROM t WHERE o IN (SELECT i FROM t);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-integer-column-in-subquery-of-oid {
+    SELECT count(*) FROM t WHERE i IN (SELECT o FROM t);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type int4 with type oid
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-in-subquery-of-integer-literal {
+    SELECT count(*) FROM t WHERE o IN (SELECT -1);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type integer
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-in-values-of-integer-literal {
+    SELECT count(*) FROM t WHERE o IN (VALUES (-1));
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type integer
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-row-in-values-of-integer-literal {
+    SELECT count(*) FROM t WHERE (o, 1) IN (VALUES (-1, 1));
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type integer
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-row-in-subquery-of-integer-column {
+    SELECT count(*) FROM t WHERE (o, 1) IN (SELECT i, 1 FROM t);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-equals-scalar-subquery-of-integer-column {
+    SELECT count(*) FROM t WHERE o = (SELECT i FROM t);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-delete-where-in-subquery-of-integer-column {
+    DELETE FROM t WHERE o IN (SELECT i FROM t); SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-joins-using-integer-column {
+    SELECT count(*) FROM t JOIN t2 USING (o);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-natural-joins-integer-column {
+    SELECT count(*) FROM t NATURAL JOIN t2;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-coalesce-with-integer-column {
+    SELECT count(*) FROM t WHERE COALESCE(o, i) = -1;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-union-with-integer-column {
+    SELECT count(*) FROM (SELECT o FROM t UNION SELECT i FROM t) s;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-intersect-with-integer-column {
+    SELECT count(*) FROM (SELECT o FROM t INTERSECT SELECT i FROM t) s;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-except-with-integer-column {
+    SELECT count(*) FROM (SELECT o FROM t EXCEPT SELECT i FROM t) s;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-equals-scalar-subquery-of-negative-integer {
+    SELECT count(*) FROM t WHERE o = (SELECT -1);
+}
+expect {
+    1
+}
+expect @tursopg {
+    0
+}
+
+@setup oid_operands
+test oid-compares-with-text-read-as-oid {
+    SELECT o2 = '5', ' 5' = o2, o > '4294967295' FROM oid_operands;
+}
+expect {
+    t|t|f
+}
+
+@setup oid_operands
+test oid-compares-with-hex-text {
+    SELECT '0x5' = o2 FROM oid_operands;
+}
+expect {
+    t
+}
+
+@setup oid_operands
+test oid-in-list-with-hex-text {
+    SELECT o2 IN ('0x5', 1) FROM oid_operands;
+}
+expect {
+    t
+}
+
+@setup oid_operands
+test oid-compares-with-text-that-is-not-an-oid {
+    SELECT o2 = 'five' FROM oid_operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "five"
+}
+
+@setup oid_operands
+test oid-compares-with-text-above-the-largest-oid {
+    SELECT o2 = '4294967296' FROM oid_operands;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+@setup oid_operands
+test oid-in-list-and-between {
+    SELECT o2 IN (1, 5), o2 NOT IN (1, 2), o2 BETWEEN 1 AND 6, o > 2147483647
+    FROM oid_operands;
+}
+expect {
+    t|t|t|t
+}
+
+@setup oid_operands
+test oid-plus-integer-errors {
+    SELECT o + i FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+@setup oid_operands
+test integer-minus-oid-errors {
+    SELECT i - o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer - oid
+}
+
+@setup oid_operands
+test oid-times-bigint-errors {
+    SELECT o * i8 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \* bigint
+}
+
+@setup oid_operands
+test oid-plus-oid-errors {
+    SELECT o + o2 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ oid
+}
+
+@setup oid_operands
+test oid-plus-literal-errors {
+    SELECT o + 1 FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+@setup oid_operands
+test negative-oid-errors {
+    SELECT -o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: - oid
+}
+
+@setup oid_operands
+test oid-bit-and-integer-errors {
+    SELECT o & i FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid & integer
+}
+
+@setup oid_operands
+test oid-equals-numeric-errors {
+    SELECT o = n FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid = numeric
+}
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: oid = double precision
+}
+
+@setup oid_operands
+test double-precision-less-than-oid-errors {
+    SELECT f < o FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: double precision < oid
+}
+
+@setup oid_operands
+test oid-equals-text-errors {
+    SELECT o = s FROM oid_operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid = text
+}
+
+test oid-cast-plus-integer-errors {
+    SELECT 1::oid + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+test oid-cast-compares-with-integer {
+    SELECT 1::oid = 1, 3000000000::oid > 5, 5 < 3000000000::oid;
+}
+expect {
+    t|t|t
+}

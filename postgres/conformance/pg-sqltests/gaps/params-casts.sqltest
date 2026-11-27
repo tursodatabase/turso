@@ -19,82 +19,13 @@ setup t_b {
     CREATE TABLE t (b boolean);
 }
 
-# A-07: int4 overflow literal cast
-@compat-gap "type:int4"
-test int4-overflow-literal-cast {
-    SELECT '2147483648'::int4;
-}
-@sqlstate 22003
-expect error {}
-expect @tursopg {
-    2147483648
-}
-
-# A-08: int2 overflow literal cast
-@compat-gap "type:int2"
-test int2-overflow-literal-cast {
-    SELECT '40000'::smallint;
-}
-@sqlstate 22003
-expect error {}
-expect @tursopg {
-    40000
-}
-
-# A-09: int8 overflow arithmetic
-@compat-gap "operator:int8 + int4"
-test int8-overflow-arithmetic {
-    SELECT 9223372036854775807::bigint + 1;
-}
-@sqlstate 22003
-expect error {}
-expect @tursopg {
-    9.223372036854776e18
-}
-
-# A-10: int4 overflow arithmetic
-@compat-gap "operator:int4 + int4"
-test int4-overflow-arithmetic {
-    SELECT 2147483647::int4 + 1;
-}
-@sqlstate 22003
-expect error {}
-expect @tursopg {
-    2147483648
-}
-
-# A-11: invalid int literal cast
-@compat-gap "type:int4"
-test invalid-int-literal-cast {
-    SELECT 'abc'::integer;
-}
-@sqlstate 22P02
-expect error {}
-expect @tursopg {
-    0
-}
-
-# A-13: '1.5'::int (text) is invalid
-@compat-gap "type:int4"
-test decimal-text-cast-to-int4-is-invalid {
-    SELECT '1.5'::integer;
-}
-@sqlstate 22P02
-expect error {}
-expect @tursopg {
-    1
-}
-
-# A-14: numeric->int rounds half away from zero
-@compat-gap "cast:numeric -> int4"
-test numeric-int-rounds-half-away-from-zero {
-    SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
+# PostgreSQL rounds a float8 to the nearest even integer when it is halfway
+# between two.
+test float8-int-rounds-half-to-even {
+    SELECT 0.5::float8::integer, 2.5::float8::integer, 3.5::float8::integer;
 }
 expect {
-    2|3|-3
-}
-expect @tursopg {
-    1|2|-2
+    0|2|4
 }
 
 # A-16: int with surrounding spaces
@@ -106,50 +37,34 @@ expect {
 }
 
 # A-17: invalid uuid literal cast
-@compat-gap "type:uuid"
 test invalid-uuid-literal-cast {
     SELECT 'nope'::uuid;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    nope
-}
 
 # A-19: uuid uppercase input normalised
-@compat-gap "type:uuid"
 test uuid-uppercase-input-normalised {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
-}
 
 # A-20: uuid braces / no-hyphen input
-@compat-gap "type:uuid"
 test uuid-braces-no-hyphen-input {
     SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid, 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|a0eebc999c0b4ef8bb6d6bb9bd380a11
-}
 
 # A-21: uuid equality across case
-@compat-gap "operator:uuid = uuid"
 test uuid-equality-across-case {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
 }
 expect {
     t
-}
-expect @tursopg {
-    f
 }
 
 # A-22: numeric(10,2) rounding half away from zero
@@ -398,16 +313,6 @@ expect {
     {1,2,3}
 }
 
-# A-52: invalid int[] literal
-@compat-gap "type:_int4"
-test invalid-int-literal {
-    SELECT '{1,x}'::int[];
-}
-@sqlstate 22P02
-expect error {}
-@sqlstate 23000
-expect @tursopg error {}
-
 # A-58: ARRAY[] constructor output
 test array-constructor-output {
     SELECT ARRAY[1,2], ARRAY['a','b'];
@@ -435,7 +340,6 @@ expect {
 }
 
 # A-61: text column = int literal (PG: no operator)
-@compat-gap "operator:text = int4"
 test text-column-int-literal-pg-no-operator {
     CREATE TABLE t (s text);
     INSERT INTO t VALUES ('1');
@@ -443,9 +347,6 @@ test text-column-int-literal-pg-no-operator {
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    1
-}
 
 # A-62: insert '42' text literal into int column
 @setup t_id
@@ -458,26 +359,20 @@ expect {
 
 # A-63: insert 'abc' into int column
 @setup t_id
-@compat-gap "type:int4"
 test insert-abc-into-int-column {
     INSERT INTO t VALUES ('abc') RETURNING id;
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-64: insert 1.7 numeric into int column
 @setup t_id
-@compat-gap "cast:numeric -> int4"
 test insert-1-7-numeric-into-int-column {
     INSERT INTO t VALUES (1.7) RETURNING id;
 }
 expect {
     2
 }
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-65: insert 'true' into bool column
 @setup t_b
@@ -490,15 +385,11 @@ expect {
 
 # A-66: insert integer 1 into bool column
 @setup t_b
-@compat-gap "cast:int4 -> bool"
 test insert-integer-1-into-bool-column {
     INSERT INTO t VALUES (1) RETURNING b;
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    t
-}
 
 # A-79: insert literal with short +00 offset into timestamptz column
 test insert-literal-with-short-00-offset-into-timestamptz {
@@ -531,26 +422,23 @@ expect {
     1.50
 }
 
-# PostgreSQL has a cast to boolean only from int4, not from int2 or int8.
-@compat-gap "cast:int2 -> bool"
 test int2-to-bool-cast-does-not-exist {
     SELECT 5::int2::boolean;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    t
-}
 
-@compat-gap "cast:int8 -> bool"
 test int8-to-bool-cast-does-not-exist {
     SELECT 5::int8::boolean;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    t
+
+test the-conversion-function-of-a-cast-is-not-callable {
+    SELECT pg_cast(5, 'int2', 'bool');
 }
+@sqlstate 42883
+expect error {}
 
 @compat-gap "cast:jsonb -> bytea"
 test jsonb-to-bytea-cast-does-not-exist {
@@ -569,9 +457,8 @@ test regdatabase-type-does-not-exist {
 }
 @sqlstate 42704
 expect error {}
-expect @tursopg {
-    1
-}
+@sqlstate 0A000
+expect @tursopg error {}
 
 # Built-in types live in pg_catalog, so public.int4 names no type.
 @compat-gap "syntax:type-name"
@@ -595,4 +482,167 @@ expect error {
 }
 expect @tursopg {
     1
+}
+
+test numeric-with-a-scale-cast-to-an-integer {
+    CREATE TABLE n (y numeric(10,2));
+    INSERT INTO n VALUES (3), (2.5), (-2.5), (2.49);
+    SELECT y::int, y::int2, y::int8 FROM n ORDER BY n.y;
+}
+expect {
+    -3|-3|-3
+    2|2|2
+    3|3|3
+    3|3|3
+}
+
+test float4-cast-keeps-its-digits {
+    SELECT 0.1::float4, 0.1::float4::text, 2.49::float4;
+}
+expect {
+    0.1|0.1|2.49
+}
+
+test float8-cast-to-text-is-in-the-form-of-float8-output {
+    SELECT 3::float8::text, 1e20::float8::text, 1e15::float8::text, 123456789012345::float8::text,
+        1e-5::float8::text, 0.1::float8::text, (1::float8 / 3)::text;
+    SELECT '-0'::float8::text, 'Infinity'::float8::text, '-Infinity'::float8::text, '1e-300'::float8::text;
+}
+expect {
+    3|1e+20|1e+15|123456789012345|1e-05|0.1|0.3333333333333333
+    -0|Infinity|-Infinity|1e-300
+}
+
+# A float4 expression is typed float8, so its text is in the form of float8.
+@compat-gap "type:float4"
+test float4-cast-to-text-is-in-the-form-of-float4-output {
+    SELECT 1e6::float4::text, 1234567::float4::text, 3::float4::text;
+}
+expect {
+    1e+06|1.234567e+06|3
+}
+expect @tursopg {
+    1000000|1234567|3
+}
+
+test float4-cast-of-a-value-too-small {
+    SELECT 1e-50::float8::float4;
+}
+@sqlstate 22003
+expect error {}
+
+# The engine's float cannot hold NaN, so a conversion that gives NaN fails.
+# PostgreSQL has NaN.
+@compat-gap "type:float8"
+test cast-nan-to-float8 {
+    SELECT 'NaN'::float8;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float4"
+test cast-nan-to-float4 {
+    SELECT 'nan'::real;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test cast-nan-text-to-float8 {
+    SELECT 'NaN'::text::float8;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test cast-infinity-to-float8-and-float4 {
+    SELECT 'Infinity'::float8::text, '-Infinity'::float8::text, 'inf'::float4::text, '-Infinity'::real::text;
+}
+expect {
+    Infinity|-Infinity|Infinity|-Infinity
+}
+
+# The result of a function has no type that core can name, so the engine
+# casts it by its own rules.
+test function-results-cast-to-integers {
+    SELECT avg(x)::int4, avg(x)::int2, avg(x)::int8 FROM (VALUES (1), (3)) t(x);
+    SELECT round(2.5)::int4, round(2.5)::int2, round(2.5)::int8;
+    SELECT sum(x)::int4 FROM (VALUES (1.5), (2.5)) t(x);
+    SELECT sqrt(16)::int4, power(2, 3)::int4;
+    SELECT sum(x)::int4, max(x)::int4, (avg(x) + 0)::int4 FROM (VALUES (1), (3)) t(x);
+    SELECT ceil(2.1)::int4, floor(2.9)::int4, trunc(2.9)::int4, abs(-2.5)::int4, length('abc')::int2, coalesce(2.5, 1)::int4;
+    SELECT round(2.5)::float8::text;
+}
+expect {
+    2|2|2
+    3|3|3
+    4
+    4|8
+    4|3|2
+    3|2|2|3|3|3
+    3
+}
+
+# A numeric without a type modifier is a REAL, which is cast to text in the
+# form of a float8.
+@compat-gap "cast:numeric -> text"
+test numeric-without-a-modifier-cast-to-text {
+    CREATE TABLE n (a numeric);
+    INSERT INTO n VALUES (1.0);
+    SELECT 1.0::numeric::text, 3::numeric::text, a::text, (a + 1)::text FROM n;
+}
+expect {
+    1.0|3|1.0|2.0
+}
+expect @tursopg {
+    1|3|1|2
+}
+
+# A value too small for the type reads as 0.
+@compat-gap "type:float8"
+test float8-input-of-a-value-too-small {
+    SELECT '1e-400'::float8;
+}
+@sqlstate 22003
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "type:float8"
+test float8-input-of-a-negative-value-too-small {
+    SELECT '-1e-400'::float8::text;
+}
+@sqlstate 22003
+expect error {}
+expect @tursopg {
+    -0
+}
+
+@compat-gap "type:float8"
+test float8-input-below-the-smallest-float8 {
+    SELECT '1e-324'::float8;
+}
+@sqlstate 22003
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "type:float4"
+test float4-input-of-a-value-too-small {
+    SELECT '1e-400'::float4;
+}
+@sqlstate 22003
+expect error {}
+expect @tursopg {
+    0
 }

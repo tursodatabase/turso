@@ -138,8 +138,17 @@ fn emit_generated_columns(
             } else {
                 translate_expr(program, None, expr, target_reg, resolver)?;
             }
+            let source = crate::translate::expr::expr_type::cast_source_of(
+                expr,
+                &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+                resolver.schema(),
+            );
             if stores_value {
-                emit_virtual_column_store(program, resolver, column, target_reg, table)?;
+                emit_virtual_column_store(program, resolver, column, target_reg, table, source)?;
+            } else {
+                emit_generated_column_assignment_cast(
+                    program, resolver, column, target_reg, table, source,
+                )?;
             }
             program.emit_column_affinity(target_reg, column.affinity());
         }
@@ -160,10 +169,12 @@ pub(crate) fn emit_virtual_column_store(
     column: &Column,
     reg: usize,
     table: &BTreeTable,
+    source: crate::dialect::CastSource,
 ) -> Result<()> {
     if !table.is_strict {
         return Ok(());
     }
+    emit_generated_column_assignment_cast(program, resolver, column, reg, table, source)?;
     emit_custom_type_encode_columns(
         program,
         resolver,
@@ -173,6 +184,22 @@ pub(crate) fn emit_virtual_column_store(
         &table.name,
         &ColumnLayout::Identity { column_count: 1 },
     )
+}
+
+/// Converts the value of a generated column's expression in `reg` to the type
+/// of the column, as the dialect does a cast on assignment.
+fn emit_generated_column_assignment_cast(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    column: &Column,
+    reg: usize,
+    table: &BTreeTable,
+    source: crate::dialect::CastSource,
+) -> Result<()> {
+    if !table.is_strict {
+        return Ok(());
+    }
+    super::new_values::emit_assignment_cast(program, resolver, column, reg, &|| source.clone())
 }
 
 /// Whether the statement sets a column that has a custom type or is an array. Its ENCODE,

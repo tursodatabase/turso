@@ -7375,6 +7375,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_pg_catalog"
+version = "0.9.0-pre.6"
+dependencies = [
+ "turso_core",
+ "turso_pg_catalog_gen",
+]
+
+[[package]]
+name = "turso_pg_catalog_gen"
+version = "0.9.0-pre.6"
+dependencies = [
+ "chumsky",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
+]
+
+[[package]]
 name = "turso_pg_client"
 version = "0.9.0-pre.6"
 dependencies = [
@@ -7416,7 +7435,12 @@ dependencies = [
  "anyhow",
  "clap",
  "similar",
+ "turso_pg_scanner",
 ]
+
+[[package]]
+name = "turso_pg_scanner"
+version = "0.9.0-pre.6"
 
 [[package]]
 name = "turso_pg_server"
@@ -7677,7 +7701,6 @@ dependencies = [
  "ctrlc",
  "dirs 5.0.1",
  "include_dir",
- "itertools 0.14.0",
  "libc",
  "limbo_completion",
  "mimalloc",
@@ -7695,6 +7718,8 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_pg",
+ "turso_pg_parser",
+ "turso_pg_scanner",
  "turso_pg_server",
  "validator",
  "windows-sys 0.61.2",

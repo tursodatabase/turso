@@ -1173,7 +1173,7 @@ fn test_postgres_add_column_with_a_default_of_the_wrong_type_fails(db: TempDatab
     assert!(
         error
             .to_string()
-            .contains("cannot store TEXT value in INTEGER column"),
+            .contains("column \"n\" is of type integer but default expression is of type text"),
         "{error}"
     );
     assert!(conn.query("SELECT n FROM t").is_err());
@@ -4209,20 +4209,19 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
     assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
     drop(rows);
 
-    // unknown type: error
+    // unknown type: the statement fails, as in PostgreSQL
     let mut rows = conn
         .query("SELECT message, sql_error_code FROM pg_input_error_info('x', 'nonexistent_type')")
         .unwrap()
         .unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    assert_eq!(
-        row.get_value(0).to_string(),
-        "type \"nonexistent_type\" does not exist"
+    let error = rows.step().unwrap_err();
+    assert_eq!(error.sqlstate, "42704", "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("type \"nonexistent_type\" does not exist"),
+        "{error}"
     );
-    assert_eq!(row.get_value(1).to_string(), "42704");
     drop(rows);
 
     // oid: valid
@@ -4606,4 +4605,47 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
             ),
         ]
     );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_oid_param_is_read_as_oid(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (o oid)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4294967295)").unwrap();
+
+    let count = |sql: &str, value: Value| {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(std::num::NonZero::new(1).unwrap(), value)
+            .unwrap();
+        stmt.run_collect_rows()
+    };
+    let one = vec![vec![Value::from_i64(1)]];
+    let none = vec![vec![Value::from_i64(0)]];
+    for sql in [
+        "SELECT count(*) FROM t WHERE o = $1",
+        "SELECT count(*) FROM t WHERE $1 = o",
+        "SELECT count(*) FROM t WHERE o IN ($1)",
+    ] {
+        for value in [
+            Value::from_i64(-1),
+            Value::from_i64(4294967295),
+            Value::from_text("-1".to_owned()),
+            Value::from_text("4294967295".to_owned()),
+        ] {
+            assert_eq!(
+                count(sql, value.clone()).unwrap(),
+                one,
+                "{sql} with {value:?}"
+            );
+        }
+    }
+    assert_eq!(
+        count("SELECT count(*) FROM t WHERE o > $1", Value::from_i64(-1)).unwrap(),
+        none
+    );
+    assert!(count(
+        "SELECT count(*) FROM t WHERE o = $1",
+        Value::from_i64(4294967296)
+    )
+    .is_err());
 }

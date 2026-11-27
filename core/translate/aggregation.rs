@@ -105,14 +105,14 @@ pub fn emit_ungrouped_aggregation<'a>(
         }
     }
 
-    // Handle OFFSET for ungrouped aggregates
-    // Since we only have one result row, either skip it (offset > 0) or emit it
+    // Handle OFFSET for ungrouped aggregates: if offset > 0, skip the single
+    // row. The offset is decremented because the arms of a compound SELECT
+    // share it, so the rows of the later arms must see that this row was skipped.
     if let Some(offset_reg) = t_ctx.reg_offset {
-        // If offset > 0, jump to end (skip the single row)
         program.emit_insn(Insn::IfPos {
             reg: offset_reg,
             target_pc: end_label,
-            decrement_by: 0,
+            decrement_by: 1,
         });
     }
 
@@ -195,12 +195,13 @@ pub fn emit_ungrouped_aggregation<'a>(
         program.preassign_label_to_next_insn(skip_nonagg_eval);
     }
 
-    // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
+    // Emit the result row (if we didn't skip it due to HAVING or OFFSET).
+    // The row counts against the LIMIT, which the arms of a compound SELECT share.
     emit_select_result(
         program,
         &t_ctx.resolver,
         plan,
-        None,
+        Some(end_label),
         None,
         t_ctx.reg_nonagg_emit_once_flag,
         None, // we've already handled offset

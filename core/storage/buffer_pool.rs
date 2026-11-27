@@ -458,10 +458,30 @@ mod arena {
             panic!("mmap failed: {}", std::io::Error::last_os_error());
         }
         #[cfg(target_os = "linux")]
-        {
-            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+        if huge_pages_requested() {
+            advise_huge_pages(ptr, len);
         }
         ptr as *mut u8
+    }
+
+    /// Whether the page arenas should ask Linux for 2 MB transparent huge pages.
+    /// Off by default: a huge page is filled as soon as one of its slots is used, so
+    /// each open database would cost up to ~2 MB of memory even when it is small.
+    /// Set `TURSO_HUGE_PAGES=1` (or `true`) to turn it on. Read once per process, so
+    /// every database in the process gets the same setting. Transparent huge pages
+    /// only exist on Linux, so this function only exists there.
+    #[cfg(target_os = "linux")]
+    fn huge_pages_requested() -> bool {
+        static HUGE_PAGES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("TURSO_HUGE_PAGES")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        });
+        *HUGE_PAGES
+    }
+
+    #[cfg(target_os = "linux")]
+    pub unsafe fn advise_huge_pages(ptr: *mut c_void, len: usize) {
+        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
     }
 
     pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
@@ -1765,5 +1785,56 @@ mod shuttle_tests {
             },
             1000,
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(miri)))]
+mod tests {
+    use super::arena;
+
+    const LEN: usize = 4 * 1024 * 1024;
+
+    #[test]
+    fn arena_asks_for_huge_pages_only_when_requested() {
+        let plain = unsafe { arena::alloc(LEN) };
+        let huge = unsafe { arena::alloc(LEN) };
+        unsafe { arena::advise_huge_pages(huge.cast(), LEN) };
+        let plain_flagged = has_huge_page_flag(plain);
+        let huge_flagged = has_huge_page_flag(huge);
+        unsafe {
+            arena::dealloc(plain, LEN);
+            arena::dealloc(huge, LEN);
+        }
+        assert!(
+            !plain_flagged,
+            "arena advised MADV_HUGEPAGE without being asked"
+        );
+        assert!(huge_flagged, "arena not advised MADV_HUGEPAGE when asked");
+    }
+
+    /// Whether the mapping holding `ptr` has the `hg` flag in `/proc/self/smaps`, which the
+    /// kernel sets on `madvise(MADV_HUGEPAGE)` whatever the system's huge page mode is.
+    fn has_huge_page_flag(ptr: *mut u8) -> bool {
+        let addr = ptr as usize;
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut in_mapping = false;
+        for line in smaps.lines() {
+            let range = line.split_whitespace().next().unwrap_or("");
+            if let Some((start, end)) = range.split_once('-') {
+                if let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                ) {
+                    in_mapping = (start..end).contains(&addr);
+                    continue;
+                }
+            }
+            if in_mapping {
+                if let Some(flags) = line.strip_prefix("VmFlags:") {
+                    return flags.split_whitespace().any(|flag| flag == "hg");
+                }
+            }
+        }
+        panic!("no mapping in /proc/self/smaps holds {addr:#x}");
     }
 }

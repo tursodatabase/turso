@@ -1,0 +1,18 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH big AS MATERIALIZED (SELECT * FROM orders WHERE total_amount > 100)
+      SELECT * FROM big;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - big
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--MATERIALIZE big
+|  `--SCAN orders
+`--SCAN big

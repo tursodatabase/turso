@@ -17,6 +17,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN t
-|--USE SORTER FOR GROUP BY
+|--MATERIALIZE agg
+|  |--SCAN t
+|  `--USE SORTER FOR GROUP BY
 `--SCAN agg

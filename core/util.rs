@@ -954,6 +954,14 @@ fn normalize_windows_path(path: &str) -> String {
     normalized
 }
 
+/// Returns the path of the database file that the URI `uri` names.
+/// `Connection::from_uri` reads `uri` in the same way, but this function does
+/// not open the file. Thus a caller can examine the file before `from_uri`
+/// creates it or changes it.
+pub fn database_path_from_uri(uri: &str) -> Result<String> {
+    Ok(OpenOptions::parse(uri)?.path)
+}
+
 impl<'a> OpenOptions<'a> {
     /// Parses a SQLite URI, handling Windows and Unix paths separately.
     pub fn parse(uri: &'a str) -> Result<OpenOptions<'a>> {

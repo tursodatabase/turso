@@ -38,6 +38,8 @@ WHERE expires_at < datetime('now')
 RETURNING session_id, user_id;
 ```
 
+A `DELETE` from a virtual table cannot have a `RETURNING` clause. It fails with `DELETE RETURNING is not available on virtual tables`, as in SQLite.
+
 <Info>
 `ORDER BY` and `LIMIT` clauses are not supported on `DELETE` statements. This matches default SQLite builds, which only accept them when compiled with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. To delete a bounded number of rows in a specific order, select the target rows with a subquery:
 

@@ -173,10 +173,13 @@ impl CompletionGroup {
         }
     }
 
-    /// Add a child. Call this before the child is submitted to the IO
-    /// backend. The child's own callback is what counts it into the group,
-    /// so the link has to be there before the child can finish.
-    pub fn add(&mut self, c: &Completion) {
+    /// Add a child. The child's own callback is what counts it into the
+    /// group, so the link has to be there before the child can finish.
+    ///
+    /// Private so that children join a group only through
+    /// [`start_in_group`], which also finishes a child whose IO failed to
+    /// start.
+    fn add(&mut self, c: &Completion) {
         self.completions.push(c.clone());
         self.inner.outstanding.fetch_add(1, Ordering::SeqCst);
         let mut parent = c.get_inner().parent.lock();
@@ -216,6 +219,30 @@ impl CompletionGroup {
         self.completion.group_one_done(None);
         self.completion
     }
+}
+
+/// Adds `c` to `group`, when given, then starts its IO with `start`.
+///
+/// `c` joins the group before `start` because the IO can finish inside
+/// `start`. If `start` returns `Err`, the IO did not start and nothing else
+/// will finish `c` (see the contract on [`crate::io::File`]), so `c` is
+/// aborted here; otherwise anything waiting on the group would wait forever.
+/// Aborting only marks `c` finished with [`CompletionError::Aborted`] and runs
+/// its callback; it does not stop an IO that did start.
+pub fn start_in_group(
+    group: Option<&mut CompletionGroup>,
+    c: Completion,
+    start: impl FnOnce(Completion) -> crate::Result<Completion>,
+) -> crate::Result<Completion> {
+    let Some(group) = group else {
+        return start(c);
+    };
+    group.add(&c);
+    start(c.clone()).inspect_err(|_| {
+        if !c.finished() {
+            c.abort();
+        }
+    })
 }
 
 pub struct GroupCompletion {

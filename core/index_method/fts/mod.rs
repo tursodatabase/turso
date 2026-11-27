@@ -33,14 +33,14 @@ use crate::{
     schema::IndexColumn,
     storage::btree::CursorTrait,
     translate::collate::CollationSeq,
-    turso_assert,
+    turso_assert, turso_debug_assert,
     types::{IOResult, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
     Connection, LimboError, Result, Value,
 };
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::{
     cell::RefCell,
@@ -486,8 +486,11 @@ struct FtsRuntimeStats {
 /// look them up; rollback purges them.
 #[derive(Debug, Default)]
 struct SegmentByteCache {
-    /// Least recently used first.
-    entries: Vec<(SegmentId, Arc<SegmentData>)>,
+    /// Least recently used first. When a query looks up its segments in
+    /// the same order as the previous query, each hit is at the front.
+    /// `VecDeque::remove` then moves no other entry, but `Vec::remove`
+    /// moves all of them.
+    entries: VecDeque<(SegmentId, Arc<SegmentData>)>,
 }
 
 impl SegmentByteCache {
@@ -503,9 +506,12 @@ impl SegmentByteCache {
             return None;
         }
         let position = self.entries.iter().position(|(entry, _)| entry == id)?;
-        let entry = self.entries.remove(position);
+        let entry = self
+            .entries
+            .remove(position)
+            .expect("position() returned an index in the cache");
         let data = Arc::clone(&entry.1);
-        self.entries.push(entry);
+        self.entries.push_back(entry);
         Some(data)
     }
 
@@ -515,10 +521,10 @@ impl SegmentByteCache {
             return;
         }
         self.entries.retain(|(entry, _)| *entry != id);
-        self.entries.push((id, data));
+        self.entries.push_back((id, data));
         // Always keep the newest entry; evict older ones to fit the budget.
         while self.entries.len() > 1 && self.total_bytes() > budget {
-            self.entries.remove(0);
+            self.entries.pop_front();
         }
     }
 
@@ -543,7 +549,10 @@ fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
             )
         })
         .collect();
-    key.sort_by_key(|(id, _, _)| id.uuid_string());
+    // `SegmentId` compares the bytes of the UUID. They sort in the same
+    // order as `uuid_string()`, which is lowercase hex, and the sort then
+    // makes no string for each comparison.
+    key.sort_by_key(|(id, _, _)| *id);
     key
 }
 
@@ -1108,8 +1117,14 @@ enum FtsState {
     /// No control row: rewinding to tell an empty store from one written
     /// by the pre-registry FTS implementation (which is refused).
     ProbeFormat { rewound: bool },
-    /// Range-scanning the visible `(SEGMENT, *)` registry rows.
-    ScanSegments { seeked: bool, advance_pending: bool },
+    /// Range-scanning the visible `(SEGMENT, *)` registry rows. `seen`
+    /// holds the ids that this scan put in `scan_descriptors`, so that a
+    /// duplicate row is found without a search through all of them.
+    ScanSegments {
+        seeked: bool,
+        advance_pending: bool,
+        seen: HashSet<SegmentId>,
+    },
     /// Range-scanning the visible tombstone rows.
     ScanTombs { seeked: bool, advance_pending: bool },
     /// Loading chunk rows for visible segments absent from the byte cache.
@@ -1674,6 +1689,7 @@ impl FtsCursor {
                     self.state = FtsState::ScanSegments {
                         seeked: false,
                         advance_pending: false,
+                        seen: HashSet::default(),
                     };
                 }
                 FtsState::ProbeFormat { rewound } => {
@@ -1736,11 +1752,16 @@ impl FtsCursor {
                 FtsState::ScanSegments {
                     seeked,
                     advance_pending,
+                    seen,
                 } => {
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
                     if !*seeked {
+                        turso_debug_assert!(
+                            self.scan_descriptors.is_empty() && seen.is_empty(),
+                            "FTS registry scan started with descriptors of another scan"
+                        );
                         let seek_key = seek_key_for_path(FTS2_SEGMENT_PREFIX)?;
                         let seek_result = return_if_io!(cursor.seek(
                             SeekKey::IndexKey(seek_key.as_record_ref()),
@@ -1800,11 +1821,7 @@ impl FtsCursor {
                     // Duplicate segment ids in one searcher trip a
                     // SearcherGeneration assert inside Tantivy; dedupe the
                     // registry scan defensively.
-                    if self
-                        .scan_descriptors
-                        .iter()
-                        .all(|existing| existing.segment_id != segment_id)
-                    {
+                    if seen.insert(segment_id) {
                         self.scan_descriptors.push(descriptor);
                     } else {
                         let existing = self
@@ -2072,6 +2089,7 @@ impl FtsCursor {
             self.state = FtsState::ScanSegments {
                 seeked: false,
                 advance_pending: false,
+                seen: HashSet::default(),
             };
         }
         self.probe_only = false;
@@ -2585,12 +2603,19 @@ impl FtsCursor {
             let inverted = segment_reader
                 .inverted_index(self.rowid_field)
                 .map_err(|e| LimboError::InternalError(format!("FTS rowid lookup: {e}")))?;
-            let Some(mut postings) = inverted
-                .read_postings(&term, IndexRecordOption::Basic)
+            // This is what `read_postings` does. But `read_postings` returns
+            // `Option<SegmentPostings>`, which is about 2 KB and is moved
+            // also when the segment does not have the rowid. Usually only one
+            // segment has it.
+            let Some(term_info) = inverted
+                .get_term_info(&term)
                 .map_err(|e| LimboError::InternalError(format!("FTS rowid postings: {e}")))?
             else {
                 continue;
             };
+            let mut postings = inverted
+                .read_postings_from_terminfo(&term_info, IndexRecordOption::Basic)
+                .map_err(|e| LimboError::InternalError(format!("FTS rowid postings: {e}")))?;
             loop {
                 let doc_id = postings.doc();
                 if doc_id == TERMINATED {

@@ -165,7 +165,7 @@ expect {
     3
     4
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-16: ILIKE ALL(array)
@@ -179,7 +179,7 @@ expect {
     3
     4
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-17: ~ regex is case-sensitive
@@ -262,7 +262,7 @@ test all-any-non-equality {
 expect {
     t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-28: = ANY(array) with NULL element
@@ -400,15 +400,12 @@ expect {
 
 # B-42: jsonb #> / #>> path
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb #> _text"
 test jsonb-path {
     SELECT j #> '{a,b}', j #>> '{a,b}', j #>> '{tags,1}' FROM t WHERE id = 1;
 }
 expect {
     1|1|y
 }
-@sqlstate 42601
-expect @tursopg error {}
 
 # B-43: jsonb @> filter
 @setup t_id_s_n_arr_ia_j_ok_with_rows
@@ -430,31 +427,24 @@ expect {
 
 # B-46: jsonb ? key
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb ? text"
 test jsonb-key {
     SELECT id FROM t WHERE j ? 'tags' ORDER BY id;
 }
 expect {
     1
 }
-@sqlstate 42601
-expect @tursopg error {}
 
 # B-47: jsonb ?| array
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb ?| _text"
 test jsonb-has-any-key-in-array {
     SELECT id FROM t WHERE j ?| array['tags','zzz'] ORDER BY id;
 }
 expect {
     1
 }
-@sqlstate 42601
-expect @tursopg error {}
 
 # B-48: jsonb ?& array
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb ?& _text"
 test jsonb-has-all-keys-in-array {
     SELECT id FROM t WHERE j ?& array['a','n'] ORDER BY id;
 }
@@ -462,8 +452,6 @@ expect {
     1
     2
 }
-@sqlstate 42601
-expect @tursopg error {}
 
 # B-49: jsonb ->> compared to text
 @setup t_id_s_n_arr_ia_j_ok_with_rows
@@ -523,7 +511,7 @@ test to-tsvector-plainto-tsquery {
 expect {
     t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-56: websearch_to_tsquery
@@ -534,7 +522,7 @@ test websearch-to-tsquery {
 expect {
     t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-57: to_tsquery / phraseto_tsquery
@@ -545,7 +533,7 @@ test to-tsquery-phraseto-tsquery {
 expect {
     t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-58: text col @@ to_tsquery
@@ -557,7 +545,7 @@ test text-col-to-tsquery {
 expect {
     1
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-59: to_tsvector output
@@ -590,7 +578,7 @@ test range-overlap-strictly-left-adjacent {
 expect {
     t|t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-62: tstzrange contains
@@ -766,15 +754,11 @@ expect {
 expect @tursopg error {}
 
 # B-77: now() text format has offset and micros
-@compat-gap "cast:timestamptz -> text"
 test now-text-format-has-offset-and-micros {
     SELECT now()::text LIKE '____-__-__ __:__:__.%+00';
 }
 expect {
     t
-}
-expect @tursopg {
-    f
 }
 
 # B-78: gen_random_uuid() format
@@ -831,7 +815,7 @@ test caret-is-the-power-operator {
 expect {
     8
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-84: || with NULL and int
@@ -927,17 +911,24 @@ expect @tursopg error {
     no such function: extract
 }
 
-# date_trunc(text, timestamp) returns a timestamp. tursopg supports only
-# timestamptz arguments.
-@compat-gap "function:date_trunc"
+# date_trunc(text, timestamp) returns a timestamp.
 test date-trunc-timestamp {
     SELECT date_trunc('hour', '2026-10-08 12:34:56'::timestamp)::text;
 }
 expect {
     2026-10-08 12:00:00
 }
-@sqlstate 0A000
-expect @tursopg error {}
+
+# date_trunc of a domain over timestamp returns the base type, timestamp.
+test date-trunc-domain-over-timestamp {
+    CREATE DOMAIN trunc_ts AS timestamp;
+    CREATE TABLE trunc_domain_events (at trunc_ts);
+    INSERT INTO trunc_domain_events VALUES ('2026-10-08 12:34:56');
+    SELECT date_trunc('day', at) FROM trunc_domain_events;
+}
+expect {
+    2026-10-08 00:00:00
+}
 
 # B-93: nullif / greatest / least
 test nullif-greatest-least {
@@ -1161,7 +1152,7 @@ test with-insert-returning-data-modifying-cte {
 expect {
     9
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-110: row comparison (a,b) > (x,y) (keyset pagination)

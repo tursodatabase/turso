@@ -2050,6 +2050,125 @@ fn test_checkpoint_after_create_and_drop_sequence() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// A checkpoint of an attached database compacts the sequences of that database,
+/// not those of `main`. Before, it read the sequences of `main` and looked up their
+/// root pages in the MVCC store of the attached database.
+#[test]
+fn test_attached_checkpoint_ignores_main_sequences() {
+    // An AUTOINCREMENT table has an internal sequence too.
+    for main_sequence_sql in [
+        &["CREATE SEQUENCE s"][..],
+        &[
+            "CREATE TABLE m(id INTEGER PRIMARY KEY AUTOINCREMENT, x)",
+            "INSERT INTO m(x) VALUES (1)",
+        ],
+    ] {
+        let db =
+            MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+        let aux_dir = tempfile::TempDir::new().unwrap();
+        let aux_path = aux_dir.path().join("aux.db");
+        let conn = db.connect();
+
+        for sql in main_sequence_sql {
+            conn.execute(sql).unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE aux.t(x)").unwrap();
+        // No table of aux has the root page of the backing table of the sequence.
+        assert_eq!(
+            get_rows(&conn, "PRAGMA aux.wal_checkpoint(TRUNCATE)"),
+            vec![vec![
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0)
+            ]],
+            "{main_sequence_sql:?}"
+        );
+    }
+}
+
+#[test]
+fn test_attached_checkpoint_keeps_rows_of_table_at_main_sequence_root_page() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+    let conn = db.connect();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    conn.execute("PRAGMA aux.journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE aux.a(x)").unwrap();
+    conn.execute("INSERT INTO aux.a VALUES ('one'), ('two'), ('three')")
+        .unwrap();
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    conn.execute("SELECT nextval('s')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // `aux.a` and the backing table of `s` in main have the same root page.
+    let root_of = |sql: &str| get_rows(&conn, sql)[0][0].clone();
+    assert_eq!(
+        root_of("SELECT rootpage FROM aux.sqlite_schema WHERE name = 'a'"),
+        root_of("SELECT rootpage FROM main.sqlite_schema WHERE name = '__turso_internal_seq_s'")
+    );
+    conn.execute("INSERT INTO aux.a VALUES ('four')").unwrap();
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+    let expected = vec![
+        vec![Value::from_i64(1), Value::build_text("one")],
+        vec![Value::from_i64(2), Value::build_text("two")],
+        vec![Value::from_i64(3), Value::build_text("three")],
+        vec![Value::from_i64(4), Value::build_text("four")],
+    ];
+    assert_eq!(
+        get_rows(&conn, "SELECT rowid, x FROM aux.a ORDER BY rowid"),
+        expected
+    );
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT rowid, x FROM aux.a ORDER BY rowid"),
+        expected
+    );
+}
+
+/// A checkpoint of an attached database compacts the backing tables of the
+/// sequences of that database to one row, as a checkpoint of `main` does for `main`.
+#[test]
+fn test_attached_checkpoint_compacts_attached_sequences() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+    let conn = db.connect();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    conn.execute("PRAGMA aux.journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE SEQUENCE aux.s").unwrap();
+    // The first checkpoint gives the backing table a positive root page. The
+    // second one compacts the rows that the nextval calls after it appended.
+    for _ in 0..2 {
+        for _ in 0..2 {
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            conn.execute("SELECT nextval('aux.s')").unwrap();
+            conn.execute("COMMIT").unwrap();
+        }
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    assert_eq!(
+        get_rows(&conn, "SELECT value FROM aux.__turso_internal_seq_s"),
+        vec![vec![Value::from_i64(4)]]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT nextval('aux.s')"),
+        vec![vec![Value::from_i64(5)]]
+    );
+}
+
 #[test]
 fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
     let _ = tracing_subscriber::fmt::try_init();

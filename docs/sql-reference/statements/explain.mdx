@@ -89,6 +89,7 @@ Rowid range searches show their lower bound first, for example `(rowid>? AND row
 | `USE TEMP B-TREE FOR DISTINCT` | A temporary B-tree is used for deduplication |
 | `COMPOUND SUBQUERY` | Indicates a UNION, INTERSECT, or EXCEPT |
 | `CORRELATED SCALAR SUBQUERY` | A correlated subquery that returns a single value |
+| `MATERIALIZE name` | The rows of a CTE or FROM clause subquery are stored in a temporary table before the steps that read it. Its child steps are the plan of the subquery's body |
 
 ## Examples
 

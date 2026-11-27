@@ -188,7 +188,11 @@ impl PgConn {
                 b'Z' => return Ok(conn),
                 b'E' => {
                     let fields = parse_error_fields(&body)?;
-                    return Err(Error::Rejected(error_message(&fields).to_string()));
+                    let code = fields.get(&b'C').map(String::as_str).unwrap_or("?????");
+                    return Err(Error::Rejected(format!(
+                        "{code}: {}",
+                        error_message(&fields)
+                    )));
                 }
                 other => {
                     return Err(Error::Protocol(format!(

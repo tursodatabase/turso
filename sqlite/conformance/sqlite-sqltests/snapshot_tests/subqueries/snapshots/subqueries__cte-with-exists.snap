@@ -24,5 +24,6 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
+|--MATERIALIZE recent_orders
+|  `--SCAN orders
 `--SEARCH ro USING INDEX ephemeral_subquery_t6 (customer_id=?)
-   `--SCAN orders

@@ -46,14 +46,16 @@ use turso_core::{
 
 use turso_core::MAIN_DB_ID;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_GRANT_OPERATION,
-    SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_DUPLICATE_TABLE, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_GRANT_OPERATION,
+    SQLSTATE_READ_ONLY_SQL_TRANSACTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_TABLE,
 };
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
+use crate::auth_members::role_does_not_exist;
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
 use crate::descriptions::{emit_delete_comments, Dropped};
-use crate::error::sqlstate_error;
+use crate::error::{not_supported, sqlstate_error};
 use crate::policies::{self, TablePolicies};
 use crate::roles::schema_roles;
 use crate::schema_init::{is_stored_catalog_table, TableInit};
@@ -104,10 +106,11 @@ pub(crate) fn refuse_relations_without_class_table(schema: &Schema) -> turso_cor
         .is_none()
         && !schema.user_relations().is_empty()
     {
-        return Err(LimboError::ParseError(
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
             "the database has relations but no relation catalog, as an earlier version of tursopg \
-             made it; this version does not open it"
-                .to_string(),
+             made it; this version does not open it",
+            None,
         ));
     }
     Ok(())
@@ -783,9 +786,11 @@ impl<'a> ClassRowWriter<'a> {
             && class_catalog(self.schema)
                 .is_some_and(|catalog| catalog.get_by_name(namespace, name).is_some())
         {
-            return Err(LimboError::ParseError(format!(
-                "relation \"{name}\" already exists"
-            )));
+            return Err(sqlstate_error(
+                SQLSTATE_DUPLICATE_TABLE,
+                format!("relation \"{name}\" already exists"),
+                None,
+            ));
         }
         let owner = table
             .and_then(|table| relation_owner(self.schema, namespace, table))
@@ -878,9 +883,8 @@ fn writes_class_rows(ctx: &CmdContext<'_>) -> turso_core::Result<bool> {
         return Ok(false);
     }
     if turso_core::is_attached_db(ctx.database_id) {
-        return Err(LimboError::ParseError(
-            "creating, renaming or dropping relations in an attached database is not supported"
-                .to_string(),
+        return Err(not_supported(
+            "creating, renaming or dropping relations in an attached database",
         ));
     }
     Ok(ctx.database_id == MAIN_DB_ID)
@@ -909,8 +913,10 @@ pub(crate) fn translate_access_statement(
                 ..
             } => Ok(()),
             AccessStatement::Grant { relations: [], .. } => Ok(()),
-            _ => Err(LimboError::ParseError(
-                "the database has no relation catalog".to_string(),
+            _ => Err(sqlstate_error(
+                SQLSTATE_READ_ONLY_SQL_TRANSACTION,
+                "the database has no relation catalog",
+                None,
             )),
         };
     };
@@ -925,10 +931,11 @@ pub(crate) fn translate_access_statement(
                     .and_then(|catalog| catalog.get_by_name(*namespace, &owner.table))
                     .map(|class| class.oid)
                     .ok_or_else(|| {
-                        LimboError::ParseError(format!(
-                            "relation \"{}\" does not exist",
-                            owner.table
-                        ))
+                        sqlstate_error(
+                            SQLSTATE_UNDEFINED_TABLE,
+                            format!("relation \"{}\" does not exist", owner.table),
+                            None,
+                        )
                     })?,
                 None => 0,
             };
@@ -965,9 +972,11 @@ pub(crate) fn translate_access_statement(
                 return Ok(());
             }
             if class.relownedby != 0 {
-                return Err(LimboError::ParseError(format!(
-                    "cannot change owner of sequence \"{name}\""
-                )));
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!("cannot change owner of sequence \"{name}\""),
+                    None,
+                ));
             }
             // A table's indexes and what it owns, such as the sequences
             // of its serial columns, go with it.
@@ -1029,21 +1038,15 @@ pub(crate) fn translate_access_statement(
                     class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
                 else {
                     if schema.get_btree_table(*namespace, name).is_some() {
-                        return Err(sqlstate_error(
-                            SQLSTATE_FEATURE_NOT_SUPPORTED,
-                            format!("{statement} on internal table {name} is not supported"),
-                            None,
-                        ));
+                        return Err(not_supported(format!(
+                            "{statement} on internal table {name}"
+                        )));
                     }
                     if *revoke {
-                        return Err(sqlstate_error(
-                            SQLSTATE_FEATURE_NOT_SUPPORTED,
-                            format!(
-                                "REVOKE on system catalog {} is not supported",
-                                catalog_view_name(name)
-                            ),
-                            None,
-                        ));
+                        return Err(not_supported(format!(
+                            "REVOKE on system catalog {}",
+                            catalog_view_name(name)
+                        )));
                     }
                     continue;
                 };
@@ -1108,9 +1111,7 @@ pub(crate) fn translate_access_statement(
             let Some(class) =
                 class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
             else {
-                return Err(LimboError::ParseError(format!(
-                    "permission denied: \"{name}\" is a system catalog"
-                )));
+                return Err(system_catalog_permission_denied(name));
             };
             if class.relrowsecurity == *enabled {
                 return Ok(());
@@ -1153,9 +1154,11 @@ pub(crate) fn translate_access_statement(
             // rather than leaving a database that cannot be opened.
             let some_oid = FIRST_NORMAL_OBJECT_ID;
             if policies::parse(&format!("{before_oid}{some_oid}{after_oid}")).is_none() {
-                return Err(LimboError::ParseError(format!(
-                    "the conditions of policy \"{policy_name}\" cannot be stored"
-                )));
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!("the conditions of policy \"{policy_name}\" cannot be stored"),
+                    None,
+                ));
             }
             emit_class_row_set_policies(
                 program,
@@ -1220,9 +1223,16 @@ fn table_class<'a>(
 ) -> turso_core::Result<&'a RelationClass> {
     class_catalog(schema)
         .and_then(|catalog| catalog.get_by_name(namespace, name))
-        .ok_or_else(|| {
-            LimboError::ParseError(format!("permission denied: \"{name}\" is a system catalog"))
-        })
+        .ok_or_else(|| system_catalog_permission_denied(name))
+}
+
+/// PostgreSQL's error for a statement that changes system catalog `name`.
+fn system_catalog_permission_denied(name: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        format!("permission denied: \"{name}\" is a system catalog"),
+        None,
+    )
 }
 
 /// The role a policy's TO clause names.
@@ -1258,8 +1268,7 @@ fn resolve_grantee(
         ast::Grantee::Role(ast::RoleSpec::CurrentRole) => role_oid(connection.current_role()),
         ast::Grantee::Role(ast::RoleSpec::SessionUser) => role_oid(connection.session_role()),
         ast::Grantee::Role(ast::RoleSpec::Name(name)) => {
-            role_oid_by_name(schema_roles(schema), name)
-                .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?
+            role_oid_by_name(schema_roles(schema), name).ok_or_else(|| role_does_not_exist(name))?
         }
     })
 }
@@ -1276,9 +1285,7 @@ fn resolve_new_owner(
     let has_row =
         class_catalog(schema).is_some_and(|catalog| catalog.get_by_name(namespace, name).is_some());
     if !has_row {
-        return Err(LimboError::ParseError(format!(
-            "permission denied: \"{name}\" is a system catalog"
-        )));
+        return Err(system_catalog_permission_denied(name));
     }
     resolve_role(schema, connection, new_owner)
 }
@@ -1293,10 +1300,11 @@ fn resolve_role(
         ast::RoleSpec::CurrentRole => connection.current_role(),
         ast::RoleSpec::SessionUser => connection.session_role(),
         ast::RoleSpec::Name(name) => engine_role_by_name(schema_roles(schema), name)
-            .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?,
+            .ok_or_else(|| role_does_not_exist(name))?,
     })
 }
 
+/// PostgreSQL's error for a role name that names no role.
 /// The cursors of one statement's class row writes: the classes table, its
 /// name index, and `sqlite_sequence`, which keeps the highest oid ever used
 /// under the classes table's own name.

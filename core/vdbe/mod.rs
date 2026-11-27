@@ -58,7 +58,7 @@ use crate::{
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
-        metrics::StatementMetrics,
+        metrics::{cursor_work, new_cursor_work_handle, CursorWorkHandle, StatementMetrics},
         vacuum::VacuumInPlaceOpContext,
     },
     ValueRef, WalAutoActions,
@@ -1078,7 +1078,19 @@ impl WriteBaseline {
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
+    /// Each instruction that the dispatch loop runs takes one step of the
+    /// countdown, so the countdown also counts the instructions that are not
+    /// yet in `metrics.vm_steps` and `metrics.insn_executed` (see
+    /// [Self::sync_step_counts]).
     check_countdown: u64,
+    /// The value of `check_countdown` when the dispatched instructions were
+    /// last added to the metrics. `countdown_synced - check_countdown`
+    /// instructions were dispatched since then.
+    countdown_synced: u64,
+    /// The instructions dispatched since the last sync that did not finish:
+    /// they returned IO, an interrupt or an error. They count as VM steps but
+    /// not as executed instructions.
+    unfinished_dispatches: u64,
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
@@ -1161,7 +1173,14 @@ pub struct ProgramState {
     active_op_state: ActiveOpStateSlot,
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
+    /// `vm_steps` and `insn_executed` leave out the instructions that the
+    /// dispatch loop counted after the last `sync_step_counts`. Read them
+    /// with `metrics()` or `with_metrics()`, or call `sync_step_counts`
+    /// first.
     pub metrics: StatementMetrics,
+    /// Live work counters of the MVCC cursors that this statement opens. Read them with
+    /// `metrics()`. They are not in `metrics` itself.
+    pub(crate) cursor_work: CursorWorkHandle,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaApplyState,
@@ -1295,6 +1314,8 @@ impl ProgramState {
             .into_boxed_slice();
         Self {
             check_countdown: 1,
+            countdown_synced: 1,
+            unfinished_dispatches: 0,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
             extension_state: crate::native_ext::ExtensionState::None,
@@ -1330,6 +1351,7 @@ impl ProgramState {
             active_op_state: ActiveOpStateSlot::default(),
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
+            cursor_work: new_cursor_work_handle(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaApplyState::NotStarted,
@@ -1390,7 +1412,11 @@ impl ProgramState {
             return;
         }
         self.execution_state = ProgramExecutionState::Interrupting;
+        // The countdown also counts the dispatched instructions, so they are
+        // added to the metrics before the countdown changes.
+        self.sync_step_counts();
         self.check_countdown = 1;
+        self.countdown_synced = 1;
     }
 
     pub fn is_interrupted(&self) -> bool {
@@ -1732,7 +1758,10 @@ impl ProgramState {
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
         );
-        if has_active_subprogram {
+        if has_active_subprogram
+            || self.has_pending_counts()
+            || !cursor_work(&self.cursor_work).is_zero()
+        {
             f(&self.metrics())
         } else {
             f(&self.metrics)
@@ -1741,6 +1770,10 @@ impl ProgramState {
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
+        self.pending_counts().add_to(&mut metrics);
+        metrics
+            .cursor_work
+            .merge(&cursor_work(&self.cursor_work).get());
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
@@ -1748,13 +1781,16 @@ impl ProgramState {
     }
 
     pub(crate) fn reset_metrics(&mut self) {
+        self.sync_step_counts();
         self.metrics.reset();
+        cursor_work(&self.cursor_work).reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
     }
 
     pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
+        self.sync_step_counts();
         match counter {
             crate::statement::StatementStatusCounter::FullscanStep => {
                 self.metrics.fullscan_steps = 0
@@ -1768,6 +1804,31 @@ impl ProgramState {
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_stmt_status(counter);
+        }
+    }
+
+    /// Moves the counts that the dispatch loop keeps out of `metrics` into
+    /// `metrics`. For each instruction, the dispatch loop takes a step of
+    /// `check_countdown` only. The readers of the metrics add these counts
+    /// (see [Self::metrics]), and the code that changes the metrics or the
+    /// countdown moves them first.
+    fn sync_step_counts(&mut self) {
+        if self.has_pending_counts() {
+            self.pending_counts().add_to(&mut self.metrics);
+            self.countdown_synced = self.check_countdown;
+            self.unfinished_dispatches = 0;
+        }
+    }
+
+    fn has_pending_counts(&self) -> bool {
+        self.countdown_synced != self.check_countdown || self.unfinished_dispatches != 0
+    }
+
+    /// The counts that are not yet in `self.metrics`.
+    fn pending_counts(&self) -> PendingCounts {
+        PendingCounts {
+            dispatched: self.countdown_synced.wrapping_sub(self.check_countdown),
+            unfinished: self.unfinished_dispatches,
         }
     }
 
@@ -2058,6 +2119,25 @@ impl ProgramState {
     pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);
+    }
+}
+
+/// The counts of a [ProgramState] that are not yet in its metrics (see
+/// [ProgramState::sync_step_counts]).
+#[derive(Clone, Copy)]
+struct PendingCounts {
+    /// Instructions dispatched.
+    dispatched: u64,
+    /// The dispatched instructions that did not finish.
+    unfinished: u64,
+}
+
+impl PendingCounts {
+    fn add_to(self, metrics: &mut StatementMetrics) {
+        metrics.vm_steps = metrics.vm_steps.wrapping_add(self.dispatched);
+        metrics.insn_executed = metrics
+            .insn_executed
+            .wrapping_add(self.dispatched.wrapping_sub(self.unfinished));
     }
 }
 
@@ -2360,6 +2440,8 @@ impl Program {
         pager: &Arc<Pager>,
         query_mode: QueryMode,
     ) -> Result<StepResult, Box<LimboError>> {
+        // The explain steps read and add to `metrics.vm_steps` directly.
+        state.sync_step_counts();
         match query_mode {
             QueryMode::Normal => unreachable!("normal queries do not step through explain"),
             QueryMode::Explain => self.explain_step(state, connection, pager),
@@ -2642,6 +2724,10 @@ impl Program {
             ProgramStep::Done => {
                 crate::native_ext::close_cursors(&mut state.cursors);
                 state.execution_state = ProgramExecutionState::Done;
+                // The metrics of a statement are read when it is done (see
+                // Statement::step), so they are synced one time here, and
+                // not for each row.
+                state.sync_step_counts();
             }
             ProgramStep::Interrupt => {
                 state.execution_state = ProgramExecutionState::Interrupted;
@@ -2712,11 +2798,17 @@ impl Program {
                     }
                 }
                 loop {
+                    // This step of the countdown also counts the instruction
+                    // as a VM step (see ProgramState::sync_step_counts).
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
                         if let Some(result) = program.periodic_checks(state, connection, pager) {
                             return result;
                         }
+                        // periodic_checks reloaded the countdown and synced
+                        // the metrics without this instruction, which runs
+                        // now without a countdown step of its own.
+                        state.countdown_synced = state.countdown_synced.wrapping_add(1);
                     }
 
                     let (insn, _) = &insns[state.pc as usize];
@@ -2724,28 +2816,19 @@ impl Program {
                         program.trace_step(state, insn, enable_tracing, vdbe_trace);
                     }
 
-                    // Always increment VM steps for every loop iteration
-                    state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
-
                     // The opcodes that run once per row of a scan are matched here
                     // so LLVM inlines them into the loop, and each one tests its
                     // own result right after its body, where the result is a
                     // constant: tested after a shared merge point, the constant
                     // reaches the compare through a phi and stays a runtime test.
                     // Every other opcode goes through the function table.
+                    // A finished instruction needs no metrics write: the
+                    // countdown step counted it.
                     macro_rules! step_inline {
                         ($op:path) => {
                             match $op(program, state, insn, connection, pager) {
-                                Ok(InsnFunctionStepResult::Step) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
-                                    continue;
-                                }
-                                Ok(InsnFunctionStepResult::Row) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
-                                    return ProgramStep::Row;
-                                }
+                                Ok(InsnFunctionStepResult::Step) => continue,
+                                Ok(InsnFunctionStepResult::Row) => return ProgramStep::Row,
                                 other => other,
                             }
                         };
@@ -2775,12 +2858,10 @@ impl Program {
                     // each; the rest settles out of line.
                     if let Ok(InsnFunctionStepResult::Step) = result {
                         // Instruction completed, moving to next
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         continue;
                     }
                     if let Ok(InsnFunctionStepResult::Row) = result {
                         // Instruction completed (ResultRow already incremented PC)
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         return ProgramStep::Row;
                     }
                     match dispatch_cold(program, state, connection, pager, waker, result) {
@@ -2802,19 +2883,24 @@ impl Program {
                 match result {
                     Ok(InsnFunctionStepResult::Done) => {
                         // Instruction completed execution
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
                         Some(ProgramStep::Done)
                     }
                     Ok(InsnFunctionStepResult::IO) => {
+                        // The instruction runs again when its IO is done.
+                        state.unfinished_dispatches += 1;
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
                     Ok(InsnFunctionStepResult::Interrupt) => {
+                        state.unfinished_dispatches += 1;
                         state.interrupt();
                         program.interrupted_during_step(state, connection, pager)
                     }
-                    Err(boxed_err) => program.fail_step(state, connection, pager, *boxed_err),
+                    Err(boxed_err) => {
+                        state.unfinished_dispatches += 1;
+                        program.fail_step(state, connection, pager, *boxed_err)
+                    }
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
                     }
@@ -2948,6 +3034,11 @@ impl Program {
         connection: &Arc<Connection>,
         pager: &Arc<Pager>,
     ) -> Option<ProgramStep> {
+        // The countdown step that reached zero is the one of the instruction
+        // at pc, which has not run yet: the metrics that the checks read
+        // leave it out, as the progress handler expects.
+        state.countdown_synced = state.countdown_synced.wrapping_sub(1);
+        state.sync_step_counts();
         let progress_ops = connection.progress_ops();
         state.check_interval = if progress_ops == 0 || progress_ops >= MAX_CHECK_INTERVAL {
             MAX_CHECK_INTERVAL
@@ -2955,6 +3046,7 @@ impl Program {
             progress_ops
         };
         state.check_countdown = state.check_interval;
+        state.countdown_synced = state.check_countdown;
         if connection.is_closed() {
             return Some(ProgramStep::Error(
                 self.closed_during_step(connection, pager),

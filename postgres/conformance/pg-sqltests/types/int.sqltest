@@ -1,0 +1,948 @@
+# The integer types smallint (int2), integer (int4) and bigint (int8) keep
+# their values inside their range, and a cast to one of them reads text as
+# PostgreSQL does.
+
+@database :memory:
+
+setup t_n {
+    CREATE TABLE t (n int);
+}
+
+test int-columns-store-the-ends-of-their-range {
+    CREATE TABLE t (s smallint, i integer, b bigint);
+    INSERT INTO t VALUES
+        (-32768, -2147483648, -9223372036854775808),
+        (32767, 2147483647, 9223372036854775807);
+    SELECT s, i, b FROM t ORDER BY i;
+}
+expect {
+    -32768|-2147483648|-9223372036854775808
+    32767|2147483647|9223372036854775807
+}
+
+test int2-int4-int8-name-the-same-types {
+    CREATE TABLE t (s int2, i int4, j int, b int8);
+    INSERT INTO t VALUES (1, 2, 3, 4);
+    SELECT s, i, j, b FROM t;
+}
+expect {
+    1|2|3|4
+}
+
+# A string literal written to an integer column is read as the type reads
+# text.
+
+test int-columns-read-a-string-literal-in-every-spelling {
+    CREATE TABLE t (id int, s smallint, i integer, b bigint);
+    INSERT INTO t VALUES
+        (1, '010', '0x10', '1_000'),
+        (2, ' 42 ', '+7', '-0b11'),
+        (3, '0o17', '-0', '007');
+    SELECT s, i, b FROM t ORDER BY id;
+}
+expect {
+    10|16|1000
+    42|7|-3
+    15|0|7
+}
+
+test int-column-reads-a-string-literal-in-an-update {
+    CREATE TABLE t (i integer);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET i = '0x20';
+    SELECT i FROM t;
+}
+expect {
+    32
+}
+
+test int-column-reads-a-string-literal-as-its-default {
+    CREATE TABLE t (id int, i integer DEFAULT '0x10');
+    INSERT INTO t (id) VALUES (1);
+    SELECT i FROM t;
+}
+expect {
+    16
+}
+
+test int-column-refuses-a-string-literal-with-an-exponent {
+    CREATE TABLE t (i integer);
+    INSERT INTO t VALUES ('1e3');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1e3"
+}
+
+test smallint-column-refuses-a-string-literal-with-a-fraction {
+    CREATE TABLE t (s smallint);
+    INSERT INTO t VALUES ('1.0');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type smallint: "1.0"
+}
+
+test bigint-column-refuses-a-string-literal-that-is-not-an-integer {
+    CREATE TABLE t (b bigint);
+    INSERT INTO t VALUES ('abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "abc"
+}
+
+test int-column-refuses-a-string-literal-out-of-its-range {
+    CREATE TABLE t (i integer);
+    INSERT INTO t VALUES ('2147483648');
+}
+@sqlstate 22003
+expect error {
+    value "2147483648" is out of range for type integer
+}
+
+test int-column-refuses-the-text-of-another-column {
+    CREATE TABLE t (i integer, x text);
+    INSERT INTO t (x) VALUES ('5');
+    UPDATE t SET i = x;
+}
+@sqlstate 42804
+expect error {}
+
+test smallint-column-refuses-a-value-above-its-range {
+    CREATE TABLE t (n smallint);
+    INSERT INTO t VALUES (32768);
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test smallint-column-refuses-a-value-below-its-range {
+    CREATE TABLE t (n smallint);
+    INSERT INTO t VALUES (-32769);
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+@setup t_n
+test integer-column-refuses-a-value-below-its-range {
+    INSERT INTO t VALUES (-2147483649);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup t_n
+test integer-column-refuses-an-update-out-of-its-range {
+    INSERT INTO t VALUES (1);
+    UPDATE t SET n = 2147483648;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup t_n
+test integer-column-refuses-a-sum-out-of-its-range {
+    INSERT INTO t VALUES (2147483647);
+    UPDATE t SET n = n + 1;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup t_n
+test integer-column-refuses-a-selected-value-out-of-its-range {
+    INSERT INTO t SELECT 2147483648;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test integer-column-refuses-a-default-out-of-its-range {
+    CREATE TABLE t (id int, n int DEFAULT 2147483648);
+    INSERT INTO t (id) VALUES (1);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test integer-primary-key-refuses-a-value-out-of-its-range {
+    CREATE TABLE t (id int PRIMARY KEY, v text);
+    INSERT INTO t VALUES (2147483648, 'a');
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test integer-primary-key-refuses-an-update-out-of-its-range {
+    CREATE TABLE t (id int PRIMARY KEY, v text);
+    INSERT INTO t VALUES (1, 'a');
+    UPDATE t SET id = 2147483648;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test integer-primary-key-refuses-an-upsert-out-of-its-range {
+    CREATE TABLE t (id int PRIMARY KEY, v text);
+    INSERT INTO t VALUES (1, 'a');
+    INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET id = 2147483648;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test integer-primary-key-stores-the-ends-of-its-range {
+    CREATE TABLE t (id int PRIMARY KEY, v text);
+    INSERT INTO t VALUES (2147483647, 'max'), (-2147483648, 'min');
+    SELECT id, v FROM t WHERE id > 0;
+    SELECT id, v FROM t WHERE id < 0;
+}
+expect {
+    2147483647|max
+    -2147483648|min
+}
+
+test serial-column-refuses-a-value-out-of-its-range {
+    CREATE TABLE t (id serial PRIMARY KEY, v text);
+    INSERT INTO t (id, v) VALUES (2147483648, 'a');
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test integer-array-column-refuses-an-element-out-of-its-range {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES (ARRAY[1, 2147483648]);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test domain-over-integer-refuses-a-value-out-of-its-range {
+    CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+    CREATE TABLE t (n posint);
+    INSERT INTO t VALUES (2147483648);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test smallint-column-added-later-refuses-a-value-out-of-its-range {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN n smallint;
+    UPDATE t SET n = 40000;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test int-columns-of-different-types-compare-and-add {
+    CREATE TABLE t (s smallint, i integer, b bigint);
+    INSERT INTO t VALUES (1, 2, 3), (4, 4, 4);
+    SELECT s + i + b, s < i, i = b FROM t ORDER BY s;
+}
+expect {
+    6|t|f
+    12|f|t
+}
+
+test int-columns-of-different-types-join {
+    CREATE TABLE a (id int PRIMARY KEY, s smallint);
+    CREATE TABLE b (id bigint PRIMARY KEY, a_id int);
+    INSERT INTO a VALUES (1, 10), (2, 20);
+    INSERT INTO b VALUES (100, 1), (200, 2), (300, 2);
+    SELECT a.s, count(*) FROM a JOIN b ON b.a_id = a.id GROUP BY a.s ORDER BY a.s;
+}
+expect {
+    10|1
+    20|2
+}
+
+@setup t_n
+test int4-column-overflow {
+    INSERT INTO t VALUES (2147483648);
+}
+@sqlstate 22003
+expect error {}
+
+# A primary key and an index of each integer type.
+
+test smallint-primary-key-finds-and-orders-its-rows {
+    CREATE TABLE t (id smallint PRIMARY KEY, v text);
+    INSERT INTO t VALUES (300, 'c'), (-32768, 'min'), (32767, 'max'), (5, 'a');
+    SELECT v FROM t WHERE id = 300;
+    SELECT id FROM t WHERE id > 5 ORDER BY id DESC;
+}
+expect {
+    c
+    32767
+    300
+}
+
+test bigint-primary-key-finds-and-orders-its-rows {
+    CREATE TABLE t (id bigint PRIMARY KEY, v text);
+    INSERT INTO t VALUES (3000000000, 'c'), (-9223372036854775808, 'min'), (9223372036854775807, 'max'), (5, 'a');
+    SELECT v FROM t WHERE id = 3000000000;
+    SELECT id FROM t WHERE id > 5 ORDER BY id DESC;
+}
+expect {
+    c
+    9223372036854775807
+    3000000000
+}
+
+test smallint-primary-key-refuses-a-value-out-of-its-range {
+    CREATE TABLE t (id smallint PRIMARY KEY, v text);
+    INSERT INTO t VALUES (32768, 'a');
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test smallint-primary-key-refuses-an-update-out-of-its-range {
+    CREATE TABLE t (id smallint PRIMARY KEY, v text);
+    INSERT INTO t VALUES (32767, 'a');
+    UPDATE t SET id = id + 1;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test integer-primary-key-refuses-a-default-out-of-its-range {
+    CREATE TABLE t (id int PRIMARY KEY DEFAULT 3000000000, v text);
+    INSERT INTO t (v) VALUES ('a');
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test smallint-primary-key-refuses-a-default-out-of-its-range-in-default-values {
+    CREATE TABLE t (id smallint PRIMARY KEY DEFAULT 40000, v text);
+    INSERT INTO t DEFAULT VALUES;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test integer-primary-keys-take-their-default {
+    CREATE TABLE t (id smallint PRIMARY KEY DEFAULT 5, v text);
+    CREATE TABLE u (id bigint PRIMARY KEY DEFAULT 3000000000, v text);
+    INSERT INTO t (v) VALUES ('a');
+    INSERT INTO u VALUES (DEFAULT, 'b');
+    SELECT id, v FROM t;
+    SELECT id, v FROM u;
+}
+expect {
+    5|a
+    3000000000|b
+}
+
+test smallint-primary-key-refuses-a-duplicate {
+    CREATE TABLE t (id smallint PRIMARY KEY, v text);
+    INSERT INTO t VALUES (1, 'a');
+    INSERT INTO t VALUES (1, 'b');
+}
+@sqlstate 23505
+expect error {}
+
+test bigint-primary-key-refuses-a-duplicate {
+    CREATE TABLE t (id bigint PRIMARY KEY, v text);
+    INSERT INTO t VALUES (3000000000, 'a');
+    INSERT INTO t VALUES (3000000000, 'b');
+}
+@sqlstate 23505
+expect error {}
+
+test integer-primary-keys-refuse-null {
+    CREATE TABLE t (id bigint PRIMARY KEY);
+    INSERT INTO t VALUES (NULL);
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-keys-refuse-an-update-to-null {
+    CREATE TABLE s (id smallint PRIMARY KEY, v text);
+    CREATE TABLE i (id integer PRIMARY KEY, v text);
+    CREATE TABLE b (id bigint PRIMARY KEY, v text);
+    INSERT INTO s VALUES (5, 'a');
+    INSERT INTO i VALUES (5, 'a');
+    INSERT INTO b VALUES (5, 'a');
+    UPDATE s SET id = NULL;
+}
+@sqlstate 23502
+expect error {
+    null value in column "id" of relation "s" violates not-null constraint
+}
+
+test bigint-primary-key-refuses-an-upsert-to-null {
+    CREATE TABLE b (id bigint PRIMARY KEY, v text);
+    INSERT INTO b VALUES (5, 'a');
+    INSERT INTO b VALUES (5, 'b') ON CONFLICT (id) DO UPDATE SET id = NULL;
+}
+@sqlstate 23502
+expect error {}
+
+test bigint-primary-key-upsert-and-update {
+    CREATE TABLE t (id bigint PRIMARY KEY, v text);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    INSERT INTO t VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+    UPDATE t SET id = id + 3000000000 WHERE id = 2;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|x
+    3000000002|b
+}
+
+test bigserial-primary-key-takes-values-past-the-range-of-integer {
+    CREATE TABLE t (id bigserial PRIMARY KEY, v text);
+    INSERT INTO t (v) VALUES ('a'), ('b');
+    INSERT INTO t VALUES (3000000000, 'c');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3000000000|c
+}
+
+test smallserial-column-refuses-a-value-out-of-its-range {
+    CREATE TABLE t (id smallserial PRIMARY KEY, v text);
+    INSERT INTO t (v) VALUES ('a');
+    INSERT INTO t VALUES (40000, 'b');
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test primary-key-of-two-integer-types {
+    CREATE TABLE t (a smallint, b bigint, v text, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES (1, 3000000000, 'x'), (1, 2, 'y'), (2, 2, 'z');
+    SELECT v FROM t WHERE a = 1 AND b = 3000000000;
+    SELECT a, b FROM t ORDER BY a, b;
+}
+expect {
+    x
+    1|2
+    1|3000000000
+    2|2
+}
+
+test primary-key-of-two-integer-types-refuses-a-duplicate {
+    CREATE TABLE t (a smallint, b bigint, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES (1, 2);
+    INSERT INTO t VALUES (1, 2);
+}
+@sqlstate 23505
+expect error {}
+
+test indexes-on-columns-of-each-integer-type {
+    CREATE TABLE t (id bigint PRIMARY KEY, s smallint, i integer, b bigint);
+    CREATE INDEX t_s ON t (s);
+    CREATE INDEX t_i ON t (i);
+    CREATE INDEX t_b ON t (b);
+    CREATE INDEX t_s_b ON t (s, b);
+    INSERT INTO t VALUES (1, 10, 100, 3000000000), (2, 20, 200, 6000000000), (3, 20, 300, 9000000000), (4, -5, NULL, NULL);
+    SELECT id FROM t WHERE s = 20 ORDER BY id;
+    SELECT id FROM t WHERE i BETWEEN 150 AND 350 ORDER BY i DESC;
+    SELECT id FROM t WHERE b > 3000000000 AND s = 20 ORDER BY b;
+    SELECT id FROM t WHERE s < 0;
+    SELECT id FROM t WHERE i IS NULL;
+}
+expect {
+    2
+    3
+    3
+    2
+    2
+    3
+    4
+    4
+}
+
+test unique-index-on-a-bigint-column-refuses-a-duplicate {
+    CREATE TABLE t (id smallint PRIMARY KEY, b bigint);
+    CREATE UNIQUE INDEX t_b ON t (b);
+    INSERT INTO t VALUES (1, 3000000000);
+    INSERT INTO t VALUES (2, 3000000000);
+}
+@sqlstate 23505
+expect error {}
+
+test index-on-an-integer-column-follows-updates-and-deletes {
+    CREATE TABLE t (id smallint PRIMARY KEY, n bigint);
+    CREATE INDEX t_n ON t (n);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t SET n = n * 10 WHERE id = 2;
+    DELETE FROM t WHERE n = 30;
+    SELECT id, n FROM t WHERE n >= 10 ORDER BY n;
+}
+expect {
+    1|10
+    2|200
+}
+
+test foreign-key-columns-of-each-integer-type-join-their-keys {
+    CREATE TABLE p (id bigint PRIMARY KEY, name text);
+    CREATE TABLE c (id smallint PRIMARY KEY, p_id bigint REFERENCES p (id));
+    CREATE INDEX c_p ON c (p_id);
+    INSERT INTO p VALUES (3000000000, 'big'), (1, 'one');
+    INSERT INTO c VALUES (1, 3000000000), (2, 3000000000), (3, 1);
+    SELECT p.name, count(*) FROM p JOIN c ON c.p_id = p.id GROUP BY p.name ORDER BY p.name;
+}
+expect {
+    big|2
+    one|1
+}
+
+# A cast to an integer type.
+
+test int-cast-reads-text-with-whitespace-and-a-sign {
+    SELECT ' 42 '::integer, '+7'::smallint, '-7'::bigint, '007'::int;
+}
+expect {
+    42|7|-7|7
+}
+
+test int-cast-reads-hexadecimal-octal-and-binary-text {
+    SELECT '0x1F'::integer, '0o17'::smallint, '0b101'::bigint, '-0X10'::int;
+}
+expect {
+    31|15|5|-16
+}
+
+test int-cast-reads-underscores-between-digits {
+    SELECT '1_000'::integer, '0x_ff'::int, '1_2_3'::smallint;
+}
+expect {
+    1000|255|123
+}
+
+test int-cast-reads-the-ends-of-each-range {
+    SELECT '-32768'::int2, '32767'::int2, '-2147483648'::int4, '2147483647'::int4,
+        '-9223372036854775808'::int8, '9223372036854775807'::int8;
+}
+expect {
+    -32768|32767|-2147483648|2147483647|-9223372036854775808|9223372036854775807
+}
+
+test smallint-cast-refuses-text-that-is-not-an-integer {
+    SELECT 'abc'::smallint;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type smallint: "abc"
+}
+
+test bigint-cast-refuses-text-with-an-exponent {
+    SELECT '1e2'::bigint;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "1e2"
+}
+
+test int-cast-refuses-empty-text {
+    SELECT ''::integer;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: ""
+}
+
+test int-cast-refuses-an-underscore-after-the-last-digit {
+    SELECT '1_'::integer;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1_"
+}
+
+test int-cast-refuses-two-numbers {
+    SELECT '1 2'::integer;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1 2"
+}
+
+test int-cast-reads-text-of-a-column {
+    CREATE TABLE t (s text);
+    INSERT INTO t VALUES (' 12 '), ('0x10');
+    SELECT s::int + 1 FROM t ORDER BY 1;
+}
+expect {
+    13
+    17
+}
+
+test int-cast-refuses-text-of-a-column-that-is-not-an-integer {
+    CREATE TABLE t (s text);
+    INSERT INTO t VALUES ('12'), ('twelve');
+    SELECT s::int FROM t;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "twelve"
+}
+
+test bigint-cast-refuses-text-above-its-range {
+    SELECT '9223372036854775808'::bigint;
+}
+@sqlstate 22003
+expect error {
+    value "9223372036854775808" is out of range for type bigint
+}
+
+test int-cast-refuses-hexadecimal-text-above-its-range {
+    SELECT '0xFFFFFFFF'::integer;
+}
+@sqlstate 22003
+expect error {
+    value "0xFFFFFFFF" is out of range for type integer
+}
+
+test smallint-cast-refuses-a-number-above-its-range {
+    SELECT 40000::smallint;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test int-cast-refuses-a-number-above-its-range {
+    SELECT 3000000000::integer;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test int-cast-refuses-a-decimal-above-its-range {
+    SELECT 2147483647.5::integer;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test int-cast-rounds-a-decimal-inside-its-range {
+    SELECT 2147483647.4::integer, 0.5::smallint, (-0.5)::bigint, 1.4::int;
+}
+expect {
+    2147483647|1|-1|1
+}
+
+test int-cast-with-cast-syntax {
+    SELECT CAST('12' AS smallint), CAST(' 13' AS integer), CAST('14 ' AS bigint);
+}
+expect {
+    12|13|14
+}
+
+test int2-function-refuses-a-number-above-its-range {
+    SELECT int2(70000);
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test int-functions-cast-as-the-types-do {
+    SELECT int2(7.6), int4(7.5), int8(-7.5);
+}
+expect {
+    8|8|-8
+}
+
+test int-cast-of-a-boolean {
+    SELECT true::integer, false::int;
+}
+expect {
+    1|0
+}
+
+test int-cast-of-null {
+    SELECT NULL::integer IS NULL, NULL::smallint IS NULL, NULL::bigint IS NULL;
+}
+expect {
+    t|t|t
+}
+
+test jsonb-number-cast-to-each-int-type {
+    SELECT '5'::jsonb::smallint, '6'::jsonb::integer, '7'::jsonb::bigint;
+}
+expect {
+    5|6|7
+}
+
+test int-array-cast-reads-each-element {
+    SELECT '{1, 2,3}'::int[];
+}
+expect {
+    {1,2,3}
+}
+
+test int4-overflow-literal-cast {
+    SELECT '2147483648'::int4;
+}
+@sqlstate 22003
+expect error {}
+
+test int2-overflow-literal-cast {
+    SELECT '40000'::smallint;
+}
+@sqlstate 22003
+expect error {}
+
+test invalid-int-literal-cast {
+    SELECT 'abc'::integer;
+}
+@sqlstate 22P02
+expect error {}
+
+test decimal-text-cast-to-int4-is-invalid {
+    SELECT '1.5'::integer;
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-int-rounds-half-away-from-zero {
+    SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
+}
+expect {
+    2|3|-3
+}
+
+test invalid-int-literal {
+    SELECT '{1,x}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+# Arithmetic on the integer types.
+
+setup ints {
+    CREATE TABLE ints (s smallint, i integer, b bigint);
+    INSERT INTO ints VALUES (32767, 2147483647, 9223372036854775807);
+}
+
+@setup ints
+test smallint-plus-smallint-out-of-range-errors {
+    SELECT s + s FROM ints;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+@setup ints
+test integer-plus-integer-out-of-range-errors {
+    SELECT i + i FROM ints;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup ints
+test bigint-plus-bigint-out-of-range-errors {
+    SELECT b + b FROM ints;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+@setup ints
+test integer-plus-an-integer-literal-out-of-range-errors {
+    SELECT i + 1 FROM ints;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup ints
+test integer-times-integer-out-of-range-errors {
+    SELECT i * 2 FROM ints;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+@setup ints
+test bigint-minus-out-of-range-errors {
+    SELECT -b - 2 FROM ints;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+@setup ints
+test arithmetic-on-two-integer-types-gives-the-wider-type {
+    SELECT s - i + i, s * 2, i - b + b, i::bigint + 1, s::integer + s FROM ints;
+}
+expect {
+    32767|65534|2147483647|2147483648|65534
+}
+
+@setup ints
+test integer-plus-a-literal-wider-than-integer-is-a-bigint {
+    SELECT i + 3000000000, s + 3000000000 FROM ints;
+}
+expect {
+    5147483647|3000032767
+}
+
+test integer-division-cuts-off-the-fraction {
+    SELECT 7::integer / 2, (-7)::integer / 2, 7::smallint / 2::bigint, 7::integer % 2, (-7)::integer % 2;
+}
+expect {
+    3|-3|3|1|-1
+}
+
+test integer-division-by-zero-errors {
+    SELECT 1::integer / 0;
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+
+test integer-remainder-by-zero-errors {
+    SELECT 1::bigint % 0::bigint;
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+
+test smallest-integer-divided-by-minus-one-errors {
+    SELECT (-2147483648)::integer / (-1);
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test smallest-integer-remainder-by-minus-one-is-zero {
+    SELECT (-2147483648)::integer % (-1), (-32768)::smallint % (-1)::smallint;
+}
+expect {
+    0|0
+}
+
+test negating-the-smallest-integer-errors {
+    CREATE TABLE t (i integer);
+    INSERT INTO t VALUES (-2147483648);
+    SELECT -i FROM t;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test bit-operators-on-integers {
+    SELECT 12::integer & 10, 12::integer | 10, ~5::integer, ~5::smallint, 12::bigint & 10::bigint;
+}
+expect {
+    8|14|-6|-6|8
+}
+
+test integer-shifts-read-the-low-bits-of-the-count {
+    SELECT 1::integer << 33, 1::integer << 31, 1::smallint << 15, 1::bigint << 65, (-8)::integer >> 1;
+}
+expect {
+    2|-2147483648|-32768|2|-4
+}
+
+@setup ints
+test string-literal-in-integer-arithmetic-is-read-as-the-integer-type {
+    SELECT s - '1', i - '0x10', b - '1_000' FROM ints;
+}
+expect {
+    32766|2147483631|9223372036854774807
+}
+
+@setup ints
+test string-literal-in-integer-arithmetic-out-of-range-errors {
+    SELECT i + '1' FROM ints;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test integer-arithmetic-in-where-group-by-order-by-and-aggregates {
+    CREATE TABLE t (id integer PRIMARY KEY, n smallint);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+    SELECT id % 2, sum(n + 1), max(id * n) FROM t WHERE id + 1 > 2 GROUP BY id % 2 ORDER BY id % 2;
+}
+expect {
+    0|62|160
+    1|31|90
+}
+
+test integer-arithmetic-in-an-index-and-a-check {
+    CREATE TABLE t (i integer CHECK (i + 1 > 0));
+    CREATE INDEX t_double ON t ((i * 2));
+    INSERT INTO t VALUES (3), (4);
+    SELECT i FROM t WHERE i * 2 = 8;
+}
+expect {
+    4
+}
+
+test integer-arithmetic-of-null-is-null {
+    CREATE TABLE t (i integer, b bigint);
+    INSERT INTO t VALUES (NULL, 1);
+    SELECT i + 1 IS NULL, i * b IS NULL, -i IS NULL FROM t;
+}
+expect {
+    t|t|t
+}
+
+test int8-overflow-arithmetic {
+    SELECT 9223372036854775807::bigint + 1;
+}
+@sqlstate 22003
+expect error {}
+
+test int4-overflow-arithmetic {
+    SELECT 2147483647::int4 + 1;
+}
+@sqlstate 22003
+expect error {}
+
+test pg-input-is-valid-reads-integers-as-the-types-do {
+    SELECT pg_input_is_valid('0x10', 'integer'), pg_input_is_valid(' 7 ', 'bigint'),
+        pg_input_is_valid('1.5', 'integer'), pg_input_is_valid('40000', 'smallint');
+}
+expect {
+    t|t|f|f
+}

@@ -673,6 +673,12 @@ pub fn translate_alter_table(
     };
     if let Some(tbl) = table.virtual_table() {
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
+            // Only a table that CREATE VIRTUAL TABLE made has a module that
+            // VRename can ask. SQLite gives this error for the virtual
+            // tables that every database has.
+            if !tbl.is_droppable {
+                crate::bail_parse_error!("table {} may not be altered", table_name);
+            }
             return translate_rename_virtual_table(
                 program, tbl, table_name, new_name, resolver, connection, namespace, input,
             );
@@ -1069,6 +1075,13 @@ pub fn translate_alter_table(
                         ast::ColumnConstraint::Generated { expr, .. } => {
                             crate::schema::validate_generated_expr(expr)?;
                             validate_generated_function_calls(expr, &resolver.catalog)?;
+                            // FIXME(pg-catalog): HACK. See refuse_timestamp_timestamptz_comparison_in_schema_expr.
+                            crate::translate::collate::refuse_timestamp_timestamptz_comparison_in_schema_expr(
+                                expr,
+                                &btree,
+                                resolver,
+                                crate::translate::collate::GENERATION_EXPRESSION_NOT_IMMUTABLE,
+                            )?;
                         }
                         ast::ColumnConstraint::Default(_) => {
                             return Err(LimboError::ParseError(format!(
@@ -1111,6 +1124,7 @@ pub fn translate_alter_table(
             }
 
             check_column_type(&col_def, table_name, btree.is_strict, resolver.schema())?;
+            crate::translate::schema::check_default_type(&column, resolver)?;
             let default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema())?;
@@ -1215,7 +1229,8 @@ pub fn translate_alter_table(
                 let has_non_constant_default = column.default.as_ref().is_some_and(|default| {
                     default_requires_empty_table(default) || !is_strict_constant_default(default)
                 });
-                computes_default_for_existing_rows = has_non_constant_default
+                computes_default_for_existing_rows = (has_non_constant_default
+                    || dialect_converts_default(&column, resolver)?)
                     && connection
                         .dialect()
                         .add_column_computes_default_for_existing_rows();
@@ -1242,7 +1257,7 @@ pub fn translate_alter_table(
                     )?;
                 }
 
-                if default_type_mismatch {
+                if default_type_mismatch && !computes_default_for_existing_rows {
                     emit_halt_if_table_has_rows(
                         program,
                         &original_btree,
@@ -2025,6 +2040,24 @@ pub fn translate_alter_table(
     Ok(())
 }
 
+/// Whether the dialect's cast on assignment changes the DEFAULT of `column`
+/// when a row stores it.
+fn dialect_converts_default(column: &Column, resolver: &Resolver) -> Result<bool> {
+    let Some(default) = column.default.as_deref() else {
+        return Ok(false);
+    };
+    let source = || {
+        crate::translate::expr::expr_type::cast_source_of(
+            default,
+            &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+            resolver.schema(),
+        )
+    };
+    let converted =
+        crate::translate::emitter::new_values::assignment_cast(default, &source, column, resolver)?;
+    Ok(converted.is_some_and(|converted| converted != *default))
+}
+
 /// Translates `ALTER TABLE name OWNER TO role`, and the same for the other
 /// relation kinds: the dialect records the new owner in its own schema
 /// state, and moves what the relation owns with it, such as the sequences
@@ -2515,25 +2548,39 @@ fn emit_rewrite_table_rows(
             // Computed again for each row, so that e.g. gen_random_uuid() gives
             // each row its own value. Not hoisted because the encode below
             // rewrites the register in place.
-            if source_column_by_schema_idx[column_index].is_none() {
-                let default = rewritten_table.columns()[column_index]
-                    .default
-                    .as_deref()
-                    .expect("a rewritten column without a source value must have a default");
-                translate_expr_no_constant_opt(
-                    program,
-                    None,
-                    default,
-                    layout.to_register(base_dest_reg, column_index),
-                    resolver,
-                    NoConstantOptReason::CustomTypeEncode,
-                )?;
-            }
+            let value_source = match source_column_by_schema_idx[column_index] {
+                Some(source_column_idx) => {
+                    crate::translate::expr::expr_type::cast_source_of_column_type(
+                        &original_btree.columns()[source_column_idx],
+                        resolver.schema(),
+                    )
+                }
+                None => {
+                    let default = rewritten_table.columns()[column_index]
+                        .default
+                        .as_deref()
+                        .expect("a rewritten column without a source value must have a default");
+                    translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        default,
+                        layout.to_register(base_dest_reg, column_index),
+                        resolver,
+                        NoConstantOptReason::CustomTypeEncode,
+                    )?;
+                    crate::translate::expr::expr_type::cast_source_of(
+                        default,
+                        &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+                        resolver.schema(),
+                    )
+                }
+            };
             if rewritten_table.is_strict {
                 emit_strict_column_conversion(
                     program,
                     resolver,
                     column_index,
+                    value_source,
                     &original_btree,
                     rewritten_table,
                     base_dest_reg,
@@ -2573,11 +2620,14 @@ fn emit_rewrite_table_rows(
 /// Convert the stored value of the altered column the same way INSERT
 /// converts a new value: decode it with the old custom type (if any), check it
 /// against the new type, encode it with the new custom type (if any), and check
-/// the encoded value against the storage type.
+/// the encoded value against the storage type. `value_source` is the source of
+/// the value before the conversion.
+#[allow(clippy::too_many_arguments)]
 fn emit_strict_column_conversion(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     column_index: usize,
+    value_source: crate::dialect::CastSource,
     original_table: &BTreeTable,
     rewritten_table: &BTreeTable,
     start_reg: usize,
@@ -2606,16 +2656,17 @@ fn emit_strict_column_conversion(
             reg: layout.to_register(start_reg, column_index),
         });
     }
-    program.emit_insn(Insn::TypeCheck {
+    let mut sources = vec![crate::dialect::CastSource::Unnamed; rewritten_table.columns().len()];
+    sources[column_index] = value_source;
+    crate::translate::emitter::new_values::emit_input_conversion(
+        program,
+        resolver,
+        &rewritten_table,
         start_reg,
-        count: layout.num_non_virtual_cols(),
-        check_generated: false,
-        table_reference: BTreeTable::input_type_check_table_ref(
-            &rewritten_table,
-            resolver.schema(),
-            Some(&column_mask),
-        )?,
-    });
+        layout,
+        crate::translate::emitter::new_values::StatementValues::Only(&column_mask),
+        &sources,
+    )?;
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
         resolver,

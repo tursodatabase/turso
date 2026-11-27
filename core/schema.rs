@@ -471,6 +471,10 @@ pub struct TypeDef {
     /// `Schema::refuses_non_text_input`). False for a domain, user type and
     /// STRUCT or UNION; a domain takes the answer of the types under it.
     pub casts_to_numbers_and_booleans: bool,
+    /// Whether a PRIMARY KEY of one column of the type is the rowid of its
+    /// table (see `Type::can_be_rowid_alias`). False for a domain, a user
+    /// type and a STRUCT or UNION.
+    pub can_be_rowid_alias: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -736,6 +740,14 @@ impl TypeDef {
             }
             (None, _) => stored,
         };
+        if ty.can_be_rowid_alias()
+            && !(stored == BuiltinType::Integer && ty.encode().is_none() && ty.decode().is_none())
+        {
+            return Err(crate::LimboError::InternalError(format!(
+                "built-in type {} can be a rowid alias, so it must have BASE integer and no ENCODE or DECODE",
+                ty.name()
+            )));
+        }
         Ok(Self::from_type(
             ty,
             true,
@@ -797,6 +809,7 @@ impl TypeDef {
                     stored_form_sorts_in_value_order: false,
                     is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
+                    can_be_rowid_alias: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -834,6 +847,7 @@ impl TypeDef {
                     stored_form_sorts_in_value_order: false,
                     is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
+                    can_be_rowid_alias: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -865,6 +879,7 @@ impl TypeDef {
             stored_form_sorts_in_value_order: ty.stored_form_sorts_in_value_order(),
             is_type_of_conditions: ty.is_type_of_conditions(),
             casts_to_numbers_and_booleans: ty.casts_to_numbers_and_booleans(),
+            can_be_rowid_alias: ty.can_be_rowid_alias(),
             sql,
             domain_checks: std::vec::Vec::new(),
             kind: TypeDefKind::Custom {
@@ -903,6 +918,7 @@ impl TypeDef {
             stored_form_sorts_in_value_order: false,
             is_type_of_conditions: false,
             casts_to_numbers_and_booleans: false,
+            can_be_rowid_alias: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -6048,6 +6064,46 @@ impl BTreeTable {
         for col in &mut self.columns {
             col.resolve_custom_type(schema)?;
         }
+        self.make_primary_key_the_rowid_alias_if_its_type_allows(schema)
+    }
+
+    fn make_primary_key_the_rowid_alias_if_its_type_allows(
+        &mut self,
+        schema: &Schema,
+    ) -> Result<()> {
+        let [(key_name, key_order)] = self.primary_key_columns.as_slice() else {
+            return Ok(());
+        };
+        if !self.has_rowid || (self.primary_key_is_inline && *key_order == SortOrder::Desc) {
+            return Ok(());
+        }
+        let key_name = key_name.clone();
+        let Some(column) = self.columns.iter_mut().find(|col| {
+            col.name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&key_name))
+        }) else {
+            return Ok(());
+        };
+        if column.is_rowid_alias() || column.is_array() {
+            return Ok(());
+        }
+        let can_be_rowid_alias = schema
+            .get_type_def_unchecked(&column.ty_str)
+            .is_some_and(|type_def| type_def.can_be_rowid_alias);
+        if !can_be_rowid_alias {
+            return Ok(());
+        }
+        column.set_rowid_alias(true);
+        let key_set = self.unique_sets.iter().position(|set| {
+            set.is_primary_key
+                && set.columns.len() == 1
+                && set.columns[0].name.eq_ignore_ascii_case(&key_name)
+        });
+        if let Some(key_set) = key_set {
+            self.rowid_alias_conflict_clause = self.unique_sets[key_set].conflict_clause;
+            self.unique_sets.remove(key_set);
+        }
         Ok(())
     }
 
@@ -6506,6 +6562,16 @@ impl BTreeTable {
     #[inline]
     pub fn logical_to_physical_column(&self, logical: usize) -> usize {
         self.logical_to_physical_map[logical]
+    }
+
+    /// Returns the column stored at record offset `physical`, the reverse of
+    /// [Self::logical_to_physical_column].
+    pub fn column_at_physical_offset(&self, physical: usize) -> Option<&Column> {
+        let logical = self
+            .logical_to_physical_map
+            .iter()
+            .position(|&offset| offset == physical)?;
+        self.columns.get(logical)
     }
 
     pub fn build_logical_to_physical_map(

@@ -551,6 +551,18 @@ impl Plan {
         }
     }
 
+    /// Returns a mutable reference to the LIMIT of a SELECT plan. For a compound
+    /// SELECT it is the LIMIT of the whole compound.
+    /// Returns None for Delete/Update plans.
+    pub fn select_limit_mut(&mut self) -> Option<&mut Option<Box<Expr>>> {
+        match self {
+            Plan::Select(select_plan) => Some(&mut select_plan.limit),
+            Plan::CompoundSelect { limit, .. } => Some(limit),
+            Plan::RecursiveCte(plan) => Some(&mut plan.limit),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
     /// Returns the result columns of a SELECT or compound SELECT plan. For a
     /// compound SELECT the columns of the right-most component are returned,
     /// since every component must agree on column count and naming.
@@ -4959,10 +4971,6 @@ fn plan_has_outer_scope_dependency_with_tables(
 /// query row. Those plans are still safe to materialize once and reuse.
 pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
     plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
-}
-
-pub fn select_plan_has_outer_scope_dependency(plan: &SelectPlan) -> bool {
-    select_plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
 }
 
 /// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.

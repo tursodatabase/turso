@@ -1,4 +1,4 @@
-use crate::alloc::TursoFromIterator;
+use crate::alloc::{TursoFromIterator, TursoIteratorExt};
 use crate::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo, With,
@@ -7,6 +7,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::security::permission::Object;
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::new_values::{emit_input_conversion, StatementValues};
 use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
@@ -17,8 +18,8 @@ use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::{
-        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        SQLITE_SEQUENCE_TABLE_NAME,
+        self, BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
+        ResolvedFkRef, Table, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -184,6 +185,8 @@ pub struct InsertEmitCtx<'a> {
     /// when a DO UPDATE must fail on such a row (see
     /// [crate::Dialect::upsert_rejects_row_written_by_same_statement]).
     pub written_rowids_cursor_id: Option<usize>,
+    /// The source type of each value of a row, in the order of the values.
+    pub value_sources: Vec<crate::dialect::CastSource>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -240,6 +243,7 @@ impl<'a> InsertEmitCtx<'a> {
             namespace,
             returning_buffer: None,
             written_rowids_cursor_id: None,
+            value_sources: Vec::new(),
         })
     }
 }
@@ -326,11 +330,15 @@ pub fn translate_insert(
         program.begin_write_on_database(database_id, schema_cookie)?;
         translate_virtual_table_insert(
             program,
+            resolver,
             virtual_table.clone(),
+            table_name.as_str(),
+            namespace,
             columns,
             body,
+            returning,
+            with_for_returning,
             on_conflict,
-            resolver,
             connection,
         )?;
         return Ok(());
@@ -372,54 +380,6 @@ pub fn translate_insert(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            table: Table::BTree(
-                table
-                    .btree()
-                    .expect("we shouldn't have got here without a BTree table"),
-            ),
-            identifier: normalize_ident(table_name.as_str()),
-            has_alias: false,
-            internal_id: program.table_reference_counter.next(),
-            op: Operation::default_scan_for(&table),
-            unmatched_right_rows_plan: None,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            namespace,
-            indexed: None,
-            plan_estimate: None,
-            row_filter: None,
-        }],
-        vec![],
-    );
-
-    // Plan CTEs and add them as outer query references for the subqueries of
-    // RETURNING and of DO UPDATE
-    let mut subquery_table_refs = Vec::new();
-    for column in &returning {
-        if let ResultColumn::Expr(expr, _) = column {
-            collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
-        }
-    }
-    for (_, _, upsert) in &upsert_actions {
-        if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
-            for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
-                collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
-            }
-        }
-    }
-    plan_ctes_as_outer_refs(
-        with_for_returning,
-        &subquery_table_refs,
-        resolver,
-        program,
-        &mut table_references,
-        connection,
-    )?;
-
     let updates_on_conflict = upsert_actions
         .iter()
         .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
@@ -434,21 +394,18 @@ pub fn translate_insert(
         None
     };
 
-    // Plan subqueries in RETURNING expressions before processing
-    // (so SubqueryResult nodes are cloned into result_columns)
-    let mut returning_subqueries = vec![];
-    plan_subqueries_from_returning(
-        program,
-        &mut returning_subqueries,
-        &mut table_references,
-        &mut returning,
-        resolver,
-        connection,
-    )?;
-
-    // Process RETURNING clause using shared module
-    let mut result_columns =
-        process_returning_clause(&mut returning, &mut table_references, resolver)?;
+    let (mut table_references, mut result_columns, mut returning_subqueries) =
+        plan_insert_returning(
+            program,
+            resolver,
+            &table,
+            table_name.as_str(),
+            namespace,
+            &mut returning,
+            &upsert_actions,
+            with_for_returning,
+            connection,
+        )?;
     let reads_columns = updates_on_conflict
         || upsert_actions
             .iter()
@@ -529,15 +486,12 @@ pub fn translate_insert(
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
     if !result_columns.is_empty() {
-        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: ret_cursor_id,
-            is_table: true,
-        });
-        ctx.returning_buffer = Some(ReturningBufferCtx {
-            cursor_id: ret_cursor_id,
-            num_columns: result_columns.len(),
-        });
+        ctx.returning_buffer = Some(ReturningBufferCtx::open(
+            program,
+            &btree_table.name,
+            &result_columns,
+            &table_references,
+        )?);
     }
 
     if resolver
@@ -767,18 +721,25 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = insertion.has_generated_columns();
+    let types_checked_first = insertion.has_generated_columns()
+        || resolver.catalog.dialect.converts_values_before_not_null();
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
             !column.is_generated() && !has_custom_type(column)
         })?;
     }
-    emit_column_type_conversion(
+    let value_sources = match ctx.table.is_strict {
+        true => insert_value_sources(&insertion, &ctx.value_sources, resolver),
+        false => Vec::new(),
+    };
+    emit_input_conversion(
         program,
         resolver,
         ctx.table,
         insertion.first_col_register(),
-        insertion.num_non_virtual_cols,
+        &ctx.table.column_layout()?,
+        StatementValues::of_insert(program),
+        &value_sources,
     )?;
     if let Some(type_check_table) = &maybe_type_check_table {
         if !program.flags.writes_stored_values() {
@@ -1037,31 +998,17 @@ pub fn translate_insert(
 
     // RETURNING reads the row before the AFTER triggers run, as in SQLite, so
     // a subquery in it does not see what a trigger writes.
-    if !returning_subqueries.is_empty() {
-        emit_returning_subqueries(
-            program,
-            resolver,
-            &table_references,
-            &mut returning_subqueries,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            &btree_table.column_layout()?,
-        )?;
-    }
-
-    // Emit RETURNING results if specified
-    if !result_columns.is_empty() {
-        emit_returning_results(
-            program,
-            &table_references,
-            &result_columns,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            resolver,
-            ctx.returning_buffer.as_ref(),
-            &btree_table.column_layout()?,
-        )?;
-    }
+    emit_insert_returning_row(
+        program,
+        resolver,
+        &table_references,
+        &result_columns,
+        &mut returning_subqueries,
+        insertion.first_col_register(),
+        insertion.key_register(),
+        ctx.returning_buffer.as_ref(),
+        &btree_table.column_layout()?,
+    )?;
 
     // Fire AFTER INSERT triggers
     let relevant_after_triggers = get_triggers_including_temp(
@@ -1241,12 +1188,14 @@ fn emit_new_row_for_before_triggers(
         dst_reg: new_first_col_reg,
         extra_amount: insertion.num_non_virtual_cols - 1,
     });
-    emit_column_type_conversion(
+    emit_input_conversion(
         program,
         resolver,
         table,
         new_first_col_reg,
-        insertion.num_non_virtual_cols,
+        &table.column_layout()?,
+        StatementValues::of_insert(program),
+        &[],
     )?;
 
     let new_registers: Vec<usize> = insertion
@@ -1282,52 +1231,6 @@ fn emit_new_row_for_before_triggers(
         .into_iter()
         .chain(std::iter::once(new_key_reg))
         .collect())
-}
-
-/// Converts the stored columns of a row, in the registers that start at `first_col_reg`, to the
-/// types of their columns: affinity, or the type check of a STRICT table.
-pub(crate) fn emit_column_type_conversion(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table: &Arc<BTreeTable>,
-    first_col_reg: usize,
-    num_non_virtual_cols: usize,
-) -> Result<()> {
-    if table.is_strict {
-        // Stored values are already in the stored form.
-        if !program.flags.writes_stored_values() {
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: first_col_reg,
-                count: num_non_virtual_cols,
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    table,
-                    resolver.schema(),
-                    None,
-                )?,
-            });
-        }
-        return Ok(());
-    }
-    let affinities = table
-        .columns()
-        .iter()
-        .filter(|column| !column.is_virtual_generated())
-        .map(|column| column.affinity());
-    if affinities
-        .clone()
-        .all(|affinity| affinity == Affinity::Blob)
-    {
-        return Ok(());
-    }
-    if let Ok(count) = NonZeroUsize::try_from(num_non_virtual_cols) {
-        program.emit_insn(Insn::Affinity {
-            start_reg: first_col_reg,
-            count,
-            affinities: affinities.map(|affinity| affinity.aff_mask()).collect(),
-        });
-    }
-    Ok(())
 }
 
 /// Emits the RETURNING subqueries of an INSERT against the row whose column
@@ -2339,7 +2242,11 @@ fn insert_target_column<'a>(
     position: usize,
 ) -> Option<&'a Column> {
     if columns.is_empty() {
-        return table.columns().iter().filter(|c| !c.hidden()).nth(position);
+        return table
+            .columns()
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .nth(position);
     }
     columns.get(position).and_then(|name| {
         let name = crate::util::normalize_ident(name.as_str());
@@ -2535,25 +2442,10 @@ fn init_source_emission<'a>(
     resolver: &Resolver,
     values: &mut Vec<Box<Expr>>,
     body: InsertBody,
-    columns: &'a [ast::Name],
+    columns: &[ast::Name],
     table_references: &TableReferences,
     namespace: NamespaceRef,
 ) -> Result<()> {
-    let required_column_count = if columns.is_empty() {
-        table.columns().iter().filter(|c| !c.is_generated()).count()
-    } else {
-        columns.len()
-    };
-    if !values.is_empty() {
-        // If we had a single tuple in VALUES, it was inserted into the values vector parameter.
-        if values.len() != required_column_count {
-            crate::bail_parse_error!(
-                "table {} has {required_column_count} columns but {} values were supplied",
-                table.get_name(),
-                values.len()
-            );
-        }
-    }
     // Check if INSERT triggers exist - if so, we need to use ephemeral table for VALUES with more than one row
     let has_insert_triggers = has_triggers_including_temp(
         resolver,
@@ -2582,39 +2474,32 @@ fn init_source_emission<'a>(
                 )
             } else {
                 // Multiple rows - use coroutine for value population
-                let yield_reg = program.alloc_register();
-                let jump_on_definition_label = program.allocate_label();
-                let start_offset_label = program.allocate_label();
-                program.emit_insn(Insn::InitCoroutine {
-                    yield_reg,
-                    jump_on_definition: jump_on_definition_label,
-                    start_offset: start_offset_label,
-                });
-                program.preassign_label_to_next_insn(start_offset_label);
-
-                let query_destination = QueryDestination::CoroutineYield {
-                    yield_reg,
-                    coroutine_implementation_start: ctx.halt_label,
-                };
-                let num_result_cols = program.nested(|program| {
-                    translate_insert_source_select(
-                        select,
-                        resolver,
-                        program,
-                        query_destination,
-                        connection,
-                    )
-                })?;
-                if num_result_cols != required_column_count {
-                    crate::bail_parse_error!(
-                        "table {} has {required_column_count} columns but {} values were supplied",
-                        table.get_name(),
-                        num_result_cols,
-                    );
-                }
-
-                program.emit_insn(Insn::EndCoroutine { yield_reg });
-                program.preassign_label_to_next_insn(jump_on_definition_label);
+                let value_columns: Vec<Option<&Column>> =
+                    match ctx.table.is_strict && !program.flags.writes_stored_values() {
+                        true => {
+                            let value_count = match columns.is_empty() {
+                                true => table
+                                    .columns()
+                                    .iter()
+                                    .filter(|c| !c.hidden() && !c.is_generated())
+                                    .count(),
+                                false => columns.len(),
+                            };
+                            (0..value_count)
+                                .map(|position| insert_target_column(table, columns, position))
+                                .collect()
+                        }
+                        false => Vec::new(),
+                    };
+                let (yield_reg, num_result_cols, value_sources) = emit_insert_select_coroutine(
+                    program,
+                    select,
+                    ctx.halt_label,
+                    resolver,
+                    connection,
+                    &value_columns,
+                )?;
+                ctx.value_sources = value_sources;
                 let cursor_id = program.alloc_cursor_id_keyed(
                     CursorKey::table(table_references.joined_tables()[0].internal_id),
                     CursorType::BTreeTable(ctx.table.clone()),
@@ -2631,59 +2516,13 @@ fn init_source_emission<'a>(
                  ** temp table in the case of row triggers.
                  */
                 if program.is_table_open(table) || has_insert_triggers {
-                    let temp_cursor_id =
-                        program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone()));
-                    ctx.temp_table_ctx = Some(TempTableCtx {
-                        cursor_id: temp_cursor_id,
-                        loop_start_label: program.allocate_label(),
-                        loop_end_label: program.allocate_label(),
-                    });
-
-                    program.emit_insn(Insn::OpenEphemeral {
-                        cursor_id: temp_cursor_id,
-                        is_table: true,
-                    });
-
-                    // Main loop
-                    program.preassign_label_to_next_insn(ctx.loop_labels.loop_start);
-                    let yield_label = program.allocate_label();
-                    program.emit_insn(Insn::Yield {
+                    let temp_table = insert_select_temp_table(table, columns, num_result_cols)?;
+                    ctx.temp_table_ctx = Some(emit_insert_select_into_temp_table(
+                        program,
+                        temp_table,
                         yield_reg,
-                        end_offset: yield_label, // stays local, we’ll route at loop end
-                        subtype_clear_start_reg: 0,
-                        subtype_clear_count: 0,
-                    });
-
-                    let record_reg = program.alloc_register();
-                    program.emit_insn(Insn::MakeRecord {
-                        start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
-                        count: to_u32(num_result_cols),
-                        dest_reg: to_u32(record_reg),
-                        index_name: None,
-                        affinity_str: None,
-                    });
-
-                    let rowid_reg = program.alloc_register();
-                    program.emit_insn(Insn::NewRowid {
-                        cursor: temp_cursor_id,
-                        rowid_reg,
-                        prev_largest_reg: 0,
-                    });
-                    program.emit_insn(Insn::Insert {
-                        cursor: temp_cursor_id,
-                        key_reg: rowid_reg,
-                        record_reg,
-                        // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
-                        flag: InsertFlags::new()
-                            .require_seek()
-                            .is_ephemeral_table_insert(),
-                        table_name: "".to_string(),
-                    });
-                    // loop back
-                    program.emit_insn(Insn::Goto {
-                        target_pc: ctx.loop_labels.loop_start,
-                    });
-                    program.preassign_label_to_next_insn(yield_label);
+                        num_result_cols,
+                    ));
 
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id,
@@ -2744,6 +2583,15 @@ fn init_source_emission<'a>(
     };
     ctx.num_values = num_values;
     ctx.cursor_id = cursor_id;
+    if ctx.yield_reg_opt.is_none() {
+        let env = crate::translate::expr::expr_type::TypeEnv::new(None, resolver);
+        ctx.value_sources = values
+            .iter()
+            .map(|value| {
+                crate::translate::expr::expr_type::cast_source_of(value, &env, resolver.schema())
+            })
+            .collect();
+    }
     Ok(())
 }
 
@@ -2929,6 +2777,14 @@ fn build_insertion<'a>(
         })
         .collect::<Vec<_>>();
 
+    if !columns.is_empty() && num_values != columns.len() {
+        crate::bail_parse_error!(
+            "table {} has {} columns but {} values were supplied",
+            &table.get_name(),
+            columns.len(),
+            num_values
+        );
+    }
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
         let num_storable_columns = table_columns
@@ -3659,18 +3515,23 @@ fn emit_preflight_constraint_checks(
     Ok(())
 }
 
-// TODO: comeback here later to apply the same improvements on select
+/// Translates an INSERT into a virtual table. Each row is passed to the module's
+/// xUpdate through `VUpdate`. As in SQLite, RETURNING is computed before the
+/// row is written, the way a BEFORE trigger sees it.
+#[allow(clippy::too_many_arguments)]
 fn translate_virtual_table_insert(
     program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
     virtual_table: Arc<VirtualTable>,
+    table_name: &str,
+    namespace: NamespaceRef,
     columns: Vec<ast::Name>,
     mut body: InsertBody,
+    mut returning: Vec<ResultColumn>,
+    with_for_returning: Option<With>,
     on_conflict: Option<ResolveType>,
-    resolver: &Resolver,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    #[cfg(not(feature = "cli_only"))]
-    let _ = connection;
     let allow_dbpage_write = {
         #[cfg(feature = "cli_only")]
         {
@@ -3685,20 +3546,106 @@ fn translate_virtual_table_insert(
     if virtual_table.readonly() && !allow_dbpage_write {
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }
-    let (num_values, value) = match &mut body {
-        InsertBody::Select(select, None) => match &mut select.body.select {
-            OneSelect::Values(values) => (values[0].len(), values.pop().unwrap()),
-            _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
-        },
-        InsertBody::DefaultValues => (0, vec![]),
-        _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
-    };
+    if matches!(body, InsertBody::Select(_, Some(_))) {
+        crate::bail_parse_error!(
+            "UPSERT not implemented for virtual table \"{}\"",
+            virtual_table.name
+        );
+    }
     let table = Table::Virtual(virtual_table.clone());
-    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
+    // The UPSERT actions are not used: a virtual table resolves conflicts itself,
+    // from the conflict mode that VUpdate passes to it.
+    let BoundInsertResult {
+        values,
+        inserting_multiple_rows,
+        ..
+    } = bind_insert(
+        program,
+        resolver,
+        &table,
+        &columns,
+        &mut body,
+        on_conflict.unwrap_or(ResolveType::Abort),
+        namespace,
+    )?;
+    let (table_references, result_columns, mut returning_subqueries) = plan_insert_returning(
+        program,
+        resolver,
+        &table,
+        table_name,
+        namespace,
+        &mut returning,
+        &[],
+        with_for_returning,
+        connection,
+    )?;
+    let reads_columns = roles::reads_columns_of(
+        table_references.joined_tables()[0].internal_id,
+        result_columns.iter().map(|column| &column.expr),
+        &returning_subqueries,
+    )?;
+    check_upsert_privileges(&table_references, &[], reads_columns, resolver, connection)?;
+
+    let returning_buffer = if result_columns.is_empty() {
+        None
+    } else {
+        Some(ReturningBufferCtx::open(
+            program,
+            &virtual_table.name,
+            &result_columns,
+            &table_references,
+        )?)
+    };
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        resolver,
+        &mut returning_subqueries,
+        &[],
+        Some(&table_references),
+        EvalAt::BeforeLoop,
+        |_| true,
+    )?;
+
+    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table.clone()));
     program.emit_insn(Insn::VOpen { cursor_id });
     if !allow_dbpage_write {
         program.emit_insn(Insn::VBegin { cursor_id });
     }
+
+    let halt_label = program.allocate_label();
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    let (num_values, row_source) = if inserting_multiple_rows {
+        let InsertBody::Select(select, _) = body else {
+            unreachable!("only a SELECT or VALUES body inserts multiple rows");
+        };
+        let (yield_reg, num_values, _) =
+            emit_insert_select_coroutine(program, select, halt_label, resolver, connection, &[])?;
+        // As in SQLite, the rows are copied into a temporary table first when
+        // the SELECT reads the virtual table that the INSERT writes to.
+        let temp_table_ctx = if program.is_table_open(&table) {
+            Some(emit_insert_select_into_temp_table(
+                program,
+                insert_select_temp_table(&table, &columns, num_values)?,
+                yield_reg,
+                num_values,
+            ))
+        } else {
+            program.preassign_label_to_next_insn(loop_start);
+            program.emit_insn(Insn::Yield {
+                yield_reg,
+                end_offset: loop_end,
+                subtype_clear_start_reg: 0,
+                subtype_clear_count: 0,
+            });
+            None
+        };
+        let select_result_start_reg = program.reg_result_cols_start.unwrap_or(yield_reg + 1);
+        (num_values, Some((select_result_start_reg, temp_table_ctx)))
+    } else {
+        (values.len(), None)
+    };
+
     /* *
      * Inserts for virtual tables are done in a single step.
      * argv[0] = (NULL for insert)
@@ -3713,10 +3660,91 @@ fn translate_virtual_table_insert(
      * argv[2..] = column values
      * */
     let insertion = build_insertion(program, &table, &columns, num_values, true)?;
+    match &row_source {
+        Some((select_result_start_reg, temp_table_ctx)) => translate_rows_multiple(
+            program,
+            &insertion,
+            *select_result_start_reg,
+            resolver,
+            temp_table_ctx,
+            false,
+        )?,
+        None => translate_rows_single(program, &values, &insertion, resolver, false)?,
+    }
 
-    translate_rows_single(program, &value, &insertion, resolver, false)?;
+    // Like SQLite, RETURNING reads a copy of the row with column affinity
+    // applied and with -1 as the rowid when none was given, and leaves the
+    // registers passed to VUpdate as they are.
+    if !result_columns.is_empty() {
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: insertion.key_register(),
+            dst_reg: rowid_reg,
+            extra_amount: 0,
+        });
+        let rowid_ready = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: rowid_reg,
+            target_pc: rowid_ready,
+        });
+        program.emit_insn(Insn::Integer {
+            value: -1,
+            dest: rowid_reg,
+        });
+        program.preassign_label_to_next_insn(rowid_ready);
+        program.emit_insn(Insn::MustBeInt {
+            reg: rowid_reg,
+            target_pc: None,
+        });
+
+        let num_columns = insertion.col_mappings.len();
+        let columns_start_reg = program.alloc_registers(num_columns);
+        if let Some(count) = NonZeroUsize::new(num_columns) {
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.first_col_register(),
+                dst_reg: columns_start_reg,
+                extra_amount: count.get() - 1,
+            });
+            program.emit_insn(Insn::Affinity {
+                start_reg: columns_start_reg,
+                count,
+                affinities: insertion
+                    .col_mappings
+                    .iter()
+                    .map(|col_mapping| col_mapping.column.affinity().aff_mask())
+                    .collect(),
+            });
+        }
+
+        emit_insert_returning_row(
+            program,
+            resolver,
+            &table_references,
+            &result_columns,
+            &mut returning_subqueries,
+            columns_start_reg,
+            rowid_reg,
+            returning_buffer.as_ref(),
+            &ColumnLayout::Identity {
+                column_count: num_columns,
+            },
+        )?;
+    }
+
+    // As in SQLite, a rowid given by the INSERT must be an integer; NULL lets
+    // the module choose one.
+    let rowid_is_null = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: insertion.key_register(),
+        target_pc: rowid_is_null,
+    });
+    program.emit_insn(Insn::MustBeInt {
+        reg: insertion.key_register(),
+        target_pc: None,
+    });
+    program.preassign_label_to_next_insn(rowid_is_null);
+
     let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
-
     program.emit_insn(Insn::VUpdate {
         cursor_id,
         arg_count: insertion.col_mappings.len() + 2, // +1 for NULL, +1 for rowid
@@ -3724,12 +3752,286 @@ fn translate_virtual_table_insert(
         conflict_action,
     });
 
-    program.emit_insn(Insn::Close { cursor_id });
+    match &row_source {
+        Some((_, Some(temp_table_ctx))) => {
+            program.emit_insn(Insn::Next {
+                cursor_id: temp_table_ctx.cursor_id,
+                pc_if_next: temp_table_ctx.loop_start_label,
+                fullscan: false,
+                is_index: false,
+            });
+            program.preassign_label_to_next_insn(temp_table_ctx.loop_end_label);
+        }
+        Some((_, None)) => {
+            program.emit_insn(Insn::Goto {
+                target_pc: loop_start,
+            });
+            program.preassign_label_to_next_insn(loop_end);
+        }
+        None => {}
+    }
 
-    let halt_label = program.allocate_label();
+    program.emit_insn(Insn::Close { cursor_id });
+    if let Some(buf) = &returning_buffer {
+        emit_returning_scan_back(program, buf);
+    }
     program.preassign_label_to_next_insn(halt_label);
 
+    program.result_columns = result_columns;
+    program.table_references.extend(table_references);
     Ok(())
+}
+
+/// Builds the table references of an INSERT, which hold only the target table,
+/// and plans the INSERT's RETURNING clause against them: its CTEs, its
+/// subqueries and its result columns.
+#[allow(clippy::too_many_arguments)]
+fn plan_insert_returning(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Table,
+    table_name: &str,
+    namespace: NamespaceRef,
+    returning: &mut [ResultColumn],
+    upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    with: Option<With>,
+    connection: &Arc<Connection>,
+) -> Result<(
+    TableReferences,
+    Vec<ResultSetColumn>,
+    Vec<NonFromClauseSubquery>,
+)> {
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            table: table.clone(),
+            identifier: normalize_ident(table_name),
+            has_alias: false,
+            internal_id: program.table_reference_counter.next(),
+            op: Operation::default_scan_for(table),
+            unmatched_right_rows_plan: None,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            namespace,
+            indexed: None,
+            plan_estimate: None,
+            row_filter: None,
+        }],
+        vec![],
+    );
+
+    // Plan CTEs and add them as outer query references for the subqueries of
+    // RETURNING and of DO UPDATE
+    let mut subquery_table_refs = Vec::new();
+    for column in returning.iter() {
+        if let ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+        }
+    }
+    for (_, _, upsert) in upsert_actions {
+        if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
+            for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
+                collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+            }
+        }
+    }
+    plan_ctes_as_outer_refs(
+        with,
+        &subquery_table_refs,
+        resolver,
+        program,
+        &mut table_references,
+        connection,
+    )?;
+
+    // Plan subqueries in RETURNING expressions before processing
+    // (so SubqueryResult nodes are cloned into result_columns)
+    let mut returning_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut returning_subqueries,
+        &mut table_references,
+        returning,
+        resolver,
+        connection,
+    )?;
+
+    let result_columns = process_returning_clause(returning, &mut table_references, resolver)?;
+    Ok((table_references, result_columns, returning_subqueries))
+}
+
+/// Emits the RETURNING row of an INSERT from the registers that hold the
+/// inserted row: the subqueries of the RETURNING clause that read the row,
+/// then the result columns.
+#[allow(clippy::too_many_arguments)]
+fn emit_insert_returning_row(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    result_columns: &[ResultSetColumn],
+    returning_subqueries: &mut [NonFromClauseSubquery],
+    columns_start_reg: usize,
+    rowid_reg: usize,
+    returning_buffer: Option<&ReturningBufferCtx>,
+    layout: &ColumnLayout,
+) -> Result<()> {
+    if !returning_subqueries.is_empty() {
+        emit_returning_subqueries(
+            program,
+            resolver,
+            table_references,
+            returning_subqueries,
+            columns_start_reg,
+            rowid_reg,
+            layout,
+        )?;
+    }
+
+    emit_returning_results(
+        program,
+        table_references,
+        result_columns,
+        columns_start_reg,
+        rowid_reg,
+        resolver,
+        returning_buffer,
+        layout,
+    )
+}
+
+/// Emits a coroutine that yields the rows of the SELECT, or of the multi-row
+/// VALUES, that an INSERT reads. `value_columns` has the column that each
+/// value of a row is written to. Returns the coroutine's yield register, the
+/// number of columns in each row, and the source type of each value of a row.
+fn emit_insert_select_coroutine(
+    program: &mut ProgramBuilder,
+    select: ast::Select,
+    halt_label: BranchOffset,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    value_columns: &[Option<&Column>],
+) -> Result<(usize, usize, Vec<crate::dialect::CastSource>)> {
+    let yield_reg = program.alloc_register();
+    let jump_on_definition_label = program.allocate_label();
+    let start_offset_label = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: jump_on_definition_label,
+        start_offset: start_offset_label,
+    });
+    program.preassign_label_to_next_insn(start_offset_label);
+
+    let query_destination = QueryDestination::CoroutineYield {
+        yield_reg,
+        coroutine_implementation_start: halt_label,
+    };
+    let (num_result_cols, value_sources) = program.nested(|program| {
+        translate_insert_source_select(
+            select,
+            resolver,
+            program,
+            query_destination,
+            connection,
+            value_columns,
+        )
+    })?;
+
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(jump_on_definition_label);
+    Ok((yield_reg, num_result_cols, value_sources))
+}
+
+/// Copies every row that the coroutine of [emit_insert_select_coroutine] yields
+/// into a new ephemeral table, so that the INSERT reads its rows from there.
+/// An INSERT does this when its SELECT reads the table it writes to.
+fn emit_insert_select_into_temp_table(
+    program: &mut ProgramBuilder,
+    temp_table: Arc<BTreeTable>,
+    yield_reg: usize,
+    num_result_cols: usize,
+) -> TempTableCtx {
+    let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(temp_table));
+    let temp_table_ctx = TempTableCtx {
+        cursor_id: temp_cursor_id,
+        loop_start_label: program.allocate_label(),
+        loop_end_label: program.allocate_label(),
+    };
+
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: temp_cursor_id,
+        is_table: true,
+    });
+
+    let fill_loop_start = program.allocate_label();
+    program.preassign_label_to_next_insn(fill_loop_start);
+    let yield_label = program.allocate_label();
+    program.emit_insn(Insn::Yield {
+        yield_reg,
+        end_offset: yield_label,
+        subtype_clear_start_reg: 0,
+        subtype_clear_count: 0,
+    });
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+        count: to_u32(num_result_cols),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: temp_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: temp_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
+        flag: InsertFlags::new()
+            .require_seek()
+            .is_ephemeral_table_insert(),
+        table_name: "".to_string(),
+    });
+    // loop back
+    program.emit_insn(Insn::Goto {
+        target_pc: fill_loop_start,
+    });
+    program.preassign_label_to_next_insn(yield_label);
+    temp_table_ctx
+}
+
+/// Build the temporary table that holds the rows of an INSERT ... SELECT.
+/// Its records hold the SELECT's values in the order of the insert's column
+/// list, so each column is named after the target column of its value.
+/// EXPLAIN comments then name the value that each column holds.
+fn insert_select_temp_table(
+    table: &Table,
+    columns: &[ast::Name],
+    num_values: usize,
+) -> Result<Arc<BTreeTable>> {
+    let value_columns = (0..num_values)
+        .map(|i| {
+            let name = insert_target_column(table, columns, i).and_then(|col| col.name.clone());
+            Column::new_default_text(name, String::new(), None)
+        })
+        .try_collect()?;
+    Ok(Arc::new(BTreeTable::new(
+        0,
+        table.get_name().to_string(),
+        crate::alloc::vec![],
+        value_columns,
+        BTreeCharacteristics::HAS_ROWID,
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        None,
+    )))
 }
 
 /// Build the UNIQUE constraint error description to match sqlite
@@ -4577,6 +4879,33 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     Ok(())
 }
 
+/// The source of the value of each column of the table in a row that an
+/// INSERT writes. `value_sources` has the sources in the order of the values.
+fn insert_value_sources(
+    insertion: &Insertion,
+    value_sources: &[crate::dialect::CastSource],
+    resolver: &Resolver,
+) -> Vec<crate::dialect::CastSource> {
+    insertion
+        .col_mappings
+        .iter()
+        .map(|mapping| match mapping.value_index {
+            Some(index) => value_sources
+                .get(index)
+                .cloned()
+                .unwrap_or(crate::dialect::CastSource::Unnamed),
+            None => {
+                let default = column_default_expr(mapping.column, true, resolver);
+                crate::translate::expr::expr_type::cast_source_of(
+                    &default,
+                    &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+                    resolver.schema(),
+                )
+            }
+        })
+        .collect()
+}
+
 /// Emit encode expressions for columns with custom types.
 /// For each column that has a custom type with an encode expression,
 /// evaluates the expression with `value` bound to the column register.
@@ -4609,5 +4938,9 @@ fn emit_custom_type_encode(
         Some(&stored_columns),
         table_name,
         &layout,
-    )
+    )?;
+    if let InsertionKey::RowidAlias(key) = &insertion.key {
+        crate::translate::expr::emit_coerce_rowid(program, key.column, key.register, resolver)?;
+    }
+    Ok(())
 }

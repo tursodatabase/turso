@@ -468,7 +468,7 @@ fn check_divisor(
     lhs: usize,
     rhs: usize,
 ) -> Result<(), Box<LimboError>> {
-    if !connection.dialect().errors_on_zero_divisor() {
+    if !connection.dialect_ref().errors_on_zero_divisor() {
         return Ok(());
     }
     if matches!(state.registers[lhs].get_value(), Value::Null) {
@@ -1290,6 +1290,7 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
+    let cursor_work = state.cursor_work.clone();
     let maybe_promote_to_mvcc_cursor =
         |btree_cursor: Box<BTreeCursor>, mv_cursor_type: MvccCursorType| -> Result<OpenedBTree> {
             // Without an MvStore there is no MVCC transaction to look up.
@@ -1297,14 +1298,17 @@ pub fn op_open_read(
                 return Ok(OpenedBTree::Plain(btree_cursor));
             };
             if let Some(tx_id) = connection.get_mv_tx_id_for_db(*db) {
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                    mv_store.clone(),
-                    connection,
-                    tx_id,
-                    *root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?)))
+                Ok(OpenedBTree::Mvcc(Box::new(
+                    MvCursor::new(
+                        mv_store.clone(),
+                        connection,
+                        tx_id,
+                        *root_page,
+                        mv_cursor_type,
+                        btree_cursor,
+                    )?
+                    .with_work_counters(cursor_work.clone()),
+                )))
             } else {
                 Ok(OpenedBTree::Plain(btree_cursor))
             }
@@ -1337,12 +1341,11 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let btree_cursor = BTreeCursor::new_table(
+            let btree_cursor = BTreeCursor::new_table_boxed(
                 pager.clone(),
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
-            )
-            .into_boxed();
+            );
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // The cursor observes the transaction-wide change-log generation
@@ -1367,20 +1370,18 @@ pub fn op_open_read(
                 .into());
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
-                BTreeCursor::new_table(
+                BTreeCursor::new_table_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
                 )
-                .into_boxed()
             } else {
-                BTreeCursor::new_without_rowid_table(
+                BTreeCursor::new_without_rowid_table_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     table.as_ref(),
                     num_columns,
                 )
-                .into_boxed()
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -3199,7 +3200,7 @@ pub fn op_union_tag(
     );
 
     let val = state.registers[*src_reg].get_value();
-    let result = match val {
+    let tag_name = match val {
         Value::Blob(blob) if !blob.is_empty() => {
             let tag_index = blob[0] as usize;
             debug_assert!(
@@ -3207,15 +3208,20 @@ pub fn op_union_tag(
                 "union tag index {tag_index} out of range (len={})",
                 tag_names.len()
             );
-            match tag_names.get(tag_index) {
-                Some(name) => Value::build_text(name.clone()),
-                None => Value::Null,
-            }
+            tag_names.get(tag_index)
         }
-        _ => Value::Null,
+        _ => None,
     };
 
-    state.registers[*dest].set_value(result);
+    // A register that holds text keeps its buffer: copy the name into it,
+    // without first copying the name into a String that is then freed.
+    match (tag_name, &mut state.registers[*dest]) {
+        (Some(name), Register::Value(Value::Text(existing))) => {
+            existing.do_extend(&name.as_str())?
+        }
+        (Some(name), register) => register.set_text(Text::new(name.clone()))?,
+        (None, register) => register.set_null(),
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9276,7 +9282,7 @@ pub fn op_agg_inverse(
     };
     let payload = agg.payload_mut();
     let counts_infinite_inputs = matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
-        && connection.dialect().sum_counts_infinite_inputs();
+        && connection.dialect_ref().sum_counts_infinite_inputs();
     inverse_agg_payload(func, arg, payload, counts_infinite_inputs)?;
 
     state.pc += 1;
@@ -9907,7 +9913,7 @@ fn op_agg_step_slow(
         _ => {
             let counts_infinite_inputs =
                 matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
-                    && connection.dialect().sum_counts_infinite_inputs();
+                    && connection.dialect_ref().sum_counts_infinite_inputs();
             let arg2_reg = match func {
                 AggFunc::GroupConcat | AggFunc::StringAgg => Some(*delimiter),
                 #[cfg(feature = "json")]
@@ -10938,7 +10944,7 @@ pub fn op_function(
                 statement_times: Cell::from_mut(&mut state.statement_times),
                 collation: func.collation,
             };
-            let value = connection.dialect().call_scalar(
+            let value = connection.dialect_ref().call_scalar(
                 &context,
                 scalar_func,
                 &state.registers[*start_reg..*start_reg + arg_count],
@@ -11978,40 +11984,46 @@ pub fn op_yield(
         },
         insn
     );
-    if let Value::Numeric(Numeric::Integer(pc)) = state.registers[*yield_reg].get_value() {
-        if state.ended_coroutine.contains(&(*yield_reg as u32)) {
-            state.pc = end_offset.as_offset_int();
-        } else {
-            let pc: u32 = (*pc)
-                .try_into()
-                .unwrap_or_else(|_| panic!("Yield: pc overflow: {pc}"));
-            // swap the program counter with the value in the yield register
-            // this is the mechanism that allows jumping back and forth between the coroutine and the caller
-            state.registers[*yield_reg].set_int((state.pc + 1) as i64);
-            state.pc = pc;
-
-            // Strip JSON subtypes from co-routine output columns so they do not
-            // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
-            // subtype_clear_count > 0 only for coroutine body yields.
-            #[cfg(feature = "json")]
-            if *subtype_clear_count > 0 {
-                use crate::types::TextSubtype;
-                for reg in &mut state.registers
-                    [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
-                {
-                    if let Register::Value(Value::Text(text)) = reg {
-                        if text.subtype == TextSubtype::Json {
-                            text.subtype = TextSubtype::Text;
-                        }
-                    }
-                }
-            }
-        }
-    } else {
+    let next_pc = (state.pc + 1) as i64;
+    let Register::Value(Value::Numeric(Numeric::Integer(pc_slot))) =
+        &mut state.registers[*yield_reg]
+    else {
         unreachable!(
             "yield_reg {} contains non-integer value: {:?}",
             *yield_reg, state.registers[*yield_reg]
         );
+    };
+    // Only EndCoroutine adds to this list, so it is usually empty. The
+    // search of a list sets up a vector loop before it reads the length,
+    // and this opcode runs for each row of a coroutine.
+    if !state.ended_coroutine.is_empty() && state.ended_coroutine.contains(&(*yield_reg as u32)) {
+        state.pc = end_offset.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let pc = *pc_slot;
+    let pc: u32 = pc
+        .try_into()
+        .unwrap_or_else(|_| panic!("Yield: pc overflow: {pc}"));
+    // swap the program counter with the value in the yield register
+    // this is the mechanism that allows jumping back and forth between the coroutine and the caller
+    *pc_slot = next_pc;
+    state.pc = pc;
+
+    // Strip JSON subtypes from co-routine output columns so they do not
+    // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
+    // subtype_clear_count > 0 only for coroutine body yields.
+    #[cfg(feature = "json")]
+    if *subtype_clear_count > 0 {
+        use crate::types::TextSubtype;
+        for reg in &mut state.registers
+            [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
+        {
+            if let Register::Value(Value::Text(text)) = reg {
+                if text.subtype == TextSubtype::Json {
+                    text.subtype = TextSubtype::Text;
+                }
+            }
+        }
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -13796,6 +13808,7 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
+        let cursor_work = state.cursor_work.clone();
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<OpenedBTree> {
@@ -13804,14 +13817,17 @@ pub fn op_open_write(
                     .as_ref()
                     .expect("mv_store should be Some when MVCC transaction is active")
                     .clone();
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                    mv_store,
-                    connection,
-                    tx_id,
-                    root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?)))
+                Ok(OpenedBTree::Mvcc(Box::new(
+                    MvCursor::new(
+                        mv_store,
+                        connection,
+                        tx_id,
+                        root_page,
+                        mv_cursor_type,
+                        btree_cursor,
+                    )?
+                    .with_work_counters(cursor_work.clone()),
+                )))
             } else if mv_store.is_some() {
                 Err(LimboError::InternalError(
                     "OpenWrite requires an active MVCC transaction".to_string(),
@@ -13862,21 +13878,21 @@ pub fn op_open_write(
             let btree_cursor: Box<BTreeCursor> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
                     btree_cursor_with_yield_context(
-                        Box::new(BTreeCursor::new_without_rowid_table(
+                        BTreeCursor::new_without_rowid_table_boxed(
                             pager,
                             maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                             table_rc.as_ref(),
                             num_columns,
-                        )),
+                        ),
                         connection,
                     )
                 }
                 _ => btree_cursor_with_yield_context(
-                    Box::new(BTreeCursor::new_table(
+                    BTreeCursor::new_table_boxed(
                         pager,
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                         num_columns,
-                    )),
+                    ),
                     connection,
                 ),
             };
@@ -15563,7 +15579,13 @@ pub struct OpInitCdcVersionInner {
 pub type OpInitCdcVersionState = Option<Box<OpInitCdcVersionInner>>;
 
 fn prepare_cdc_internal(conn: &Arc<Connection>, sql: String) -> Result<crate::Statement> {
-    let stmt = conn.prepare_internal(sql)?;
+    // CDC must not capture the creation of its own tables, also when switching
+    // from one capture table to another while capture is on.
+    let cdc_info = conn.get_capture_data_changes_info().clone();
+    conn.set_capture_data_changes_info(None);
+    let stmt = conn.prepare_internal(sql);
+    conn.set_capture_data_changes_info(cdc_info);
+    let stmt = stmt?;
     stmt.program
         .prepared
         .needs_stmt_subtransactions
@@ -15600,10 +15622,13 @@ pub fn op_init_cdc_version(
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        // If CDC is already enabled, re-parse with current version and exit
-        // early. Idempotent; avoids CDC capturing its own table creation when
-        // the pragma is called multiple times.
-        if let Some(info) = conn.get_capture_data_changes_info().as_ref() {
+        // If CDC is already enabled for the same table, only the mode can
+        // change: re-parse with the current version and skip the table setup.
+        if let Some(info) = conn
+            .get_capture_data_changes_info()
+            .as_ref()
+            .filter(|info| info.table.eq_ignore_ascii_case(cdc_table_name))
+        {
             let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
             state.pending_cdc_info = Some(opts);
             state.pc += 1;
@@ -16420,16 +16445,16 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
+                BTreeCursor::new_index_boxed(pager.clone(), root_page, index, num_columns)
             } else {
-                Ok(BTreeCursor::new_table(
+                Ok(BTreeCursor::new_table_boxed(
                     pager.clone(),
                     root_page,
                     num_columns,
                 ))
             }?;
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::Rewind {
-                cursor: Box::new(cursor),
+                cursor,
                 temp_file: temp_file.take(),
             };
         }
@@ -16541,18 +16566,18 @@ pub fn op_open_dup(
                 .into());
             }
             let cursor: Box<BTreeCursor> = if table.has_rowid {
-                Box::new(BTreeCursor::new_table(
+                BTreeCursor::new_table_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.columns().len(),
-                ))
+                )
             } else {
-                Box::new(BTreeCursor::new_without_rowid_table(
+                BTreeCursor::new_without_rowid_table_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.as_ref(),
                     table.columns().len(),
-                ))
+                )
             };
             let cursor = if !is_ephemeral {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
@@ -16560,14 +16585,17 @@ pub fn op_open_dup(
                         .as_ref()
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                        mv_store,
-                        connection,
-                        tx_id,
-                        root_page,
-                        MvccCursorType::Table,
-                        cursor,
-                    )?))
+                    OpenedBTree::Mvcc(Box::new(
+                        MvCursor::new(
+                            mv_store,
+                            connection,
+                            tx_id,
+                            root_page,
+                            MvccCursorType::Table,
+                            cursor,
+                        )?
+                        .with_work_counters(state.cursor_work.clone()),
+                    ))
                 } else {
                     OpenedBTree::Plain(cursor)
                 }
@@ -17007,7 +17035,9 @@ pub fn op_cast(
 ) -> InsnResult {
     load_insn!(Cast { reg, affinity }, insn);
 
-    let value = state.registers[*reg].get_value().clone();
+    // `exec_cast` reads the value through a reference, so the value needs no
+    // clone.
+    let value = state.registers[*reg].get_value();
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
@@ -17015,7 +17045,6 @@ pub fn op_cast(
         Affinity::Integer => value.exec_cast("INTEGER"),
         Affinity::Real => value.exec_cast("REAL"),
     }?;
-
     state.registers[*reg].set_value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

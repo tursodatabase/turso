@@ -714,46 +714,7 @@ impl DatabaseReplayGenerator {
             dropped_columns,
             &columns,
         )?;
-        return Ok(());
-
-        fn renamed_and_dropped_columns<'a>(
-            local_columns: &'a [turso_core::ast::ColumnDefinition],
-            remote_columns: &'a [turso_core::ast::ColumnDefinition],
-        ) -> (
-            Vec<(&'a turso_core::ast::Name, &'a turso_core::ast::Name)>,
-            Vec<&'a turso_core::ast::Name>,
-        ) {
-            let mut renamed = Vec::new();
-            let mut dropped = Vec::new();
-            let mut remote_columns = remote_columns.iter().peekable();
-            for (index, local_column) in local_columns.iter().enumerate() {
-                let local_name = &local_column.col_name;
-                let Some(remote_column) = remote_columns.peek() else {
-                    dropped.push(local_name);
-                    continue;
-                };
-                let remote_name = &remote_column.col_name;
-                if local_name
-                    .as_str()
-                    .eq_ignore_ascii_case(remote_name.as_str())
-                {
-                    // The remote can change only the case of a name.
-                    if local_name.as_str() != remote_name.as_str() {
-                        renamed.push((local_name, remote_name));
-                    }
-                    remote_columns.next();
-                } else if has_column(&local_columns[index + 1..], remote_name.as_str()) {
-                    // This doesn't correctly handle a remote transaction that swaps two columns,
-                    // https://github.com/tursodatabase/turso/issues/9430 . But for now, this is the
-                    // best we can do. Note that this change didn't introduce the bug.
-                    dropped.push(local_name);
-                } else {
-                    renamed.push((local_name, remote_name));
-                    remote_columns.next();
-                }
-            }
-            (renamed, dropped)
-        }
+        Ok(())
     }
 
     /// Changes the columns of the local table to the columns of the remote
@@ -1040,7 +1001,10 @@ impl DatabaseReplayGenerator {
             // matches the values of a row with the columns by position, so the
             // columns that stay must be the first columns of the remote table.
             // A column that stays and is generated on one side only also comes
-            // from a wrong match of the columns.
+            // from a wrong match of the columns. So does a regular column that
+            // stays with another type than the remote column at its place, for
+            // example after the remote dropped a column and gave its name to
+            // another column.
             let Some(staying_columns) =
                 staying_columns_with_remote(local_columns, &names, remote_columns)
             else {
@@ -1055,6 +1019,17 @@ impl DatabaseReplayGenerator {
             {
                 return Err(Error::DatabaseTapeError(format!(
                     "the generated columns {} of table {tbl_name} use a dropped column, but the column {} is generated on one side only",
+                    users.join(", "),
+                    column.col_name
+                )));
+            }
+            if let Some((column, _)) = staying_columns.iter().find(|(column, remote_column)| {
+                !is_generated(column)
+                    && !is_generated(remote_column)
+                    && !same_type(column, remote_column)
+            }) {
+                return Err(Error::DatabaseTapeError(format!(
+                    "the generated columns {} of table {tbl_name} use a dropped column, but the column {} has another type in the remote table",
                     users.join(", "),
                     column.col_name
                 )));
@@ -1285,6 +1260,63 @@ impl DatabaseReplayGenerator {
         };
         Ok((column_names, pk_column_indices, rowid_alias_pk_column_index))
     }
+}
+
+/// Matches the columns of the local table with the columns of the remote table
+/// by position. Returns the local columns to rename, each with its remote name,
+/// and the local columns to drop.
+fn renamed_and_dropped_columns<'a>(
+    local_columns: &'a [turso_core::ast::ColumnDefinition],
+    remote_columns: &'a [turso_core::ast::ColumnDefinition],
+) -> (
+    Vec<(&'a turso_core::ast::Name, &'a turso_core::ast::Name)>,
+    Vec<&'a turso_core::ast::Name>,
+) {
+    let mut renamed = Vec::new();
+    let mut dropped = Vec::new();
+    let mut remote_columns = remote_columns.iter().peekable();
+    for (index, local_column) in local_columns.iter().enumerate() {
+        let local_name = &local_column.col_name;
+        let Some(remote_column) = remote_columns.peek() else {
+            dropped.push(local_name);
+            continue;
+        };
+        let remote_name = &remote_column.col_name;
+        if local_name
+            .as_str()
+            .eq_ignore_ascii_case(remote_name.as_str())
+        {
+            // The remote can change only the case of a name.
+            if local_name.as_str() != remote_name.as_str() {
+                renamed.push((local_name, remote_name));
+            }
+            remote_columns.next();
+        } else if has_column(&local_columns[index + 1..], remote_name.as_str()) {
+            // This doesn't correctly handle a remote transaction that swaps two columns,
+            // https://github.com/tursodatabase/turso/issues/9430 . But for now, this is the
+            // best we can do. Note that this change didn't introduce the bug.
+            dropped.push(local_name);
+        } else if local_columns[index..].iter().all(is_generated)
+            && dropped
+                .iter()
+                .any(|name| name.as_str().eq_ignore_ascii_case(remote_name.as_str()))
+        {
+            // The remote dropped the column `remote_name` and added it again at
+            // the end, so it added the remote columns from here on after that
+            // column. A rename to that name would fail, because the local column
+            // that is dropped still has it. This column and the later local
+            // columns are generated and keep no values, so they are dropped too
+            // and added again from the remote table. When one of them is regular,
+            // the column goes to the rename, as before: the remote can have
+            // renamed it to the dropped name. A drop here would make the match
+            // give that name to the next regular column, with its values.
+            dropped.push(local_name);
+        } else {
+            renamed.push((local_name, remote_name));
+            remote_columns.next();
+        }
+    }
+    (renamed, dropped)
 }
 
 /// Returns the names of the generated columns of the local table, `local`,
@@ -1684,6 +1716,22 @@ fn staying_columns_with_remote<'a>(
         .collect()
 }
 
+/// Returns whether the local column `local` has the declared type of the
+/// remote column `remote`. It ignores ASCII case. It does not compare the
+/// constraints, because core writes them in another form when it writes the
+/// table text again after ALTER TABLE, for example a REFERENCES clause as a
+/// table FOREIGN KEY.
+fn same_type(
+    local: &turso_core::ast::ColumnDefinition,
+    remote: &turso_core::ast::ColumnDefinition,
+) -> bool {
+    match (&local.col_type, &remote.col_type) {
+        (None, None) => true,
+        (Some(local), Some(remote)) => local.to_string().eq_ignore_ascii_case(&remote.to_string()),
+        _ => false,
+    }
+}
+
 /// Returns the index in `columns` of the next column of `names` to drop: the
 /// last one that no other column of `columns` uses. If each of them is in
 /// use, it returns the last one, and core then refuses the drop with an error.
@@ -1743,6 +1791,8 @@ fn has_column(columns: &[turso_core::ast::ColumnDefinition], name: &str) -> bool
 mod tests {
     use super::*;
     use crate::database_tape::DatabaseReplaySessionOpts;
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use turso_core::{ConnectOpts, SessionRole};
@@ -2017,5 +2067,237 @@ mod tests {
         .unwrap();
         assert!(!generator
             .upsert_needs_null_safe_predelete(&rowid_alias, &[turso_core::Value::Null, text("v")]));
+    }
+
+    /// The remote drops `k` and renames the generated column `g` to `k`. The
+    /// match must rename `g`, and not drop `g` and give the name `k` to the
+    /// regular column `z` after it.
+    #[test]
+    fn match_renames_generated_column_that_a_regular_column_follows() {
+        let local = column_definitions(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, x TEXT, g TEXT AS (upper(x)), z TEXT)",
+        );
+        let remote = column_definitions(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, k TEXT AS (upper(x)), z TEXT)",
+        );
+        let (renamed, dropped) = renamed_and_dropped_columns(&local, &remote);
+        let renamed = renamed
+            .iter()
+            .map(|(old_name, new_name)| (old_name.as_str(), new_name.as_str()))
+            .collect::<Vec<_>>();
+        let dropped = dropped.iter().map(|name| name.as_str()).collect::<Vec<_>>();
+        assert_eq!(renamed, vec![("g", "k")]);
+        assert_eq!(dropped, vec!["k"]);
+    }
+
+    /// The remote renames `x` to `y`, and then the generated column `l`, the
+    /// last column, to `x`. Only generated columns follow `l`, so the rule for
+    /// a name that the remote added again can apply to it. The match must still
+    /// rename `l`, because it drops no column with the name `x`.
+    #[test]
+    fn match_renames_trailing_generated_column_to_name_of_renamed_column() {
+        let local = column_definitions(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, l TEXT AS (upper(x)))",
+        );
+        let remote = column_definitions(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, y TEXT, x TEXT AS (upper(y)))",
+        );
+        let (renamed, dropped) = renamed_and_dropped_columns(&local, &remote);
+        let renamed = renamed
+            .iter()
+            .map(|(old_name, new_name)| (old_name.as_str(), new_name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(renamed, vec![("x", "y"), ("l", "x")]);
+        assert!(dropped.is_empty());
+    }
+
+    /// The number of random cases of
+    /// `fuzz_match_of_remote_drops_renames_and_adds`. Set `SEED` to run other
+    /// cases.
+    const MATCH_FUZZ_CASES: u64 = 2000;
+
+    /// The remote keeps, drops or renames each column, and adds columns at the
+    /// end. A rename gives a new name, or the old name of an earlier column
+    /// that the remote renamed. The final remote table shows what the remote
+    /// did, so the match must find exactly the renames and the drops of the
+    /// remote. Each table writes the names in a random form, with or without
+    /// quotes.
+    #[test]
+    fn fuzz_match_of_remote_drops_renames_and_adds() {
+        let seed = crate::tests::seed_u64();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        for case in 0..MATCH_FUZZ_CASES {
+            let local = random_columns(&mut rng);
+            let (remote, renamed, dropped) = random_remote_change(&mut rng, &local);
+            let local_sql = create_table_sql(&mut rng, &local);
+            let remote_sql = create_table_sql(&mut rng, &remote);
+            let local_columns = column_definitions(&local_sql);
+            let remote_columns = column_definitions(&remote_sql);
+            let (actual_renamed, actual_dropped) =
+                renamed_and_dropped_columns(&local_columns, &remote_columns);
+            let actual_renamed = actual_renamed
+                .iter()
+                .map(|(old_name, new_name)| {
+                    (old_name.as_str().to_string(), new_name.as_str().to_string())
+                })
+                .collect::<Vec<_>>();
+            let actual_dropped = actual_dropped
+                .iter()
+                .map(|name| name.as_str().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                (actual_renamed, actual_dropped),
+                (renamed, dropped),
+                "seed {seed}, case {case}\nlocal:  {local_sql}\nremote: {remote_sql}"
+            );
+        }
+    }
+
+    /// A column of a table in `fuzz_match_of_remote_drops_renames_and_adds`.
+    #[derive(Clone, Debug)]
+    struct FuzzColumn {
+        name: String,
+        generated: bool,
+    }
+
+    /// What the remote does with a local column in
+    /// `fuzz_match_of_remote_drops_renames_and_adds`.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Change {
+        Keep,
+        Drop,
+        Rename,
+    }
+
+    /// Returns the column `id` and up to eight more columns with the names
+    /// that `column_name` gives for 0, 1, 2 and so on, each regular or
+    /// generated at random. `id` is first, so that no table is empty.
+    fn random_columns(rng: &mut ChaCha8Rng) -> Vec<FuzzColumn> {
+        let count = rng.random_range(0..=8);
+        let mut columns = vec![FuzzColumn {
+            name: "id".to_string(),
+            generated: false,
+        }];
+        for index in 0..count {
+            columns.push(FuzzColumn {
+                name: column_name(index),
+                generated: rng.random_bool(0.4),
+            });
+        }
+        columns
+    }
+
+    /// Returns the name of the column number `index`. An odd number gives a
+    /// name with a space, which needs quotes.
+    fn column_name(index: usize) -> String {
+        if index % 2 == 0 {
+            format!("c{index}")
+        } else {
+            format!("c {index}")
+        }
+    }
+
+    /// Returns the remote columns after a random change of the table `local`,
+    /// as `fuzz_match_of_remote_drops_renames_and_adds` describes it, and the
+    /// renames and the drops of the change, in the local order. The first
+    /// column, `id`, stays.
+    fn random_remote_change(
+        rng: &mut ChaCha8Rng,
+        local: &[FuzzColumn],
+    ) -> (Vec<FuzzColumn>, Vec<(String, String)>, Vec<String>) {
+        let mut changes = local[1..]
+            .iter()
+            .map(|_| match rng.random_range(0..4) {
+                0 => Change::Drop,
+                1 => Change::Rename,
+                _ => Change::Keep,
+            })
+            .collect::<Vec<_>>();
+        // A drop right before a rename gives the remote table of a rename of
+        // the dropped column, so the column after one or more drops keeps its
+        // name.
+        let mut after_drop = false;
+        for change in &mut changes {
+            if after_drop && *change == Change::Rename {
+                *change = Change::Keep;
+            }
+            after_drop = *change == Change::Drop;
+        }
+        // A drop of the last column and an added column give the remote table
+        // of a rename of the last column.
+        let added_columns: usize = if changes.last() == Some(&Change::Drop) {
+            0
+        } else {
+            rng.random_range(0..3)
+        };
+
+        let mut remote = vec![local[0].clone()];
+        let mut renamed = Vec::new();
+        let mut dropped = Vec::new();
+        // The old names of the renamed columns that no column has now.
+        let mut free_names = Vec::new();
+        for (column, change) in local[1..].iter().zip(changes) {
+            match change {
+                Change::Keep => remote.push(column.clone()),
+                Change::Drop => dropped.push(column.name.clone()),
+                Change::Rename => {
+                    let new_name = if !free_names.is_empty() && rng.random_bool(0.5) {
+                        free_names.swap_remove(rng.random_range(0..free_names.len()))
+                    } else {
+                        format!("r{}", renamed.len())
+                    };
+                    free_names.push(column.name.clone());
+                    renamed.push((column.name.clone(), new_name.clone()));
+                    remote.push(FuzzColumn {
+                        name: new_name,
+                        generated: column.generated,
+                    });
+                }
+            }
+        }
+        for index in 0..added_columns {
+            remote.push(FuzzColumn {
+                name: format!("a{index}"),
+                generated: rng.random_bool(0.4),
+            });
+        }
+        (remote, renamed, dropped)
+    }
+
+    /// Returns a CREATE TABLE statement for `columns`. It writes each name
+    /// without quotes, or in double quotes, brackets or backticks, at random,
+    /// so that two tables can write a name in other forms.
+    fn create_table_sql(rng: &mut ChaCha8Rng, columns: &[FuzzColumn]) -> String {
+        let columns = columns
+            .iter()
+            .map(|column| {
+                let name = &column.name;
+                let name = match rng.random_range(0..4) {
+                    0 if !name.contains(' ') => name.clone(),
+                    0 | 1 => format!("\"{name}\""),
+                    2 => format!("[{name}]"),
+                    _ => format!("`{name}`"),
+                };
+                if column.generated {
+                    format!("{name} TEXT AS (1)")
+                } else {
+                    format!("{name} TEXT")
+                }
+            })
+            .collect::<Vec<_>>();
+        format!("CREATE TABLE t ({})", columns.join(", "))
+    }
+
+    /// Returns the column definitions of the CREATE TABLE statement `sql`.
+    fn column_definitions(sql: &str) -> Vec<turso_core::ast::ColumnDefinition> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let Some(Ok(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::CreateTable {
+            body: turso_core::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        }))) = parser.next()
+        else {
+            panic!("not a CREATE TABLE statement: {sql}");
+        };
+        columns
     }
 }

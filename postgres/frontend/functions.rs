@@ -1,9 +1,12 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
-use crate::error::sqlstate_error;
+use crate::error::{sqlstate_error, sqlstate_error_with_hint};
+use crate::pg_type::{built_in_type_named, lookup_type_name, type_input, NamedTypeKind};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 
@@ -52,6 +55,7 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
+    let options = crate::pg_type::register_integer_operator_functions(options);
     options
         .extension_function(
             pg_scalar_function(
@@ -69,7 +73,9 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
                 true,
                 |_, args| exec_date_trunc(args),
             )
-            .receiving_argument_types(),
+            .receiving_argument_types()
+            .checking_argument_types(check_date_trunc_types)
+            .returning_argument_type(1),
         )
         // FIXME(pg-interval): PostgreSQL has no function of this name. It exists
         // because tursopg has no interval type: the translator rewrites
@@ -85,18 +91,13 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types()
             .checking_argument_types(check_timestamp_plus_interval_types)
-            // FIXME(pg-catalog): The check refuses a domain on the left because
-            // the result would get the domain's type, where pg_operator gives
-            // the base type (timestamp or timestamptz). A pg_operator lookup
-            // replaces this.
-            .returning_first_argument_type(),
+            .returning_argument_type(0),
         )
 }
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
-/// timestamptz. `types` are the argument type names, with domain names kept;
-/// the first is the left side, so a domain over timestamp or timestamptz is
-/// refused. Every other type gets 0A000, including the ones that have no operator
+/// timestamptz. `types` are the argument type names, with a domain replaced by
+/// its base type; the first is the left side. Every other type gets 0A000, including the ones that have no operator
 /// in PostgreSQL (which gives 42883), because the type name does not say
 /// whether PostgreSQL has one. The translator turns `-` into `+` of the
 /// negated interval, so the message always says `+`.
@@ -108,11 +109,45 @@ fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
     let time_type = types[0].as_str();
     match time_type {
         "timestamp" | "timestamptz" => Ok(()),
+        "date" => Err(sqlstate_error_with_hint(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
+            ),
+            "Cast the date to timestamp first: d::timestamp + interval.",
+        )),
         _ => Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             format!(
                 "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
             ),
+            None,
+        )),
+    }
+}
+
+/// Refuses date_trunc when its second argument is not timestamp or
+/// timestamptz. `types` are the argument type names, with a domain replaced by
+/// its base type, as PostgreSQL resolves it.
+// FIXME(pg-catalog): HACK. This is a hand-written overload rule: the second
+// argument of date_trunc is timestamp or timestamptz, and the result has that
+// type (see `returning_argument_type(1)` where date_trunc is registered). It
+// stands in for the pg_proc rows date_trunc(text, timestamp) returns timestamp
+// and date_trunc(text, timestamptz) returns timestamptz. It refuses with 0A000
+// arguments that PostgreSQL accepts, such as a date, which PostgreSQL casts to
+// timestamptz. A pg_proc lookup replaces it.
+fn check_date_trunc_types(types: &[String]) -> Result<()> {
+    let time_type = types[1].as_str();
+    match time_type {
+        "timestamp" | "timestamptz" => Ok(()),
+        "date" => Err(sqlstate_error_with_hint(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("date_trunc is supported only for timestamp and timestamptz, not {time_type}"),
+            "Cast the value to timestamptz: date_trunc(unit, d::timestamptz).",
+        )),
+        _ => Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("date_trunc is supported only for timestamp and timestamptz, not {time_type}"),
             None,
         )),
     }
@@ -185,39 +220,48 @@ fn add_interval(time: NaiveDateTime, months: i64, days: i64, micros: i64) -> Opt
         .checked_add_signed(Duration::microseconds(micros))
 }
 
-/// date_trunc(field, timestamptz). The declared return type is timestamptz,
-/// so any other argument type fails with 0A000 instead of returning a
-/// timestamptz for a timestamp or date argument.
-fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
+/// date_trunc(field, timestamp) and date_trunc(field, timestamptz). The result
+/// has the type of the second argument, which `check_date_trunc_types` limits
+/// to timestamp and timestamptz when the statement is compiled. Only UTC is
+/// supported, so timestamptz is truncated like timestamp.
+fn exec_date_trunc(args: &[Register]) -> Result<Value> {
     // Registered with arity 2 or 3; each argument is followed by its type.
     if args.len() == 6 {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "date_trunc with a time zone argument is not supported".to_string(),
-            None,
-        ));
+        let message = "date_trunc with a time zone argument is not supported".to_string();
+        let zone_is_utc = matches!(
+            args[2].get_value(),
+            Value::Text(zone) if zone.as_str().eq_ignore_ascii_case("utc")
+        );
+        return Err(if zone_is_utc {
+            sqlstate_error_with_hint(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                message,
+                "Leave out the time zone argument; the session time zone is UTC.",
+            )
+        } else {
+            sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
+        });
     }
     let (args, types) = args.split_at(args.len() / 2);
     let argument_type = types[1].get_value().to_string();
-    if argument_type != "timestamptz" {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            format!("date_trunc is supported only for timestamptz, not {argument_type}"),
-            None,
-        ));
-    }
+    // The name PostgreSQL uses for the type in its messages.
+    let type_name = match argument_type.as_str() {
+        "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        other => unreachable!("check_date_trunc_types refuses date_trunc of {other}"),
+    };
     let not_supported = |what: String| sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, what, None);
     let field = match args[0].get_value() {
         Value::Text(field) => field,
         // A SQL NULL unit gives NULL. A typed NULL such as NULL::int is
         // indistinguishable from it here, because the argument types are
         // not available for a NULL value.
-        Value::Null => return Ok(None),
+        Value::Null => return Ok(Value::Null),
         other => {
             return Err(sqlstate_error(
                 SQLSTATE_UNDEFINED_FUNCTION,
                 format!(
-                    "function date_trunc({}, timestamp with time zone) does not exist",
+                    "function date_trunc({}, {type_name}) does not exist",
                     types[0].get_value()
                 ),
                 Some(format!("Got a unit argument that is not text: {other}")),
@@ -225,12 +269,12 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
         }
     };
     let Value::Text(value) = args[1].get_value() else {
-        return Ok(None);
+        return Ok(Value::Null);
     };
     let time =
         NaiveDateTime::parse_from_str(value.as_str(), "%Y-%m-%d %H:%M:%S%.f").map_err(|_| {
             not_supported(format!(
-                "date_trunc is not supported for the timestamptz value \"{}\"",
+                "date_trunc is not supported for the {argument_type} value \"{}\"",
                 value.as_str()
             ))
         })?;
@@ -238,13 +282,13 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
     let parsed = DatetimeUnit::parse(field.as_str());
     if parsed == Some(DatetimeUnit::TimeZone) {
         return Err(not_supported(format!(
-            "unit \"{lowered_field}\" not supported for type timestamp with time zone"
+            "unit \"{lowered_field}\" not supported for type {type_name}"
         )));
     }
     let Some(unit) = parsed else {
         return Err(sqlstate_error(
             SQLSTATE_INVALID_PARAMETER_VALUE,
-            format!("unit \"{lowered_field}\" not recognized for type timestamp with time zone"),
+            format!("unit \"{lowered_field}\" not recognized for type {type_name}"),
             None,
         ));
     };
@@ -255,7 +299,7 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
             value.as_str()
         ))
     })?;
-    Ok(Some(Timestamptz(timestamp_text(truncated))))
+    Ok(Value::build_text(timestamp_text(truncated)))
 }
 
 /// `time` truncated to `unit`, as PostgreSQL's date_trunc does it, or None
@@ -338,6 +382,27 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "jsonb_contains"(FunctionArity::Exact(2), true) => {
             exec_jsonb_contains(args[0].get_value(), args[1].get_value())?
         },
+        "jsonb_extract_path"(FunctionArity::Variadic, true) => {
+            exec_jsonb_extract_path(args)?
+        },
+        "jsonb_extract_path_text"(FunctionArity::Variadic, true) => {
+            exec_jsonb_extract_path_text(args)?
+        },
+        "jsonb_extract_path_op"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_extract_path_op(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_extract_path_text_op"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_extract_path_text_op(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_exists"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_exists(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_exists_any"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_exists_keys(args[0].get_value(), args[1].get_value(), false)?
+        },
+        "jsonb_exists_all"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_exists_keys(args[0].get_value(), args[1].get_value(), true)?
+        },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -363,12 +428,13 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             )
         )?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
-            exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
+            exec_pg_input_is_valid(connection, args[0].get_value(), args[1].get_value())?
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
         ))?,
+        "pg_cast"(FunctionArity::Exact(3), true) => crate::cast_planning::exec_pg_cast(args)?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
@@ -704,50 +770,11 @@ fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
     let value = args[i].get_value();
     match value {
         Value::Null => Ok(None),
-        Value::Text(text) => parse_oid(text.as_str()).map(Some),
+        Value::Text(text) => Ok(crate::pg_type::oid_input(text.as_str())?.as_int()),
         value => value.as_int().map(Some).ok_or_else(|| {
             LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
         }),
     }
-}
-
-fn parse_oid(text: &str) -> Result<i64> {
-    let invalid =
-        || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
-    let out_of_range =
-        || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
-    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
-    let number = text.trim_matches(is_space);
-    let (negative, unsigned) = match number.as_bytes().first() {
-        Some(b'-') => (true, &number[1..]),
-        Some(b'+') => (false, &number[1..]),
-        _ => (false, number),
-    };
-    let (radix, digits) = if let Some(hex) = unsigned
-        .strip_prefix("0x")
-        .or_else(|| unsigned.strip_prefix("0X"))
-        .filter(|hex| hex.starts_with(|c: char| c.is_ascii_hexdigit()))
-    {
-        (16, hex)
-    } else if unsigned.len() > 1 && unsigned.starts_with('0') {
-        (8, &unsigned[1..])
-    } else {
-        (10, unsigned)
-    };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return Err(invalid());
-    }
-    let magnitude = u64::from_str_radix(digits, radix).map_err(|_| out_of_range())?;
-    let value = if negative {
-        magnitude.wrapping_neg()
-    } else {
-        magnitude
-    };
-    let oid = value as u32;
-    if value != u64::from(oid) && value != oid as i32 as i64 as u64 {
-        return Err(out_of_range());
-    }
-    Ok(i64::from(oid))
 }
 
 fn text_arg(args: &[Register], i: usize) -> String {
@@ -1036,16 +1063,107 @@ fn exec_jsonb_field(json: &Value, key: &Value) -> Result<Option<String>> {
 /// as text. A string has no quotes and no escapes, a number is written as
 /// jsonb writes it, and a JSON null is NULL.
 fn exec_jsonb_field_text(json: &Value, key: &Value) -> Result<Option<String>> {
-    let Some(field) = find_json_field(json, key, "->>")? else {
+    match find_json_field(json, key, "->>")? {
+        Some(field) => json_value_text(&field),
+        None => Ok(None),
+    }
+}
+
+/// PostgreSQL's functions json_extract_path() and jsonb_extract_path(): the
+/// JSON text of the value at a path in a JSON document. The arguments after
+/// the document are the elements of the path, as PostgreSQL's VARIADIC
+/// parameter gives them.
+fn exec_jsonb_extract_path(args: &[Register]) -> Result<Option<String>> {
+    Ok(find_json_path("jsonb_extract_path", "#>", args)?.map(str::to_string))
+}
+
+/// PostgreSQL's functions json_extract_path_text() and
+/// jsonb_extract_path_text(): the value that jsonb_extract_path() finds, as
+/// text, as `->>` gives it.
+fn exec_jsonb_extract_path_text(args: &[Register]) -> Result<Option<String>> {
+    match find_json_path("jsonb_extract_path_text", "#>>", args)? {
+        Some(value) => json_value_text(value),
+        None => Ok(None),
+    }
+}
+
+/// PostgreSQL's `json #> path` and `jsonb #> path`: the value that
+/// jsonb_extract_path() finds at the text array `path` in the JSON document
+/// `json`. The translator turns the operator into a call of this function.
+fn exec_jsonb_extract_path_op(json: &Value, path: &Value) -> Result<Option<String>> {
+    Ok(find_json_path_of_array("jsonb_extract_path", "#>", json, path)?.map(str::to_string))
+}
+
+/// PostgreSQL's `json #>> path` and `jsonb #>> path`: the value that `#>`
+/// finds, as text, as `->>` gives it.
+fn exec_jsonb_extract_path_text_op(json: &Value, path: &Value) -> Result<Option<String>> {
+    match find_json_path_of_array("jsonb_extract_path_text", "#>>", json, path)? {
+        Some(value) => json_value_text(value),
+        None => Ok(None),
+    }
+}
+
+/// PostgreSQL's `jsonb ? key`, which is also its function jsonb_exists():
+/// whether the text `key` is the name of a field of the object `json`, or a
+/// string element of the array `json`. Only the top level counts. jsonb
+/// stores a scalar document as an array with one element, so `'"a"' ? 'a'`
+/// is true.
+fn exec_jsonb_exists(json: &Value, key: &Value) -> Result<Option<Boolean>> {
+    let Some(document) = json_document(json, "?", "text")? else {
         return Ok(None);
     };
-    if field.starts_with('"') {
-        return decode_json_string(&field, &mut 0).map(Some);
+    let key = match key {
+        Value::Null => return Ok(None),
+        Value::Text(key) => key.as_str(),
+        other => {
+            return Err(undefined_function(
+                "jsonb_exists",
+                &["jsonb", pg_type_name(other)],
+            ))
+        }
+    };
+    let keys = json_top_level_keys(document)?;
+    Ok(Some(Boolean(keys.contains(key))))
+}
+
+/// PostgreSQL's `jsonb ?| keys` and `jsonb ?& keys`, which are also its
+/// functions jsonb_exists_any() and jsonb_exists_all(): whether any element,
+/// or every element, of the text array `keys` is a key of `json` as `?` finds
+/// it: every element when `every_key` is true. A NULL element does not count,
+/// so `?|` is false and `?&` is true when `keys` has no other element.
+fn exec_jsonb_exists_keys(json: &Value, keys: &Value, every_key: bool) -> Result<Option<Boolean>> {
+    let (func, op) = if every_key {
+        ("jsonb_exists_all", "?&")
+    } else {
+        ("jsonb_exists_any", "?|")
+    };
+    let Some(document) = json_document(json, op, "text[]")? else {
+        return Ok(None);
+    };
+    let Some(wanted) = text_array_elements(func, keys)? else {
+        return Ok(None);
+    };
+    let keys = json_top_level_keys(document)?;
+    let mut wanted = wanted.iter().flatten();
+    Ok(Some(Boolean(if every_key {
+        wanted.all(|key| keys.contains(key.as_str()))
+    } else {
+        wanted.any(|key| keys.contains(key.as_str()))
+    })))
+}
+
+/// The text that `->>` gives for the JSON value `value`, which must be valid
+/// JSON: a string without quotes and escapes, a number as jsonb writes it, and
+/// NULL for a JSON null. A boolean, an object and an array are their JSON
+/// text.
+fn json_value_text(value: &str) -> Result<Option<String>> {
+    if value.starts_with('"') {
+        return decode_json_string(value, &mut 0).map(Some);
     }
-    if field.starts_with(|c: char| c == '-' || c.is_ascii_digit()) {
+    if value.starts_with(|c: char| c == '-' || c.is_ascii_digit()) {
         // A valid JSON number fails only when it has more digits than numeric
         // allows. PostgreSQL then fails when it makes the jsonb value.
-        return turso_core::format_numeric_text(&field)
+        return turso_core::format_numeric_text(value)
             .map(Some)
             .map_err(|_| {
                 sqlstate_error(
@@ -1055,10 +1173,165 @@ fn exec_jsonb_field_text(json: &Value, key: &Value) -> Result<Option<String>> {
                 )
             });
     }
-    Ok((field != "null").then_some(field))
+    Ok((value != "null").then(|| value.to_string()))
 }
 
-/// The field or array element that `->` and `->>` look up.
+/// The JSON text of the value at a path in a JSON document, for
+/// jsonb_extract_path() and jsonb_extract_path_text(). `args` are the document
+/// and one text argument for each element of the path. `func` and `op` name
+/// the function and its operator, for errors.
+fn find_json_path<'a>(func: &str, op: &str, args: &'a [Register]) -> Result<Option<&'a str>> {
+    let Some((json, path_args)) = args.split_first().filter(|(_, path)| !path.is_empty()) else {
+        let arg_types = vec!["jsonb"; args.len()];
+        return Err(undefined_function(func, &arg_types));
+    };
+    let Some(document) = json_document(json.get_value(), op, "text[]")? else {
+        return Ok(None);
+    };
+    let path = path_args
+        .iter()
+        .map(|arg| match arg.get_value() {
+            Value::Null => Ok(None),
+            Value::Text(element) => Ok(Some(element.as_str().to_string())),
+            // PostgreSQL reads a text array as the path only after the
+            // keyword VARIADIC, which the translator rejects.
+            other => Err(undefined_function(func, &["jsonb", pg_type_name(other)])),
+        })
+        .collect::<Result<_>>()?;
+    json_path_value(document, path)
+}
+
+/// The JSON text of the value at the text array `path` in the JSON document
+/// `json`, for `#>` and `#>>`. `func` and `op` name the function and the
+/// operator, for errors.
+fn find_json_path_of_array<'a>(
+    func: &str,
+    op: &str,
+    json: &'a Value,
+    path: &Value,
+) -> Result<Option<&'a str>> {
+    let Some(document) = json_document(json, op, "text[]")? else {
+        return Ok(None);
+    };
+    match text_array_elements(func, path)? {
+        Some(path) => json_path_value(document, path),
+        None => Ok(None),
+    }
+}
+
+/// The JSON text of the value at `path` in `document`, which must be valid
+/// JSON. Each element of the path is the name of a field of an object, or the
+/// index of an element of an array (see `json_path_index`). None when the
+/// document has no value at the path, or when an element is NULL. A scalar
+/// has no value at a path that is not empty, and the empty path gives the
+/// whole document.
+fn json_path_value(document: &str, path: Vec<Option<String>>) -> Result<Option<&str>> {
+    // A NULL element gives NULL, as a NULL key of `->` does.
+    let Some(path) = path.into_iter().collect::<Option<Vec<_>>>() else {
+        return Ok(None);
+    };
+    let mut value = document.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    if path.is_empty() {
+        // The walk reads the whole document, so that a bad escape or deep
+        // nesting anywhere in it errors as it does for a path that is not
+        // empty.
+        walk_json_members(value, |_, _| {})?;
+    }
+    for element in &path {
+        let key = match value.as_bytes()[0] {
+            b'{' => JsonKey::Field(element),
+            b'[' => match json_path_index(element) {
+                Some(index) => JsonKey::Index(index),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        match json_field_span(value, &key)? {
+            Some(found) => value = found,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(value))
+}
+
+/// The index of an array element that the path element `text` of `#>` gives,
+/// as PostgreSQL reads it with strtoint(): a decimal integer that fits in 32
+/// bits, after white space and an optional sign. None when `text` is not one,
+/// and then the path leads to no value.
+fn json_path_index(text: &str) -> Option<i64> {
+    let number = text.trim_start_matches([' ', '\t', '\n', '\u{b}', '\u{c}', '\r']);
+    let digits = number.strip_prefix(['+', '-']).unwrap_or(number);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<i32>().ok().map(i64::from)
+}
+
+/// The names of the fields of the object `json`, or the string elements of
+/// the array `json`: the keys that `?` finds. A scalar string is an array
+/// with one element in jsonb, and another scalar has no keys. `json` must be
+/// valid JSON.
+fn json_top_level_keys(json: &str) -> Result<HashSet<String>> {
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    skip_json_whitespace(bytes, &mut pos);
+    if bytes[pos] == b'"' {
+        return Ok(HashSet::from([decode_json_string(json, &mut pos)?]));
+    }
+    let mut keys = HashSet::new();
+    let mut strings = Vec::new();
+    walk_json_members(json, |name, value| match name {
+        Some(name) => {
+            keys.insert(name);
+        }
+        None if value.starts_with('"') => strings.push(value),
+        None => {}
+    })?;
+    for string in strings {
+        keys.insert(decode_json_string(string, &mut 0)?);
+    }
+    Ok(keys)
+}
+
+/// The elements of the text array `value`, an argument of `func`, with None
+/// for a NULL element, or None when `value` is NULL. A text value, such as a
+/// string literal on the right of `?|`, `?&`, `#>` and `#>>`, is read as an
+/// array literal, such as `{a,b}`, as PostgreSQL reads a string literal for a
+/// text array.
+fn text_array_elements(func: &str, value: &Value) -> Result<Option<Vec<Option<String>>>> {
+    let elements = match value {
+        Value::Null => return Ok(None),
+        // FIXME(pg-catalog): This reads each text value as a text array literal, because a value does not carry its PostgreSQL type. PostgreSQL reads only a string literal or a parameter without a type so: pg_operator has `?|`, `?&`, `#>` and `#>>` only with a text[] right operand, so `j ?| '{a}'::text` fails with 42883. An expression tree that carries PostgreSQL types replaces this.
+        Value::Text(text) => {
+            turso_core::parse_text_array_of_texts(text.as_str()).ok_or_else(|| {
+                sqlstate_error(
+                    SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                    format!("malformed array literal: \"{}\"", text.as_str()),
+                    None,
+                )
+            })?
+        }
+        Value::Blob(_) => turso_core::array_values_from_any(value)
+            .ok_or_else(|| undefined_function(func, &["jsonb", "bytea"]))?,
+        Value::Numeric(_) => return Err(undefined_function(func, &["jsonb", pg_type_name(value)])),
+    };
+    elements
+        .into_iter()
+        .map(|element| match element {
+            Value::Null => Ok(None),
+            Value::Text(text) => Ok(Some(text.as_str().to_string())),
+            // An array of numbers or of arrays: PostgreSQL has these
+            // functions only for text arrays.
+            other => Err(undefined_function(
+                func,
+                &["jsonb", &format!("{}[]", pg_type_name(&other))],
+            )),
+        })
+        .collect::<Result<_>>()
+        .map(Some)
+}
+
+/// The field or array element that `->`, `->>`, `#>` and `#>>` look up.
 enum JsonKey<'a> {
     /// The field with this name of an object.
     Field(&'a str),
@@ -1070,21 +1343,9 @@ enum JsonKey<'a> {
 /// The JSON text of the value at `key` in the JSON document `json`, or None
 /// when the document has no such value. `op` is the operator, for errors.
 fn find_json_field(json: &Value, key: &Value, op: &str) -> Result<Option<String>> {
-    // A json or jsonb column reads as text. A blob is a bytea, which has no
-    // -> in PostgreSQL.
-    let json = match json {
-        Value::Null => return Ok(None),
-        Value::Text(text) => text.as_str(),
-        Value::Numeric(_) | Value::Blob(_) => {
-            return Err(undefined_operator(
-                pg_type_name(json),
-                op,
-                pg_type_name(key),
-            ))
-        }
+    let Some(json) = json_document(json, op, pg_type_name(key))? else {
+        return Ok(None);
     };
-    // Validate first, so the walk below can assume well-formed input.
-    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
     let key = match key {
         Value::Null => return Ok(None),
         Value::Text(name) => JsonKey::Field(name.as_str()),
@@ -1092,6 +1353,24 @@ fn find_json_field(json: &Value, key: &Value, op: &str) -> Result<Option<String>
         other => return Err(undefined_operator("jsonb", op, pg_type_name(other))),
     };
     Ok(json_field_span(json, &key)?.map(str::to_string))
+}
+
+/// The JSON document that `value`, the left operand of the JSON operator
+/// `op`, holds, or None when `value` is NULL. The document is checked, so
+/// that the code that reads it can assume valid JSON. A json or jsonb value
+/// reads as text. A number, or a blob, which is a bytea, has no JSON
+/// operators in PostgreSQL. `right_type` is the type of the right operand,
+/// for that error.
+fn json_document<'a>(value: &'a Value, op: &str, right_type: &str) -> Result<Option<&'a str>> {
+    let json = match value {
+        Value::Null => return Ok(None),
+        Value::Text(text) => text.as_str(),
+        Value::Numeric(_) | Value::Blob(_) => {
+            return Err(undefined_operator(pg_type_name(value), op, right_type))
+        }
+    };
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    Ok(Some(json))
 }
 
 /// The JSON text of the value at `key` in `json`, which must be valid JSON.
@@ -1556,7 +1835,7 @@ fn write_json_string(text: &str, json: &mut String) {
 /// A float8 in PostgreSQL's text form: the shortest digits that read back as
 /// the same number, in scientific notation when the exponent is below -4 or
 /// 15 or more, as in `1e+20` and `1e-05`.
-fn float8_text(value: f64) -> String {
+pub(crate) fn float8_text(value: f64) -> String {
     if value.is_infinite() {
         return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
@@ -1885,13 +2164,9 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
     let escape = args
         .get(1)
         .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
-    match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
-        Ok(regex) => Ok(Some(regex)),
-        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
-            Err(sqlstate_error(sqlstate, message, None))
-        }
-        Err(error) => Err(LimboError::ParseError(error.to_string())),
-    }
+    turso_pg_parser::translator::similar_to_regex(&pattern, &escape)
+        .map(Some)
+        .map_err(crate::error::sql_parse_error)
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
@@ -1904,7 +2179,7 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
 
 /// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It prints unknown for an oid it does not list, where PostgreSQL prints the name of that pg_type row, and character for bpchar with typemod -1, where PostgreSQL prints bpchar. A lookup in a pg_type table replaces this.
 /// The name of a type as `format_type` prints it.
-fn format_type(type_oid: i64, typemod: i64) -> String {
+pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
         16 => "boolean".to_string(),
         17 => "bytea".to_string(),
@@ -1986,13 +2261,29 @@ fn to_char_not_supported() -> LimboError {
 
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
-fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
-    let s = match input {
-        Value::Text(t) => t.as_str().to_string(),
-        Value::Null => return None,
-        v => v.to_string(),
+fn exec_pg_input_is_valid(
+    conn: &Arc<Connection>,
+    input: &Value,
+    type_name: &Value,
+) -> Result<Option<Boolean>> {
+    let Value::Text(type_name) = type_name else {
+        return Ok(None);
     };
-    Some(Boolean(validate_pg_input(&s, type_name).is_none()))
+    let input = match input {
+        Value::Text(text) => text.as_str().to_string(),
+        Value::Null => return Ok(None),
+        other => other.to_string(),
+    };
+    // FIXME(pg-class): Catalog row types are missing from type lookup. PostgreSQL
+    // gives pg_class a composite row type whose INPUT is record_in, so
+    // pg_input_is_valid('1', 'pg_class') returns false for a malformed record.
+    // We instead raise 42704 before checking the input. The pg_class work must
+    // register relation row types in pg_type, expose their field types, and
+    // connect them to record_in. Then flip pg-input-is-valid-catalog-row-type
+    // in postgres/conformance/pg-sqltests/functions.sqltest: keep PostgreSQL's
+    // expected result and remove @compat-gap and the expect @tursopg block.
+    let error = validate_pg_input(conn, &input, type_name.as_str())?;
+    Ok(Some(Boolean(error.is_none())))
 }
 
 fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {
@@ -2028,9 +2319,19 @@ fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
 }
 
 fn undefined_operator(left_type: &str, op: &str, right_type: &str) -> LimboError {
+    undefined_operator_of(op, &[left_type, right_type])
+}
+
+/// The 42883 error for an operator with one operand (a prefix operator) or two.
+pub(crate) fn undefined_operator_of(op: &str, operand_types: &[&str]) -> LimboError {
+    let signature = match operand_types {
+        [operand] => format!("{op} {operand}"),
+        [left, right] => format!("{left} {op} {right}"),
+        _ => unreachable!("an operator has one or two operands"),
+    };
     sqlstate_error(
         SQLSTATE_UNDEFINED_FUNCTION,
-        format!("operator does not exist: {left_type} {op} {right_type}"),
+        format!("operator does not exist: {signature}"),
         None,
     )
 }
@@ -2047,97 +2348,88 @@ fn pg_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// FIXME(pg-catalog): This hand-codes the input function (typinput) of each type by type name. A call to the typinput function of the pg_type entry replaces this.
-/// Validate input for a PostgreSQL type, returning error info if invalid.
-///
-/// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
-/// Used by both `pg_input_error_info` (table-valued) and `pg_input_is_valid` (scalar).
-pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, String)> {
-    let trimmed = input.trim();
+/// What is wrong with text as input of a type: PostgreSQL's message and
+/// SQLSTATE.
+pub(crate) type InputError = (String, String);
 
-    // Extract base type and optional length modifier, e.g. "varchar(4)" → ("varchar", Some(4))
-    let (base_type, type_mod) = match type_name.find('(') {
-        Some(pos) => {
-            let base = type_name[..pos].trim();
-            let mod_str = type_name[pos + 1..].trim_end_matches(')').trim();
-            let modifier = mod_str.parse::<usize>().ok();
-            (base.to_lowercase(), modifier)
-        }
-        None => (type_name.to_lowercase(), None),
+/// What is wrong with `input` as text of the type that `type_name` names, or
+/// None when the type reads it. `type_name` is resolved as a statement
+/// resolves a type name (see `lookup_type_name`), so a name of no type fails
+/// with 42704. `pg_input_is_valid` and `pg_input_error_info` both read this.
+pub(crate) fn validate_pg_input(
+    conn: &Arc<Connection>,
+    input: &str,
+    type_name: &str,
+) -> Result<Option<InputError>> {
+    let ty = lookup_type_name(conn, type_name)?;
+    // FIXME(pg-catalog): The text of an array, of an enum or a domain, and of a row type is not checked, because none of them has an INPUT. An INPUT for each type made by CREATE TYPE and for arrays replaces this refusal (see `Type::input`).
+    let element_name = match ty.kind {
+        NamedTypeKind::BuiltIn { typname, .. } => typname,
+        NamedTypeKind::Custom | NamedTypeKind::RowOfRelation => ty.written_name.as_str(),
     };
+    let not_supported = || {
+        sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "checking the input of type {element_name}{} is not supported",
+                "[]".repeat(ty.array_dimensions as usize)
+            ),
+            None,
+        )
+    };
+    let NamedTypeKind::BuiltIn { oid, typname } = ty.kind else {
+        return Err(not_supported());
+    };
+    if ty.array_dimensions > 0 {
+        return Err(not_supported());
+    }
+    if let Some(read) = type_input(oid) {
+        return Ok(input_error_of(read(input)));
+    }
+    let modifier = ty
+        .modifiers
+        .first()
+        .and_then(|modifier| usize::try_from(*modifier).ok());
+    hand_written_input_error(typname, modifier, input).ok_or_else(not_supported)
+}
 
-    match base_type.as_str() {
-        "bool" | "boolean" => {
-            if parse_pg_bool(trimmed).is_some() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type boolean: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            }
-        }
-        "int2" | "smallint" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type smallint"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type smallint: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type integer"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type integer: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int8" | "bigint" => match trimmed.parse::<i64>() {
-            Ok(_) => None,
-            Err(_) => {
-                if trimmed.parse::<i128>().is_ok() {
-                    Some((
-                        format!("value \"{input}\" is out of range for type bigint"),
-                        "22003".to_string(),
-                    ))
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bigint: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
-                }
-            }
-        },
-        "float4" | "real" => match trimmed.parse::<f32>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type real"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type real: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "float8" | "double precision" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type double precision"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type double precision: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "numeric" | "decimal" => match trimmed.parse::<f64>() {
+/// What is wrong with `text` as input of the built-in type whose pg_type row
+/// is named `typname`, for a caller that already holds the type.
+pub(crate) fn built_in_input_error(typname: &str, text: &str) -> Option<InputError> {
+    let read = built_in_type_named(typname)
+        .filter(|(_, _, dimensions_of_name)| *dimensions_of_name == 0)
+        .and_then(|(oid, _, _)| type_input(oid));
+    match read {
+        Some(read) => input_error_of(read(text)),
+        None => hand_written_input_error(typname, None, text).flatten(),
+    }
+}
+
+fn input_error_of(read: Result<Value>) -> Option<InputError> {
+    match read {
+        Ok(_) => None,
+        Err(LimboError::Dialect(error)) => Some((error.message, error.code.to_string())),
+        Err(other) => Some((
+            other.to_string(),
+            SQLSTATE_INVALID_TEXT_REPRESENTATION.to_string(),
+        )),
+    }
+}
+
+/// FIXME(pg-catalog): This hand-codes the input function (typinput) of each built-in type that has no INPUT yet, by the name of its pg_type row. An arm goes away when its type gets an INPUT (see `type_input`).
+/// What is wrong with `input` as text of the built-in type `typname`, with
+/// the length `type_mod` when the type name gave one. The outer None is a
+/// type this function does not read.
+fn hand_written_input_error(
+    typname: &str,
+    type_mod: Option<usize>,
+    input: &str,
+) -> Option<Option<InputError>> {
+    let trimmed = input.trim();
+    Some(match typname {
+        "float4" => float_input_error(input, "real", true),
+        "float8" => float_input_error(input, "double precision", false),
+        "numeric" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_nan() || v.is_infinite() => Some((
                 format!("invalid input syntax for type numeric: \"{input}\""),
                 "22P02".to_string(),
@@ -2149,24 +2441,24 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             )),
         },
         "text" => None,
-        "varchar" | "character varying" => {
+        "varchar" => {
             if let Some(max_len) = type_mod {
                 if trimmed.chars().count() > max_len {
-                    return Some((
+                    return Some(Some((
                         format!("value too long for type character varying({max_len})"),
                         "22001".to_string(),
-                    ));
+                    )));
                 }
             }
             None
         }
-        "char" | "character" => {
+        "bpchar" => {
             if let Some(max_len) = type_mod {
                 if trimmed.chars().count() > max_len {
-                    return Some((
+                    return Some(Some((
                         format!("value too long for type character({max_len})"),
                         "22001".to_string(),
-                    ));
+                    )));
                 }
             }
             None
@@ -2183,18 +2475,14 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             }
         }
         "date" => check_temporal_input(input, "date"),
-        "timestamp" | "timestamp without time zone" => check_temporal_input(input, "timestamp"),
-        "timestamptz" | "timestamp with time zone" => check_temporal_input(input, "timestamptz"),
-        "time" | "time without time zone" => check_temporal_input(input, "time"),
+        "timestamp" => check_temporal_input(input, "timestamp"),
+        "timestamptz" => check_temporal_input(input, "timestamptz"),
+        "time" => check_temporal_input(input, "time"),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 None
             } else {
-                let type_label = if base_type == "jsonb" {
-                    "jsonb"
-                } else {
-                    "json"
-                };
+                let type_label = if typname == "jsonb" { "jsonb" } else { "json" };
                 Some((
                     format!("invalid input syntax for type {type_label}: \"{input}\""),
                     "22P02".to_string(),
@@ -2224,16 +2512,16 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 // If there's a prefix, validate it
                 if let Some(prefix_str) = trimmed.split('/').nth(1) {
                     if prefix_str.parse::<u8>().is_err() {
-                        return Some((
-                            format!("invalid input syntax for type {base_type}: \"{input}\""),
+                        return Some(Some((
+                            format!("invalid input syntax for type {typname}: \"{input}\""),
                             "22P02".to_string(),
-                        ));
+                        )));
                     }
                 }
                 None
             } else {
                 Some((
-                    format!("invalid input syntax for type {base_type}: \"{input}\""),
+                    format!("invalid input syntax for type {typname}: \"{input}\""),
                     "22P02".to_string(),
                 ))
             }
@@ -2253,19 +2541,31 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "oid" => {
-            if trimmed.parse::<u32>().is_ok() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type oid: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            }
-        }
-        _ => Some((
-            format!("type \"{type_name}\" does not exist"),
-            "42704".to_string(),
+        _ => return None,
+    })
+}
+
+/// The error of text that is not a float8 or float4, or is too large for it.
+/// `inf` and `infinity` are valid, with or without a sign, in any case.
+fn float_input_error(input: &str, type_name: &str, single: bool) -> Option<(String, String)> {
+    let trimmed = input.trim();
+    let is_infinity_word = matches!(
+        trimmed
+            .trim_start_matches(['+', '-'])
+            .to_ascii_lowercase()
+            .as_str(),
+        "inf" | "infinity"
+    );
+    match trimmed.parse::<f64>() {
+        Ok(_) if is_infinity_word => None,
+        Ok(v) if v.is_infinite() || (single && (v as f32).is_infinite()) => Some((
+            format!("value \"{input}\" is out of range for type {type_name}"),
+            "22003".to_string(),
+        )),
+        Ok(_) => None,
+        Err(_) => Some((
+            format!("invalid input syntax for type {type_name}: \"{input}\""),
+            "22P02".to_string(),
         )),
     }
 }

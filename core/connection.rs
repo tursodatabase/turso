@@ -2872,6 +2872,13 @@ impl Connection {
         self.db.dialect()
     }
 
+    /// The dialect of the database, as a reference. Opcodes call this for
+    /// each row: a clone of the `Arc` and its drop each change the shared
+    /// reference count with an atomic operation.
+    pub(crate) fn dialect_ref(&self) -> &dyn crate::Dialect {
+        self.db.dialect_ref()
+    }
+
     pub fn register_internal_vtab<T>(&self, table: T) -> Result<String>
     where
         T: crate::vtab::InternalVirtualTable + 'static,

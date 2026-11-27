@@ -1,0 +1,16 @@
+[package]
+name = "turso_pg_scanner"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL SQL statement scanner"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_pg_scanner"
+path = "lib.rs"

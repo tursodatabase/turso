@@ -27,5 +27,6 @@ info:
 ---
 QUERY PLAN
 |--SCAN categories AS c
+|--MATERIALIZE category_stats
+|  `--SCAN products USING INDEX idx_products_category
 `--SEARCH cs USING INDEX ephemeral_subquery_t2 (category_id=? AND product_count>?)
-   `--SCAN products USING INDEX idx_products_category

@@ -21,14 +21,15 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN products USING COVERING INDEX idx_products_price
+|--MATERIALIZE prices
+|  `--SCAN products USING COVERING INDEX idx_products_price
 |--SCAN prices AS p1
 `--CORRELATED SCALAR SUBQUERY 1
    `--SCAN prices AS p2
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4           p5  comment
-   0  Init              0  43   0                0  Start at 43
+   0  Init              0  44   0                0  Start at 44
    1  Gosub             3   3   0                0
    2  Goto              0  14   0                0
    3  Once             13   0   0                0  goto 13
@@ -43,17 +44,17 @@ addr  opcode           p1  p2  p3  p4           p5  comment
   12  Next              1   7   0                1
   13  Return            3   0   0                0
   14  Gosub             3   3   0                0
-  15  Rewind            0  42   0                0  Rewind  ephemeral()
+  15  Rewind            0  43   0                0  Rewind  ephemeral()
   16    Column          0   0   2                0  r[2]=ephemeral().price
   17    Copy            2   9   0                0  r[9]=r[2]
-  18    Ge              9  10  41  Binary        0  if r[9]>=r[10] goto 41
+  18    Ge              9  10  42  Binary        0  if r[9]>=r[10] goto 42
   19    BeginSubrtn    11   0   0                0  r[11]=NULL
   20    Null            0   1   0                0  r[1]=NULL
   21    Gosub           3   3   0                0
   22    OpenDup         2   0   0                0  new_cursor=2, original_cursor=0
   23    Null            0  14   0                0  r[14]=NULL
   24    Integer         1  15   0                0  r[15]=1; LIMIT counter
-  25    IfNot          15  38   0                0  if !r[15] goto 38
+  25    IfNot          15  39   0                0  if !r[15] goto 39
   26    Last            2  35   0                0
   27      Column        2   0  12                0  r[12]=ephemeral().price
   28      Copy         12  17   0                0  r[17]=r[12]
@@ -66,11 +67,12 @@ addr  opcode           p1  p2  p3  p4           p5  comment
   35    AggFinal        0  14   0  max           0  accum=r[14]
   36    Copy           14  13   0                0  r[13]=r[14]
   37    Copy           13   1   0                0  r[1]=r[13]
-  38    Return         11   0   1                0
-  39    Copy            1   7   0                0  r[7]=r[1]
-  40    ResultRow       7   1   0                0  output=r[7]
-  41  Next              0  16   0                0
-  42  Halt              0   0   0                0
-  43  Transaction       0   1  14                0  iDb=0 tx_mode=Read
-  44  Integer         100  10   0                0  r[10]=100
-  45  Goto              0   1   0                0
+  38    DecrJumpZero   15  39   0                0  if (--r[15]==0) goto 39
+  39    Return         11   0   1                0
+  40    Copy            1   7   0                0  r[7]=r[1]
+  41    ResultRow       7   1   0                0  output=r[7]
+  42  Next              0  16   0                0
+  43  Halt              0   0   0                0
+  44  Transaction       0   1  14                0  iDb=0 tx_mode=Read
+  45  Integer         100  10   0                0  r[10]=100
+  46  Goto              0   1   0                0

@@ -434,6 +434,21 @@ expect {
     1
 }
 
+# PostgreSQL has no = operator for timestamp[] with timestamptz[], so tursopg
+# keeps refusing it although it allows the scalar comparison.
+@compat-gap "operator:timestamp[] = timestamptz[]"
+test datetime-compare-timestamp-array-eq-timestamptz-array {
+    SELECT ARRAY['2024-01-05 10:00:00'::timestamp] = ARRAY['2024-01-05 10:00:00+00'::timestamptz];
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone\[\] = timestamp with time zone\[\]
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type timestamp\[\] with type timestamptz\[\]
+}
+
 # A date compared with a timestamp or a timestamptz fails in tursopg, where
 # PostgreSQL reads the date as midnight of that day in the other type. A date
 # and a timestamp are stored as different texts, and no rule says how one
@@ -904,12 +919,10 @@ expect @tursopg error {
     type "time" is not supported
 }
 
-# A timestamp compared with a timestamptz fails in tursopg, where PostgreSQL
-# reads the timestamp as a timestamptz in the session time zone. Stored
-# timestamps and timestamptz values are different texts, so comparing them
-# as stored would give wrong rows;
-# no rule says how one converts into the other, so the comparison is refused
-# whichever way the query is run.
+# A timestamp compared with a timestamptz works in tursopg only because the
+# session time zone is always UTC, so both store the same UTC text (a
+# hard-coded exception, see timestamp_compared_with_timestamptz in
+# core/translate/collate.rs). A UNION or JOIN USING of the two is still refused.
 
 setup datetime-compare-ts-tz {
     CREATE TABLE a (id int, ts timestamp);
@@ -918,7 +931,6 @@ setup datetime-compare-ts-tz {
     INSERT INTO b VALUES (1, '2024-01-05 10:00:00+00'), (2, '2024-01-05 12:00:00+02');
 }
 
-@compat-gap "operator:timestamp = timestamptz"
 @setup datetime-compare-ts-tz
 test datetime-compare-timestamp-eq-timestamptz-scan {
     SELECT a.id, b.id FROM a, b WHERE a.ts = b.tz ORDER BY a.id, b.id;
@@ -927,9 +939,94 @@ expect {
     2|1
     2|2
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type timestamp with type timestamptz
+
+# The index on b.tz makes the join a seek, and the IN forms compare the two
+# types through an ephemeral index.
+@setup datetime-compare-ts-tz
+test datetime-compare-timestamp-timestamptz-seek-and-in {
+    CREATE INDEX b_tz ON b (tz);
+    SELECT a.id, b.id FROM a, b WHERE a.ts = b.tz ORDER BY a.id, b.id;
+    SELECT id FROM a WHERE ts IN (SELECT tz FROM b);
+    SELECT id FROM b WHERE tz IN (SELECT ts FROM a);
+    SELECT a.id, b.id FROM a, b WHERE a.ts IN (b.tz, b.tz) ORDER BY a.id, b.id;
+}
+expect {
+    2|1
+    2|2
+    2
+    1
+    2
+    2|1
+    2|2
+}
+
+# PostgreSQL refuses the comparison of a timestamp with a timestamptz in a
+# generated column, an index expression and a partial index predicate, because
+# its comparison functions are STABLE and these must be IMMUTABLE. A CHECK
+# constraint allows it. (FIXME(pg-catalog): HACK, see
+# refuse_timestamp_timestamptz_comparison_in_schema_expr in
+# core/translate/collate.rs.)
+
+test datetime-compare-ts-tz-generated-column-is-an-error {
+    CREATE TABLE gc (ts timestamp, f boolean GENERATED ALWAYS AS (ts > '2026-01-01+00'::timestamptz) STORED);
+}
+@sqlstate 42P17
+expect error {
+    generation expression is not immutable
+}
+
+test datetime-compare-ts-tz-alter-add-generated-column-is-an-error {
+    CREATE TABLE ga (ts timestamp);
+    ALTER TABLE ga ADD COLUMN f boolean GENERATED ALWAYS AS (ts > '2026-01-01+00'::timestamptz) STORED;
+}
+@sqlstate 42P17
+expect error {
+    generation expression is not immutable
+}
+
+test datetime-compare-ts-tz-index-expression-is-an-error {
+    CREATE TABLE ie (ts timestamp);
+    CREATE INDEX ie_i ON ie ((ts > '2026-01-01+00'::timestamptz));
+}
+@sqlstate 42P17
+expect error {
+    functions in index expression must be marked IMMUTABLE
+}
+
+test datetime-compare-ts-tz-partial-index-is-an-error {
+    CREATE TABLE ip (ts timestamp);
+    CREATE INDEX ip_i ON ip (ts) WHERE ts > '2026-01-01+00'::timestamptz;
+}
+@sqlstate 42P17
+expect error {
+    functions in index predicate must be marked IMMUTABLE
+}
+
+test datetime-compare-ts-tz-index-expression-case-operand-is-an-error {
+    CREATE TABLE ic (ts timestamp);
+    CREATE INDEX ic_i ON ic ((CASE ts WHEN '2026-01-01+00'::timestamptz THEN 1 END));
+}
+@sqlstate 42P17
+expect error {
+    functions in index expression must be marked IMMUTABLE
+}
+
+test datetime-compare-ts-tz-partial-index-row-value-is-an-error {
+    CREATE TABLE ir (ts timestamp, tz timestamptz);
+    CREATE INDEX ir_i ON ir (ts) WHERE (ts, 1) = (tz, 1);
+}
+@sqlstate 42P17
+expect error {
+    functions in index predicate must be marked IMMUTABLE
+}
+
+test datetime-compare-ts-tz-check-constraint-is-allowed {
+    CREATE TABLE ck (ts timestamp, CHECK (ts > '2026-01-01+00'::timestamptz));
+    INSERT INTO ck VALUES ('2026-02-01 00:00:00');
+    SELECT ts FROM ck;
+}
+expect {
+    2026-02-01 00:00:00
 }
 
 @compat-gap "operator:timestamp UNION timestamptz"
@@ -947,10 +1044,24 @@ expect @tursopg error {
     cannot compare type timestamp with type timestamptz
 }
 
+@compat-gap "operator:timestamp JOIN USING timestamptz"
+@setup datetime-compare-ts-tz
+test datetime-result-join-using {
+    CREATE TABLE u1 (k timestamp, v int);
+    CREATE TABLE u2 (k timestamptz, w int);
+    INSERT INTO u1 VALUES ('2024-01-05 10:00:00', 1);
+    INSERT INTO u2 VALUES ('2024-01-05 10:00:00+00', 10);
+    SELECT k FROM u1 JOIN u2 USING (k);
+}
+expect {
+    2024-01-05 10:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
 # PostgreSQL has no operator that compares a timestamptz with a varchar.
-# tursopg does not know which type pairs PostgreSQL compares, so it refuses
-# every comparison of two different custom types with 0A000.
-@compat-gap "operator:timestamptz = varchar"
 test datetime-compare-timestamptz-eq-varchar-is-an-error {
     CREATE TABLE tv (tz timestamptz, v varchar(40));
     INSERT INTO tv VALUES ('2024-01-05 02:00:00+02', '2024-01-05 02:00:00+02');
@@ -959,10 +1070,6 @@ test datetime-compare-timestamptz-eq-varchar-is-an-error {
 @sqlstate 42883
 expect error {
     operator does not exist
-}
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type timestamptz with type varchar
 }
 
 # lag's result is one type in PostgreSQL: the timestamp rows convert to

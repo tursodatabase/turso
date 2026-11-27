@@ -11,21 +11,48 @@ use thiserror::Error;
 
 pub mod sqlstate;
 pub mod translator;
+mod type_name;
 
 /// The frontend function that the translator calls for `timestamp + interval`
 /// and `timestamp - interval` with an interval literal. Its arguments are the
 /// timestamp and the interval's months, days and microseconds.
 pub const TIMESTAMP_PLUS_INTERVAL_FUNCTION: &str = "pg_timestamp_plus_interval";
 
+pub use pg_query_error::PgQueryError;
+
+mod pg_query_error {
+    /// An error of pg_query, such as SQL that PostgreSQL's grammar refuses.
+    /// It is built only from a `pg_query::Error`, so an error of the
+    /// translator cannot take this form and lose its SQLSTATE.
+    #[derive(Debug)]
+    pub struct PgQueryError(String);
+
+    impl From<pg_query::Error> for PgQueryError {
+        fn from(error: pg_query::Error) -> Self {
+            Self(error.to_string())
+        }
+    }
+
+    impl std::fmt::Display for PgQueryError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ParseError {
+    /// An error of pg_query, without a SQLSTATE.
     #[error("{0}")]
-    ParseError(String),
+    PgQuery(PgQueryError),
     /// An error that PostgreSQL reports with this SQLSTATE.
     #[error("{message}")]
     Sqlstate {
         sqlstate: &'static str,
         message: String,
+        /// PostgreSQL's HINT field: how to get the same result in a way
+        /// that is supported. The message does not repeat it.
+        hint: Option<String>,
     },
     /// A schema-qualified name of an object that the translator accepts only
     /// without a schema. If the schema does not exist, PostgreSQL reports the
@@ -47,11 +74,52 @@ pub enum ParseError {
 }
 
 impl ParseError {
+    /// An error that PostgreSQL reports with SQLSTATE `sqlstate`.
+    pub(crate) fn sqlstate(sqlstate: &'static str, message: impl Into<String>) -> Self {
+        Self::Sqlstate {
+            sqlstate,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    /// PostgreSQL's error for an option given twice or with options that
+    /// exclude each other.
+    pub(crate) fn conflicting_options() -> Self {
+        Self::syntax_error("conflicting or redundant options")
+    }
+
     /// PostgreSQL's `feature_not_supported` error, reading "`what` is not supported".
     pub(crate) fn not_supported(what: impl std::fmt::Display) -> Self {
-        Self::Sqlstate {
-            sqlstate: sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
-            message: format!("{what} is not supported"),
+        Self::sqlstate(
+            sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("{what} is not supported"),
+        )
+    }
+
+    /// PostgreSQL's `syntax_error`, for SQL that pg_query accepts but
+    /// PostgreSQL refuses in a later step.
+    pub(crate) fn syntax_error(message: impl Into<String>) -> Self {
+        Self::sqlstate(sqlstate::SQLSTATE_SYNTAX_ERROR, message)
+    }
+
+    /// PostgreSQL's `internal_error`, which PostgreSQL reports for an error
+    /// raised without a SQLSTATE.
+    pub(crate) fn internal_error(message: impl Into<String>) -> Self {
+        Self::sqlstate(sqlstate::SQLSTATE_INTERNAL_ERROR, message)
+    }
+
+    /// The error with the HINT `hint`.
+    pub(crate) fn with_hint(self, hint: impl Into<String>) -> Self {
+        match self {
+            Self::Sqlstate {
+                sqlstate, message, ..
+            } => Self::Sqlstate {
+                sqlstate,
+                message,
+                hint: Some(hint.into()),
+            },
+            other => unreachable!("a hint on an error without a SQLSTATE: {other:?}"),
         }
     }
 }
@@ -83,6 +151,8 @@ impl FunctionTypeUse {
     }
 }
 
+pub use type_name::{parse_type_name, WrittenTypeName};
+
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     pg_query::parse(sql, pg_query::ParserOptions::DEFAULT).map_err(parse_error)
@@ -94,12 +164,9 @@ pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
 fn parse_error(error: pg_query::Error) -> ParseError {
     match &error {
         pg_query::Error::Parse(message) if is_reserved_role_name_error(message) => {
-            ParseError::Sqlstate {
-                sqlstate: sqlstate::SQLSTATE_RESERVED_NAME,
-                message: message.clone(),
-            }
+            ParseError::sqlstate(sqlstate::SQLSTATE_RESERVED_NAME, message.clone())
         }
-        _ => ParseError::ParseError(error.to_string()),
+        _ => ParseError::PgQuery(error.into()),
     }
 }
 
@@ -147,8 +214,7 @@ fn first_statement(parsed: &ParseResult) -> Option<&NodeEnum> {
 /// FUNCTION do not end the statement. Text with a syntax error is an error,
 /// because PostgreSQL runs none of the statements in it.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
-    let parts =
-        pg_query::split_with_parser(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let parts = pg_query::split_with_parser(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
     Ok(parts
         .into_iter()
         .map(|s| s.trim().to_string())
@@ -164,7 +230,7 @@ pub fn get_tables(sql: &str) -> Result<Vec<String>, ParseError> {
 
 /// Normalize a query (replace constants with $1, $2, etc.)
 pub fn normalize(sql: &str) -> Result<String, ParseError> {
-    pg_query::normalize(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::normalize(sql).map_err(|e| ParseError::PgQuery(e.into()))
 }
 
 /// Get a fingerprint for a query (for caching/deduplication)
@@ -175,7 +241,7 @@ pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
         pg_query::FingerprintOptions::DEFAULT,
     )
     .map(|fp| fp.hex)
-    .map_err(|e| ParseError::ParseError(e.to_string()))
+    .map_err(|e| ParseError::PgQuery(e.into()))
 }
 
 /// Quote an identifier following PostgreSQL's server-side quote_identifier()
@@ -229,9 +295,7 @@ pub fn write_out_serial_column(
     let parse_result = parse(sql)?;
     let nodes = parse_result.protobuf.nodes();
     let Some((NodeRef::CreateStmt(create), ..)) = nodes.first() else {
-        return Err(ParseError::ParseError(
-            "not a CREATE TABLE statement".to_string(),
-        ));
+        return Err(ParseError::internal_error("not a CREATE TABLE statement"));
     };
     let col_def = create
         .table_elts
@@ -240,7 +304,7 @@ pub fn write_out_serial_column(
             Some(Node::ColumnDef(col_def)) if col_def.colname == column => Some(col_def),
             _ => None,
         })
-        .ok_or_else(|| ParseError::ParseError(format!("no column \"{column}\"")))?;
+        .ok_or_else(|| ParseError::internal_error(format!("no column \"{column}\"")))?;
     let identity = col_def
         .constraints
         .iter()
@@ -275,7 +339,7 @@ pub fn write_out_serial_column(
     let type_name = col_def
         .type_name
         .as_ref()
-        .ok_or_else(|| ParseError::ParseError(format!("column \"{column}\" has no type")))?;
+        .ok_or_else(|| ParseError::internal_error(format!("column \"{column}\" has no type")))?;
     let type_word = type_name.names.last().and_then(|name| match &name.node {
         Some(Node::String(word)) => Some(word.sval.to_lowercase()),
         _ => None,
@@ -285,7 +349,7 @@ pub fn write_out_serial_column(
         Some("bigserial" | "serial8") => "bigint",
         Some("smallserial" | "serial2") => "smallint",
         _ => {
-            return Err(ParseError::ParseError(format!(
+            return Err(ParseError::internal_error(format!(
                 "column \"{column}\" is not a serial or identity column"
             )))
         }
@@ -445,7 +509,7 @@ pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseEr
 fn identity_constraint_end(sql: &str, location: usize) -> Result<usize, ParseError> {
     use pg_query::protobuf::Token;
 
-    let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
     let mut tokens = scan
         .tokens
         .iter()
@@ -453,7 +517,7 @@ fn identity_constraint_end(sql: &str, location: usize) -> Result<usize, ParseErr
         .skip_while(|token| token.token != Token::IdentityP as i32);
     let identity = tokens
         .next()
-        .ok_or_else(|| ParseError::ParseError("no IDENTITY at the location".to_string()))?;
+        .ok_or_else(|| ParseError::internal_error("no IDENTITY at the location"))?;
     let mut end = identity.end as usize;
     let mut rest = tokens.peekable();
     if rest
@@ -481,14 +545,14 @@ fn identity_constraint_end(sql: &str, location: usize) -> Result<usize, ParseErr
 fn qualified_name_end(sql: &str, location: usize) -> Result<usize, ParseError> {
     use pg_query::protobuf::Token;
 
-    let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
     let mut tokens = scan
         .tokens
         .iter()
         .skip_while(|token| (token.start as usize) < location);
     let first = tokens
         .next()
-        .ok_or_else(|| ParseError::ParseError("no name at the location".to_string()))?;
+        .ok_or_else(|| ParseError::internal_error("no name at the location"))?;
     let mut end = first.end as usize;
     let mut rest = tokens.peekable();
     if rest

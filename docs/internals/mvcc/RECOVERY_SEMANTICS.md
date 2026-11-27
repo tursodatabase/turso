@@ -50,6 +50,12 @@ Recovery classifies startup state using two checks:
 | 6 | No WAL + valid header, no frames (size <= `LOG_HDR_SIZE`) | No replay needed; timestamp state comes from metadata row. |
 | 7 | No WAL + empty log (0 bytes / `NoLog`) | Timestamp state loaded from metadata row if present; no replay. |
 
+A read-only open cannot write, so it handles cases 1 and 2 without completing the
+checkpoint: it leaves the WAL in place, reads the pages and the metadata row through
+it, and replays the logical-log frames above that boundary in memory only. This is
+the state a read-write open reaches after completing the checkpoint. Cases 3 and 5
+fail closed as in a read-write open.
+
 Notes:
 - After checkpoint, the log is truncated to 0 bytes. On restart this is case 7.
 - Torn tail in log body is treated as EOF (prefix frames remain valid).
@@ -100,13 +106,16 @@ logical ordering or fail-closed validation behavior.
 
 ## Test Coverage
 
-Key tests in `core/mvcc/database/tests.rs`:
+Key tests in `tests/integration/mvcc/`:
 - `test_bootstrap_completes_interrupted_checkpoint_with_committed_wal`
 - `test_bootstrap_rejects_committed_wal_without_log_file`
 - `test_bootstrap_rejects_torn_log_header_with_committed_wal`
 - `test_bootstrap_handles_committed_wal_when_log_truncated`
 - `test_bootstrap_ignores_wal_frames_without_commit_marker`
 - `test_bootstrap_rejects_corrupt_log_header_without_wal`
+- `test_read_only_open_reads_wal_left_by_passive_checkpoint`
+- `test_read_only_open_after_interrupted_checkpoint_reads_wal_in_place`
+- `test_read_only_open_rejects_torn_log_header_with_committed_wal`
 - `test_empty_log_recovery_loads_checkpoint_watermark`
 - `test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit`
 - `test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_recoverable`

@@ -218,6 +218,24 @@ pub fn translate_create_index(
         )
     })?;
 
+    // FIXME(pg-catalog): HACK. See refuse_timestamp_timestamptz_comparison_in_schema_expr.
+    for expr in columns.iter().filter_map(|col| col.expression()) {
+        crate::translate::collate::refuse_timestamp_timestamptz_comparison_in_schema_expr(
+            expr,
+            &tbl,
+            resolver,
+            crate::translate::collate::INDEX_EXPRESSION_NOT_IMMUTABLE,
+        )?;
+    }
+    if let Some(where_clause) = &where_clause {
+        crate::translate::collate::refuse_timestamp_timestamptz_comparison_in_schema_expr(
+            where_clause,
+            &tbl,
+            resolver,
+            crate::translate::collate::INDEX_PREDICATE_NOT_IMMUTABLE,
+        )?;
+    }
+
     // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be sorted
     // and on lossy types
     for col in &columns {

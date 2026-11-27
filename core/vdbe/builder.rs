@@ -1773,15 +1773,27 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn with_cte_materialization_eqp<T>(
+    /// Runs `emit`, which fills the table of a FROM clause subquery or CTE,
+    /// under a `MATERIALIZE <name>` step of the query plan. For a CTE, the
+    /// plan steps of the body are also listed in `cte_materializations`.
+    pub fn with_materialization_eqp<T>(
         &mut self,
-        cte_id: usize,
+        cte_id: Option<usize>,
         name: &str,
         emit: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        emit_explain!(
+            self,
+            true,
+            EqpDetail::Materialize {
+                cte_id,
+                name: name.to_string(),
+            }
+        );
         let insns_start = self.insns.len();
         let emitted = emit(self)?;
-        if self.mode.is_explain_query_plan() {
+        self.pop_current_parent_explain();
+        if let (Some(cte_id), true) = (cte_id, self.mode.is_explain_query_plan()) {
             let node_ids: Vec<usize> = (insns_start..self.insns.len())
                 .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
                 .collect();
@@ -2107,6 +2119,9 @@ impl ProgramBuilder {
                 }
                 Insn::IfPos { target_pc, .. } => {
                     resolve(target_pc, "IfPos")?;
+                }
+                Insn::IfNeg { target_pc, .. } => {
+                    resolve(target_pc, "IfNeg")?;
                 }
                 Insn::Next { pc_if_next, .. } => {
                     resolve(pc_if_next, "Next")?;

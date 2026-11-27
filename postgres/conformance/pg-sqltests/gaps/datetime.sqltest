@@ -15,8 +15,6 @@
 
 @database :memory:
 
-# A stored timestamptz cast to text loses its +00 offset.
-@compat-gap "cast:timestamptz -> text"
 test stored-timestamptz-text-cast {
     CREATE TABLE t (id int, created_at timestamptz);
     INSERT INTO t VALUES (1, '2026-01-01 10:00:00.25+02');
@@ -24,9 +22,6 @@ test stored-timestamptz-text-cast {
 }
 expect {
     2026-01-01 08:00:00.25+00
-}
-expect @tursopg {
-    2026-01-01 08:00:00.25
 }
 
 # Concatenation converts the value with the same cast.
@@ -43,8 +38,6 @@ expect @tursopg {
     at 2026-01-01 08:00:00.25
 }
 
-# Without the offset, the text comparison on tursopg returns no rows.
-@compat-gap "cast:timestamptz -> text"
 test where-timestamptz-text-compare {
     CREATE TABLE t (id int, ts timestamptz);
     INSERT INTO t VALUES (1, '2026-01-01 00:00Z'), (2, '2026-01-01 01:00+01'), (3, '2025-12-31 21:00-03');
@@ -54,8 +47,6 @@ expect {
     1
     2
     3
-}
-expect @tursopg {
 }
 
 @compat-gap "type:_timestamptz"
@@ -91,8 +82,6 @@ expect @tursopg {
     at 2026-01-31 10:00:00
 }
 
-# tursopg reads the integer as its text, as it reads an untyped parameter.
-@compat-gap "cast:int4 -> timestamptz"
 test insert-integer-into-timestamptz {
     CREATE TABLE t (created_at timestamptz);
     INSERT INTO t VALUES (20260101);
@@ -100,76 +89,48 @@ test insert-integer-into-timestamptz {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2026-01-01 00:00:00+00
-}
 
-@compat-gap "cast:int4 -> timestamptz"
 test insert-select-integer-into-timestamptz {
     CREATE TABLE t (ts timestamptz);
     CREATE TABLE s (v int); INSERT INTO s VALUES (20260101); INSERT INTO t SELECT v FROM s; SELECT ts FROM t;
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2026-01-01 00:00:00+00
-}
 
-# tursopg reads the integer of a subquery as its text.
-@compat-gap "cast:int4 -> timestamptz"
 test insert-subquery-integer-into-timestamptz {
     CREATE TABLE t (ts timestamptz);
     INSERT INTO t VALUES ((SELECT 20260101)); SELECT ts FROM t;
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2026-01-01 00:00:00+00
-}
 
-@compat-gap "operator:timestamptz > int4"
 test compare-timestamptz-with-integer {
     CREATE TABLE t (ts timestamptz);
     INSERT INTO t VALUES ('2026-01-01Z'); SELECT count(*) FROM t WHERE ts > 5;
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    0
-}
 
-@compat-gap "cast:int4 -> timestamptz"
 test update-timestamptz-to-integer {
     CREATE TABLE t (ts timestamptz);
     INSERT INTO t VALUES ('2026-01-01Z'); UPDATE t SET ts = 5; SELECT ts FROM t;
 }
 @sqlstate 42804
 expect error {}
-@sqlstate 22007
-expect @tursopg error {}
 
-# PostgreSQL has no assignment cast from text to timestamptz.
-@compat-gap "cast:text -> timestamptz"
 test insert-select-text-into-timestamptz {
     CREATE TABLE t (ts timestamptz);
     CREATE TABLE s (v text); INSERT INTO s VALUES ('2026-01-01 10:00Z'); INSERT INTO t SELECT v FROM s; SELECT ts FROM t;
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2026-01-01 10:00:00+00
-}
 
-@compat-gap "operator:timestamptz = text"
 test compare-timestamptz-with-text-column {
     CREATE TABLE t (ts timestamptz);
     CREATE TABLE s (v text); INSERT INTO s VALUES ('2026-01-01 10:00Z'); SELECT count(*) FROM t, s WHERE t.ts = s.v;
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    0
-}
 
 test timestamptz-cast-to-bigint {
     SELECT timestamptz '2026-01-31Z'::bigint;
@@ -382,7 +343,7 @@ test timestamptz-plus-untyped-literal {
 expect {
     2026-02-01 10:00:00+00
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # PostgreSQL resolves the untyped literal of now() - '7 days' as timestamptz.
@@ -394,7 +355,7 @@ test now-minus-untyped-literal {
 }
 @sqlstate 22007
 expect error {}
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "operator:timestamptz - timestamptz"
@@ -406,7 +367,7 @@ test timestamptz-minus-timestamptz {
 expect {
     2 days 02:30:00
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "operator:timestamp - timestamp"
@@ -418,7 +379,7 @@ test timestamp-minus-timestamp {
 expect {
     30 days 10:20:30.5
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # The common type of timestamptz and timestamp is timestamptz.
@@ -740,6 +701,22 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
+# The timestamp with timestamptz comparison reads the timestamp in the
+# session time zone. When SET TIME ZONE works, this test fails if the
+# comparison still treats the timestamp as UTC.
+@compat-gap "syntax:set"
+test set-timezone-compare-timestamp-with-timestamptz {
+    CREATE TABLE t (ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 12:00:00', '2026-01-31 10:00:00+00');
+    SET TIME ZONE 'Europe/Helsinki';
+    SELECT count(*) FROM t WHERE ts = tz;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 @compat-gap "function:set_config"
 test set-config-timezone {
     CREATE TABLE t (ts timestamptz);
@@ -807,7 +784,6 @@ expect {
 @sqlstate 22008
 expect @tursopg error {}
 
-@compat-gap "cast:int4 -> timestamp"
 test insert-integer-into-timestamp-column {
     CREATE TABLE t (ts timestamp);
     INSERT INTO t VALUES (20200101);
@@ -815,9 +791,6 @@ test insert-integer-into-timestamp-column {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2020-01-01 00:00:00
-}
 
 # PostgreSQL has no casts between date or time types and numbers.
 @compat-gap "cast:int4 -> date"
@@ -857,7 +830,7 @@ expect error {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    adding an interval is supported only for timestamp and timestamptz, not integer
+    adding an interval is supported only for timestamp and timestamptz, not int4
 }
 
 # PostgreSQL compares a date with a timestamp as the timestamp at midnight of
