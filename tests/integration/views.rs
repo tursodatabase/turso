@@ -6,6 +6,7 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::view::{extract_view_columns, referenced_tables};
 use turso_core::ConnectOpts;
 use turso_core::SessionRole;
+use turso_sqlite::SqliteDialect;
 
 #[test]
 fn concurrent_view_expansion_is_not_spuriously_circular() {
@@ -82,16 +83,18 @@ fn a_view_body_reads_the_tables_of_the_view_namespace() {
     let (schema, other) = schema_with_a_table_t_in_two_namespaces();
     let body = select("SELECT * FROM t");
     assert_eq!(
-        column_names(&extract_view_columns(other, &body, &schema).unwrap()),
+        column_names(&extract_view_columns(other, &body, &schema, &SqliteDialect).unwrap()),
         ["b", "c"]
     );
     assert_eq!(
-        column_names(&extract_view_columns(NamespaceId::ROOT, &body, &schema).unwrap()),
+        column_names(
+            &extract_view_columns(NamespaceId::ROOT, &body, &schema, &SqliteDialect).unwrap()
+        ),
         ["a"]
     );
     let qualified = select("SELECT * FROM main.t");
     assert_eq!(
-        column_names(&extract_view_columns(other, &qualified, &schema).unwrap()),
+        column_names(&extract_view_columns(other, &qualified, &schema, &SqliteDialect).unwrap()),
         ["a"]
     );
 }

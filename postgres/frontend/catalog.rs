@@ -1122,6 +1122,7 @@ impl SnapshotRows for PgAttributeTable {
                         class.relnamespace,
                         &select,
                         &schema,
+                        &PostgresDialect,
                     )
                     .expect("index expressions reference their table")
                     .columns

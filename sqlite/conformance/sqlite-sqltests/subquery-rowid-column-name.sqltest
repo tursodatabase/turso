@@ -95,3 +95,46 @@ expect {
     rowid
     x:1
 }
+
+@setup schema
+test view-table-info-names-are-resolved-names {
+    CREATE VIEW v AS SELECT rowid, t.X, oid, x COLLATE nocase, (_rowid_), t.rowid FROM t;
+    SELECT name FROM pragma_table_info('v');
+}
+expect {
+    a
+    x
+    a:1
+    x:1
+    a:2
+    a:3
+}
+
+@setup schema
+test view-table-info-subquery-names-are-written-names {
+    CREATE TABLE w(y);
+    CREATE VIEW v AS SELECT * FROM (SELECT t.X, rowid, (x) FROM t);
+    CREATE VIEW v2 AS SELECT rowid, oid FROM w;
+    SELECT name FROM pragma_table_info('v');
+    SELECT name FROM pragma_table_info('v2');
+}
+expect {
+    X
+    rowid
+    x:1
+    rowid
+    rowid:1
+}
+
+@setup schema
+test view-table-info-names-with-schema-qualifier-are-resolved-names {
+    CREATE TABLE s(A, xY);
+    CREATE VIEW v AS SELECT main.t.rowid, main.u.xy, main.t.X, main.u.a FROM main.t, main.s AS u;
+    SELECT name FROM pragma_table_info('v');
+}
+expect {
+    a
+    xY
+    x
+    A:1
+}

@@ -3584,9 +3584,14 @@ pub(super) fn query_output_columns(
 /// The name a stored column gets from the name `name` of the column at the
 /// 0-based `index`. SQLite's sqlite3ColumnsFromExprList() does not name a
 /// column true or false, also when an alias or a column list gives that
-/// name, and uses columnN instead.
-pub(crate) fn stored_column_name(name: String, index: usize, resolver: &Resolver) -> String {
-    if resolver.catalog.dialect.parses_true_false_as_identifiers()
+/// name, and uses columnN instead. It keeps the name when `dialect` does
+/// not parse TRUE and FALSE as identifiers.
+pub(crate) fn stored_column_name(
+    name: String,
+    index: usize,
+    dialect: &dyn crate::dialect::Dialect,
+) -> String {
+    if dialect.parses_true_false_as_identifiers()
         && (name.eq_ignore_ascii_case("true") || name.eq_ignore_ascii_case("false"))
     {
         format!("column{}", index + 1)
@@ -3607,7 +3612,7 @@ fn subquery_output_columns(
         column.name = column
             .name
             .take()
-            .map(|name| stored_column_name(name, index, resolver));
+            .map(|name| stored_column_name(name, index, resolver.catalog.dialect.as_ref()));
     }
     make_column_names_unique(&mut columns);
     Ok((columns, column_types))

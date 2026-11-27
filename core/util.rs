@@ -1412,18 +1412,6 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
     ))
 }
 
-/// Extract column name from an expression (e.g., for SELECT clauses).
-/// Like SQLite's sqlite3ColumnsFromExprList(), it looks through parentheses
-/// and COLLATE, so `(x)` and `x COLLATE nocase` are named x.
-pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<String> {
-    let expr = expr.as_ref();
-    let name = crate::translate::expr::column_reference_name(expr)?;
-    match crate::translate::expr::skip_parens_and_collate(expr) {
-        ast::Expr::Id(_) => Some(name.as_str().to_string()),
-        _ => Some(normalize_ident(name.as_str())),
-    }
-}
-
 /// What a walk over a statement, a SELECT or a trigger reports. A closure
 /// over `&ast::Expr` is a visitor that only looks at expressions.
 pub trait AstVisitor {

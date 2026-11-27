@@ -974,7 +974,7 @@ fn derive_ctas_schema(
             let name = col
                 .output_column_name(table_refs)
                 .map_or_else(|| col.expr.to_string(), String::from);
-            stored_column_name(name, index, resolver)
+            stored_column_name(name, index, resolver.catalog.dialect.as_ref())
         })
         .collect();
 

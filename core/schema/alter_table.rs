@@ -3,6 +3,7 @@ use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::schema::view::{extract_view_columns, ViewColumnSchema};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
+use crate::translate::plan::stored_column_name;
 use crate::util::normalize_ident;
 use crate::{
     schema::{Column, Schema},
@@ -123,8 +124,13 @@ mod rename_column_view {
 
         let rewrite_result = (|| -> Result<Option<RewrittenView>> {
             let original_select = select.clone();
-            let original_columns =
-                view_columns_from_select(&original_select, schema, namespace, &view_columns)?;
+            let original_columns = view_columns_from_select(
+                &original_select,
+                schema,
+                dialect,
+                namespace,
+                &view_columns,
+            )?;
 
             let ctx = ViewRewriteCtx::new(
                 dialect,
@@ -138,12 +144,16 @@ mod rename_column_view {
             let sql_changed =
                 rewrite_view_select_for_column_rename(&mut select, &ctx, &[], visiting_views)?;
 
-            let view_column_schema = extract_view_columns(namespace, &select, schema)?;
+            let view_column_schema = extract_view_columns(namespace, &select, schema, dialect)?;
             let mut final_columns = apply_view_column_rename(view_column_schema, &ctx);
 
             for (i, indexed_col) in view_columns.iter().enumerate() {
                 if let Some(col) = final_columns.get_mut(i) {
-                    col.name = Some(indexed_col.col_name.as_str().to_string());
+                    col.name = Some(stored_column_name(
+                        indexed_col.col_name.as_str().to_string(),
+                        i,
+                        dialect,
+                    ));
                 }
             }
 
@@ -212,17 +222,13 @@ mod rename_column_view {
     fn view_columns_from_select(
         select: &ast::Select,
         schema: &Schema,
+        dialect: &dyn crate::dialect::Dialect,
         namespace: NamespaceId,
         explicit: &[ast::IndexedColumn],
     ) -> Result<crate::alloc::Vec<Column>> {
-        let view_column_schema = extract_view_columns(namespace, select, schema)?;
-        let mut columns = view_column_schema.flat_columns()?;
-        for (i, indexed_col) in explicit.iter().enumerate() {
-            if let Some(col) = columns.get_mut(i) {
-                col.name = Some(indexed_col.col_name.as_str().to_string());
-            }
-        }
-        Ok(columns)
+        let mut view_column_schema = extract_view_columns(namespace, select, schema, dialect)?;
+        view_column_schema.rename_columns(explicit, dialect);
+        view_column_schema.flat_columns()
     }
 
     fn columns_equivalent(left: &[Column], right: &[Column]) -> bool {
@@ -1020,7 +1026,7 @@ mod rename_column_view {
         ctx: &ViewRewriteCtx,
         apply_rename: bool,
     ) -> Result<Vec<String>> {
-        let view_columns = extract_view_columns(ctx.namespace, select, ctx.schema)?;
+        let view_columns = extract_view_columns(ctx.namespace, select, ctx.schema, ctx.dialect)?;
         let mut columns = view_columns.columns;
         if apply_rename {
             let target_norm = ctx.target_table_norm.as_str();

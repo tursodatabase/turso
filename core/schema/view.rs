@@ -1,15 +1,15 @@
 use crate::alloc::TursoIteratorExt;
 use crate::ast;
+use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::schema::ColDef;
-use crate::translate::expr::WalkControl;
+use crate::translate::expr::{column_reference_name, skip_parens_and_collate, WalkControl};
 use crate::translate::plan::{
-    left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources,
-    ColumnLookup, JoinInfo, JoinType,
+    left_using_column_sources, star_column_uses_merged_value, stored_column_name,
+    unqualified_column_sources, ColumnLookup, JoinInfo, JoinType, OutputColumnNames,
 };
-use crate::util::{
-    extract_column_name_from_expr, normalize_ident, type_from_name, visit_select, AstVisitor,
-};
+use crate::translate::planner::ROWID_STRS;
+use crate::util::{normalize_ident, type_from_name, visit_select, AstVisitor};
 use crate::vdbe::affinity::Affinity;
 use crate::{
     schema::{Column, Schema, Table},
@@ -68,11 +68,16 @@ impl ViewColumnSchema {
     }
 
     /// Name the view's columns from the column list of `CREATE VIEW v(x, y)`.
-    pub fn rename_columns(&mut self, names: &[ast::IndexedColumn]) {
-        for (view_column, name) in self.columns.iter_mut().zip(names) {
+    /// See [stored_column_name] for the names true and false.
+    pub fn rename_columns(&mut self, names: &[ast::IndexedColumn], dialect: &dyn Dialect) {
+        for (index, (view_column, name)) in self.columns.iter_mut().zip(names).enumerate() {
             // as_str: Display would render the quoted form, embedding literal
             // quote characters in the name
-            view_column.column.name = Some(name.col_name.as_str().to_string());
+            view_column.column.name = Some(stored_column_name(
+                name.col_name.as_str().to_string(),
+                index,
+                dialect,
+            ));
         }
     }
 }
@@ -80,6 +85,10 @@ impl ViewColumnSchema {
 #[derive(Clone)]
 struct ViewSource {
     qualifiers: Vec<String>,
+    /// The namespace of the table or view this source reads, which a
+    /// column reference with a schema qualifier must name. A subquery or
+    /// CTE has none.
+    namespace: Option<NamespaceId>,
     columns: Vec<ViewColumn>,
     /// The join that added this source. The first source has no join.
     join_info: Option<JoinInfo>,
@@ -107,6 +116,7 @@ fn view_source_from_select_table(
     namespace: NamespaceId,
     select_table: &ast::SelectTable,
     schema: &Schema,
+    dialect: &dyn Dialect,
     ctes: &HashMap<String, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
 ) -> Result<ViewSource> {
@@ -122,6 +132,7 @@ fn view_source_from_select_table(
                 if let Some(cte) = ctes.get(&table_name) {
                     return Ok(ViewSource {
                         qualifiers,
+                        namespace: None,
                         columns: append_view_column_schema(cte.clone(), tables),
                         join_info: None,
                     });
@@ -137,7 +148,7 @@ fn view_source_from_select_table(
                     .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
-            let table_namespace = view_source_namespace(schema, namespace, name);
+            let table_namespace = view_source_namespace(schema, namespace, name.namespace.as_ref());
             let mut table = schema.get_table(table_namespace, &table_name);
             let mut view = table
                 .is_none()
@@ -169,17 +180,26 @@ fn view_source_from_select_table(
                 .collect();
             Ok(ViewSource {
                 qualifiers,
+                namespace: Some(table_namespace),
                 columns,
                 join_info: None,
             })
         }
         ast::SelectTable::Select { select, alias, .. } => {
-            let derived = extract_view_columns_inner(namespace, select, schema, ctes)?;
+            let derived = extract_view_columns_inner(
+                namespace,
+                select,
+                schema,
+                dialect,
+                ctes,
+                OutputColumnNames::AsWritten,
+            )?;
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
                     .map(|a| vec![normalize_ident(a.name().as_str())])
                     .unwrap_or_default(),
+                namespace: None,
                 columns: append_view_column_schema(derived, tables),
                 join_info: None,
             })
@@ -195,15 +215,16 @@ fn view_source_from_select_table(
                 }
                 | ast::SelectTable::Sub(_, source_alias) => source_alias.clone_from(alias),
             }
-            view_source_from_select_table(namespace, &source_table, schema, ctes, tables)
+            view_source_from_select_table(namespace, &source_table, schema, dialect, ctes, tables)
         }
         ast::SelectTable::Sub(from, alias) => {
-            let sources = view_sources_from_clause(namespace, from, schema, ctes, tables)?;
+            let sources = view_sources_from_clause(namespace, from, schema, dialect, ctes, tables)?;
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
                     .map(|a| vec![normalize_ident(a.name().as_str())])
                     .unwrap_or_default(),
+                namespace: None,
                 columns: expand_view_star(&sources),
                 join_info: None,
             })
@@ -239,6 +260,7 @@ fn view_source_from_select_table(
                 .unwrap_or_default();
             Ok(ViewSource {
                 qualifiers,
+                namespace: Some(namespace),
                 columns,
                 join_info: None,
             })
@@ -253,9 +275,9 @@ fn view_source_from_select_table(
 fn view_source_namespace(
     schema: &Schema,
     view_namespace: NamespaceId,
-    name: &ast::QualifiedName,
+    qualifier: Option<&ast::Name>,
 ) -> NamespaceId {
-    let Some(qualifier) = name.namespace.as_ref() else {
+    let Some(qualifier) = qualifier else {
         return view_namespace;
     };
     schema
@@ -289,10 +311,12 @@ fn view_sources_from_clause(
     namespace: NamespaceId,
     from: &ast::FromClause,
     schema: &Schema,
+    dialect: &dyn Dialect,
     ctes: &HashMap<String, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
 ) -> Result<Vec<ViewSource>> {
-    let first = view_source_from_select_table(namespace, &from.select, schema, ctes, tables)?;
+    let first =
+        view_source_from_select_table(namespace, &from.select, schema, dialect, ctes, tables)?;
     let mut sources = vec![first];
     // SQLite enables strict USING checks for the full list when any join keeps right rows.
     let has_right_or_full_join = from
@@ -301,7 +325,8 @@ fn view_sources_from_clause(
         .any(|join| JoinType::from_join_operator(&join.operator).keeps_right_rows());
 
     for join in &from.joins {
-        let right = view_source_from_select_table(namespace, &join.table, schema, ctes, tables)?;
+        let right =
+            view_source_from_select_table(namespace, &join.table, schema, dialect, ctes, tables)?;
         let natural = matches!(
             join.operator,
             ast::JoinOperator::TypedJoin(Some(join_type))
@@ -509,13 +534,18 @@ fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<St
     *count += 1;
 }
 
+/// The columns of `select_stmt`. `names` says how a result column without
+/// an alias is named, as for the planner: a view names it after it
+/// resolves names, a FROM subquery or a CTE before.
 fn extract_view_columns_inner(
     namespace: NamespaceId,
     select_stmt: &ast::Select,
     schema: &Schema,
+    dialect: &dyn Dialect,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
+    names: OutputColumnNames,
 ) -> Result<ViewColumnSchema> {
-    let ctes = extract_cte_columns(namespace, &select_stmt.with, schema, outer_ctes)?;
+    let ctes = extract_cte_columns(namespace, &select_stmt.with, schema, dialect, outer_ctes)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -532,22 +562,16 @@ fn extract_view_columns_inner(
 
     let sources = from
         .as_ref()
-        .map(|from| view_sources_from_clause(namespace, from, schema, &ctes, &mut tables))
+        .map(|from| view_sources_from_clause(namespace, from, schema, dialect, &ctes, &mut tables))
         .transpose()?
         .unwrap_or_default();
 
     for result_column in select_columns {
         match result_column {
             ast::ResultColumn::Expr(expr, alias) => {
-                let name = alias
-                    .as_ref()
-                    .filter(|alias| !matches!(alias, ast::As::ImplicitColumnName(_)))
-                    .map(|alias| alias.name().as_str().to_string())
-                    .or_else(|| extract_column_name_from_expr(expr))
-                    .unwrap_or_else(|| expr.to_string());
-                let mut column = view_result_column(expr, &sources);
+                let name = view_result_column_name(expr, alias.as_ref(), &sources, schema, names);
+                let mut column = view_result_column(expr, &sources, schema);
                 column.column.name = Some(name);
-                deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
             }
             ast::ResultColumn::Star => {
@@ -562,10 +586,7 @@ fn extract_view_columns_inner(
                         ),
                     });
                 }
-                for mut column in expanded {
-                    deduplicate_view_column_name(&mut column, &mut column_name_counts);
-                    columns.push(column);
-                }
+                columns.extend(expanded);
             }
             ast::ResultColumn::TableStar(table_ref) => {
                 let qualifier = normalize_ident(table_ref.as_str());
@@ -580,13 +601,22 @@ fn extract_view_columns_inner(
                         .iter()
                         .filter(|column| !column.column.hidden())
                     {
-                        let mut column = view_star_column(&sources, source_index, source_column);
-                        deduplicate_view_column_name(&mut column, &mut column_name_counts);
-                        columns.push(column);
+                        columns.push(view_star_column(&sources, source_index, source_column));
                     }
                 }
             }
         }
+    }
+
+    // As in SQLite's sqlite3ColumnsFromExprList(), the names true and false
+    // are replaced before the names are made unique.
+    for (index, column) in columns.iter_mut().enumerate() {
+        column.column.name = column
+            .column
+            .name
+            .take()
+            .map(|name| stored_column_name(name, index, dialect));
+        deduplicate_view_column_name(column, &mut column_name_counts);
     }
 
     Ok(ViewColumnSchema { tables, columns })
@@ -596,13 +626,27 @@ pub(crate) fn extract_cte_columns(
     namespace: NamespaceId,
     with: &Option<ast::With>,
     schema: &Schema,
+    dialect: &dyn Dialect,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<HashMap<String, ViewColumnSchema>> {
     let mut ctes = outer_ctes.clone();
     for cte in with.iter().flat_map(|with| &with.ctes) {
-        let mut derived = extract_view_columns_inner(namespace, &cte.select, schema, &ctes)?;
-        for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
-            column.column.name = Some(explicit_name.col_name.as_str().to_string());
+        let mut derived = extract_view_columns_inner(
+            namespace,
+            &cte.select,
+            schema,
+            dialect,
+            &ctes,
+            OutputColumnNames::AsWritten,
+        )?;
+        for (index, (column, explicit_name)) in
+            derived.columns.iter_mut().zip(&cte.columns).enumerate()
+        {
+            column.column.name = Some(stored_column_name(
+                explicit_name.col_name.as_str().to_string(),
+                index,
+                dialect,
+            ));
         }
         ctes.insert(normalize_ident(cte.tbl_name.as_str()), derived);
     }
@@ -613,10 +657,17 @@ pub(crate) fn select_table_column_names(
     namespace: NamespaceId,
     select_table: &ast::SelectTable,
     schema: &Schema,
+    dialect: &dyn Dialect,
     ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<Vec<String>> {
-    let source =
-        view_source_from_select_table(namespace, select_table, schema, ctes, &mut Vec::new())?;
+    let source = view_source_from_select_table(
+        namespace,
+        select_table,
+        schema,
+        dialect,
+        ctes,
+        &mut Vec::new(),
+    )?;
     Ok(source
         .columns
         .iter()
@@ -625,11 +676,81 @@ pub(crate) fn select_table_column_names(
         .collect())
 }
 
-fn view_result_column(expr: &ast::Expr, sources: &[ViewSource]) -> ViewColumn {
-    if let Some(column) = view_referenced_column(expr, sources) {
+/// The name of the result column `expr` with `alias`, before
+/// [stored_column_name] and before it is made unique, as SQLite's
+/// sqlite3ColumnsFromExprList() gives it: the alias, else the name of a
+/// column reference, else the expression as written. With
+/// [OutputColumnNames::Resolved], a column reference has the name of the
+/// column it reads, and a rowid reference the name of the table's
+/// INTEGER PRIMARY KEY column. With [OutputColumnNames::AsWritten], it has
+/// its name as written.
+fn view_result_column_name(
+    expr: &ast::Expr,
+    alias: Option<&ast::As>,
+    sources: &[ViewSource],
+    schema: &Schema,
+    names: OutputColumnNames,
+) -> String {
+    let expr_text = match alias {
+        Some(ast::As::ImplicitColumnName(text)) => Some(text),
+        Some(alias) => return alias.name().as_str().to_string(),
+        None => None,
+    };
+    if names == OutputColumnNames::Resolved {
+        let reference = skip_parens_and_collate(expr);
+        if let Some(name) = view_referenced_column(reference, sources, schema)
+            .and_then(|column| column.column.name)
+            .or_else(|| view_rowid_column_name(reference, sources, schema))
+        {
+            return name;
+        }
+    }
+    column_reference_name(expr)
+        .or(expr_text)
+        .map(|name| name.as_str().to_string())
+        .unwrap_or_else(|| expr.to_string())
+}
+
+/// The name of the column that `expr` reads, if `expr` reads the rowid of
+/// a source: the name of its INTEGER PRIMARY KEY column, else rowid.
+fn view_rowid_column_name(
+    expr: &ast::Expr,
+    sources: &[ViewSource],
+    schema: &Schema,
+) -> Option<String> {
+    let (qualifier, column_name) = match expr {
+        ast::Expr::Id(column_name) => (None, column_name),
+        ast::Expr::Qualified(table, column_name) => (Some((None, table)), column_name),
+        ast::Expr::DoublyQualified(database, table, column_name) => {
+            (Some((Some(database), table)), column_name)
+        }
+        _ => return None,
+    };
+    if !ROWID_STRS
+        .iter()
+        .any(|rowid| rowid.eq_ignore_ascii_case(column_name.as_str()))
+    {
+        return None;
+    }
+    // SQLite refuses an unqualified rowid when the FROM clause has more than
+    // one source, so the first source is the one it reads.
+    let source = match qualifier {
+        None => sources.first(),
+        Some((database, table)) => view_source_named(sources, schema, database, table),
+    }?;
+    let rowid_alias = source
+        .columns
+        .iter()
+        .find(|column| column.column.is_rowid_alias())
+        .and_then(view_column_name);
+    Some(rowid_alias.unwrap_or("rowid").to_string())
+}
+
+fn view_result_column(expr: &ast::Expr, sources: &[ViewSource], schema: &Schema) -> ViewColumn {
+    if let Some(column) = view_referenced_column(expr, sources, schema) {
         return column;
     }
-    let ty_str = view_affinity_type_name(view_expression_affinity(expr, sources));
+    let ty_str = view_affinity_type_name(view_expression_affinity(expr, sources, schema));
     let (ty, _) = type_from_name(ty_str);
     ViewColumn {
         table_index: usize::MAX,
@@ -645,42 +766,68 @@ fn view_result_column(expr: &ast::Expr, sources: &[ViewSource]) -> ViewColumn {
     }
 }
 
-fn view_referenced_column(expr: &ast::Expr, sources: &[ViewSource]) -> Option<ViewColumn> {
-    match expr {
+fn view_referenced_column(
+    expr: &ast::Expr,
+    sources: &[ViewSource],
+    schema: &Schema,
+) -> Option<ViewColumn> {
+    let (database, table, column_name) = match expr {
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            view_referenced_column(&exprs[0], sources)
+            return view_referenced_column(&exprs[0], sources, schema);
         }
-        ast::Expr::Id(column_name) => resolve_view_column(sources, column_name.as_str()),
-        ast::Expr::Qualified(qualifier, column_name) => sources
-            .iter()
-            .find(|source| {
-                source
-                    .qualifiers
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
-            })
-            .and_then(|source| {
-                source.columns.iter().find(|column| {
-                    view_column_name(column).is_some_and(|candidate| {
-                        candidate.eq_ignore_ascii_case(column_name.as_str())
-                    })
-                })
-            })
-            .map(view_output_column),
-        _ => None,
-    }
+        ast::Expr::Id(column_name) => {
+            return resolve_view_column(sources, column_name.as_str());
+        }
+        ast::Expr::Qualified(table, column_name) => (None, table, column_name),
+        ast::Expr::DoublyQualified(database, table, column_name) => {
+            (Some(database), table, column_name)
+        }
+        _ => return None,
+    };
+    view_source_named(sources, schema, database, table)?
+        .columns
+        .iter()
+        .find(|column| {
+            view_column_name(column)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(column_name.as_str()))
+        })
+        .map(view_output_column)
 }
 
-fn view_expression_affinity(expr: &ast::Expr, sources: &[ViewSource]) -> Affinity {
+/// The source that a column reference qualified with `table`, and with
+/// `database` if it has a schema qualifier, reads from. As in SQLite, a
+/// reference with a schema qualifier reads only a table or view of that
+/// schema, never a subquery or CTE.
+fn view_source_named<'a>(
+    sources: &'a [ViewSource],
+    schema: &Schema,
+    database: Option<&ast::Name>,
+    table: &ast::Name,
+) -> Option<&'a ViewSource> {
+    sources.iter().find(|source| {
+        let database_matches = database.is_none_or(|database| {
+            source.namespace.is_some_and(|namespace| {
+                view_source_namespace(schema, namespace, Some(database)) == namespace
+            })
+        });
+        database_matches
+            && source
+                .qualifiers
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(table.as_str()))
+    })
+}
+
+fn view_expression_affinity(expr: &ast::Expr, sources: &[ViewSource], schema: &Schema) -> Affinity {
     match expr {
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            view_expression_affinity(&exprs[0], sources)
+            view_expression_affinity(&exprs[0], sources, schema)
         }
-        ast::Expr::Collate(inner, _) => view_expression_affinity(inner, sources),
+        ast::Expr::Collate(inner, _) => view_expression_affinity(inner, sources, schema),
         ast::Expr::Cast { type_name, .. } => {
             Affinity::affinity(type_name.as_ref().map_or("", |type_name| &type_name.name))
         }
-        _ => view_referenced_column(expr, sources).map_or(Affinity::None, |column| {
+        _ => view_referenced_column(expr, sources, schema).map_or(Affinity::None, |column| {
             Affinity::affinity(&column.column.ty_str)
         }),
     }
@@ -705,13 +852,22 @@ fn view_affinity_type_name(affinity: Affinity) -> &'static str {
 /// which source supplies a merged column.
 ///
 /// `namespace` is the namespace of the view, where the names of its body
-/// that have no qualifier are looked up.
+/// that have no qualifier are looked up. `dialect` says whether a column
+/// can have the name true or false.
 pub fn extract_view_columns(
     namespace: NamespaceId,
     select_stmt: &ast::Select,
     schema: &Schema,
+    dialect: &dyn Dialect,
 ) -> Result<ViewColumnSchema> {
-    extract_view_columns_inner(namespace, select_stmt, schema, &HashMap::default())
+    extract_view_columns_inner(
+        namespace,
+        select_stmt,
+        schema,
+        dialect,
+        &HashMap::default(),
+        OutputColumnNames::Resolved,
+    )
 }
 
 /// The tables `select` reads, each with the namespace it is written

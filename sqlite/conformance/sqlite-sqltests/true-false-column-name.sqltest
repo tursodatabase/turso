@@ -49,3 +49,30 @@ expect {
     column2
     x
 }
+
+# PRAGMA table_info reads the column names that the schema stores for a
+# view. They follow the same rule as the names a query of the view gives.
+test view-table-info-true-false-named-column-n {
+    CREATE TABLE "TRUE"("true", y);
+    CREATE VIEW v AS SELECT "true", 3 AS FALSE, y, * FROM "TRUE";
+    CREATE VIEW v2(true, b) AS SELECT 4, 5;
+    CREATE VIEW v3 AS SELECT * FROM (SELECT true, 1 AS x);
+    CREATE VIEW v4 AS WITH w(false, k) AS (SELECT 1, 2) SELECT * FROM w;
+    SELECT name FROM pragma_table_info('v');
+    SELECT name FROM pragma_table_info('v2');
+    SELECT name FROM pragma_table_info('v3');
+    SELECT name FROM pragma_table_info('v4');
+}
+expect {
+    column1
+    column2
+    y
+    column4
+    y:1
+    column1
+    b
+    column1
+    x
+    column1
+    k
+}

@@ -3973,7 +3973,7 @@ impl Schema {
                 columns, select, ..
             })) = crate::dialect::parse_statement(dialect, &sql)?
             {
-                self.populate_view(namespace, view_name, sql, &columns, select)?;
+                self.populate_view(dialect, namespace, view_name, sql, &columns, select)?;
                 continue;
             }
 
@@ -4117,14 +4117,15 @@ impl Schema {
     /// Builds an ordinary view after its source relations and namespaces are known.
     fn populate_view(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         namespace: NamespaceId,
         name: String,
         sql: String,
         column_names: &[ast::IndexedColumn],
         select: ast::Select,
     ) -> Result<()> {
-        let mut columns = view::extract_view_columns(namespace, &select, self)?;
-        columns.rename_columns(column_names);
+        let mut columns = view::extract_view_columns(namespace, &select, self, dialect)?;
+        columns.rename_columns(column_names, dialect);
         let view = View::new(
             name,
             sql,
@@ -4616,6 +4617,7 @@ impl Schema {
                                 );
                             } else {
                                 self.populate_view(
+                                    dialect,
                                     namespace,
                                     view_name,
                                     sql.to_string(),

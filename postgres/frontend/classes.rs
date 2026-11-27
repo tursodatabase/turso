@@ -1133,6 +1133,7 @@ fn refuse_changed_view_width(
             view_namespace,
             &view.select_stmt,
             &after,
+            &crate::catalog::PostgresDialect,
         )?;
         if columns.columns.len() != view.columns.len() {
             // FIXME(pg-rewrite): PostgreSQL expands SELECT * when it creates
