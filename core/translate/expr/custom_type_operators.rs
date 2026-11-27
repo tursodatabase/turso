@@ -18,7 +18,7 @@ use crate::translate::expr::expr_type::{
 /// have none for them, so the engine runs them unless the dialect chooses a
 /// function. The dialect is asked even when no operand has a custom type, since
 /// it may run its own function on plain values, as PostgreSQL does for LIKE.
-const DIALECT_ONLY_OPERATORS: [&str; 2] = ["||", "~~"];
+const DIALECT_ONLY_OPERATORS: [&str; 3] = ["||", "~~", "@>"];
 
 /// The function that runs the operator expression `expr`, such as `a + b` or
 /// `-a`, for code that has not computed the operands' types yet. See
@@ -235,7 +235,7 @@ enum UseKind {
 }
 
 /// The operands of `expr` and the operators it applies to them: the
-/// arithmetic, bit and comparison operators, `||`, `LIKE` as `~~`, the prefix `-` and `~`, the two
+/// arithmetic, bit and comparison operators, `||`, `LIKE` as `~~`, `@>`, the prefix `-` and `~`, the two
 /// comparisons of a BETWEEN, the `=` of each value of an IN list and of each
 /// WHEN of a CASE with a base, the `=` of NULLIF, a comparison of two row
 /// values as one comparison of each pair, and `IS [NOT] DISTINCT FROM` next
@@ -660,6 +660,7 @@ fn binary_symbol(op: &ast::Operator) -> Option<&'static str> {
         Operator::LeftShift => "<<",
         Operator::RightShift => ">>",
         Operator::Concat => "||",
+        Operator::ArrayContains => "@>",
         _ => return None,
     })
 }

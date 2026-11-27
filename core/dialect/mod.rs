@@ -677,7 +677,8 @@ pub trait Dialect: Send + Sync + 'static {
 
     /// Chooses the operator `op` for operands of the given types: one type
     /// for a prefix operator, two for the others. `op` is an arithmetic, bit
-    /// or comparison operator. An error refuses the operator. `operands` gives
+    /// or comparison operator, `||`, `~~` (LIKE) or `@>`. An error refuses the
+    /// operator. `operands` gives
     /// the types, and is only called by a dialect that needs them.
     fn choose_operator(
         &self,
