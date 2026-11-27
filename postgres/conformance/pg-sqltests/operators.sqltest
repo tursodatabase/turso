@@ -1099,7 +1099,6 @@ expect {
     1
 }
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-union-with-integer-column {
     SELECT count(*) FROM (SELECT o FROM t UNION SELECT i FROM t) s;
@@ -1107,12 +1106,7 @@ test oid-union-with-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-intersect-with-integer-column {
     SELECT count(*) FROM (SELECT o FROM t INTERSECT SELECT i FROM t) s;
@@ -1120,22 +1114,13 @@ test oid-intersect-with-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-except-with-integer-column {
     SELECT count(*) FROM (SELECT o FROM t EXCEPT SELECT i FROM t) s;
 }
 expect {
     0
-}
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
 }
 
 @setup oid_paths
@@ -1271,6 +1256,23 @@ expect error {
 @sqlstate 42883
 expect @tursopg error {
     operator does not exist: oid = double precision
+}
+
+@setup oid_paths
+test compound-of-integer-column-and-string-literal {
+    SELECT i FROM t UNION ALL SELECT '5' ORDER BY 1;
+}
+expect {
+    -1
+    5
+}
+
+@setup oid_paths
+test compound-of-integer-and-oid-orders-by-column-name {
+    SELECT i FROM t UNION SELECT o FROM t ORDER BY i;
+}
+expect {
+    4294967295
 }
 
 setup oid_right_join {

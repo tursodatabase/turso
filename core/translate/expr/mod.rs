@@ -104,9 +104,9 @@ pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{
-    cast_in_subquery_operands, check_custom_operator, check_in_subquery_operator,
-    custom_operator_call, emit_operator_call_on_registers, in_subquery_operand,
-    read_literal_operands,
+    cast_compound_columns, cast_in_subquery_operands, check_custom_operator,
+    check_in_subquery_operator, custom_operator_call, emit_operator_call_on_registers,
+    in_subquery_operand, read_literal_operands,
 };
 pub(crate) use custom_types::read_untyped_operand_as;
 pub(crate) use custom_types::{

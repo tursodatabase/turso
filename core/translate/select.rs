@@ -15,6 +15,7 @@ use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
+use crate::translate::expr::cast_compound_columns;
 use crate::translate::expr::expr_type::select_column_type;
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement, expr_vector_size,
@@ -421,7 +422,7 @@ fn push_compound_arm(
 /// LIMIT, OFFSET and ORDER BY.
 #[inline(never)]
 fn finish_compound_select_plan(
-    left: Vec<(SelectPlan, ast::CompoundOperator)>,
+    mut left: Vec<(SelectPlan, ast::CompoundOperator)>,
     mut last: Box<SelectPlan>,
     order_by: Vec<ast::SortedColumn>,
     limit: Option<ast::Limit>,
@@ -438,6 +439,7 @@ fn finish_compound_select_plan(
             );
         }
     }
+    cast_compound_columns(&mut left, &mut last, resolver)?;
     let (mut limit, mut offset) =
         limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
     let mut cse_map = Vec::new();

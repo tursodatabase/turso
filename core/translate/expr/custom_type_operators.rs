@@ -10,8 +10,9 @@ use crate::dialect::{ChosenOperator, Dialect, EngineType, OperandType, OperatorC
 use crate::function::Deterministic;
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
-    dialect_operand_type, query_column_type, same_type_def, sqlite_operand_type, type_of,
-    without_wrappers, BuiltinType, ColumnCustomType, ExprType, TypeEnv,
+    dialect_operand_type, query_column_type, same_type_def, select_column_type,
+    sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType, ExprType,
+    TypeEnv,
 };
 use crate::translate::plan::{Plan, SelectPlan};
 
@@ -204,10 +205,18 @@ fn in_subquery_choice(
             rhs_operand,
         ]
     };
+    choose_equals(&operand_types, resolver)
+}
+
+/// The dialect's choice of the `=` of two column values, `None` when it chooses none.
+fn choose_equals(
+    operand_types: &dyn Fn() -> Vec<OperandType>,
+    resolver: &Resolver<'_>,
+) -> Result<Option<ChosenOperator>> {
     let choice = resolver
         .catalog
         .dialect
-        .choose_operator("=", &operand_types)?;
+        .choose_operator("=", operand_types)?;
     Ok(match choice {
         OperatorChoice::Chosen(chosen) => Some(chosen),
         _ => None,
@@ -237,14 +246,82 @@ fn cast_result_column(plan: &mut Plan, column: usize, ty: &ast::Type) {
         Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => return,
     };
     for select in selects {
-        if select.values.is_empty() {
-            wrap_in_cast(&mut select.result_columns[column].expr, ty.clone());
-        } else {
-            for row in &mut select.values {
-                wrap_in_cast(&mut row[column], ty.clone());
+        cast_select_column(select, column, ty);
+    }
+}
+
+/// Casts column `column` of one SELECT, or of every row of a VALUES list, to
+/// `ty`.
+fn cast_select_column(select: &mut SelectPlan, column: usize, ty: &ast::Type) {
+    if select.values.is_empty() {
+        let name = select.result_columns[column]
+            .name(&select.table_references)
+            .map(str::to_owned);
+        let result_column = &mut select.result_columns[column];
+        result_column.alias = result_column.alias.take().or(name);
+        wrap_in_cast(&mut result_column.expr, ty.clone());
+    } else {
+        for row in &mut select.values {
+            wrap_in_cast(&mut row[column], ty.clone());
+        }
+    }
+}
+
+/// Casts the columns of a compound SELECT to one type where the dialect's `=` says to.
+pub(crate) fn cast_compound_columns(
+    left: &mut [(SelectPlan, ast::CompoundOperator)],
+    right_most: &mut SelectPlan,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(());
+    }
+    let mut arms: Vec<&mut SelectPlan> = left
+        .iter_mut()
+        .map(|(select, _)| select)
+        .chain(core::iter::once(right_most))
+        .collect();
+    for column in 0..arms[0].result_columns.len() {
+        for arm in 1..arms.len() {
+            let Some(chosen) = compound_choice(arms[0], arms[arm], column, resolver)? else {
+                continue;
+            };
+            if chosen.cast_operands.first() == Some(&true) {
+                for earlier in &mut arms[..arm] {
+                    cast_select_column(earlier, column, &chosen.operands[0]);
+                }
+            }
+            if chosen.cast_operands.get(1) == Some(&true) {
+                cast_select_column(arms[arm], column, &chosen.operands[1]);
             }
         }
     }
+    Ok(())
+}
+
+/// The dialect's choice of the `=` of column `column` of two SELECTs, `None` when it chooses none.
+fn compound_choice(
+    first: &SelectPlan,
+    other: &SelectPlan,
+    column: usize,
+    resolver: &Resolver<'_>,
+) -> Result<Option<ChosenOperator>> {
+    let operand = |select: &SelectPlan| {
+        let env = TypeEnv::new(Some(&select.table_references), resolver);
+        let ty = select_column_type(select, column, resolver);
+        if matches!(ty, ExprType::Null) {
+            return None;
+        }
+        let expr = &select.result_columns[column].expr;
+        match dialect_operand_type(expr, ty, &env) {
+            OperandType::StringLiteral(_) => None,
+            other => Some(other),
+        }
+    };
+    let (Some(first), Some(other)) = (operand(first), operand(other)) else {
+        return Ok(None);
+    };
+    choose_equals(&|| vec![first.clone(), other.clone()], resolver)
 }
 
 /// Asks the dialect to choose `operator` and records, for each string literal
