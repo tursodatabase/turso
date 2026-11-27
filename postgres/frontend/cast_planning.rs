@@ -106,8 +106,21 @@ fn table_cast(
         CastContext::Assignment => NamePlace::Column,
         _ => NamePlace::CastTarget,
     };
-    let CastRule::Table(target) = cast_rule(target, target_place)? else {
-        return Ok(None);
+    let target = match cast_rule(target, target_place)? {
+        CastRule::Table(target) => target,
+        // FIXME(pg-catalog): The translator lowers a CAST to numeric without a
+        // modifier to a CAST to REAL, which the engine decides. A cast from
+        // jsonb has its own rules (`from_jsonb`), so it is the cast of
+        // `CASTS` to numeric. A numeric type that needs no modifier removes
+        // this case.
+        CastRule::Engine
+            if target_place == NamePlace::CastTarget
+                && is_lowered_numeric(target)
+                && is_jsonb(source()) =>
+        {
+            Numeric
+        }
+        CastRule::Engine => return Ok(None),
     };
     let mut source_is_a_guess = false;
     let (source, context) = match source() {
@@ -132,6 +145,23 @@ fn table_cast(
         context,
         source_is_a_guess,
     }))
+}
+
+/// Whether `target` is the REAL that a CAST to numeric without a modifier is
+/// lowered to.
+fn is_lowered_numeric(target: &TypeRef) -> bool {
+    target.array_dimensions == 0
+        && matches!(&target.identity, TypeIdentity::Name(name) if name.eq_ignore_ascii_case("real"))
+}
+
+fn is_jsonb(source: CastSource) -> bool {
+    match source {
+        CastSource::Typed(source) => {
+            source.array_dimensions == 0
+                && matches!(&source.identity, TypeIdentity::Registered(type_def) if type_def.name == "jsonb")
+        }
+        _ => false,
+    }
 }
 
 fn conversion_call(operand: &ast::Expr, source: CastType, target: CastType) -> ast::Expr {

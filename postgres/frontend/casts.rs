@@ -389,8 +389,11 @@ fn from_jsonb(connection: &Arc<Connection>, value: &Value, target: CastType) -> 
         Some(b'[') => "array",
         Some(b'{') => "object",
         _ if target == Bool => "numeric",
-        // The stored form of a jsonb number is numeric text.
-        _ => return convert(connection, value, Numeric, target),
+        // The stored form of a jsonb number is numeric text, which PostgreSQL
+        // casts as a numeric: exactly, and not through a float8.
+        _ if target.is_integer() => return numeric_text_to_integer(json, target),
+        _ if target.is_float() => return convert(connection, value, Text, target),
+        _ => return Ok(value.clone()),
     };
     Err(sqlstate_error(
         SQLSTATE_INVALID_PARAMETER_VALUE,
@@ -400,6 +403,33 @@ fn from_jsonb(connection: &Arc<Connection>, value: &Value, target: CastType) -> 
         ),
         None,
     ))
+}
+
+/// The integer of type `target` that the numeric text `text` rounds to, half
+/// away from zero, as PostgreSQL casts a numeric to an integer type:
+/// `9007199254740993` stays exact and `-1.5` is -2.
+fn numeric_text_to_integer(text: &str, target: CastType) -> Result<Value> {
+    // The text is in numeric's output form: a sign, digits and a fraction,
+    // without an exponent.
+    let text = turso_core::format_numeric_text(text).map_err(|_| out_of_range(target))?;
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, text.as_str()),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let rounds_up = fraction
+        .as_bytes()
+        .first()
+        .is_some_and(|digit| *digit >= b'5');
+    let magnitude = whole
+        .parse::<i128>()
+        .ok()
+        .and_then(|whole| whole.checked_add(i128::from(rounds_up)))
+        .ok_or_else(|| out_of_range(target))?;
+    let number = if negative { -magnitude } else { magnitude };
+    let number = i64::try_from(number).map_err(|_| out_of_range(target))?;
+    check_integer_range(number, target)?;
+    Ok(Value::from_i64(number))
 }
 
 fn to_oid(value: &Value, source: CastType) -> Result<Value> {

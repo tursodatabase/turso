@@ -794,6 +794,98 @@ expect {
     1
 }
 
+# A jsonb number casts to an integer type as a numeric does: exactly, and
+# rounded half away from zero.
+test cast-jsonb-numbers-to-integers-exactly {
+    SELECT '9007199254740993'::jsonb::int8, '9223372036854775807'::jsonb::int8,
+           '1.5'::jsonb::int4, '-1.5'::jsonb::int4, '2.5'::jsonb::int2,
+           '0.49999999999999999999'::jsonb::int4;
+}
+expect {
+    9007199254740993|9223372036854775807|2|-2|3|0
+}
+
+test cast-jsonb-number-out-of-range-of-int4 {
+    SELECT '99999999999'::jsonb::int4;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test cast-jsonb-number-out-of-range-of-float8 {
+    SELECT '1e309'::jsonb::float8;
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-jsonb-to-floats-numeric-and-boolean {
+    SELECT '1.5'::jsonb::float8::text, '2.5'::jsonb::float4::text, '1.5'::jsonb::numeric,
+           'true'::jsonb::bool, 'false'::jsonb::bool;
+}
+expect {
+    1.5|2.5|1.5|t|f
+}
+
+test cast-jsonb-null-to-numbers-and-boolean-is-null {
+    SELECT 'null'::jsonb::int4 IS NULL, 'null'::jsonb::float8 IS NULL,
+           'null'::jsonb::numeric IS NULL, 'null'::jsonb::bool IS NULL;
+}
+expect {
+    t|t|t|t
+}
+
+test cast-jsonb-array-to-numeric {
+    SELECT '[1]'::jsonb::numeric;
+}
+@sqlstate 22023
+expect error {
+    cannot cast jsonb array to type numeric
+}
+
+test cast-jsonb-boolean-to-numeric {
+    SELECT 'true'::jsonb::numeric;
+}
+@sqlstate 22023
+expect error {
+    cannot cast jsonb boolean to type numeric
+}
+
+test cast-jsonb-string-to-int8 {
+    SELECT '"x"'::jsonb::int8;
+}
+@sqlstate 22023
+expect error {
+    cannot cast jsonb string to type bigint
+}
+
+test cast-jsonb-object-to-float8 {
+    SELECT '{}'::jsonb::float8;
+}
+@sqlstate 22023
+expect error {
+    cannot cast jsonb object to type double precision
+}
+
+test cast-jsonb-number-to-boolean {
+    SELECT '1'::jsonb::bool;
+}
+@sqlstate 22023
+expect error {
+    cannot cast jsonb numeric to type boolean
+}
+
+test cast-jsonb-column-to-numeric {
+    CREATE TABLE cast_jsonb_column (j jsonb);
+    INSERT INTO cast_jsonb_column VALUES ('[1]');
+    SELECT j::numeric FROM cast_jsonb_column;
+}
+@sqlstate 22023
+expect error {
+    cannot cast jsonb array to type numeric
+}
+
 test cast-int4-to-jsonb {
     SELECT 5::jsonb;
 }
