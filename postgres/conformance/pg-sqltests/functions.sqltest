@@ -1270,6 +1270,13 @@ test acldefault-non-ascii-object-kind-errors {
 @sqlstate XX000
 expect error {}
 
+test format-type-of-name {
+    SELECT format_type(19, -1);
+}
+expect {
+    name
+}
+
 test format-type-expanded {
     SELECT format_type(16, -1);
     SELECT format_type(23, -1);
