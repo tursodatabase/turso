@@ -20030,11 +20030,27 @@ fn op_vacuum_into_inner(
                 let source_db = connection.get_source_database(source_db_id);
                 connection.execute("BEGIN DEFERRED")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                let source_pager = connection.get_pager_from_database_index(&source_db_id)?;
+                // BEGIN DEFERRED starts no read transaction, so the source is
+                // read without a pinned snapshot: nested copy statements serve
+                // from this connection's stale page cache and skip beginning
+                // their own read transaction, so the copy can drop rows another
+                // connection committed before VACUUM INTO ran (issue #11753).
+                // Begin the read transaction now, before the output file is
+                // created, mirroring SQLite's sqlite3BtreeBeginTrans right after
+                // BEGIN (src/vacuum.c). begin_read_tx invalidates the stale cache
+                // and the Read state makes the nested statements reuse this
+                // snapshot; COMMIT/rollback in the later phases release it.
+                // MVCC sources take their snapshot through the MVCC transaction
+                // layer instead, so leave them on the deferred/Pending path.
+                if !source_db.mvcc_enabled() && !source_pager.holds_read_lock() {
+                    source_pager.begin_read_tx()?;
+                    connection.set_tx_state(TransactionState::Read);
+                }
                 let page_size: u32 = extract_pragma_int(
                     &connection.pragma_query(&format!("\"{escaped_schema_name}\".page_size"))?,
                     "page_size",
                 )?;
-                let source_pager = connection.get_pager_from_database_index(&source_db_id)?;
                 let source_auto_vacuum_mode = source_pager.get_auto_vacuum_mode();
                 reject_unsupported_vacuum_auto_vacuum_mode(source_auto_vacuum_mode)?;
                 let header_meta = if let Some(mv_store) = connection.mv_store_for_db(source_db_id) {
