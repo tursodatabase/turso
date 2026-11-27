@@ -61,7 +61,7 @@ Basics not enumerated by the official feature matrix.
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS. An omitted name avoids every relation name in the table's schema, including constraint indexes. An index expression or a WHERE clause that uses `->` or `->>` fails with `0A000` |
 | CREATE VIEW | ✅ Supported | A table named without a schema is bound to the schema it is found in when the view is created, so the view keeps reading it when `search_path` changes; column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
-| COMMENT ON | 🟡 Partial | Stored in `pg_description` for tables, views, materialized views, indexes, sequences, table columns and schemas. Any other kind of object, a column of a view, a catalog relation such as `pg_class`, and the index of a PRIMARY KEY or UNIQUE constraint, is rejected with 0A000 |
+| COMMENT ON | 🟡 Partial | Stored in `pg_description` for tables, views, materialized views, indexes, sequences, table columns and schemas. Any other kind of object, a column of a view, a catalog relation such as `pg_class`, the index of a PRIMARY KEY or UNIQUE constraint, and a built-in object such as the schema `public`, is rejected with 0A000 |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
 | ALTER SEQUENCE | 🟡 Partial | OWNED BY { table.column \| NONE } works, which is how a serial column's sequence belongs to its table; the other options are rejected |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE 1 accepted, a larger CACHE rejected (Turso does not cache sequence values); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default, CHECK constraint, view or policy binds it to the schema it is in when the table, column, view or policy is created; a serial column's sequence is created in the table's schema |
@@ -104,10 +104,18 @@ relations report initial estimates; collected PostgreSQL planner statistics are
 not implemented.
 Catalog indexes are not implemented, so built-in catalogs report
 `relhasindex = false`; PostgreSQL reports true for its indexed catalogs.
-`pg_description` is a stored table. It has the comments that `COMMENT ON`
-stored, and the default `standard public schema` comment for `public`, so
-pg_dump does not emit a command to clear that comment on restore. Dropping a
-relation, a column or a schema deletes its comments. The public schema reports
+`pg_description` has the 3,675 built-in comments of PostgreSQL 18 and the
+comments that `COMMENT ON` stored. The built-in comments come from the running
+binary and are not stored in the database file, so a newer binary shows its own
+built-in comments. One of them is the `standard public schema` comment of
+`public`, so pg_dump does not emit a command to clear that comment on restore.
+`COMMENT ON` a built-in object, such as the schema `public`, is rejected with
+0A000, so a built-in comment cannot be changed or removed. A built-in comment names its object by the
+oid of PostgreSQL, and `pg_proc` has other oids, so `obj_description(oid)`
+without a catalog name can return the built-in comment of another object.
+The catalog does not have the comments that PostgreSQL's `initdb` adds after
+`postgres.bki`, such as those of the system views. Dropping a relation, a
+column or a schema deletes its comments. The public schema reports
 `pg_database_owner` as its owner, with CREATE and USAGE for that role and USAGE
 for PUBLIC. These are catalog defaults; role management is not implemented.
 `pg_depend` has the rows of each view's `_RETURN` rule: the rule is part of
