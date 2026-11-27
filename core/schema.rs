@@ -4764,20 +4764,44 @@ impl Schema {
                     continue;
                 }
             }
-            let parent_name = normalize_ident(&fk.parent_table);
-            let parent_tbl = self
-                .get_btree_table(fk.parent_namespace, &parent_name)
-                .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
-            out.push_within_capacity(self.resolve_fk(
-                namespace,
-                fk,
-                &child,
-                &parent_tbl,
-                /*require_unique=*/ true,
-            )?)
-            .expect("resolved FK vector was preallocated to child.foreign_keys.len()");
+            let (resolved, _) = self
+                .resolve_child_fk(namespace, fk, &child)?
+                .ok_or_else(|| fk_mismatch_err(&child.name, &normalize_ident(&fk.parent_table)))?;
+            out.push_within_capacity(resolved)
+                .expect("resolved FK vector was preallocated to child.foreign_keys.len()");
         }
         Ok(out)
+    }
+
+    /// Resolves `fk`, which `child` declares, as `resolved_fks_for_child`
+    /// does, and returns it with the parent table. Returns `None` when no
+    /// table, view or materialized view has the name of the parent table.
+    pub fn resolve_child_fk(
+        &self,
+        namespace: NamespaceId,
+        fk: &Arc<ForeignKey>,
+        child: &Arc<BTreeTable>,
+    ) -> crate::Result<Option<(ResolvedFkRef, Arc<BTreeTable>)>> {
+        let parent_name = normalize_ident(&fk.parent_table);
+        let Some(parent_tbl) = self.get_btree_table(fk.parent_namespace, &parent_name) else {
+            if self.get_table(fk.parent_namespace, &parent_name).is_some()
+                || self.get_view(fk.parent_namespace, &parent_name).is_some()
+                || self
+                    .get_materialized_view(fk.parent_namespace, &parent_name)
+                    .is_some()
+            {
+                return Err(fk_mismatch_err(&child.name, &parent_name));
+            }
+            return Ok(None);
+        };
+        let resolved = self.resolve_fk(
+            namespace,
+            fk,
+            child,
+            &parent_tbl,
+            /*require_unique=*/ true,
+        )?;
+        Ok(Some((resolved, parent_tbl)))
     }
 
     pub fn resolved_fks_for_check(
@@ -4790,16 +4814,8 @@ impl Schema {
 
         let mut out = Vec::try_with_capacity_ext(foreign_keys.len())?;
         for (fkid, fk) in foreign_keys.into_iter().enumerate() {
-            let parent_name = normalize_ident(&fk.parent_table);
-            let Some(parent_tbl) = self.get_btree_table(fk.parent_namespace, &parent_name) else {
-                if self.get_table(fk.parent_namespace, &parent_name).is_some()
-                    || self.get_view(fk.parent_namespace, &parent_name).is_some()
-                    || self
-                        .get_materialized_view(fk.parent_namespace, &parent_name)
-                        .is_some()
-                {
-                    return Err(fk_mismatch_err(&child.name, &parent_name));
-                }
+            let Some((resolved, parent_tbl)) = self.resolve_child_fk(namespace, fk, child)? else {
+                let parent_name = normalize_ident(&fk.parent_table);
                 let mut child_pos = Vec::try_with_capacity_ext(fk.child_columns.len())?;
                 for column_name in fk.child_columns.iter() {
                     let (pos, _) = child
@@ -4815,7 +4831,6 @@ impl Schema {
                 })?;
                 continue;
             };
-            let resolved = self.resolve_fk(namespace, fk, child, &parent_tbl, true)?;
             let parent = match resolved.parent_unique_index {
                 Some(index) => FkCheckParent::Index { parent_tbl, index },
                 None => FkCheckParent::Rowid { parent_tbl },

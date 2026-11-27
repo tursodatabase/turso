@@ -5398,3 +5398,623 @@ test fk-update-child-without-parent-fails {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+# Deleting a parent counts one violation per child row found through the
+# child index, because deleting each child row removes one.
+test fk-deferred-delete-parent-counts-each-indexed-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX c_pid ON c(pid);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1, 1), (2, 1);
+    BEGIN;
+    INSERT INTO c VALUES(4, 5);
+    DELETE FROM p WHERE id=1;
+    DELETE FROM c WHERE pid=1;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# A DEFERRABLE INITIALLY DEFERRED child key lets DROP TABLE remove the parent
+# until COMMIT, so recreating the parent in the same transaction commits.
+test fk-deferred-drop-parent-table-recreated-before-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1, 1);
+    BEGIN;
+    DROP TABLE p;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    INSERT INTO p VALUES(1);
+    COMMIT;
+    SELECT count(*) FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    1
+    1
+}
+
+# ON DELETE RESTRICT fails at once even for a deferred key, so DROP TABLE of
+# the parent fails as DELETE does.
+test fk-deferred-restrict-drop-parent-table-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    BEGIN;
+    DROP TABLE p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# PRAGMA defer_foreign_keys defers RESTRICT too, so the parent can be dropped
+# and recreated before COMMIT.
+test fk-defer-pragma-restrict-drop-parent-table-recreated-before-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id) ON DELETE RESTRICT);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    DROP TABLE p;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    INSERT INTO p VALUES(1);
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    1
+}
+
+
+test fk-defer-pragma-default-and-boolean-values {
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=off;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=yes;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=0;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=1;
+    PRAGMA defer_foreign_keys;
+}
+expect {
+    0
+    1
+    0
+    1
+    0
+    1
+}
+
+# The pragma turns off when a transaction ends: COMMIT, ROLLBACK, or an
+# autocommit statement that reads the database file. `SELECT 1` does not.
+test fk-defer-pragma-resets-when-transaction-ends {
+    CREATE TABLE t(x);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA defer_foreign_keys;
+    COMMIT;
+    PRAGMA defer_foreign_keys;
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    ROLLBACK;
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=ON;
+    SELECT 1;
+    PRAGMA defer_foreign_keys;
+    SELECT count(*) FROM t;
+    PRAGMA defer_foreign_keys;
+}
+expect {
+    1
+    0
+    0
+    1
+    1
+    0
+    0
+}
+
+# Like SQLite, statements that read the database file without opening a
+# transaction also turn the pragma off. `EXPLAIN SELECT 1` does not.
+test fk-defer-pragma-resets-after-statements-without-transaction {
+    CREATE TABLE t(x);
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA journal_mode;
+    PRAGMA defer_foreign_keys;
+    SELECT 'a';
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA wal_checkpoint;
+    PRAGMA defer_foreign_keys;
+    SELECT 'b';
+    PRAGMA defer_foreign_keys=ON;
+    EXPLAIN SELECT 1;
+    PRAGMA defer_foreign_keys;
+    SELECT 'c';
+    EXPLAIN SELECT x FROM t;
+    PRAGMA defer_foreign_keys;
+}
+expect pattern {
+    (?s)^\w+\n0\na\n[-\d|]+\n0\nb\n.*\n1\nc\n.*\n0$
+}
+
+
+# Like SQLite, only a statement that reads a table, a virtual table or the
+# schema of an existing table or index turns the pragma off.
+test fk-defer-pragma-stays-on-after-select-without-from {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, x);
+    CREATE INDEX p_x ON p(x);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    PRAGMA defer_foreign_keys=ON;
+    SELECT 1;
+    SELECT 2 + 1;
+    PRAGMA defer_foreign_keys;
+    BEGIN;
+    INSERT INTO c VALUES(1, 5);
+    INSERT INTO p VALUES(5, 0);
+    COMMIT;
+    SELECT count(*) FROM c;
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA foreign_key_list(c);
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=ON;
+    PRAGMA index_info(p_x);
+    PRAGMA defer_foreign_keys;
+    PRAGMA defer_foreign_keys=ON;
+    SELECT count(*) FROM (SELECT * FROM p);
+    PRAGMA defer_foreign_keys;
+}
+expect {
+    1
+    3
+    1
+    1
+    0|0|p|pid|id|NO ACTION|NO ACTION|NONE
+    0
+    0|1|x
+    0
+    1
+    0
+}
+
+@cross-check-integrity
+test fk-defer-pragma-child-before-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    CREATE TABLE cu(id INTEGER PRIMARY KEY, pu REFERENCES p(u));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(1, 1);
+    INSERT INTO cu VALUES(1, 'a'), (2, 'b');
+    INSERT INTO p VALUES(1, 'a'), (2, 'b');
+    COMMIT;
+    PRAGMA defer_foreign_keys;
+    SELECT * FROM c;
+    SELECT * FROM cu;
+}
+expect {
+    0
+    1|1
+    1|a
+    2|b
+}
+
+@cross-check-integrity
+test fk-defer-pragma-child-update-and-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1, 1), (2, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    UPDATE c SET pid=5 WHERE id=1;
+    INSERT INTO c VALUES(3, 6);
+    DELETE FROM c WHERE id=3;
+    INSERT INTO p VALUES(5);
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|5
+    2|1
+}
+
+# RESTRICT is deferred too.
+@cross-check-integrity
+test fk-defer-pragma-restrict-delete-and-update {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE RESTRICT ON UPDATE RESTRICT);
+    INSERT INTO p VALUES(1), (2);
+    INSERT INTO c VALUES(1, 1), (2, 2);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    DELETE FROM p WHERE id=1;
+    INSERT INTO p VALUES(1);
+    UPDATE p SET id=20 WHERE id=2;
+    UPDATE c SET pid=20 WHERE id=2;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|1
+    2|20
+}
+
+test fk-defer-pragma-commit-fails-with-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(1, 5);
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-defer-pragma-autocommit-statement-fails-with-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(1, 5);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-defer-pragma-rollback-to-savepoint-removes-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    SAVEPOINT s;
+    INSERT INTO c VALUES(1, 5);
+    ROLLBACK TO s;
+    RELEASE s;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+# Like SQLite, turning the pragma off forgets every counted violation,
+# including those of DEFERRABLE INITIALLY DEFERRED keys.
+@cross-check-integrity
+test fk-defer-pragma-off-clears-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    CREATE TABLE cd(id INTEGER PRIMARY KEY, pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(1, 5);
+    PRAGMA defer_foreign_keys=OFF;
+    COMMIT;
+    BEGIN;
+    INSERT INTO cd VALUES(1, 5);
+    PRAGMA defer_foreign_keys=OFF;
+    COMMIT;
+    SELECT count(*) FROM c;
+    SELECT count(*) FROM cd;
+}
+expect {
+    1
+    1
+}
+
+test fk-defer-pragma-drop-parent-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    DROP TABLE p;
+    ROLLBACK;
+    SELECT count(*) FROM p;
+    PRAGMA defer_foreign_keys;
+}
+expect {
+    1
+    0
+}
+
+# Dropping a child table removes the violations counted for its rows, as
+# SQLite's DROP TABLE deletes the rows first (fkey6-2.4 and fkey6-2.6).
+test fk-defer-pragma-drop-child-table-removes-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(5);
+    DROP TABLE c;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema WHERE name='c';
+}
+expect {
+    0
+}
+
+test fk-deferred-drop-child-table-removes-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a, b, UNIQUE(a, b));
+    CREATE TABLE c(x, y, FOREIGN KEY(x, y) REFERENCES p(a, b) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO p VALUES(1, 1);
+    INSERT INTO c VALUES(1, 1), (2, 2), (3, 3);
+    DROP TABLE c;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema WHERE name='c';
+}
+expect {
+    0
+}
+
+# After the parent table is dropped, each child row with a non-NULL key is an
+# orphan, so dropping the child table removes one violation for each of them.
+test fk-deferred-drop-parent-then-child-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1), (1), (NULL);
+    BEGIN;
+    DROP TABLE p;
+    DROP TABLE c;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# DROP TABLE ignores a key whose parent is missing or has no UNIQUE index on
+# the parent columns, as SQLite does.
+test fk-deferred-drop-child-table-parent-mismatch {
+    CREATE TABLE p(x);
+    CREATE TABLE c1(y REFERENCES p(x) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE c2(y REFERENCES nosuchtable DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO c1 VALUES(1);
+    INSERT INTO c2 VALUES(1);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE c1;
+    DROP TABLE c2;
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    p
+}
+
+# The rows of a table that references itself go away together with the rows
+# they reference, so DROP TABLE leaves no violation for them.
+test fk-defer-pragma-drop-self-referencing-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id));
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    DROP TABLE cat;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+test fk-defer-pragma-drop-self-referencing-table-with-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO cat VALUES(1, NULL), (2, 99);
+    DROP TABLE cat;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+test fk-deferred-drop-self-referencing-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO cat VALUES(1, 2), (2, 1);
+    DROP TABLE cat;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+test fk-immediate-drop-self-referencing-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id));
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    DROP TABLE cat;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# DROP TABLE deletes the rows in rowid order. With ON DELETE RESTRICT it fails
+# when a row is deleted before a row that references it.
+test fk-restrict-drop-self-referencing-table-later-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id) ON DELETE RESTRICT);
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    DROP TABLE cat;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-restrict-drop-self-referencing-table-earlier-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, k UNIQUE, parent REFERENCES cat(k) ON DELETE RESTRICT);
+    INSERT INTO cat VALUES(1, 10, 20), (2, 20, NULL), (3, 30, 30);
+    DROP TABLE cat;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+test fk-restrict-deferred-drop-self-referencing-table-later-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    DROP TABLE cat;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-defer-pragma-restrict-drop-self-referencing-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE cat(id INTEGER PRIMARY KEY, parent REFERENCES cat(id) ON DELETE RESTRICT);
+    INSERT INTO cat VALUES(1, NULL), (2, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    DROP TABLE cat;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# The violations counted for the rows of another child table remain.
+test fk-deferred-drop-child-table-keeps-other-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c1(pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE c2(pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c1 VALUES(5);
+    INSERT INTO c2 VALUES(6);
+    DROP TABLE c1;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# ROLLBACK TO restores the child table and the violations of its rows.
+test fk-deferred-drop-child-table-rollback-to-savepoint {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(5);
+    SAVEPOINT s;
+    DROP TABLE c;
+    ROLLBACK TO s;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+
+# A CASCADE, SET NULL or SET DEFAULT action removes one counted violation for
+# each child row it changes, so the parent change must count those rows first.
+@cross-check-integrity
+test fk-defer-pragma-actions-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u UNIQUE);
+    CREATE TABLE cc(id INTEGER PRIMARY KEY, pu REFERENCES p(u) ON DELETE CASCADE ON UPDATE CASCADE);
+    CREATE TABLE cn(id INTEGER PRIMARY KEY, pu REFERENCES p(u) ON DELETE SET NULL);
+    CREATE TABLE cd(id INTEGER PRIMARY KEY, pu DEFAULT 3 REFERENCES p(u) ON DELETE SET DEFAULT);
+    INSERT INTO p VALUES(1, 1), (2, 2), (3, 3);
+    INSERT INTO cc VALUES(1, 1), (2, 1), (3, 2);
+    INSERT INTO cn VALUES(1, 1), (2, 1);
+    INSERT INTO cd VALUES(1, 1), (2, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    UPDATE p SET u=20 WHERE id=2;
+    DELETE FROM p WHERE id=1;
+    COMMIT;
+    SELECT * FROM cc;
+    SELECT * FROM cn;
+    SELECT * FROM cd;
+}
+expect {
+    3|20
+    1|
+    2|
+    1|3
+    2|3
+}
+
+test fk-defer-pragma-cascade-delete-keeps-earlier-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pu REFERENCES p(u) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1, 1), (2, 2);
+    INSERT INTO c VALUES(1, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(4, 5);
+    DELETE FROM p WHERE id=1;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-defer-pragma-set-null-delete-keeps-earlier-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL);
+    CREATE INDEX c_pid ON c(pid);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1, 1), (2, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(4, 5);
+    DELETE FROM p WHERE id=1;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-defer-pragma-cascade-update-keeps-earlier-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pu REFERENCES p(u) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1, 1);
+    INSERT INTO c VALUES(1, 1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO c VALUES(4, 5);
+    UPDATE p SET u=7 WHERE id=1;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+

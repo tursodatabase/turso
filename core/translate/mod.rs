@@ -163,6 +163,7 @@ pub fn translate(
         row_security_role,
     );
     resolver.automatic_index = connection.automatic_index();
+    resolver.defer_foreign_keys = connection.defer_foreign_keys();
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 

@@ -3101,6 +3101,7 @@ impl Database {
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             namespace_being_dropped: RwLock::new(None),
+            defer_fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             triggers_enabled: AtomicBool::new(true),
             writes_stored_values: AtomicBool::new(false),
