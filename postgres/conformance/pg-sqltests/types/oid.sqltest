@@ -135,10 +135,6 @@ test oid-refuses-cast-from-double-precision {
 expect error {
     cannot cast type double precision to oid
 }
-@sqlstate 42846
-expect @tursopg error {
-    cannot cast type float8 to oid
-}
 
 test oid-casts-to-bigint {
     SELECT 4294967295::oid::int8, 5::oid::int8;
@@ -161,10 +157,6 @@ test oid-refuses-cast-to-smallint {
 @sqlstate 42846
 expect error {
     cannot cast type oid to smallint
-}
-@sqlstate 42846
-expect @tursopg error {
-    cannot cast type oid to int2
 }
 
 @compat-gap "type:numeric"

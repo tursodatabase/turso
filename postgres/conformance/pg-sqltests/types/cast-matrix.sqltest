@@ -760,10 +760,6 @@ test json-to-int-cast {
 expect error {
     cannot cast type json to integer
 }
-@sqlstate 42846
-expect @tursopg error {
-    cannot cast type json to int4
-}
 
 test cast-int4-to-json {
     SELECT 5::json;

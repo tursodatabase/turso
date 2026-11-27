@@ -10,7 +10,7 @@
 
 use crate::catalog::regclass_text;
 use crate::error::sqlstate_error;
-use crate::functions::{built_in_input_error, float8_text};
+use crate::functions::{built_in_input_error, float8_text, format_type};
 use crate::pg_type::regtype_text;
 use crate::pg_type::{bytea_to_int, check_oid_range, int_to_bytea, type_input, IntegerType};
 use crate::text::{encode_bytea, value_text, TextType};
@@ -67,20 +67,10 @@ impl CastType {
         }
     }
 
-    /// The name of the type as PostgreSQL's format_type() writes it, which
-    /// some errors use.
-    fn formatted_name(self) -> &'static str {
-        match self {
-            Self::Int2 => "smallint",
-            Self::Int4 => "integer",
-            Self::Int8 => "bigint",
-            Self::Float4 => "real",
-            Self::Float8 => "double precision",
-            Self::Bool => "boolean",
-            Self::Timestamp => "timestamp without time zone",
-            Self::TimestampTz => "timestamp with time zone",
-            other => other.name(),
-        }
+    /// The name of the type as PostgreSQL's format_type() writes it in an
+    /// error, such as `integer` for int4.
+    fn formatted_name(self) -> String {
+        format_type(self.oid(), -1)
     }
 
     pub(crate) fn oid(self) -> i64 {
@@ -317,7 +307,11 @@ pub(crate) fn resolve(
         ),
         _ => (
             SQLSTATE_CANNOT_COERCE,
-            format!("cannot cast type {} to {}", source.name(), target.name()),
+            format!(
+                "cannot cast type {} to {}",
+                source.formatted_name(),
+                target.formatted_name()
+            ),
         ),
     };
     Err(sqlstate_error(sqlstate, message, None))
