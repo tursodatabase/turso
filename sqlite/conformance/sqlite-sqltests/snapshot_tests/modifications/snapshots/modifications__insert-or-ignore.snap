@@ -42,7 +42,7 @@ addr  opcode       p1  p2  p3  p4                p5  comment
   25  Copy          2  11   0                     0  r[11]=r[2]
   26  MakeRecord   10   2  12                     0  r[12]=mkrec(r[10..11]); for sqlite_autoindex_users_1
   27  IdxInsert     0  12  10                     2  key=r[12]
-  28  Insert        1   7   2  users              0  intkey=r[2] data=r[7]
+  28  Insert        1   7   2  users              8  intkey=r[2] data=r[7]
   29  Goto          0  30   0                     0
   30  Goto          0  31   0                     0
   31  Halt          0   0   0                     0

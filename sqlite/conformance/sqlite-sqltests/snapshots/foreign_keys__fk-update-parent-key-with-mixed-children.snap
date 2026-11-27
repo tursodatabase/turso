@@ -70,7 +70,7 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
   53      MakeRecord      6   2  21                      0  r[21]=mkrec(r[6..7])
   54      NotExists       1  62   5                      0
   55      Delete          1   0   0  parent              0
-  56      Insert          1  21   5  parent             11  intkey=r[5] data=r[21]
+  56      Insert          1  21   5  parent              3  intkey=r[5] data=r[21]
   57      Copy           11  22   0                      0  r[22]=r[11]
   58      Copy            7  23   0                      0  r[23]=r[7]
   59      Eq             22  23  62  Binary              0  if r[22]==r[23] goto 62
@@ -103,6 +103,6 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
   18    Close             1   0   0                      0
   19    Goto              0  20   0                      0
   20    MakeRecord        5   2   8                      0  r[8]=mkrec(r[5..6])
-  21    Insert            0   8   4  child_cascade       8  intkey=r[4] data=r[8]
+  21    Insert            0   8   4  child_cascade       0  intkey=r[4] data=r[8]
   22  Next                0   3   0                      1
   23  Halt                0   0   0  fk action           0

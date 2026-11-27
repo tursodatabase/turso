@@ -297,11 +297,7 @@ fn emit_output_arrangement(
         cursor: table_cursor,
         key_reg: arrangement_rowid_reg,
         record_reg: state_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
+        flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
         table_name: arrangement_table_name.to_string(),
     });
     // New rows need a primary-key index entry; replacing an existing table

@@ -41,7 +41,7 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   23    Copy            2  10   0                      0  r[10]=r[2]
   24    MakeRecord      9   2  11                      0  r[11]=mkrec(r[9..10]); for sqlite_autoindex_parent_1
   25    IdxInsert       0  11   9                      2  key=r[11]
-  26    Insert          1   6   2  parent              0  intkey=r[2] data=r[6]
+  26    Insert          1   6   2  parent              8  intkey=r[2] data=r[6]
   27    Goto            0  56   0                      0
   28    SeekRowid       1   1  56                      0  if (r[1]!=cursor 1 for table parent.rowid) goto 56
   29    RowId           1  12   0                      0  r[12]=parent.rowid
@@ -64,7 +64,7 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   46    IdxInsert       0  23  21                      2  key=r[23]
   47    Null            0  18   0                      0  r[18]=NULL
   48    MakeRecord     18   3  27                      0  r[27]=mkrec(r[18..20])
-  49    Insert          1  27   1  parent              8  intkey=r[1] data=r[27]
+  49    Insert          1  27   1  parent              0  intkey=r[1] data=r[27]
   50    Copy           13  28   0                      0  r[28]=r[13]
   51    Copy           19  29   0                      0  r[29]=r[19]
   52    Eq             28  29  55  Binary              0  if r[28]==r[29] goto 55
@@ -96,6 +96,6 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   18    Close           1   0   0                      0
   19    Goto            0  20   0                      0
   20    MakeRecord      5   2   8                      0  r[8]=mkrec(r[5..6])
-  21    Insert          0   8   4  child               8  intkey=r[4] data=r[8]
+  21    Insert          0   8   4  child               0  intkey=r[4] data=r[8]
   22  Next              0   3   0                      1
   23  Halt              0   0   0  fk action           0

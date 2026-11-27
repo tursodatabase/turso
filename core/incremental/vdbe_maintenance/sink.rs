@@ -228,11 +228,7 @@ pub(super) fn emit_terminal_delta(
         cursor: view_cursor_id,
         key_reg: identity_reg,
         record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
+        flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
         table_name: view_name.to_string(),
     });
 

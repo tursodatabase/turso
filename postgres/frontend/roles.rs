@@ -344,7 +344,7 @@ pub(crate) fn translate_create_role(
         cursor: table_cursor_id,
         key_reg: id_reg,
         record_reg,
-        flag: InsertFlags::new().skip_last_rowid(),
+        flag: InsertFlags::new(),
         table_name: AUTHID_TABLE_NAME.to_string(),
     });
     emit_name_index_insert(program, index_cursor_id, name, id_reg);

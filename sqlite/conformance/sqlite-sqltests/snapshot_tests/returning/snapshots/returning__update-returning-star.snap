@@ -33,7 +33,7 @@ addr  opcode          p1  p2  p3  p4     p5  comment
   15    Affinity       3   3   0          0  r[3..6] = D, B, E
   16    MakeRecord     3   3   8          0  r[8]=mkrec(r[3..5])
   17    FinishSeek     1   0   0          0
-  18    Insert         1   8   2  t1      8  intkey=r[2] data=r[8]
+  18    Insert         1   8   2  t1      0  intkey=r[2] data=r[8]
   19    Copy           2   9   0          0  r[9]=r[2]
   20    Copy           4  10   0          0  r[10]=r[4]
   21    Copy           5  11   0          0  r[11]=r[5]

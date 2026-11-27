@@ -951,7 +951,7 @@ pub fn translate_insert(
 
     resolver.register_columns.clear();
 
-    let mut insert_flags = InsertFlags::new();
+    let mut insert_flags = InsertFlags::new().set_last_rowid();
 
     // For REPLACE (statement-level or constraint-level), we need to force a seek on the
     // insert, as we may have already deleted the conflicting row and the cursor is not
@@ -4326,9 +4326,7 @@ fn emit_update_sqlite_sequence(
 /// changes(), total_changes() nor last_insert_rowid(). A user's INSERT into
 /// sqlite_sequence has none of these flags and counts as usual.
 pub(crate) fn autoincrement_bookkeeping_insert_flags() -> InsertFlags {
-    InsertFlags::new()
-        .skip_last_rowid()
-        .skip_all_change_counts()
+    InsertFlags::new().skip_all_change_counts()
 }
 
 fn emit_replace_delete_conflicting_row(

@@ -199,10 +199,7 @@ fn emit_sequence_initial_row(
         cursor: seq_cursor_id,
         key_reg: base_reg, // base_reg holds the start value
         record_reg,
-        flag: InsertFlags::new()
-            .require_seek()
-            .skip_last_rowid()
-            .skip_all_change_counts(),
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -347,10 +344,7 @@ pub fn emit_disk_read_nextval(
         cursor: cursor_id,
         key_reg: target_register,
         record_reg,
-        flag: InsertFlags::new()
-            .require_seek()
-            .skip_last_rowid()
-            .skip_all_change_counts(),
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -626,10 +620,7 @@ pub fn emit_disk_advance_past(
         cursor: cursor_id,
         key_reg: value_reg,
         record_reg,
-        flag: InsertFlags::new()
-            .require_seek()
-            .skip_last_rowid()
-            .skip_all_change_counts(),
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
     program.emit_insn(Insn::SetSequenceCurrval {
@@ -949,10 +940,7 @@ pub fn emit_sqlite_sequence_row_write(
         cursor: sseq_cursor,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new()
-            .require_seek()
-            .skip_last_rowid()
-            .skip_all_change_counts(),
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Close {

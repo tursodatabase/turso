@@ -1202,11 +1202,7 @@ pub(super) fn emit_semi_or_anti_join(
         cursor: state_cursor,
         key_reg: row_reg,
         record_reg: state_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
+        flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
         table_name: state_name.clone(),
     });
     program.emit_insn(Insn::Goto {

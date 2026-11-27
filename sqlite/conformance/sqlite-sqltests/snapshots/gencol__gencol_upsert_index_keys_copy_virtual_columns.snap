@@ -51,7 +51,7 @@ addr  opcode         p1  p2  p3  p4      p5  comment
   33  Copy            2  19   0           0  r[19]=r[2]
   34  MakeRecord     18   2  20           0  r[20]=mkrec(r[18..19]); for sqlite_autoindex_t_1
   35  IdxInsert       1  20  18           2  key=r[20]
-  36  Insert          2   8   2  t        0  intkey=r[2] data=r[8]
+  36  Insert          2   8   2  t        8  intkey=r[2] data=r[8]
   37  Goto            0  78   0           0
   38  SeekRowid       2   1  78           0  if (r[1]!=cursor 2 for table t.rowid) goto 78
   39  RowId           2  21   0           0  r[21]=t.rowid
@@ -91,7 +91,7 @@ addr  opcode         p1  p2  p3  p4      p5  comment
   73  IdxInsert       1  47  45           2  key=r[47]
   74  Null            0  34   0           0  r[34]=NULL
   75  MakeRecord     34   3  53           0  r[53]=mkrec(r[34..36])
-  76  Insert          2  53   1  t        8  intkey=r[1] data=r[53]
+  76  Insert          2  53   1  t        0  intkey=r[1] data=r[53]
   77  Goto            0  78   0           0
   78  Goto            0  79   0           0
   79  Halt            0   0   0           0

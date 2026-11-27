@@ -2110,9 +2110,7 @@ fn emit_class_row_insert(
         cursor: cursors.table_cursor_id,
         key_reg: oid_reg,
         record_reg,
-        flag: InsertFlags::new()
-            .skip_last_rowid()
-            .skip_all_change_counts(),
+        flag: InsertFlags::new().skip_all_change_counts(),
         table_name: CLASSES_TABLE_NAME.to_string(),
     });
 
@@ -3174,10 +3172,7 @@ fn emit_class_row_overwrite(
         cursor: cursors.table_cursor_id,
         key_reg: rowid_reg,
         record_reg: record.record_reg,
-        flag: InsertFlags::new()
-            .skip_last_rowid()
-            .skip_all_change_counts()
-            .require_seek(),
+        flag: InsertFlags::new().skip_all_change_counts().require_seek(),
         table_name: CLASSES_TABLE_NAME.to_string(),
     });
 }
