@@ -55,16 +55,6 @@ fn hash_join_key<V: AsValueRef>(key_values: &[V], collations: &[CollationSeq]) -
     hasher.finish()
 }
 
-/// Normalize signed zero so 0.0 and -0.0 hash the same.
-#[inline]
-pub(crate) const fn normalized_f64_bits(f: f64) -> u64 {
-    if f == 0.0 {
-        0.0f64.to_bits()
-    } else {
-        f.to_bits()
-    }
-}
-
 /// Check if any of the key values is NULL.
 /// Rows with NULL join keys should be skipped in hash joins since NULL != NULL in SQL.
 fn has_null_key(key_values: &[Value]) -> bool {
@@ -5397,5 +5387,47 @@ mod hashtests {
         expected_unmatched.sort_unstable();
         actual_unmatched.sort_unstable();
         assert_eq!(actual_unmatched, expected_unmatched);
+    }
+
+    #[test]
+    fn nan_representations_match_in_hash_joins_and_distinct() {
+        let config = HashTableConfig {
+            num_keys: 1,
+            collations: vec![CollationSeq::BINARY],
+            ..Default::default()
+        };
+        let mut join = HashTable::new(config.clone(), Arc::new(MemoryIO::new())).unwrap();
+        let mut distinct = HashTable::new(config, Arc::new(MemoryIO::new())).unwrap();
+        let canonical = Value::from_f64(f64::NAN);
+        let _ = join
+            .insert(vec![canonical.clone()], 7, vec![], None)
+            .unwrap();
+        let _ = join.finalize_build(None).unwrap();
+        for (index, bits) in [
+            0x7ff8_0000_0000_0000u64,
+            0xfff8_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+            0x7fff_ffff_ffff_ffff,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let value = Value::from_f64(f64::from_bits(bits));
+            assert_eq!(
+                hash_join_key(&[value.as_value_ref()], &[CollationSeq::BINARY]),
+                hash_join_key(&[canonical.as_value_ref()], &[CollationSeq::BINARY])
+            );
+            assert_eq!(
+                join.probe(vec![value.clone()], None)
+                    .unwrap()
+                    .unwrap()
+                    .rowid,
+                7
+            );
+            let inserted = distinct
+                .insert_distinct(&[value.clone()], &[value.as_value_ref()], None)
+                .unwrap();
+            assert!(matches!(inserted, IOResult::Done(v) if v == (index == 0)));
+        }
     }
 }

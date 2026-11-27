@@ -25,6 +25,19 @@ impl Double {
     pub const fn is_nan(self) -> bool {
         self.0.is_nan()
     }
+
+    /// Bits for hashing and sort prefixes, consistent with this type's equality.
+    /// All NaNs share one positive encoding, as do both signs of zero.
+    pub const fn canonical_bits(self) -> u64 {
+        if self.0 == 0.0 {
+            0.0f64.to_bits()
+        } else if self.0.is_nan() {
+            // Rust does not specify the sign or payload of f64::NAN.
+            0x7ff8_0000_0000_0000
+        } else {
+            self.0.to_bits()
+        }
+    }
 }
 
 impl PartialEq for Double {
