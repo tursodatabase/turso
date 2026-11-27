@@ -2860,3 +2860,21 @@ expect {
     pg_catalog|t
     public|f
 }
+
+test pg-class-ctas-reads-existing-relations {
+    CREATE TABLE catalog_source (x int);
+    CREATE TABLE catalog_copy AS
+        SELECT relname, relnatts FROM pg_class WHERE relname = 'catalog_source';
+    SELECT * FROM catalog_copy;
+    CREATE TABLE catalog_self AS
+        SELECT oid FROM pg_class WHERE relname = 'catalog_self';
+    SELECT count(*) FROM catalog_self;
+    SELECT relname, relnatts FROM pg_class
+        WHERE relname IN ('catalog_copy', 'catalog_self') ORDER BY relname;
+}
+expect {
+    catalog_source|1
+    0
+    catalog_copy|2
+    catalog_self|1
+}

@@ -1730,3 +1730,64 @@ fn assert_implemented_catalog_rows(conn: &Arc<Connection>) {
         .collect();
     assert_eq!(rows, expected);
 }
+
+#[turso_macros::test(mvcc)]
+fn column_ddl_does_not_rewrite_relation_identity(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE derived (x int CHECK (x > 0))")
+        .unwrap();
+    let stored = || {
+        pg.inner()
+            .prepare_engine_schema_statement(
+                "SELECT * FROM __turso_internal_classes WHERE relname = 'derived'",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+    };
+    let before = stored();
+    pg.execute("ALTER TABLE derived ADD COLUMN y int").unwrap();
+    assert_eq!(
+        stored(),
+        before,
+        "column metadata belongs to the schema, not the identity row"
+    );
+    let read = || {
+        pg.prepare("SELECT relnatts, relchecks FROM pg_class WHERE relname = 'derived'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+    };
+    assert_eq!(read(), vec![vec![Value::from_i64(2), Value::from_i64(1)]]);
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    assert_eq!(read(), vec![vec![Value::from_i64(2), Value::from_i64(1)]]);
+}
+
+#[test]
+fn an_obsolete_relation_catalog_layout_is_refused_before_reading_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old-catalog.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Earlier layouts stored the engine namespace and ACL under these names.
+        conn.execute_batch(
+            "CREATE TABLE __turso_internal_classes (
+            oid INTEGER PRIMARY KEY, relname TEXT, relnamespace INTEGER,
+            relkind TEXT, relowner INTEGER, relownedby INTEGER, relacl TEXT,
+            relrowsecurity INTEGER, relpolicies TEXT, relownedbycolumn TEXT)",
+        )
+        .unwrap();
+    }
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let error = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("earlier version of tursopg"),
+        "{error}"
+    );
+}

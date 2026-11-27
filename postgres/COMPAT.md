@@ -95,8 +95,10 @@ always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`,
 `pg_class` is a virtual table with all 34 PostgreSQL 18 columns and a hidden
 `tableoid`. It combines user relation rows from a private physical table with
 built-in catalog rows from the running binary. DDL updates the physical rows
-in the same transaction, and schema loading rejects missing, orphaned or stale
-user rows. Changes to built-in catalog definitions do not require file updates.
+in the same transaction, and schema loading rejects missing or orphaned user
+identities. Column counts, check counts, index presence and ACL display text
+are derived from the current schema and roles instead of stored a second time.
+Changes to built-in catalog definitions do not require file updates.
 `pg_description` is a stored table. It has the comments that `COMMENT ON`
 stored, and the default `standard public schema` comment for `public`, so
 pg_dump does not emit a command to clear that comment on restore. Dropping a

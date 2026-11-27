@@ -13,7 +13,7 @@
 //! whenever it loads the schema.
 //!
 //! The PostgreSQL opening functions create these tables before
-//! returning the database. Every relation receives its catalog row when created.
+//! returning the database. Every user relation receives a row when created.
 //!
 //! Oids start at 16384, PostgreSQL's `FirstNormalObjectId`, and are never
 //! reused inside one database, even after the relation is dropped: the
@@ -67,111 +67,35 @@ pub(crate) const CLASSES_NAME_INDEX_NAME: &str = "__turso_internal_classes_name"
 /// relation. Smaller oids belong to built-in catalog objects.
 pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 
-/// The columns of the catalog table: those of PostgreSQL's `pg_class`, in its
-/// order, then hidden implementation fields. `relownedby` is the oid of
-/// the table whose
-/// serial column owns the relation, 0 when no relation owns it, and
-/// `relownedbycolumn` is the name of that column, NULL when no relation owns
-/// it: what PostgreSQL records in `pg_depend` as an automatic dependency,
-/// kept here until there is a `pg_depend`. `relenginename` is the name the
-/// engine's schema gives the relation, with ASCII letters folded to lowercase.
-/// It also differs for the index of a PRIMARY KEY or UNIQUE constraint, named after
-/// the constraint, and NULL for the primary key of a rowid table, which has
-/// no object in the schema. `relindrelid` is the oid of the table of an
-/// index, 0 for any other relation. `relpolicies` holds the table's
-/// row-level security policies in the form [`policies`] describes, NULL when
-/// it has none. `relacl` is the access control list in the text form of
-/// PostgreSQL's `aclitem[]`, NULL until the first `GRANT`, when the owner has
-/// every privilege and nobody else has any. `relprivileges` keeps the same
-/// ACL with numeric role OIDs for permission checks. `relenginenamespace`
-/// is the engine namespace ID; `relnamespace` is the PostgreSQL OID.
+/// Persistent relation identity, ownership, privileges and policies. Public
+/// pg_class fields that follow from the schema are computed by the virtual table.
 pub(crate) const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     oid INTEGER PRIMARY KEY, \
     relname TEXT NOT NULL, \
-    relnamespace INTEGER NOT NULL, \
-    reltype INTEGER NOT NULL, \
-    reloftype INTEGER NOT NULL, \
-    relowner INTEGER NOT NULL, \
-    relam INTEGER NOT NULL, \
-    relfilenode INTEGER NOT NULL, \
-    reltablespace INTEGER NOT NULL, \
-    relpages INTEGER NOT NULL, \
-    reltuples REAL NOT NULL, \
-    relallvisible INTEGER NOT NULL, \
-    relallfrozen INTEGER NOT NULL, \
-    reltoastrelid INTEGER NOT NULL, \
-    relhasindex BOOLEAN NOT NULL, \
-    relisshared BOOLEAN NOT NULL, \
-    relpersistence TEXT NOT NULL, \
+    relenginenamespace INTEGER NOT NULL, \
     relkind TEXT NOT NULL, \
-    relnatts INTEGER NOT NULL, \
-    relchecks INTEGER NOT NULL, \
-    relhasrules BOOLEAN NOT NULL, \
-    relhastriggers BOOLEAN NOT NULL, \
-    relhassubclass BOOLEAN NOT NULL, \
-    relrowsecurity BOOLEAN NOT NULL, \
-    relforcerowsecurity BOOLEAN NOT NULL, \
-    relispopulated BOOLEAN NOT NULL, \
-    relreplident TEXT NOT NULL, \
-    relispartition BOOLEAN NOT NULL, \
-    relrewrite INTEGER NOT NULL, \
-    relfrozenxid INTEGER NOT NULL, \
-    relminmxid INTEGER NOT NULL, \
-    relacl TEXT, \
-    reloptions TEXT, \
-    relpartbound TEXT, \
+    relowner INTEGER NOT NULL, \
     relownedby INTEGER NOT NULL, \
+    relprivileges TEXT, \
+    relrowsecurity BOOLEAN NOT NULL, \
     relpolicies TEXT, \
     relownedbycolumn TEXT, \
     relenginename TEXT, \
-    relindrelid INTEGER NOT NULL, \
-    relenginenamespace INTEGER NOT NULL, \
-    relprivileges TEXT, \
-    tableoid INTEGER NOT NULL)";
+    relindrelid INTEGER NOT NULL)";
 
-const CLASS_COLUMNS: [&str; 42] = [
+const CLASS_COLUMNS: [&str; 12] = [
     "oid",
     "relname",
-    "relnamespace",
-    "reltype",
-    "reloftype",
-    "relowner",
-    "relam",
-    "relfilenode",
-    "reltablespace",
-    "relpages",
-    "reltuples",
-    "relallvisible",
-    "relallfrozen",
-    "reltoastrelid",
-    "relhasindex",
-    "relisshared",
-    "relpersistence",
+    "relenginenamespace",
     "relkind",
-    "relnatts",
-    "relchecks",
-    "relhasrules",
-    "relhastriggers",
-    "relhassubclass",
-    "relrowsecurity",
-    "relforcerowsecurity",
-    "relispopulated",
-    "relreplident",
-    "relispartition",
-    "relrewrite",
-    "relfrozenxid",
-    "relminmxid",
-    "relacl",
-    "reloptions",
-    "relpartbound",
+    "relowner",
     "relownedby",
+    "relprivileges",
+    "relrowsecurity",
     "relpolicies",
     "relownedbycolumn",
     "relenginename",
     "relindrelid",
-    "relenginenamespace",
-    "relprivileges",
-    "tableoid",
 ];
 
 const CLASS_COLUMN_COUNT: usize = CLASS_COLUMNS.len();
@@ -179,17 +103,15 @@ const CLASS_COLUMN_COUNT: usize = CLASS_COLUMNS.len();
 const COLUMN_RELNAME: usize = column_position("relname");
 const COLUMN_RELENGINENAMESPACE: usize = column_position("relenginenamespace");
 const COLUMN_RELPRIVILEGES: usize = column_position("relprivileges");
-pub(crate) const PG_CLASS_COLUMN_COUNT: usize = column_position("relownedby");
 const COLUMN_RELOWNER: usize = column_position("relowner");
 const COLUMN_RELROWSECURITY: usize = column_position("relrowsecurity");
-const COLUMN_RELACL: usize = column_position("relacl");
 const COLUMN_RELOWNEDBY: usize = column_position("relownedby");
 const COLUMN_RELPOLICIES: usize = column_position("relpolicies");
 const COLUMN_RELOWNEDBYCOLUMN: usize = column_position("relownedbycolumn");
 const COLUMN_RELENGINENAME: usize = column_position("relenginename");
 const COLUMN_RELINDRELID: usize = column_position("relindrelid");
 
-pub(crate) const fn column_position(name: &str) -> usize {
+const fn column_position(name: &str) -> usize {
     let mut position = 0;
     while position < CLASS_COLUMNS.len() {
         if same_text(CLASS_COLUMNS[position], name) {
@@ -217,16 +139,6 @@ const fn same_text(left: &str, right: &str) -> bool {
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
      ON __turso_internal_classes (relenginenamespace, relname)";
-
-/// Hides the implementation columns after parsing either engine SQL or
-/// SQL rewritten by VACUUM. User relations have mangled names on disk.
-pub(crate) fn hide_internal_columns(table: &mut BTreeTable) {
-    if table.name == CLASSES_TABLE_NAME {
-        for column in table.columns_mut().iter_mut().skip(PG_CLASS_COLUMN_COUNT) {
-            column.set_hidden(true);
-        }
-    }
-}
 
 /// Fails for a database that has relations and no class table, as an
 /// earlier version of tursopg made it.
@@ -266,32 +178,6 @@ pub(crate) const TABLE_INIT: TableInit = TableInit {
         INSERT_HIGHEST_OID_SQL,
     ],
 };
-
-/// Builds the binary-defined catalog rows without persisting them in the file.
-fn builtin_rows(schema: &Schema) -> Vec<Vec<Value>> {
-    crate::catalog::BUILTIN_CATALOGS
-        .iter()
-        .map(|&(oid, name, kind, shared)| {
-            let new = NewRelation {
-                natts: crate::catalog::builtin_catalog_columns(schema, name).len(),
-                ..NewRelation::of_relation(NamespaceId::ROOT, name, kind)
-            };
-            let mut values = new_class_values(&new, RoleId::SUPERUSER, 11);
-            values[column_position("oid")] = ClassValue::Int(oid);
-            values[column_position("relisshared")] = ClassValue::Int(i64::from(shared));
-            values
-                .into_iter()
-                .map(|value| match value {
-                    ClassValue::Null => Value::Null,
-                    ClassValue::Int(value) => Value::from_i64(value),
-                    ClassValue::Real(value) => Value::from_f64(value),
-                    ClassValue::Text(value) => Value::build_text(value),
-                    ClassValue::Register(_) => unreachable!("built-in rows are constants"),
-                })
-                .collect()
-        })
-        .collect()
-}
 
 /// PostgreSQL's `pg_class.relkind` letter for `kind`.
 pub(crate) fn relkind_letter(kind: RelationKind) -> &'static str {
@@ -359,7 +245,6 @@ impl RelationClass {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ClassCatalog {
     by_oid: BTreeMap<i64, RelationClass>,
-    stored_rows: BTreeMap<i64, Vec<Value>>,
     oids_by_engine_name: HashMap<(NamespaceId, String), i64>,
     oids_by_relname: HashMap<(NamespaceId, String), i64>,
 }
@@ -383,43 +268,39 @@ impl ClassCatalog {
             }
         }
         for class in catalog.classes() {
-            catalog.check_relation(schema, &relations, class)?;
+            catalog.relation_metadata(schema, &relations, class)?;
         }
-        // Built-in identities come from this binary, after validating file rows.
-        for row in builtin_rows(schema) {
-            let prefix = vec![
-                row[column_position("oid")].clone(),
-                row[column_position("relname")].clone(),
-                Value::from_i64(0),
-                row[column_position("relkind")].clone(),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::Null,
-                Value::from_i64(0),
-                Value::Null,
-                Value::Null,
-                row[column_position("relenginename")].clone(),
-                Value::from_i64(0),
-            ];
-            let class = class_from_row(&prefix)?;
-            catalog.stored_rows.insert(class.oid, row);
-            catalog.add(class);
+        // The file stores only user relations. Built-in identities belong to the binary.
+        for &(oid, name, kind, _) in crate::catalog::BUILTIN_CATALOGS {
+            catalog.add(RelationClass {
+                oid,
+                relname: name.to_string(),
+                relnamespace: NamespaceId::ROOT,
+                relkind: kind,
+                relowner: RoleId::SUPERUSER,
+                relownedby: 0,
+                relownedbycolumn: None,
+                engine_name: Some(name.to_string()),
+                relindrelid: 0,
+                relacl: None,
+                relrowsecurity: false,
+                relpolicies: TablePolicies::default(),
+            });
         }
         Ok(catalog)
     }
 
-    /// Checks both identities and fields derived by DDL. Stored rows are
-    /// input from disk, so a mismatch is corruption, not an assertion.
-    fn check_relation(
+    /// Checks stored identities against the schema and derives relation metadata.
+    /// Stored rows are input from disk, so an invalid identity is corruption.
+    fn relation_metadata(
         &self,
         schema: &Schema,
         relations: &[(NamespaceId, String, RelationKind)],
         class: &RelationClass,
-    ) -> turso_core::Result<()> {
-        let row = &self.stored_rows[&class.oid];
+    ) -> turso_core::Result<(usize, bool, usize)> {
         let invalid = || {
             LimboError::Corrupt(format!(
-                "stored class row for \"{}\" has no matching relation or has stale columns",
+                "stored class row for \"{}\" has no matching relation",
                 class.relname
             ))
         };
@@ -504,32 +385,17 @@ impl ClassCatalog {
                 }
             }
         };
-        for (name, expected) in [
-            (
-                "relnamespace",
-                crate::catalog::namespace_oid(schema, class.relnamespace),
-            ),
-            ("relowner", role_oid(class.relowner)),
-            ("relnatts", natts as i64),
-            ("relhasindex", i64::from(has_index)),
-            ("relchecks", checks as i64),
-        ] {
-            if row[column_position(name)].as_int() != Some(expected) {
-                return Err(invalid());
-            }
-        }
-        Ok(())
+        Ok((natts, has_index, checks))
     }
 
     /// Returns a catalog of the rows read from the classes table.
     fn new(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
-            if row.len() != 12 + CLASS_COLUMN_COUNT {
+            if row.len() != CLASS_COLUMN_COUNT {
                 return Err(corrupt_row(row));
             }
-            let class = class_from_row(&row[..12])?;
-            catalog.stored_rows.insert(class.oid, row[12..].to_vec());
+            let class = class_from_row(row)?;
             let engine_name_is_taken = class
                 .engine_name
                 .as_ref()
@@ -547,11 +413,44 @@ impl ClassCatalog {
         Ok(catalog)
     }
 
-    /// The public columns as stored, without deriving values from Schema.
-    pub(crate) fn stored_rows(&self) -> Vec<Vec<Value>> {
-        self.stored_rows
-            .values()
-            .map(|row| row[..PG_CLASS_COLUMN_COUNT].to_vec())
+    /// Public pg_class rows from persistent identities and this schema snapshot.
+    pub(crate) fn rows(&self, schema: &Schema) -> Vec<Vec<Value>> {
+        let relations = schema.user_relations();
+        self.classes()
+            // CTAS allocates its identity before running the source query, but
+            // publishes its schema entry afterwards. Like PostgreSQL, that
+            // query must not see the relation it is still creating. File rows
+            // have already been checked by build; only live DDL has this state.
+            .filter(|class| {
+                class.oid < FIRST_NORMAL_OBJECT_ID
+                    || class.engine_name.as_ref().is_none_or(|name| {
+                        relations.iter().any(|(namespace, relation_name, kind)| {
+                            *namespace == class.relnamespace
+                                && relation_name == name
+                                && *kind == class.relkind
+                        })
+                    })
+            })
+            .map(|class| {
+                let (natts, has_index, checks, shared) = if class.oid < FIRST_NORMAL_OBJECT_ID {
+                    let &(_, name, _, shared) = crate::catalog::BUILTIN_CATALOGS
+                        .iter()
+                        .find(|&&(oid, _, _, _)| oid == class.oid)
+                        .expect("built-in identity");
+                    (
+                        crate::catalog::builtin_catalog_columns(schema, name).len(),
+                        false,
+                        0,
+                        shared,
+                    )
+                } else {
+                    let (natts, has_index, checks) = self
+                        .relation_metadata(schema, &relations, class)
+                        .expect("loaded relation identities agree with the schema");
+                    (natts, has_index, checks, false)
+                };
+                public_class_row(schema, class, natts, has_index, checks, shared)
+            })
             .collect()
     }
 
@@ -640,7 +539,6 @@ impl ClassCatalog {
 
     fn remove_by_oid(&mut self, oid: i64) -> Option<RelationClass> {
         let class = self.by_oid.remove(&oid)?;
-        self.stored_rows.remove(&oid);
         self.oids_by_relname
             .remove(&(class.relnamespace, class.relname.clone()));
         if let Some(engine_name) = &class.engine_name {
@@ -651,12 +549,84 @@ impl ClassCatalog {
     }
 }
 
-fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
-    let [oid, relname, relnamespace, relkind, relowner, relownedby, relacl, relrowsecurity, relpolicies, relownedbycolumn, relenginename, relindrelid] =
-        row
-    else {
-        return Err(corrupt_row(row));
+/// The public columns, in PostgreSQL order. Schema metadata and ACL names are
+/// derived from the same snapshot as the relation's persistent identity.
+fn public_class_row(
+    schema: &Schema,
+    class: &RelationClass,
+    natts: usize,
+    has_index: bool,
+    checks: usize,
+    shared: bool,
+) -> Vec<Value> {
+    let (access_method, replica_identity, reltuples) = match class.relkind {
+        RelationKind::Table | RelationKind::MaterializedView => (2, "d", 0.0),
+        RelationKind::Index => (403, "d", 0.0),
+        RelationKind::Sequence => (0, "n", 1.0),
+        RelationKind::View => (0, "n", 0.0),
     };
+    let acl = class.relacl.as_ref().map_or(Value::Null, |acl| {
+        Value::build_text(acl.display_text(&|oid| {
+            crate::catalog::role_name_by_oid(schema_roles(schema), oid)
+                .unwrap_or_else(|| oid.to_string())
+        }))
+    });
+    vec![
+        Value::from_i64(class.oid),               // oid
+        Value::build_text(class.relname.clone()), // relname
+        Value::from_i64(crate::catalog::namespace_oid(schema, class.relnamespace)),
+        Value::from_i64(0), // reltype
+        Value::from_i64(0), // reloftype
+        Value::from_i64(role_oid(class.relowner)),
+        Value::from_i64(access_method), // relam
+        Value::from_i64(0),             // relfilenode
+        Value::from_i64(0),             // reltablespace
+        Value::from_i64(1),             // relpages
+        Value::from_f64(reltuples),
+        Value::from_i64(0), // relallvisible
+        Value::from_i64(0), // relallfrozen
+        Value::from_i64(0), // reltoastrelid
+        Value::from_i64(i64::from(has_index)),
+        Value::from_i64(i64::from(shared)),
+        Value::build_text("p"), // relpersistence
+        Value::build_text(relkind_letter(class.relkind)),
+        Value::from_i64(natts as i64),
+        Value::from_i64(checks as i64),
+        // FIXME(pg-rewrite): Views have an INSTEAD SELECT _RETURN rule in
+        // PostgreSQL. A stored rule catalog should supply relhasrules.
+        Value::from_i64(i64::from(class.relkind == RelationKind::View)),
+        Value::from_i64(0), // relhastriggers
+        Value::from_i64(0), // relhassubclass
+        Value::from_i64(i64::from(class.relrowsecurity)),
+        Value::from_i64(0), // relforcerowsecurity
+        Value::from_i64(1), // relispopulated
+        Value::build_text(replica_identity),
+        Value::from_i64(0), // relispartition
+        Value::from_i64(0), // relrewrite
+        Value::from_i64(0), // relfrozenxid
+        Value::from_i64(0), // relminmxid
+        acl,
+        Value::Null, // reloptions
+        Value::Null, // relpartbound
+    ]
+}
+
+fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
+    if row.len() != CLASS_COLUMN_COUNT {
+        return Err(corrupt_row(row));
+    }
+    let oid = &row[column_position("oid")];
+    let relname = &row[column_position("relname")];
+    let relnamespace = &row[column_position("relenginenamespace")];
+    let relkind = &row[column_position("relkind")];
+    let relowner = &row[column_position("relowner")];
+    let relownedby = &row[column_position("relownedby")];
+    let relacl = &row[column_position("relprivileges")];
+    let relrowsecurity = &row[column_position("relrowsecurity")];
+    let relpolicies = &row[column_position("relpolicies")];
+    let relownedbycolumn = &row[column_position("relownedbycolumn")];
+    let relenginename = &row[column_position("relenginename")];
+    let relindrelid = &row[column_position("relindrelid")];
     match (
         oid,
         relname,
@@ -720,7 +690,9 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                     NamespaceId::new(*relnamespace as u32)
                 },
                 relkind,
-                relowner: RoleId::from_stored(*relowner),
+                relowner: crate::catalog::role_id_from_oid(*relowner)
+                    .filter(|id| *id != RoleId::PUBLIC)
+                    .ok_or_else(|| corrupt_row(row))?,
                 relownedby: *relownedby,
                 relownedbycolumn,
                 relacl,
@@ -744,15 +716,23 @@ pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
 
 /// The query that reads the relation catalog for the frontend's schema
 /// state, or None when the database has no classes table.
-pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
-    schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
-    Some(format!(
-        "SELECT oid, relname, relenginenamespace, relkind, \
-         CASE WHEN relowner = 10 THEN 0 ELSE relowner - 16384 END, \
-         relownedby, relprivileges, relrowsecurity, relpolicies, \
-         relownedbycolumn, relenginename, relindrelid, {} FROM {CLASSES_TABLE_NAME}",
+pub(crate) fn schema_state_query(schema: &Schema) -> turso_core::Result<Option<String>> {
+    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME) else {
+        return Ok(None);
+    };
+    if table.columns().len() != CLASS_COLUMN_COUNT
+        || table
+            .columns()
+            .iter()
+            .zip(CLASS_COLUMNS)
+            .any(|(column, name)| column.name.as_deref() != Some(name))
+    {
+        return Err(not_supported("the database has a relation catalog from an earlier version of tursopg; this version does not open it"));
+    }
+    Ok(Some(format!(
+        "SELECT {} FROM {CLASSES_TABLE_NAME}",
         CLASS_COLUMNS.join(", ")
-    ))
+    )))
 }
 
 /// [`turso_core::Dialect::relation_owner`] for the PostgreSQL frontend.
@@ -875,35 +855,12 @@ impl Catalog for PostgresCatalog {
                             kind: RelationKind::Index,
                             table: Some(index.table),
                             indexed_table: IndexedTable::Oid(table_oid),
-                            natts: match index.statement {
-                                ast::Stmt::CreateIndex { columns, .. } => columns.len(),
-                                _ => unreachable!("CreateIndex carries CREATE INDEX"),
-                            },
-                            has_index: false,
-                            checks: 0,
                         },
                     )?;
-                    rows.set_columns(program, index.namespace, index.table, &[("relhasindex", 1)]);
                 }
             }
             CatalogCmd::DropIndex(index) => {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
-                    if let Some(catalog) = class_catalog(ctx.schema) {
-                        if let Some(class) = catalog.get_by_name(index.namespace, index.name) {
-                            let table = catalog
-                                .get_by_oid(class.relindrelid)
-                                .expect("index has a table");
-                            let has_index = catalog
-                                .indexes_of(table.oid)
-                                .any(|other| other.oid != class.oid);
-                            rows.set_columns(
-                                program,
-                                index.namespace,
-                                &table.relname,
-                                &[("relhasindex", i64::from(has_index))],
-                            );
-                        }
-                    }
                     rows.dropped_relation(program, index.namespace, index.name);
                 }
             }
@@ -946,13 +903,6 @@ impl Catalog for PostgresCatalog {
                         program,
                         NewRelation {
                             name: view.written_name.as_str(),
-                            natts: turso_core::schema::view::extract_view_columns(
-                                view.namespace,
-                                view.select,
-                                ctx.schema,
-                            )?
-                            .columns
-                            .len(),
                             ..NewRelation::of_relation(
                                 view.namespace,
                                 view.name,
@@ -968,13 +918,6 @@ impl Catalog for PostgresCatalog {
                         program,
                         NewRelation {
                             name: view.written_name.as_str(),
-                            natts: turso_core::schema::view::extract_view_columns(
-                                view.namespace,
-                                view.select,
-                                ctx.schema,
-                            )?
-                            .columns
-                            .len(),
                             ..NewRelation::of_relation(
                                 view.namespace,
                                 view.name,
@@ -1027,28 +970,15 @@ impl Catalog for PostgresCatalog {
                     column.definition.col_name.as_str(),
                 )?;
             }
+            // Column metadata is derived from the schema by the virtual catalog.
             CatalogCmd::AddColumn(column) => {
-                // Column changes in attached SQLite databases have no class
-                // row to update and do not change a relation's identity.
-                if ctx.database_id != MAIN_DB_ID {
-                    return Ok(());
-                }
-                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                if ctx.database_id == MAIN_DB_ID {
                     refuse_changed_view_width(
                         ctx.schema,
                         column.namespace,
                         column.name,
                         column.table,
                     )?;
-                    rows.set_columns(
-                        program,
-                        column.namespace,
-                        column.name,
-                        &[
-                            ("relnatts", column.table.columns().len() as i64),
-                            ("relchecks", column.table.check_constraints.len() as i64),
-                        ],
-                    );
                 }
             }
             // The statement drops the sequences that the column owns
@@ -1057,23 +987,7 @@ impl Catalog for PostgresCatalog {
                 if ctx.database_id != MAIN_DB_ID {
                     return Ok(());
                 }
-                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
-                    refuse_changed_view_width(
-                        ctx.schema,
-                        column.namespace,
-                        column.name,
-                        column.table,
-                    )?;
-                    rows.set_columns(
-                        program,
-                        column.namespace,
-                        column.name,
-                        &[
-                            ("relnatts", column.table.columns().len() as i64),
-                            ("relchecks", column.table.check_constraints.len() as i64),
-                        ],
-                    );
-                }
+                refuse_changed_view_width(ctx.schema, column.namespace, column.name, column.table)?;
                 if ctx.origin != CmdOrigin::Engine && ctx.database_id == MAIN_DB_ID {
                     emit_dropped_column_comments(program, ctx, column);
                 }
@@ -1201,9 +1115,6 @@ struct NewRelation<'a> {
     /// The table whose owner owns the relation, for an index.
     table: Option<&'a str>,
     indexed_table: IndexedTable,
-    natts: usize,
-    has_index: bool,
-    checks: usize,
 }
 
 impl<'a> NewRelation<'a> {
@@ -1217,9 +1128,6 @@ impl<'a> NewRelation<'a> {
             kind,
             table: None,
             indexed_table: IndexedTable::None,
-            natts: if kind == RelationKind::Sequence { 3 } else { 0 },
-            has_index: false,
-            checks: 0,
         }
     }
 }
@@ -1247,10 +1155,6 @@ fn emit_new_table_rows(
         program,
         NewRelation {
             name: table.written_name.as_str(),
-            natts: table.table.columns().len(),
-            has_index: !table.automatic_indexes.is_empty()
-                || table.table.get_rowid_alias_column().is_some(),
-            checks: table.table.check_constraints.len(),
             ..NewRelation::of_relation(table.namespace, table.name, RelationKind::Table)
         },
     )?
@@ -1275,12 +1179,6 @@ fn emit_new_table_rows(
                 kind: RelationKind::Index,
                 table: Some(table.name),
                 indexed_table: IndexedTable::Register(table_oid_reg),
-                natts: match key {
-                    ConstraintKey::PrimaryKey => btree.primary_key_columns.len(),
-                    ConstraintKey::Unique(set) => set.columns.len(),
-                },
-                has_index: false,
-                checks: 0,
             },
         )?;
         Ok(())
@@ -1482,36 +1380,7 @@ impl<'a> ClassRowWriter<'a> {
             .table
             .and_then(|table| relation_owner(self.schema, new.namespace, table))
             .unwrap_or_else(|| self.connection.current_role());
-        let namespace_oid = crate::catalog::namespace_oid(self.schema, new.namespace);
-        Ok(emit_class_row_insert(
-            program,
-            &self.cursors,
-            new,
-            owner,
-            namespace_oid,
-        ))
-    }
-
-    /// Updates columns derived from the relation's definition in the same
-    /// statement that changes its schema row.
-    // FIXME(pg-catalog): A catalog with physical and virtual parts could derive
-    // relnatts, relchecks and relhasindex from the schema in its virtual part,
-    // removing the need to store and update these fields during DDL.
-    fn set_columns(
-        &self,
-        program: &mut ProgramBuilder,
-        namespace: NamespaceId,
-        name: &str,
-        columns: &[(&str, i64)],
-    ) {
-        emit_find_class_row(program, &self.cursors, namespace, name, |program, row| {
-            let changes = columns
-                .iter()
-                .map(|(name, value)| (column_position(name), ClassRecordColumn::LiteralInt(*value)))
-                .collect();
-            let record_reg = emit_class_record(program, row, changes);
-            emit_class_row_overwrite(program, &self.cursors, row.rowid_reg, record_reg);
-        });
+        Ok(emit_class_row_insert(program, &self.cursors, new, owner))
     }
 
     /// The oid of the class row of the relation that the schema calls
@@ -1764,7 +1633,7 @@ pub(crate) fn translate_access_statement(
                     acl.change_owner(role_oid(other.relowner), role_oid(owner));
                     acl
                 });
-                emit_class_row_set_owner(program, &cursors, other.oid, owner, acl.as_ref(), schema);
+                emit_class_row_set_owner(program, &cursors, other.oid, owner, acl.as_ref());
             }
         }
         AccessStatement::Grant {
@@ -1865,7 +1734,7 @@ pub(crate) fn translate_access_statement(
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;
                 }
-                emit_class_row_set_acl(program, &cursors, *namespace, name, &acl, schema);
+                emit_class_row_set_acl(program, &cursors, *namespace, name, &acl);
             }
         }
         AccessStatement::SetRowSecurity {
@@ -2142,7 +2011,6 @@ fn emit_class_row_insert(
     cursors: &ClassTableCursors,
     new: NewRelation<'_>,
     owner: RoleId,
-    namespace_oid: i64,
 ) -> Option<usize> {
     if !is_user_relation_name(new.kind, new.engine_name.unwrap_or(new.name)) {
         return None;
@@ -2152,10 +2020,7 @@ fn emit_class_row_insert(
     emit_class_name_index_insert(program, cursors, new.namespace, new.name, oid_reg);
 
     let first_column_reg = program.alloc_registers(CLASS_COLUMN_COUNT);
-    for (column, value) in new_class_values(&new, owner, namespace_oid)
-        .into_iter()
-        .enumerate()
-    {
+    for (column, value) in new_class_values(&new, owner).into_iter().enumerate() {
         emit_class_value(program, value, first_column_reg + column);
     }
     let record_reg = program.alloc_register();
@@ -2193,7 +2058,6 @@ fn emit_class_row_insert(
         engine_owner_reg,
         first_column_reg + COLUMN_RELINDRELID,
     );
-    StoredClassRow.emit(program, oid_reg, first_column_reg);
     Some(oid_reg)
 }
 
@@ -2202,7 +2066,6 @@ fn emit_class_row_insert(
 enum ClassValue {
     Null,
     Int(i64),
-    Real(f64),
     Text(String),
     Register(usize),
 }
@@ -2211,66 +2074,21 @@ enum ClassValue {
 /// the record keeps NULL for it, as SQLite does for an INTEGER PRIMARY KEY
 /// column. No GRANT has touched a new relation, so `relacl` is NULL, and it
 /// has no row-level security and no policies.
-fn new_class_values(new: &NewRelation<'_>, owner: RoleId, namespace_oid: i64) -> Vec<ClassValue> {
-    let (name, namespace, kind) = (new.name, new.namespace, new.kind);
-    let (access_method, replica_identity, reltuples) = match kind {
-        RelationKind::Table | RelationKind::MaterializedView => (2, "d", 0.0),
-        RelationKind::Index => (403, "d", 0.0),
-        RelationKind::Sequence => (0, "n", 1.0),
-        RelationKind::View => (0, "n", 0.0),
-    };
+fn new_class_values(new: &NewRelation<'_>, owner: RoleId) -> Vec<ClassValue> {
     let mut values = vec![ClassValue::Null; CLASS_COLUMN_COUNT];
     let mut set = |column: &str, value: ClassValue| values[column_position(column)] = value;
-    set("relname", ClassValue::Text(name.to_string()));
-    set("relnamespace", ClassValue::Int(namespace_oid));
-    set("reltype", ClassValue::Int(0));
-    set("reloftype", ClassValue::Int(0));
-    set("relowner", ClassValue::Int(role_oid(owner)));
+    set("relname", ClassValue::Text(new.name.to_string()));
     set(
         "relenginenamespace",
-        ClassValue::Int(i64::from(namespace.as_u32())),
+        ClassValue::Int(i64::from(new.namespace.as_u32())),
     );
-    set("relam", ClassValue::Int(access_method));
-    set("relfilenode", ClassValue::Int(0));
-    set("reltablespace", ClassValue::Int(0));
-    set("relpages", ClassValue::Int(1));
-    set("reltuples", ClassValue::Real(reltuples));
-    set("relallvisible", ClassValue::Int(0));
-    set("relallfrozen", ClassValue::Int(0));
-    set(
-        "tableoid",
-        ClassValue::Int(turso_pg_parser::translator::PG_CLASS_OID),
-    );
-    set("reltoastrelid", ClassValue::Int(0));
-    set("relhasindex", ClassValue::Int(i64::from(new.has_index)));
-    set("relisshared", ClassValue::Int(0));
-    set("relpersistence", ClassValue::Text("p".to_string()));
     set(
         "relkind",
-        ClassValue::Text(relkind_letter(kind).to_string()),
+        ClassValue::Text(relkind_letter(new.kind).to_string()),
     );
-    set("relnatts", ClassValue::Int(new.natts as i64));
-    set("relchecks", ClassValue::Int(new.checks as i64));
-    // FIXME(pg-rewrite): PostgreSQL gives views an INSTEAD SELECT _RETURN
-    // rule. A stored rule catalog should supply this flag.
-    set(
-        "relhasrules",
-        ClassValue::Int(i64::from(kind == RelationKind::View)),
-    );
-    set("relhastriggers", ClassValue::Int(0));
-    set("relhassubclass", ClassValue::Int(0));
-    set("relrowsecurity", ClassValue::Int(0));
-    set("relforcerowsecurity", ClassValue::Int(0));
-    set("relispopulated", ClassValue::Int(1));
-    set(
-        "relreplident",
-        ClassValue::Text(replica_identity.to_string()),
-    );
-    set("relispartition", ClassValue::Int(0));
-    set("relrewrite", ClassValue::Int(0));
-    set("relfrozenxid", ClassValue::Int(0));
-    set("relminmxid", ClassValue::Int(0));
+    set("relowner", ClassValue::Int(role_oid(owner)));
     set("relownedby", ClassValue::Int(0));
+    set("relrowsecurity", ClassValue::Int(0));
     set(
         "relenginename",
         new.engine_name
@@ -2294,7 +2112,6 @@ fn emit_class_value(program: &mut ProgramBuilder, value: ClassValue, dest: usize
             dest_end: None,
         }),
         ClassValue::Int(value) => program.emit_insn(Insn::Integer { value, dest }),
-        ClassValue::Real(value) => program.emit_insn(Insn::Real { value, dest }),
         ClassValue::Text(value) => program.emit_insn(Insn::String8 { value, dest }),
         ClassValue::Register(src_reg) => program.emit_insn(Insn::Copy {
             src_reg,
@@ -2517,7 +2334,6 @@ fn emit_class_row_set_owner(
     oid: i64,
     owner: RoleId,
     acl: Option<&Acl>,
-    schema: &Schema,
 ) {
     let owner_reg = program.alloc_register();
     program.emit_insn(Insn::Integer {
@@ -2525,7 +2341,6 @@ fn emit_class_row_set_owner(
         dest: owner_reg,
     });
     let acl_reg = emit_acl(program, acl);
-    let displayed_acl_reg = emit_display_acl(program, schema, acl);
     emit_find_class_row_by(program, cursors, ClassKey::Oid(oid), |program, row| {
         let record_reg = emit_class_record(
             program,
@@ -2536,10 +2351,6 @@ fn emit_class_row_set_owner(
                     ClassRecordColumn::LiteralInt(role_oid(owner)),
                 ),
                 (COLUMN_RELPRIVILEGES, ClassRecordColumn::Register(acl_reg)),
-                (
-                    COLUMN_RELACL,
-                    ClassRecordColumn::Register(displayed_acl_reg),
-                ),
             ],
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
@@ -2555,21 +2366,13 @@ fn emit_class_row_set_acl(
     namespace: NamespaceId,
     name: &str,
     acl: &Acl,
-    schema: &Schema,
 ) {
     let acl_reg = emit_acl(program, Some(acl));
-    let displayed_acl_reg = emit_display_acl(program, schema, Some(acl));
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
             row,
-            vec![
-                (COLUMN_RELPRIVILEGES, ClassRecordColumn::Register(acl_reg)),
-                (
-                    COLUMN_RELACL,
-                    ClassRecordColumn::Register(displayed_acl_reg),
-                ),
-            ],
+            vec![(COLUMN_RELPRIVILEGES, ClassRecordColumn::Register(acl_reg))],
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -2684,30 +2487,6 @@ fn emit_class_row_set_policies(
     .emit(program, policies_reg);
 }
 
-/// The full stored record, kept with the schema snapshot for catalog joins.
-#[derive(Debug)]
-struct StoredClassRow;
-
-impl StoredClassRow {
-    fn emit(self, program: &mut ProgramBuilder, oid_reg: usize, first_column_reg: usize) {
-        let registers = std::iter::once(oid_reg)
-            .chain((1..CLASS_COLUMN_COUNT).map(|column| first_column_reg + column))
-            .collect();
-        emit_catalog_apply(program, self, registers);
-    }
-
-    fn apply_to(&self, classes: &mut ClassCatalog, values: &[Value]) -> turso_core::Result<()> {
-        assert_eq!(values.len(), CLASS_COLUMN_COUNT);
-        let oid = read_back_integer(&values[0])?;
-        assert!(
-            classes.by_oid.contains_key(&oid),
-            "a stored row has an identity"
-        );
-        classes.stored_rows.insert(oid, values.to_vec());
-        Ok(())
-    }
-}
-
 /// A class row that the statement inserted.
 #[derive(Debug)]
 struct ClassCreated {
@@ -2804,14 +2583,7 @@ impl ClassRenamed {
     }
 
     fn apply_to(&self, classes: &mut ClassCatalog, _values: &[Value]) -> turso_core::Result<()> {
-        let stored = classes
-            .get_by_name(self.namespace, &self.old_name)
-            .and_then(|class| classes.stored_rows.get(&class.oid))
-            .cloned();
         if let Some(mut class) = classes.remove(self.namespace, &self.old_name) {
-            if let Some(stored) = stored {
-                classes.stored_rows.insert(class.oid, stored);
-            }
             class.relname.clone_from(&self.new_name);
             class.engine_name = Some(self.new_name.to_ascii_lowercase());
             classes.add(class);
@@ -2835,14 +2607,7 @@ impl ClassEngineNameChanged {
     }
 
     fn apply_to(&self, classes: &mut ClassCatalog, _values: &[Value]) -> turso_core::Result<()> {
-        let stored = classes
-            .get_by_name(self.namespace, &self.old_name)
-            .and_then(|class| classes.stored_rows.get(&class.oid))
-            .cloned();
         if let Some(mut class) = classes.remove(self.namespace, &self.old_name) {
-            if let Some(stored) = stored {
-                classes.stored_rows.insert(class.oid, stored);
-            }
             class.engine_name = Some(self.new_name.clone());
             classes.add(class);
         }
@@ -3023,7 +2788,6 @@ macro_rules! apply_to_class_catalog {
 }
 
 apply_to_class_catalog!(
-    StoredClassRow,
     ClassCreated,
     ClassDropped,
     ClassRenamed,
@@ -3088,18 +2852,6 @@ fn emit_acl(program: &mut ProgramBuilder, acl: Option<&Acl>) -> usize {
             });
             acl_reg
         }
-    }
-}
-
-/// Resolves names when a GRANT or owner change writes the ACL, so scans
-/// can return the stored text without reading the role catalog.
-fn emit_display_acl(program: &mut ProgramBuilder, schema: &Schema, acl: Option<&Acl>) -> usize {
-    match acl {
-        Some(acl) => program.emit_string8_new_reg(acl.display_text(&|oid| {
-            crate::catalog::role_name_by_oid(schema_roles(schema), oid)
-                .unwrap_or_else(|| oid.to_string())
-        })),
-        None => emit_acl(program, None),
     }
 }
 
@@ -3268,7 +3020,6 @@ enum ClassRecordColumn {
 /// keeps NULL for it.
 struct ClassRecord {
     record_reg: usize,
-    first_column_reg: usize,
 }
 
 fn emit_class_record(
@@ -3325,10 +3076,7 @@ fn emit_class_record(
         index_name: None,
         affinity_str: None,
     });
-    ClassRecord {
-        record_reg,
-        first_column_reg,
-    }
+    ClassRecord { record_reg }
 }
 
 /// Replaces the class row at `rowid_reg` with `record_reg`. The cursor is on
@@ -3357,7 +3105,6 @@ fn emit_class_row_overwrite(
             .require_seek(),
         table_name: CLASSES_TABLE_NAME.to_string(),
     });
-    StoredClassRow.emit(program, rowid_reg, record.first_column_reg);
 }
 
 /// Adds `(namespace, name, rowid)` to the name index, failing if another

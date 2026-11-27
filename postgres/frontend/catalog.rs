@@ -127,8 +127,7 @@ impl Dialect for PostgresDialect {
             else {
                 unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
             };
-            let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
-            crate::classes::hide_internal_columns(&mut table);
+            let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
             if !table.has_rowid {
                 return Err(sqlstate_error(
                     SQLSTATE_FEATURE_NOT_SUPPORTED,
@@ -149,9 +148,7 @@ impl Dialect for PostgresDialect {
             .map_err(sql_parse_error)?;
         match stmt {
             turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                let mut table =
-                    BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
-                crate::classes::hide_internal_columns(&mut table);
+                let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
                 Ok(table)
             }
             _ => Err(sqlstate_error(
@@ -872,8 +869,9 @@ impl SnapshotRows for PgClassTable {
     const ESTIMATED_ROWS: u32 = 100;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        crate::classes::class_catalog(&conn.current_schema())
-            .map_or_else(Vec::new, |catalog| catalog.stored_rows())
+        let schema = conn.current_schema();
+        crate::classes::class_catalog(&schema)
+            .map_or_else(Vec::new, |catalog| catalog.rows(&schema))
     }
 }
 
@@ -1208,6 +1206,16 @@ pub(crate) fn role_oid(id: RoleId) -> i64 {
         RoleId::SUPERUSER => SUPERUSER_OID,
         RoleId::PUBLIC => 0,
         _ => USER_ROLE_OID_START + id.get(),
+    }
+}
+
+/// The engine role ID corresponding to a PostgreSQL role OID.
+pub(crate) fn role_id_from_oid(oid: i64) -> Option<RoleId> {
+    match oid {
+        SUPERUSER_OID => Some(RoleId::SUPERUSER),
+        0 => Some(RoleId::PUBLIC),
+        oid if oid > USER_ROLE_OID_START => Some(RoleId::from_stored(oid - USER_ROLE_OID_START)),
+        _ => None,
     }
 }
 
@@ -3703,10 +3711,10 @@ impl ObjectAddress {
 
 impl RelationRow {
     // Zero-based positions in PgClassTable's SQL column order.
-    const OID_COLUMN: usize = crate::classes::column_position("oid");
-    const NAMESPACE_OID_COLUMN: usize = crate::classes::column_position("relnamespace");
-    const ACCESS_METHOD_OID_COLUMN: usize = crate::classes::column_position("relam");
-    const KIND_COLUMN: usize = crate::classes::column_position("relkind");
+    const OID_COLUMN: usize = 0;
+    const NAMESPACE_OID_COLUMN: usize = 2;
+    const ACCESS_METHOD_OID_COLUMN: usize = 6;
+    const KIND_COLUMN: usize = 17;
 
     fn from_row(row: &[Value]) -> Self {
         Self {
@@ -4774,7 +4782,11 @@ mod tests {
         let mut schema =
             turso_core::alloc::TryClone::try_clone(conn.current_schema().as_ref()).unwrap();
         let rows = conn
-            .prepare_engine_schema_statement(&crate::classes::schema_state_query(&schema).unwrap())
+            .prepare_engine_schema_statement(
+                &crate::classes::schema_state_query(&schema)
+                    .unwrap()
+                    .unwrap(),
+            )
             .unwrap()
             .run_collect_rows()
             .unwrap();
@@ -4793,12 +4805,12 @@ mod tests {
         let catalog = crate::classes::ClassCatalog::build(&schema, &rows).unwrap();
         assert_eq!(catalog.get_by_oid(oid).unwrap().relname, "kept");
         let am = catalog
-            .stored_rows()
+            .rows(&schema)
             .into_iter()
             .find(|row| row[0].as_int() == Some(2601))
             .unwrap();
         assert_eq!(
-            am[crate::classes::column_position("relnatts")].as_int(),
+            am[18].as_int(),
             Some(builtin_catalog_columns(&schema, "pg_am").len() as i64)
         );
     }
