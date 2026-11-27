@@ -2,6 +2,7 @@
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
 @verify-materialized-views
+@skip-file-if model "materialized views are not supported in model storage"
 
 # Test that INSERT with reused primary keys maintains correct aggregate counts
 # When a row is deleted and a new row is inserted with the same primary key

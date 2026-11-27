@@ -1,6 +1,7 @@
 @database :memory:
 @skip-file-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
 @skip-file-if sqlite "SQLite supports WITHOUT ROWID operations that Turso does not yet implement"
+@skip-file-if model "WITHOUT ROWID tables are not supported in model storage"
 
 test without-rowid-hidden-rowid {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;

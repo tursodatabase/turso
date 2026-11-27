@@ -132,6 +132,7 @@ expect error {
 }
 
 @skip-if mvcc "attach is not supported for mvcc"
+@skip-if model "ATTACH is not supported in model storage"
 test create-index-attached-schema-qualified-column {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.u (a);
@@ -142,6 +143,7 @@ expect error {
 }
 
 @skip-if mvcc "attach is not supported for mvcc"
+@skip-if model "ATTACH is not supported in model storage"
 test create-index-attached-table-qualified-with-main {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.u (a);

@@ -1,5 +1,6 @@
 @database :temp:
 @skip-file-if sqlite "MVCC is not supported in SQLite"
+@skip-file-if model "MVCC is not supported in model storage"
 
 # BEGIN (IMMEDIATE) should fail when the connection is already in a concurrent tx
 

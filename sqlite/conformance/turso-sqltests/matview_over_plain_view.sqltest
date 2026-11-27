@@ -2,6 +2,7 @@
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
 @verify-materialized-views
+@skip-file-if model "materialized views are not supported in model storage"
 
 # Reproducer for #3655: a materialized view built on top of a plain VIEW
 # recorded the plain view's name as its only dependency. Writes land on the

@@ -2,6 +2,7 @@
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
 @verify-materialized-views
+@skip-file-if model "materialized views are not supported in model storage"
 
 # Reads of a materialized view go through the same cursor operations as reads
 # of a table: rowid range seeks, backward scans, and rowid lookups with text

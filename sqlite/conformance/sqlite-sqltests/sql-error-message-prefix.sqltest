@@ -19,6 +19,7 @@ expect error {
 # "Database is full: database or disk is full".
 
 @skip-if mvcc "MVCC keeps new rows in memory until checkpoint, so the page limit is not hit at INSERT time"
+@skip-if model "PRAGMA page_size is not supported in model storage"
 test database-full-error-has-no-prefix {
     PRAGMA page_size = 1024;
     PRAGMA max_page_count = 2;

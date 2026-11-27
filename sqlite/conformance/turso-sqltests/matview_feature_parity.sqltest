@@ -2,6 +2,7 @@
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
 @verify-materialized-views
+@skip-file-if model "materialized views are not supported in model storage"
 
 # UPSERT updates are captured as an ordered retraction and insertion. Moving a
 # row between groups must update both groups while the insert arm creates a new

@@ -1,5 +1,6 @@
 @database :temp:
 @skip-file-if sqlite "MVCC is not supported in SQLite"
+@skip-file-if model "MVCC is not supported in model storage"
 
 test mvcc-integrity-check-skips-index-dropped-before-update {
     PRAGMA journal_mode='MVCC';

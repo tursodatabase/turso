@@ -795,6 +795,7 @@ expect {
     ok
 }
 
+@skip-if model "MVCC is not supported in model storage"
 test alter-column-rejects-index-rewrite-mvcc {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE t(x NUMERIC);
@@ -806,6 +807,7 @@ expect error {
     cannot ALTER COLUMN "x": rebuilding affected indexes is not supported in MVCC mode
 }
 
+@skip-if model "MVCC is not supported in model storage"
 test alter-column-rejects-index-only-rewrite-mvcc {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE t(a TEXT, g TEXT GENERATED ALWAYS AS ('old:' || a) VIRTUAL);
@@ -867,6 +869,7 @@ expect {
 }
 
 # Same scenario as above under MVCC mode.
+@skip-if model "MVCC is not supported in model storage"
 test alter-column-virtual-to-regular-rewrites-rows-mvcc {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE core (

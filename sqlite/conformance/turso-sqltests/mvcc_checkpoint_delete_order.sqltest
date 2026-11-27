@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if model "MVCC is not supported in model storage"
 
 test mvcc-checkpoint-before-delete {
     PRAGMA journal_mode = 'mvcc';

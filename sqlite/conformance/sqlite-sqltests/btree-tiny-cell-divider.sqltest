@@ -44,6 +44,7 @@ expect {
 
 @skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
 @cross-check-integrity
+@skip-if model "WITHOUT ROWID tables are not supported in model storage"
 test without-rowid-empty-string-key-on-split-boundary {
     CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID;
     WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 310)

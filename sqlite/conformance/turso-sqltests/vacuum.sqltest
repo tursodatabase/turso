@@ -1,5 +1,6 @@
 @database :temp:
 
+@skip-if model "VACUUM INTO is not supported in model storage"
 test vacuum-nonexistent-schema {
     VACUUM nonexistent INTO 'out.db';
 }

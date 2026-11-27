@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if model "PRAGMA page_size is not supported in model storage"
 
 # Regression coverage for the deferred-seek invalidation invariant
 # established by "Fix stale deferred seeks when cursor slots are reopened"

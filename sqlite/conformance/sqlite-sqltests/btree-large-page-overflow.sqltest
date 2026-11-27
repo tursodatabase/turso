@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if model "PRAGMA page_size is not supported in model storage"
 
 # Regression test for https://github.com/tursodatabase/turso/issues/5276
 # page_free_array used u16 for offset/len which overflows when offset + len > 65535

@@ -591,6 +591,7 @@ expect error {
 
 # Ordered-set aggregates work over tables in an ATTACHed database (same results as a
 # main-database table; the data source is irrelevant).
+@skip-if model "ATTACH is not supported in model storage"
 test ordered-set-over-attached-db {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t(g, x);

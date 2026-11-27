@@ -112,6 +112,7 @@ expect {
 
 @skip-if mvcc "attach is not supported for mvcc"
 @cross-check-integrity
+@skip-if model "ATTACH is not supported in model storage"
 test pragma-table-list-attached-database {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(a, b, c);

@@ -1,5 +1,6 @@
 @database :temp:
 @skip-file-if sqlite "MVCC is not supported in SQLite"
+@skip-file-if model "MVCC is not supported in model storage"
 
 # A join seeks the index of t once per row of o. After the seek for 2 finds a
 # row, the next seek for 3 must still find the row added to 3 after the

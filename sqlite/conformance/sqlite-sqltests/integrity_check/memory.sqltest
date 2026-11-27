@@ -11,6 +11,7 @@ expect {
 }
 
 
+@skip-if model "ATTACH is not supported in model storage"
 test integrity-check-qualified-empty-attached-database {
     CREATE TABLE main.t(a UNIQUE);
     ATTACH ':memory:' AS aux;
@@ -27,6 +28,7 @@ expect {
     ok
 }
 
+@skip-if model "ATTACH is not supported in model storage"
 test integrity-check-qualified-corrupt-attached-database {
     ATTACH 'database/integrity_missing_index_entry.db' AS corrupt_aux;
     PRAGMA corrupt_aux.integrity_check;

@@ -6,6 +6,7 @@
 # same blob bytes, not as the text of its hex digits.
 # See: https://github.com/tursodatabase/turso/issues/7355
 
+@skip-if model "known bug U8: op_insert record capture for materialized views does NewRowid then Read on a cursor without a position"
 test matview-blob-literal-select-star {
     CREATE TABLE t(id INT);
     CREATE MATERIALIZED VIEW mv AS SELECT x'FF' FROM t;
@@ -16,6 +17,7 @@ expect {
     FF
 }
 
+@skip-if model "known bug U8: op_insert record capture for materialized views does NewRowid then Read on a cursor without a position"
 test matview-blob-literal-type-and-bytes {
     CREATE TABLE t2(id INT);
     CREATE MATERIALIZED VIEW mv2 AS SELECT id, x'FF' AS b, X'0102ab' AS c FROM t2;

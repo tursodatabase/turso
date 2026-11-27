@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if model "ATTACH is not supported in model storage"
 
 test cross-db-view-rejected-join {
     CREATE TABLE main_table (id INTEGER, value TEXT);

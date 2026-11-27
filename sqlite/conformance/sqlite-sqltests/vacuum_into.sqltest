@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if model "VACUUM INTO is not supported in model storage"
 
 test vacuum-into-memory-targets {
     CREATE TABLE t(a);
