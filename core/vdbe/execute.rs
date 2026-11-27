@@ -79,7 +79,7 @@ use crate::{
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
+    Database, DatabaseStorage, Double, IOExt, MonotonicInstant, MvCursor, OpenFlags, QueryMode,
     Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
@@ -6419,8 +6419,9 @@ pub fn op_real(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Real { value, dest }, insn);
-    state.registers[*dest]
-        .set_float(NonNan::new(*value).expect("f64 passed to op_real should be a valid NonNan"));
+    state.registers[*dest].set_float(
+        Double::non_nan(*value).expect("f64 passed to op_real should be a valid Double"),
+    );
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6435,8 +6436,8 @@ pub fn op_real_affinity(
     load_insn!(RealAffinity { register }, insn);
     if let Value::Numeric(Numeric::Integer(i)) = &state.registers[*register].get_value() {
         state.registers[*register].set_float(
-            NonNan::new(*i as f64)
-                .expect("i64 passed to op_real_affinity should be a valid NonNan"),
+            Double::non_nan(*i as f64)
+                .expect("i64 passed to op_real_affinity should be a valid Double"),
         );
     };
     state.pc += 1;
@@ -10000,14 +10001,14 @@ fn step_builtin_agg(
 /// Adds `value` to a float total and its error term like [apply_kbn_step], or
 /// returns `None` when the result is not finite and the generic step must run.
 #[inline]
-fn kbn_step_finite(sum: NonNan, r_err: NonNan, value: f64) -> Option<(NonNan, NonNan)> {
+fn kbn_step_finite(sum: Double, r_err: Double, value: f64) -> Option<(Double, Double)> {
     let s = f64::from(sum);
     let t = s + value;
     if !t.is_finite() {
         return None;
     }
     let err = f64::from(r_err) + kbn_correction(s, value, t);
-    Some((NonNan::new(t)?, NonNan::new(err)?))
+    Some((Double::non_nan(t)?, Double::non_nan(err)?))
 }
 
 pub fn op_agg_final(
@@ -10082,7 +10083,7 @@ pub fn op_agg_final(
             match func {
                 AggFunc::Total => {
                     state.registers[dest_reg]
-                        .set_float(NonNan::new(0.0).expect("0.0 is a valid NonNan"));
+                        .set_float(Double::non_nan(0.0).expect("0.0 is a valid Double"));
                 }
                 AggFunc::Count | AggFunc::Count0 => {
                     state.registers[dest_reg].set_int(0);
@@ -11031,7 +11032,7 @@ pub fn op_function(
             MathFuncArity::Nullary => match math_func {
                 MathFunc::Pi => {
                     state.registers[*dest].set_float(
-                        NonNan::new(std::f64::consts::PI).expect("PI is a valid NonNan"),
+                        Double::non_nan(std::f64::consts::PI).expect("PI is a valid Double"),
                     );
                 }
                 _ => {
