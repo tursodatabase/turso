@@ -572,6 +572,8 @@ pub struct Stats {
     pub fts_checkpoints: usize,
     /// Same-connection checkpoint probes fired against suspended statements
     pub checkpoint_probes: usize,
+    /// Completed comparisons between the access paths of `scan_sim`
+    pub scan_checks: usize,
 }
 
 /// Result of a single simulation step.

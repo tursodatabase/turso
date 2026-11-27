@@ -159,6 +159,16 @@ pub enum Operation {
     /// Return the row count difference, index count, and IDs whose counts differ.
     /// The first two values must be `(0, 1)`. Without an index, both reads scan the table.
     CompareFtsResults { word: String },
+    /// Read the rows of `scan_sim` with `k` in `lo..=hi` through several access paths in
+    /// one statement: a table scan, forward and backward index range scans, a backward
+    /// rowid range scan, and joins that probe the table by rowid, the index on `k` by key,
+    /// and the UNIQUE index on `u`. All the reads see the same database view, so each
+    /// returns the same summary of the rows. The last two values give the smallest and
+    /// largest `k` from the index and from a table scan.
+    CompareScans { lo: i64, hi: i64 },
+    /// A write to `scan_sim` with `RETURNING id`. A statement writes a row at most once,
+    /// so an ID must not come back twice.
+    WriteScanSim { sql: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -329,6 +339,37 @@ impl Operation {
                           FROM row_counts WHERE scan_count > fts_count)"
                 )
             }
+            Operation::CompareScans { lo, hi } => {
+                let table = crate::workloads::SCAN_SIM_TABLE;
+                let index = crate::workloads::SCAN_SIM_INDEX;
+                let offset = crate::workloads::SCAN_SIM_UNIQUE_OFFSET;
+                let summary = |t: &str| {
+                    format!("count(*)||':'||total({t}id)||':'||total({t}k)||':'||total({t}v)")
+                };
+                let rows = summary("");
+                let outer = summary("a.");
+                let range = format!("k BETWEEN {lo} AND {hi}");
+                // LIMIT -1 keeps each ORDER BY .. DESC subquery, so the backward scans run.
+                format!(
+                    "SELECT \
+                       (SELECT {rows} FROM {table} NOT INDEXED WHERE {range}), \
+                       (SELECT {rows} FROM {table} INDEXED BY {index} WHERE {range}), \
+                       (SELECT {rows} FROM (SELECT id, k, v FROM {table} INDEXED BY {index} \
+                          WHERE {range} ORDER BY k DESC LIMIT -1)), \
+                       (SELECT {rows} FROM (SELECT id, k, v FROM {table} NOT INDEXED \
+                          WHERE id >= 0 ORDER BY id DESC LIMIT -1) WHERE {range}), \
+                       (SELECT {outer} FROM {table} AS a INDEXED BY {index} \
+                          JOIN {table} AS b ON b.id = a.id WHERE a.{range}), \
+                       (SELECT {outer} FROM {table} AS a NOT INDEXED \
+                          JOIN {table} AS b INDEXED BY {index} ON b.k = a.k AND b.id = a.id \
+                          WHERE a.{range}), \
+                       (SELECT {outer} FROM {table} AS a NOT INDEXED \
+                          JOIN {table} AS c ON c.u = a.id + {offset} WHERE a.{range}), \
+                       (SELECT min(k)||':'||max(k) FROM {table} INDEXED BY {index}), \
+                       (SELECT min(k)||':'||max(k) FROM {table} NOT INDEXED)"
+                )
+            }
+            Operation::WriteScanSim { sql } => sql.clone(),
         }
     }
 
@@ -464,6 +505,9 @@ impl Operation {
             Operation::CompareFtsResults { .. } => {
                 stats.fts_checks += 1;
             }
+            Operation::CompareScans { .. } => {
+                stats.scan_checks += 1;
+            }
             _ => {}
         }
     }
@@ -518,6 +562,35 @@ mod tests {
         let duplicate = query_one(&connection, &wrong_sql);
         assert_eq!(duplicate[0].as_int(), Some(1));
         assert!(matches!(&duplicate[2], Value::Text(value) if value.as_str() == "1:2/1"));
+    }
+
+    #[test]
+    fn scan_comparison_sql_returns_one_summary_for_each_access_path() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        for (_, sql) in crate::workloads::scan_sim_schema() {
+            connection.execute(&sql).unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO scan_sim VALUES \
+                 (1, 5, 10, 1000001), (2, 5, 20, 1000002), (3, 7, 30, 1000003), \
+                 (4, 1, 40, 1000004), (5, NULL, 50, 1000005), (6, 9, 60, 1000006)",
+            )
+            .unwrap();
+
+        let row = query_one(&connection, &Operation::CompareScans { lo: 2, hi: 8 }.sql());
+
+        assert_eq!(row.len(), 9);
+        for value in &row[..7] {
+            assert!(matches!(value, Value::Text(text) if text.as_str() == "3:6.0:17.0:60.0"));
+        }
+        for value in &row[7..] {
+            assert!(matches!(value, Value::Text(text) if text.as_str() == "1:9"));
+        }
     }
 
     fn query_one(connection: &Arc<turso_core::Connection>, sql: &str) -> Vec<Value> {
