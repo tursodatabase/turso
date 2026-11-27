@@ -615,7 +615,7 @@ fn dv_empty_database() {
 #[test]
 fn dv_lists_user_views_without_catalog_views() {
     let output = run_tursopg(
-        b"CREATE VIEW pg_user_view AS SELECT 1 AS x;\nCREATE SCHEMA reporting;\nCREATE VIEW reporting.user_view AS SELECT 2 AS x;\n\\dv\n",
+        b"CREATE VIEW pg_user_view AS SELECT 1 AS x;\nCREATE SCHEMA reporting;\nCREATE VIEW reporting.user_view AS SELECT 2 AS x;\nSET search_path = reporting, public;\n\\dv\n",
     );
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
@@ -628,6 +628,61 @@ fn dv_lists_user_views_without_catalog_views() {
     for catalog in ["pg_indexes", "pg_roles", "pg_tables", "pg_settings"] {
         assert!(!out.contains(catalog), "\\dv listed {catalog}: {out}");
     }
+}
+
+#[test]
+fn dv_uses_the_search_path_and_postgres_columns() {
+    let output = run_tursopg(
+        b"CREATE SCHEMA first_schema;\nCREATE SCHEMA second_schema;\nCREATE SCHEMA hidden_schema;\nCREATE TABLE first_schema.shadowed (x int);\nCREATE VIEW second_schema.shadowed AS SELECT 1 AS x;\nCREATE VIEW second_schema.visible_view AS SELECT 2 AS x;\nCREATE VIEW hidden_schema.hidden_view AS SELECT 3 AS x;\nSET search_path = first_schema, second_schema;\n\\dv\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    for value in [
+        "Schema",
+        "Name",
+        "Type",
+        "Owner",
+        "second_schema",
+        "visible_view",
+    ] {
+        assert!(out.contains(value), "missing {value}: {out}");
+    }
+    assert!(
+        out.lines().any(|line| {
+            line.split('|')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>()
+                == ["second_schema", "visible_view", "view", "postgres"]
+        }),
+        "{out}"
+    );
+    for name in ["shadowed", "hidden_view", "pg_tables"] {
+        assert!(!out.contains(name), "\\dv listed {name}: {out}");
+    }
+}
+
+#[test]
+fn dv_qualifies_catalogs_when_a_user_relation_shadows_pg_class() {
+    let output = run_tursopg(
+        b"CREATE VIEW public.pg_class AS SELECT 1 AS x;\nSET search_path = public, pg_catalog;\n\\dv\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("pg_class"), "{out}");
+    assert!(out.contains("public"), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+#[test]
+fn dv_with_an_empty_search_path_lists_no_views() {
+    let output = run_tursopg(
+        b"CREATE VIEW public.hidden_view AS SELECT 1 AS x;\nSET search_path = '';\n\\dv\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("No views found"), "{out}");
+    assert!(!out.contains("hidden_view"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
