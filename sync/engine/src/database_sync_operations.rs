@@ -3157,13 +3157,24 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             want_rows: Some(false),
             replication_index: None,
         },
-        // set for all steps at once below, when the batch is complete
-        condition: None,
+        condition: Some(BatchCond::Not {
+            cond: Box::new(BatchCond::IsAutocommit {}),
+        }),
     };
 
     let mut add_column_step_indices = std::collections::HashSet::new();
     let mut sql_over_http_requests = vec![
-        step("BEGIN IMMEDIATE".to_string(), Vec::new()),
+        BatchStep {
+            stmt: Stmt {
+                sql: Some("BEGIN IMMEDIATE".to_string()),
+                sql_id: None,
+                args: Vec::new(),
+                named_args: Vec::new(),
+                want_rows: Some(false),
+                replication_index: None,
+            },
+            condition: None,
+        },
         step(TURSO_SYNC_CREATE_TABLE.to_string(), Vec::new()),
     ];
 
@@ -3328,37 +3339,21 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             ],
         ));
     }
-    sql_over_http_requests.push(step("COMMIT".to_string(), Vec::new()));
-
-    // A failed statement does not end the remote transaction. So each step runs only
-    // if the step before it succeeded: otherwise the remote would apply the other rows
-    // of the batch, record the client's last change id and commit, and the next push
-    // would skip the failed rows. An ALTER TABLE ADD COLUMN error is ignored, so the
-    // step after it also runs on that error, but only inside the transaction.
-    for (i, request) in sql_over_http_requests.iter_mut().enumerate().skip(1) {
-        let prev = (i - 1) as u32;
-        request.condition = Some(if add_column_step_indices.contains(&(i - 1)) {
-            BatchCond::And(BatchCondList {
-                conds: vec![
-                    BatchCond::Not {
-                        cond: Box::new(BatchCond::IsAutocommit {}),
-                    },
-                    BatchCond::Or(BatchCondList {
-                        conds: vec![
-                            BatchCond::Ok { step: prev },
-                            BatchCond::Error { step: prev },
-                        ],
-                    }),
-                ],
-            })
-        } else {
-            BatchCond::Ok { step: prev }
-        });
-    }
-    // Roll back when BEGIN succeeded but COMMIT did not, so that the remote does not
-    // keep the transaction open. If no transaction is open any more, ROLLBACK fails,
-    // and the push reports that error instead of success.
-    let commit_step = (sql_over_http_requests.len() - 1) as u32;
+    // A failed statement does not end the remote transaction. So commit only if every
+    // step succeeded, except an ALTER TABLE ADD COLUMN step whose error is ignored, and
+    // roll back otherwise: else the remote would apply the other rows of the batch,
+    // record the client's last change id, and the next push would skip the failed rows.
+    let commit_step = sql_over_http_requests.len() as u32;
+    let all_ok = (0..sql_over_http_requests.len())
+        .filter(|i| !add_column_step_indices.contains(i))
+        .map(|i| BatchCond::Ok { step: i as u32 })
+        .collect();
+    sql_over_http_requests.push(BatchStep {
+        condition: Some(BatchCond::And(BatchCondList { conds: all_ok })),
+        ..step("COMMIT".to_string(), Vec::new())
+    });
+    // If no transaction is open any more, ROLLBACK fails, and the push reports that
+    // error instead of success.
     sql_over_http_requests.push(BatchStep {
         condition: Some(BatchCond::And(BatchCondList {
             conds: vec![
