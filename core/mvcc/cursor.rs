@@ -583,6 +583,10 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// type, read before the MVCC peek was taken.
     /// See [`Self::step`].
     mvcc_peek_epoch: u64,
+    /// The start of the MvStore range of the seek in progress. A seek that resumes after a
+    /// yield positions the MvStore head here again when the MvStore changed.
+    /// See [`Self::reposition_seek_mvcc_head_if_changed`].
+    seek_mvcc_start: Option<Bound<RowKey>>,
     /// The work counters of the statement that opened the cursor.
     /// See [`crate::vdbe::metrics::CursorWork`].
     work: CursorWorkHandle,
@@ -657,6 +661,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             mvcc_range_end: None,
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
+            seek_mvcc_start: None,
             work: new_cursor_work_handle(),
         })
     }
@@ -895,6 +900,23 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         cursor_work(&self.work).visibility_check();
         self.db
             .query_btree_version_is_valid(self.table_id, key, self.tx_id)
+    }
+
+    /// Returns true when the row that the cursor is on is visible to its transaction.
+    fn loaded_row_is_visible(&self, row_id: &RowID, in_btree: bool) -> Result<bool> {
+        // Prefer the B-tree copy when this cursor is already on it: a stale SkipMap read
+        // here would hide later checkpointed updates and change scan totals.
+        if in_btree {
+            return self.query_btree_version_is_valid(&row_id.row_id);
+        }
+        let maybe_index_id = match &self.mv_cursor_type {
+            MvccCursorType::Index(_) => Some(self.table_id),
+            MvccCursorType::Table => None,
+        };
+        Ok(self
+            .db
+            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+            .is_some())
     }
 
     fn mvcc_rows_epoch(&self) -> u64 {
@@ -1479,6 +1501,23 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // The forward scan is monotonic; a reposition invalidates it.
         self.index_shadow_scan.reset();
     }
+
+    /// Positions the MvStore head of the seek in progress at the start of its range again
+    /// when the MvStore changed since the head was positioned. A write of this cursor's own
+    /// transaction while the seek waited on IO can add an MvStore version of a row that the
+    /// MvStore iterator already passed, or that hides a B-tree row. The seek returned no
+    /// row yet, so it can start the MvStore range again. The range end stays the same.
+    fn reposition_seek_mvcc_head_if_changed(&mut self, dir: IterationDirection) -> Result<()> {
+        if self.mvcc_rows_epoch() == self.mvcc_peek_epoch {
+            return Ok(());
+        }
+        let start = self
+            .seek_mvcc_start
+            .clone()
+            .expect("a seek in progress has an MvStore range start");
+        let end = self.mvcc_range_end.clone();
+        self.position_mvcc_head(start, dir, end)
+    }
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCursor<Clock, A> {
@@ -1599,28 +1638,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     &row_id.row_id,
                     &seek_key,
                     &self.mv_cursor_type,
-                )? {
-                    let maybe_index_id = match &self.mv_cursor_type {
-                        MvccCursorType::Index(_) => Some(self.table_id),
-                        MvccCursorType::Table => None,
-                    };
-                    // Prefer the B-tree copy when this cursor is already on it:
-                    // a stale SkipMap read here would hide later checkpointed
-                    // updates and change scan totals.
-                    let visible = if *in_btree {
-                        self.query_btree_version_is_valid(&row_id.row_id)?
-                    } else {
-                        self.db
-                            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
-                            .is_some()
-                    };
-                    if visible {
-                        // We need to clear the null flag for the table cursor before seeking,
-                        // because it might have been set to false by an unmatched left-join row
-                        // during the previous iteration on the outer loop.
-                        self.set_null_flag(false);
-                        return Ok(IOResult::Done(SeekResult::Found));
-                    }
+                )? && self.loaded_row_is_visible(row_id, *in_btree)?
+                {
+                    // We need to clear the null flag for the table cursor before seeking,
+                    // because it might have been set to false by an unmatched left-join row
+                    // during the previous iteration on the outer loop.
+                    self.set_null_flag(false);
+                    return Ok(IOResult::Done(SeekResult::Found));
                 }
             }
         }
@@ -1679,11 +1703,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         SeekOp::GE { .. } | SeekOp::LE { .. } => Bound::Included(key),
                         SeekOp::GT | SeekOp::LT => Bound::Excluded(key),
                     };
-                    self.position_mvcc_head(start, direction, end)?;
+                    self.position_mvcc_head(start.clone(), direction, end)?;
+                    self.seek_mvcc_start = Some(start);
                     self.state = Some(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction));
                     inject_io_yield!(self, CursorYieldPoint::SeekStart);
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction)) => {
+                    self.reposition_seek_mvcc_head_if_changed(direction)?;
                     if op.eq_only()
                         && self.eq_bound.as_ref().is_some_and(|bound| bound.one_row)
                         && self.land_on_visible_mvcc_head(direction)?
@@ -1723,8 +1749,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::Walk, direction)) => {
+                    self.reposition_seek_mvcc_head_if_changed(direction)?;
                     return_if_io!(self.walk(direction));
                     self.state = None;
+                    self.seek_mvcc_start = None;
                     return Ok(IOResult::Done(match self.current_pos {
                         CursorPosition::Loaded { .. } => SeekResult::Found,
                         _ => SeekResult::NotFound,
@@ -1891,6 +1919,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn set_null_flag(&mut self, flag: bool) {
         self.null_flag = flag;
+    }
+
+    fn current_row_hidden_since_move(&mut self) -> Result<bool> {
+        // The MvStore did not change since the heads were positioned, which is before the
+        // cursor moved to its row.
+        if self.mvcc_rows_epoch() == self.mvcc_peek_epoch {
+            return Ok(false);
+        }
+        let CursorPosition::Loaded {
+            row_id, in_btree, ..
+        } = &self.current_pos
+        else {
+            return Ok(false);
+        };
+        Ok(!self.loaded_row_is_visible(row_id, *in_btree)?)
     }
 
     fn get_null_flag(&self) -> bool {

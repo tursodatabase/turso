@@ -1901,7 +1901,11 @@ pub fn op_last(
 #[derive(Debug, Clone, Copy)]
 pub enum OpColumnState {
     Start,
-    Seek { rowid: i64, table_cursor_id: usize },
+    Seek {
+        rowid: i64,
+        table_cursor_id: usize,
+        index_cursor_id: usize,
+    },
     GetColumn,
 }
 
@@ -2049,6 +2053,7 @@ fn op_column_deferred(
                     *state.active_op_state.column() = OpColumnState::Seek {
                         rowid: deferred.rowid,
                         table_cursor_id: deferred.table_cursor_id,
+                        index_cursor_id: deferred.index_cursor_id,
                     };
                 } else {
                     *state.active_op_state.column() = OpColumnState::GetColumn;
@@ -2057,9 +2062,15 @@ fn op_column_deferred(
             OpColumnState::Seek {
                 rowid,
                 table_cursor_id,
+                index_cursor_id,
             } => {
                 return_if_io!(state, seek_deferred_row(state, table_cursor_id, rowid));
                 count_deferred_seek(state);
+                if let Some(pc) = stale_index_row_step_pc(program, state, index_cursor_id)? {
+                    state.active_op_state.clear();
+                    state.pc = pc;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
@@ -6718,16 +6729,16 @@ pub fn op_deferred_seek(
 /// SQLite emits this before a write when no Column instruction had to move
 /// the table cursor.
 pub fn op_finish_seek(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(FinishSeek { cursor_id }, insn);
-    let Some(rowid) = state.deferred_seeks[*cursor_id]
+    let Some((rowid, index_cursor_id)) = state.deferred_seeks[*cursor_id]
         .as_ref()
-        .map(|deferred| deferred.rowid)
+        .map(|deferred| (deferred.rowid, deferred.index_cursor_id))
     else {
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -6735,6 +6746,10 @@ pub fn op_finish_seek(
     return_if_io!(state, seek_deferred_row(state, *cursor_id, rowid));
     state.deferred_seeks[*cursor_id] = None;
     count_deferred_seek(state);
+    if let Some(pc) = stale_index_row_step_pc(program, state, index_cursor_id)? {
+        state.pc = pc;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6749,6 +6764,41 @@ fn seek_deferred_row(
         .get_cursor(table_cursor_id)
         .as_btree_mut()
         .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+}
+
+/// Returns the address of the `Next` or `Prev` that steps the index cursor of a deferred seek,
+/// when the index row is no longer visible after the table seek.
+///
+/// Under MVCC, the table seek can wait on IO, and a statement of the same transaction can
+/// run in that time. If that statement deletes the row, or changes its index key, the index
+/// row that gave the rowid is stale: the table cursor is on no row, or on a row with a
+/// different key. The loop must skip the stale index row, as if the write came before the
+/// index cursor moved to it. The `Next` or `Prev` of the loop does this: the MVCC cursor
+/// sees the write and steps to the next visible row.
+fn stale_index_row_step_pc(
+    program: &Program,
+    state: &mut ProgramState,
+    index_cursor_id: usize,
+) -> Result<Option<u32>> {
+    let Some(Some(Cursor::Dyn(index_cursor, _))) = state.cursors.get_mut(index_cursor_id) else {
+        return Ok(None);
+    };
+    if !index_cursor.current_row_hidden_since_move()? {
+        return Ok(None);
+    }
+    // Each loop that emits DeferredSeek steps its index cursor after the loop body, so the
+    // first step of the index cursor after this instruction is the step of the loop.
+    let pc = state.pc as usize;
+    let step_pc = program.insns[pc..]
+        .iter()
+        .position(|(insn, _)| match insn {
+            Insn::Next { cursor_id, .. } | Insn::Prev { cursor_id, .. } => {
+                *cursor_id == index_cursor_id
+            }
+            _ => false,
+        })
+        .map(|offset| (pc + offset) as u32);
+    Ok(step_pc)
 }
 
 fn count_deferred_seek(state: &mut ProgramState) {
