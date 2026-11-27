@@ -4875,11 +4875,19 @@ impl PostgreSQLTranslator {
             });
         }
 
-        // Translate function arguments
+        // Translate function arguments. `t.*` is the row of table t, which the
+        // functions of a record take; the engine finds its columns.
+        let takes_record = takes_record(&func_name);
         let args = func_call
             .args
             .iter()
-            .map(|arg| Ok(Box::new(self.translate_expr(arg)?)))
+            .map(|arg| match table_star(arg) {
+                Some(table) if takes_record => Ok(Box::new(ast::Expr::Qualified(
+                    exact_name(table),
+                    exact_name("*"),
+                ))),
+                _ => Ok(Box::new(self.translate_expr(arg)?)),
+            })
             .collect::<Result<Vec<_>, ParseError>>()?;
 
         let distinctness = if func_call.agg_distinct {
@@ -11062,6 +11070,34 @@ fn reject_column_aliases(
 }
 
 // FIXME(pg-catalog): This guesses from the shape of the second argument whether substring() resolves to the pg_proc entry substring(text, text), which takes a regular expression, instead of substring(text, integer). Function resolution in pg_proc on a typed expression tree replaces this.
+/// Whether the function `name` takes a record, so that an argument may be the
+/// row of a table.
+// FIXME(pg-catalog): This hand-codes the functions of pg_proc whose parameter
+// is a record or anyelement and that tursopg can give a row: to_json,
+// to_jsonb and row_to_json. A record type and function resolution in pg_proc
+// replace this list.
+fn takes_record(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "to_json" | "to_jsonb" | "row_to_json"
+    )
+}
+
+/// The table `t` of a column reference `t.*`, or None for any other node.
+fn table_star(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::ColumnRef(column_ref)) = &node.node else {
+        return None;
+    };
+    match column_ref.fields.as_slice() {
+        [table, star] if matches!(star.node, Some(Node::AStar(_))) => match &table.node {
+            Some(Node::String(table)) => Some(table.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Whether the function `name` has one parameter of the type anyelement,
 /// whose type PostgreSQL takes from the argument.
 // FIXME(pg-catalog): This hand-codes the proargtypes of to_json and to_jsonb

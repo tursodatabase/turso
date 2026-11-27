@@ -2817,6 +2817,69 @@ expect {
     {"b": 1,  "a":2}|{"b": 1,  "a":2}
 }
 
+test to-json-of-the-row-of-a-table {
+    CREATE TABLE to_json_rows (id int, s text, n int, arr text[], j jsonb, ok boolean, "we""ird" text);
+    INSERT INTO to_json_rows VALUES (2, 'Abd', NULL, '{c}', '{"b":2,"a":1}', false, 'x');
+    SELECT to_json(to_json_rows), to_json(r.*), row_to_json(r)
+    FROM to_json_rows, to_json_rows AS r;
+}
+expect {
+    {"id":2,"s":"Abd","n":null,"arr":["c"],"j":{"a": 1, "b": 2},"ok":false,"we\\"ird":"x"}|{"id":2,"s":"Abd","n":null,"arr":["c"],"j":{"a": 1, "b": 2},"ok":false,"we\\"ird":"x"}|{"id":2,"s":"Abd","n":null,"arr":["c"],"j":{"a": 1, "b": 2},"ok":false,"we\\"ird":"x"}
+}
+
+test to-jsonb-of-the-row-of-a-table {
+    CREATE TABLE to_jsonb_rows (id int, s text, aa int[]);
+    INSERT INTO to_jsonb_rows VALUES (1, 'a', '{1,2}');
+    SELECT to_jsonb(to_jsonb_rows) FROM to_jsonb_rows;
+}
+expect {
+    {"s": "a", "aa": [1, 2], "id": 1}
+}
+
+test row-to-json-pretty-puts-a-line-feed-after-each-comma {
+    CREATE TABLE row_to_json_pretty (id int, s text);
+    INSERT INTO row_to_json_pretty VALUES (1, 'a');
+    SELECT replace(row_to_json(row_to_json_pretty, true)::text, chr(10), '|'),
+           row_to_json(row_to_json_pretty, NULL) IS NULL
+    FROM row_to_json_pretty;
+}
+expect {
+    {"id":1,| "s":"a"}|t
+}
+
+test to-json-of-a-name-that-is-a-column-and-a-table-is-the-column {
+    SELECT to_json(s) FROM (SELECT 1 AS s) s;
+}
+expect {
+    1
+}
+
+test to-json-of-the-row-of-a-subquery-and-of-an-outer-query {
+    CREATE TABLE to_json_scopes (id int, s text);
+    INSERT INTO to_json_scopes VALUES (1, 'a');
+    SELECT (SELECT to_json(to_json_scopes) FROM (SELECT 1 AS z) q),
+           (SELECT to_json(sub) FROM (SELECT id, s AS label FROM to_json_scopes) sub)
+    FROM to_json_scopes;
+}
+expect {
+    {"id":1,"s":"a"}|{"id":1,"label":"a"}
+}
+
+test row-to-json-of-a-number {
+    SELECT row_to_json(1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test to-json-of-the-row-of-a-missing-table {
+    CREATE TABLE to_json_missing (id int);
+    SELECT to_json(nosuch.*) FROM to_json_missing;
+}
+@sqlstate 42P01
+expect error {
+}
+
 test to-json-takes-one-argument {
     SELECT to_json(1, 2);
 }

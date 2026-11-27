@@ -11,7 +11,8 @@ use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFuncti
 use turso_core::security::roles::RoleId;
 
 use crate::roles::{connection_roles, RoleCatalog};
-use turso_core::dialect::ScalarFuncContext;
+use turso_core::ast;
+use turso_core::dialect::{RowColumns, ScalarFuncContext};
 use turso_core::types::IOResultOr;
 use turso_core::{
     exec_temporal_encode, Connection, Decimal, ExternalFunc, IOResult, LimboError, Numeric,
@@ -53,6 +54,11 @@ macro_rules! scalar_functions {
     }};
 }
 
+/// The function that a call of to_json() and the other functions of a record
+/// stands for when its argument is the row of a table (see
+/// `expand_record_call`).
+pub(crate) const PG_RECORD_TO_JSON_FUNCTION: &str = "pg_record_to_json";
+
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
     let options = crate::pg_type::register_integer_operator_functions(options);
@@ -77,6 +83,20 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             pg_scalar_function("to_jsonb", FunctionArity::Exact(1), true, |_, args| {
                 exec_to_jsonb(args)
             })
+            .receiving_argument_types(),
+        )
+        // FIXME(pg-record): PostgreSQL has no function of this name. It exists
+        // because tursopg has no record type: the engine turns to_json(t),
+        // to_jsonb(t) and row_to_json(t) of the row of a table t into a call of
+        // it with the names and values of the columns (`expand_record_call`).
+        // A record type, with the record_out of a row, replaces it.
+        .extension_function(
+            pg_scalar_function(
+                PG_RECORD_TO_JSON_FUNCTION,
+                FunctionArity::Variadic,
+                true,
+                |_, args| exec_record_to_json(args),
+            )
             .receiving_argument_types(),
         )
         .extension_function(
@@ -1752,20 +1772,8 @@ fn json_contains(json: &JsonNode, template: &JsonNode) -> bool {
 fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
     let (args, types) = args.split_at(args.len() / 2);
     let array = args[0].get_value();
-    let pretty = match args.get(1).map(Register::get_value) {
-        None => false,
-        Some(Value::Null) => return Ok(None),
-        Some(Value::Text(text)) => parse_pg_bool(text.as_str()).ok_or_else(|| {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!(
-                    "invalid input syntax for type boolean: \"{}\"",
-                    text.as_str()
-                ),
-                None,
-            )
-        })?,
-        Some(pretty) => !matches!(pretty, Value::Numeric(Numeric::Integer(0))),
+    let Some(pretty) = pretty_argument(args.get(1).map(Register::get_value))? else {
+        return Ok(None);
     };
     if matches!(array, Value::Null) {
         return Ok(None);
@@ -1784,6 +1792,105 @@ fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
         },
         &mut json,
     )?;
+    Ok(Some(Json(json)))
+}
+
+/// The `pretty` argument of array_to_json() and row_to_json(): false when it
+/// is not given, and None when it is NULL, which makes the result NULL.
+fn pretty_argument(pretty: Option<&Value>) -> Result<Option<bool>> {
+    Ok(Some(match pretty {
+        None => false,
+        Some(Value::Null) => return Ok(None),
+        Some(Value::Text(text)) => parse_pg_bool(text.as_str()).ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type boolean: \"{}\"",
+                    text.as_str()
+                ),
+                None,
+            )
+        })?,
+        Some(pretty) => !matches!(pretty, Value::Numeric(Numeric::Integer(0))),
+    }))
+}
+
+/// The call that `to_json(r)`, `to_jsonb(r)` or `row_to_json(r [, pretty])`
+/// stands for when the argument `r` names the row of a table, as `t` or
+/// `t.*` does: a call of pg_record_to_json() with the names and values of
+/// the columns of the row. `rows` has the columns of the row that each
+/// argument names (see `Dialect::expand_row_arguments`).
+pub(crate) fn expand_record_call(
+    name: &str,
+    args: &[Box<ast::Expr>],
+    rows: Vec<Option<RowColumns>>,
+) -> Result<ast::Expr> {
+    let mut rows = rows.into_iter();
+    let (Some(Some(columns)), pretty) = (rows.next(), args.get(1)) else {
+        return Err(undefined_function(name, &vec!["record"; args.len()]));
+    };
+    if rows.any(|row| row.is_some()) || (name != "row_to_json" && args.len() > 1) {
+        return Err(undefined_function(name, &vec!["record"; args.len()]));
+    }
+    let pretty = pretty
+        .map(|pretty| (**pretty).clone())
+        .unwrap_or_else(|| ast::Expr::Literal(ast::Literal::Numeric("0".into())));
+    let mut record_args = vec![pretty];
+    for (column, value) in columns {
+        let column = column.replace('\'', "''");
+        record_args.push(ast::Expr::Literal(ast::Literal::String(format!(
+            "'{column}'"
+        ))));
+        record_args.push(*value);
+    }
+    let record = function_call(PG_RECORD_TO_JSON_FUNCTION, record_args);
+    Ok(match name {
+        "to_jsonb" => function_call("to_jsonb", vec![record]),
+        _ => record,
+    })
+}
+
+fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::exact(name.to_string()),
+        distinctness: None,
+        args: args.into_iter().map(Box::new).collect(),
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+/// `pg_record_to_json(pretty, name1, value1, name2, value2, ...)`: a JSON
+/// object with a field for each column of a row, as PostgreSQL writes a
+/// record: `{"id":1,"s":"a"}`, with a line feed and a space after each comma
+/// when `pretty` is true. Each value is written by its type, as to_json()
+/// writes it. After the arguments come their type names.
+fn exec_record_to_json(args: &[Register]) -> Result<Option<Json>> {
+    let (args, types) = args.split_at(args.len() / 2);
+    let Some(pretty) = pretty_argument(Some(args[0].get_value()))? else {
+        return Ok(None);
+    };
+    let mut json = String::from("{");
+    for (i, (field, field_type)) in args[1..]
+        .chunks_exact(2)
+        .zip(types[1..].chunks_exact(2))
+        .enumerate()
+    {
+        if i > 0 {
+            json.push_str(if pretty { ",\n " } else { "," });
+        }
+        push_json_string(&field[0].get_value().to_string(), &mut json);
+        json.push(':');
+        match field[1].get_value() {
+            Value::Null => json.push_str("null"),
+            value => write_json_of_type(value, &field_type[1].get_value().to_string(), &mut json)?,
+        }
+    }
+    json.push('}');
     Ok(Some(Json(json)))
 }
 

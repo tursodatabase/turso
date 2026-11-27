@@ -487,15 +487,12 @@ expect @tursopg error {}
 
 # C-44: row_to_json of whole row
 @setup t_b_n_ts_j_jb_arr_u_with_rows
-@compat-gap "function:row_to_json"
 test row-to-json-of-whole-row {
     SELECT row_to_json(t) FROM t;
 }
 expect {
     {"b":true,"n":1.50,"ts":"2026-10-08T12:00:00+00:00","j":{"x": 1},"jb":{"y": 2},"arr":["a"],"u":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
 }
-@sqlstate 42703
-expect @tursopg error {}
 
 # C-45: text[] output of an element with a newline
 @compat-gap "type:_text"
