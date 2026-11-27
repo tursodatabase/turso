@@ -894,6 +894,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> Result<bool> {
         cursor_work(&self.work).visibility_check();
+        cursor_work(&self.work).mvcc_point_lookup();
         self.db
             .query_btree_version_is_valid(self.table_id, key, self.tx_id)
     }

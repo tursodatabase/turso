@@ -80,13 +80,14 @@ impl Class {
 }
 
 /// The counters of [`CursorWork`] with their names.
-fn counters(work: &CursorWork) -> [(&'static str, u64); 5] {
+fn counters(work: &CursorWork) -> [(&'static str, u64); 6] {
     [
         ("mvcc_entries", work.mvcc_entries_examined),
         ("btree_rows", work.btree_rows_examined),
         ("mvcc_seeks", work.mvcc_seeks),
         ("btree_seeks", work.btree_seeks),
         ("visibility_checks", work.visibility_checks),
+        ("mvcc_point_lookups", work.mvcc_point_lookups),
     ]
 }
 
@@ -1502,7 +1503,8 @@ const HIDDEN_AT_EDGE: &[&str] = &[
 /// size N, in the order of [`counters`]. A change to the cursor must not raise a total above
 /// its ceiling: the growth classes do not see a cost that grows by a constant factor, such
 /// as one more seek for each probe. When a change lowers a total, the ceiling can stay. Run
-/// with `MVCC_COST_REPORT=1` to print the current totals.
+/// with `MVCC_COST_REPORT=1` to print the current totals. The ceilings cover the first five
+/// counters. Main did not count MvStore point lookups, so they have only a growth class.
 const WORK_CEILINGS: &[(&str, [u64; 5])] = &[
     ("CountAll", [12025, 4314, 72, 42, 13428]),
     ("DeleteThroughIndex", [4695, 0, 4704, 0, 4032]),
