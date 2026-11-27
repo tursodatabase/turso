@@ -1,6 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
-use crate::catalog::role_name_by_oid;
+use crate::catalog::{pg_type_oid, role_name_by_oid};
 use crate::error::{sqlstate_error, sqlstate_error_with_hint};
+use crate::operators::{implicitly_casts, INT4};
 use crate::pg_type::{built_in_type_named, lookup_type_name, type_input, NamedTypeKind};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
@@ -24,8 +25,9 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
     SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -94,6 +96,67 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             .checking_argument_types(check_timestamp_plus_interval_types)
             .returning_argument_type(0),
         )
+        .extension_function(
+            pg_scalar_function("chr", FunctionArity::Exact(1), true, |_, args| {
+                exec_chr(args)
+            })
+            .receiving_argument_types()
+            .checking_argument_types(check_chr_types),
+        )
+}
+
+/// Refuses an argument of chr() whose type PostgreSQL does not convert to
+/// integer. `args` are the argument expressions, `types` their type names
+/// with domain names kept, and `base_types` the same names with domains
+/// replaced: a domain over integer or smallint is accepted, as in PostgreSQL,
+/// but a domain over text is not.
+// FIXME(pg-catalog): PostgreSQL finds chr(integer) in pg_proc. This hand-codes
+// that one candidate and asks the implicit casts of pg_cast whether the
+// argument converts to it. A pg_proc lookup replaces that. The type names also
+// come from Turso, which names an integer literal and the result of SQLite
+// functions such as length() `integer`, the 64-bit type of SQLite, and the
+// result of count() and sum() `any`, where PostgreSQL types some of them
+// bigint, so this accepts them. Arithmetic is not checked, because Turso
+// types it by SQLite's rules, which make `1 + NULL` a numeric where
+// PostgreSQL resolves it as `integer + integer`. exec_chr then checks the
+// value, so `bigint + NULL` gives NULL where PostgreSQL fails with 42883. An
+// expression tree that carries PostgreSQL types fixes that.
+fn check_chr_types(args: &[Box<ast::Expr>], types: &[String], base_types: &[String]) -> Result<()> {
+    if !has_known_type(&args[0]) {
+        return Ok(());
+    }
+    let base = base_types[0].as_str();
+    if matches!(base, "null" | "any" | "unknown")
+        || pg_type_oid(base).is_some_and(|oid| implicitly_casts(oid, INT4))
+    {
+        return Ok(());
+    }
+    Err(undefined_function("chr", &[types[0].as_str()]))
+}
+
+/// Whether the type Turso gives an argument expression is the one PostgreSQL
+/// gives it. It is not for a string literal, which Turso names text but
+/// PostgreSQL types unknown, which converts to any type. Only the literal
+/// itself is unknown: a CASE, subquery or view column made from literals is
+/// text. It is not for arithmetic either, which Turso types by SQLite's rules.
+/// Parentheses do not count, because PostgreSQL's parser drops them, and a
+/// COLLATE does not change the type.
+fn has_known_type(arg: &ast::Expr) -> bool {
+    match arg {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => has_known_type(&exprs[0]),
+        ast::Expr::Collate(collated, _) => has_known_type(collated),
+        ast::Expr::Literal(ast::Literal::String(_)) => false,
+        ast::Expr::Binary(
+            _,
+            ast::Operator::Add
+            | ast::Operator::Subtract
+            | ast::Operator::Multiply
+            | ast::Operator::Divide
+            | ast::Operator::Modulus,
+            _,
+        ) => false,
+        _ => true,
+    }
 }
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
@@ -898,6 +961,67 @@ fn unrecognized_parameter(name: &str) -> LimboError {
 fn exec_random(bits: i64) -> f64 {
     let mantissa = (bits as u64) >> 11;
     mantissa as f64 / (1_u64 << 53) as f64
+}
+
+/// chr(integer): the character with code point `code`. A NULL argument gives
+/// NULL, unlike SQLite's char(), which reads it as code point 0.
+fn exec_chr(args: &[Register]) -> Result<Option<String>> {
+    // Registered with arity 1; the argument is followed by its type.
+    let [code, _code_type] = args else {
+        unreachable!("chr is registered with one argument and its type");
+    };
+    // check_chr_types accepted the type when the statement was compiled. A
+    // parameter has the type any, and an expression whose type the planner
+    // cannot work out has the type unknown, so their values are checked here.
+    let code = match code.get_value() {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Integer(code)) => {
+            i32::try_from(*code).map_err(|_| undefined_function("chr", &["bigint"]))?
+        }
+        // A string literal is read by the INPUT of integer, the argument type.
+        Value::Text(text) => {
+            let read = type_input(INT4).expect("integer has an INPUT");
+            match read(text.as_str())? {
+                Value::Numeric(Numeric::Integer(code)) => {
+                    i32::try_from(code).expect("int4 input is in the range of i32")
+                }
+                other => unreachable!("int4 input gave {other:?}"),
+            }
+        }
+        other => return Err(undefined_function("chr", &[pg_type_name(other)])),
+    };
+    if code < 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "character number must be positive",
+            None,
+        ));
+    }
+    if code == 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            "null character not permitted",
+            None,
+        ));
+    }
+    let code = code as u32;
+    if code > char::MAX as u32 {
+        return Err(sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            format!("requested character too large for encoding: {code}"),
+            None,
+        ));
+    }
+    // The only code points up to char::MAX that are not characters are the
+    // UTF-16 surrogates.
+    let character = char::from_u32(code).ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            format!("requested character not valid for encoding: {code}"),
+            None,
+        )
+    })?;
+    Ok(Some(character.to_string()))
 }
 
 /// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding

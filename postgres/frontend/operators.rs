@@ -603,7 +603,7 @@ fn cast_type_of(oid: i64) -> Option<CastType> {
 /// Whether a value of the type `from` converts to the type `to` with an
 /// implicit cast: the rows of `pg_cast` of `casts.rs` for the types that have
 /// them, and `IMPLICIT_CASTS` for the others.
-fn implicitly_casts(from: i64, to: i64) -> bool {
+pub(crate) fn implicitly_casts(from: i64, to: i64) -> bool {
     from == to
         || casts_implicitly(from, to)
         || matches!(
@@ -619,7 +619,7 @@ const NONE: i64 = 0;
 const BOOL: i64 = 16;
 const INT8: i64 = 20;
 const INT2: i64 = 21;
-const INT4: i64 = 23;
+pub(crate) const INT4: i64 = 23;
 const TEXT: i64 = 25;
 const OID: i64 = 26;
 const FLOAT4: i64 = 700;

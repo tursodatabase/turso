@@ -1303,9 +1303,15 @@ mod tests {
 
     #[test]
     fn error_response_fields_end_at_nul() {
-        let (mut client, _conn) = copy_test_client();
+        let (mut client, conn) = copy_test_client();
+        // PostgreSQL text cannot hold a NUL, so store one with SQLite's char().
+        conn.inner()
+            .execute(
+                "CREATE TABLE nul_name AS SELECT 'nodot' || char(0) || 'Dinjected detail' AS name",
+            )
+            .unwrap();
         let events = client
-            .simple_query("SELECT set_config('nodot' || chr(0) || 'Dinjected detail', 'x', false)")
+            .simple_query("SELECT set_config(name, 'x', false) FROM nul_name")
             .unwrap();
         let fields = events
             .iter()
