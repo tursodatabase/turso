@@ -31,7 +31,7 @@ use crate::{
         trigger_exec::{fire_trigger, TriggerContext},
     },
     vdbe::{
-        builder::{CursorKey, CursorType, DmlRowForm, ProgramBuilder},
+        builder::{CursorKey, DmlRowForm, ProgramBuilder},
         insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
@@ -74,19 +74,12 @@ fn emit_row_loop_delete(
     // All DML completes before any RETURNING rows are yielded to the caller.
     let returning_buffer = if !plan.result_columns.is_empty() {
         let table_ref = plan.table_references.joined_tables().first().unwrap();
-        let btree_table = table_ref
-            .table
-            .btree()
-            .expect("DELETE target must be a BTree table");
-        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: ret_cursor_id,
-            is_table: true,
-        });
-        Some(ReturningBufferCtx {
-            cursor_id: ret_cursor_id,
-            num_columns: plan.result_columns.len(),
-        })
+        Some(ReturningBufferCtx::open(
+            program,
+            table_ref.table.get_name(),
+            &plan.result_columns,
+            &plan.table_references,
+        )?)
     } else {
         None
     };

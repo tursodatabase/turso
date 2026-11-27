@@ -1,4 +1,4 @@
-use crate::alloc::{TursoFromIterator, TursoSliceExt};
+use crate::alloc::{TursoFromIterator, TursoIteratorExt};
 use crate::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo, With,
@@ -18,8 +18,8 @@ use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::{
-        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        SQLITE_SEQUENCE_TABLE_NAME,
+        self, BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
+        ResolvedFkRef, Table, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -486,15 +486,12 @@ pub fn translate_insert(
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
     if !result_columns.is_empty() {
-        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: ret_cursor_id,
-            is_table: true,
-        });
-        ctx.returning_buffer = Some(ReturningBufferCtx {
-            cursor_id: ret_cursor_id,
-            num_columns: result_columns.len(),
-        });
+        ctx.returning_buffer = Some(ReturningBufferCtx::open(
+            program,
+            &btree_table.name,
+            &result_columns,
+            &table_references,
+        )?);
     }
 
     if resolver
@@ -2519,9 +2516,10 @@ fn init_source_emission<'a>(
                  ** temp table in the case of row triggers.
                  */
                 if program.is_table_open(table) || has_insert_triggers {
+                    let temp_table = insert_select_temp_table(table, columns, num_result_cols)?;
                     ctx.temp_table_ctx = Some(emit_insert_select_into_temp_table(
                         program,
-                        ctx.table.clone(),
+                        temp_table,
                         yield_reg,
                         num_result_cols,
                     ));
@@ -3588,33 +3586,15 @@ fn translate_virtual_table_insert(
     )?;
     check_upsert_privileges(&table_references, &[], reads_columns, resolver, connection)?;
 
-    // Ephemeral tables are declared with a B-tree table. This one has the
-    // columns of the virtual table.
-    let ephemeral_table = || -> Result<Arc<BTreeTable>> {
-        Ok(Arc::new(BTreeTable::new(
-            0,
-            virtual_table.name.clone(),
-            crate::alloc::vec![],
-            virtual_table.columns.try_to_vec()?,
-            schema::BTreeCharacteristics::HAS_ROWID,
-            crate::alloc::vec![],
-            crate::alloc::vec![],
-            crate::alloc::vec![],
-            None,
-        )))
-    };
     let returning_buffer = if result_columns.is_empty() {
         None
     } else {
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table()?));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id,
-            is_table: true,
-        });
-        Some(ReturningBufferCtx {
-            cursor_id,
-            num_columns: result_columns.len(),
-        })
+        Some(ReturningBufferCtx::open(
+            program,
+            &virtual_table.name,
+            &result_columns,
+            &table_references,
+        )?)
     };
     emit_non_from_clause_subqueries_for_eval_at(
         program,
@@ -3646,7 +3626,7 @@ fn translate_virtual_table_insert(
         let temp_table_ctx = if program.is_table_open(&table) {
             Some(emit_insert_select_into_temp_table(
                 program,
-                ephemeral_table()?,
+                insert_select_temp_table(&table, &columns, num_values)?,
                 yield_reg,
                 num_values,
             ))
@@ -4024,6 +4004,34 @@ fn emit_insert_select_into_temp_table(
     });
     program.preassign_label_to_next_insn(yield_label);
     temp_table_ctx
+}
+
+/// Build the temporary table that holds the rows of an INSERT ... SELECT.
+/// Its records hold the SELECT's values in the order of the insert's column
+/// list, so each column is named after the target column of its value.
+/// EXPLAIN comments then name the value that each column holds.
+fn insert_select_temp_table(
+    table: &Table,
+    columns: &[ast::Name],
+    num_values: usize,
+) -> Result<Arc<BTreeTable>> {
+    let value_columns = (0..num_values)
+        .map(|i| {
+            let name = insert_target_column(table, columns, i).and_then(|col| col.name.clone());
+            Column::new_default_text(name, String::new(), None)
+        })
+        .try_collect()?;
+    Ok(Arc::new(BTreeTable::new(
+        0,
+        table.get_name().to_string(),
+        crate::alloc::vec![],
+        value_columns,
+        BTreeCharacteristics::HAS_ROWID,
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        None,
+    )))
 }
 
 /// Build the UNIQUE constraint error description to match sqlite
