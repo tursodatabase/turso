@@ -120,49 +120,40 @@ on what it drops.
 operators `=`, `<>`, `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/`, `%`, `&`, `|`,
 `<<`, `>>`, `~`, `!~`, `~*`, `!~*` and `||` whose operand and result types are
 all among boolean, smallint, integer, bigint, real, double precision, numeric,
-text, date, timestamp, timestamptz and uuid: 216 of PostgreSQL's 799 rows. It
+text, date, timestamp, timestamptz and uuid: 222 of PostgreSQL's 799 rows. It
 leaves out the comparisons of two different types among date, timestamp and
 timestamptz, which fail with 0A000, every operator of another type, such as
 bytea, time, interval, json, jsonb, inet and the array types, and every other
 operator name, such as `^`, `@` and `~~`. `oprcode`, `oprrest` and `oprjoin`
 are 0, because `pg_proc` does not have PostgreSQL's functions under their oids.
-`pg_proc` has the rows of PostgreSQL 18, with PostgreSQL's oids, for 58 functions:
-the aggregates `count`, `sum`, `avg`, `min`, `max`, `stddev` and `string_agg` over
-the number, text, bytea, date, timestamp and timestamptz types that tursopg
-accepts, `abs` for the six number types, and `now`, `quote_ident`,
-`format_type`, `pg_get_constraintdef` and `pg_is_in_recovery`. It does not list
-the other functions of PostgreSQL, and it does not list any function that
-only tursopg has.
+`pg_proc` has the rows of PostgreSQL 18, with PostgreSQL's oids: 185 rows for
+80 function names, every overload of the math, string, bytea, date and time, catalog and
+session functions that tursopg runs, and 46 rows of aggregates over the types
+tursopg accepts. 10 rows are written in SQL, as in PostgreSQL. `prosrc` is the
+name of the function that runs the row, and the frontend registers the native
+functions under those names. It does not list the other functions of
+PostgreSQL, and it does not list any function that only tursopg has.
 A comparison (also of BETWEEN, an IN list, `IN (SELECT ...)`, `CASE x WHEN`,
 NULLIF and each pair of two row values), an arithmetic operator or a
-bit operator is refused with 42883 (`operator does not exist`) when no row of
-that name has operand types of the same type category (`pg_type.typcategory`)
-as the operands: `text_column = 1`, `timestamptz_column > 5`, `true = 1`,
-`-date_column`. A string literal or a parameter fits any type. The arithmetic and bit operators
-with a date, or a numeric that has a precision such as `numeric(10, 2)`, are not
-decided by `pg_operator` but by the operator list of the engine, which fails
-with 42883 too; its message names the engine's type (`numeric % real` where
-PostgreSQL says `numeric % double precision`). Every comparison is decided by
-`pg_operator`. Still different
-from PostgreSQL, because the implicit casts of `pg_cast` are not used: two
-operands of the same category always pass, so `1.5::float8 % 2` and `5 & 1.0`
-run where PostgreSQL has no such operator. A value of type text may be a
-uuid, json, jsonb or inet value that a cast or a function returned, so only
-the comparisons of text are checked: `text_column + 1` runs, and
-`uuid_column = text_column` is compared. An operand of a type without rows
-(bytea, time, json, jsonb, inet, arrays, domains over them, enums) is not
-checked. Neither is an operand that is a subquery, or that reads a column of
-a subquery, a CTE, a view or a catalog table, unless the column has one of the
-types boolean, smallint, bigint, numeric, varchar, date, timestamp,
-timestamptz or uuid: `text_column = (SELECT 1)` is compared. A string literal next to a value of a number type is read as that type when
+bit operator is chosen by the resolver (see "Function and operator
+resolution" below), from `pg_operator`, `pg_cast` and `pg_type`. It fails with
+42883 when no row takes the operand types, with 42725 when several rows fit
+equally well, and with PostgreSQL's message: `text_column = 1`,
+`1.5::float8 % 2`, `5 & 1.0` and `uuid_column = text_column` fail as in
+PostgreSQL. An operand with no type at all fails with 42P18. An operand of a
+type that no row of `pg_operator` takes (bytea, time, interval, json, jsonb,
+inet, arrays, domains over them, enums) is not chosen: the engine runs it as before.
+Core does not ask the dialect about an operand it cannot type: a hidden column, a
+scalar subquery, a row value, and a column with no declared type (a table that
+is not STRICT, a virtual table, a subquery that reads one), so
+`text_column = (SELECT 1)` is compared. A string literal next to a value of a number type is read as that type when
 `pg_operator` has the operator for two operands of the type: `1 = '1'` is
 true, and `1 = 'a'`, `'a' + 1` and `int_column IN (1, 'x')` fail with 22P02. The values of an IN list that
 read no column are given one type together with the left side, as PostgreSQL
 does with `select_common_type`: `1 IN ('1.5', 1.5)` reads `'1.5'` as a
 numeric and is false, while `1 IN ('1.5', 2)` fails with 22P02. A value that
 reads a column is compared with the left side alone. The implicit casts of that choice are the
-rows of `pg_cast` between the types that `pg_operator` has rows for, written
-in the frontend.
+rows of `pg_cast`.
 A literal next to a numeric or a double precision that the engine stores as a double, and that a double does not keep exactly (`n = '9007199254740993'`), fails with 0A000, where PostgreSQL compares all the digits of a numeric. Still different from PostgreSQL: a literal next to an integer that has no registered type, such as an integer written in the statement or the result of a function, is checked
 against the range of bigint, a literal that is NaN, an infinity or a numeric past the range
 of a double next to a real, a double precision or a numeric is compared as text, `x IS DISTINCT FROM y` does not choose an operator unless an operand is a string literal, and `-'1'` is -1 where PostgreSQL fails with 42725.
@@ -271,6 +262,76 @@ numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
+
+### Function and operator resolution
+
+The frontend chooses the function or operator of a call as PostgreSQL does
+(`parse_func.c`, `parse_oper.c`, `parse_coerce.c` and `namespace.c`, translated
+into `postgres/frontend/resolve/`). It reads the rows of `pg_proc`, `pg_operator`,
+`pg_cast` and `pg_type` of the frontend, from the types of the arguments:
+
+- It drops the rows whose parameters the arguments cannot reach by the implicit
+  casts of `pg_cast`, and picks the best one by PostgreSQL's rules, including
+  the rules for a quoted literal (`unknown`). Two equally good rows fail with
+  42725 and none fits with 42883, with PostgreSQL's message and hint, such as
+  `function abs(text) does not exist`.
+- It gives the call the argument casts and the result type of the chosen row:
+  `lower(7)` and `abs('abc'::text)` fail with 42883, a quoted literal takes the
+  text overload.
+- An argument with no type at all fails with 42P18.
+- The native function that runs is the one registered under the `prosrc` of the
+  chosen row, so overloads no longer share one body: `length(bytea)` has its own.
+
+What the resolver does not decide, and is left to the engine (as before): an
+aggregate and a window function (`f(*)` and `OVER`), a variadic or polymorphic
+parameter (`concat`, `format`, `string_to_array`, anything with `anyelement` or
+`anyarray`), default arguments, a type name written as a function (`text(x)`,
+a cast), an array argument that is coerced, a domain, a composite type, a range
+type, a procedure, a parameter of type `internal`, and a type that has no `pg_type`
+row here. A function with no row in `pg_proc` is also left to the engine, so it still
+accepts any argument type.
+
+Calls that are kept out of the resolver on purpose:
+
+- The rows whose `prosrc` the frontend does not register (`LEFT_TO_THE_ENGINE` in
+  `function_choice.rs`: `textlen`, `text_reverse`, `textpos`, `numeric_round`,
+  `numeric_ceil`, `dceil`, `int4abs`, `extract_*` and 30 others) run by their SQL
+  name, and a row written in SQL runs as the engine runs it.
+- An operand that core cannot type, so it does not ask the dialect: a hidden
+  column, a scalar subquery, a row value, and a column with no declared type
+  (`is_left_to_the_engine` in core).
+- An operator whose operand type has no rows in `pg_operator` (bytea, interval,
+  time, json, jsonb, inet, arrays, enums).
+
+The types that are not registered cost accuracy (`FIXME(registered-types)`):
+
+- An engine type is read as the PostgreSQL type it most often stands for: an
+  integer as int4, a real as float8, a decimal as numeric, text as text and a
+  blob as bytea. So a text that is a varchar, json, inet or uuid value is text
+  to the resolver, an integer written in the statement or the result of
+  `count(*)` is int4, and a numeric or float8 value is read as a double.
+  `round(2.5::numeric, 7)` fails with 42883, because the cast reads as a double
+  precision, which has no `round` with a scale.
+- A column of a table that is not STRICT or a catalog column whose declared type
+  is not PostgreSQL's has no type, and a function called on one fails with 42P18.
+- bytea is not a registered type: `'\x41'::bytea` is the four bytes of the text,
+  so `length('\x41'::bytea)`, `octet_length`, `reverse`, `btrim`, `ltrim` and
+  `rtrim` on it still count the text (the gap tests `length-of-bytea-counts-bytes`
+  and the five like it). The bytea functions are right when they get real bytes,
+  such as a bound parameter.
+- numeric is not registered: `ceil`, `floor`, `round` and `trunc` of a numeric print
+  `3.0` where PostgreSQL prints `3`, and `sqrt`, `power` and `log` lose digits (the
+  gap tests `ceil-of-numeric-has-no-fraction-digits` and the four like it). text,
+  float4, float8, json, inet, cidr, macaddr, varchar, date, timestamp, timestamptz,
+  uuid and jsonb have the same cost.
+
+Still different from PostgreSQL: `f(*)` and window calls are not resolved; a function
+that only tursopg runs, or that has no `pg_proc` row, accepts any type; a few
+functions with a variadic or array parameter accept a wrong type
+(`format(7)`, `string_to_array(7, 'a')`), and so do `col_description` and
+`obj_description`; and functions that PostgreSQL has are missing, for example `ascii`,
+`initcap`, `left`, `right`, `md5`, `bit_length`, `to_hex`, `translate`, `age`
+(0A000) and `regexp_replace`.
 
 A comparison, `AND`, `OR`, `NOT`, `IS` tests, `IN`, `BETWEEN`, `LIKE`, `EXISTS`,
 the regular expression operators, `= ANY(array)`, `@>`, `<@`, `&&` and the
