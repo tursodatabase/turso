@@ -37,11 +37,20 @@ pub(super) fn emit_rename_table_rows(
     } else {
         stored_old_name
     };
+    // The rewrite function stores this name in the `name` and `tbl_name`
+    // columns. SQLite stores the new name with the case the statement gave it.
+    let new_name_argument = resolver.mangle_name(
+        NamespaceRef {
+            database_id: ctx.database_id,
+            id: table.namespace,
+        },
+        table.written_new_name,
+    );
     emit_rewrite_of_every_row(
         program,
         ctx,
         AlterTableFunc::RenameTable,
-        &[old_name_argument.to_string(), stored_new_name.to_string()],
+        &[old_name_argument.to_string(), new_name_argument],
         table.written_old_name,
     );
     if table.is_virtual {

@@ -1561,8 +1561,9 @@ impl Limbo {
             }
             _ => {}
         }
+        let table_condition = schema_pattern_condition(table_name);
         let sql = format!(
-            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view', 'trigger') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 WHEN 'trigger' THEN 4 END, rowid"
+            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view', 'trigger') AND {table_condition} AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 WHEN 'trigger' THEN 4 END, rowid"
         );
 
         let mut found = false;
@@ -1672,9 +1673,11 @@ impl Limbo {
 
         for name in self.database_names()? {
             let prefix = (name != "main").then_some(&name);
+            // Like sqlite3, match the table with LIKE, which ignores case.
             let sql = match maybe_table {
                 Some(ref tbl_name) => format!(
-                    "SELECT name FROM {name}.sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='index' AND tbl_name LIKE '{}' ORDER BY 1",
+                    tbl_name.replace('\'', "''")
                 ),
                 None => format!("SELECT name FROM {name}.sqlite_schema WHERE type='index' ORDER BY 1"),
             };
@@ -2534,6 +2537,18 @@ impl EqpTreeEntry {
                 &format!("{children_prefix}{continuation}"),
             );
         }
+    }
+}
+
+/// The condition with which sqlite3 matches the PATTERN of `.schema` to the
+/// rows of `sqlite_schema`: `lower(tbl_name)` with LIKE, or with GLOB when
+/// the pattern has a GLOB wildcard. LIKE ignores case.
+fn schema_pattern_condition(pattern: &str) -> String {
+    let quoted = pattern.replace('\'', "''");
+    if pattern.contains(['*', '?', '[']) {
+        format!("lower(tbl_name) GLOB '{quoted}'")
+    } else {
+        format!("lower(tbl_name) LIKE '{quoted}' ESCAPE '\\'")
     }
 }
 

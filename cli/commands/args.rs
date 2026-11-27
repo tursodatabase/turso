@@ -5,7 +5,7 @@ use crate::{input::OutputMode, opcodes_dictionary::OPCODE_DESCRIPTIONS};
 
 #[derive(Debug, Clone, Args)]
 pub struct IndexesArgs {
-    /// Name of table
+    /// LIKE pattern for the names of the tables
     pub tbl_name: Option<String>,
 }
 
@@ -30,7 +30,7 @@ pub struct OpenArgs {
 #[derive(Debug, Clone, Args)]
 pub struct SchemaArgs {
     // TODO depends on PRAGMA table_list for completions
-    /// Table name to visualize schema
+    /// LIKE pattern, or GLOB pattern, for the names of the tables
     pub table_name: Option<String>,
 }
 

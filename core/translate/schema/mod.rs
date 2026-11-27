@@ -1624,7 +1624,9 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    let escaped_tbl_name = escape_sql_string_literal(&mangled_tbl_name);
+    // The rows of the table have the name as the statement wrote it.
+    let escaped_tbl_name =
+        escape_sql_string_literal(&resolver.mangle_name(namespace, tbl_name.name.as_str()));
     let mut parse_schema_where_clause = String::with_capacity(
         "tbl_name = '' AND type != 'trigger'".len()
             + escaped_tbl_name.len()
@@ -1907,7 +1909,7 @@ pub fn translate_create_virtual_table(
     let opts = ProgramBuilderOpts::new(2, 40, 2);
     program.extend(&opts);
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
-    let table_name_reg = program.emit_string8_new_reg(table_name.clone());
+    let table_name_reg = program.emit_string8_new_reg(table_name);
     let args_reg = if !args_vec.is_empty() {
         let args_start = program.alloc_registers(args_vec.len());
 
@@ -1952,7 +1954,8 @@ pub fn translate_create_virtual_table(
         value: resolver.schema().schema_version as i32 + 1,
         p5: 0,
     });
-    let escaped_table_name = escape_sql_string_literal(&table_name);
+    // The row of the table has the name as the statement wrote it.
+    let escaped_table_name = escape_sql_string_literal(tbl_name.name.as_str());
     let parse_schema_where_clause =
         format!("tbl_name = '{escaped_table_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
@@ -2453,12 +2456,13 @@ pub fn translate_drop_table(
         program.emit_column_or_rowid(ver_cursor_id, 0, ver_table_name_reg);
 
         let continue_ver_label = program.allocate_label();
+        // The table can have one version row for each spelling of its name.
         program.emit_insn(Insn::Ne {
             lhs: ver_table_name_reg,
             rhs: dropped_name_reg,
             target_pc: continue_ver_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
+            collation: CollationSeq::NOCASE,
         });
 
         if let (Some(index), Some(cursor_id)) = (&version_index, ver_index_cursor_id) {

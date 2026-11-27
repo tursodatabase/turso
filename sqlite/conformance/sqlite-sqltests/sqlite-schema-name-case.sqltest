@@ -1,0 +1,94 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/12600
+#
+# SQLite stores the name of a schema object in sqlite_schema with the case
+# that the CREATE statement gave it. Name lookups in SQL ignore case, but
+# code that looks up an object by its exact name in sqlite_schema needs the
+# original case.
+
+@cross-check-integrity
+test schema-rows-keep-name-case {
+    CREATE TABLE "MixedCase_Table" ("Id" INTEGER PRIMARY KEY, "SomeCol" TEXT UNIQUE);
+    CREATE INDEX "MyIdx" ON mixedcase_table ("SomeCol");
+    CREATE VIEW "MyView" AS SELECT 1;
+    CREATE TRIGGER "MyTrig" AFTER INSERT ON MIXEDCASE_TABLE BEGIN SELECT 1; END;
+    CREATE TABLE Unquoted (x);
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY rowid;
+}
+expect {
+    table|MixedCase_Table|MixedCase_Table
+    index|sqlite_autoindex_MixedCase_Table_1|MixedCase_Table
+    index|MyIdx|MixedCase_Table
+    view|MyView|MyView
+    trigger|MyTrig|MIXEDCASE_TABLE
+    table|Unquoted|Unquoted
+}
+
+test temp-schema-rows-keep-name-case {
+    CREATE TABLE Base (x);
+    CREATE TEMP TABLE "TempTable" (x PRIMARY KEY);
+    CREATE TEMP TRIGGER "TempTrig" AFTER INSERT ON base BEGIN SELECT 1; END;
+    SELECT type, name, tbl_name FROM temp.sqlite_schema ORDER BY rowid;
+}
+expect {
+    table|TempTable|TempTable
+    index|sqlite_autoindex_TempTable_1|TempTable
+    trigger|TempTrig|base
+}
+
+test exact-name-lookup-in-schema-finds-table {
+    CREATE TABLE "MixedCase_Table" ("Id" INTEGER PRIMARY KEY);
+    SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'MixedCase_Table';
+}
+expect {
+    MixedCase_Table
+}
+
+@cross-check-integrity
+test drop-objects-with-other-case-removes-rows {
+    CREATE TABLE "MixedCase_Table" (a UNIQUE, b);
+    CREATE INDEX "MyIdx" ON "MixedCase_Table" (b);
+    CREATE VIEW "MyView" AS SELECT a FROM "MixedCase_Table";
+    CREATE TRIGGER "MyTrig" AFTER INSERT ON "MixedCase_Table" BEGIN SELECT 1; END;
+    CREATE TEMP TRIGGER "TempTrig" AFTER INSERT ON "MixedCase_Table" BEGIN SELECT 1; END;
+    INSERT INTO mixedcase_table VALUES (1, 2);
+    SELECT * FROM myview;
+    DROP INDEX myidx;
+    DROP VIEW myview;
+    DROP TRIGGER mytrig;
+    DROP TRIGGER temptrig;
+    SELECT type, name FROM sqlite_schema ORDER BY rowid;
+    SELECT count(*) FROM temp.sqlite_schema;
+    DROP TABLE mixedcase_table;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    1
+    table|MixedCase_Table
+    index|sqlite_autoindex_MixedCase_Table_1
+    0
+    0
+}
+
+@cross-check-integrity
+test rename-table-keeps-new-name-case {
+    CREATE TABLE "Foo" (a UNIQUE);
+    CREATE INDEX "FooIdx" ON foo (a);
+    CREATE TABLE "Foo_x" (b UNIQUE);
+    ALTER TABLE foo RENAME TO "NewName";
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY rowid;
+    ALTER TABLE NEWNAME ADD COLUMN b;
+    INSERT INTO newname VALUES (1, 2);
+    SELECT * FROM NewName;
+    SELECT type, name FROM sqlite_schema WHERE name = 'NewName';
+}
+expect {
+    table|NewName|NewName
+    index|sqlite_autoindex_NewName_1|NewName
+    index|FooIdx|NewName
+    table|Foo_x|Foo_x
+    index|sqlite_autoindex_Foo_x_1|Foo_x
+    1|2
+    table|NewName
+}

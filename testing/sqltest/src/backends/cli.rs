@@ -225,10 +225,12 @@ impl CliDatabaseInstance {
     }
 
     fn normalize_sqlite_dot_command_output(dot_command: &str, stdout: &str) -> Vec<Vec<String>> {
+        // The command can have arguments, such as `.schema foo`.
+        let command = dot_command.split_whitespace().next().unwrap_or_default();
         stdout
             .lines()
             .filter(|line| !line.is_empty())
-            .map(|line| match dot_command {
+            .map(|line| match command {
                 ".tables" => vec![Self::collapse_repeated_spaces(line)],
                 ".schema" => vec![Self::normalize_sqlite_schema_line(line)],
                 _ => vec![line.to_string()],

@@ -4599,9 +4599,13 @@ impl Schema {
                         Stmt::CreateMaterializedView { .. } => {
                             // The view is built in a later pass, when the
                             // root pages of its hidden state tables are known.
-                            // Its key is the row's name, namespace and all.
-                            view_info
-                                .insert(name.to_string(), (namespace, sql.to_string(), root_page));
+                            // Its key is the row's name, namespace and all,
+                            // normalized as the keys of its state tables are:
+                            // the row keeps the case that CREATE gave the name.
+                            view_info.insert(
+                                normalize_ident(name),
+                                (namespace, sql.to_string(), root_page),
+                            );
                         }
                         Stmt::CreateView {
                             view_name: _,
@@ -4610,8 +4614,10 @@ impl Schema {
                             ..
                         } => {
                             if !self.namespace_names_loaded {
+                                // Normalized like the key of a materialized
+                                // view, so the dependencies of views match.
                                 view_info.insert(
-                                    name.to_string(),
+                                    normalize_ident(name),
                                     (namespace, sql.to_string(), root_page),
                                 );
                             } else {

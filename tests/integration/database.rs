@@ -322,7 +322,7 @@ fn test_drop_and_rename_objects_of_sqlite_file_with_mixed_case_names() {
         conn.execute("DROP VIEW myview").unwrap();
         conn.execute("DROP TRIGGER mytrig").unwrap();
         conn.execute("DROP TABLE OTHER").unwrap();
-        conn.execute("ALTER TABLE mixedcase RENAME TO newname")
+        conn.execute(r#"ALTER TABLE mixedcase RENAME TO "NewName""#)
             .unwrap();
         conn.execute("ALTER TABLE newname ADD COLUMN c").unwrap();
         conn.execute("DROP TRIGGER KEPTTRIG").unwrap();
@@ -333,19 +333,76 @@ fn test_drop_and_rename_objects_of_sqlite_file_with_mixed_case_names() {
     assert_eq!(
         sqlite_schema_rows(&path),
         vec![
-            (s("table"), s("newname"), s("newname")),
-            (s("index"), s("sqlite_autoindex_newname_1"), s("newname")),
+            (s("table"), s("NewName"), s("NewName")),
+            (s("index"), s("sqlite_autoindex_NewName_1"), s("NewName")),
         ]
     );
     let sqlite = rusqlite::Connection::open(&path).unwrap();
     let columns: i64 = sqlite
         .query_row(
-            "SELECT count(*) FROM pragma_table_info('newname')",
+            "SELECT count(*) FROM pragma_table_info('NewName')",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(columns, 3);
+    assert_eq!(sqlite_integrity_check(&path), "ok");
+}
+
+/// Older Turso versions wrote names in lowercase in the name and tbl_name
+/// columns of sqlite_schema, while the SQL text keeps the case that CREATE
+/// gave the name. Turso must find these rows by the names they have.
+#[test]
+fn test_drop_objects_of_file_with_lowercase_schema_names() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("lowercase_names.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            r#"CREATE TABLE "MixedCase"(a UNIQUE, b);
+               CREATE INDEX "MyIdx" ON "MixedCase"(b);
+               CREATE VIEW "MyView" AS SELECT a FROM "MixedCase";
+               CREATE TRIGGER "MyTrig" AFTER INSERT ON "MixedCase" BEGIN SELECT 1; END;
+               CREATE TABLE "Other"(x);
+               CREATE TRIGGER "OtherTrig" AFTER INSERT ON "Other" BEGIN SELECT 1; END;
+               PRAGMA writable_schema = ON;
+               UPDATE sqlite_schema SET name = lower(name), tbl_name = lower(tbl_name);"#,
+        )
+        .unwrap();
+    drop(sqlite);
+
+    {
+        let db = crate::common::TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE INDEX NewIdx ON MIXEDCASE(a)").unwrap();
+        conn.execute("DROP INDEX MYIDX").unwrap();
+        conn.execute("DROP VIEW MyView").unwrap();
+        conn.execute("DROP TRIGGER MyTrig").unwrap();
+    }
+
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        sqlite_schema_rows(&path),
+        vec![
+            (s("table"), s("mixedcase"), s("mixedcase")),
+            (
+                s("index"),
+                s("sqlite_autoindex_mixedcase_1"),
+                s("mixedcase")
+            ),
+            (s("table"), s("other"), s("other")),
+            (s("trigger"), s("othertrig"), s("other")),
+            (s("index"), s("NewIdx"), s("MixedCase")),
+        ]
+    );
+
+    {
+        let db = crate::common::TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("DROP TABLE MixedCase").unwrap();
+        conn.execute("DROP TABLE Other").unwrap();
+    }
+    assert_eq!(sqlite_schema_rows(&path), vec![]);
     assert_eq!(sqlite_integrity_check(&path), "ok");
 }
 

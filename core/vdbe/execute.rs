@@ -11151,12 +11151,13 @@ pub fn op_function(
                     // The old name comes from the statement, so compare it
                     // with the `name` and `tbl_name` columns without case,
                     // as SQLite does (`tbl_name=%Q COLLATE nocase` in
-                    // alter.c).
+                    // alter.c). Like SQLite, store the new name as the
+                    // statement wrote it.
                     let renamed_autoindex = if normalize_ident(&tbl_name) == rename_from {
                         crate::util::renamed_automatic_index_name(
                             &normalize_ident(&name),
                             &rename_from,
-                            &rename_to,
+                            original_rename_to.as_str(),
                         )
                     } else {
                         None
@@ -11164,13 +11165,13 @@ pub fn op_function(
                     let new_name = if let Some(index_name) = renamed_autoindex {
                         index_name
                     } else if normalize_ident(&name) == rename_from {
-                        rename_to.clone()
+                        original_rename_to.to_string()
                     } else {
                         name
                     };
 
                     let new_tbl_name = if normalize_ident(&tbl_name) == rename_from {
-                        rename_to.clone()
+                        original_rename_to.to_string()
                     } else {
                         tbl_name
                     };
@@ -15643,10 +15644,12 @@ pub fn op_init_cdc_version(
             return Ok(InsnFunctionStepResult::Step);
         }
 
+        // The user names the CDC table, and table names do not depend on
+        // case.
         let stmt = prepare_cdc_internal(
             &conn,
             format!(
-                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}' COLLATE NOCASE",
             ),
         )?;
         *state.active_op_state.init_cdc_version() = Some(Box::new(OpInitCdcVersionInner {
@@ -15739,10 +15742,15 @@ fn drive_init_cdc_version(
                     } else {
                         *version
                     };
+                    // Each spelling of the table name gets its own row. A
+                    // new spelling takes the version that the table has
+                    // under another spelling, because table names do not
+                    // depend on case. Without this, a table that has a
+                    // version would look like a legacy v1 table.
                     inner.stmt = prepare_cdc_internal(
                         conn,
                         format!(
-                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
+                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', coalesce((SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}' COLLATE NOCASE), '{version_to_insert}'))",
                         ),
                     )?;
                     inner.phase = OpInitCdcVersionPhase::InsertVersion;
@@ -17198,7 +17206,9 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
-                normalized_to.clone_into(&mut btree.declared_name);
+                // The declared name keeps the case that the statement gave
+                // the new name, as the schema row does.
+                to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
