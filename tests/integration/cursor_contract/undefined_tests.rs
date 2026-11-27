@@ -9,6 +9,11 @@
 //! test is a `known_bug_*` test, because no engine refuses yet. When an engine does, the
 //! test fails with "does not fail any more": remove the wrapper.
 //!
+//! The `:model:` engine (`DbKind::Model`) is not in the `known_bug` part: it must refuse
+//! every sequence. A case marked `model_gap` is one that the model engine cannot see, because
+//! it infers the ops from the calls of the VDBE on `CursorTrait`. The test then requires that
+//! the model engine does not refuse it, so that a better inference shows up.
+//!
 //! A release build may still do anything. The tests exist only in debug builds.
 
 use super::index_model::{ColDef, Coll, IReplay, IdxDef, Order, Val};
@@ -38,6 +43,83 @@ const INDEX_CONFIGS: [(DbKind, Layout); 4] = [
 
 const TABLE_ROWS: &[(i64, i64)] = &[(10, 100), (20, 200), (30, 300)];
 
+/// Asserts that the model calls the last op of the table program illegal and the ops before
+/// it legal.
+#[track_caller]
+fn assert_table_illegal(rows: &[(i64, i64)], ncursors: usize, ops: &[Op]) {
+    let (last, prefix) = ops.split_last().expect("a program");
+    let mut model = Replay::new(rows, ncursors);
+    for op in prefix {
+        assert!(
+            model.apply(op, None).is_some(),
+            "{op:?} is illegal in the model: it must be the last op"
+        );
+    }
+    assert!(
+        model.apply(last, None).is_none(),
+        "the model must call {last:?} illegal"
+    );
+}
+
+/// The same for an index program.
+#[track_caller]
+fn assert_index_illegal(idef: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) {
+    let (last, prefix) = ops.split_last().expect("a program");
+    let mut model = IReplay::new(rows, nidx, false, idef);
+    for op in prefix {
+        assert!(
+            model.apply(op).is_some(),
+            "{op:?} is illegal in the model: it must be the last op"
+        );
+    }
+    let state = format!("{:?}", model.st);
+    assert!(
+        model.apply(last).is_none(),
+        "the model must call {last:?} illegal in {state}"
+    );
+}
+
+fn index_run(
+    idef: IdxDef,
+    rows: &[Row],
+    nidx: usize,
+    kind: DbKind,
+    layout: Layout,
+) -> IndexRun<'_> {
+    IndexRun {
+        kind,
+        layout,
+        rows,
+        idef,
+        nidx,
+        ntbl: 0,
+        mode: ReadMode::Column,
+    }
+}
+
+/// The error of the `:model:` engine for the table program, if any.
+fn model_table_error(rows: &[(i64, i64)], ncursors: usize, ops: &[Op]) -> Option<String> {
+    run(DbKind::Model, Layout::AllInMemory, rows, ncursors, ops).err()
+}
+
+/// The error of the `:model:` engine for the index program, if any.
+fn model_index_error(idef: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) -> Option<String> {
+    let cfg = index_run(idef, rows, nidx, DbKind::Model, Layout::AllInMemory);
+    run_index(&cfg, ops).error
+}
+
+/// Requires that the `:model:` engine does not refuse a program of a `model_gap` case.
+#[track_caller]
+fn model_misses(error: Option<String>, why: &str) {
+    if let Some(e) = &error {
+        assert!(
+            !e.starts_with("panic: unsupported"),
+            "the model engine refuses this program now, so it is not a gap any more \
+             ({why}): remove `model_gap` from the case. {e}"
+        );
+    }
+}
+
 /// The engine result for the last op: `None` means the program ran without an error.
 fn judge(config: &str, op: &str, error: Option<&str>) {
     match error {
@@ -54,18 +136,8 @@ fn judge(config: &str, op: &str, error: Option<&str>) {
 /// Table cursors. Table rows are `(rowid, value)`.
 #[track_caller]
 fn rejects_table(rows: &[(i64, i64)], ncursors: usize, ops: &[Op]) {
-    let (last, prefix) = ops.split_last().expect("a program");
-    let mut model = Replay::new(rows, ncursors);
-    for op in prefix {
-        assert!(
-            model.apply(op, None).is_some(),
-            "{op:?} is illegal in the model: it must be the last op"
-        );
-    }
-    assert!(
-        model.apply(last, None).is_none(),
-        "the model must call {last:?} illegal"
-    );
+    assert_table_illegal(rows, ncursors, ops);
+    let last = ops.last().expect("a program");
     for (kind, layout) in CONFIGS {
         let got = run(kind, layout, rows, ncursors, ops);
         judge(
@@ -79,29 +151,10 @@ fn rejects_table(rows: &[(i64, i64)], ncursors: usize, ops: &[Op]) {
 /// Index cursors.
 #[track_caller]
 fn rejects_index(idef: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) {
-    let (last, prefix) = ops.split_last().expect("a program");
-    let mut model = IReplay::new(rows, nidx, false, idef);
-    for op in prefix {
-        assert!(
-            model.apply(op).is_some(),
-            "{op:?} is illegal in the model: it must be the last op"
-        );
-    }
-    let state = format!("{:?}", model.st);
-    assert!(
-        model.apply(last).is_none(),
-        "the model must call {last:?} illegal in {state}"
-    );
+    assert_index_illegal(idef, rows, nidx, ops);
+    let last = ops.last().expect("a program");
     for (kind, layout) in INDEX_CONFIGS {
-        let cfg = IndexRun {
-            kind,
-            layout,
-            rows,
-            idef,
-            nidx,
-            ntbl: 0,
-            mode: ReadMode::Column,
-        };
+        let cfg = index_run(idef, rows, nidx, kind, layout);
         let outcome = run_index(&cfg, ops);
         judge(
             &format!("{kind:?}/{layout:?}"),
@@ -111,12 +164,28 @@ fn rejects_index(idef: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) {
     }
 }
 
-/// A table program whose last op is Undefined. `$id` is the rule of SPEC 2d.
+/// A table program whose last op is Undefined. `$id` is the rule of SPEC 2d. The `:model:`
+/// engine must refuse it, unless the case gives a `model_gap` reason.
 macro_rules! table_case {
     ($name:ident, $id:literal, $ncur:expr, [$($op:expr),+ $(,)?]) => {
         #[test]
         fn $name() {
-            known_bug($id, EXPECTED, || rejects_table(TABLE_ROWS, $ncur, &[$($op),+]));
+            let ops = [$($op),+];
+            assert_table_illegal(TABLE_ROWS, $ncur, &ops);
+            judge(
+                "Model",
+                &format!("{:?}", ops.last().unwrap()),
+                model_table_error(TABLE_ROWS, $ncur, &ops).as_deref(),
+            );
+            known_bug($id, EXPECTED, || rejects_table(TABLE_ROWS, $ncur, &ops));
+        }
+    };
+    ($name:ident, $id:literal, $ncur:expr, [$($op:expr),+ $(,)?], model_gap: $why:literal) => {
+        #[test]
+        fn $name() {
+            let ops = [$($op),+];
+            model_misses(model_table_error(TABLE_ROWS, $ncur, &ops), $why);
+            known_bug($id, EXPECTED, || rejects_table(TABLE_ROWS, $ncur, &ops));
         }
     };
 }
@@ -126,7 +195,24 @@ macro_rules! index_case {
     ($name:ident, $id:literal, $idef:expr, $rows:expr, $ncur:expr, [$($op:expr),+ $(,)?]) => {
         #[test]
         fn $name() {
-            known_bug($id, EXPECTED, || rejects_index($idef, &$rows, $ncur, &[$($op),+]));
+            let ops = [$($op),+];
+            let rows = $rows;
+            assert_index_illegal($idef, &rows, $ncur, &ops);
+            judge(
+                "Model",
+                &format!("{:?}", ops.last().unwrap()),
+                model_index_error($idef, &rows, $ncur, &ops).as_deref(),
+            );
+            known_bug($id, EXPECTED, || rejects_index($idef, &rows, $ncur, &ops));
+        }
+    };
+    ($name:ident, $id:literal, $idef:expr, $rows:expr, $ncur:expr, [$($op:expr),+ $(,)?], model_gap: $why:literal) => {
+        #[test]
+        fn $name() {
+            let ops = [$($op),+];
+            let rows = $rows;
+            model_misses(model_index_error($idef, &rows, $ncur, &ops), $why);
+            known_bug($id, EXPECTED, || rejects_index($idef, &rows, $ncur, &ops));
         }
     };
 }
@@ -273,7 +359,8 @@ index_case!(
     default_idef(),
     index_rows(),
     1,
-    [IOp::Rewind(0), del(0, 1, 10, 1), IOp::Next(0)]
+    [IOp::Rewind(0), del(0, 1, 10, 1), IOp::Next(0)],
+    model_gap: "IdxDelete calls an eq-only seek and Delete; Delete leaves a direction"
 );
 
 // ---------------------------------------------------------------------------------------
@@ -284,7 +371,8 @@ table_case!(
     known_bug_u3_insert_after_null_row,
     "U3",
     1,
-    [Op::NullRow(0), insert(0, 25, true)]
+    [Op::NullRow(0), insert(0, 25, true)],
+    model_gap: "an insert that seeks makes the calls of a seek opcode and an insert, and that seek is legal after NullRow"
 );
 table_case!(
     known_bug_u3_delete_after_null_row,
@@ -310,7 +398,8 @@ index_case!(
     default_idef(),
     index_rows(),
     1,
-    [IOp::NullRow(0), add(0, 7, 7, 70, false)]
+    [IOp::NullRow(0), add(0, 7, 7, 70, false)],
+    model_gap: "an insert that seeks makes the calls of a seek opcode and an insert, and that seek is legal after NullRow"
 );
 index_case!(
     known_bug_u3_idx_delete_after_null_row,
@@ -462,7 +551,8 @@ index_case!(
     default_idef(),
     index_rows(),
     1,
-    [del(0, 9, 9, 99)]
+    [del(0, 9, 9, 99)],
+    model_gap: "the VDBE returns Corrupt after the seek misses and calls no delete"
 );
 index_case!(
     known_bug_u7_idx_delete_of_equal_but_not_identical_key,
@@ -475,7 +565,8 @@ index_case!(
         a: Val::text("A"),
         b: v(1),
         rowid: 1,
-    }]
+    }],
+    model_gap: "the VDBE returns Corrupt after the seek misses and calls no delete"
 );
 
 // ---------------------------------------------------------------------------------------
@@ -570,7 +661,8 @@ index_case!(
     default_idef(),
     index_rows(),
     1,
-    [IOp::NoConflict(0, vec![Val::Null]), IOp::Observe(0)]
+    [IOp::NoConflict(0, vec![Val::Null]), IOp::Observe(0)],
+    model_gap: "NoConflict with a NULL makes no call on the cursor"
 );
 
 // ---------------------------------------------------------------------------------------

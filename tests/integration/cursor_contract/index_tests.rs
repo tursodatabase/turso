@@ -6,7 +6,7 @@
 //! `(NULL,5,6) (1,10,1) (1,20,2) (2,10,3) (2,30,4) (3,NULL,5)`.
 //! Column `a` has duplicates, NULL sorts first, and `b` is NULL in the last entry.
 
-use super::index_model::{IdxDef, Val};
+use super::index_model::{is_legal, IdxDef, Val};
 use super::index_program::{run_index, IObs, IOp::*, IndexRun, Outcome, Row};
 use super::program::ReadMode;
 use super::{known_bug, DbKind, Layout};
@@ -70,12 +70,13 @@ fn r(rowid: i64) -> IObs {
 }
 
 /// The configs of every test. Layout has no meaning for the ephemeral engine, so it runs once.
-const CONFIGS: [(DbKind, Layout); 5] = [
+const CONFIGS: [(DbKind, Layout); 6] = [
     (DbKind::Wal, Layout::AllInMemory),
     (DbKind::Wal, Layout::Checkpointed),
     (DbKind::Mvcc, Layout::AllInMemory),
     (DbKind::Mvcc, Layout::Checkpointed),
     (DbKind::Ephemeral, Layout::AllInMemory),
+    (DbKind::Model, Layout::AllInMemory),
 ];
 
 /// The read modes that agree everywhere, as long as the program does not read a cursor that
@@ -159,6 +160,18 @@ fn check(rows: &[Row], opts: Opts, ops: &Ops, expected: &[IObs]) {
     assert_eq!(ops.len(), expected.len(), "one observation per op");
     let mut failures = Vec::new();
     for (label, outcome) in run_all(rows, opts, ops) {
+        // Some scenarios pin what the engines do for an undefined sequence. The `:model:`
+        // engine refuses such a program, and that is its correct result.
+        let refused = outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("panic: unsupported"));
+        if label.starts_with("Model/")
+            && refused
+            && !is_legal(rows, opts.nidx, false, IdxDef::default(), ops)
+        {
+            continue;
+        }
         if let Some(why) = divergence(&outcome, ops, expected) {
             failures.push(format!("{label}: {why}"));
         }
@@ -1022,7 +1035,7 @@ fn clear_empties_the_index_in_wal_and_errors_in_mvcc() {
             let got = run_index(&cfg, &ops);
             let label = format!("{kind:?}/{layout:?}/{mode:?}: {got:?}");
             match kind {
-                DbKind::Wal => assert_eq!(
+                DbKind::Wal | DbKind::Model => assert_eq!(
                     got,
                     Outcome {
                         obs: vec![n(), n(), e(6, NULL, 5), n(), n(), n(), r(0), j()],
@@ -1667,7 +1680,7 @@ mod collation {
         agree(def(DESC, NOCASE), &rows, 1, &ops);
         // The same with the equality seek that the translator emits. MVCC with all entries
         // in the overlay loses `Next` after it (OV1, also with the default index).
-        let configs = [CONFIGS[0], CONFIGS[1], CONFIGS[3], CONFIGS[4]];
+        let configs = [CONFIGS[0], CONFIGS[1], CONFIGS[3], CONFIGS[4], CONFIGS[5]];
         for d in [def(DESC, NOCASE), def(DESC, DESC), def(NOCASE, BIN)] {
             with_eq_only_seek_ge(|| agree_on(&configs, d, &rows, 1, &ops));
         }

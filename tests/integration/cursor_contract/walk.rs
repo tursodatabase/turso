@@ -21,6 +21,9 @@ use std::collections::HashSet;
 /// The keys of the walk are in `0..=KEY_MAX`.
 const KEY_MAX: i64 = 26;
 const MAX_OPS: usize = 25;
+/// The `:model:` engine runs in every scope: it is fast, and it must agree with the model on
+/// every legal program.
+const MODEL: (DbKind, Layout) = (DbKind::Model, Layout::AllInMemory);
 const CONFIGS: [(DbKind, Layout); 4] = [
     (DbKind::Wal, Layout::AllInMemory),
     (DbKind::Wal, Layout::Checkpointed),
@@ -149,12 +152,14 @@ pub fn walk(cfg: &WalkConfig) -> Vec<String> {
 }
 
 fn random_scope(rng: &mut ChaCha8Rng) -> Vec<(DbKind, Layout)> {
-    match rng.random_range(0..10) {
+    let mut scope = match rng.random_range(0..10) {
         0..=3 => CONFIGS.to_vec(),
         4 => CONFIGS[..2].to_vec(),
         5 => CONFIGS[2..].to_vec(),
         _ => vec![CONFIGS[rng.random_range(0..4)]],
-    }
+    };
+    scope.push(MODEL);
+    scope
 }
 
 /// Runs one case on the given configs. Returns (engine runs, skipped runs).

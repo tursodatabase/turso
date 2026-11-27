@@ -41,6 +41,9 @@ const MAX_OPS: usize = 30;
 const ROWID_MAX: i64 = 40;
 
 const EPHEMERAL: (DbKind, Layout) = (DbKind::Ephemeral, Layout::AllInMemory);
+/// The `:model:` engine runs in every scope: it is fast, and it must agree with the model on
+/// every legal program.
+const MODEL: (DbKind, Layout) = (DbKind::Model, Layout::AllInMemory);
 const CONFIGS: [(DbKind, Layout); 4] = [
     (DbKind::Wal, Layout::AllInMemory),
     (DbKind::Wal, Layout::Checkpointed),
@@ -98,9 +101,14 @@ impl IdxGaps {
     /// PD2: WAL: `Delete` of the entry under the cursor after another cursor wrote to the
     /// index panics (`idx < cell_count`).
     pub const PD2_DELETE_AFTER_PEER_WRITE: IdxGaps = IdxGaps(1 << 19);
+    /// MI1: the `:model:` engine: `NoConflict` with a NULL in the key makes no call on the
+    /// cursor, so the engine does not see that it clears the null-row flag, and refuses a
+    /// write or `Count` after it (U3). The translator does not emit `NullRow` before
+    /// `NoConflict` on a cursor.
+    pub const MI1_MODEL_NO_CONFLICT_NULL_AFTER_NULL_ROW: IdxGaps = IdxGaps(1 << 20);
 
     pub const NONE: IdxGaps = IdxGaps(0);
-    pub const ALL: IdxGaps = IdxGaps(0b1111_1101_0000_0000_1111);
+    pub const ALL: IdxGaps = IdxGaps(0b1_1111_1101_0000_0000_1111);
 
     pub fn has(self, other: IdxGaps) -> bool {
         self.0 & other.0 == other.0
@@ -126,7 +134,7 @@ impl IdxGaps {
         }
     }
 
-    pub const NAMES: [(&'static str, IdxGaps); 11] = [
+    pub const NAMES: [(&'static str, IdxGaps); 12] = [
         ("IDX_D1_MVCC_CKPT", IdxGaps::IDX_D1_MVCC_CKPT),
         ("IDX_END_INSERT", IdxGaps::IDX_END_INSERT),
         ("ROWDATA_IDX_INSERT", IdxGaps::ROWDATA_IDX_INSERT),
@@ -141,6 +149,7 @@ impl IdxGaps {
         ("G3", IdxGaps::G3_NULL_ROW_AND_PEER_WRITE),
         ("OV1", IdxGaps::OV1_NEXT_AFTER_FOUND_HIT),
         ("PD2", IdxGaps::PD2_DELETE_AFTER_PEER_WRITE),
+        ("MI1", IdxGaps::MI1_MODEL_NO_CONFLICT_NULL_AFTER_NULL_ROW),
     ];
 }
 
@@ -311,6 +320,7 @@ fn random_scope(rng: &mut ChaCha8Rng, nidx: usize) -> Vec<(DbKind, Layout)> {
             _ => {}
         }
     }
+    scope.push(MODEL);
     scope
 }
 
@@ -770,7 +780,14 @@ impl Gen {
             .any(|c| matches!(c.0, DbKind::Wal | DbKind::Ephemeral));
         let mvcc = self.scope.iter().any(|c| c.0 == DbKind::Mvcc);
         let mvcc_ckpt = self.scope.contains(&(DbKind::Mvcc, Layout::Checkpointed));
-        (self.gaps.has(IdxGaps::IDX_D1_MVCC_CKPT) && mvcc_ckpt && self.idx_d1(op))
+        let model = self.scope.iter().any(|c| c.0 == DbKind::Model);
+        (self
+            .gaps
+            .has(IdxGaps::MI1_MODEL_NO_CONFLICT_NULL_AFTER_NULL_ROW)
+            && model
+            && matches!(op, IOp::NoConflict(c, p)
+                if self.replay.st.icurs[*c].null_row && p.iter().any(|v| *v == Val::Null)))
+            || (self.gaps.has(IdxGaps::IDX_D1_MVCC_CKPT) && mvcc_ckpt && self.idx_d1(op))
             || (self.gaps.has(IdxGaps::IDX_END_INSERT) && wal_or_eph && self.idx_end_insert(op))
             || (self.gaps.has(IdxGaps::ROWDATA_IDX_INSERT)
                 && wal_or_eph

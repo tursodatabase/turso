@@ -17,21 +17,23 @@ use super::program::{Op, ReadMode};
 use super::{known_bug, DbKind, Layout};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-const TABLE_CONFIGS: [(DbKind, Layout); 5] = [
+const TABLE_CONFIGS: [(DbKind, Layout); 6] = [
     (DbKind::Wal, Layout::AllInMemory),
     (DbKind::Wal, Layout::Checkpointed),
     (DbKind::Mvcc, Layout::AllInMemory),
     (DbKind::Mvcc, Layout::Checkpointed),
     (DbKind::Ephemeral, Layout::AllInMemory),
+    (DbKind::Model, Layout::AllInMemory),
 ];
 
 /// The ephemeral engine has no index `OpenDup` (O1), so index programs with two cursors do
 /// not run on it.
-const INDEX_CONFIGS: [(DbKind, Layout); 4] = [
+const INDEX_CONFIGS: [(DbKind, Layout); 5] = [
     (DbKind::Wal, Layout::AllInMemory),
     (DbKind::Wal, Layout::Checkpointed),
     (DbKind::Mvcc, Layout::AllInMemory),
     (DbKind::Mvcc, Layout::Checkpointed),
+    (DbKind::Model, Layout::AllInMemory),
 ];
 
 const TABLE_ROWS: &[(i64, i64)] = &[(10, 100), (20, 200), (30, 300)];

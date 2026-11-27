@@ -7,7 +7,7 @@
 //! `Found`, and an `Insert` or `IdxInsert` that does not seek uses the seek token of the last
 //! move. Facts that no call shows are listed in SPEC section 2e.
 
-use super::spec::{self, Outcome, Pos, Tree, Write};
+use super::spec::{self, Dir, Outcome, Pos, Tree, Write};
 use super::stats;
 use super::store::ConnTrees;
 use crate::storage::btree::{BTreeKey, CursorStep, CursorTrait};
@@ -193,6 +193,16 @@ pub struct ModelCursor {
     /// The main pager of the connection. Only `ClearBtree` asks for it.
     pager: Arc<Pager>,
     recent: VecDeque<&'static str>,
+    /// The key of the last eq-only seek and the shape before it. `Insert` with `REQUIRE_SEEK`
+    /// and `IdxInsert` without `USE_SEEK` make this seek themselves and then insert the same
+    /// key: that is `Insert { use_seek: false }` on the shape before the seek. A seek opcode
+    /// followed by an insert without a seek makes the same calls: that is a seek and
+    /// `Insert { use_seek: true }`. The two differ only in the direction afterwards.
+    /// The third field is `alt_dirs` before the seek.
+    own_seek: Option<(Key, Shape, Vec<Dir>)>,
+    /// The directions of the other readings of the last insert, while they are still open.
+    /// An op that is illegal with the direction of the cursor is tried with these.
+    alt_dirs: Vec<Dir>,
 }
 
 impl ModelCursor {
@@ -228,21 +238,48 @@ impl ModelCursor {
             record: None,
             pager,
             recent: VecDeque::new(),
+            own_seek: None,
+            alt_dirs: Vec::new(),
         }
     }
 
     /// One spec step. An illegal op panics with `unsupported: U<n>: ...`.
     fn run(&mut self, op: Op, value: Option<&ImmutableRecord>) -> bool {
         self.catch_up();
+        let is_read = matches!(op, Op::Read);
+        // A read between the seek and the insert is part of the opcode (a unique check).
+        if !is_read {
+            self.own_seek = None;
+        }
+        let alt_dirs = if is_read {
+            self.alt_dirs.clone()
+        } else {
+            std::mem::take(&mut self.alt_dirs)
+        };
         stats::step(op.name());
         if self.recent.len() == RECENT {
             self.recent.pop_front();
         }
         self.recent.push_back(op.name());
         let shape = &self.shape;
-        let result = self
-            .tree
-            .read(&self.info, |t| spec::step(&t.rows, shape, &op));
+        let mut used_alt = false;
+        let result = self.tree.read(&self.info, |t| {
+            let first = spec::step(&t.rows, shape, &op);
+            if first.is_ok() {
+                return first;
+            }
+            for dir in &alt_dirs {
+                let alt = Shape {
+                    dir: *dir,
+                    ..shape.clone()
+                };
+                if let Ok(outcome) = spec::step(&t.rows, &alt, &op) {
+                    used_alt = true;
+                    return Ok(outcome);
+                }
+            }
+            first
+        });
         let Outcome { shape, hit, write } = match result {
             Ok(outcome) => outcome,
             Err(e) => panic!(
@@ -266,6 +303,10 @@ impl ModelCursor {
                 t.version
             });
         }
+        // The other reading stays open while the ops keep the direction (a read, a delete).
+        if !is_read && !used_alt && shape.dir == self.shape.dir {
+            self.alt_dirs = alt_dirs;
+        }
         self.shape = shape;
         self.record = None;
         hit
@@ -283,6 +324,7 @@ impl ModelCursor {
             })
         });
         if let Some((shape, version)) = caught {
+            self.own_seek = None;
             self.shape = shape;
             self.seen = version;
             self.record = None;
@@ -334,10 +376,17 @@ impl ModelCursor {
                 self.finish_new_rowid();
             }
             found.is_some()
-        } else if matches!(key, Key::Record(_)) && op == (SeekOp::GE { eq_only: true }) {
+        } else if op == (SeekOp::GE { eq_only: true }) {
+            let before = self.shape.clone();
+            let before_alts = self.alt_dirs.clone();
             // On an index an eq-only `SeekGE` is also the seek of `Found`, `NotFound`,
             // `NoConflict`, `IdxInsert` and `IdxDelete`: they all get the rules of `Found`.
-            self.run(Op::Found(key), None)
+            let hit = match &key {
+                Key::Record(_) => self.run(Op::Found(key.clone()), None),
+                Key::Rowid(_) => self.run(Op::Seek(key.clone(), op), None),
+            };
+            self.own_seek = Some((key, before, before_alts));
+            hit
         } else {
             self.run(Op::Seek(key, op), None)
         };
@@ -604,8 +653,26 @@ impl CursorTrait for ModelCursor {
             }
         };
         self.finish_new_rowid();
-        // An opcode that seeks made the seek call already, so an insert always checks the
-        // seek token of the last move.
+        self.catch_up();
+        // The insert checks the seek token of the last move. When that move was an eq-only
+        // seek of the same key, the seek can also be the own seek of the insert opcode
+        // (`own_seek`): then the direction before the seek is the other reading.
+        let mut other = Vec::new();
+        if let Some((sought, before, before_alts)) = self.own_seek.take() {
+            let op = Op::Insert {
+                key: key.clone(),
+                use_seek: false,
+            };
+            // The insert keeps the direction, and its legality does not depend on it.
+            if sought == key
+                && self
+                    .tree
+                    .read(&self.info, |t| spec::step(&t.rows, &before, &op).is_ok())
+            {
+                other.push(before.dir);
+                other.extend(before_alts);
+            }
+        }
         self.run(
             Op::Insert {
                 key,
@@ -613,6 +680,9 @@ impl CursorTrait for ModelCursor {
             },
             value.as_ref(),
         );
+        other.retain(|dir| *dir != self.shape.dir);
+        other.dedup();
+        self.alt_dirs = other;
         Ok(IOResult::Done(()))
     }
 

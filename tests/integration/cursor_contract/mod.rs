@@ -31,6 +31,11 @@ pub enum DbKind {
     /// An ephemeral b-tree (`OpenEphemeral`, `OpenAutoindex`): no MVCC and no schema. The
     /// program writes the setup rows itself. `Layout` has no meaning for it.
     Ephemeral,
+    /// A `:model:` database: every tree, the schema tree too, is a tree of the in-memory
+    /// model of the contract (`core/storage/model`). It refuses a program that the contract
+    /// calls illegal with a panic that starts with `unsupported:`. `Layout` has no meaning
+    /// for it.
+    Model,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,6 +97,7 @@ fn open_database(
     let db = match kind {
         DbKind::Wal | DbKind::Ephemeral => TempDatabase::new_empty(),
         DbKind::Mvcc => TempDatabase::new_with_mvcc("cursor_contract.db"),
+        DbKind::Model => TempDatabase::new_model(),
     };
     let conn = db.connect_limbo();
     let sql = |text: &str| conn.execute(text).map_err(|e| format!("{text}: {e}"));
@@ -103,7 +109,7 @@ fn open_database(
             sql(text)?;
         }
     }
-    if layout == Layout::Checkpointed && kind != DbKind::Ephemeral {
+    if layout == Layout::Checkpointed && matches!(kind, DbKind::Wal | DbKind::Mvcc) {
         // This pragma returns a row, so it is read with `query`.
         let mut stmt = conn
             .query("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -245,13 +251,14 @@ mod tests {
         Obs { jumped, rowid, col }
     }
 
-    /// Every engine and layout. Layout has no meaning for the ephemeral engine, so it runs once.
-    const CONFIGS: [(DbKind, Layout); 5] = [
+    /// Every engine and layout. Layout has no meaning for the ephemeral and model engines, so they run once.
+    const CONFIGS: [(DbKind, Layout); 6] = [
         (DbKind::Wal, Layout::AllInMemory),
         (DbKind::Wal, Layout::Checkpointed),
         (DbKind::Mvcc, Layout::AllInMemory),
         (DbKind::Mvcc, Layout::Checkpointed),
         (DbKind::Ephemeral, Layout::AllInMemory),
+        (DbKind::Model, Layout::AllInMemory),
     ];
 
     /// Runs the program on every engine, layout and read mode and asserts that they all give
@@ -274,6 +281,9 @@ mod tests {
             for mode in modes {
                 let mode = *mode;
                 let got = run_mode(kind, layout, rows, ncursors, ops, mode);
+                if kind == DbKind::Model && refused_illegal(rows, ncursors, ops, &got) {
+                    continue;
+                }
                 assert_eq!(
                     got.as_deref(),
                     Ok(expected),
@@ -283,6 +293,20 @@ mod tests {
             // The model must agree with the engine on every hand-written scenario.
             model::assert_agrees_prefix(kind, layout, rows, ncursors, ops);
         }
+    }
+
+    /// Some hand-written scenarios pin what the engines do for an undefined sequence (for
+    /// example `Prev` after `SeekRowid`). The `:model:` engine refuses such a program, and
+    /// that is its correct result.
+    fn refused_illegal(
+        rows: &[(i64, i64)],
+        ncursors: usize,
+        ops: &[Op],
+        got: &Result<Vec<Obs>, String>,
+    ) -> bool {
+        let refused = matches!(got, Err(e) if e.starts_with("panic: unsupported"));
+        let mut replay = model::Replay::new(rows, ncursors);
+        refused && !ops.iter().all(|op| replay.apply(op, None).is_some())
     }
 
     /// Runs the program on every engine and layout and returns the results, to compare them.
