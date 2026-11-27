@@ -3792,6 +3792,9 @@ pub fn halt(
     on_error: Option<ResolveType>,
     constraint_info: Option<&ConstraintInfo>,
 ) -> InsnResult {
+    if let Some(error) = state.pending_fail_after_cdc_commit.take() {
+        return Err(error.into());
+    }
     state.halt_in_progress = true;
     let mv_store = state.mv_store(connection).cloned();
     let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
@@ -3872,6 +3875,13 @@ pub fn halt(
                 && state.get_fk_immediate_violations_during_stmt() > 0
             {
                 return Err(state.immediate_foreign_key_error().into());
+            }
+
+            // The subroutine returns to this Halt, which then finds the same
+            // error again.
+            let pc = state.pc;
+            if program.enter_cdc_commit_for_fail(state, |_| pc) {
+                return Ok(InsnFunctionStepResult::Step);
             }
 
             // Maintain materialized views with the kept rows and stage every

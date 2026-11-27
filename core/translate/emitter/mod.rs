@@ -45,7 +45,7 @@ use crate::vdbe::{
         CursorKey, CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder, SelfTableContext,
     },
     insn::{to_u32, ConstraintInfo, InsertFlags, Insn},
-    BranchOffset, CursorID,
+    BranchOffset, CdcCommitSubroutine, CursorID,
 };
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
@@ -60,6 +60,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use turso_macros::turso_assert;
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
@@ -1874,6 +1875,10 @@ pub fn emit_cdc_commit_insns(
 /// Emit the CDC COMMIT record at the end of a statement, once, when in autocommit mode (v2 only).
 /// Only the root statement writes it; a trigger or FK action subprogram never does.
 /// `target_captured` tells whether the statement captures the changes of its own target table.
+///
+/// The record is a subroutine (see [`CdcCommitSubroutine`]). The end of the statement enters it
+/// by falling through. A FAIL-mode error, which commits the rows written before it without the
+/// end of the statement, jumps to it and makes it return to a Halt that returns the error.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1891,6 +1896,15 @@ pub fn emit_cdc_autocommit_commit(
         // action ran during this statement that could have captured a row elsewhere.
         return Ok(());
     }
+
+    // A NULL return address makes the Return below continue with the rest of the statement.
+    let return_reg = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: return_reg,
+        dest_end: None,
+    });
+    let start = program.allocate_label();
+    program.preassign_label_to_next_insn(start);
 
     // Check if we're in autocommit mode; if so, emit a COMMIT record.
     let is_autocommit_fn_ctx = crate::function::FuncCtx {
@@ -1939,7 +1953,7 @@ pub fn emit_cdc_autocommit_commit(
         });
     }
 
-    // Open a cursor for the record: the statement may not have opened its CDC cursor
+    // The subroutine opens its own cursor: the statement may not have opened its CDC cursor
     // yet, for example when a WHERE clause that is always false skips its loop.
     let (cdc_cursor_id, _) =
         prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
@@ -1947,6 +1961,33 @@ pub fn emit_cdc_autocommit_commit(
     emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
 
     program.preassign_label_to_next_insn(skip_label);
+    program.emit_insn(Insn::Return {
+        return_reg,
+        can_fallthrough: true,
+    });
+    let after_label = program.allocate_label();
+    program.emit_insn(Insn::Goto {
+        target_pc: after_label,
+    });
+    let fail_resume = program.allocate_label();
+    program.preassign_label_to_next_insn(fail_resume);
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: 0,
+        description: String::new(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(after_label);
+    turso_assert!(
+        program.cdc_commit_subroutine.is_none(),
+        "a statement writes at most one CDC COMMIT record"
+    );
+    program.cdc_commit_subroutine = Some(CdcCommitSubroutine {
+        start,
+        return_reg,
+        fail_resume,
+    });
 
     Ok(())
 }

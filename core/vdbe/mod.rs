@@ -1208,6 +1208,12 @@ pub struct ProgramState {
     /// here while those rows reach the materialized views and their
     /// index-method writes finish, through the normal resumable I/O path.
     pending_fail_prepare_error: Option<LimboError>,
+    /// True once a FAIL-mode error has run the CDC COMMIT-record subroutine,
+    /// so that the error runs it only once.
+    cdc_commit_ran_for_fail: bool,
+    /// The FAIL-mode error that the `fail_resume` Halt of the CDC
+    /// COMMIT-record subroutine returns.
+    pub(crate) pending_fail_after_cdc_commit: Option<LimboError>,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
     /// arriving during Halt's resumable work (staging index-method writes,
@@ -1378,6 +1384,8 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_fail_prepare_error: None,
+            cdc_commit_ran_for_fail: false,
+            pending_fail_after_cdc_commit: None,
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
@@ -1572,6 +1580,8 @@ impl ProgramState {
         self.explain_state.get_mut().clear();
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
+        self.cdc_commit_ran_for_fail = false;
+        self.pending_fail_after_cdc_commit = None;
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
@@ -2288,6 +2298,8 @@ pub struct PreparedProgram {
     /// can't go stale while this program is running.
     pub has_materialized_views: bool,
     pub resolve_type: ResolveType,
+    /// The bytecode that writes the CDC COMMIT record at the end of the statement.
+    pub cdc_commit_subroutine: Option<CdcCommitSubroutine>,
     pub prepare_context: PrepareContext,
     /// The custom collations of the connection that prepared the program. The
     /// program keeps them alive because its `CollationSeq::Custom` values
@@ -2300,6 +2312,22 @@ pub struct PreparedProgram {
     /// Whether the program frees a b-tree (`Insn::Destroy`) or the storage of an
     /// index method (`Insn::IndexMethodDestroy`), as DROP TABLE and DROP INDEX do.
     pub destroys_btree: bool,
+}
+
+/// The bytecode that writes the CDC COMMIT record of an autocommit statement.
+/// The statement runs it at its end. A FAIL error that keeps the rows written
+/// before it also runs it, because those rows commit without the rest of the
+/// statement.
+#[derive(Debug, Clone, Copy)]
+pub struct CdcCommitSubroutine {
+    /// The first instruction of the subroutine.
+    pub start: BranchOffset,
+    /// The register that holds the address that the subroutine returns to.
+    /// When it is not an integer, the subroutine continues with the
+    /// instruction after it.
+    pub return_reg: usize,
+    /// A `Halt` that returns the FAIL error that ran the subroutine.
+    pub fail_resume: BranchOffset,
 }
 
 #[derive(Clone)]
@@ -3154,8 +3182,8 @@ impl Program {
     }
 
     /// An instruction that failed: a busy error retries at the same PC, a
-    /// trigger's FAIL is staged for the loop to prepare (None), and every
-    /// other error aborts the statement.
+    /// trigger's FAIL runs the CDC COMMIT-record subroutine or is staged for
+    /// the loop to prepare (None), and every other error aborts the statement.
     #[cold]
     #[inline(never)]
     fn fail_step(
@@ -3181,7 +3209,13 @@ impl Program {
                 && self.resolve_type == ResolveType::Fail)
                 || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
             {
-                state.pending_fail_prepare_error = Some(err);
+                if self.enter_cdc_commit_for_fail(state, |subroutine| {
+                    subroutine.fail_resume.as_offset_int()
+                }) {
+                    state.pending_fail_after_cdc_commit = Some(err);
+                } else {
+                    state.pending_fail_prepare_error = Some(err);
+                }
                 None
             }
             err => {
@@ -3191,6 +3225,32 @@ impl Program {
                 Some(ProgramStep::Error(err.into()))
             }
         }
+    }
+
+    /// A FAIL-mode error keeps the rows written before it, and in autocommit
+    /// mode they commit without the end of the statement, which writes the
+    /// CDC COMMIT record. Thus jump to the CDC COMMIT-record subroutine, once,
+    /// and make it return to the address that `return_pc` gives. Returns
+    /// false when the statement has no such subroutine or the error already
+    /// ran it.
+    pub(crate) fn enter_cdc_commit_for_fail(
+        &self,
+        state: &mut ProgramState,
+        return_pc: impl FnOnce(&CdcCommitSubroutine) -> InsnReference,
+    ) -> bool {
+        let Some(subroutine) = &self.cdc_commit_subroutine else {
+            return false;
+        };
+        if state.cdc_commit_ran_for_fail {
+            return false;
+        }
+        state.cdc_commit_ran_for_fail = true;
+        // The failed instruction does not resume, so its multi-step state must
+        // not reach the instructions of the subroutine.
+        state.active_op_state.clear();
+        state.registers[subroutine.return_reg].set_int(i64::from(return_pc(subroutine)));
+        state.pc = subroutine.start.as_offset_int();
+        true
     }
 
     /// Apply and consume the transaction change log, resetting the resumable

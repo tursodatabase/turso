@@ -108,6 +108,12 @@ record. Outside an explicit transaction, a statement that changes no rows
 still writes a COMMIT record; since there are no row records to take a
 `change_txn_id` from, its `change_txn_id` is -1.
 
+A statement that fails with the FAIL conflict resolution (`INSERT OR FAIL`,
+`UPDATE OR FAIL`, a constraint with `ON CONFLICT FAIL`, or `RAISE(FAIL)` in a
+trigger) keeps the rows that it changed before the error. Outside an explicit
+transaction it commits them, so their records stay and a COMMIT record follows
+them, as if the statement ended at the error.
+
 ## Querying Changes
 
 Once CDC is enabled, you can query the changes table like any other table:

@@ -1172,8 +1172,10 @@ Every transaction ends with a COMMIT record (`change_type = 2`). Statements exec
 
 An explicit transaction that captures no changes, for example one whose only statement is an `UPDATE` matching zero rows, commits without writing a COMMIT record. Outside an explicit transaction, a statement that changes no rows still writes a COMMIT record with `change_txn_id = -1`.
 
+A statement that fails with the FAIL conflict resolution (`INSERT OR FAIL`, `UPDATE OR FAIL`, a constraint with `ON CONFLICT FAIL`, or `RAISE(FAIL)` in a trigger) keeps the rows that it changed before the error. Outside an explicit transaction it commits them, so their records stay and a COMMIT record follows them, as if the statement ended at the error.
+
 > CDC records are visible even before a transaction commits. 
-> Operations that fail (e.g., constraint violations) are not recorded in CDC.
+> Operations that fail (e.g., constraint violations) are not recorded in CDC, except for the rows that a FAIL conflict resolution keeps.
 
 > Changes to the CDC table itself are never captured, even if CDC is enabled for that connection.
 
