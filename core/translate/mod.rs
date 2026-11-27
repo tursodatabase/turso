@@ -126,12 +126,7 @@ pub fn translate(
     // invariant as unmarked schema rows. They look names up in every
     // database, like SQLite does, whatever the connection's search path
     // says.
-    let is_engine_statement = matches!(
-        origin,
-        crate::statement::StatementOrigin::InternalHelper
-            | crate::statement::StatementOrigin::EngineMetadataRead
-            | crate::statement::StatementOrigin::EngineSchemaWrite
-    );
+    let is_engine_statement = origin.is_engine();
     let search_path = if is_engine_statement {
         None
     } else {
@@ -161,6 +156,7 @@ pub fn translate(
         },
         search_path.as_deref(),
         row_security_role,
+        origin,
     );
     resolver.automatic_index = connection.automatic_index();
     resolver.defer_foreign_keys = connection.defer_foreign_keys();

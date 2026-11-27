@@ -88,6 +88,15 @@ pub enum StatementStatusCounter {
 }
 
 impl StatementOrigin {
+    /// Whether the engine made the statement: a helper statement, a read of
+    /// the engine's own metadata or a schema write of the engine.
+    pub(crate) const fn is_engine(self) -> bool {
+        matches!(
+            self,
+            Self::InternalHelper | Self::EngineMetadataRead | Self::EngineSchemaWrite
+        )
+    }
+
     pub(crate) const fn needs_nested_guard(self) -> bool {
         matches!(self, Self::InternalHelper)
     }
