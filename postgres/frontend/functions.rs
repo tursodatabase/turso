@@ -1534,7 +1534,12 @@ fn holds_array(value: &Value) -> bool {
 enum JsonNode {
     Null,
     Bool(bool),
-    Number(Decimal),
+    /// A number: its value, which comparisons use, and the text it was read
+    /// from, which write_jsonb_text writes as numeric does.
+    Number {
+        value: Decimal,
+        text: String,
+    },
     String(String),
     Array(Vec<JsonNode>),
     Object(Vec<(String, JsonNode)>),
@@ -1621,14 +1626,18 @@ fn read_json_document(json: &str) -> Result<JsonNode> {
                 // A JSON number is also valid numeric text, so the only error
                 // is a number with more digits than numeric allows. jsonb
                 // stores its numbers as numeric, so PostgreSQL fails then too.
-                let number = json[start..pos].parse::<Decimal>().map_err(|_| {
+                let text = &json[start..pos];
+                let value = text.parse::<Decimal>().map_err(|_| {
                     sqlstate_error(
                         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
                         "value overflows numeric format",
                         None,
                     )
                 })?;
-                JsonNode::Number(number)
+                JsonNode::Number {
+                    value,
+                    text: text.to_string(),
+                }
             }
         };
         match open.last_mut() {
@@ -1675,7 +1684,7 @@ fn json_document_contains(json: &JsonNode, template: &JsonNode) -> bool {
     match (json, template) {
         (
             JsonNode::Array(elements),
-            JsonNode::Null | JsonNode::Bool(_) | JsonNode::Number(_) | JsonNode::String(_),
+            JsonNode::Null | JsonNode::Bool(_) | JsonNode::Number { .. } | JsonNode::String(_),
         ) => elements
             .iter()
             .any(|element| json_contains(element, template)),
@@ -1705,7 +1714,7 @@ fn json_contains(json: &JsonNode, template: &JsonNode) -> bool {
         }
         (JsonNode::Null, JsonNode::Null) => true,
         (JsonNode::Bool(a), JsonNode::Bool(b)) => a == b,
-        (JsonNode::Number(a), JsonNode::Number(b)) => a == b,
+        (JsonNode::Number { value: a, .. }, JsonNode::Number { value: b, .. }) => a == b,
         (JsonNode::String(a), JsonNode::String(b)) => a == b,
         _ => false,
     }
@@ -1754,6 +1763,78 @@ fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
     Ok(Some(Json(json)))
 }
 
+/// The JSON document `json` in the form PostgreSQL's jsonb_out writes it,
+/// read with the errors of jsonb_in. It is the stored form of a jsonb value.
+pub(crate) fn jsonb_text(json: &str) -> Result<String> {
+    let mut text = String::new();
+    write_jsonb_text(&read_json_document(json)?, &mut text);
+    Ok(text)
+}
+
+/// Writes the jsonb value `node` as PostgreSQL's jsonb_out writes it: a space
+/// after each `,` and `:`, the fields of an object ordered by the length of
+/// their names and then by their bytes, and numbers as numeric writes them.
+///
+/// A list of the steps that are left does the work, not a function that calls
+/// itself for each level, for the reason that read_json_document gives.
+fn write_jsonb_text(node: &JsonNode, out: &mut String) {
+    enum Step<'a> {
+        Node(&'a JsonNode),
+        Name(&'a str),
+        Text(&'static str),
+    }
+    let mut steps = vec![Step::Node(node)];
+    while let Some(step) = steps.pop() {
+        let node = match step {
+            Step::Node(node) => node,
+            Step::Name(name) => {
+                push_json_string(name, out);
+                out.push_str(": ");
+                continue;
+            }
+            Step::Text(text) => {
+                out.push_str(text);
+                continue;
+            }
+        };
+        match node {
+            JsonNode::Null => out.push_str("null"),
+            JsonNode::Bool(true) => out.push_str("true"),
+            JsonNode::Bool(false) => out.push_str("false"),
+            JsonNode::Number { text, .. } => out.push_str(
+                &turso_core::format_numeric_text(text)
+                    .expect("the text of a number was read as a Decimal, within the same limits"),
+            ),
+            JsonNode::String(string) => push_json_string(string, out),
+            JsonNode::Array(elements) => {
+                out.push('[');
+                steps.push(Step::Text("]"));
+                // The steps are taken from the end, so they are pushed in
+                // reverse order.
+                for (i, element) in elements.iter().enumerate().rev() {
+                    steps.push(Step::Node(element));
+                    if i > 0 {
+                        steps.push(Step::Text(", "));
+                    }
+                }
+            }
+            JsonNode::Object(fields) => {
+                out.push('{');
+                steps.push(Step::Text("}"));
+                let mut fields: Vec<&(String, JsonNode)> = fields.iter().collect();
+                fields.sort_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+                for (i, (name, value)) in fields.iter().enumerate().rev() {
+                    steps.push(Step::Node(value));
+                    steps.push(Step::Name(name));
+                    if i > 0 {
+                        steps.push(Step::Text(", "));
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct JsonArrayLayout {
     element: JsonElement,
     /// The number of array levels, or 0 when the argument's type doesn't say.
@@ -1770,6 +1851,8 @@ enum JsonElement {
     Number,
     /// The value as it is, since it is already JSON.
     Json,
+    /// The value as jsonb writes it: `{"a": 1, "b": 2}`.
+    Jsonb,
     /// `"\\x0102"`: the bytes in hex, as a string.
     Bytea,
     /// A JSON string with a `T` between the date and the time.
@@ -1788,8 +1871,11 @@ impl JsonElement {
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
-            "integer" | "smallint" | "bigint" | "real" | "numeric" => Self::Number,
-            "json" | "jsonb" => Self::Json,
+            "integer" | "smallint" | "bigint" | "int2" | "int4" | "int8" | "real" | "numeric" => {
+                Self::Number
+            }
+            "json" => Self::Json,
+            "jsonb" => Self::Jsonb,
             // A cast to bytea is a cast to blob, so a blob is a bytea.
             "bytea" | "blob" => Self::Bytea,
             "timestamp" => Self::Timestamp,
@@ -1824,18 +1910,21 @@ fn write_json_array_level(
             Value::Null => json.push_str("null"),
             // Only the outermost level gets line feeds, as in PostgreSQL.
             _ if inner_level => write_json_array_level(element, layout, ",", level + 1, json)?,
-            _ => write_json_element(element, layout.element, json),
+            _ => write_json_element(element, layout.element, json)?,
         }
     }
     json.push(']');
     Ok(())
 }
 
-fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
+fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) -> Result<()> {
     match (kind, element) {
         (JsonElement::Boolean, Value::Numeric(Numeric::Integer(0))) => json.push_str("false"),
         (JsonElement::Boolean, Value::Numeric(_)) => json.push_str("true"),
         (JsonElement::Json, Value::Text(text)) => json.push_str(text.as_str()),
+        // tursopg keeps a jsonb value as the text it was given, so it is read
+        // and written again in the form PostgreSQL gives it.
+        (JsonElement::Jsonb, Value::Text(text)) => json.push_str(&jsonb_text(text.as_str())?),
         (JsonElement::Timestamp, Value::Text(text)) => {
             write_json_string(&text.as_str().replacen(' ', "T", 1), json)
         }
@@ -1843,6 +1932,15 @@ fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
             &format!("{}+00:00", text.as_str().replacen(' ', "T", 1)),
             json,
         ),
+        // A numeric value is read as its text, such as `1.50`, and written as
+        // numeric writes it, which is also a JSON number. NaN and the
+        // infinities are not numbers, so they are strings.
+        (JsonElement::Number, Value::Text(text)) => {
+            match turso_core::format_numeric_text(text.as_str()) {
+                Ok(number) => json.push_str(&number),
+                Err(_) => write_json_string(text.as_str(), json),
+            }
+        }
         (JsonElement::Text, Value::Numeric(number)) => {
             write_json_string(&Value::Numeric(*number).to_string(), json)
         }
@@ -1862,6 +1960,7 @@ fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
         }
         (_, Value::Null) => json.push_str("null"),
     }
+    Ok(())
 }
 
 fn write_json_string(text: &str, json: &mut String) {

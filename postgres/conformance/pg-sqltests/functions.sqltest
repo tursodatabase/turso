@@ -2714,6 +2714,24 @@ expect {
     [[1,2]]|2
 }
 
+test array-to-json-writes-int-and-numeric-values-as-numbers {
+    CREATE TABLE array_to_json_numbers (ia int[], n numeric(5, 2));
+    INSERT INTO array_to_json_numbers VALUES ('{1,2}', 1.50);
+    SELECT array_to_json(ia), array_to_json(ARRAY[n]) FROM array_to_json_numbers;
+}
+expect {
+    [1,2]|[1.50]
+}
+
+test array-to-json-writes-jsonb-in-the-jsonb-output-format {
+    CREATE TABLE array_to_json_jsonb (jb jsonb);
+    INSERT INTO array_to_json_jsonb VALUES ('{"b": 1, "a": [1,{"yy":1,"x":2.50}]}');
+    SELECT array_to_json(array_agg(jb)) FROM array_to_json_jsonb;
+}
+expect {
+    [{"a": [1, {"x": 2.50, "yy": 1}], "b": 1}]
+}
+
 test table-function-argument-cannot-name-a-table-listed-after-it {
     CREATE TABLE json_each_later (j json);
     SELECT * FROM json_each(json_each_later.j), json_each_later;
