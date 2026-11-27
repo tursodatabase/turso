@@ -1570,7 +1570,7 @@ mod tests {
         host: String,
         db_prefix: String,
         server: Option<Child>,
-        _data_dir_created_by_harness: Option<TempDir>,
+        _sync_dir_created_by_harness: Option<TempDir>,
         client: Client,
     }
 
@@ -1617,7 +1617,7 @@ mod tests {
                     host: format!("{name}--{name}--{name}.localhost"),
                     db_prefix: String::new(),
                     server: None,
-                    _data_dir_created_by_harness: None,
+                    _sync_dir_created_by_harness: None,
                     client,
                 })
             } else {
@@ -1688,7 +1688,7 @@ mod tests {
                                 host: String::new(),
                                 db_prefix,
                                 server: Some(child),
-                                _data_dir_created_by_harness: None,
+                                _sync_dir_created_by_harness: None,
                                 client: client.clone(),
                             };
                             // When a server of another test already listens on
@@ -1697,17 +1697,12 @@ mod tests {
                             // if its database is in this harness's directory.
                             match server.main_db_file().await {
                                 Ok(file) if file.starts_with(&data_dir_path) => {
-                                    server._data_dir_created_by_harness = Some(data_dir);
+                                    server._sync_dir_created_by_harness = Some(data_dir);
                                     return Ok(server);
                                 }
-                                Ok(file) => eprintln!(
-                                    "port {port} is served by another sync server with \
-                                     database {} (attempt {attempt}/{SPAWN_ATTEMPTS})",
-                                    file.display()
-                                ),
-                                Err(err) => eprintln!(
-                                    "cannot get the database of the sync server on port \
-                                     {port}: {err} (attempt {attempt}/{SPAWN_ATTEMPTS})"
+                                other => eprintln!(
+                                    "port {port} is served by another sync server: {other:?} \
+                                     (attempt {attempt}/{SPAWN_ATTEMPTS})"
                                 ),
                             }
                             // Dropping the server kills the child.
