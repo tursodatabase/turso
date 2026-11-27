@@ -12,7 +12,7 @@ use crate::catalog::regclass_text;
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text};
 use crate::pg_type::regtype_text;
-use crate::pg_type::{check_oid_range, type_input};
+use crate::pg_type::{bytea_to_int, check_oid_range, int_to_bytea, type_input, IntegerType};
 use crate::text::{encode_bytea, value_text, TextType};
 use std::sync::Arc;
 use turso_core::dialect::CastContext;
@@ -89,7 +89,16 @@ impl CastType {
     }
 
     fn is_integer(self) -> bool {
-        matches!(self, Self::Int2 | Self::Int4 | Self::Int8)
+        self.integer_type().is_some()
+    }
+
+    fn integer_type(self) -> Option<IntegerType> {
+        match self {
+            Self::Int2 => Some(IntegerType::Int2),
+            Self::Int4 => Some(IntegerType::Int4),
+            Self::Int8 => Some(IntegerType::Int8),
+            _ => None,
+        }
     }
 
     /// The smallest number that a type of integers holds.
@@ -112,13 +121,21 @@ struct Cast {
     source: CastType,
     target: CastType,
     context: CastContext,
+    /// The `oid` of the pg_proc row of the conversion function, 0 when pg_proc
+    /// does not have the function.
+    function: i64,
 }
 
 const fn cast(source: CastType, target: CastType, context: CastContext) -> Cast {
+    cast_by(source, target, context, 0)
+}
+
+const fn cast_by(source: CastType, target: CastType, context: CastContext, function: i64) -> Cast {
     Cast {
         source,
         target,
         context,
+        function,
     }
 }
 
@@ -161,6 +178,12 @@ const CASTS: &[Cast] = &[
     cast(RegType, Oid, I),
     cast(RegType, Int4, A),
     cast(RegType, Int8, A),
+    cast_by(Int2, Bytea, E, 6367),
+    cast_by(Int4, Bytea, E, 6368),
+    cast_by(Int8, Bytea, E, 6369),
+    cast_by(Bytea, Int2, E, 6370),
+    cast_by(Bytea, Int4, E, 6371),
+    cast_by(Bytea, Int8, E, 6372),
     cast(Int4, Bool, E),
     cast(Bool, Int4, E),
     cast(Bool, Text, A),
@@ -186,18 +209,31 @@ const CASTS: &[Cast] = &[
 /// The `oid` of the first row of `pg_cast`.
 pub(crate) const FIRST_CAST_OID: i64 = 10_000;
 
-/// The rows of `pg_cast`: source, target, the letter of the context and the
-/// letter of the method. Every cast in `CASTS` goes through a conversion
+/// A row of `pg_cast`.
+pub(crate) struct CastRow {
+    pub(crate) source: CastType,
+    pub(crate) target: CastType,
+    pub(crate) function: i64,
+    pub(crate) context: &'static str,
+    pub(crate) method: &'static str,
+}
+
+/// The rows of `pg_cast`. Every cast in `CASTS` goes through a conversion
 /// function.
-pub(crate) fn cast_rows() -> impl Iterator<Item = (CastType, CastType, &'static str, &'static str)>
-{
+pub(crate) fn cast_rows() -> impl Iterator<Item = CastRow> {
     CASTS.iter().map(|cast| {
         let context = match cast.context {
             CastContext::Implicit => "i",
             CastContext::Assignment => "a",
             CastContext::Explicit => "e",
         };
-        (cast.source, cast.target, context, "f")
+        CastRow {
+            source: cast.source,
+            target: cast.target,
+            function: cast.function,
+            context,
+            method: "f",
+        }
     })
 }
 
@@ -261,6 +297,12 @@ pub(crate) fn convert(
     {
         return read(Some(connection), text.as_str());
     }
+    if let (Bytea, Some(target)) = (source, target.integer_type()) {
+        return from_bytea(value, target);
+    }
+    if let (Some(source), Bytea) = (source.integer_type(), target) {
+        return to_bytea(value, source);
+    }
     if target.is_integer() {
         return to_integer(value, source, target);
     }
@@ -274,6 +316,20 @@ pub(crate) fn convert(
         Text => to_text(connection, value, source),
         Bool => to_bool(value),
         _ => Ok(value.clone()),
+    }
+}
+
+fn from_bytea(value: &Value, target: IntegerType) -> Result<Value> {
+    match value {
+        Value::Blob(bytes) => bytea_to_int(bytes, target).map(Value::from_i64),
+        other => Ok(other.clone()),
+    }
+}
+
+fn to_bytea(value: &Value, source: IntegerType) -> Result<Value> {
+    match value {
+        Value::Numeric(Numeric::Integer(number)) => Ok(int_to_bytea(*number, source)),
+        other => Ok(other.clone()),
     }
 }
 

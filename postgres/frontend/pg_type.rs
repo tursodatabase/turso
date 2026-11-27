@@ -14,7 +14,7 @@ mod regclass;
 mod regtype;
 mod uuid;
 
-pub(crate) use bytea_functions::register_bytea_functions;
+pub(crate) use bytea_functions::{bytea_to_int, int_to_bytea, register_bytea_functions};
 pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
 pub(crate) use oid::{check_oid_range, oid_input};

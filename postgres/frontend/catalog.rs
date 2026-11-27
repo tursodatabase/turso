@@ -3204,14 +3204,14 @@ impl SnapshotRows for PgCastTable {
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
         crate::casts::cast_rows()
             .enumerate()
-            .map(|(index, (source, target, context, method))| {
+            .map(|(index, row)| {
                 vec![
                     Value::from_i64(crate::casts::FIRST_CAST_OID + index as i64),
-                    Value::from_i64(source.oid()),
-                    Value::from_i64(target.oid()),
-                    Value::from_i64(0),
-                    Value::build_text(context),
-                    Value::build_text(method),
+                    Value::from_i64(row.source.oid()),
+                    Value::from_i64(row.target.oid()),
+                    Value::from_i64(row.function),
+                    Value::build_text(row.context),
+                    Value::build_text(row.method),
                 ]
             })
             .collect()

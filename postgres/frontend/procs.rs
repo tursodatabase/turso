@@ -105,6 +105,12 @@ pub(crate) const PROCS: &[Proc] = procs![
     (3538, "string_agg", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[25, 25], 25),
     (3545, "string_agg", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[17, 17], 17),
     (3810, "pg_is_in_recovery", "f", false, true, false, "v", "s", 1.0, 0.0, 0, &[], 16),
+    (6367, "bytea", "f", true, true, false, "i", "s", 1.0, 0.0, 0, &[21], 17),
+    (6368, "bytea", "f", true, true, false, "i", "s", 1.0, 0.0, 0, &[23], 17),
+    (6369, "bytea", "f", true, true, false, "i", "s", 1.0, 0.0, 0, &[20], 17),
+    (6370, "int2", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17], 21),
+    (6371, "int4", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17], 23),
+    (6372, "int8", "f", false, true, false, "i", "s", 1.0, 0.0, 0, &[17], 20),
     (6395, "max", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[17], 17),
     (6396, "min", "a", false, false, false, "i", "s", 1.0, 0.0, 0, &[17], 17),
 ];

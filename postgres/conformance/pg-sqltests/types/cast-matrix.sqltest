@@ -863,25 +863,19 @@ expect {
     \x6162
 }
 
-@compat-gap "cast:bytea -> int4"
 test cast-bytea-to-int4 {
     SELECT '\x6162'::bytea::int4;
 }
 expect {
     24930
 }
-@sqlstate 42846
-expect @tursopg error {}
 
-@compat-gap "cast:int4 -> bytea"
 test cast-int4-to-bytea {
     SELECT 5::bytea;
 }
 expect {
     \x00000005
 }
-@sqlstate 42846
-expect @tursopg error {}
 
 test cast-bool-to-bytea {
     SELECT true::bytea;
