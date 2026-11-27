@@ -14000,10 +14000,11 @@ impl YieldInjector for YieldOnceAt {
     }
 }
 
-/// Runs `scan` in a transaction over checkpointed rows 1..=20. The second step of the scan
-/// yields at `point`, and at the yield the same transaction runs `write`. Returns the
-/// column `id_column` of each row of the scan.
+/// Runs `scan` in a transaction over checkpointed rows 1..=20. After `rows_before_yield`
+/// rows, the scan yields at `point`, and at the yield the same transaction runs `write`.
+/// Returns the column `id_column` of each row of the scan.
 fn scan_with_own_write_at_step_yield(
+    rows_before_yield: usize,
     point: YieldPoint,
     mvcc_tail: &str,
     write: &str,
@@ -14024,7 +14025,7 @@ fn scan_with_own_write_at_step_yield(
     }
     let injector = Arc::new(YieldOnceAt {
         point,
-        armed: AtomicBool::new(false),
+        armed: AtomicBool::new(rows_before_yield == 0),
     });
     conn.set_yield_injector(Some(injector.clone()));
     let mut ids = Vec::new();
@@ -14037,7 +14038,9 @@ fn scan_with_own_write_at_step_yield(
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 ids.push(row.get_value(id_column).as_int().unwrap());
-                injector.armed.store(ids.len() == 1, Ordering::SeqCst);
+                injector
+                    .armed
+                    .store(ids.len() == rows_before_yield, Ordering::SeqCst);
             }
             StepResult::Done => break,
             other => panic!("unexpected step result {other:?}"),
@@ -14059,6 +14062,7 @@ fn step_sees_own_write_made_at_yield() {
     let point = CursorYieldPoint::NextStart.point();
     let tail = "UPDATE t SET w = 5 WHERE id = 20";
     let ids = scan_with_own_write_at_step_yield(
+        1,
         point,
         tail,
         "UPDATE t SET w = 7 WHERE id = 2",
@@ -14067,6 +14071,7 @@ fn step_sees_own_write_made_at_yield() {
     );
     assert_eq!(ids, (1..=20).collect::<Vec<_>>());
     let ids = scan_with_own_write_at_step_yield(
+        1,
         point,
         "UPDATE t SET w = 5 WHERE id = 1",
         "UPDATE t SET w = 7 WHERE id = 19",
@@ -14076,6 +14081,7 @@ fn step_sees_own_write_made_at_yield() {
     assert_eq!(ids, (1..=20).rev().collect::<Vec<_>>());
     // The update rewrites the index entry of row 2 with the same key.
     let ids = scan_with_own_write_at_step_yield(
+        1,
         point,
         "UPDATE t SET v = 20 WHERE id = 20",
         "UPDATE t SET v = 2 WHERE id = 2",
@@ -14085,6 +14091,7 @@ fn step_sees_own_write_made_at_yield() {
     assert_eq!(ids, (1..=20).collect::<Vec<_>>());
     // The same write while the step waits for the B-tree.
     let ids = scan_with_own_write_at_step_yield(
+        1,
         CursorYieldPoint::AdvanceBtreeForwardProgress.point(),
         tail,
         "UPDATE t SET w = 7 WHERE id = 2",
@@ -14092,4 +14099,30 @@ fn step_sees_own_write_made_at_yield() {
         0,
     );
     assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+}
+
+/// The walk of `rewind` or `last` to the first row did not check whether the MvStore
+/// changed while it waited for the B-tree. A write of the same transaction at that yield
+/// gave the first B-tree row a new MvStore version, which the MvStore iterator had already
+/// passed, so the scan skipped the first row.
+#[test]
+fn edge_walk_sees_own_write_made_at_yield() {
+    let ids = scan_with_own_write_at_step_yield(
+        0,
+        CursorYieldPoint::AdvanceBtreeForwardProgress.point(),
+        "UPDATE t SET w = 5 WHERE id = 20",
+        "UPDATE t SET w = 7 WHERE id = 1",
+        "SELECT id FROM t",
+        0,
+    );
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+    let ids = scan_with_own_write_at_step_yield(
+        0,
+        CursorYieldPoint::AdvanceBtreeBackwardProgress.point(),
+        "UPDATE t SET w = 5 WHERE id = 1",
+        "UPDATE t SET w = 7 WHERE id = 20",
+        "SELECT id FROM t ORDER BY id DESC",
+        0,
+    );
+    assert_eq!(ids, (1..=20).rev().collect::<Vec<_>>());
 }

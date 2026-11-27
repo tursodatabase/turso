@@ -1040,6 +1040,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             self.set_null_flag(false);
             self.start_at_edge(dir)?;
             self.state = Some(MvccLazyCursorState::Walk(dir));
+        } else if self.mvcc_rows_epoch() != self.mvcc_peek_epoch {
+            // A write of this cursor's own transaction while the walk waited on IO can add
+            // an MvStore version of a row that the MvStore iterator already passed. The walk
+            // returned no row yet, so it can start the MvStore at the edge again.
+            self.position_mvcc_head(Bound::Unbounded, dir, None)?;
         }
         turso_assert!(
             matches!(self.state, Some(MvccLazyCursorState::Walk(walk_dir)) if walk_dir == dir),
