@@ -1355,16 +1355,7 @@ impl TursoConnection {
             .prepare(sql)
             .map_err(TursoError::from)
             .map_err(|error| self.map_sync_transient_error(error))?;
-        let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
-        let stmt_id = self.track_stmt(&handle);
-        Ok(Box::new(TursoStatement {
-            concurrent_guard: self.concurrent_guard.clone(),
-            async_io: self.async_io,
-            sync_busy: self.sync_busy.clone(),
-            handle,
-            stmt_id,
-            stmts: self.stmts.clone(),
-        }))
+        Ok(self.new_statement(statement))
     }
 
     /// Prepare a statement from the provided SQL string and cache it for future use.
@@ -1385,16 +1376,7 @@ impl TursoConnection {
                     cached.query_mode,
                     0,
                 )?;
-                let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
-                let stmt_id = self.track_stmt(&handle);
-                return Ok(Box::new(TursoStatement {
-                    concurrent_guard: self.concurrent_guard.clone(),
-                    async_io: self.async_io,
-                    sync_busy: self.sync_busy.clone(),
-                    handle,
-                    stmt_id,
-                    stmts: self.stmts.clone(),
-                }));
+                return Ok(self.new_statement(statement));
             }
         }
 
@@ -1415,16 +1397,7 @@ impl TursoConnection {
             .unwrap()
             .insert(sql_str.to_string(), cached);
 
-        let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
-        let stmt_id = self.track_stmt(&handle);
-        Ok(Box::new(TursoStatement {
-            concurrent_guard: self.concurrent_guard.clone(),
-            async_io: self.async_io,
-            sync_busy: self.sync_busy.clone(),
-            handle,
-            stmt_id,
-            stmts: self.stmts.clone(),
-        }))
+        Ok(self.new_statement(statement))
     }
 
     /// prepares first SQL statement from the string and return prepared statement and position after the end of the parsed statement
@@ -1442,21 +1415,7 @@ impl TursoConnection {
             .map_err(TursoError::from)
             .map_err(|error| self.map_sync_transient_error(error))?
         {
-            Some((statement, position)) => {
-                let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
-                let stmt_id = self.track_stmt(&handle);
-                Ok(Some((
-                    Box::new(TursoStatement {
-                        async_io: self.async_io,
-                        concurrent_guard: Arc::new(ConcurrentGuard::new()),
-                        sync_busy: self.sync_busy.clone(),
-                        handle,
-                        stmt_id,
-                        stmts: self.stmts.clone(),
-                    }),
-                    position,
-                )))
-            }
+            Some((statement, position)) => Ok(Some((self.new_statement(statement), position))),
             None => Ok(None),
         }
     }
@@ -1520,15 +1479,25 @@ impl TursoConnection {
         Arc::from_raw(value as *const Self)
     }
 
-    /// Register a statement handle and return its ID. The statement removes
-    /// itself from the registry on drop via its `stmt_id` + `stmts` ref.
-    fn track_stmt(&self, handle: &StatementHandle) -> usize {
-        let id = self.next_stmt_id.fetch_add(1, Ordering::Relaxed);
+    /// Wrap a prepared statement of this connection and register its handle.
+    /// The statement removes itself from the registry on drop via its
+    /// `stmt_id` + `stmts` ref. All statements of the connection share its
+    /// `concurrent_guard`, because they all change the state of one `Connection`.
+    fn new_statement(&self, statement: Statement) -> Box<TursoStatement> {
+        let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+        let stmt_id = self.next_stmt_id.fetch_add(1, Ordering::Relaxed);
         self.stmts
             .lock()
             .unwrap()
-            .insert(id, Arc::downgrade(handle));
-        id
+            .insert(stmt_id, Arc::downgrade(&handle));
+        Box::new(TursoStatement {
+            async_io: self.async_io,
+            concurrent_guard: self.concurrent_guard.clone(),
+            sync_busy: self.sync_busy.clone(),
+            handle,
+            stmt_id,
+            stmts: self.stmts.clone(),
+        })
     }
 }
 
@@ -1835,6 +1804,9 @@ impl TursoStatement {
     }
     /// reset internal statement state and bindings
     pub fn reset(&mut self) -> Result<(), TursoError> {
+        // Resetting a running statement can roll back the transaction of the connection.
+        let guard = self.concurrent_guard.clone();
+        let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_mut()
@@ -2291,6 +2263,45 @@ mod tests {
             errors.iter().all(|e| matches!(e, TursoError::Misuse(_))),
             "all errors must have Misuse code: {errors:?}"
         );
+    }
+
+    #[test]
+    pub fn test_db_statements_share_connection_guard() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        assert!(!db.open().unwrap().is_io());
+        let conn = db.connect().unwrap();
+        conn.prepare_single("CREATE TABLE t (x)")
+            .unwrap()
+            .execute(None)
+            .unwrap();
+        let sql = "INSERT INTO t VALUES (1)";
+        let statements = [
+            conn.prepare_single(sql).unwrap(),
+            conn.prepare_cached(sql).unwrap(),
+            conn.prepare_cached(sql).unwrap(),
+            conn.prepare_first(sql).unwrap().unwrap().0,
+        ];
+        for mut stmt in statements {
+            // Another thread that uses the connection holds the guard during its call.
+            let token = conn.concurrent_guard.try_use().unwrap();
+            assert!(matches!(stmt.step(None), Err(TursoError::Misuse(_))));
+            assert!(matches!(stmt.execute(None), Err(TursoError::Misuse(_))));
+            assert!(matches!(stmt.reset(), Err(TursoError::Misuse(_))));
+            assert!(matches!(stmt.finalize(None), Err(TursoError::Misuse(_))));
+            drop(token);
+            assert_eq!(stmt.execute(None).unwrap().rows_changed, 1);
+            stmt.finalize(None).unwrap();
+        }
     }
 
     #[test]
