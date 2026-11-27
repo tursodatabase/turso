@@ -1873,10 +1873,11 @@ pub fn emit_cdc_commit_insns(
 
 /// Emit the CDC COMMIT record at the end of a statement, once, when in autocommit mode (v2 only).
 /// Only the root statement writes it; a trigger or FK action subprogram never does.
+/// `target_captured` tells whether the statement captures the changes of its own target table.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    cdc_cursor_id: Option<usize>,
+    target_captured: bool,
 ) -> Result<()> {
     if program.flags.is_subprogram() {
         return Ok(());
@@ -1885,7 +1886,7 @@ pub fn emit_cdc_autocommit_commit(
     if !cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         return Ok(());
     }
-    if cdc_cursor_id.is_none() && !program.has_emitted_program_call() {
+    if !target_captured && !program.has_emitted_program_call() {
         // Our own target table was not captured (e.g. a TEMP table), and no trigger or FK
         // action ran during this statement that could have captured a row elsewhere.
         return Ok(());
@@ -1913,38 +1914,36 @@ pub fn emit_cdc_autocommit_commit(
         jump_if_null: true,
     });
 
-    let cdc_cursor_id = match cdc_cursor_id {
-        Some(cdc_cursor_id) => cdc_cursor_id,
-        None => {
-            // A trigger or FK action fired during this statement may have captured a row
-            // elsewhere. Only write the COMMIT record when something was actually captured.
-            let minus_one_reg = program.alloc_register();
-            program.emit_int(-1, minus_one_reg);
-            let txn_id_reg = program.alloc_register();
-            program.emit_insn(Insn::Function {
-                constant_mask: 0,
-                start_reg: minus_one_reg,
-                dest: txn_id_reg,
-                func: crate::function::FuncCtx {
-                    func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
-                    arg_count: 1,
-                    collation: CollationSeq::BINARY,
-                },
-            });
-            program.emit_insn(Insn::Eq {
-                lhs: txn_id_reg,
-                rhs: minus_one_reg,
-                target_pc: skip_label,
-                flags: crate::vdbe::insn::CmpInsFlags::default(),
+    if !target_captured {
+        // A trigger or FK action fired during this statement may have captured a row
+        // elsewhere. Only write the COMMIT record when something was actually captured.
+        let minus_one_reg = program.alloc_register();
+        program.emit_int(-1, minus_one_reg);
+        let txn_id_reg = program.alloc_register();
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: minus_one_reg,
+            dest: txn_id_reg,
+            func: crate::function::FuncCtx {
+                func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+                arg_count: 1,
                 collation: CollationSeq::BINARY,
-            });
-            let (cursor_id, _) =
-                prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
-                    .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
-            cursor_id
-        }
-    };
+            },
+        });
+        program.emit_insn(Insn::Eq {
+            lhs: txn_id_reg,
+            rhs: minus_one_reg,
+            target_pc: skip_label,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: CollationSeq::BINARY,
+        });
+    }
 
+    // Open a cursor for the record: the statement may not have opened its CDC cursor
+    // yet, for example when a WHERE clause that is always false skips its loop.
+    let (cdc_cursor_id, _) =
+        prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
+            .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
     emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
 
     program.preassign_label_to_next_insn(skip_label);
