@@ -12,6 +12,9 @@ use thiserror::Error;
 pub mod sqlstate;
 pub mod translator;
 mod type_name;
+mod type_oid;
+
+pub use type_oid::{type_oid, BOOL_OID};
 
 /// The frontend function that the translator calls for `timestamp + interval`
 /// and `timestamp - interval` with an interval literal. Its arguments are the

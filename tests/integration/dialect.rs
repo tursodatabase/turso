@@ -828,6 +828,7 @@ impl Dialect for NoMinusForTextDialect {
             name: "INTEGER".to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         };
         Ok(if has_integer {
             OperatorChoice::Chosen(ChosenOperator {
@@ -1757,6 +1758,7 @@ impl Dialect for RustTypesDialect {
             name: "percent".to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         };
         Ok(OperatorChoice::Chosen(ChosenOperator {
             id: 0,

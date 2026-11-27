@@ -1419,6 +1419,7 @@ impl<'a> Parser<'a> {
             name: type_name,
             size,
             array_dimensions,
+            ty_annotation: None,
         }))
     }
 
@@ -6416,6 +6417,7 @@ mod tests {
                                         name: "INTEGER".to_owned(),
                                         size: None,
                                         array_dimensions: 0,
+                                        ty_annotation: None,
                                     }),
                                 }),
                                 None,
@@ -6447,6 +6449,7 @@ mod tests {
                                             Literal::Numeric("255".to_owned()),
                                         )))),
                                         array_dimensions: 0,
+                                        ty_annotation: None,
                                     }),
                                 }),
                                 None,
@@ -6483,6 +6486,7 @@ mod tests {
                                             ))),
                                         )),
                                         array_dimensions: 0,
+                                        ty_annotation: None,
                                     }),
                                 }),
                                 None,
@@ -11196,6 +11200,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![],
                     }),
@@ -11211,6 +11216,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11233,6 +11239,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11257,6 +11264,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11282,6 +11290,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11307,6 +11316,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11329,6 +11339,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11352,6 +11363,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11375,6 +11387,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11398,6 +11411,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11421,6 +11435,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11444,6 +11459,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11467,6 +11483,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11490,6 +11507,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11517,6 +11535,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11558,6 +11577,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11599,6 +11619,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11640,6 +11661,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11681,6 +11703,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11722,6 +11745,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11763,6 +11787,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11804,6 +11829,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11834,6 +11860,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11864,6 +11891,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11894,6 +11922,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11924,6 +11953,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11946,6 +11976,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11970,6 +12001,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11994,6 +12026,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -12020,6 +12053,7 @@ mod tests {
                                 name: "INTEGER".to_owned(),
                                 size: None,
                                 array_dimensions: 0,
+                                ty_annotation: None,
                             }),
                             constraints: vec![],
                         },
@@ -12186,6 +12220,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    ty_annotation: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -12228,6 +12263,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    ty_annotation: None,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {
@@ -12246,6 +12282,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    ty_annotation: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -12292,6 +12329,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    ty_annotation: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -12332,6 +12370,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    ty_annotation: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -13474,6 +13513,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    ty_annotation: None,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {

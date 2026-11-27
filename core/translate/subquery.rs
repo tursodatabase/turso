@@ -13,7 +13,9 @@ use super::{
     select::first_aggregate_without_over_clause,
 };
 use crate::translate::expr::comparison_affinity;
-use crate::translate::expr::expr_type::query_column_type;
+use crate::translate::expr::expr_type::{
+    query_column_reads_only_declared_types, query_column_type, TypeEnv,
+};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
@@ -32,8 +34,8 @@ use crate::{
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
         expr::{
-            check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
-            WalkControl,
+            cast_in_subquery_operands, choose_and_check_operators, get_expr_affinity,
+            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
@@ -696,16 +698,12 @@ fn plan_subqueries_with_outer_query_access<'a>(
             let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
             walk_expr_mut(expr, &mut subquery_parser)?;
             if has_subquery {
-                let expr: &ast::Expr = expr;
                 with_subqueries.push(expr);
             }
         }
     }
-    // Binding checked these with the types of their subqueries not known yet.
-    // Check them again with those types, as compiling them would, in case
-    // the planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
     for expr in with_subqueries {
-        check_custom_types(expr, Some(referenced_tables), resolver)?;
+        choose_and_check_operators(expr, Some(referenced_tables), resolver)?;
     }
     Ok(())
 }
@@ -965,6 +963,11 @@ fn get_subquery_parser<'a>(
                             &ExprContext::new(Some(plan.select_table_references()), resolver),
                         ),
                         expr_type: query_column_type(&plan, i, resolver),
+                        reads_only_declared_types: query_column_reads_only_declared_types(
+                            &plan,
+                            i,
+                            &TypeEnv::new(Some(referenced_tables), resolver),
+                        ),
                     })
                     .collect();
                 if let [column] = columns.as_slice() {
@@ -1041,6 +1044,7 @@ fn get_subquery_parser<'a>(
                                         name: "NUMERIC".to_string(),
                                         size: None,
                                         array_dimensions: 0,
+                                        ty_annotation: None,
                                     }),
                                 )),
                             )),
@@ -1132,6 +1136,12 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let mut plan = plan;
+                cast_in_subquery_operands(
+                    &mut lhs,
+                    &TypeEnv::new(Some(referenced_tables), resolver),
+                    &mut plan,
+                    resolver,
+                )?;
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {

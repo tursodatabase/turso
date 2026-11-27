@@ -6,6 +6,7 @@
 //! shapes itself.
 
 use crate::ast;
+use crate::dialect::Dialect;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
@@ -279,6 +280,13 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
+    /// The dialect of the statement, which answers what the frontend knows
+    /// about a type. A table or a type body is checked without one.
+    fn dialect(&self) -> Option<&dyn Dialect> {
+        self.resolver()
+            .map(|resolver| resolver.catalog.dialect.as_ref())
+    }
+
     /// The type of a name in a CREATE TYPE body: `value` or a parameter.
     /// Anywhere else a name is not bound yet.
     fn name_type(&self, name: &str) -> ExprType {
@@ -452,6 +460,181 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
     }
 }
 
+/// The frontend's annotation of the type of `expr`: the annotation that the
+/// frontend stored on the type of a cast, or, for any other expression, the
+/// annotation derived from the expression. None when nothing tells it.
+pub(crate) fn ty_annotation_of(expr: &ast::Expr, env: &TypeEnv) -> Option<ast::TypeAnnotation> {
+    match expr_ty_annotation(expr, env) {
+        TyAnnotation::Known(annotation) => Some(annotation),
+        TyAnnotation::Untyped | TyAnnotation::Unknown => None,
+    }
+}
+
+/// What is known of the type annotation of an expression.
+#[derive(Clone, Copy)]
+enum TyAnnotation {
+    Known(ast::TypeAnnotation),
+    /// A NULL or a string literal, which takes the type of the values it is
+    /// used with: `coalesce(x, NULL)` has the annotation of x.
+    Untyped,
+    Unknown,
+}
+
+impl TyAnnotation {
+    fn known(annotation: Option<ast::TypeAnnotation>) -> Self {
+        annotation.map_or(Self::Unknown, Self::Known)
+    }
+}
+
+fn expr_ty_annotation(expr: &ast::Expr, env: &TypeEnv) -> TyAnnotation {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => expr_ty_annotation(&exprs[0], env),
+        ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+            expr_ty_annotation(inner, env)
+        }
+        ast::Expr::Literal(ast::Literal::Null | ast::Literal::String(_)) => TyAnnotation::Untyped,
+        ast::Expr::Literal(literal) => TyAnnotation::known(
+            env.dialect()
+                .and_then(|dialect| dialect.literal_type_annotation(literal)),
+        ),
+        ast::Expr::Cast {
+            type_name: Some(ty),
+            ..
+        } => TyAnnotation::known(
+            ty.ty_annotation
+                .or_else(|| env.dialect()?.type_annotation(ty)),
+        ),
+        ast::Expr::Column { table, column, .. } => {
+            TyAnnotation::known(column_ty_annotation(*table, *column, env))
+        }
+        ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => common_ty_annotation(
+            when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.as_deref()),
+            env,
+        ),
+        ast::Expr::MergedColumn(columns) => {
+            common_ty_annotation(columns.iter().map(|column| column.as_ref()), env)
+        }
+        ast::Expr::FunctionCall { name, args, .. } => function_ty_annotation(name, args, expr, env),
+        _ => custom_type_ty_annotation(expr, env),
+    }
+}
+
+/// The annotation of the declared type of a column of a table.
+fn column_ty_annotation(
+    table: ast::TableInternalId,
+    column: usize,
+    env: &TypeEnv,
+) -> Option<ast::TypeAnnotation> {
+    let (_, table) = env.tables()?.find_table_by_internal_id(table)?;
+    if matches!(
+        table,
+        Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+    ) {
+        return None;
+    }
+    let column = table.get_column_at(column)?;
+    env.dialect()?.type_annotation(&declared_type(
+        &column.ty_str,
+        &column.ty_params,
+        column.array_dimensions(),
+    ))
+}
+
+/// The annotation of a call to a function. A function that returns one of
+/// its arguments unchanged, such as `coalesce`, has the annotation of those
+/// arguments.
+fn function_ty_annotation(
+    name: &ast::Name,
+    args: &[Box<ast::Expr>],
+    call: &ast::Expr,
+    env: &TypeEnv,
+) -> TyAnnotation {
+    let Ok(Some(func)) = env.resolve_function(name.as_str(), args.len()) else {
+        return TyAnnotation::Unknown;
+    };
+    let first_argument = || {
+        args.first()
+            .map_or(TyAnnotation::Unknown, |arg| expr_ty_annotation(arg, env))
+    };
+    match func {
+        Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => {
+            first_argument()
+        }
+        func => match func.result_type() {
+            ResultType::FirstArgument => first_argument(),
+            ResultType::OneOfTheArguments => {
+                common_ty_annotation(args.iter().map(|arg| arg.as_ref()), env)
+            }
+            ResultType::OneOfTheIifValues => {
+                common_ty_annotation(iif_values(args).map(|arg| arg.as_ref()), env)
+            }
+            ResultType::OneOfTheFirstAndThirdArguments => {
+                common_ty_annotation(first_and_third_arguments(args).map(|arg| arg.as_ref()), env)
+            }
+            _ => custom_type_ty_annotation(call, env),
+        },
+    }
+}
+
+/// The annotation of a value that is one of `exprs`: the annotation they all
+/// have. Expressions with different annotations have no common one.
+fn common_ty_annotation<'e>(
+    exprs: impl Iterator<Item = &'e ast::Expr>,
+    env: &TypeEnv,
+) -> TyAnnotation {
+    let mut common = TyAnnotation::Untyped;
+    for expr in exprs {
+        common = match (common, expr_ty_annotation(expr, env)) {
+            (common, TyAnnotation::Untyped) => common,
+            (TyAnnotation::Untyped, annotation) => annotation,
+            (TyAnnotation::Known(a), TyAnnotation::Known(b)) if a == b => TyAnnotation::Known(a),
+            _ => return TyAnnotation::Unknown,
+        };
+    }
+    common
+}
+
+/// The annotation of an expression whose type was made with CREATE TYPE, which
+/// the dialect knows by the name of the type.
+fn custom_type_ty_annotation(expr: &ast::Expr, env: &TypeEnv) -> TyAnnotation {
+    let (element, array_dimensions) = match type_of(expr, env) {
+        ExprType::Array {
+            element,
+            dimensions,
+        } => (*element, dimensions),
+        scalar => (scalar, 0),
+    };
+    let ExprType::Custom { type_def, params } = element else {
+        return TyAnnotation::Unknown;
+    };
+    TyAnnotation::known(env.dialect().and_then(|dialect| {
+        dialect.type_annotation(&declared_type(&type_def.name, &params, array_dimensions))
+    }))
+}
+
+/// The declared type of a column or of a value of a custom type, as the AST
+/// writes a type, for the dialect to annotate.
+fn declared_type(name: &str, params: &[Box<ast::Expr>], array_dimensions: u32) -> ast::Type {
+    let size = match params {
+        [max] => Some(ast::TypeSize::MaxSize(max.clone())),
+        [precision, scale] => Some(ast::TypeSize::TypeSize(precision.clone(), scale.clone())),
+        _ => None,
+    };
+    ast::Type {
+        name: name.to_string(),
+        size,
+        array_dimensions,
+        ty_annotation: None,
+    }
+}
+
 /// The custom type of a column reference, for code that must know whether a register
 /// holds a custom type's decoded or stored form.
 ///
@@ -556,6 +739,7 @@ impl ColumnCustomType {
             name: self.type_def.name.clone(),
             size,
             array_dimensions: 0,
+            ty_annotation: None,
         }
     }
 
@@ -1289,6 +1473,7 @@ pub(super) fn dialect_operand_type(expr: &ast::Expr, ty: ExprType, env: &TypeEnv
             name: name.to_string(),
             size: None,
             array_dimensions: dimensions,
+            ty_annotation: None,
         })
     };
     let engine = |ty| OperandType::Engine {
@@ -1325,18 +1510,50 @@ pub(super) fn dialect_operand_type(expr: &ast::Expr, ty: ExprType, env: &TypeEnv
 
 /// FIXME(registered-types): The catalog tables declare some columns with another type than PostgreSQL (a boolean as INTEGER, a regproc as TEXT), and a subquery column does not say what type it has. So an operand that reads any of them is not checked. Once types are registered, every column and subquery column has its own type and this function goes away.
 /// Whether every value that `expr` reads has a declared type. A column of a
-/// table that is not STRICT, such as a virtual table, may hold any value, and
-/// the type of a subquery's column does not say where its values come from.
+/// table that is not STRICT, such as a virtual table, may hold any value. A
+/// column of a subquery has a declared type when the values of the subquery's
+/// result column do.
 fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
     let mut declared = true;
+    let mut subquery_columns_seen: Vec<(ast::TableInternalId, usize)> = Vec::new();
     let _ = super::walk_expr(
         expr,
         &mut |expr: &ast::Expr| -> Result<super::WalkControl> {
             declared &= match expr {
-                ast::Expr::Column { table, .. } => env
-                    .tables()
-                    .and_then(|tables| tables.find_table_by_internal_id(*table))
-                    .is_some_and(|(_, table)| table.is_strict()),
+                ast::Expr::Column { table, column, .. } => {
+                    match env
+                        .tables()
+                        .and_then(|tables| tables.find_table_by_internal_id(*table))
+                    {
+                        Some((_, Table::FromClauseSubquery(subquery))) => {
+                            if subquery_columns_seen.contains(&(*table, *column)) {
+                                true
+                            } else {
+                                subquery_columns_seen.push((*table, *column));
+                                query_column_reads_only_declared_types(&subquery.plan, *column, env)
+                            }
+                        }
+                        Some((_, table)) => table.is_strict(),
+                        None => false,
+                    }
+                }
+                ast::Expr::SubqueryResult {
+                    subquery_id,
+                    query_type:
+                        ast::SubqueryType::RowValue {
+                            result_reg_start,
+                            num_regs: 1,
+                            ..
+                        },
+                    ..
+                } => env
+                    .resolver()
+                    .and_then(|resolver| resolver.row_value_subqueries.get(*subquery_id))
+                    .is_some_and(|subquery| {
+                        subquery
+                            .column(*result_reg_start)
+                            .is_some_and(|column| column.reads_only_declared_types)
+                    }),
                 ast::Expr::SubqueryResult { .. }
                 | ast::Expr::Subquery(_)
                 | ast::Expr::Register { .. } => false,
@@ -1346,6 +1563,36 @@ fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
         },
     );
     declared
+}
+
+/// Whether the values of column `column` of the query `plan`, in each of its
+/// SELECTs and each row of a VALUES list, read only declared types.
+pub(crate) fn query_column_reads_only_declared_types(
+    plan: &Plan,
+    column: usize,
+    env: &TypeEnv,
+) -> bool {
+    let Some(resolver) = env.resolver() else {
+        return false;
+    };
+    let selects: Vec<&SelectPlan> = match plan {
+        Plan::Select(select) => vec![select],
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter()
+            .map(|(select, _)| select)
+            .chain(core::iter::once(right_most.as_ref()))
+            .collect(),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => return false,
+    };
+    selects.into_iter().all(|select| {
+        let env = TypeEnv::new(Some(&select.table_references), resolver);
+        column < select.result_columns.len()
+            && select
+                .column_exprs(column)
+                .all(|expr| reads_only_declared_types(expr, &env))
+    })
 }
 
 /// The source of a value read from `column`.
@@ -2037,6 +2284,7 @@ mod tests {
             name: name.to_string(),
             size: None,
             array_dimensions: dimensions,
+            ty_annotation: None,
         }
     }
 
@@ -2049,6 +2297,7 @@ mod tests {
                 Box::new(int(scale)),
             )),
             array_dimensions: 0,
+            ty_annotation: None,
         }
     }
 

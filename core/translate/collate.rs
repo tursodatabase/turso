@@ -20,7 +20,7 @@ use crate::{
                 first_and_third_arguments, iif_values, query_column_type, same_type_def, type_of,
                 type_ordering, ExprType,
             },
-            row_value_component_expr, row_value_len,
+            in_subquery_operand, row_value_component_expr, row_value_len,
         },
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
@@ -566,7 +566,7 @@ pub fn in_subquery_collation(
     check_in_subquery_operator(
         lhs,
         &lhs_context.type_env(),
-        rhs,
+        in_subquery_operand(query, column),
         &rhs_context.type_env(),
         types[1].clone(),
         resolver,
@@ -1063,6 +1063,7 @@ fn dialect_casts_to_compare(dialect: &dyn Dialect, x: &TypeDef, y: &TypeDef) -> 
             name: ty.name.clone(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         })
     };
     let choice = dialect.choose_operator("=", &|| vec![operand(x), operand(y)]);
@@ -1635,6 +1636,7 @@ mod tests {
             name: "TEXT".to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         });
         let expr_cast = Expr::cast(
             Expr::Column {

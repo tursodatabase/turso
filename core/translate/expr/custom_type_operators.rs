@@ -10,9 +10,11 @@ use crate::dialect::{ChosenOperator, Dialect, EngineType, OperandType, OperatorC
 use crate::function::Deterministic;
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
-    dialect_operand_type, same_type_def, sqlite_operand_type, type_of, without_wrappers,
-    BuiltinType, ColumnCustomType, ExprType, TypeEnv,
+    dialect_operand_type, query_column_type, same_type_def, select_column_type,
+    sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType, ExprType,
+    TypeEnv,
 };
+use crate::translate::plan::{Plan, SelectPlan};
 
 /// The function that runs the operator expression `expr`, such as `a + b` or
 /// `-a`, for code that has not computed the operands' types yet. See
@@ -54,8 +56,31 @@ pub(crate) fn read_literal_operands(
     if resolver.schema().type_registry.is_empty() {
         return Ok(());
     }
+    // FIXME(registered-types): A typed expression tree gives each expression
+    // its type from the types of what it contains, in one run from the leaves
+    // up, and this loop goes away.
+    for _ in 0..MAX_DEPTH_OF_CASTS {
+        if !read_literal_operands_once(expr, tables, resolver)? {
+            return Ok(());
+        }
+    }
+    Err(crate::LimboError::InternalError(
+        "the operands of an expression are still being cast after the most levels it can have"
+            .to_string(),
+    ))
+}
+
+const MAX_DEPTH_OF_CASTS: usize = 64;
+
+/// One walk of [read_literal_operands]. Whether it cast an operand.
+fn read_literal_operands_once(
+    expr: &mut ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
     let context = ExprContext::new(tables, resolver);
     let dialect = resolver.catalog.dialect.as_ref();
+    let mut cast_any = false;
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
         let (mut operands, uses) = operator_uses(expr);
         let mut types = vec![None; operands.len()];
@@ -70,21 +95,15 @@ pub(crate) fn read_literal_operands(
             let Some(ty) = ty else {
                 continue;
             };
-            let literal = std::mem::replace(*operand, ast::Expr::Literal(ast::Literal::Null));
-            **operand = ast::Expr::Cast {
-                expr: Box::new(literal),
-                type_name: Some(ty),
-            };
+            cast_any = true;
+            wrap_in_cast(operand, ty);
         }
         Ok(WalkControl::Continue)
     })?;
-    Ok(())
+    Ok(cast_any)
 }
 
-/// Asks the dialect to choose the `=` of `lhs IN (SELECT rhs ...)`, where
-/// `rhs` is a column of the subquery and `rhs_type` its type. A string literal
-/// selected by the subquery is text, as in PostgreSQL, so it is not read as the
-/// type of `lhs`.
+/// Fails when the dialect's `=` of `lhs IN (SELECT rhs ...)` still casts an operand.
 pub(crate) fn check_in_subquery_operator(
     lhs: &ast::Expr,
     lhs_env: &TypeEnv,
@@ -93,12 +112,85 @@ pub(crate) fn check_in_subquery_operator(
     rhs_type: ExprType,
     resolver: &Resolver<'_>,
 ) -> Result<()> {
-    if resolver.schema().type_registry.is_empty() {
+    let lhs_type = type_of(lhs, lhs_env);
+    let choice = in_subquery_choice(lhs, lhs_env, rhs, rhs_env, rhs_type.clone(), resolver)?;
+    if choice.is_some_and(|chosen| chosen.cast_operands.contains(&true)) {
+        return Err(LimboError::ParseError(format!(
+            "cannot compare type {lhs_type} with type {rhs_type}"
+        )));
+    }
+    Ok(())
+}
+
+/// Casts the operands of `lhs IN (SELECT ...)` that the dialect's `=` casts.
+pub(crate) fn cast_in_subquery_operands(
+    lhs: &mut ast::Expr,
+    lhs_env: &TypeEnv,
+    plan: &mut Plan,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    let components: Vec<&mut ast::Expr> = match lhs {
+        ast::Expr::Parenthesized(exprs) => exprs.iter_mut().map(|expr| expr.as_mut()).collect(),
+        expr => vec![expr],
+    };
+    if components.len() != plan.select_result_columns().len() {
         return Ok(());
+    }
+    let mut choices = Vec::with_capacity(components.len());
+    for (column, component) in components.iter().enumerate() {
+        let rhs = in_subquery_operand(plan, column);
+        let rhs_env = TypeEnv::new(Some(plan.select_table_references()), resolver);
+        let rhs_type = query_column_type(plan, column, resolver);
+        choices.push(in_subquery_choice(
+            component, lhs_env, rhs, &rhs_env, rhs_type, resolver,
+        )?);
+    }
+    for (column, (component, choice)) in components.into_iter().zip(choices).enumerate() {
+        let Some(chosen) = choice else {
+            continue;
+        };
+        if chosen.cast_operands.first() == Some(&true) {
+            wrap_in_cast(component, chosen.operands[0].clone());
+        }
+        if chosen.cast_operands.get(1) == Some(&true) {
+            cast_result_column(plan, column, &chosen.operands[1]);
+        }
+    }
+    Ok(())
+}
+
+/// The expression whose type `x IN (...)` reads for column `column` of `plan`: a string
+/// literal when a VALUES list gives only string literals there, which are text.
+pub(crate) fn in_subquery_operand(plan: &Plan, column: usize) -> &ast::Expr {
+    if let Plan::Select(select) = plan {
+        let literal = |row: &Vec<Box<ast::Expr>>| {
+            matches!(
+                without_wrappers(&row[column]),
+                ast::Expr::Literal(ast::Literal::String(_))
+            )
+        };
+        if !select.values.is_empty() && select.values.iter().all(literal) {
+            return &select.values[0][column];
+        }
+    }
+    &plan.select_result_columns()[column].expr
+}
+
+/// The dialect's choice of the `=` of `lhs IN (SELECT rhs ...)`, `None` when it chooses none.
+fn in_subquery_choice(
+    lhs: &ast::Expr,
+    lhs_env: &TypeEnv,
+    rhs: &ast::Expr,
+    rhs_env: &TypeEnv,
+    rhs_type: ExprType,
+    resolver: &Resolver<'_>,
+) -> Result<Option<ChosenOperator>> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(None);
     }
     let lhs_type = type_of(lhs, lhs_env);
     if matches!(lhs_type, ExprType::Null) || matches!(rhs_type, ExprType::Null) {
-        return Ok(());
+        return Ok(None);
     }
     let operand_types = || {
         let rhs_operand = match dialect_operand_type(rhs, rhs_type.clone(), rhs_env) {
@@ -113,23 +205,123 @@ pub(crate) fn check_in_subquery_operator(
             rhs_operand,
         ]
     };
+    choose_equals(&operand_types, resolver)
+}
+
+/// The dialect's choice of the `=` of two column values, `None` when it chooses none.
+fn choose_equals(
+    operand_types: &dyn Fn() -> Vec<OperandType>,
+    resolver: &Resolver<'_>,
+) -> Result<Option<ChosenOperator>> {
     let choice = resolver
         .catalog
         .dialect
-        .choose_operator("=", &operand_types)?;
-    // FIXME(registered-types): Only the comparison of an expression with an
-    // expression is cast, so an operand of an IN subquery that the choice says
-    // to cast is refused. The comparison of two values has no single place
-    // that all comparisons go through yet. Once it has, the subquery's result
-    // column is cast there.
-    if let OperatorChoice::Chosen(chosen) = &choice {
-        if chosen.cast_operands.iter().any(|cast| *cast) {
-            return Err(LimboError::ParseError(format!(
-                "cannot compare type {lhs_type} with type {rhs_type}"
-            )));
+        .choose_operator("=", operand_types)?;
+    Ok(match choice {
+        OperatorChoice::Chosen(chosen) => Some(chosen),
+        _ => None,
+    })
+}
+
+fn wrap_in_cast(expr: &mut ast::Expr, ty: ast::Type) {
+    let inner = std::mem::take(expr);
+    *expr = ast::Expr::Cast {
+        expr: Box::new(inner),
+        type_name: Some(ty),
+    };
+}
+
+/// Casts column `column` of every SELECT of `plan`, and of every row of a
+/// VALUES list, to `ty`.
+fn cast_result_column(plan: &mut Plan, column: usize, ty: &ast::Type) {
+    let selects: Vec<&mut SelectPlan> = match plan {
+        Plan::Select(select) => vec![select],
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter_mut()
+            .map(|(select, _)| select)
+            .chain(core::iter::once(right_most.as_mut()))
+            .collect(),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => return,
+    };
+    for select in selects {
+        cast_select_column(select, column, ty);
+    }
+}
+
+/// Casts column `column` of one SELECT, or of every row of a VALUES list, to
+/// `ty`.
+fn cast_select_column(select: &mut SelectPlan, column: usize, ty: &ast::Type) {
+    if select.values.is_empty() {
+        let name = select.result_columns[column]
+            .name(&select.table_references)
+            .map(str::to_owned);
+        let result_column = &mut select.result_columns[column];
+        result_column.alias = result_column.alias.take().or(name);
+        wrap_in_cast(&mut result_column.expr, ty.clone());
+    } else {
+        for row in &mut select.values {
+            wrap_in_cast(&mut row[column], ty.clone());
+        }
+    }
+}
+
+/// Casts the columns of a compound SELECT to one type where the dialect's `=` says to.
+pub(crate) fn cast_compound_columns(
+    left: &mut [(SelectPlan, ast::CompoundOperator)],
+    right_most: &mut SelectPlan,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(());
+    }
+    let mut arms: Vec<&mut SelectPlan> = left
+        .iter_mut()
+        .map(|(select, _)| select)
+        .chain(core::iter::once(right_most))
+        .collect();
+    for column in 0..arms[0].result_columns.len() {
+        for arm in 1..arms.len() {
+            let Some(chosen) = compound_choice(arms[0], arms[arm], column, resolver)? else {
+                continue;
+            };
+            if chosen.cast_operands.first() == Some(&true) {
+                for earlier in &mut arms[..arm] {
+                    cast_select_column(earlier, column, &chosen.operands[0]);
+                }
+            }
+            if chosen.cast_operands.get(1) == Some(&true) {
+                cast_select_column(arms[arm], column, &chosen.operands[1]);
+            }
         }
     }
     Ok(())
+}
+
+/// The dialect's choice of the `=` of column `column` of two SELECTs, `None` when it chooses none.
+fn compound_choice(
+    first: &SelectPlan,
+    other: &SelectPlan,
+    column: usize,
+    resolver: &Resolver<'_>,
+) -> Result<Option<ChosenOperator>> {
+    let operand = |select: &SelectPlan| {
+        let env = TypeEnv::new(Some(&select.table_references), resolver);
+        let ty = select_column_type(select, column, resolver);
+        if matches!(ty, ExprType::Null) {
+            return None;
+        }
+        let expr = &select.result_columns[column].expr;
+        match dialect_operand_type(expr, ty, &env) {
+            OperandType::StringLiteral(_) => None,
+            other => Some(other),
+        }
+    };
+    let (Some(first), Some(other)) = (operand(first), operand(other)) else {
+        return Ok(None);
+    };
+    choose_equals(&|| vec![first.clone(), other.clone()], resolver)
 }
 
 /// Asks the dialect to choose `operator` and records, for each string literal
@@ -360,10 +552,21 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
             (operands, uses)
         }
         ast::Expr::FunctionCall { name, args, .. }
-            if name.as_str().eq_ignore_ascii_case("nullif") && args.len() == 2 =>
+            if (name.as_str().eq_ignore_ascii_case("nullif") && args.len() == 2)
+                || (name.as_str().eq_ignore_ascii_case("coalesce") && args.len() > 1) =>
         {
+            let is_nullif = name.as_str().eq_ignore_ascii_case("nullif");
+            let count = args.len();
             let operands = args.iter_mut().map(|arg| arg.as_mut()).collect();
-            (operands, first_with_each("=", 1..2))
+            if is_nullif {
+                return (operands, first_with_each("=", 1..2));
+            }
+            let uses = vec![OperatorUse {
+                name: "=",
+                operands: (0..count).collect(),
+                kind: UseKind::ListValues,
+            }];
+            (operands, uses)
         }
         // The comparison with the values of a subquery is asked when the
         // subquery is planned: see `in_subquery_collation`.
@@ -817,6 +1020,7 @@ fn call_for(
         name: result.to_string(),
         size: None,
         array_dimensions: 0,
+        ty_annotation: None,
     };
     Ok(Some(OperatorCall {
         func: function,

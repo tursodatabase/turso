@@ -2558,7 +2558,7 @@ pub const MAX_ARRAY_DIMENSIONS: u32 = 7;
 
 /// Column type
 // https://sqlite.org/syntax/type-name.html
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Type {
     /// type name
@@ -2567,6 +2567,48 @@ pub struct Type {
     pub size: Option<TypeSize>,
     /// Number of array dimensions: 0 = scalar, 1 = `type[]`, 2 = `type[][]`, etc.
     pub array_dimensions: u32,
+    /// What the frontend knows about the type beyond its name. For an array
+    /// type it describes the element type.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub ty_annotation: Option<TypeAnnotation>,
+}
+
+/// Two types are equal if their names, sizes and array dimensions are. The
+/// annotation is not compared, because the SQL text of a type has none: an
+/// expression that is printed and parsed again, such as the expression of an
+/// index, has to stay equal to the expression of a query that it came from.
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.size == other.size
+            && self.array_dimensions == other.array_dimensions
+    }
+}
+
+/// What a frontend knows about a type beyond its name.
+///
+/// A frontend that has identifiers for its types fills this in for the types
+/// it writes into the tree. Core carries it to the type information of a
+/// result column and does not read it. The SQL text of a type does not have
+/// it, so a type that core reads from stored SQL gets it from
+/// `Dialect::type_annotation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct TypeAnnotation {
+    /// The frontend's identifier of the type. The PostgreSQL frontend puts
+    /// the oid of the type here, such as 114 for `json`.
+    pub type_id: u32,
+}
+
+impl TypeAnnotation {
+    /// The annotation of the type that the frontend identifies as `type_id`.
+    pub const fn new(type_id: u32) -> Self {
+        Self { type_id }
+    }
 }
 
 impl Type {
@@ -2750,4 +2792,31 @@ pub enum FrameExclude {
     Group,
     /// `TIES`
     Ties,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn types_that_differ_only_in_their_annotation_are_equal() {
+        let text = Type {
+            name: "TEXT".to_string(),
+            size: None,
+            array_dimensions: 0,
+            ty_annotation: None,
+        };
+        let json = Type {
+            ty_annotation: Some(TypeAnnotation::new(114)),
+            ..text.clone()
+        };
+        assert_eq!(text, json);
+        assert_eq!(json.to_string(), "TEXT");
+
+        let array = Type {
+            array_dimensions: 1,
+            ..text.clone()
+        };
+        assert_ne!(text, array);
+    }
 }

@@ -552,9 +552,6 @@ expect {
     f|t|t|t
 }
 
-# tursopg does not check an operand that is a subquery, or that reads a
-# column of a subquery or of a catalog table.
-@compat-gap "operator:text = int4"
 @setup operands
 test text-equals-integer-subquery-errors {
     SELECT s = (SELECT 1) FROM operands;
@@ -562,9 +559,6 @@ test text-equals-integer-subquery-errors {
 @sqlstate 42883
 expect error {
     operator does not exist: text = integer
-}
-expect @tursopg {
-    t
 }
 
 # The catalog tables of tursopg declare some columns with another type than
@@ -993,7 +987,6 @@ expect {
     1
 }
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-in-subquery-of-integer-column {
     SELECT count(*) FROM t WHERE o IN (SELECT i FROM t);
@@ -1001,12 +994,7 @@ test oid-in-subquery-of-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-integer-column-in-subquery-of-oid {
     SELECT count(*) FROM t WHERE i IN (SELECT o FROM t);
@@ -1014,12 +1002,7 @@ test oid-integer-column-in-subquery-of-oid {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type int4 with type oid
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-in-subquery-of-integer-literal {
     SELECT count(*) FROM t WHERE o IN (SELECT -1);
@@ -1027,12 +1010,7 @@ test oid-in-subquery-of-integer-literal {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type integer
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-in-values-of-integer-literal {
     SELECT count(*) FROM t WHERE o IN (VALUES (-1));
@@ -1040,12 +1018,7 @@ test oid-in-values-of-integer-literal {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type integer
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-row-in-values-of-integer-literal {
     SELECT count(*) FROM t WHERE (o, 1) IN (VALUES (-1, 1));
@@ -1053,12 +1026,7 @@ test oid-row-in-values-of-integer-literal {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type integer
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-row-in-subquery-of-integer-column {
     SELECT count(*) FROM t WHERE (o, 1) IN (SELECT i, 1 FROM t);
@@ -1066,12 +1034,31 @@ test oid-row-in-subquery-of-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
+
+@setup oid_paths
+test oid-equals-column-of-cte-of-negative-integer {
+    WITH c(x) AS (SELECT -1) SELECT count(*) FROM t, c WHERE o = c.x;
+}
+expect {
+    1
 }
 
-@compat-gap "operator:oid = int4"
+@setup oid_paths
+test oid-equals-column-of-subquery-in-from-of-negative-integer {
+    SELECT count(*) FROM t, (SELECT -1 AS x) s WHERE o = s.x;
+}
+expect {
+    1
+}
+
+@setup oid_paths
+test oid-equals-column-of-values-of-negative-integer {
+    SELECT count(*) FROM t, (VALUES (-1)) v(x) WHERE o = v.x;
+}
+expect {
+    1
+}
+
 @setup oid_paths
 test oid-equals-scalar-subquery-of-integer-column {
     SELECT count(*) FROM t WHERE o = (SELECT i FROM t);
@@ -1079,12 +1066,7 @@ test oid-equals-scalar-subquery-of-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-delete-where-in-subquery-of-integer-column {
     DELETE FROM t WHERE o IN (SELECT i FROM t); SELECT count(*) FROM t;
@@ -1092,12 +1074,7 @@ test oid-delete-where-in-subquery-of-integer-column {
 expect {
     0
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-joins-using-integer-column {
     SELECT count(*) FROM t JOIN t2 USING (o);
@@ -1105,12 +1082,7 @@ test oid-joins-using-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-natural-joins-integer-column {
     SELECT count(*) FROM t NATURAL JOIN t2;
@@ -1118,12 +1090,7 @@ test oid-natural-joins-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-coalesce-with-integer-column {
     SELECT count(*) FROM t WHERE COALESCE(o, i) = -1;
@@ -1131,12 +1098,7 @@ test oid-coalesce-with-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-union-with-integer-column {
     SELECT count(*) FROM (SELECT o FROM t UNION SELECT i FROM t) s;
@@ -1144,12 +1106,7 @@ test oid-union-with-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-intersect-with-integer-column {
     SELECT count(*) FROM (SELECT o FROM t INTERSECT SELECT i FROM t) s;
@@ -1157,12 +1114,7 @@ test oid-intersect-with-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-except-with-integer-column {
     SELECT count(*) FROM (SELECT o FROM t EXCEPT SELECT i FROM t) s;
@@ -1170,21 +1122,13 @@ test oid-except-with-integer-column {
 expect {
     0
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-equals-scalar-subquery-of-negative-integer {
     SELECT count(*) FROM t WHERE o = (SELECT -1);
 }
 expect {
     1
-}
-expect @tursopg {
-    0
 }
 
 @setup oid_operands
@@ -1312,6 +1256,66 @@ expect error {
 @sqlstate 42883
 expect @tursopg error {
     operator does not exist: oid = double precision
+}
+
+@setup oid_paths
+test compound-of-integer-column-and-string-literal {
+    SELECT i FROM t UNION ALL SELECT '5' ORDER BY 1;
+}
+expect {
+    -1
+    5
+}
+
+@setup oid_paths
+test compound-of-integer-and-oid-orders-by-column-name {
+    SELECT i FROM t UNION SELECT o FROM t ORDER BY i;
+}
+expect {
+    4294967295
+}
+
+setup oid_right_join {
+    CREATE TABLE t3 (o oid, y text);
+    INSERT INTO t3 VALUES (4294967295, 'p'), (1, 'q');
+    CREATE TABLE t4 (o int4, x text);
+    INSERT INTO t4 VALUES (-1, 'a'), (1, 'b');
+}
+
+@compat-gap "operator:oid = int4"
+@setup oid_right_join
+test oid-right-join-using-integer-column {
+    SELECT o FROM t3 RIGHT JOIN t4 USING (o) ORDER BY x;
+}
+expect {
+    4294967295
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:int4 = oid"
+@setup oid_paths
+test oid-joins-using-integer-column-on-the-left {
+    SELECT o FROM t2 JOIN t USING (o);
+}
+expect {
+    4294967295
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type int4 with type oid
+}
+
+@setup oid_paths
+test oid-in-values-of-string-literal-errors {
+    SELECT count(*) FROM t WHERE o IN (VALUES ('1'));
+}
+@sqlstate 42883
+expect error {
+    operator does not exist
 }
 
 @setup oid_operands

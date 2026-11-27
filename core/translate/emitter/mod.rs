@@ -315,6 +315,8 @@ pub(crate) struct RowValueSubqueryColumn {
     /// The column's type, which decides custom-type operators: in
     /// `d - (SELECT e FROM u)` with `e` a date, the result is a number of days.
     pub(crate) expr_type: ExprType,
+    /// Whether the column's values read only declared types.
+    pub(crate) reads_only_declared_types: bool,
 }
 
 impl RowValueSubquery {
