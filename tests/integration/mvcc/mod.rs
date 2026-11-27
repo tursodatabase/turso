@@ -50,6 +50,7 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
 struct RecordingDurableStorage {
     inner: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
     used_log_tx: std::sync::atomic::AtomicBool,
+    checkpoint_starts: AtomicUsize,
 }
 
 impl RecordingDurableStorage {
@@ -57,6 +58,7 @@ impl RecordingDurableStorage {
         Self {
             inner,
             used_log_tx: std::sync::atomic::AtomicBool::new(false),
+            checkpoint_starts: AtomicUsize::new(0),
         }
     }
 
@@ -168,6 +170,11 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
 
     fn set_header(&self, header: turso_core::mvcc::persistent_storage::logical_log::LogHeader) {
         self.inner.set_header(header)
+    }
+
+    fn on_checkpoint_start(&self) -> turso_core::Result<()> {
+        self.checkpoint_starts.fetch_add(1, Ordering::SeqCst);
+        self.inner.on_checkpoint_start()
     }
 }
 
@@ -2167,5 +2174,64 @@ fn test_mvcc_open_tolerates_null_sqlite_sequence_name() -> anyhow::Result<()> {
     conn.execute("INSERT INTO t3 VALUES(NULL)")?;
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT seq FROM sqlite_sequence WHERE name='t3'");
     assert_eq!(rows, vec![(6,)]);
+    Ok(())
+}
+
+/// While a connect holds a WAL read lock for its page-1 read, a blocking
+/// checkpoint must fail with Busy before it calls `on_checkpoint_start`, and
+/// dropping the pending connect must release the lock.
+#[test]
+fn test_checkpoint_does_not_start_while_a_connect_reads_page_1() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = ":checkpoint-while-connect-reads-page-1:";
+    let log_file = io.open_file(&format!("{path}-log"), OpenFlags::Create, false)?;
+    let storage = Arc::new(RecordingDurableStorage::new(Arc::new(
+        turso_core::mvcc::persistent_storage::Storage::new(log_file, io.clone(), None),
+    )));
+    let db = Database::open(
+        io.clone(),
+        path,
+        OpenOptions::new(Arc::new(SqliteDialect)).durable_storage(
+            storage.clone() as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>
+        ),
+    )?;
+    let owner = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    owner.pragma_update("journal_mode", "'mvcc'")?;
+    owner.execute("CREATE TABLE t(x INTEGER)")?;
+    owner.execute("INSERT INTO t VALUES (1)")?;
+    owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let starts_before = storage.checkpoint_starts.load(Ordering::SeqCst);
+
+    // The first wait of a plaintext connect is its header read, before the
+    // read lock. The second is its page-1 read, under the read lock.
+    let opts = ConnectOpts::new(SessionRole::Superuser);
+    let mut state = turso_core::ConnectAsyncState::new();
+    let turso_core::IOResult::IO(header_read) = db.connect_async(opts.clone(), &mut state)? else {
+        panic!("a connect must wait for its header read");
+    };
+    header_read.wait(io.as_ref())?;
+    let turso_core::IOResult::IO(pending) = db.connect_async(opts, &mut state)? else {
+        panic!("a connect must wait for its page-1 read");
+    };
+
+    let checkpoint = owner.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(
+        matches!(checkpoint, Err(turso_core::LimboError::Busy)),
+        "the checkpoint must be busy while a connect reads page 1: {checkpoint:?}"
+    );
+    assert_eq!(
+        storage.checkpoint_starts.load(Ordering::SeqCst),
+        starts_before,
+        "a busy checkpoint must fail before it starts"
+    );
+
+    drop(pending);
+    drop(state);
+    owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(
+        storage.checkpoint_starts.load(Ordering::SeqCst),
+        starts_before + 1,
+        "the checkpoint must start once the pending connect is dropped"
+    );
     Ok(())
 }

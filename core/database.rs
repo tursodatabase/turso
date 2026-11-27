@@ -5,6 +5,7 @@
 
 use crate::ast;
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
+use crate::mvcc::database::CheckpointReadGuard;
 use crate::namespace::NamespaceId;
 use crate::schema::load::{load_steps, SchemaInstall, SchemaLoader, StepsFor};
 use crate::security::roles::{RoleId, SessionRole};
@@ -451,7 +452,12 @@ pub(crate) enum InitState {
     /// Verifies credentials and reads page 1 on cold opens to authenticate its layout.
     AuthenticateHeader(HeaderAuthenticationState),
     /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
-    ReadPage1 { pager: Box<Pager> },
+    ReadPage1 {
+        pager: Box<Pager>,
+        /// Holds the MVCC blocking-checkpoint lock in read mode for as long as the
+        /// read transaction is open. `None` without MVCC or in passive checkpoint mode.
+        _checkpoint_guard: Option<CheckpointReadGuard>,
+    },
 }
 
 impl Default for InitState {
@@ -465,6 +471,7 @@ impl InitState {
         if let Self::ReadPage1 { pager, .. } = self {
             pager.end_read_tx();
         }
+        // Dropping the old state releases its checkpoint guard after the read tx ends.
         *self = Self::default();
     }
 }
@@ -2071,6 +2078,20 @@ impl Database {
                     ));
                     let pager = self.init_pager(header)?;
 
+                    // A blocking MVCC checkpoint keeps MVCC transactions out with its lock,
+                    // calls `on_checkpoint_start`, and only then looks for WAL readers. Take
+                    // that lock in read mode for this read transaction, as an MVCC
+                    // transaction does. A checkpoint that runs while this connect waits for
+                    // page 1 then fails with Busy before it starts.
+                    // TODO: `Connection::reparse_schema` and `force_reparse_schema_inner` also
+                    // open a pager read transaction outside an MVCC transaction without this
+                    // lock. If they can wait for I/O while a blocking checkpoint runs, they
+                    // need it too; a single place would be the code that opens such reads.
+                    let checkpoint_guard = match self.get_mv_store().as_ref() {
+                        Some(mv_store) => mv_store.try_checkpoint_read_guard()?,
+                        None => None,
+                    };
+
                     // Start a read transaction before reading page 1 to prevent a concurrent
                     // checkpoint from truncating the WAL underneath bootstrap. Under heavy
                     // same-process connection churn, the shared WAL bootstrap path can
@@ -2093,9 +2114,10 @@ impl Database {
 
                     *st = InitState::ReadPage1 {
                         pager: Box::new(pager),
+                        _checkpoint_guard: checkpoint_guard,
                     };
                 }
-                InitState::ReadPage1 { pager } => {
+                InitState::ReadPage1 { pager, .. } => {
                     // Read page 1 within the read transaction to determine the
                     // autovacuum mode. The read tx stays open across an IO
                     // yield here (re-entry resumes the read); we only end it

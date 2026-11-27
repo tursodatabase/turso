@@ -3025,6 +3025,8 @@ fn reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
         .execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
 
+    // Connect before the checkpoint takes its lock; a connect fails with Busy while it holds it.
+    let reader = db.connect();
     let checkpoint_injector =
         FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
     writer.set_yield_injector(Some(checkpoint_injector.clone()));
@@ -3039,7 +3041,6 @@ fn reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
         "insert",
     );
 
-    let reader = db.connect();
     let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
     reader.set_yield_injector(Some(read_mark_probe.clone()));
     let mut read = reader.prepare("SELECT v FROM t WHERE id = 1").unwrap();
@@ -3092,6 +3093,8 @@ fn integrity_check_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
         .execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
 
+    // Connect before the checkpoint takes its lock; a connect fails with Busy while it holds it.
+    let reader = db.connect();
     let checkpoint_injector =
         FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
     writer.set_yield_injector(Some(checkpoint_injector.clone()));
@@ -3104,7 +3107,6 @@ fn integrity_check_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
         "drop-table checkpoint",
     );
 
-    let reader = db.connect();
     let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
     reader.set_yield_injector(Some(read_mark_probe.clone()));
     let mut integrity_check = reader.prepare("PRAGMA integrity_check").unwrap();
@@ -3251,6 +3253,8 @@ fn savepoint_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
         .execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
 
+    // Connect before the checkpoint takes its lock; a connect fails with Busy while it holds it.
+    let reader = db.connect();
     let checkpoint_injector =
         FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
     writer.set_yield_injector(Some(checkpoint_injector.clone()));
@@ -3265,7 +3269,6 @@ fn savepoint_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
         "insert",
     );
 
-    let reader = db.connect();
     let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
     reader.set_yield_injector(Some(read_mark_probe.clone()));
     let mut savepoint = reader.prepare("SAVEPOINT s").unwrap();
@@ -4951,6 +4954,16 @@ fn conflict_abort_ckpt_indexed_update_body(db: MvccTestDbNoConn) {
             LimboError::Busy | LimboError::BusySnapshot | LimboError::CommitDependencyAborted
         )
     }
+    fn connect_retry(db: &Arc<Database>) -> Arc<Connection> {
+        for _ in 0..100_000 {
+            match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
+                Ok(conn) => return conn,
+                Err(e) if is_transient(&e) => std::thread::yield_now(),
+                Err(e) => panic!("connect failed: {e:?}"),
+            }
+        }
+        panic!("connect stayed busy after 100000 attempts");
+    }
     fn read_retry(conn: &Arc<Connection>, query: &str) -> Option<Vec<Vec<Value>>> {
         for _ in 0..100_000 {
             let mut stmt = match conn.prepare(query) {
@@ -4984,9 +4997,7 @@ fn conflict_abort_ckpt_indexed_update_body(db: MvccTestDbNoConn) {
     let reader_stop = stop.clone();
     let reader_db = db_arc.clone();
     let reader_handle = std::thread::spawn(move || {
-        let reader = reader_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let reader = connect_retry(&reader_db);
         reader
             .execute("PRAGMA mvcc_checkpoint_threshold = 0")
             .unwrap();
@@ -5014,15 +5025,11 @@ fn conflict_abort_ckpt_indexed_update_body(db: MvccTestDbNoConn) {
 
     let writer_db = db_arc;
     let writer_handle = std::thread::spawn(move || {
-        let conn1 = writer_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let conn1 = connect_retry(&writer_db);
         conn1
             .execute("PRAGMA mvcc_checkpoint_threshold = 0")
             .unwrap();
-        let conn2 = writer_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let conn2 = connect_retry(&writer_db);
         conn2
             .execute("PRAGMA mvcc_checkpoint_threshold = 0")
             .unwrap();
@@ -5734,6 +5741,16 @@ fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
         .unwrap();
     aux_mv_store.set_checkpoint_threshold(0);
 
+    // Connect and attach before the checkpoint takes its lock; a connect fails with Busy while it holds it.
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    let reader_aux_db_id = reader.get_database_id_by_name("aux").unwrap();
+    let reader_aux_pager = reader
+        .get_pager_from_database_index(&reader_aux_db_id)
+        .unwrap();
+
     let checkpoint_io = writer
         .get_pager_from_database_index(&aux_db_id)
         .unwrap()
@@ -5752,14 +5769,6 @@ fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
         "attached insert",
     );
 
-    let reader = db.connect();
-    reader
-        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
-        .unwrap();
-    let reader_aux_db_id = reader.get_database_id_by_name("aux").unwrap();
-    let reader_aux_pager = reader
-        .get_pager_from_database_index(&reader_aux_db_id)
-        .unwrap();
     let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
     reader.set_yield_injector(Some(read_mark_probe.clone()));
     let mut read = reader.prepare("SELECT v FROM aux.t WHERE id = 1").unwrap();
