@@ -699,8 +699,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::SkipCondition::Debug)
             }
+            Some(Token::Identifier(name)) if name == "model" => {
+                self.advance();
+                Ok(ast::SkipCondition::Model)
+            }
             Some(token) => Err(self.error(format!(
-                "expected skip condition (mvcc, sqlite, postgres, debug), got {token}"
+                "expected skip condition (mvcc, sqlite, postgres, debug, model), got {token}"
             ))),
             None => Err(self.error("expected skip condition, got EOF".to_string())),
         }
@@ -1681,6 +1685,38 @@ expect {
     }
 
     #[test]
+    fn test_parse_skip_if_model() {
+        let input = r#"
+@database :memory:
+@skip-file-if model "materialized views are not supported in model storage"
+
+@skip-if model "ATTACH is not supported in model storage"
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            vec![ast::Skip {
+                reason: "materialized views are not supported in model storage".to_string(),
+                condition: Some(ast::SkipCondition::Model),
+            }]
+        );
+        assert_eq!(
+            file.tests[0].modifiers.skip,
+            vec![ast::Skip {
+                reason: "ATTACH is not supported in model storage".to_string(),
+                condition: Some(ast::SkipCondition::Model),
+            }]
+        );
+    }
+
+    #[test]
     fn test_parse_global_skip_if_postgres() {
         let input = r#"
 @database :memory:
@@ -1720,8 +1756,9 @@ expect {
 
         let err = parse(input).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("expected skip condition (mvcc, sqlite, postgres, debug), got mysql"),
+            err.to_string().contains(
+                "expected skip condition (mvcc, sqlite, postgres, debug, model), got mysql"
+            ),
             "{err}"
         );
     }

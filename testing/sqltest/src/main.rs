@@ -419,6 +419,7 @@ async fn run_tests(
     let mut config = RunnerConfig::default()
         .with_max_jobs(jobs)
         .with_mvcc(mvcc)
+        .with_model_storage(model_storage)
         .with_snapshot_update_mode(snapshot_mode)
         .with_fail_fast(fail_fast);
     if let Some(f) = filter {

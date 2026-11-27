@@ -349,6 +349,9 @@ pub enum SkipCondition {
     /// Skip when the test runner is a debug build. The Makefile builds tursodb
     /// with the same profile as the runner.
     Debug,
+    /// Skip when the runner puts all B-trees in the in-memory model
+    /// (`--model-storage`).
+    Model,
 }
 
 /// What we expect from executing the SQL
