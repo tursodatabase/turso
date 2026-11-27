@@ -1808,7 +1808,7 @@ pub enum Insn {
     DropType {
         /// The database within which this type needs to be dropped
         db: usize,
-        /// The name of the type being dropped
+        /// The name token of the type being dropped, with its quotes
         type_name: String,
     },
     /// Add a fully-configured sequence to the in-memory schema.

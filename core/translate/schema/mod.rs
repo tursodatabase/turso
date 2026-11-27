@@ -2816,9 +2816,13 @@ pub fn translate_create_type(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    // The SQLite parser gives the name token with its quotes.
-    let type_name = &crate::util::dequote(type_name);
+    // The parsers give the name token, with its quotes. The type registry
+    // finds a type by its token, and the type's name is the token without
+    // quotes.
+    let type_token = type_name;
+    let type_name = &crate::util::dequote(type_token);
     let normalized_name = normalize_ident(type_name);
+    let registry_key = type_registry_key(type_token);
 
     // Reject names that shadow SQLite base types
     let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
@@ -2833,7 +2837,7 @@ pub fn translate_create_type(
     // Check if type already exists
     if resolver
         .schema()
-        .get_type_def_unchecked(&normalized_name)
+        .get_type_def_unchecked(type_token)
         .is_some()
     {
         if if_not_exists {
@@ -2841,7 +2845,7 @@ pub fn translate_create_type(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
-    check_name_not_cast_to("type", &normalized_name, resolver)?;
+    check_name_not_cast_to("type", &normalized_name, &registry_key, resolver)?;
 
     // Validate encode/coerce/decode expressions for safety (only for custom types)
     if let ast::CreateTypeBody::CustomType {
@@ -2868,7 +2872,7 @@ pub fn translate_create_type(
             .plain_value_type(&normalized_name, type_def.value_input_type())?;
         // A CAST to the type from its own DECODE would run that DECODE again
         // without end.
-        if type_def_uses_type(&type_def, &type_registry_key(&normalized_name))? {
+        if type_def_uses_type(&type_def, &registry_key)? {
             bail_parse_error!("cannot create type {normalized_name}: it casts to itself");
         }
         check_decode_type(&type_def, resolver)?;
@@ -3021,9 +3025,13 @@ pub fn translate_create_domain(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    // The SQLite parser gives the name token with its quotes.
-    let domain_name = &crate::util::dequote(domain_name);
+    // The parsers give the name token, with its quotes. The type registry
+    // finds a type by its token, and the domain's name is the token without
+    // quotes.
+    let domain_token = domain_name;
+    let domain_name = &crate::util::dequote(domain_token);
     let normalized_name = normalize_ident(domain_name);
+    let registry_key = type_registry_key(domain_token);
 
     // Reject names that shadow SQLite base types
     let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
@@ -3038,7 +3046,7 @@ pub fn translate_create_domain(
     // Check if type/domain already exists
     if resolver
         .schema()
-        .get_type_def_unchecked(&normalized_name)
+        .get_type_def_unchecked(domain_token)
         .is_some()
     {
         if if_not_exists {
@@ -3046,7 +3054,7 @@ pub fn translate_create_domain(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
-    check_name_not_cast_to("domain", &normalized_name, resolver)?;
+    check_name_not_cast_to("domain", &normalized_name, &registry_key, resolver)?;
 
     // Validate base type exists — must be a primitive or a registered type
     let base_normalized = normalize_ident(base_type);
@@ -3079,7 +3087,6 @@ pub fn translate_create_domain(
     }
     // A CAST to the domain from its own CHECK or DEFAULT would run that
     // expression again without end.
-    let registry_key = type_registry_key(&normalized_name);
     for expr in constraints
         .iter()
         .map(|c| c.check.as_ref())
@@ -3139,10 +3146,14 @@ fn check_type_name_against_relations(
 /// expression already casts to. That CAST follows SQLite's rules for the name
 /// (`CAST(x AS b)` gives a NUMERIC), and creating the type would change the
 /// values it gives, such as those stored in an index.
-fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver) -> Result<()> {
-    let registry_key = type_registry_key(normalized_name);
+fn check_name_not_cast_to(
+    kind: &str,
+    normalized_name: &str,
+    registry_key: &str,
+    resolver: &Resolver,
+) -> Result<()> {
     if let Some(name) =
-        find_in_any_database(resolver, |schema| find_type_using(schema, &registry_key))?
+        find_in_any_database(resolver, |schema| find_type_using(schema, registry_key))?
     {
         bail_parse_error!(
             "cannot create {kind} {normalized_name}: type {name} already casts to it; \
@@ -3150,7 +3161,7 @@ fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver
         );
     }
     if let Some(owner) = find_in_any_database(resolver, |schema| {
-        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), registry_key)
     })? {
         bail_parse_error!("cannot create {kind} {normalized_name}: {owner} already casts to it");
     }
@@ -3165,11 +3176,14 @@ pub fn translate_drop_type(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let normalized_name = normalize_ident(type_name);
+    // The parsers give the name token, with its quotes. The type registry
+    // finds a type by its token, and the row of the type has the name
+    // without quotes.
+    let normalized_name = normalize_ident(&crate::util::dequote(type_name));
     let kind = if is_domain_drop { "domain" } else { "type" };
 
     // Check if type exists
-    let type_def = resolver.schema().get_type_def_unchecked(&normalized_name);
+    let type_def = resolver.schema().get_type_def_unchecked(type_name);
     if type_def.is_none() {
         if if_exists {
             return Ok(());
@@ -3220,7 +3234,7 @@ pub fn translate_drop_type(
     // Remove from in-memory schema
     program.emit_insn(Insn::DropType {
         db: MAIN_DB_ID,
-        type_name: normalized_name,
+        type_name: type_name.to_string(),
     });
 
     program.emit_insn(Insn::SetCookie {

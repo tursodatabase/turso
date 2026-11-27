@@ -2908,6 +2908,59 @@ expect {
     Zz Ty Space
 }
 
+# Quotes and brackets in a type's name are part of the name.
+test a-type-name-that-starts-with-a-quote-keeps-it {
+    CREATE TYPE "[zz_qb]" AS ENUM ('a');
+    CREATE DOMAIN """zz_qd""" AS int;
+    CREATE TYPE "`zz_qt`" AS ENUM ('a');
+    CREATE TABLE zz_qb (a int);
+    CREATE TABLE zz_qd (a int);
+    CREATE VIEW zz_qt AS SELECT 1 AS a;
+    SELECT typname FROM pg_type
+    WHERE typname IN ('[zz_qb]', '"zz_qd"', '`zz_qt`') ORDER BY typname;
+}
+expect {
+    "zz_qd"
+    [zz_qb]
+    `zz_qt`
+}
+
+test a-relation-name-that-starts-with-a-quote-is-not-a-type-name {
+    CREATE TYPE zz_qr AS ENUM ('a');
+    CREATE TABLE "[zz_qr]" (a int);
+    CREATE TABLE """zz_qr""" (a int);
+    CREATE VIEW "`zz_qr`" AS SELECT 1 AS a;
+    CREATE SEQUENCE "'zz_qr'";
+    CREATE TABLE "[zz_qr" (a int);
+    CREATE TABLE zz_qr_old (a int);
+    ALTER TABLE zz_qr_old RENAME TO "[zz_qr]x";
+    SELECT count(*) FROM pg_class WHERE relname LIKE '%zz_qr%';
+}
+expect {
+    6
+}
+
+test a-relation-named-like-a-type-whose-name-has-quotes {
+    CREATE DOMAIN """zz_qq""" AS int;
+    CREATE TABLE """zz_qq""" (a int);
+}
+@sqlstate 42710
+expect error {
+    type ""zz_qq"" already exists
+}
+
+test a-type-whose-name-starts-with-a-quote-can-be-dropped {
+    CREATE TYPE "[zz_qx]" AS ENUM ('a');
+    CREATE TYPE zz_qx AS ENUM ('a');
+    DROP TYPE "[zz_qx]";
+    CREATE DOMAIN """zz_qy""" AS int;
+    DROP DOMAIN """zz_qy""";
+    SELECT typname FROM pg_type WHERE typname IN ('[zz_qx]', 'zz_qx', '"zz_qy"');
+}
+expect {
+    zz_qx
+}
+
 # A table keeps the letter case of the name that RENAME TO gives it.
 test a-renamed-table-keeps-the-letter-case-of-its-new-name {
     CREATE TABLE zz_rn_case_old (a int);

@@ -403,7 +403,7 @@ impl Dialect for PostgresDialect {
             return Ok(());
         }
         let Some(type_def) = schema
-            .get_type_def_unchecked(name)
+            .get_type_def_unchecked(&type_token(name))
             .filter(|type_def| !type_def.is_builtin)
         else {
             return Ok(());
@@ -436,7 +436,7 @@ impl Dialect for PostgresDialect {
             return Err(crate::error::type_outside_public());
         }
         if let Some(type_def) = schema
-            .get_type_def_unchecked(name)
+            .get_type_def_unchecked(&type_token(name))
             .filter(|type_def| !type_def.is_builtin && type_def.name != name)
         {
             return Err(names_differ_only_in_case("two types", &type_def.name, name));
@@ -748,6 +748,13 @@ pub(crate) fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
 fn holds_user_types(schema: &Schema, namespace: NamespaceRef) -> bool {
     namespace.database_id == MAIN_DB_ID
         && namespace_oid(schema, namespace.id) == PUBLIC_NAMESPACE_OID
+}
+
+/// The token that the engine finds the type named `name` by: the name, in
+/// quotes when it needs them. The engine removes the quotes of a token, so a
+/// name that starts with a quote finds another type without them.
+fn type_token(name: &str) -> String {
+    ast::Name::exact(name.to_string()).as_ident()
 }
 
 /// FIXME(pg-quoted-identifier): The engine finds types and relations by the

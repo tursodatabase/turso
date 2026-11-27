@@ -1819,11 +1819,11 @@ impl PostgreSQLTranslator {
             }),
             ObjectType::ObjectType => Ok(ast::Stmt::DropType {
                 if_exists: drop.missing_ok,
-                type_name: qualified_name.name.as_str().to_string(),
+                type_name: type_token(qualified_name.name.as_str()),
             }),
             ObjectType::ObjectDomain => Ok(ast::Stmt::DropDomain {
                 if_exists: drop.missing_ok,
-                domain_name: qualified_name.name.as_str().to_string(),
+                domain_name: type_token(qualified_name.name.as_str()),
             }),
             ObjectType::ObjectSequence => Ok(ast::Stmt::DropSequence {
                 if_exists: drop.missing_ok,
@@ -6173,7 +6173,7 @@ impl PostgreSQLTranslator {
         Ok(ast::Stmt::CreateDomain {
             if_not_exists: false,
             namespace,
-            domain_name,
+            domain_name: type_token(domain_name),
             base_type,
             default,
             not_null,
@@ -7905,7 +7905,7 @@ fn translate_create_enum(
     Ok(ast::Stmt::CreateType {
         if_not_exists: false,
         namespace,
-        type_name,
+        type_name: type_token(type_name),
         body: ast::CreateTypeBody::CustomType {
             params: vec![ast::TypeParam {
                 name: "value".into(),
@@ -7936,6 +7936,12 @@ fn created_type_name(
         _ => None,
     };
     Ok((namespace, name))
+}
+
+/// The token that the engine takes for the type named `name`: the name, in
+/// quotes when it needs them, as the SQLite parser gives the name of a type.
+fn type_token(name: impl Into<String>) -> String {
+    exact_name(name).as_ident()
 }
 
 #[allow(clippy::vec_box)]
