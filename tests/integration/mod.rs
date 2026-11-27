@@ -43,6 +43,7 @@ mod query_timeout;
 mod queued_io;
 mod reindex;
 mod schema;
+mod schema_reprepare_sibling;
 mod security;
 mod statement;
 mod statement_lifecycle;
