@@ -11,7 +11,7 @@ Status: draft. Every rule marked **DECISION** needs a human OK.
 
 | File | Purpose |
 |---|---|
-| `program.rs`, `index_program.rs`, `mod.rs` | Harness. Builds a VDBE program from a list of table or index operations, runs it on one engine, returns what each operation saw. Engines: WAL, MVCC, ephemeral. Layouts: all in memory, checkpointed. |
+| `program.rs`, `index_program.rs`, `mod.rs` | Harness. Builds a VDBE program from a list of table or index operations, runs it on one engine, returns what each operation saw. Engines: WAL, MVCC, ephemeral, model (a `:model:` database, section 2e). Layouts: all in memory, checkpointed. |
 | `model.rs`, `index_model.rs` | Reference models: the table and index stores with their compare functions, on top of the step function `turso_core::storage::model::spec`. No database. |
 | `walk.rs`, `index_walk.rs` | Random walks. Generate operations, run them on all engines and on the model, compare, shrink a failure. Known bugs are filtered by name; `NO_FILTER=1` turns the filters off. |
 | `index_tests.rs`, `overlay_tests.rs`, `defined_tests.rs`, tests in `mod.rs` | Fixed scenarios. `defined_tests.rs` has the peer writes of section 1 and the `Found`-style seeks of section 2b. A test named `known_bug_*` asserts that a bug is still open (section 5b). `index_tests.rs::collation` has the scenarios of section 2c: DESC and NOCASE seeks, scans and range loops, `Found`, and the replacement of a key by a case variant. |
@@ -181,7 +181,7 @@ engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 | U2 | `Next` or `Prev` from a position that has no direction: after `Count`, `NewRowid`, `IdxDelete`, a `SeekRowid` or `NotExists` that missed | section 1 |
 | U3 | After `NullRow`: `Insert`, `IdxInsert`, `Delete`, `Count`, `NewRowid` (`Next` and `Prev` are legal and find no row) | section 2 |
 | U4 | `Delete` with no entry under the cursor: fresh cursor, scan ended, failed seek | D4 |
-| U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key. The token of a `Found` or `NotFound` hit allows only the same whole key, so with a prefix it allows nothing (SQLite seeks again); a miss allows every key with that prefix | section 3 |
+| U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key. The token of a `Found` or `NotFound` hit allows only the same whole key, so with a prefix it allows nothing (SQLite seeks again); a miss allows every key with that prefix. Two places need no token: the entry of the key is under the cursor (an update in place), and the cursor is in the gap of its own `Delete` of the key (an update that deletes and inserts the row) | section 3 |
 | U6 | `IdxGE/GT/LE/LT` on a cursor whose entry was deleted (by itself or by another cursor) | SQLite asserts, `vdbe.c:7112` |
 | U7 | `IdxDelete` with P5 of a key that is not in the index, and of a key that is equal under the collation but not identical (section 2c). The opcode reports a corrupt index | section 2c |
 | U8 | A read (`Column`, `RowId`, `IdxRowId`) at a position that is not defined: after `Count`, `SeekEnd`, `NewRowid`, a `Delete` (own, or of the entry by a peer), `IdxDelete`, an exact seek that missed (also `Found`, `NotFound`), `NoConflict` with a NULL | section 1 |
@@ -201,17 +201,67 @@ a sorted collection (a map for a table, a sorted list of records for an index, o
 the B-tree record compare) and does no I/O. An illegal opcode panics with
 `unsupported: U<n>: ...`.
 
-With `TURSO_MODEL_EPHEMERAL=1` (debug builds), `OpenEphemeral`, `OpenAutoindex` and `OpenDup`
-open their trees on the model. The variable sets the default of a connection flag
-(`Connection::set_model_ephemeral`). A process that opened a model tree prints counters
-(trees, steps per opcode) to stderr at exit. Run the corpus:
-`TURSO_MODEL_EPHEMERAL=1 make -C sqlite/conformance run-rust ARGS="--snapshot-filter __never__"`.
+**The `:model:` database.** A database opened with the path `:model:` is like `:memory:`,
+but every tree is a model tree: user tables and indexes, `sqlite_schema` (root 1), the
+backing trees of index methods, and the ephemeral trees of `OpenEphemeral`, `OpenAutoindex`
+and `OpenDup`. A release build refuses
+the path. `Database::new` picks the storage once, from the path
+(`storage::tree_store::tree_storage_for_path`). The pager of each connection then holds a
+`TreeStore`. The opcodes that open a cursor or create, destroy or clear a tree, and the
+transaction and savepoint entry points of the pager, ask it. The VDBE has no code for the
+model: every other call goes through `CursorTrait`. The pager still allocates the root
+pages, keeps the header and takes the locks.
 
-An opcode can make several cursor calls (`IdxInsert` seeks, reads and inserts), and
-`NoConflict` with a NULL makes none. In debug builds the VDBE tells the cursor which opcode
-starts (`CursorTrait::note_opcode`) for `NoConflict` with a NULL, `NewRowid`, `Insert`,
-`IdxInsert` and `IdxDelete`. The calls inside the opcode are not checked one by one; the
-opcode is one step. On an index, every eq-only `SeekGE` gets the rules of `Found`.
+A version of the database is an immutable map from root page to tree. A read transaction
+keeps the version it started with. A write transaction changes a copy, and the first write
+to a tree copies that tree. Commit publishes the copy, rollback drops it. A savepoint (also
+the statement savepoint) keeps the copy of its start, and a rollback to it puts that copy
+back. Temp tables stay on a real B-tree: the temp database has no tree store.
+
+These features return the error `unsupported in model storage: <feature>`: `ATTACH`,
+`VACUUM INTO`, `WITHOUT ROWID` tables, materialized views, the page pragmas `page_count`,
+`page_size`, `freelist_count`, `max_page_count`, and the encryption pragmas. `VACUUM` does
+nothing. `PRAGMA wal_checkpoint` copies only the pages, which hold no rows. `PRAGMA
+journal_mode` with a value does not change the mode; it returns the current mode. `integrity_check` checks the empty pages and returns
+`ok`. The sqltest runner opens `:model:` with `--model-storage` (`--backend rust`), and skips
+the tests that need a pre-built database file.
+
+A process that opened a model tree prints counters (trees, cursors, steps per opcode) to
+stderr at exit.
+
+**What the model cursor infers.** The cursor sees only the calls of `CursorTrait`. An opcode
+can make several calls, and it can make none. The model cursor maps calls to the ops of
+`spec.rs`:
+
+- `seek_to_last` starts `NewRowid`. The reads and the random seeks after it are part of it,
+  and `next` or a seek that misses ends it. After a random seek that misses, the next insert
+  uses that seek.
+- On an index, an eq-only `SeekGE` is `Found`. It is also the seek of `NotFound`,
+  `NoConflict`, `IdxInsert` and `IdxDelete`.
+- An eq-only seek followed by an insert of the same key can be the own seek of `Insert` with
+  `REQUIRE_SEEK` or of `IdxInsert` without `USE_SEEK`, or a seek opcode and an insert that
+  uses its token. The calls are the same. The cursor keeps both readings (they differ only
+  in the direction) and refuses an op only when it is illegal in both.
+- `holds_row` (the no-op check of `Insert`) and `duplicate` (`OpenDup`) are generic
+  `CursorTrait` methods.
+- An insert in place compares keys with the compare of the tree (`Tree::same_entry`), not
+  byte by byte. A hit token names one entry when it has all key columns. The backing trees
+  of an index method compare only a prefix of their records.
+
+What the cursor cannot see, and what it costs:
+
+| Sequence | Why | Cost |
+|---|---|---|
+| `NoConflict` with a NULL | the opcode makes no call | U8 after it is not found. U3 after `NullRow`, `NoConflict` with a NULL and a write is refused although it is legal (the walk filter `MI1` avoids it) |
+| `IdxDelete` | a seek, a read and `Delete`; the cursor ends in the gap with a direction | U2 (`Next` after `IdxDelete`) is not found |
+| `IdxDelete` with P5 of a missing key | the VDBE returns `Corrupt` after the seek and calls no delete | U7 is an error, not a refusal |
+| `Insert` or `IdxInsert` that seeks, after `NullRow` | the own seek reads as a seek opcode, which is legal after `NullRow` | U3 is not found |
+| `IdxInsert` with `NO_OP_DUPLICATE` of a duplicate | the opcode stops after the seek | the position stays on the duplicate instead of no position |
+| U1 and U2 after an eq-only seek and an insert of the same key | two readings | refused only when both readings are illegal |
+
+The undefined tests mark these cases `model_gap`: the `:model:` engine must not refuse them,
+so that a better inference shows up. Every other undefined test requires the refusal from
+the `:model:` engine.
 
 `spec::after_peer_write` gives the shape of the other cursors after a write (section 1).
 The model storage applies it lazily, when a cursor sees that the tree version moved.
@@ -234,6 +284,9 @@ caller must have left the cursor at a `Seeked k` or `At k` position for the same
 - `Insert k` without `REQUIRE_SEEK` is legal only if the previous opcode on that cursor
   was `NotExists`, `SeekRowid`, `NoConflict`, `Found`/`NotFound`, `NewRowid` or `SeekEnd`
   for key `k`, and no write or delete on the same tree happened in between.
+- It is also legal when the cursor is `At k` (an update in place), and when the cursor is in
+  the gap of its own `Delete` of `k` (an `UPDATE` that deletes the row and inserts it again).
+  The B-tree is then at the place of `k`.
 - The model keeps a seek token for this. Any other write by any cursor on the tree
   clears the token.
 - MVCC ignores position, so a missing token only breaks WAL. The harness runs both and

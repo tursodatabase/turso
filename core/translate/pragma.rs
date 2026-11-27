@@ -266,6 +266,25 @@ pub fn translate_pragma(
     let schema_was_explicit = name.namespace.is_some();
     let query_only = connection.get_query_only();
 
+    // A tree store keeps no trees in the pages. The pragmas that read or change the pages
+    // are not supported, and the journal mode stays as it is.
+    let mut body = body;
+    if let Some(store) = pager.tree_store() {
+        match pragma {
+            PragmaName::PageCount
+            | PragmaName::PageSize
+            | PragmaName::FreelistCount
+            | PragmaName::MaxPageCount
+            | PragmaName::EncryptionKey
+            | PragmaName::EncryptionCipher => store.check_feature(&format!(
+                "PRAGMA {}",
+                name.name.as_str().to_ascii_lowercase()
+            ))?,
+            PragmaName::JournalMode => body = None,
+            _ => {}
+        }
+    }
+
     let mode = match body {
         None => query_pragma(
             pragma,

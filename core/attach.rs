@@ -39,6 +39,9 @@ pub fn translate_attach(
             "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
         ));
     }
+    if let Some(store) = connection.get_pager().tree_store() {
+        store.check_feature("ATTACH")?;
+    }
 
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
     // We'll allocate registers for the arguments and call the function

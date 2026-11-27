@@ -37,6 +37,9 @@ pub fn translate_vacuum(
     let schema_name = schema_name.map_or_else(|| "main".to_string(), |n| n.as_str().to_string());
     match into {
         Some(dest_expr) => {
+            if let Some(store) = connection.get_pager().tree_store() {
+                store.check_feature("VACUUM INTO")?;
+            }
             if connection.get_database_id_by_name(&schema_name)? == TEMP_DB_ID {
                 return Ok(());
             }
@@ -105,6 +108,10 @@ pub fn translate_vacuum(
                     "VACUUM is only supported for the main database; schema '{}' is not supported yet",
                     schema_name
                 );
+            }
+            // A tree store keeps no trees in the pages, so there is nothing to compact.
+            if connection.get_pager().tree_store().is_some() {
+                return Ok(());
             }
             program.emit_insn(Insn::Vacuum {
                 db: crate::MAIN_DB_ID,

@@ -11,6 +11,7 @@ use crate::schema::Index;
 use crate::storage::btree::CursorTrait;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
+use crate::types::IndexInfo;
 use crate::Result;
 use std::any::Any;
 
@@ -27,6 +28,8 @@ pub enum TreeKind<'a> {
     /// A table without a rowid: its rows are stored as index records.
     WithoutRowidTable,
     Index(&'a Index),
+    /// An index tree that has no schema entry (the backing store of an index method).
+    Keys(&'a Arc<IndexInfo>),
 }
 
 /// A saved version of the trees, for a savepoint.

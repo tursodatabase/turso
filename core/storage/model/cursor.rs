@@ -7,7 +7,7 @@
 //! `Found`, and an `Insert` or `IdxInsert` that does not seek uses the seek token of the last
 //! move. Facts that no call shows are listed in SPEC section 2e.
 
-use super::spec::{self, Dir, Outcome, Pos, Tree, Write};
+use super::spec::{self, Dir, Outcome, Pos, Token, Tree, Write};
 use super::stats;
 use super::store::ConnTrees;
 use crate::storage::btree::{BTreeKey, CursorStep, CursorTrait};
@@ -373,7 +373,12 @@ impl ModelCursor {
             // `NewRowid` looks for a free random rowid.
             let found = self.tree.read(&self.info, |t| t.rows.seek(&key, op));
             if found.is_none() {
+                // The rowid is free, and the insert that follows uses this seek.
                 self.finish_new_rowid();
+                self.shape.token = Token::Key {
+                    key: key.clone(),
+                    hit: false,
+                };
             }
             found.is_some()
         } else if op == (SeekOp::GE { eq_only: true }) {
@@ -550,11 +555,19 @@ impl Tree for Rows {
             Rows::Table(_) => rowid_of(token) == rowid_of(k),
             Rows::Index(info, _) => {
                 let (token, k) = (record_of(token), record_of(k));
-                // A hit names one entry only with the whole key. A miss names the place of every
-                // key with that prefix.
-                (!hit || token.column_count() == k.column_count())
+                // A hit names one entry only with all key columns. A miss names the place of
+                // every key with that prefix. (The key columns can be fewer than the columns
+                // of a record: the backing trees of an index method compare a prefix only.)
+                (!hit || token.column_count() >= info.key_info.len())
                     && cmp(info, k, token, Ordering::Equal).is_eq()
             }
+        }
+    }
+
+    fn same_entry(&self, a: &Key, b: &Key) -> bool {
+        match self {
+            Rows::Table(_) => rowid_of(a) == rowid_of(b),
+            Rows::Index(info, _) => cmp(info, record_of(a), record_of(b), Ordering::Equal).is_eq(),
         }
     }
 

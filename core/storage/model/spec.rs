@@ -245,6 +245,10 @@ pub trait Tree {
     fn token_allows(&self, token: &Self::Probe, hit: bool, k: &Self::Key) -> bool;
     /// True when `k` is above every entry.
     fn above_all(&self, k: &Self::Key) -> bool;
+    /// True when `a` and `b` name the same entry: an insert of one replaces the other.
+    fn same_entry(&self, a: &Self::Key, b: &Self::Key) -> bool {
+        a == b
+    }
 }
 
 /// The shape of a cursor and the op it runs, with the types of tree `T`.
@@ -276,8 +280,9 @@ pub fn step<T: Tree>(t: &T, c: &TShape<T>, op: &TOp<T>) -> Result<TOutcome<T>, I
             // Without its own seek an insert is legal at the place of the key: the seek token
             // of the key, the entry of the key under the cursor (an update in place), or the
             // gap of the key that this cursor just deleted.
-            let in_place = matches!(&c.pos, Pos::At(k) if k == key);
-            let reinsert = c.token == Token::Deleted && c.pos == Pos::Gone(key.clone());
+            let in_place = matches!(&c.pos, Pos::At(k) if t.same_entry(k, key));
+            let reinsert =
+                c.token == Token::Deleted && matches!(&c.pos, Pos::Gone(k) if t.same_entry(k, key));
             if *use_seek && !in_place && !reinsert && !token_allows(t, &c.token, key) {
                 return illegal(Rule::U5, "an insert without the seek token of its key");
             }

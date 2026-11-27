@@ -116,6 +116,7 @@ fn index_info(kind: &TreeKind<'_>) -> Result<Option<Arc<IndexInfo>>> {
         TreeKind::Table => Ok(None),
         TreeKind::WithoutRowidTable => Err(unsupported("WITHOUT ROWID")),
         TreeKind::Index(index) => Ok(Some(Arc::new(IndexInfo::new_from_index(index)?))),
+        TreeKind::Keys(info) => Ok(Some(Arc::clone(info))),
     }
 }
 
