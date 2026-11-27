@@ -292,15 +292,18 @@ you fix a bug, the test fails with "does not fail any more". Then remove the `kn
 wrapper: the body is a normal regression test. "WAL" means the B-tree path. An id with the
 prefix `IDX_` is the same bug as the id without it, found with an index cursor.
 
-SQL reachability: only CL1 is reproduced from SQL (issue 9285). For D1, G4, N1, N4, OV1, R1
-and O1 about 100 hand-written statements and 2,100 random transactions (with and without
+SQL reachability: CL1 (issue 9285) and D1 are reproduced from SQL. D1: a one-pass `UPDATE` of
+a table with a `UNIQUE ON CONFLICT REPLACE` column scans, seeks, deletes and inserts with one
+table cursor; after the `Insert`, `Next` loses the rows that are in the B-tree (MVCC, rows
+checkpointed; `known_bug_d1_update_with_replace_conflict_then_next`, PR 12484). For G4, N1,
+N4, OV1, R1 and O1 about 100 hand-written statements and 2,100 random transactions (with and without
 a checkpoint, compared with sqlite3 3.51.0) gave no difference. G4 is tracked in issue 8197,
 which says that no ordinary SQL reaches it. The translator uses two-pass plans (an
 ephemeral table) wherever one cursor would write and another would read the same tree.
 
 | Id | Engine | Bug |
 |---|---|---|
-| D1 | MVCC, checkpointed | After `Insert`, `Next` and `Prev` lose the position |
+| D1 | MVCC, checkpointed | After `Insert`, `Next` and `Prev` lose the position. From SQL: `INSERT INTO t VALUES (3,3,0)`, checkpoint, `INSERT INTO t VALUES (1,1,0),(2,2,0)`, then `UPDATE t SET u = CASE WHEN id = 1 THEN 2 ELSE u END, v = v + 1` with `u UNIQUE ON CONFLICT REPLACE` leaves row 3 at `v = 0` |
 | G4 | MVCC, checkpointed | After an overwrite by `Insert` on the same cursor, `Column` reads the old record |
 | R1 | all | `RowData` and `Column` disagree: on a null row, after `IdxInsert`, on a cursor without an entry, and with a pending `DeferredSeek` |
 | O1 | ephemeral | `OpenDup` rejects index cursors |

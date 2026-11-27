@@ -771,6 +771,47 @@ mod tests {
         });
     }
 
+    /// D1 from SQL: the one-pass `UPDATE` of a table with a `UNIQUE ON CONFLICT REPLACE`
+    /// column. Rows 15 and 25 are written in this run, 10, 20 and 30 are in the B-tree. The
+    /// scan is on row 15; the conflict check deletes row 25, the update deletes and inserts row
+    /// 15 again, then `Next` must go to 20. MVCC with the rows checkpointed ends the scan, so
+    /// the `UPDATE` skips rows 20 and 30. SQL:
+    /// `CREATE TABLE t(id INTEGER PRIMARY KEY, u UNIQUE ON CONFLICT REPLACE, v);`
+    /// `INSERT INTO t VALUES (3,3,0); PRAGMA wal_checkpoint(TRUNCATE);`
+    /// `INSERT INTO t VALUES (1,1,0),(2,2,0);`
+    /// `UPDATE t SET u = CASE WHEN id = 1 THEN 2 ELSE u END, v = v + 1;` leaves row 3 at v = 0.
+    ///
+    /// Fails today because of D1; see SPEC section 5b.
+    #[test]
+    fn known_bug_d1_update_with_replace_conflict_then_next() {
+        known_bug(
+            "D1",
+            "Mvcc/Checkpointed: engine differs from the model",
+            || {
+                let insert = |rowid| Insert {
+                    cur: 0,
+                    rowid,
+                    value: 1,
+                    require_seek: true,
+                };
+                let ops = [
+                    insert(15),
+                    insert(25),
+                    Rewind(0),
+                    Next(0),
+                    SeekRowid(0, 25),
+                    Delete(0),
+                    SeekRowid(0, 15),
+                    Delete(0),
+                    insert(15),
+                    Next(0),
+                    RowId(0),
+                ];
+                agree_all(ROWS, 1, &ops);
+            },
+        );
+    }
+
     /// G4: `Insert` that replaces a row. `Column` on the same cursor must read the new
     /// record. MVCC with the row in the B-tree reads the old record (200).
     ///
@@ -837,10 +878,11 @@ mod tests {
                 1,
                 &[insert(25), SeekRowid(0, 25), Delete(0), Next(0), RowId(0)],
             );
+            // `SeekLE` gives a backward position: `Prev` after a `SeekRowid` hit is U1.
             agree_all(
                 ROWS,
                 1,
-                &[insert(25), SeekRowid(0, 25), Delete(0), Prev(0), RowId(0)],
+                &[insert(25), SeekLE(0, 25), Delete(0), Prev(0), RowId(0)],
             );
             // An update of a row that is in the B-tree.
             agree_all(
