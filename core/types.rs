@@ -803,12 +803,40 @@ impl<V: AsValueRef> AsValueRef for &V {
     }
 }
 
+/// What a SQL dialect does with a floating-point NaN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NanPolicy {
+    Null,
+    Preserve,
+}
+
+impl NanPolicy {
+    pub(crate) fn for_dialect(dialect: &dyn crate::Dialect) -> Self {
+        if dialect.nan_is_a_value() {
+            Self::Preserve
+        } else {
+            Self::Null
+        }
+    }
+
+    #[inline]
+    pub(crate) fn normalize(self, value: &mut Value) {
+        if self == Self::Null && value.is_nan() {
+            *value = Value::Null;
+        }
+    }
+}
+
 impl Value {
     pub const fn from_f64(f: f64) -> Self {
         match Double::non_nan(f) {
             Some(nn) => Self::Numeric(Numeric::Float(nn)),
             None => Self::Null,
         }
+    }
+
+    pub fn is_nan(&self) -> bool {
+        matches!(self, Self::Numeric(Numeric::Float(f)) if f.is_nan())
     }
 
     pub const fn from_i64(i: i64) -> Self {

@@ -2884,7 +2884,12 @@ impl Connection {
         stmt.run_collect_rows()
     }
 
-    /// The SQL dialect of the database this connection belongs to.
+    /// The NaN rule of the database this connection belongs to.
+    pub(crate) fn nan_policy(&self) -> crate::types::NanPolicy {
+        self.db.nan_policy()
+    }
+
+    /// The SQL dialect this database was opened with.
     pub fn dialect(&self) -> Arc<dyn crate::Dialect> {
         self.db.dialect()
     }
