@@ -1045,6 +1045,50 @@ fn test_cursor_basic() {
     assert!(cursor.is_empty());
 }
 
+/// What this test checks: prev() after an exists() that did not find the key moves the cursor
+/// to the last visible row and then backwards through the table, as after last().
+/// Why this matters: exists() leaves the cursor at End with no peek values, and prev() from that
+/// position used to call last() while its own state was set, which failed an assertion.
+#[test]
+fn test_prev_after_failed_exists_does_not_panic() {
+    let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2, 3, 4]);
+    // The last row is not visible to this transaction, so prev() must skip it.
+    assert!(db
+        .mvcc_store
+        .delete(tx_id, RowID::new(table_id, RowKey::Int(4)))
+        .unwrap());
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            btree_root_page,
+            1,
+        )),
+    )
+    .unwrap();
+
+    let found = cursor.exists(&Value::from_i64(99)).unwrap();
+    assert!(matches!(found, IOResult::Done(false)));
+
+    let mut rowids = Vec::new();
+    loop {
+        let res = cursor.prev().unwrap();
+        assert!(matches!(res, IOResult::Done(())));
+        if !cursor.has_record() {
+            break;
+        }
+        let IOResult::Done(Some(rowid)) = cursor.rowid().unwrap() else {
+            panic!("cursor has a record but no rowid");
+        };
+        rowids.push(rowid);
+    }
+    assert_eq!(rowids, vec![3, 2, 1]);
+}
+
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]

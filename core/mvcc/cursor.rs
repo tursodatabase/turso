@@ -1611,13 +1611,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
-            // If End and peek not initialized, initialize via last()
+            // If End and peek not initialized, initialize the peek values from the last rows
             if matches!(self.current_pos, CursorPosition::End) {
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     self.state
                         .replace(MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized));
-                    return_if_io!(self.last());
                 } else {
                     self.state
                         .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
@@ -1632,7 +1631,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.state.as_ref().expect("prev state is not initialized"),
             MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized)
         ) {
-            return_if_io!(self.last());
+            // The MVCC iterator is initialized after the B-tree, because the B-tree step can
+            // yield for IO and is then called again.
+            return_if_io!(self.advance_btree_backward());
+            self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+            self.init_mvcc_iterator_backward()?;
             self.state
                 .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
         }
@@ -1644,7 +1647,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // Determine which cursor(s) need to be advanced based on current position
             let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::End => {
-                    // First call after last() - peek values should already be populated
+                    // First call after last() or after the peek values were initialized
+                    // above - just need to pick the larger one
                     (false, false)
                 }
                 CursorPosition::Loaded {
