@@ -45,7 +45,6 @@ miette = { workspace = true, features = ["fancy"] }
 # File globbing
 glob = "0.3"
 
-itertools = { workspace = true }
 chumsky = { workspace = true }
 
 # Database generation
