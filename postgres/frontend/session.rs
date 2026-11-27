@@ -1653,7 +1653,8 @@ fn relation_name_is_taken(
             let ns = namespace.target.id;
             (
                 schema.get_table(ns, table).is_some() && !schema.is_materialized_view(ns, table),
-                schema.relation_kind(ns, name).is_some(),
+                crate::classes::class_catalog(schema)
+                    .is_some_and(|catalog| catalog.name_is_taken(ns, name)),
             )
         });
         taken = name_exists;

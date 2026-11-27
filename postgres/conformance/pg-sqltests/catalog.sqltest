@@ -2,12 +2,53 @@
 
 @database :memory:
 
+test pg-attribute-index-and-view-columns-do-not-inherit-not-null {
+    CREATE TABLE source (id int PRIMARY KEY, value text NOT NULL);
+    CREATE INDEX source_value_idx ON source(value);
+    CREATE VIEW source_view AS SELECT id, value FROM source;
+    SELECT c.relname, a.attname, a.attnotnull
+    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND a.attnum > 0
+    ORDER BY c.relname, a.attnum;
+}
+expect {
+    source|id|t
+    source|value|t
+    source_pkey|id|f
+    source_value_idx|value|f
+    source_view|id|f
+    source_view|value|f
+}
+
 test pg-collation-pgdump-columns {
     SELECT tableoid, oid, collname, collnamespace, collowner, collencoding
     FROM pg_catalog.pg_collation
     WHERE oid >= 16384;
 }
 expect {}
+
+test pg-attribute-view-and-index-user-types {
+    CREATE TYPE mood AS ENUM ('happy', 'sad');
+    CREATE DOMAIN label AS text;
+    CREATE TABLE typed (m mood, l label);
+    CREATE INDEX typed_idx ON typed(m, l);
+    CREATE VIEW typed_view AS SELECT m, l FROM typed;
+    SELECT c.relname, a.attname, t.typname
+    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+    JOIN pg_type t ON t.oid = a.atttypid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND a.attnum > 0
+    ORDER BY c.relname, a.attnum;
+}
+expect {
+    typed|m|mood
+    typed|l|label
+    typed_idx|m|mood
+    typed_idx|l|label
+    typed_view|m|mood
+    typed_view|l|label
+}
 
 setup indexed_tables {
     CREATE TABLE items (id int, name text, price int);
@@ -1724,7 +1765,6 @@ expect {
     kept_seq
 }
 
-@compat-gap "syntax:catalog"
 test pg-primary-key-dump-catalogs {
     CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
     CREATE SEQUENCE after_indexes;
@@ -1747,12 +1787,6 @@ expect {
     1
 }
 
-expect @tursopg {
-    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX __turso_internal_pk_index_items ON public.items USING btree (id)
-    1
-    1
-}
-
 test pg-primary-key-with-other-unique-constraint {
     CREATE TABLE keys (a TEXT UNIQUE, b TEXT, c TEXT, PRIMARY KEY (b, c));
     SELECT c.contype, i.indkey, CASE WHEN i.indisprimary THEN 1 ELSE 0 END,
@@ -1766,7 +1800,6 @@ expect {
     u|1|0|UNIQUE (a)
 }
 
-@compat-gap "syntax:catalog"
 test pg-primary-key-named-and-quoted {
     CREATE TABLE "quoted table" (payload TEXT, "key column" INTEGER CONSTRAINT "custom key" PRIMARY KEY);
     SELECT c.conname, i.indkey, pg_get_constraintdef(c.oid), pg_get_indexdef(c.conindid)
@@ -1778,11 +1811,6 @@ test pg-primary-key-named-and-quoted {
 expect {
     custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
     custom key|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
-}
-
-expect @tursopg {
-    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
-    __turso_internal_pk_index_quoted table|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
 }
 
 test pg-primary-key-after-identical-unique {
@@ -1799,7 +1827,6 @@ expect {
     t|t_pkey|p|PRIMARY KEY (a)|1
 }
 
-@compat-gap "syntax:catalog"
 test pg-primary-key-index-name-collisions {
     CREATE TABLE t_pkey(x INTEGER);
     CREATE INDEX t_pkey1 ON t_pkey(x);
@@ -1820,11 +1847,6 @@ expect {
     t_pkey3|t_pkey3|CREATE UNIQUE INDEX t_pkey3 ON public.t USING btree (id)
     1
     t_pkey3|t_pkey3
-}
-expect @tursopg {
-    t_pkey|__turso_internal_pk_index_t|CREATE UNIQUE INDEX __turso_internal_pk_index_t ON public.t USING btree (id)
-    1
-    t_pkey|__turso_internal_pk_index_t
 }
 
 test pg-attribute-not-null-dump {
@@ -2264,23 +2286,49 @@ expect error {
     COMMENT ON a system catalog relation is not supported
 }
 
-@skip-if postgres "PostgreSQL stores comments on the index of a constraint"
+@compat-gap "syntax:COMMENT ON INDEX of a constraint"
 test comment-on-primary-key-index-is-not-supported {
     CREATE TABLE comment_keyed (id int PRIMARY KEY, a int UNIQUE);
     COMMENT ON INDEX comment_keyed_pkey IS 'x';
 }
+expect {}
 @sqlstate 0A000
-expect error {
+expect @tursopg error {
     COMMENT ON the index of a constraint is not supported
 }
 
-@skip-if postgres "PostgreSQL stores comments on the index of a constraint"
+@compat-gap "syntax:COMMENT ON INDEX of a constraint"
 test comment-on-unique-constraint-index-is-not-supported {
     CREATE TABLE comment_unique (a int UNIQUE, b int, CONSTRAINT comment_named_unique UNIQUE (b));
     COMMENT ON INDEX comment_named_unique IS 'x';
 }
+expect {}
 @sqlstate 0A000
-expect error {
+expect @tursopg error {
+    COMMENT ON the index of a constraint is not supported
+}
+
+@compat-gap "syntax:COMMENT ON INDEX of a constraint"
+test comment-on-renamed-tables-constraint-index-is-not-supported {
+    CREATE TABLE original (id int PRIMARY KEY);
+    ALTER TABLE original RENAME TO renamed;
+    COMMENT ON INDEX original_pkey IS 'x';
+}
+expect {}
+@sqlstate 0A000
+expect @tursopg error {
+    COMMENT ON the index of a constraint is not supported
+}
+
+@compat-gap "syntax:COMMENT ON INDEX of a constraint"
+test comment-on-numbered-constraint-index-is-not-supported {
+    CREATE TABLE numbered_pkey (id int);
+    CREATE TABLE numbered (id int PRIMARY KEY);
+    COMMENT ON INDEX numbered_pkey1 IS 'x';
+}
+expect {}
+@sqlstate 0A000
+expect @tursopg error {
     COMMENT ON the index of a constraint is not supported
 }
 
@@ -2750,4 +2798,155 @@ test pg-depend-has-the-relations-that-a-view-reads {
 expect {
     dep_base|n
     dep_other|n
+}
+
+test pg-table-is-visible-missing-oid {
+    SELECT pg_table_is_visible(0), pg_table_is_visible(NULL);
+}
+expect {
+    |
+}
+
+test pg-table-is-visible-search-path {
+    CREATE SCHEMA visible_first;
+    CREATE SCHEMA visible_second;
+    CREATE TABLE visible_first.same_name (x int);
+    CREATE VIEW visible_second.same_name AS SELECT 1 AS x;
+    CREATE VIEW visible_second.other_name AS SELECT 2 AS x;
+    SET search_path = missing_schema, visible_first, visible_second;
+    SELECT n.nspname, c.relname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('visible_first', 'visible_second')
+    ORDER BY 1, 2;
+    SET search_path = visible_second;
+    SELECT n.nspname, c.relname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('visible_first', 'visible_second')
+    ORDER BY 1, 2;
+}
+expect {
+    visible_first|same_name|t
+    visible_second|other_name|t
+    visible_second|same_name|f
+    visible_first|same_name|f
+    visible_second|other_name|t
+    visible_second|same_name|t
+}
+
+test pg-table-is-visible-catalog-search-path {
+    CREATE VIEW public.pg_class AS SELECT 1 AS x;
+    SELECT n.nspname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'pg_class' ORDER BY 1;
+    SET search_path = public, pg_catalog;
+    SELECT n.nspname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'pg_class' ORDER BY 1;
+    SET search_path = '';
+    SELECT n.nspname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'pg_class' ORDER BY 1;
+}
+expect {
+    pg_catalog|t
+    public|f
+    pg_catalog|f
+    public|t
+    pg_catalog|t
+    public|f
+}
+
+test pg-class-ctas-reads-existing-relations {
+    CREATE TABLE catalog_source (x int);
+    CREATE TABLE catalog_copy AS
+        SELECT relname, relnatts FROM pg_class WHERE relname = 'catalog_source';
+    SELECT * FROM catalog_copy;
+    CREATE TABLE catalog_self AS
+        SELECT oid FROM pg_class WHERE relname = 'catalog_self';
+    SELECT count(*) FROM catalog_self;
+    SELECT relname, relnatts FROM pg_class
+        WHERE relname IN ('catalog_copy', 'catalog_self') ORDER BY relname;
+}
+expect {
+    catalog_source|1
+    0
+    catalog_copy|2
+    catalog_self|1
+}
+
+test pg-class-initial-relation-statistics {
+    CREATE TABLE stats_source (x int);
+    CREATE INDEX stats_ix ON stats_source(x);
+    CREATE VIEW stats_view AS SELECT * FROM stats_source;
+    CREATE SEQUENCE stats_seq;
+    SELECT relname, relpages, reltuples::int FROM pg_class
+        WHERE relname IN ('stats_source', 'stats_ix', 'stats_view', 'stats_seq')
+        ORDER BY relname;
+    INSERT INTO stats_source VALUES (1), (2);
+    SELECT relpages, reltuples::int FROM pg_class WHERE relname = 'stats_view';
+}
+expect {
+    stats_ix|1|0
+    stats_seq|1|1
+    stats_source|0|-1
+    stats_view|0|-1
+    0|-1
+}
+
+test pg-class-builtin-view-statistics {
+    SELECT relname, relpages, reltuples::int FROM pg_class
+        WHERE relnamespace = 11 AND relname IN
+            ('pg_indexes', 'pg_policies', 'pg_roles', 'pg_sequences', 'pg_settings', 'pg_tables')
+        ORDER BY relname;
+}
+expect {
+    pg_indexes|0|-1
+    pg_policies|0|-1
+    pg_roles|0|-1
+    pg_sequences|0|-1
+    pg_settings|0|-1
+    pg_tables|0|-1
+}
+
+# PostgreSQL indexes its physical catalogs. These catalog indexes are not
+# implemented by tursopg's virtual catalogs and must not be advertised.
+@compat-gap "syntax:catalog"
+test pg-class-builtin-catalog-index-presence {
+    SELECT relname, CASE WHEN relhasindex THEN 1 ELSE 0 END FROM pg_class
+        WHERE relnamespace = 11 AND relname IN ('pg_class', 'pg_type') ORDER BY relname;
+}
+expect {
+    pg_class|1
+    pg_type|1
+}
+expect @tursopg {
+    pg_class|0
+    pg_type|0
+}
+
+# Constraint indexes have SQL names even when their engine storage is a rowid
+# or an automatic index. Unnamed indexes must avoid those names in their schema.
+test pg-unnamed-index-avoids-constraint-names {
+    CREATE TABLE x (y int CONSTRAINT x_y_idx PRIMARY KEY);
+    CREATE INDEX ON x (y);
+    CREATE INDEX ON x (y);
+    CREATE SCHEMA other;
+    CREATE TABLE other.x (y text CONSTRAINT x_y_idx UNIQUE);
+    CREATE INDEX ON other.x (y);
+    SELECT n.nspname, c.relname FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'i' AND n.nspname IN ('public', 'other')
+    ORDER BY n.nspname, c.relname;
+}
+expect {
+    other|x_y_idx
+    other|x_y_idx1
+    public|x_y_idx
+    public|x_y_idx1
+    public|x_y_idx2
 }

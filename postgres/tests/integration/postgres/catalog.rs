@@ -56,7 +56,7 @@ fn test_physical_catalog_tableoid_is_hidden(db: TempDatabase) {
         conn.prepare("SELECT * FROM pg_class")
             .unwrap()
             .num_columns(),
-        33
+        34
     );
     assert_eq!(
         conn.prepare("SELECT * FROM pg_namespace")

@@ -491,10 +491,7 @@ impl PostgreSQLTranslator {
                             let pk_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
                                 name: if constraint.conname.is_empty() {
-                                    Some(exact_name(format!(
-                                        "{}_pkey",
-                                        bare_table_name(&tbl_name_str)
-                                    )))
+                                    None
                                 } else {
                                     Some(exact_name(constraint.conname.clone()))
                                 },
@@ -905,9 +902,7 @@ impl PostgreSQLTranslator {
         // PRIMARY KEY (only on column level if there's no table-level PK)
         if is_primary_key && !has_table_pk {
             constraints.push(ast::NamedColumnConstraint {
-                name: Some(pk_conname.unwrap_or_else(|| {
-                    exact_name(format!("{}_pkey", bare_table_name(tbl_name.name.as_str())))
-                })),
+                name: pk_conname,
                 constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
@@ -9398,12 +9393,9 @@ pub fn unnamed_index_name<E>(
     }
 
     let columns = column_names.join("_");
-    let mut name = make_object_name(&table, &columns, "idx");
-    let mut number = 0;
-    while name_is_taken(schema, &table, &name)? {
-        number += 1;
-        name = make_object_name(&table, &columns, &format!("idx{number}"));
-    }
+    let name = available_object_name(&table, Some(&columns), "idx", |name| {
+        name_is_taken(schema, &table, name)
+    })?;
     let on_location = pg_query::scan(sql)
         .expect("a statement that parses also scans")
         .tokens
@@ -9421,12 +9413,29 @@ pub fn unnamed_index_name<E>(
 /// identifier, and refuses an enum label longer than that.
 const MAX_IDENTIFIER_BYTES: usize = 63;
 
-/// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, with the longer
-/// of the table and column parts shortened first until the name fits in
-/// [`MAX_IDENTIFIER_BYTES`], so the name can be referred to again.
-fn make_object_name(table: &str, columns: &str, label: &str) -> String {
-    let available = MAX_IDENTIFIER_BYTES - label.len() - 2;
-    let (mut table_len, mut columns_len) = (table.len(), columns.len());
+/// Chooses a generated relation name, adding a suffix until the namespace
+/// accepts it. Rebuild each candidate so the suffix fits in the identifier limit.
+pub fn available_object_name<E>(
+    table: &str,
+    columns: Option<&str>,
+    label: &str,
+    mut is_taken: impl FnMut(&str) -> Result<bool, E>,
+) -> Result<String, E> {
+    let mut name = make_object_name(table, columns, label);
+    let mut number = 0;
+    while is_taken(&name)? {
+        number += 1;
+        name = make_object_name(table, columns, &format!("{label}{number}"));
+    }
+    Ok(name)
+}
+
+/// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, omitting the
+/// column part for primary keys. Shorten the longer part first, preserving
+/// the label and UTF-8 boundaries, so the name can be referred to again.
+pub fn make_object_name(table: &str, columns: Option<&str>, label: &str) -> String {
+    let available = MAX_IDENTIFIER_BYTES - label.len() - 1 - usize::from(columns.is_some());
+    let (mut table_len, mut columns_len) = (table.len(), columns.map_or(0, str::len));
     while table_len + columns_len > available {
         if table_len > columns_len {
             table_len -= 1;
@@ -9434,11 +9443,14 @@ fn make_object_name(table: &str, columns: &str, label: &str) -> String {
             columns_len -= 1;
         }
     }
-    format!(
-        "{}_{}_{label}",
-        char_boundary_prefix(table, table_len),
-        char_boundary_prefix(columns, columns_len)
-    )
+    let table = char_boundary_prefix(table, table_len);
+    match columns {
+        Some(columns) => format!(
+            "{table}_{}_{label}",
+            char_boundary_prefix(columns, columns_len)
+        ),
+        None => format!("{table}_{label}"),
+    }
 }
 
 /// The longest prefix of `s` that has at most `max_len` bytes and does not

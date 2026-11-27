@@ -353,7 +353,10 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
-        "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
+        "pg_table_is_visible"(FunctionArity::Exact(1), false) => {
+            oid_arg(args, 0)?.and_then(|oid| exec_pg_table_is_visible(connection, oid))
+        },
+        "pg_function_is_visible" | "pg_type_is_visible"(
             FunctionArity::Exact(1), true
         ) => oid_arg(args, 0)?.map(exec_pg_is_visible),
         "pg_encoding_to_char"(FunctionArity::Exact(1), true) => {
@@ -952,6 +955,31 @@ pub(crate) fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> 
 
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
     role_name_by_oid(&connection_roles(conn), oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
+}
+
+fn exec_pg_table_is_visible(conn: &Connection, oid: i64) -> Option<Boolean> {
+    let schema = conn.current_schema();
+    let catalog = crate::classes::class_catalog(&schema)?;
+    let relation = catalog.get_by_oid(oid)?;
+    for name in crate::session::current_schemas(conn, true) {
+        let namespace = if name == "pg_catalog" {
+            turso_core::namespace::NamespaceId::ROOT
+        } else {
+            let Some(qualifier) = conn.qualifier(&name) else {
+                continue;
+            };
+            qualifier.target.id
+        };
+        if namespace == relation.relnamespace {
+            return Some(Boolean(true));
+        }
+        // Any earlier relation with the same SQL name hides this one, even
+        // when the earlier relation has a different kind.
+        if catalog.name_is_taken(namespace, &relation.relname) {
+            return Some(Boolean(false));
+        }
+    }
+    Some(Boolean(false))
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {

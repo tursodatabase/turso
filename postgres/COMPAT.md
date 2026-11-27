@@ -59,7 +59,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE TABLE AS / SELECT INTO | 🟡 Partial | Schema derived from the SELECT; a result column whose type converts values (timestamptz, timestamp, date, time, uuid, json, numeric, boolean, a comparison or other condition, inet, domains, now()), is rejected with 0A000 because the copy would be a plain column; a copy of a varchar(n), smallint or integer column keeps the values but not the length or range check; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
 | ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, OWNER TO, ENABLE/DISABLE ROW LEVEL SECURITY work (RENAME TABLE, like CREATE INDEX, needs CREATE on the schema, which only a superuser has until GRANT exists); one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS (except for OWNER TO) and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
-| CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS. An index expression or a WHERE clause that uses `->` or `->>` fails with `0A000` |
+| CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS. An omitted name avoids every relation name in the table's schema, including constraint indexes. An index expression or a WHERE clause that uses `->` or `->>` fails with `0A000` |
 | CREATE VIEW | ✅ Supported | A table named without a schema is bound to the schema it is found in when the view is created, so the view keeps reading it when `search_path` changes; column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Stored in `pg_description` for tables, views, materialized views, indexes, sequences, table columns and schemas. Any other kind of object, a column of a view, a catalog relation such as `pg_class`, and the index of a PRIMARY KEY or UNIQUE constraint, is rejected with 0A000 |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
@@ -89,9 +89,21 @@ The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_database`, `pg_roles` (built-in `postgres` superuser and `pg_database_owner`, and roles from `CREATE ROLE`), `pg_auth_members` (memberships from `GRANT role TO role`), `pg_proc`, `pg_am`,
 `pg_policy` (row-level security policies, with `polqual` and `polwithcheck`
 as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Present but
-always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
+always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_class` is a virtual table with all 34 PostgreSQL 18 columns and a hidden
+`tableoid`. It combines user relation rows from a private physical table with
+built-in catalog rows from the running binary. DDL updates the physical rows
+in the same transaction, and schema loading rejects missing or orphaned user
+identities. Column counts, check counts, index presence and ACL display text
+are derived from the current schema and roles instead of stored a second time.
+Changes to built-in catalog definitions do not require file updates.
+Views report zero pages and an unknown row estimate (`reltuples = -1`). Stored
+relations report initial estimates; collected PostgreSQL planner statistics are
+not implemented.
+Catalog indexes are not implemented, so built-in catalogs report
+`relhasindex = false`; PostgreSQL reports true for its indexed catalogs.
 `pg_description` is a stored table. It has the comments that `COMMENT ON`
 stored, and the default `standard public schema` comment for `public`, so
 pg_dump does not emit a command to clear that comment on restore. Dropping a
@@ -100,8 +112,9 @@ relation, a column or a schema deletes its comments. The public schema reports
 for PUBLIC. These are catalog defaults; role management is not implemented.
 `pg_depend` has the rows of each view's `_RETURN` rule: the rule is part of
 the view, and depends on each table and view that the view reads, as whole
-relations and not column by column. The rule is not in `pg_rewrite` and the
-view is not in `pg_class`. DROP reads these rows to find the views that depend
+relations and not column by column. The rule is in `pg_rewrite` and the
+view is in `pg_class` with `relhasrules` set. The rule action is SQL text,
+not a PostgreSQL query tree. DROP reads these rows to find the views that depend
 on what it drops.
 `pg_operator` has the rows of PostgreSQL 18, with PostgreSQL's oids, for the
 operators `=`, `<>`, `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/`, `%`, `&`, `|`,
@@ -211,6 +224,8 @@ forms; the first schema of `search_path` that exists), `current_schemas(boolean)
 `obj_description()`/`col_description()` read `pg_description`; `obj_description()`
 knows the catalogs `pg_class` and `pg_namespace` and returns NULL for any other.
 A call of either in a column DEFAULT, a CHECK constraint or an index, or with an aggregate or window function in an argument, is rejected with 0A000.
+`pg_table_is_visible(oid)` checks the current search path and name shadowing,
+including the implicit position of `pg_catalog`, and returns NULL for an unknown OID.
 DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
@@ -834,3 +849,8 @@ Upgrade is not supported.
 Not applicable: the Turso Postgres frontend is Rust and builds on every
 platform Turso supports; PostgreSQL's platform/compiler feature entries do
 not carry over.
+
+Only implemented catalogs have relation identities in `pg_class`; empty
+compatibility placeholders do not. Catalog relation identities come from the running binary. They use
+PostgreSQL 18's OIDs in `pg_catalog`. Their attribute counts describe the columns
+that this frontend exposes, and `pg_attribute` lists those same columns.
