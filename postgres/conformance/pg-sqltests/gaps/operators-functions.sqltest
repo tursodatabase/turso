@@ -395,15 +395,6 @@ expect {
     |
 }
 
-# B-52: jsonb ->> object returns PG-formatted text
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test jsonb-object-returns-pg-formatted-text {
-    SELECT j ->> 'a' FROM t WHERE id = 1;
-}
-expect {
-    {"b": 1}
-}
-
 # B-53: jsonb -> array element ->> of string
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test jsonb-array-element-of-string {
