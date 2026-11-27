@@ -2878,3 +2878,19 @@ expect {
     catalog_copy|2
     catalog_self|1
 }
+
+# PostgreSQL indexes its physical catalogs. These catalog indexes are not
+# implemented by tursopg's virtual catalogs and must not be advertised.
+@compat-gap "syntax:catalog"
+test pg-class-builtin-catalog-index-presence {
+    SELECT relname, CASE WHEN relhasindex THEN 1 ELSE 0 END FROM pg_class
+        WHERE relnamespace = 11 AND relname IN ('pg_class', 'pg_type') ORDER BY relname;
+}
+expect {
+    pg_class|1
+    pg_type|1
+}
+expect @tursopg {
+    pg_class|0
+    pg_type|0
+}

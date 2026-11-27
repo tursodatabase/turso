@@ -439,6 +439,8 @@ impl ClassCatalog {
                         .expect("built-in identity");
                     (
                         crate::catalog::builtin_catalog_columns(schema, name).len(),
+                        // FIXME(pg-catalog): Catalog indexes are not implemented.
+                        // Derive this flag from their identities when they are.
                         false,
                         0,
                         shared,
