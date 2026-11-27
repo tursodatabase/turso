@@ -1,0 +1,1779 @@
+DataSource after connection is closed successfully::dataSource.isInitialized should be false
+DataSource after connection is closed successfully::should not be able to close already closed connection
+DataSource after connection is established successfully::dataSource.isInitialized should be true
+DataSource after connection is established successfully::entity manager should be accessible
+DataSource after connection is established successfully::should be able to close a connection
+DataSource after connection is established successfully::should not be able to connect again
+DataSource generate a schema when dataSource.synchronize is called::database should be empty after schema is synced with dropDatabase flag
+DataSource skip schema generation when synchronize option is set to false::database should be empty after schema sync
+DataSource working with repositories after connection is established successfully::should be able to get simple entity repository
+DataSource working with repositories after connection is established successfully::should be able to get tree entity repository
+base entity::test if DataSource calls `useDataSource` of the provided entities
+base entity::test if DataSource calls `useDataSource` of the provided entities in the entities directory
+better-sqlite3 driver > enable wal::github issues > #9410 The better-sqlite3 driver should support the enableWal flag
+cache > query runner release::should not release a query runner passed in to clear()
+cache > query runner release::should release the query runner it creates in clear()
+cache > query runner release::should release the query runner it creates in getFromCache()
+cache > query runner release::should release the self-created runner in clear() even when clearTable throws
+cascades > cascade remove relation::should NOT remove the related entity when relation is set to null and cascade remove is not set
+cascades > cascade update should NOT cascade update when cascade: ['insert'] is set (update not included)::should NOT update the related entity when parent is saved
+cascades > cascade update should cascade update when cascade: ['update'] is set::should update the related entity when parent is saved
+cascades > custom column primary key cascade insert with custom column name::should unlink relation without cascade remove
+cascades > insert complex::should insert everything by cascades properly
+cascades > insert from inverse one-to-one side with shared primary key::should work perfectly
+cascades > insert nested::should insert everything by cascades properly
+cascades > insert one-to-one inverse with single table inheritance::account property in accountActivationToken should not be null
+cascades > insert with composite primary key duplicate constraint::persisting the cascading entities should succeed
+cascades > insert with composite primary key duplicate constraint::persisting the cascading entities without JoinColumn should succeed
+cascades > insert with composite primary key duplicate constraint::persisting the child entity should succeed
+cascades > insert with composite primary keys::should cascade-remove recipients when removing a single message
+cascades > insert with composite primary keys::should cascade-remove recipients when removing all messages
+cascades > insert with composite primary keys::should remove recipients directly
+cascades > insert with composite primary keys::throws an error because there is no object id defined
+cascades > insert with table inheritance::should save entities properly
+cascades > remove::should remove everything by cascades properly
+cascades > save insert vs update::should update rather than insert on second save
+cascades > save with shared primary key::save an entity having a child entity with shared PK and CreatedDateColumn by cascade
+cascades > should insert by cascades from both sides::should insert by cascades from inverse side
+cascades > should insert by cascades from both sides::should insert by cascades from owner side
+cascades > soft-remove::recovers 1-many relations after soft-remove cascade
+cascades > soft-remove::recovers many-to-many relations after soft-remove cascade
+cascades > soft-remove::recovers user when a many-to-many related entity is independently soft-deleted
+cascades > soft-remove::recovers user without duplicate junction inserts when many-to-many has no cascade recover
+cascades > soft-remove::save does not interfere with soft-deleted one-to-many relations
+cascades > soft-remove::save removes many-to-many junction row when soft-deleted entity is excluded from relation array
+cascades > soft-remove::should soft-remove everything by cascades properly
+cascades > traversal scope::remove should cascade-remove children through cascade: ['remove'] relation
+cascades > traversal scope::save should not cascade-insert children through cascade: ['remove'] relation
+cascades > traversal scope::save should not cascade-insert grandchildren through cascade: ['remove'] → cascade: ['insert'] chain
+column > virtual columns::should be able to read non-selectable virtual columns (with query builder)
+column > virtual columns::should be able to save and find sub-select data in the database
+column > virtual columns::should be able to save and find sub-select data in the database (with query builder)
+column > virtual columns::should generate expected sub-select & nested-subselect statement
+column > virtual columns::should generate expected sub-select & select statement
+column > virtual columns::should not generate sub-select if column is not selected
+column kinds > create date column::create date column can also be manually set by user
+column kinds > create date column::create date column should not be updated automatically on every change
+column kinds > create date column::create date column should set a custom date when specified
+column kinds > update date column::update column should not update if no changes were detected
+column kinds > update date column::update date column can also be manually set by user
+column kinds > update date column::update date column should automatically be set by a database
+column kinds > update date column::update date column should be updated automatically on every change
+column kinds > update date column::update date column should set a custom date when specified
+column kinds > version column::version column can also be manually set by user
+column kinds > version column::version column should automatically be set by a database
+column kinds > version column::version column should be updated automatically on every change
+column kinds > version column::version column should not update version if no changes were detected
+column kinds > version column::version column should set a custom value when specified
+columns > date utc flag::should save date columns in UTC when utc flag is true and in local timezone when false
+columns > embedded columns::should insert / update / remove entity with embedded correctly
+columns > embedded columns::should properly generate column names
+columns > embedded columns::should update embedded columns when saving entity with relations
+columns > getters and setters::should not update columns marked with readonly property
+columns > insert-control::should be able to create an entity with non-inserted column missing from the database
+columns > insert-control::should ignore provided value for insert: false column
+columns > insert-control::should use default value when insert: false column is set
+columns > select-control::should not select columns marked with select: false option
+columns > select-control::should not select columns with QueryBuilder marked with select: false option
+columns > select-control::should preserve user-supplied values for select: false columns in embedded entities on save()
+columns > select-control::should preserve user-supplied values for select: false columns on the entity returned by save()
+columns > select-control::should select columns with select: false even columns were implicitly selected
+columns > update-control::should not update columns marked with update: false
+columns > value-transformer > null transform::should run transform from if column is null
+columns > value-transformer functionality::should apply all the transformers
+columns > value-transformer functionality::should apply no transformer
+columns > value-transformer functionality::should apply three transformers in the right order
+columns > value-transformer functionality::should marshal data using a complex value-transformer
+columns > value-transformer functionality::should marshal data using the provided value-transformer
+commands - migration create::should use custom timestamp when option is passed
+commands - migration create::should write Javascript empty migration file when option is passed
+commands - migration create::should write regular empty migration file when no option is passed
+commands - migration generate::writes Javascript printed file when option is passed
+commands - migration generate::writes migration file with custom timestamp when option is passed
+commands - migration generate::writes regular migration file when no option is passed
+custom cache provider::should be used instead of built-ins
+custom cache provider::should cache results properly
+custom cache provider::should cache results with `true` provided
+custom cache provider::should cache results with custom id and duration supplied
+custom cache provider::should cache results with pagination enabled properly
+custom cache provider::should cache results with pagination enabled properly and custom id and loaded relations
+custom repository::withRepository must work properly in transactions
+database schema > column length > sqlite::all types should create with correct size
+database schema > column length > sqlite::all types should update their size
+database schema > column types > sqlite::all types should work correctly - persist and hydrate
+database schema > column types > sqlite::all types should work correctly - persist and hydrate when types are not specified on columns
+database schema > custom constraint names > foreign key::should load constraints with custom names
+database schema > custom constraint names > foreign key::should not change constraint names when column renamed
+database schema > custom constraint names > foreign key::should not change constraint names when table renamed
+database schema > custom constraint names > foreign key::should set custom constraint names
+database schema > custom constraint names > index::should load constraints with custom names
+database schema > custom constraint names > index::should not change constraint names when column renamed
+database schema > custom constraint names > index::should not change constraint names when table renamed
+database schema > custom constraint names > index::should set custom constraint names
+database schema > custom constraint names > unique::should load constraints with custom names
+database schema > custom constraint names > unique::should not change constraint names when column renamed
+database schema > custom constraint names > unique::should not change constraint names when table renamed
+database schema > custom constraint names > unique::should set custom constraint names
+database schema > generated columns > sqlite::should add generated column and revert add
+database schema > generated columns > sqlite::should change generated column and revert change
+database schema > generated columns > sqlite::should create table with generated columns
+database schema > generated columns > sqlite::should drop generated column and revert drop
+database schema > generated columns > sqlite::should not generate queries when no model changes
+database schema > generated columns > sqlite::should remove data from 'typeorm_metadata' when table dropped
+database schema > generated columns > sqlite::should rename generated column and revert rename
+database schema > generated columns > sqlite::should rename table with generated columns and revert rename
+database schema > indices > reading index from entity and updating database::should create a non unique index with 2 columns
+database schema > indices > reading index from entity and updating database::should update the index swapping the 2 columns
+database schema > indices > reading index from entity and updating database::should update the index to be unique
+database schema > simple enum arrays::should correctly create default values
+database schema > simple enum arrays::should correctly save and retrieve
+database schema > simple-enums::should correctly save and retrieve
+database schema > simple-enums::should correctly use default values
+decorators > embedded basic functionality::should be used with prop
+decorators > embedded basic functionality::should persist and load entities with embeddeds properly
+decorators > foreign-key basic functionality::should create a foreign keys
+decorators > foreign-key basic functionality::should persist and load entities
+decorators > foreign-key basic functionality::should throw an error if a column in the foreign key is missing
+decorators > foreign-key basic functionality::should throw an error if referenced entity metadata is not found
+decorators > relation-id > one-to-many::should load id when RelationId decorator used
+decorators > relation-id > one-to-many::should load id when RelationId decorator used with additional condition
+decorators > relation-id > one-to-one::should load id when loadRelationIdAndMap used on inverse side
+decorators > relation-id > one-to-one::should load ids when loadRelationIdAndMap used on owner side
+decorators > relation-id-decorator > many-to-many::should load ids when RelationId decorator used on inverse side
+decorators > relation-id-decorator > many-to-many::should load ids when RelationId decorator used on inverse side with additional condition
+decorators > relation-id-decorator > many-to-many::should load ids when RelationId decorator used on nested relation
+decorators > relation-id-decorator > many-to-many::should load ids when RelationId decorator used on nested relation with additional conditions
+decorators > relation-id-decorator > many-to-many::should load ids when RelationId decorator used on owner side
+decorators > relation-id-decorator > many-to-many::should load ids when RelationId decorator used on owner side with additional condition
+decorators > relation-id-decorator > many-to-many::should load ids when RelationId decorator used on owner side without inverse side
+decorators > relation-id-decorator > many-to-many::should load ids when RelationId decorator used on owner side without inverse side and with additional condition
+decorators > relation-id-decorator > many-to-many::should not load ids of nested relations when RelationId decorator used on inherit relation and parent relation was not found
+decorators > relation-id-decorator > many-to-one::should load ids when RelationId decorator used
+deferrable foreign key constraint > many-to-many (#11739) bidirectional with deferrable on both sides::should apply deferrable option to both junction table foreign keys
+deferrable foreign key constraint > many-to-many (#11739) bidirectional with deferrable on both sides::should defer constraint validation until end of transaction
+deferrable foreign key constraint > many-to-many (#11739) unidirectional with deferrable on owning side only::should apply deferrable to both junction table foreign keys
+deferrable foreign key constraint > many-to-many (#11739) unidirectional with deferrable on owning side only::should defer constraint validation until end of transaction
+deferrable foreign key constraint::initially deferred fk should be validated at the end of transaction
+deferrable foreign key constraint::initially immediate fk should be validated at the end at transaction with deferred check time
+embedded > basic functionality::should insert, load, update and remove entities with embeddeds properly
+embedded > embedded-many-to-many-case1 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation
+embedded > embedded-many-to-many-case1 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation
+embedded > embedded-many-to-many-case2 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation
+embedded > embedded-many-to-many-case2 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation
+embedded > embedded-many-to-many-case3 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation with multiple primary keys (one PK in each embed)
+embedded > embedded-many-to-many-case3 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation with multiple primary keys (one PK in each embed)
+embedded > embedded-many-to-many-case4 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation with multiple primary keys (multiple keys in related entity)
+embedded > embedded-many-to-many-case4 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation with multiple primary keys (multiple keys in related entity)
+embedded > embedded-many-to-many-case5 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation with multiple primary keys (multiple keys in both sides)
+embedded > embedded-many-to-many-case5 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToMany relation with multiple primary keys (multiple keys in both sides)
+embedded > embedded-many-to-one-case1 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation
+embedded > embedded-many-to-one-case1 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation
+embedded > embedded-many-to-one-case2 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation
+embedded > embedded-many-to-one-case2 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation
+embedded > embedded-many-to-one-case3 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation with multiple primary keys (one PK in each embed)
+embedded > embedded-many-to-one-case3 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation with multiple primary keys (one PK in each embed)
+embedded > embedded-many-to-one-case4 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation with multiple primary keys (multiple keys in related entity)
+embedded > embedded-many-to-one-case4 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation with multiple primary keys (multiple keys in related entity)
+embedded > embedded-many-to-one-case5 inverse side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation with multiple primary keys (multiple keys in both sides)
+embedded > embedded-many-to-one-case5 owner side::should insert, load, update and remove entities with embeddeds when embedded entity having ManyToOne relation with multiple primary keys (multiple keys in both sides)
+embedded > embedded-one-to-one owner side::should insert, load, update and remove entities with embeddeds when embedded entity having OneToOne relation
+embedded > embedded-relation-id-column::merges the explicit id column with the relation join column (sanity check)
+embedded > embedded-relation-id-column::persists a relation object assigned inside an embedded
+embedded > embedded-relation-id-column::persists a relation object assigned inside an embedded on update
+embedded > embedded-relation-id-column::persists a relation object assigned on a top-level property (control)
+embedded > embedded-with-special-columns::should insert, load, update and remove entities with embeddeds when embeds contains special columns (e.g. CreateDateColumn, UpdateDateColumn, DeleteDateColumn, VersionColumn
+embedded > multiple-primary-column::should insert, load, update and remove entities with embeddeds when primary column defined in main and in embedded entities
+embedded > multiple-primary-columns-with-nested-embed::should insert, load, update and remove entities with embeddeds when primary column defined in main and in embedded entities
+embedded > order by with duplicate column name::should order organisations correctly when properties are duplicate in its embeddable
+embedded > outer-primary-column::should insert, load, update and remove entities with embeddeds when primary column defined only in embedded entity
+embedded > prefix functionality::should insert, load, update and remove entities with embeddeds properly
+entity > soft-remove::should perform soft removal and recovery correctly
+entity > soft-remove::should throw error when delete date column is missing
+entity manager > invalidWhereValuesBehavior default (unconfigured)::EntityManager.delete throws on a null value by default and leaves the row
+entity manager > invalidWhereValuesBehavior default (unconfigured)::EntityManager.softDelete throws on a null value by default
+entity manager > invalidWhereValuesBehavior default (unconfigured)::EntityManager.update throws on an undefined value by default
+entity manager > invalidWhereValuesBehavior default (unconfigured)::matches the read path: findBy also throws on null by default
+entity manager > invalidWhereValuesBehavior default (unconfigured)::passes entity class instances through (does not throw) even when unconfigured
+entity manager > invalidWhereValuesBehavior default (unconfigured)::throws on a null value inside an array (OR) criteria by default
+entity manager > invalidWhereValuesBehavior does NOT affect QB .where()::should NOT throw when QB .where() is used with null
+entity manager > invalidWhereValuesBehavior does NOT affect QB .where()::should NOT throw when QB .where() is used with undefined
+entity manager > invalidWhereValuesBehavior with ignore::rejects criteria whose every key is stripped instead of deleting the whole table
+entity manager > invalidWhereValuesBehavior with ignore::should strip nested null criteria in EntityManager.update() with ignore
+entity manager > invalidWhereValuesBehavior with ignore::should strip nested undefined criteria in EntityManager.delete() with ignore
+entity manager > invalidWhereValuesBehavior with ignore::should strip null criteria in EntityManager.delete() with ignore
+entity manager > invalidWhereValuesBehavior with ignore::should strip undefined criteria in EntityManager.delete() with ignore
+entity manager > invalidWhereValuesBehavior with sql-null::should transform null to IS NULL in EntityManager.delete()
+entity manager > invalidWhereValuesBehavior with sql-null::should transform null to IS NULL in EntityManager.update()
+entity manager > invalidWhereValuesBehavior with throw::passes entity class instances through unchanged (only plain objects are normalized)
+entity manager > invalidWhereValuesBehavior with throw::rejects a __proto__-only criteria in EntityManager.delete() instead of deleting the whole table
+entity manager > invalidWhereValuesBehavior with throw::rejects a __proto__-only criteria in EntityManager.restore()
+entity manager > invalidWhereValuesBehavior with throw::rejects a __proto__-only criteria in EntityManager.softDelete()
+entity manager > invalidWhereValuesBehavior with throw::rejects a __proto__-only criteria in EntityManager.update() instead of updating the whole table
+entity manager > invalidWhereValuesBehavior with throw::rejects an array criteria that normalizes to an empty OR-branch
+entity manager > invalidWhereValuesBehavior with throw::rejects an empty entity class instance instead of deleting the whole table
+entity manager > invalidWhereValuesBehavior with throw::rejects criteria whose only key expands to zero predicates (nested keyless relation)
+entity manager > invalidWhereValuesBehavior with throw::should throw error for nested null values in EntityManager.update()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for nested undefined values in EntityManager.delete()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for null values in EntityManager.delete()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for null values in EntityManager.restore()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for null values in EntityManager.softDelete()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for null values in EntityManager.update()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for null values in Repository.delete()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for null values in Repository.update()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for undefined values in EntityManager.delete()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for undefined values in EntityManager.restore()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for undefined values in EntityManager.softDelete()
+entity manager > invalidWhereValuesBehavior with throw::should throw error for undefined values in EntityManager.update()
+entity schema > custom constraint names > foreign key::should load constraints with custom names
+entity schema > custom constraint names > foreign key::should not change constraint names when column renamed
+entity schema > custom constraint names > foreign key::should not change constraint names when table renamed
+entity schema > custom constraint names > foreign key::should set custom constraint names
+entity schema > custom constraint names > index::should load constraints with custom names
+entity schema > custom constraint names > index::should not change constraint names when column renamed
+entity schema > custom constraint names > index::should not change constraint names when table renamed
+entity schema > custom constraint names > index::should set custom constraint names
+entity schemas > basic functionality::should perform basic operations with entity using manager
+entity schemas > basic functionality::should perform basic operations with entity using repository
+entity schemas > target option::should create instance of the target
+entity schemas > target option::should find instances of the target
+entity subscriber > query data::cleans up the data after the save completes
+entity subscriber > query data::passes query data to subscriber
+entity subscriber > query events::should broadcast afterQuery with success false when the query fails
+entity subscriber > query events::should wait for an async afterQuery subscriber before rejecting
+entity subscriber > query events::should wait for an async afterQuery subscriber before resolving
+entity subscriber > query events::should wrap a failing query in QueryFailedError
+entity subscriber > transaction flow::query data in subscribers
+entity subscriber > transaction flow::transactionCommit
+entity subscriber > transaction flow::transactionRollback
+entity subscriber > transaction flow::transactionStart
+entity-listeners::beforeUpdate
+entity-listeners::should call correct listeners when using inheritance
+entity-metadata > create with entitySkipConstructor::should call the constructor when creating an object
+entity-metadata > create with entitySkipConstructor::should not call the constructor when retrieving an object
+entity-metadata > create with entitySkipConstructor::should set the default property values when creating an object
+entity-metadata > create without entitySkipConstructor::should call the constructor when creating an object
+entity-metadata > create without entitySkipConstructor::should call the constructor when retrieving an object
+entity-metadata > create without entitySkipConstructor::should set the default property values
+entity-metadata > property-map::should create correct property map object
+entity-model upsert::should upsert successfully
+entity-model::should reload exactly the same entity
+entity-model::should reload given entity successfully
+entity-model::should save successfully and use static methods successfully
+entity-schema > columns > virtual column::should query virtual columns
+entity-schema > embedded - class-instance::should contains instance of target class embedded entity
+entity-schema > embedded - class-instance::should create an table
+entity-schema > embedded - class-instance::should create embedded column name with prefix
+entity-schema > embedded - class-instance::should create index for embedded
+entity-schema > embedded - class-instance::should not create table with embedded
+entity-schema > embedded - class-instance::should save entity with embedded
+entity-schema > embedded - plain-object::should contains instance of plain object for embedded entity
+entity-schema > embedded - plain-object::should save entity with embedded
+entity-schema > foreign-keys basic functionality::should create a foreign keys
+entity-schema > foreign-keys basic functionality::should persist and load entities
+entity-schema > indices > basic::should create a non unique index with 2 columns
+entity-schema > indices > basic::should update the index swaping the 2 columns
+entity-schema > indices > basic::should update the index to be unique
+entity-schema > tree tables > nested-set::attach should work properly
+entity-schema > uniques::should create a unique constraint with 2 columns
+entity-subscriber > update columns::if entity was changed, subscriber should be take updated columns
+escape sqlite query parameters::should transform boolean parameters with value `false` into `0`
+escape sqlite query parameters::should transform boolean parameters with value `true` into `1`
+find options > null and undefined handling with both invalidWhereValuesBehavior options enabled::should handle array FindOptionsWhere values correctly
+find options > null and undefined handling with both invalidWhereValuesBehavior options enabled::should handle both null and undefined correctly
+find options > null and undefined handling with default behavior (throw)::should skip empty nested relation objects by default
+find options > null and undefined handling with default behavior (throw)::should throw error for null properties by default
+find options > null and undefined handling with default behavior (throw)::should throw error for null relation properties by default
+find options > null and undefined handling with default behavior (throw)::should throw error for undefined properties by default
+find options > null and undefined handling with default behavior (throw)::should throw error for undefined relation properties by default
+find options > null and undefined handling with default behavior (throw)::should throw for nested relation properties with null by default
+find options > null and undefined handling with ignore behavior::should skip empty nested relation objects
+find options > null and undefined handling with ignore behavior::should skip nested relation properties with null
+find options > null and undefined handling with ignore behavior::should skip null properties and return all rows
+find options > null and undefined handling with ignore behavior::should skip null relation properties and return all rows
+find options > null and undefined handling with ignore behavior::should skip undefined properties and return all rows
+find options > null and undefined handling with ignore behavior::should skip undefined relation properties and return all rows
+find options > null and undefined handling with invalidWhereValuesBehavior.null set to 'sql-null'::should transform JS null to SQL NULL for relations when invalidWhereValuesBehavior.null is 'sql-null'
+find options > null and undefined handling with invalidWhereValuesBehavior.null set to 'sql-null'::should transform JS null to SQL NULL when invalidWhereValuesBehavior.null is 'sql-null'
+find options > null and undefined handling with invalidWhereValuesBehavior.null set to 'throw'::should throw an error when null is encountered and invalidWhereValuesBehavior.null is 'throw'
+find options > null and undefined handling with invalidWhereValuesBehavior.null set to 'throw'::should throw an error when null is encountered in relations and invalidWhereValuesBehavior.null is 'throw'
+find options > null and undefined handling with invalidWhereValuesBehavior.undefined set to 'throw'::should not throw when a property is not provided
+find options > null and undefined handling with invalidWhereValuesBehavior.undefined set to 'throw'::should throw an error for nested relation with partial undefined properties
+find options > null and undefined handling with invalidWhereValuesBehavior.undefined set to 'throw'::should throw an error when undefined is encountered and invalidWhereValuesBehavior.undefined is 'throw'
+find options > null and undefined handling with invalidWhereValuesBehavior.undefined set to 'throw'::should throw an error when undefined is encountered in relations and invalidWhereValuesBehavior.undefined is 'throw'
+find options > opaque-types-over-primitives::should work in order by
+find options > opaque-types-over-primitives::should work in select
+find options > opaque-types-over-primitives::should work in where
+find options > order::order by column in embed
+find options > order::order by complex nested relations
+find options > order::order by id DESC
+find options > order::order by nested relations
+find options > order::order by relation
+find options > order::order by relation in embed
+find options > order::order by relation with where relation applied
+find options > order::order by title
+find options > order::where two criteria
+find options > relations::basic relation
+find options > relations::complex relation #1
+find options > relations::complex relation #2
+find options > relations::relation in embed
+find options > select::select column in embed
+find options > select::select id
+find options > select::select title
+find options > select::select title and text
+find options > select::should select all from category and meta only from post
+find options > select::should select all from category and meta only from post with all meta properties
+find options > select::should select all properties of relation post
+find options > select::should select all properties of relation post and its relation tag
+find options > where::should apply inner join if true is applied
+find options > where::should throw when all nested relation conditions are undefined by default
+find options > where::where column and relation
+find options > where::where column in embed
+find options > where::where complex nested relations
+find options > where::where complex with or + and
+find options > where::where id
+find options > where::where nested relations
+find options > where::where or + optional relations
+find options > where::where relation
+find options > where::where relation in embed
+find options > where::where relations with operators
+find options > where::where title
+find options > where::where two criteria
+find options > where::where two criteria without match
+find options > where::where with or + and find operator
+github issue > #1282 FEATURE REQUEST - Naming strategy joinTableColumnName if it is called from the owning or owned (inverse) context ::NamingStrategyUnderTest#
+github issue > #2200 Bug - Issue with snake_case naming strategy::Renammed alias allow to query correctly
+github issues > #1014 Transaction doesn't rollback::should rollback transaction if some operation failed in it
+github issues > #10322 logMigration of AbstractLogger has wrong logging condition.::should call fakeLog when migration failed
+github issues > #10389 softDelete should not update already deleted rows::should correctly handle OR conditions in softDelete and not update already deleted rows
+github issues > #10389 softDelete should not update already deleted rows::should only restore rows that are soft deleted previously
+github issues > #10389 softDelete should not update already deleted rows::should only soft delete rows that are not soft deleted previously
+github issues > #10431 When requesting nested relations on foreign key primary entities, relation becomes empty entity rather than null::should return [] when requested nested relations are empty on ManyToMany relation with @VirtualColumn definitions
+github issues > #10494 Custom discriminator values when using Single Table Inheritance with Entity Schemas::should use custom discriminator values, when specified
+github issues > #10496 User-defined index name for Single Table Inheritance discriminator columns::should create a single index for the discriminator column, with the specified column name
+github issues > #10517 EntityManager update/delete/softDelete don't work with list of where condition objects::delete by array of condition objects
+github issues > #10517 EntityManager update/delete/softDelete don't work with list of where condition objects::restore by array of condition objects
+github issues > #10517 EntityManager update/delete/softDelete don't work with list of where condition objects::soft delete by array of condition objects
+github issues > #10517 EntityManager update/delete/softDelete don't work with list of where condition objects::update by array of condition objects
+github issues > #10569 Fix type inferencing of EntityManager#create::should correctly inference entity type
+github issues > #10626 Regression in transactionDepth handling::transactionDepth should be updated correctly when commit fails
+github issues > #10653 Default value in child table/entity column decorator for multiple table inheritance is ignored for inherited columns::should honor distinct default value configured on inherited column of child entity
+github issues > #1099 BUG - QueryBuilder MySQL skip sql is wrong::drivers which does not support offset without limit should throw an exception, other drivers must work fine
+github issues > #11085 BeforeQuery promises are not awaited before query execution::should find user since beforeQuery promise must be awaited before query execution
+github issues > #1123 load relation eagerly by setting isEager property::should load all eager relations when object is loaded
+github issues > #1123 load relation eagerly by setting isEager property::should not load eager relations when query builder is used
+github issues > #1140 timestamp column and value transformer causes TypeError::correctly store/load timestamp columns
+github issues > #1200 Update multiple nested embeddeds::should update all embedded entities including the nested ones
+github issues > #12234 INSERT/UPDATE omits shared join column when relation is set to plain id::should not omit shared join column on insert when only one composite-FK relation is set
+github issues > #12234 INSERT/UPDATE omits shared join column when relation is set to plain id::should persist shared join column when updating via direct column value
+github issues > #12234 INSERT/UPDATE omits shared join column when relation is set to plain id::should preserve the shared join column on update when a composite-FK relation is set to a scalar plain id
+github issues > #1245 `findBy` with `In` ignores `FindManyOptions`::should filter correctly using findBy with In
+github issues > #12473 select: false columns are stripped from the entity after save()::should expose select: false columns to afterInsert subscribers
+github issues > #12473 select: false columns are stripped from the entity after save()::should expose select: false columns to afterUpdate subscribers
+github issues > #12473 select: false columns are stripped from the entity after save()::should keep select: false columns on the entity returned by save()
+github issues > #12473 select: false columns are stripped from the entity after save()::should not mutate the original entity reference passed to save()
+github issues > #1355 Allow explicitly named primary keys, foreign keys, and indices::should set foreign keys their names to given names
+github issues > #1369 EntitySubscriber not firing events on abstract class entity::should fire the given event for an abstract entity
+github issues > #1476 subqueries::should
+github issues > #151 joinAndSelect can't find entity from inverse side of relation::should cascade persist successfully
+github issues > #161 joinAndSelect can't find entity from inverse side of relation::should persist successfully
+github issues > #161 joinAndSelect can't find entity from inverse side of relation::should return joined relation successfully
+github issues > #1623 NOT NULL constraint failed after a new column is added (SQLite)::should correctly add new column
+github issues > #1680 Delete & Update applies to all entities in table if criteria is undefined or empty::Delete & Update should throw an error when supplied with an empty criteria
+github issues > #1748 PrimaryColumn combined with transformer leads to error on save::should work as expected
+github issues > #1898 Simple JSON breaking in @next::should correctly persist
+github issues > #1981 Boolean values not casted properly when used in .find() condition::should be able to find by boolean find
+github issues > #2005::should be able to find by boolean find
+github issues > #2065 TypeError: Cannot convert object to primitive value::should save an entity created with Object.create(null)
+github issues > #2103 query builder regression::whereInIds should respect logical operator precedence > multiple primary keys
+github issues > #2103 query builder regression::whereInIds should respect logical operator precedence > single simple primary key (in is used)
+github issues > #2131 InsertResult return the same primary key::should get correct insert ids for multiple entities inserted
+github issues > #215 invalid replacements of join conditions::should not do invalid replacements of join conditions
+github issues > #219 FindOptions should be able to resolve null values::should properly query null values
+github issues > #2199 - Inserting value for @PrimaryGeneratedColumn() for mysql, sqlite and mssql::should allow to explicitly insert primary key value
+github issues > #2199 - Inserting value for @PrimaryGeneratedColumn() for mysql, sqlite and mssql::should reset mssql's INSERT_IDENTITY flag correctly after failed queries
+github issues > #2201 - Create a select query when using a (custom) junction table::Should create only two PM columns ('order_id' and 'user_id')
+github issues > #2251 - Unexpected behavior when passing duplicate entities to repository.save()::should handle cascade updates
+github issues > #2251 - Unexpected behavior when passing duplicate entities to repository.save()::should update all entities
+github issues > #2253 - inserting multiple child entities fails::should be able to save multiple child entities
+github issues > #2286 find operators like MoreThan and LessThan doesn't work properly for date fields::should find a record by its datetime value with find options
+github issues > #2286 find operators like MoreThan and LessThan doesn't work properly for date fields::should find a record by its datetime value with query builder
+github issues > #2286 find operators like MoreThan and LessThan doesn't work properly for date fields::should save, update, and load with a date PK
+github issues > #2298 - Repository filtering not considering related columns as filter::should work perfectly
+github issues > #2313 - BaseEntity has no findOneOrFail() method::should find the appropriate record when one exists
+github issues > #2313 - BaseEntity has no findOneOrFail() method::should throw no matching record exists
+github issues > #2364 should generate id value if @Column generated:true is set::should generate id value
+github issues > #2376 Naming single column unique constraint with decorator not working as expected::should keep user-specified Unique constraint name
+github issues > #2464 - ManyToMany onDelete option not working::should delete when onDelete is not set
+github issues > #2464 - ManyToMany onDelete option not working::should not delete when onDelete is 'NO ACTION'
+github issues > #2557 object looses its prototype before transformer.to()::should give correct object in transformer.to
+github issues > #2588 - createQueryBuilder always does left joins on relations::Should allow joins with conditions
+github issues > #2632 createQueryBuilder relation remove works only if using ID::should add and remove relations of an entity if given a mix of ids and objects
+github issues > #2703 Column with transformer is not normalized for update::should transform values when computing changed columns
+github issues > #2800 - Can't override embedded entities in STI implementation::should be able to save entity with embedded entities overriding
+github issues > #2809 afterUpdate subscriber entity argument is undefined::if entity has been updated via repository update(), subscriber should get passed entity to change
+github issues > #2965 Reuse preloaded lazy relations::should resuse preloaded lazy relations
+github issues > #2984 Discriminator conflict reported even for non-inherited tables::should load entities even with the same discriminator
+github issues > #300 support of embeddeds that are not set::embedded with custom column name should persist and load without errors
+github issues > #3047 Mysqsl on duplicate key update use current values::should overwrite using current value in MySQL/MariaDB
+github issues > #3047 Mysqsl on duplicate key update use current values::should overwrite using current value in PostgreSQL
+github issues > #306 embeddeds with custom column name don't work::embedded with custom column name should persist and load without errors
+github issues > #3111 Inserting with query builder attempts to insert a default row when values is empty array::should not insert with default values on .values([])
+github issues > #3111 Inserting with query builder attempts to insert a default row when values is empty array::should still error on missing .values()
+github issues > #3112 default:null should inserts nulls to database::should insert null when no value specified
+github issues > #3302 Tracking query time for slow queries and statsd timers::if query executed, should write query to file
+github issues > #3349 Multiple where conditions with parameters::should work with findOne
+github issues > #3349 Multiple where conditions with parameters::should work with query builder
+github issues > #3363 Isolation Level in transaction() from Connection::should execute operations in READ UNCOMMITED isolation level
+github issues > #3363 Isolation Level in transaction() from Connection::should execute operations in SERIALIZABLE isolation level
+github issues > #341 OneToOne relation with referencedColumnName does not work::custom join column name and referencedColumnName
+github issues > #3416 Unknown fields are stripped from WHERE clause should throw FindCriteriaNotFoundError when supplying unknown property in where criteria::delete
+github issues > #3416 Unknown fields are stripped from WHERE clause should throw FindCriteriaNotFoundError when supplying unknown property in where criteria::find
+github issues > #3416 Unknown fields are stripped from WHERE clause should throw FindCriteriaNotFoundError when supplying unknown property in where criteria::update
+github issues > #345 Join query on ManyToMany relations not working::embedded with custom column name should persist and load without errors
+github issues > #3534: store regexp::allows entities with regexp columns
+github issues > #363 Can't save 2 unrelated entity types in a single persist call::entityManager should allow you to delete unrelated entities with one remove call
+github issues > #363 Can't save 2 unrelated entity types in a single persist call::entityManager should allow you to save unrelated entities with one persist call
+github issues > #3685 Brackets syntax failed when use where with object literal::should accept objects in .where method (github issue #3685)
+github issues > #3803 column option unique sqlite error::should create unique constraints defined in EntitySchema
+github issues > #3847 FEATURE REQUEST - Naming strategy foreign key override name::NamingStrategyUnderTest#
+github issues > #388 skip and take with string ID don't work::should load posts with string id successfully
+github issues > #3949 sqlite date hydration is susceptible to corruption::should correctly read date column that was inserted raw in canonical format
+github issues > #3949 sqlite date hydration is susceptible to corruption::should correctly read date column that was inserted raw in iso 8601 format
+github issues > #401 special keywords should be escaped in join queries::should escape 'group' keyword properly
+github issues > #4096 SQLite support for orUpdate::should overwrite using current value in SQLite
+github issues > #4147 `SQLITE_ERROR: near "-": syntax error` when use sqlite, simple-enum::should not error while synchronizing when using simple-enum with sqlite
+github issues > #4185 afterLoad() subscriber interface missing additional info available on other events::should invoke afterLoad() with LoadEvent
+github issues > #4190 Relation decorators: allow to pass string instead of typeFunction::should work with many-to-many relations
+github issues > #4190 Relation decorators: allow to pass string instead of typeFunction::should work with many-to-one/one-to-many relations
+github issues > #4190 Relation decorators: allow to pass string instead of typeFunction::should work with one-to-one relations
+github issues > #423 Cannot use Group as Table name && cannot autoSchemeSync when use alias Entity::should successfully sync schema
+github issues > #4277 Using cache in findAndCount and getManyAndCount returns 0 as count::getManyAndCount and findAndCount should count correctly when NOT using cache
+github issues > #4277 Using cache in findAndCount and getManyAndCount returns 0 as count::getManyAndCount and findAndCount should count correctly when NOT using cacheId
+github issues > #4277 Using cache in findAndCount and getManyAndCount returns 0 as count::getManyAndCount and findAndCount should count correctly when using cacheId
+github issues > #4410 allow custom filepath for FileLogger when logPath option is passed as a file::writes to the given filename
+github issues > #4410 allow custom filepath for FileLogger when logPath option is passed as a nested path::writes to the given path
+github issues > #4410 allow custom filepath for FileLogger when no option is passed::writes to the base path
+github issues > #4452 InsertQueryBuilder fails on some SQL Expressions values::should be able to use sql functions
+github issues > #479 orWhere breaks skip / take::where expression of the skip/take should not break original where query
+github issues > #4842 QueryExpressionMap doesn't clone distinct property::should contain correct distinct value after query builder is cloned
+github issues > #493 pagination should work with string primary keys::should work perfectly with string primary keys
+github issues > #4947 beforeUpdate subscriber entity argument is undefined::if entity has been updated via repository update(), subscriber should get passed entity to change
+github issues > #495 Unable to set multi-column indices::should successfully create indices and save an object
+github issues > #4958 getRepository returns results from another Repo::sql generated is for correct model
+github issues > #499 postgres DATE hydrated as DATETIME object::should return date in a string format
+github issues > #512 Table name escaping in UPDATE in QueryBuilder::should escape table name using driver's escape function in UPDATE
+github issues > #513 Incorrect time/datetime types for SQLite::should create datetime column type for datetime in sqlite
+github issues > #513 Incorrect time/datetime types for SQLite::should create datetime column type for time in sqlite
+github issues > #513 Incorrect time/datetime types for SQLite::should persist correct type in datetime column in sqlite
+github issues > #5160 (MSSQL) DML statement cannot have any enabled triggers if the statement contains an OUTPUT clause without INTO clause::should update entity model after insertion to MSSQL table with trigger
+github issues > #5160 (MSSQL) DML statement cannot have any enabled triggers if the statement contains an OUTPUT clause without INTO clause::should update entity model after save to MSSQL table with trigger
+github issues > #5174 `selectQueryBuilder.take` messes up the query when using the `ids` parameter::should allow the 'ids' parameter without messing up the query when using .take
+github issues > #521 Attributes in UPDATE in QB arent getting replaced::should replace parameters
+github issues > #5520 save does not return generated id if object to save contains a many to one relationship with an undefined id::should generate parents and childs uuid and return them
+github issues > #5684 eager relation skips children relations::should select children of an eager relation
+github issues > #5691 RelationId is too slow::should be as fast as separate queries
+github issues > #5734 insert([]) should not crash::should not crash on insert([])
+github issues > #5734 insert([]) should not crash::should still work with a nonempty array
+github issues > #5762 `Using URL as a rich column type breaks::should allow assigning URL as a field value
+github issues > #594 WhereInIds no longer works in the latest version.::should load entities by given simple post ids (non mixed)
+github issues > #6195 feature: fake migrations for existing tables fake rollback tests::should fail for non-existent column
+github issues > #6195 feature: fake migrations for existing tables fake rollback tests::should not fail for non-existent column when run with the fake option
+github issues > #6195 feature: fake migrations for existing tables fake run tests::should fail for duplicate column
+github issues > #6195 feature: fake migrations for existing tables fake run tests::should not fail for duplicate column when run with the fake option
+github issues > #620 Feature Request: Flexibility in Foreign Key names::should work as expected
+github issues > #6265 `fix: resolve issue with find with relations returns soft-deleted entities::should soft delete one record in relation table
+github issues > #6327 softRemove DeleteDateColumn is null at Susbscriber's AfterUpdate method::should send correct update and delete date columns to after update subscriber
+github issues > #6977 Relation columns in embedded entities are not prefixed::should correctly assign foreign key columns in embedded entity
+github issues > #703.findOne does not return an empty array on OneToMany relationship::should not return anything in joined relation if nothing was found
+github issues > #704 Table alias in WHERE clause is not quoted in PostgreSQL::should return user by a given email and proper escape 'user' keyword
+github issues > #7041 When requesting nested relations on foreign key primary entities, relation becomes empty entity rather than null::should return [] when requested nested relations are empty on OneToMany relation
+github issues > #7041 When requesting nested relations on foreign key primary entities, relation becomes empty entity rather than null::should return null when requested nested relations are empty on OneToOne relation
+github issues > #7065 ChildEntity type relationship produces unexpected results::should join child entity with discriminator value condition
+github issues > #7079 Error when sorting by an embedded entity while using join and skip/take::should be able to getMany with join and sorting by an embedded entity column while user take and skip
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' eager-loaded relations::should return null if ManyToOne relation has NULL in database
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' eager-loaded relations::should return null if OneToOne relation has NULL in database
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' eager-loaded relations::should return null if OneToOne+JoinColumn relation has NULL in database
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' lazy-loaded relations included in 'relations' find option::should return null if ManyToOne relation has NULL in database
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' lazy-loaded relations included in 'relations' find option::should return null if OneToOne relation has NULL in database
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' lazy-loaded relations included in 'relations' find option::should return null if OneToOne+JoinColumn relation has NULL in database
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' lazy-loaded relations::should return null if ManyToOne relation has NULL in database
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' lazy-loaded relations::should return null if OneToOne relation has NULL in database
+github issues > #7146 Lazy relations resolve to 'undefined' instead of 'null' lazy-loaded relations::should return null if OneToOne+JoinColumn relation has NULL in database
+github issues > #736 ClosureEntity should set (composite) primary/unique key in the closure table::should create composite primary key on closure ancestor and descendant
+github issues > #752 postgres - count query fails for empty table::should return user by a given email and proper escape 'user' keyword
+github issues > #7558 Child entities' wrong discriminator value when embedded in parent entity::should set the correct discriminators for trees in STI settings
+github issues > #7558 Child entities' wrong discriminator value when embedded in parent entity::should use the correct subclass for inheritance when saving & retrieving a single STI entity (one-to-one)
+github issues > #7558 Child entities' wrong discriminator value when embedded in parent entity::should use the correct subclass for inheritance when saving & retrieving multiple STI entities (one-to-many)
+github issues > #762 Nullable @Embedded inside @Embedded::should work perfectly with all data set
+github issues > #762 Nullable @Embedded inside @Embedded::should work perfectly with some data not set
+github issues > #762 Nullable @Embedded inside @Embedded::should work perfectly without any data set
+github issues > #7882 .findOne reduces relations to an empty array::should delete all documents related to search pattern
+github issues > #8018 Non-unique relation property names causes entity mixup in query results::should create child entities of the correct type
+github issues > #8026 Inserting a value for a column that has a relation, and is also a date, results in the value being inserted as DEFAULT::it should include a related date column in the constructed query
+github issues > #807 Error in persisting dates::should be able to save dates as objects
+github issues > #807 Error in persisting dates::should be able to save dates as strings
+github issues > #813 order by must support functions::should work perfectly
+github issues > #813 order by must support functions::should work perfectly with pagination as well
+github issues > #815 @RelationId properties are not updated after entity saving::should work perfectly with many-to-many relation
+github issues > #815 @RelationId properties are not updated after entity saving::should work perfectly with many-to-many relation (inverse side)
+github issues > #815 @RelationId properties are not updated after entity saving::should work perfectly with many-to-one relation
+github issues > #815 @RelationId properties are not updated after entity saving::should work perfectly with one-to-many relation
+github issues > #8221::afterLoad entity modifier must not make relation key matching fail
+github issues > #8346 MySQL: Regression when using take, orderBy, and getMany on a joined relation::should return customers ordered by contacts
+github issues > #8393 When trying to update `update: false` column with `@UpdateDateColumn` the update column is updated::should not update the @UpdateDateColumn column when trying to update un-updatable column
+github issues > #8398 Separate update event into the update, soft remove and restore events::should trigger different events for update, soft remove, and recover
+github issues > #8430 sqlite temporary tables do not honor withoutRowid::should keep 'withoutRowid' after table recreation
+github issues > #8444 entitySkipConstructor not working with entitySkipConstructor::createTestingConnections should succeed
+github issues > #8522 Single table inheritance returns the same discriminator value error for unrelated tables where their parents extend from the same entity Unrelated tables::should loads internal user and internal role
+github issues > #8527 cannot clear database inside a transaction.::should not fail when clearing a database inside a transaction
+github issues > #8627 junction aliases are not unique::should not fail querying many-to-many-relation
+github issues > #863 indices > create schema build schema::it should just work, creating the index
+github issues > #8644 BUG - Special keyword column name for simple-enum in sqlite::it should be able to set special keyword as column name for simple-enum types
+github issues > #867 result of `findAndCount` is wrong when apply `skip` and `take` option::should work perfectly
+github issues > #8681 DeepPartial simplification breaks the .create() and .save() method in certain cases.::should .save() and .create() complex deep partial entities
+github issues > #8681 DeepPartial simplification breaks the .create() and .save() method in certain cases.::should .save() and .create() complex deep partial entities using a generic repository
+github issues > #8690 Relations do not render primary key column values correctly when transformers present::should load relations correctly when primary columns have transformers
+github issues > #8723 Fail on Update when reference exists together with FK: multiple assignments to same column ::should able to update when both reference and the id exist in the update object
+github issues > #8796 New find select object api should support false values as expected::should suport false value when selecting fields
+github issues > #8890 it should be possible to query IS NULL on ManyToOne relations::where In
+github issues > #8890 it should be possible to query IS NULL on ManyToOne relations::where IsNull
+github issues > #8890 it should be possible to query IS NULL on ManyToOne relations::where IsNull OR In
+github issues > #8890 it should be possible to query IS NULL on OneToOne relations on owner side::where In
+github issues > #8890 it should be possible to query IS NULL on OneToOne relations on owner side::where IsNull
+github issues > #8890 it should be possible to query IS NULL on OneToOne relations on owner side::where IsNull OR In
+github issues > #8892 ManyToMany relations save throws "Violation of PRIMARY KEY constraint"::should work perfectly with with many to many relation with primary key from related object is a primary key from an many to one relation
+github issues > #9033 Cannot manually insert type in discriminator column of parent entity class whenusing single table inheritance when creating instance of parent entity::is possible to set the discriminator column manually on the base entity
+github issues > #9152 Can't use LessThan for Union field::should not raise TypeScript error when LessThan with Union is passed to FindOptionsWhere
+github issues > #9173 missing typeorm_metadata::should create a view without view entity
+github issues > #9266 queryRunner.getTable() fails if Foreign Key is set in target table::should be able to load tables
+github issues > #9272 Fix select on deeply nested embedded entities, using Repository API::should be able to pass select options for deeply nested embedded entities
+github issues > #929 sub-queries should set their own parameters on execution::should persist successfully and return persisted entity
+github issues > #9381 The column option 《transformer》 affects the result of the query condition generation::transform and find values
+github issues > #966 Inheritance in embeddables::should save and load Superclass fields in embeddable
+github issues > #9770 check for referencing foreign keys when altering a table using sqlite::shouldn't loose dependant table data
+github issues > #9833 Add support for Single Table Inheritance when using Entity Schemas::should instantiate concrete entities when using EntitySchema
+github issues > #9910 Incorrect behaivor of 'alwaysEnabled: true' after change from issue #9023::should automatically cache if alwaysEnabled
+github issues > #9948 Subscribers with both 'beforeUpdate' and 'afterUpdate' methods defined cause duplicate 'updatedColumn' entries::should not duplicate update column
+github issues > #9977::where relations with (More|Less)ThanOrEqual operators
+indices > basic unique index test unique index::should work without errors
+indices > conditional index::should correctly create conditional indices with WHERE condition
+indices > conditional index::should correctly drop conditional indices and revert drop
+indices > embeds index test embeddeds index::should work without errors
+json > defaults::should insert default values properly
+jsonb type > sqlite::should bulk insert and retrieve JSONB data correctly
+jsonb type > sqlite::should correctly save and retrieve JSONB array data
+jsonb type > sqlite::should correctly save and retrieve JSONB data
+jsonb type > sqlite::should create updates when changing object
+jsonb type > sqlite::should handle JSONB with quotes correctly
+jsonb type > sqlite::should make correct schema with Sqlite's jsonb type
+jsonb type > sqlite::should not create new migrations when everything is equivalent
+jsonb type > sqlite::should not create updates when resorting object
+jsonb type > sqlite::should query JSONB data correctly
+jsonb type > sqlite::should update JSONB data correctly
+jsonb type > sqlite::should upsert JSONB data correctly with orUpdate
+metadata builder > RelationJoinColumnBuilder::should correctly generate sql with simple and composite joins (referenceColumnNames)
+metadata builder > RelationJoinColumnBuilder::should not throw error when loading entities with composite FK with shared columns
+metadata-builder > ColumnMetadata::getValue
+metadata-builder > ColumnMetadata::getValueMap
+migrations > generate command::can recognize model changes
+migrations > generate command::does not generate when no model changes
+migrations > show command::can recognise no pending migrations
+migrations > show command::can recognise pending migrations
+multi-database > basic-functionality multiple databases::should correctly attach and create database files
+multi-database > basic-functionality multiple databases::should create foreign keys for relations within the same database
+multi-database > basic-functionality multiple databases::should not affect tableName when using default main database
+multi-database > basic-functionality multiple databases::should prefix tableName when custom database used in Entity decorator
+option nativeBinding for better-sqlite3::should use a the path set in nativeBindings to the node file
+other issues > Relation decorators: allow to pass given table name string instead of typeFunction or entity name::should work with many-to-many relations
+other issues > Relation decorators: allow to pass given table name string instead of typeFunction or entity name::should work with many-to-one/one-to-many relations
+other issues > Relation decorators: allow to pass given table name string instead of typeFunction or entity name::should work with one-to-one relations
+other issues > auto-increment id as string::should relationIds exist
+other issues > bulk save in sqlite::should save entities in bulk
+other issues > column with getter / setter should work::getters and setters should work correctly
+other issues > composite keys doesn't work as expected in 0.3 compared to 0.2::should properly save new relation items
+other issues > composite keys doesn't work as expected in 0.3 compared to 0.2::should properly save new relation items - Drata
+other issues > double inheritance produces multiple duplicated columns::should not produce duplicate columns
+other issues > entity change in listeners should affect persistence::if entity was changed in the listener, changed property should be updated in the db
+other issues > entity change in subscribers should affect persistence::if entity was changed, subscriber should be take updated columns
+other issues > entity listeners must work in embeddeds as well::getters and setters should work correctly
+other issues > escaping function parameter::insert query builder should work with function parameters
+other issues > escaping function parameter::select query builder should ignore function-based parameters
+other issues > escaping function parameter::update query builder should work with function parameters
+other issues > getId should not return undefined for composite primary keys with lazy relations::getId should not return undefined
+other issues > joining empty relations::should return empty array if its joined and nothing was found
+other issues > joining empty relations::should return empty array if its joined and nothing was found, but relations in empty results should be skipped
+other issues > lazy count::run count query when joining a relation with a limit
+other issues > lazy count::run count query when joining a relation with a limit and an offset
+other issues > lazy count::run count query when joining a relation with skip is greater than total entities
+other issues > lazy count::run count query when offset is greater than total entities
+other issues > lazy count::run count query when returned entities reach the take
+other issues > lazy count::skip count query when an offset is defined
+other issues > lazy count::skip count query when fewer entities are returned than the limit
+other issues > lazy count::skip count query when fewer entities are returned than the take
+other issues > lazy count::skip count query when joining a relation with a take
+other issues > lazy count::skip count query when joining a relation with a take and a skip
+other issues > lazy count::skip count query when skip is defined
+other issues > preventing-injection::should not allow non-numeric values in skip and take in QueryBuilder
+other issues > preventing-injection::should not allow non-numeric values in skip and take via FindOptions
+other issues > preventing-injection::should not allow selection of non-exist columns via FindOptions
+other issues > preventing-injection::should throw error for non-exist columns in where expression via FindOptions
+other issues > update relational column on relation change::should update relational column when relation is inserted
+other issues > using limit in conjunction with order by::clears the title when provided with a null value
+other issues > using limit in conjunction with order by::should persist successfully and return persisted entity
+other issues > using take with multiple primary keys::should persist successfully and return persisted entity
+persistence > basic functionality::should be able to save and remove entities of different types
+persistence > basic functionality::should remove an entity
+persistence > basic functionality::should save an entity
+persistence > basic functionality::should throw an error when not an object is passed to a remove method
+persistence > basic functionality::should throw an error when not an object is passed to a save method
+persistence > basic functionality::should throw an exception if object literal is given instead of constructed entity because it cannot determine what to save
+persistence > bulk-insert-remove-optimization::should group multiple insert and remove queries
+persistence > custom-column-names::should attach exist entity to exist entity with many-to-one relation
+persistence > custom-column-names::should attach exist entity to exist entity with one-to-one relation
+persistence > custom-column-names::should attach new entity to exist entity with many-to-one relation
+persistence > custom-column-names::should attach new entity to exist entity with one-to-one relation
+persistence > custom-column-names::should attach new entity to new entity with many-to-one relation
+persistence > entity updation::should update default values after saving
+persistence > entity updation::should update even when multiple primary keys are used
+persistence > entity updation::should update even with embeddeds
+persistence > entity updation::should update generated auto-increment id after saving
+persistence > entity updation::should update generated uuid after saving
+persistence > entity updation::should update special columns after saving
+persistence > insert > update-relation-columns-after-insertion::should work perfectly
+persistence > many-to-many::add exist element to exist object with empty many-to-many relation and save it and it should contain a new category
+persistence > many-to-many::remove all elements (set to null) from many-to-many relation should remove from the database as well
+persistence > many-to-many::remove all elements from many-to-many relation if parent entity is removed
+persistence > many-to-many::remove all elements from many-to-many relation should remove from the database as well
+persistence > many-to-many::remove one element from many-to-many relation should remove from the database as well
+persistence > many-to-many::should not remove junction rows of an entity saved in the same call without its relation loaded
+persistence > many-to-one bi-directional relation::should NOT remove exist post by cascades when category is saved without a post (post is set to undefined)
+persistence > many-to-one bi-directional relation::should save a category and a new post by cascades
+persistence > many-to-one bi-directional relation::should save a category with a post attached
+persistence > many-to-one bi-directional relation::should set category's post to NULL when post is removed from the database (database ON DELETE)
+persistence > many-to-one bi-directional relation::should unset exist post when its set to null
+persistence > many-to-one bi-directional relation::should update exist post by cascades when category is saved
+persistence > many-to-one bi-directional relation::should work when relation id is directly set into relation (without related object)
+persistence > many-to-one uni-directional relation::should NOT remove exist post by cascades when category is saved without a post (post is set to undefined)
+persistence > many-to-one uni-directional relation::should save a category and a new post by cascades
+persistence > many-to-one uni-directional relation::should save a category with a post attached
+persistence > many-to-one uni-directional relation::should set category's post to NULL when post is removed from the database (database ON DELETE)
+persistence > many-to-one uni-directional relation::should unset exist post when its set to null
+persistence > many-to-one uni-directional relation::should update exist post by cascades when category is saved
+persistence > many-to-one uni-directional relation::should work when relation id is directly set into relation (without related object)
+persistence > multi primary keys insert::should insert entity when there are multi column primary keys
+persistence > multi primary keys on both sides insert::should insert entity when there are multi column primary keys
+persistence > null and default behaviour::should insert NULL when post.title is null
+persistence > null and default behaviour::should insert default when post.title is undefined
+persistence > null and default behaviour::should insert value if it is set
+persistence > null and default behaviour::should update nothing when post.title is undefined
+persistence > null and default behaviour::should update to null when post.title is null
+persistence > one-to-many::set relation to null (elements exist there) from one-to-many relation and save it
+persistence > one-to-many::should add exist element to exist object with empty one-to-many relation and save it
+persistence > one-to-many::should add exist element to new object with empty one-to-many relation and save it
+persistence > one-to-many::should remove all elements from one-to-many relation and save it
+persistence > one-to-many::should remove exist element from one-to-many relation and save it
+persistence > one-to-one doesn't allow the same relation to be used twice::should reject the saving attempt
+persistence > one-to-one set the relation with proper item::should have an access token
+persistence > orphanage > delete when a Post is removed from a Category::should delete the orphaned Post from the database
+persistence > orphanage > delete when a Post is removed from a Category::should retain a Post on the Category
+persistence > orphanage > delete when a Post is removed from a Category::should retain foreign keys on remaining Posts
+persistence > orphanage > disable when a User is updated without all settings being loaded...::should not delete setting with orphanedRowAction=disabed
+persistence > orphanage > disable when a User is updated without all settings being loaded...::should not orphane any Settings
+persistence > partial persist::should persist partial entities without data loss
+persistence > persistence options > listeners::remove listeners should be disabled if remove option is specified
+persistence > persistence options > listeners::remove listeners should work by default
+persistence > persistence options > listeners::save listeners should be disabled if save option is specified
+persistence > persistence options > listeners::save listeners should work by default
+persistence > persistence options > listeners::soft-remove listeners should be disabled if remove option is specified
+persistence > persistence options > listeners::soft-remove listeners should work by default
+persistence > persistence options > transaction::should disable transaction when option is specified
+persistence > persistence options > transaction::should disable transaction when the drivers transactionSupport setting equals `none`
+persistence > pg concurrent query deprecation::should keep relationLoadStrategy: 'query' working with ManyToMany on every supported driver
+persistence > pg concurrent query deprecation::should not emit pg 'client.query already executing' warning during relationLoadStrategy: 'query' on postgres or cockroachdb
+persistence > remove-topological-order::should remove depend properties in a proper order
+persistence > save-empty-array::should not fail if empty array is given to persist method
+persistence > save-empty-array::should persist successfully and return persisted entity
+query builder > brackets::should be able to use join attributes in brackets
+query builder > brackets::should put brackets correctly into WHERE expression
+query builder > brackets::should put parentheses in the SQL
+query builder > cache::should cache results properly
+query builder > cache::should cache results with `true` provided
+query builder > cache::should cache results with custom id and duration supplied
+query builder > cache::should cache results with pagination enabled properly
+query builder > comment::should allow a comment with just whitespaces
+query builder > comment::should allow a multi-line comment
+query builder > comment::should include comment in delete
+query builder > comment::should include comment in insert
+query builder > comment::should include comment in select
+query builder > comment::should include comment in update
+query builder > comment::should not allow an empty comment
+query builder > comment::should scrub end comment pattern from string
+query builder > composite key hydration::should keep colliding composite keys and their children separate
+query builder > composite key hydration::should preserve every joined child with colliding composite keys
+query builder > convert raw results to entity::should return false in entity property when record column is false
+query builder > convert raw results to entity::should return null value in entity property when record column is null
+query builder > convert raw results to entity::should return true in entity property when record column is true
+query builder > count::Count query should count database values
+query builder > count::Count query should handle ambiguous values
+query builder > count::Count query should of empty table should be 0
+query builder > count::counting joined queries should handle ambiguous values
+query builder > count::counting joined query should count database values
+query builder > count::getCount should not switch to distinct when query builder selects non-unique column
+query builder > cte > materialized::should allow MATERIALIZED hint
+query builder > cte > materialized::should allow NOT MATERIALIZED hint
+query builder > cte > materialized::should omit hint if materialized option is not set
+query builder > cte > recursive::should support multiple mixed-recursive CTEs
+query builder > cte > recursive::should work with simple recursive query
+query builder > cte > simple::should allow join with CTE
+query builder > cte > simple::should allow string for CTE
+query builder > cte > simple::should allow to use INSERT with RETURNING clause in CTE
+query builder > cte > simple::show allow select from CTE
+query builder > delete::should be able to delete entities by embed criteria
+query builder > delete::should perform deletion correctly
+query builder > delete::should return correct delete result
+query builder > delete::should throw error when unknown property in where criteria
+query builder > enabling transaction::should execute query in a transaction
+query builder > entity updation::should not override already set properties
+query builder > entity updation::should not update entity model after insertion if updateEntity is set to false
+query builder > entity updation::should not update special entity properties after entity updation if updateEntity is set to false
+query builder > entity updation::should update entity model after insertion if updateEntity is set to true
+query builder > entity updation::should update entity model after save
+query builder > entity updation::should update special entity properties after entity updation if updateEntity is set to true
+query builder > exists::Exists query of empty table should be false
+query builder > exists::Exists query of non empty table should be true
+query builder > find with the global condition of "non-deleted" and eager relation::The global condition of "non-deleted" should be set for the entity with delete date columns and eager relation
+query builder > find with the global condition of "non-deleted" and eager relation::The global condition of "non-deleted" should not be set when "withDeleted" is called
+query builder > find with the global condition of "non-deleted"::The global condition of "non-deleted" should be set for the entity with delete date columns
+query builder > find with the global condition of "non-deleted"::The global condition of "non-deleted" should not be set when "withDeleted" is called
+query builder > insert > on conflict::should build orUpdate query when inserting into a raw table without entity metadata
+query builder > insert > on conflict::should perform insertion correctly using orIgnore
+query builder > insert > on conflict::should perform insertion correctly using orUpdate
+query builder > insert > on conflict::should perform insertion correctly using orUpdate with condition
+query builder > insert > on conflict::should perform insertion on partial index using orUpdate
+query builder > insert > on conflict::should perform insertion using partial index and skipping update on no change
+query builder > insert > on conflict::should support alias in insert using orUpdate
+query builder > insert > on conflict::should throw error if using indexPredicate and an unsupported driver
+query builder > insert from select::should correctly generate SQL query
+query builder > insert from select::should handle parameters correctly
+query builder > insert from select::should insert all rows when no WHERE clause is specified
+query builder > insert from select::should insert from select using a SelectQueryBuilder directly
+query builder > insert from select::should insert from select using a callback function
+query builder > insert from select::should insert from select with INNER JOIN
+query builder > insert from select::should insert from select with JOIN and GROUP BY
+query builder > insert from select::should insert from select with orIgnore()
+query builder > insert from select::should insert from select with orUpdate updating multiple columns
+query builder > insert from select::should insert from select with orUpdate()
+query builder > insert from select::should insert when no columns are specified, insert all selected columns
+query builder > insert from select::should work with ORDER BY and LIMIT in select
+query builder > insert::should be able to insert entities with different properties set even inside embeds
+query builder > insert::should be able to use sql functions
+query builder > insert::should perform bulk insertion correctly
+query builder > insert::should perform insertion correctly
+query builder > isolated-where::should correctly apply brackets when where statement isolation is enabled
+query builder > joins innerJoinAndMap::should load and map selected data when data will given from same entity but with different conditions
+query builder > joins innerJoinAndMap::should load and map selected data when data will given from same property but with different conditions
+query builder > joins innerJoinAndMap::should load and map selected data when entity used as join argument
+query builder > joins innerJoinAndMap::should load and map selected data when query builder used as join argument
+query builder > joins innerJoinAndMap::should load and map selected data when table name used as join argument
+query builder > joins innerJoinAndMap::should not find results when join subquery with conditions does not find join data
+query builder > joins innerJoinAndMap::should not return any result when related data does not exist
+query builder > joins innerJoinAndSelect::should load data when additional condition used
+query builder > joins innerJoinAndSelect::should load only exist data for all relation types
+query builder > joins innerJoinAndSelect::should load results from a left join with a child inner join both of which have zero results
+query builder > joins innerJoinAndSelect::should load results from a left join with a child inner join that has zero results
+query builder > joins innerJoinAndSelect::should load results from a left join with a child inner join when inner join has matching data
+query builder > joins innerJoinAndSelect::should load results from a many-to-one left join with a child inner join that has zero results
+query builder > joins innerJoinAndSelect::should nest a child inner join inside its left joined parent
+query builder > joins innerJoinAndSelect::should not nest a child left join inside its left joined parent
+query builder > joins innerJoinAndSelect::should not return any result when related data does not exist
+query builder > joins leftJoin with composite primary keys::should work correctly when all composite primary key columns are selected
+query builder > joins leftJoin with composite primary keys::should work correctly when no composite primary key columns are selected
+query builder > joins leftJoin with composite primary keys::should work correctly when only part of composite primary key is selected
+query builder > joins leftJoin with skip/take pagination::should work correctly when leftJoin used with addSelect and pagination without primary key
+query builder > joins leftJoin with skip/take pagination::should work correctly with explicit primary key selection
+query builder > joins leftJoin with skip/take pagination::should work correctly with leftJoinAndSelect as comparison
+query builder > joins leftJoinAndMap::should load and map selected data when data will given from same entity but with different conditions
+query builder > joins leftJoinAndMap::should load and map selected data when data will given from same property but with different conditions
+query builder > joins leftJoinAndMap::should load and map selected data when entity used as join argument
+query builder > joins leftJoinAndMap::should load and map selected data when query builder used as join argument
+query builder > joins leftJoinAndMap::should load and map selected data when table name used as join argument
+query builder > joins leftJoinAndMap::should not load join data when join subquery does not find results
+query builder > joins leftJoinAndSelect::should load data for all relation types
+query builder > joins leftJoinAndSelect::should load data when additional condition used
+query builder > joins leftJoinAndSelect::should load data when join tables does not have direct relation
+query builder > locking::nowait with "pessimistic_read"
+query builder > locking::should allow locking a relation of a relation
+query builder > locking::should allow locking a relation of a relation with select
+query builder > locking::should allow on a left join
+query builder > locking::should allow using lockTables on all types of locking
+query builder > locking::should attach dirty read lock statement on query if locking enabled
+query builder > locking::should attach for key share lock statement on query if locking enabled
+query builder > locking::should attach for no key update lock statement on query if locking enabled
+query builder > locking::should attach pessimistic read lock statement on query if locking enabled
+query builder > locking::should attach pessimistic write lock statement on query if locking enabled
+query builder > locking::should not allow empty array for lockTables
+query builder > locking::should not attach for key share lock statement on query if locking is not used
+query builder > locking::should not attach for no key update lock statement on query if locking is not used
+query builder > locking::should not attach pessimistic read lock statement on query if locking is not used
+query builder > locking::should not attach pessimistic write lock statement on query if locking is not used
+query builder > locking::should not throw error if for key share lock used with transaction
+query builder > locking::should not throw error if for no key update lock used with transaction
+query builder > locking::should not throw error if optimistic lock used with getOne method
+query builder > locking::should not throw error if pessimistic lock used with transaction
+query builder > locking::should only specify locked tables in FOR UPDATE OF clause if argument is given
+query builder > locking::should throw error if for key share lock used without transaction
+query builder > locking::should throw error if for key share locking not supported by given driver
+query builder > locking::should throw error if for no key update lock used without transaction
+query builder > locking::should throw error if for no key update locking not supported by given driver
+query builder > locking::should throw error if optimistic lock used with getCount method
+query builder > locking::should throw error if optimistic lock used with getMany method
+query builder > locking::should throw error if optimistic lock used with getManyAndCount method
+query builder > locking::should throw error if optimistic lock used with getRawMany method
+query builder > locking::should throw error if optimistic lock used with getRawOne method
+query builder > locking::should throw error if pessimistic lock used without transaction
+query builder > locking::should throw error if pessimistic locking not supported by given driver
+query builder > locking::should throw error when specifying a table that is not part of the query
+query builder > locking::skip_locked with "for_key_share" check getOne
+query builder > locking::skip_locked with "pessimistic_read"
+query builder > locking::skip_locked with "pessimistic_read" check getOne
+query builder > locking::skip_locked with "pessimistic_read" fails on early versions of MySQL
+query builder > not::should put negation correctly into WHERE expression with one condition
+query builder > not::should put negation correctly into WHERE expression with two conditions
+query builder > not::should put negation in the SQL with one condition
+query builder > not::should put negation in the SQL with two condition
+query builder > order-by > sql injections::should not allow SQL injection via OrderByCondition object
+query builder > order-by > sql injections::should not allow SQL injection via order by direction
+query builder > order-by > sql injections::should not allow non-allowed values in order by direction
+query builder > order-by > sql injections::should not allow non-allowed values in order by nulls option
+query builder > order-by expression-based orderBy::should allow expression-based orderBy keys with explicit direction
+query builder > order-by expression-based orderBy::should allow expression-based orderBy keys without explicit direction
+query builder > order-by::should be able to order by sql statement
+query builder > order-by::should be always in right order(custom order)
+query builder > order-by::should be always in right order(default order)
+query builder > order-by::should order by joined entity column using database column name with pagination
+query builder > order-by::should order by joined entity column using database column name without pagination
+query builder > order-by::should order by joined entity column using property name with pagination
+query builder > order-by::should order by joined entity column using property name without pagination
+query builder > order-by::should properly escape column names or aliases in order by
+query builder > parameters > date parameters::should be escaped correctly
+query builder > parameters > reused parameters::should generate a valid query
+query builder > parameters > spread IN parameters::should handle WHERE IN with spread parameter syntax
+query builder > parameters > sqlite::should allow periods in parameters
+query builder > parameters > sqlite::should prevent invalid characters from being used as identifiers
+query builder > parameters > sqlite::should replace basic parameters when executing
+query builder > relation-id > many-to-many > basic-functionality::should load ids when loadRelationIdAndMap used on ManyToMany inverse side
+query builder > relation-id > many-to-many > basic-functionality::should load ids when loadRelationIdAndMap used on ManyToMany inverse side with additional condition
+query builder > relation-id > many-to-many > basic-functionality::should load ids when loadRelationIdAndMap used on ManyToMany owner side
+query builder > relation-id > many-to-many > basic-functionality::should load ids when loadRelationIdAndMap used on ManyToMany owner side without inverse side
+query builder > relation-id > many-to-many > basic-functionality::should load ids when loadRelationIdAndMap used on ManyToMany owning side with additional condition
+query builder > relation-id > many-to-many > basic-functionality::should load ids when loadRelationIdAndMap used on ManyToMany owning side without inverse side and with additional condition
+query builder > relation-id > many-to-many > basic-functionality::should load ids when loadRelationIdAndMap used on nested relation
+query builder > relation-id > many-to-many > basic-functionality::should load ids when loadRelationIdAndMap used on nested relation with additional conditions
+query builder > relation-id > many-to-many > basic-functionality::should not load ids of nested relations when loadRelationIdAndMap used on inherit relation and parent relation was not found
+query builder > relation-id > many-to-many > basic-functionality::should not load ids when RelationId decorator is not specified
+query builder > relation-id > many-to-many > embedded-with-multiple-pk inverse side::should load ids when loadRelationIdAndMap used on embedded table and each table have primary key
+query builder > relation-id > many-to-many > embedded-with-multiple-pk owner side::should load ids when loadRelationIdAndMap used on embedded table and each table have primary key
+query builder > relation-id > many-to-many > embedded::should load ids when loadRelationIdAndMap used on embedded and nested embedded tables
+query builder > relation-id > many-to-many > multiple-pk inverse side::should load ids when both entities have multiple primary keys
+query builder > relation-id > many-to-many > multiple-pk inverse side::should load ids when both entities have multiple primary keys and additional condition used
+query builder > relation-id > many-to-many > multiple-pk inverse side::should load ids when loadRelationIdAndMap used on nested relation
+query builder > relation-id > many-to-many > multiple-pk inverse side::should load ids when only one entity have multiple primary key
+query builder > relation-id > many-to-many > multiple-pk owner side::should load ids when both entities have multiple primary keys
+query builder > relation-id > many-to-many > multiple-pk owner side::should load ids when both entities have multiple primary keys and additional condition used
+query builder > relation-id > many-to-many > multiple-pk owner side::should load ids when both entities have multiple primary keys and related entity does not have inverse side
+query builder > relation-id > many-to-many > multiple-pk owner side::should load ids when loadRelationIdAndMap used on nested relation
+query builder > relation-id > many-to-many > multiple-pk owner side::should load ids when only one entity have multiple primary key
+query builder > relation-id > many-to-one > basic-functionality::should load ids when loadRelationIdAndMap used
+query builder > relation-id > many-to-one > basic-functionality::should load ids when loadRelationIdAndMap used and target entity has multiple primary keys
+query builder > relation-id > many-to-one > basic-functionality::should load ids when loadRelationIdAndMap used on nested relation and target entity has multiple primary keys
+query builder > relation-id > many-to-one > embedded-with-multiple-pk::should load ids when loadRelationIdAndMap used on embedded table and each table have primary key
+query builder > relation-id > many-to-one > embedded::should load ids when loadRelationIdAndMap used on embedded and nested embedded tables
+query builder > relation-id > many-to-one > multiple-pk::should load ids when both entities have multiple primary keys
+query builder > relation-id > many-to-one > multiple-pk::should load ids when both entities have multiple primary keys and related entity does not have inverse side
+query builder > relation-id > many-to-one > multiple-pk::should load ids when loadRelationIdAndMap used on nested relation
+query builder > relation-id > many-to-one > multiple-pk::should load ids when only one entity have multiple primary keys
+query builder > relation-id > one-to-many > basic-functionality::should load id when loadRelationIdAndMap used on nested relation
+query builder > relation-id > one-to-many > basic-functionality::should load id when loadRelationIdAndMap used with OneToMany relation
+query builder > relation-id > one-to-many > basic-functionality::should load id when loadRelationIdAndMap used with additional condition
+query builder > relation-id > one-to-many > embedded-with-multiple-pk::should load ids when loadRelationIdAndMap used on embedded table and each table have primary key
+query builder > relation-id > one-to-many > embedded::should load ids when loadRelationIdAndMap used on embedded and nested embedded tables
+query builder > relation-id > one-to-many > multiple-pk::should load ids when both entities have multiple primary keys
+query builder > relation-id > one-to-many > multiple-pk::should load ids when both entities have multiple primary keys and additional condition used
+query builder > relation-id > one-to-many > multiple-pk::should load ids when loadRelationIdAndMap used on nested relation
+query builder > relation-id > one-to-many > multiple-pk::should load ids when only one entity have multiple primary keys
+query builder > relation-id > one-to-one > basic-functionality::should load id when loadRelationIdAndMap used with OneToOne inverse side relation
+query builder > relation-id > one-to-one > basic-functionality::should load ids when loadRelationIdAndMap used with OneToOne owner side relation
+query builder > relation-id > one-to-one > embedded-with-multiple-pk::should load ids when loadRelationIdAndMap used on embedded table and each table have primary key
+query builder > relation-id > one-to-one > embedded::should load ids when loadRelationIdAndMap used on embedded and nested embedded tables
+query builder > relation-id > one-to-one > multiple-pk inverse side::should load ids when both entities have multiple primary keys
+query builder > relation-id > one-to-one > multiple-pk inverse side::should load ids when loadRelationIdAndMap used on nested relation
+query builder > relation-id > one-to-one > multiple-pk inverse side::should load ids when only one entity have multiple primary keys
+query builder > relation-id > one-to-one > multiple-pk owner side::should load ids when both entities have multiple primary keys
+query builder > relation-id > one-to-one > multiple-pk owner side::should load ids when both entities have multiple primary keys and related entity does not have inverse side
+query builder > relation-id > one-to-one > multiple-pk owner side::should load ids when loadRelationIdAndMap used on nested relation
+query builder > relation-id > one-to-one > multiple-pk owner side::should load ids when only one entity have multiple primary keys
+query builder > relational query builder > add operation > one to many relation::should add entity relation of a given entity by entity id
+query builder > relational query builder > add operation > one to many relation::should add entity relation of a given entity by entity id map
+query builder > relational query builder > add operation > one to many relation::should add entity relation of a given entity by entity objects
+query builder > relational query builder > add operation > one to many relation::should add multiple entities into relation of a multiple entities
+query builder > relational query builder > add operation > one to many relation::should handle addAndRemove method as well
+query builder > relational query builder > load operation > many-to-one and one-to-one relations::should load relation entity of a given entity id
+query builder > relational query builder > load operation > many-to-one and one-to-one relations::should load relation entity of a given entity object
+query builder > relational query builder > load operation > many-to-one and one-to-one relations::should load relation entity of a given id
+query builder > relational query builder > set operation > many to one relation::should set entity relation of a given entity by entity id
+query builder > relational query builder > set operation > many to one relation::should set entity relation of a given entity by entity id map
+query builder > relational query builder > set operation > many to one relation::should set entity relation of a given entity by entity objects
+query builder > relational query builder > set operation > many to one relation::should set entity relation of a multiple entities
+query builder > relational query builder > set operation > one-to-one non owner side::should raise error when setting entity relation of a multiple entities
+query builder > relational query builder > set operation > one-to-one non owner side::should set entity relation of a given entity by entity id
+query builder > relational query builder > set operation > one-to-one non owner side::should set entity relation of a given entity by entity id map
+query builder > relational query builder > set operation > one-to-one non owner side::should set entity relation of a given entity by entity objects
+query builder > relational query builder > set operation > one-to-one relation::should raise error when setting entity relation of a multiple entities
+query builder > relational query builder > set operation > one-to-one relation::should set entity relation of a given entity by entity id
+query builder > relational query builder > set operation > one-to-one relation::should set entity relation of a given entity by entity id map
+query builder > relational query builder > set operation > one-to-one relation::should set entity relation of a given entity by entity objects
+query builder > relational with many > add and remove many to many inverse::should add entity relation of a given entity by entity id
+query builder > relational with many > add and remove many to many inverse::should add entity relation of a given entity by entity id map
+query builder > relational with many > add and remove many to many inverse::should add entity relation of a given entity by entity objects
+query builder > relational with many > add and remove many to many inverse::should add entity relation of a multiple entities
+query builder > relational with many > add and remove many to many inverse::should add multiple entities into relation of a multiple entities
+query builder > relational with many > add and remove many to many::should add entity relation of a given entity by entity id
+query builder > relational with many > add and remove many to many::should add entity relation of a given entity by entity id map
+query builder > relational with many > add and remove many to many::should add entity relation of a given entity by entity objects
+query builder > relational with many > add and remove many to many::should add entity relation of a multiple entities
+query builder > relational with many > add and remove many to many::should add multiple entities into relation of a multiple entities
+query builder > relational with many > load many::should load relation entity of a given entity id
+query builder > relational with many > load many::should load relation entity of a given entity id map
+query builder > relational with many > load many::should load relation entity of a given entity object
+query builder > select column order in select statement::should return columns in the order they were specified in select statement
+query builder > select column order in select statement::works with joins and subqueries
+query builder > select limit and offset handling::should generate LIMIT 0 OFFSET 5 when limit is 0 and offset is 5
+query builder > select limit and offset handling::should generate LIMIT 0 when limit is set to 0
+query builder > select limit and offset handling::should generate LIMIT 0 when take is set to 0 without joins
+query builder > select limit and offset handling::should generate OFFSET 0 when offset is set to 0
+query builder > select limit and offset handling::should generate OFFSET 0 when skip is set to 0 without joins
+query builder > select limit and offset handling::should handle limit(0) with offset(0)
+query builder > select limit and offset handling::should return empty array when limit(0) is used in actual query execution
+query builder > select limit and offset handling::should return empty array when take(0) is used in actual query execution without joins
+query builder > select limit and offset handling::should work correctly with non-zero limits and offsets
+query builder > select partial selection without primary key::should not group rows with identical selected values when the primary key is not selected
+query builder > select partial selection without primary key::should return one entity per row when the primary key is not selected
+query builder > select query execution and retrieval::should return a single entity for getOne when found
+query builder > select query execution and retrieval::should return a single entity for getOneOrFail when found
+query builder > select query execution and retrieval::should return undefined for getOne when not found
+query builder > select query execution and retrieval::should throw an Error for getOneOrFail when not found
+query builder > select where-in-ids::should create expected query with composite primary keys
+query builder > select where-in-ids::should create expected query with composite primary keys with missing value
+query builder > select where-in-ids::should create expected query with simple primary keys
+query builder > select with relations and where clause deeply nested relations::should craft query with FindOperator
+query builder > select with relations and where clause deeply nested relations::should craft query with exact value
+query builder > select with relations and where clause many-to-many::should craft query with FindOperator
+query builder > select with relations and where clause many-to-many::should craft query with exact value
+query builder > select with relations and where clause many-to-one::should craft query with FindOperator
+query builder > select with relations and where clause many-to-one::should craft query with Raw
+query builder > select with relations and where clause many-to-one::should craft query with exact value
+query builder > select with relations and where clause one-to-many::should craft query with FindOperator
+query builder > select with relations and where clause one-to-many::should craft query with exact value
+query builder > select with relations and where clause one-to-one::should craft query with FindOperator
+query builder > select with relations and where clause one-to-one::should craft query with exact value
+query builder > select::Support max execution time
+query builder > select::Support using certain index
+query builder > select::should append all entity mapped columns from both main selection and join selections to select statement
+query builder > select::should append all entity mapped columns from main selection to SELECT DISTINCT statement
+query builder > select::should append all entity mapped columns from main selection to select statement
+query builder > select::should append entity mapped columns from both main alias and join aliases to select statement
+query builder > select::should append entity mapped columns to select statement, if they passed as array
+query builder > select::should append raw sql and entity mapped column to select statement
+query builder > select::should append raw sql and entity mapped columns to advanced select statement
+query builder > select::should append raw sql to select statement
+query builder > select::should not create alias for selection, which is not entity mapped column
+query builder > soft-delete::should find with soft deleted relations
+query builder > soft-delete::should perform restory with limit correctly
+query builder > soft-delete::should perform soft delete with limit correctly
+query builder > soft-delete::should perform soft deletion and recovery correctly
+query builder > soft-delete::should soft-delete and restore properties inside embeds as well
+query builder > soft-delete::should throw error when delete date column is missing
+query builder > sql injection SoftDeleteQueryBuilder limit validation::should accept valid numeric limit
+query builder > sql injection SoftDeleteQueryBuilder limit validation::should reject non-numeric limit
+query builder > sql injection SoftDeleteQueryBuilder orderBy direction injection::should reject invalid nulls value
+query builder > sql injection SoftDeleteQueryBuilder orderBy direction injection::should reject invalid order direction in addOrderBy
+query builder > sql injection SoftDeleteQueryBuilder orderBy direction injection::should reject invalid order direction string
+query builder > sql injection UpdateQueryBuilder limit validation::should accept valid numeric limit
+query builder > sql injection UpdateQueryBuilder limit validation::should reject non-numeric limit
+query builder > sql injection UpdateQueryBuilder orderBy direction injection::should accept valid order directions
+query builder > sql injection UpdateQueryBuilder orderBy direction injection::should reject invalid nulls value
+query builder > sql injection UpdateQueryBuilder orderBy direction injection::should reject invalid order direction in addOrderBy
+query builder > sql injection UpdateQueryBuilder orderBy direction injection::should reject invalid order direction string
+query builder > sql injection andWhere::should prevent injection with: "; DROP TABLE post; --
+query builder > sql injection andWhere::should prevent injection with: ' OR SLEEP(5)--
+query builder > sql injection andWhere::should prevent injection with: ' UNION SELECT * FROM post --
+query builder > sql injection andWhere::should prevent injection with: '' OR ''='
+query builder > sql injection andWhere::should prevent injection with: '/**/OR/**/1=1--
+query builder > sql injection andWhere::should prevent injection with: '; DROP TABLE post; --
+query builder > sql injection andWhere::should prevent injection with: '; DROP TABLE post;--
+query builder > sql injection andWhere::should prevent injection with: 0x27 OR 1=1--
+query builder > sql injection andWhere::should prevent injection with: 1 OR 1=1
+query builder > sql injection andWhere::should prevent injection with: 1; DELETE FROM post;
+query builder > sql injection andWhere::should prevent injection with: \'; DROP TABLE post; --
+query builder > sql injection andWhere::should prevent injection with: test' OR '1'='1
+query builder > sql injection delete::should prevent injection with: "; DROP TABLE post; --
+query builder > sql injection delete::should prevent injection with: ' OR SLEEP(5)--
+query builder > sql injection delete::should prevent injection with: ' UNION SELECT * FROM post --
+query builder > sql injection delete::should prevent injection with: '' OR ''='
+query builder > sql injection delete::should prevent injection with: '/**/OR/**/1=1--
+query builder > sql injection delete::should prevent injection with: '; DROP TABLE post; --
+query builder > sql injection delete::should prevent injection with: '; DROP TABLE post;--
+query builder > sql injection delete::should prevent injection with: 0x27 OR 1=1--
+query builder > sql injection delete::should prevent injection with: 1 OR 1=1
+query builder > sql injection delete::should prevent injection with: 1; DELETE FROM post;
+query builder > sql injection delete::should prevent injection with: \'; DROP TABLE post; --
+query builder > sql injection delete::should prevent injection with: test' OR '1'='1
+query builder > sql injection having::should prevent injection with: "; DROP TABLE post; --
+query builder > sql injection having::should prevent injection with: ' OR SLEEP(5)--
+query builder > sql injection having::should prevent injection with: ' UNION SELECT * FROM post --
+query builder > sql injection having::should prevent injection with: '' OR ''='
+query builder > sql injection having::should prevent injection with: '/**/OR/**/1=1--
+query builder > sql injection having::should prevent injection with: '; DROP TABLE post; --
+query builder > sql injection having::should prevent injection with: '; DROP TABLE post;--
+query builder > sql injection having::should prevent injection with: 0x27 OR 1=1--
+query builder > sql injection having::should prevent injection with: 1 OR 1=1
+query builder > sql injection having::should prevent injection with: 1; DELETE FROM post;
+query builder > sql injection having::should prevent injection with: \'; DROP TABLE post; --
+query builder > sql injection having::should prevent injection with: test' OR '1'='1
+query builder > sql injection orWhere::should prevent injection with: "; DROP TABLE post; --
+query builder > sql injection orWhere::should prevent injection with: ' OR SLEEP(5)--
+query builder > sql injection orWhere::should prevent injection with: ' UNION SELECT * FROM post --
+query builder > sql injection orWhere::should prevent injection with: '' OR ''='
+query builder > sql injection orWhere::should prevent injection with: '/**/OR/**/1=1--
+query builder > sql injection orWhere::should prevent injection with: '; DROP TABLE post; --
+query builder > sql injection orWhere::should prevent injection with: '; DROP TABLE post;--
+query builder > sql injection orWhere::should prevent injection with: 0x27 OR 1=1--
+query builder > sql injection orWhere::should prevent injection with: 1 OR 1=1
+query builder > sql injection orWhere::should prevent injection with: 1; DELETE FROM post;
+query builder > sql injection orWhere::should prevent injection with: \'; DROP TABLE post; --
+query builder > sql injection orWhere::should prevent injection with: test' OR '1'='1
+query builder > sql injection orderBy value injection::should accept valid OrderByCondition values
+query builder > sql injection orderBy value injection::should accept valid OrderByCondition with nulls option
+query builder > sql injection orderBy value injection::should reject invalid nulls option in OrderByCondition
+query builder > sql injection orderBy value injection::should reject invalid order direction in OrderByCondition
+query builder > sql injection orderBy value injection::should reject invalid order direction in SoftDeleteQueryBuilder
+query builder > sql injection orderBy value injection::should reject invalid order direction in UpdateQueryBuilder
+query builder > sql injection update::should prevent injection with: "; DROP TABLE post; --
+query builder > sql injection update::should prevent injection with: ' OR SLEEP(5)--
+query builder > sql injection update::should prevent injection with: ' UNION SELECT * FROM post --
+query builder > sql injection update::should prevent injection with: '' OR ''='
+query builder > sql injection update::should prevent injection with: '/**/OR/**/1=1--
+query builder > sql injection update::should prevent injection with: '; DROP TABLE post; --
+query builder > sql injection update::should prevent injection with: '; DROP TABLE post;--
+query builder > sql injection update::should prevent injection with: 0x27 OR 1=1--
+query builder > sql injection update::should prevent injection with: 1 OR 1=1
+query builder > sql injection update::should prevent injection with: 1; DELETE FROM post;
+query builder > sql injection update::should prevent injection with: \'; DROP TABLE post; --
+query builder > sql injection update::should prevent injection with: test' OR '1'='1
+query builder > sql injection useIndex::should escape a malicious index name
+query builder > sql injection useIndex::should escape a malicious index name in an array
+query builder > sql injection useIndex::should escape each index name when an array is passed
+query builder > sql injection where::should prevent injection with: "; DROP TABLE post; --
+query builder > sql injection where::should prevent injection with: ' OR SLEEP(5)--
+query builder > sql injection where::should prevent injection with: ' UNION SELECT * FROM post --
+query builder > sql injection where::should prevent injection with: '' OR ''='
+query builder > sql injection where::should prevent injection with: '/**/OR/**/1=1--
+query builder > sql injection where::should prevent injection with: '; DROP TABLE post; --
+query builder > sql injection where::should prevent injection with: '; DROP TABLE post;--
+query builder > sql injection where::should prevent injection with: 0x27 OR 1=1--
+query builder > sql injection where::should prevent injection with: 1 OR 1=1
+query builder > sql injection where::should prevent injection with: 1; DELETE FROM post;
+query builder > sql injection where::should prevent injection with: \'; DROP TABLE post; --
+query builder > sql injection where::should prevent injection with: test' OR '1'='1
+query builder > sub-query::should execute sub query in from expression (using different query builder)
+query builder > sub-query::should execute sub query in from expression (using from's query builder)
+query builder > sub-query::should execute sub query in from expression as second from expression
+query builder > sub-query::should execute sub query in joins (using provided sub query builder)
+query builder > sub-query::should execute sub query in joins as string (as selection)
+query builder > sub-query::should execute sub query in joins with subquery factory (as selection)
+query builder > sub-query::should execute sub query in selects
+query builder > sub-query::should execute sub query in selects (using provided sub query builder)
+query builder > sub-query::should execute sub query in where function using subQuery method
+query builder > sub-query::should execute sub query in where string using subQuery method
+query builder > sub-query::should execute sub query using different query builder
+query builder > update::should be able to use sql functions
+query builder > update::should perform update with limit correctly
+query builder > update::should perform updation correctly
+query builder > update::should throw error when unknown property in where criteria
+query builder > update::should throw error when update property in set method is unknown
+query builder > update::should throw error when update value is missing
+query builder > update::should throw error when update value is missing 2
+query builder > update::should update and escape properly
+query builder > update::should update properties inside embeds as well
+query builder order nulls first/last::should work with uppercase/lowercase first/last
+query runner > add column::should correctly add column and revert add
+query runner > change column::should correctly change column 'isGenerated' property and revert change
+query runner > change column::should correctly change column and revert change
+query runner > change column::should correctly change generated as expression
+query runner > create check constraint::should correctly create check constraint and revert creation
+query runner > create foreign key::should correctly create foreign key and revert creation
+query runner > create index::should correctly create index and revert creation
+query runner > create primary key::should correctly create primary key and revert creation
+query runner > create table::should correctly create table from Entity
+query runner > create table::should correctly create table from simple object and revert creation
+query runner > create table::should correctly create table with all dependencies and revert creation
+query runner > create table::should correctly create table with different `Unique` definitions
+query runner > create table::should correctly create table with different `withoutRowid` definitions
+query runner > create unique constraint::should correctly create unique constraint and revert creation
+query runner > drop check constraint::should correctly drop check constraint and revert drop
+query runner > drop check constraint::should not throw when dropping non-existent check constraint with ifExists
+query runner > drop column array modification during iteration::should drop all columns without skipping any when iterating over array
+query runner > drop column when columns are instances of TableColumn::should correctly drop column and revert drop
+query runner > drop column when columns are strings::should correctly drop column and revert drop
+query runner > drop column::should not throw when dropping non-existent column with ifExists
+query runner > drop foreign key::should correctly drop foreign key and revert drop
+query runner > drop foreign key::should drop all foreign keys without skipping any when iterating over array
+query runner > drop foreign key::should not throw when dropping non-existent foreign key with ifExists
+query runner > drop index::should correctly drop index and revert drop
+query runner > drop index::should drop all indices without skipping any when iterating over array
+query runner > drop index::should not throw when dropping non-existent index with ifExists
+query runner > drop primary key::should correctly drop primary key and revert drop
+query runner > drop primary key::should not throw when dropping non-existent primary key with ifExists
+query runner > drop table::should correctly drop table with relations and revert drop
+query runner > drop table::should correctly drop table without relations and revert drop
+query runner > drop table::should not throw when dropping non-existent table with ifExists
+query runner > drop unique constraint::should correctly drop unique constraint and revert drop
+query runner > drop unique constraint::should drop all unique constraints without skipping any when iterating over array
+query runner > drop unique constraint::should not throw when dropping non-existent unique constraint with ifExists
+query runner > error stack trace::should include call site stack trace on entity operation error
+query runner > error stack trace::should include call site stack trace on query error
+query runner > has column::should correctly check if column exist
+query runner > has table::should return true for existing tables and false for non-existing
+query runner > rename column::should correctly rename column and revert rename
+query runner > rename column::should correctly rename column with all constraints and revert rename
+query runner > rename column::should correctly rename column with all constraints in custom table schema and database and revert rename
+query runner > rename table::should correctly rename table and revert rename
+query runner > rename table::should correctly rename table with all constraints depend to that table and revert rename
+query runner > rename table::should correctly rename table with custom schema and database and all its dependencies and revert rename
+query runner > sql injection DDL methods createDatabase::should prevent injection with: "; DROP TABLE post; --
+query runner > sql injection DDL methods createDatabase::should prevent injection with: ' OR SLEEP(5)--
+query runner > sql injection DDL methods createDatabase::should prevent injection with: ' UNION SELECT * FROM post --
+query runner > sql injection DDL methods createDatabase::should prevent injection with: '' OR ''='
+query runner > sql injection DDL methods createDatabase::should prevent injection with: '/**/OR/**/1=1--
+query runner > sql injection DDL methods createDatabase::should prevent injection with: '; DROP TABLE post; --
+query runner > sql injection DDL methods createDatabase::should prevent injection with: '; DROP TABLE post;--
+query runner > sql injection DDL methods createDatabase::should prevent injection with: 0x27 OR 1=1--
+query runner > sql injection DDL methods createDatabase::should prevent injection with: 1 OR 1=1
+query runner > sql injection DDL methods createDatabase::should prevent injection with: 1; DELETE FROM post;
+query runner > sql injection DDL methods createDatabase::should prevent injection with: \'; DROP TABLE post; --
+query runner > sql injection DDL methods createDatabase::should prevent injection with: test' OR '1'='1
+query runner > sql injection DDL methods createSchema::should prevent injection with: "; DROP TABLE post; --
+query runner > sql injection DDL methods createSchema::should prevent injection with: ' OR SLEEP(5)--
+query runner > sql injection DDL methods createSchema::should prevent injection with: ' UNION SELECT * FROM post --
+query runner > sql injection DDL methods createSchema::should prevent injection with: '' OR ''='
+query runner > sql injection DDL methods createSchema::should prevent injection with: '/**/OR/**/1=1--
+query runner > sql injection DDL methods createSchema::should prevent injection with: '; DROP TABLE post; --
+query runner > sql injection DDL methods createSchema::should prevent injection with: '; DROP TABLE post;--
+query runner > sql injection DDL methods createSchema::should prevent injection with: 0x27 OR 1=1--
+query runner > sql injection DDL methods createSchema::should prevent injection with: 1 OR 1=1
+query runner > sql injection DDL methods createSchema::should prevent injection with: 1; DELETE FROM post;
+query runner > sql injection DDL methods createSchema::should prevent injection with: \'; DROP TABLE post; --
+query runner > sql injection DDL methods createSchema::should prevent injection with: test' OR '1'='1
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: "; DROP TABLE post; --
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: ' OR SLEEP(5)--
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: ' UNION SELECT * FROM post --
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: '' OR ''='
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: '/**/OR/**/1=1--
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: '; DROP TABLE post; --
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: '; DROP TABLE post;--
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: 0x27 OR 1=1--
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: 1 OR 1=1
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: 1; DELETE FROM post;
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: \'; DROP TABLE post; --
+query runner > sql injection DDL methods dropDatabase::should prevent injection with: test' OR '1'='1
+query runner > sql injection DDL methods dropSchema::should prevent injection with: "; DROP TABLE post; --
+query runner > sql injection DDL methods dropSchema::should prevent injection with: ' OR SLEEP(5)--
+query runner > sql injection DDL methods dropSchema::should prevent injection with: ' UNION SELECT * FROM post --
+query runner > sql injection DDL methods dropSchema::should prevent injection with: '' OR ''='
+query runner > sql injection DDL methods dropSchema::should prevent injection with: '/**/OR/**/1=1--
+query runner > sql injection DDL methods dropSchema::should prevent injection with: '; DROP TABLE post; --
+query runner > sql injection DDL methods dropSchema::should prevent injection with: '; DROP TABLE post;--
+query runner > sql injection DDL methods dropSchema::should prevent injection with: 0x27 OR 1=1--
+query runner > sql injection DDL methods dropSchema::should prevent injection with: 1 OR 1=1
+query runner > sql injection DDL methods dropSchema::should prevent injection with: 1; DELETE FROM post;
+query runner > sql injection DDL methods dropSchema::should prevent injection with: \'; DROP TABLE post; --
+query runner > sql injection DDL methods dropSchema::should prevent injection with: test' OR '1'='1
+query runner > sql injection DDL methods dropTable::should prevent injection with: "; DROP TABLE post; --
+query runner > sql injection DDL methods dropTable::should prevent injection with: ' OR SLEEP(5)--
+query runner > sql injection DDL methods dropTable::should prevent injection with: ' UNION SELECT * FROM post --
+query runner > sql injection DDL methods dropTable::should prevent injection with: '' OR ''='
+query runner > sql injection DDL methods dropTable::should prevent injection with: '/**/OR/**/1=1--
+query runner > sql injection DDL methods dropTable::should prevent injection with: '; DROP TABLE post; --
+query runner > sql injection DDL methods dropTable::should prevent injection with: '; DROP TABLE post;--
+query runner > sql injection DDL methods dropTable::should prevent injection with: 0x27 OR 1=1--
+query runner > sql injection DDL methods dropTable::should prevent injection with: 1 OR 1=1
+query runner > sql injection DDL methods dropTable::should prevent injection with: 1; DELETE FROM post;
+query runner > sql injection DDL methods dropTable::should prevent injection with: \'; DROP TABLE post; --
+query runner > sql injection DDL methods dropTable::should prevent injection with: test' OR '1'='1
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: "; DROP TABLE post; --
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: ' OR SLEEP(5)--
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: ' UNION SELECT * FROM post --
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: '' OR ''='
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: '/**/OR/**/1=1--
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: '; DROP TABLE post; --
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: '; DROP TABLE post;--
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: 0x27 OR 1=1--
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: 1 OR 1=1
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: 1; DELETE FROM post;
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: \'; DROP TABLE post; --
+query runner > sql injection read methods hasColumn::should prevent injection via column name with: test' OR '1'='1
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: "; DROP TABLE post; --
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: ' OR SLEEP(5)--
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: ' UNION SELECT * FROM post --
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: '' OR ''='
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: '/**/OR/**/1=1--
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: '; DROP TABLE post; --
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: '; DROP TABLE post;--
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: 0x27 OR 1=1--
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: 1 OR 1=1
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: 1; DELETE FROM post;
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: \'; DROP TABLE post; --
+query runner > sql injection read methods hasColumn::should prevent injection via table name with: test' OR '1'='1
+query runner > sql injection read methods hasDatabase::should prevent injection with: "; DROP TABLE post; --
+query runner > sql injection read methods hasDatabase::should prevent injection with: ' OR SLEEP(5)--
+query runner > sql injection read methods hasDatabase::should prevent injection with: ' UNION SELECT * FROM post --
+query runner > sql injection read methods hasDatabase::should prevent injection with: '' OR ''='
+query runner > sql injection read methods hasDatabase::should prevent injection with: '/**/OR/**/1=1--
+query runner > sql injection read methods hasDatabase::should prevent injection with: '; DROP TABLE post; --
+query runner > sql injection read methods hasDatabase::should prevent injection with: '; DROP TABLE post;--
+query runner > sql injection read methods hasDatabase::should prevent injection with: 0x27 OR 1=1--
+query runner > sql injection read methods hasDatabase::should prevent injection with: 1 OR 1=1
+query runner > sql injection read methods hasDatabase::should prevent injection with: 1; DELETE FROM post;
+query runner > sql injection read methods hasDatabase::should prevent injection with: \'; DROP TABLE post; --
+query runner > sql injection read methods hasDatabase::should prevent injection with: test' OR '1'='1
+query runner > sql injection read methods hasSchema::should prevent injection with: "; DROP TABLE post; --
+query runner > sql injection read methods hasSchema::should prevent injection with: ' OR SLEEP(5)--
+query runner > sql injection read methods hasSchema::should prevent injection with: ' UNION SELECT * FROM post --
+query runner > sql injection read methods hasSchema::should prevent injection with: '' OR ''='
+query runner > sql injection read methods hasSchema::should prevent injection with: '/**/OR/**/1=1--
+query runner > sql injection read methods hasSchema::should prevent injection with: '; DROP TABLE post; --
+query runner > sql injection read methods hasSchema::should prevent injection with: '; DROP TABLE post;--
+query runner > sql injection read methods hasSchema::should prevent injection with: 0x27 OR 1=1--
+query runner > sql injection read methods hasSchema::should prevent injection with: 1 OR 1=1
+query runner > sql injection read methods hasSchema::should prevent injection with: 1; DELETE FROM post;
+query runner > sql injection read methods hasSchema::should prevent injection with: \'; DROP TABLE post; --
+query runner > sql injection read methods hasSchema::should prevent injection with: test' OR '1'='1
+query runner > sql injection read methods hasTable::should prevent injection with: "; DROP TABLE post; --
+query runner > sql injection read methods hasTable::should prevent injection with: ' OR SLEEP(5)--
+query runner > sql injection read methods hasTable::should prevent injection with: ' UNION SELECT * FROM post --
+query runner > sql injection read methods hasTable::should prevent injection with: '' OR ''='
+query runner > sql injection read methods hasTable::should prevent injection with: '/**/OR/**/1=1--
+query runner > sql injection read methods hasTable::should prevent injection with: '; DROP TABLE post; --
+query runner > sql injection read methods hasTable::should prevent injection with: '; DROP TABLE post;--
+query runner > sql injection read methods hasTable::should prevent injection with: 0x27 OR 1=1--
+query runner > sql injection read methods hasTable::should prevent injection with: 1 OR 1=1
+query runner > sql injection read methods hasTable::should prevent injection with: 1; DELETE FROM post;
+query runner > sql injection read methods hasTable::should prevent injection with: \'; DROP TABLE post; --
+query runner > sql injection read methods hasTable::should prevent injection with: test' OR '1'='1
+query-builder > take > sqlite high take limit::should not fail with too many SQL variables when take is 1000
+relations > composite foreign key with joinColumn order different from PK order::should create schema and persist when joinColumn order differs from PK order
+relations > composite foreign key with joinTable order different from PK order::should create junction table when inverseJoinColumns order differs from PK order
+relations > custom-join-column-name::should persist entity with many-to-one relation using custom join column name
+relations > custom-referenced-column-name many-to-one::should load related entity when relation defined with empty join column
+relations > custom-referenced-column-name many-to-one::should load related entity when relation defined without column name
+relations > custom-referenced-column-name many-to-one::should load related entity when relation defined without reference column name
+relations > custom-referenced-column-name many-to-one::should load related entity when relation defined without reference column name and relation does not have relation column in entity
+relations > custom-referenced-column-name many-to-one::should load related entity when relation use custom referenced column name
+relations > custom-referenced-column-name many-to-one::should persist relation when relation sets via join column
+relations > custom-referenced-column-name one-to-one::should load related entity when relation defined without column name
+relations > custom-referenced-column-name one-to-one::should load related entity when relation defined without reference column name
+relations > custom-referenced-column-name one-to-one::should load related entity when relation defined without reference column name and relation does not have relation column in entity
+relations > custom-referenced-column-name one-to-one::should load related entity when relation use custom referenced column name
+relations > custom-referenced-column-name one-to-one::should persist relation when relation sets via join column
+relations > eager relations > basic::should load all eager relations when object is loaded
+relations > eager relations > basic::should not join eager relations twice when explicitly specified with DeleteDateColumn entity (issue #11823)
+relations > eager relations > basic::should not load eager relations when query builder is used
+relations > eager relations > basic::should preserve manually requested nested relations with DeleteDateColumn
+relations > eager relations > lazy nested eager relations::should load all eager relations nested inside a lazy relation
+relations > empty relation returns array::should return post with categories even if post was saved without categories set
+relations > empty relation returns array::should return post with categories even if post with empty categories was saved
+relations > empty relation returns array::should return post with categories if they are attached to the post
+relations > join strategy ManyToMany QueryBuilder::should always use LEFT JOIN regardless of nullable
+relations > join strategy ManyToMany find methods::should return both posts including one without associations
+relations > join strategy ManyToOne QueryBuilder::should use INNER JOIN when nullable=false, eager=false
+relations > join strategy ManyToOne QueryBuilder::should use INNER JOIN when nullable=false, eager=true
+relations > join strategy ManyToOne QueryBuilder::should use LEFT JOIN when nullable=true, eager=false
+relations > join strategy ManyToOne QueryBuilder::should use LEFT JOIN when nullable=true, eager=true
+relations > join strategy ManyToOne find methods::should return both posts when nullable=false (INNER JOIN keeps all rows)
+relations > join strategy ManyToOne find methods::should return both posts when nullable=true (LEFT JOIN includes null rows)
+relations > join strategy OneToMany QueryBuilder::should always use LEFT JOIN regardless of nullable
+relations > join strategy OneToMany find methods::should return both posts including one without children
+relations > join strategy OneToOne (inverse side) QueryBuilder::should always use LEFT JOIN regardless of nullable
+relations > join strategy OneToOne (inverse side) find methods::should return both posts including one without inverse relation
+relations > join strategy OneToOne (owner side) QueryBuilder::should use INNER JOIN when nullable=false
+relations > join strategy OneToOne (owner side) QueryBuilder::should use LEFT JOIN when nullable=true
+relations > join strategy OneToOne (owner side) find methods::should return both posts when nullable=false (INNER JOIN keeps all rows)
+relations > join strategy OneToOne (owner side) find methods::should return both posts when nullable=true (LEFT JOIN includes null rows)
+relations > join strategy nested joins (parent LEFT → child must also be LEFT) QueryBuilder::should use LEFT JOIN for nullable=false child when parent is LEFT-joined
+relations > join strategy nested joins (parent LEFT → child must also be LEFT) find methods::should not filter out parent rows when nested child is nullable=false
+relations > join strategy soft-delete interaction QueryBuilder::should preserve parent rows when related soft-deleted entity is soft-deleted
+relations > join strategy soft-delete interaction QueryBuilder::should use INNER JOIN when nullable=false with @DeleteDateColumn and withDeleted=true
+relations > join strategy soft-delete interaction QueryBuilder::should use LEFT JOIN when nullable=false but target has @DeleteDateColumn
+relations > join strategy soft-delete interaction find methods::should preserve parent rows when related entity is soft-deleted
+relations > load-strategy > query > circular eager (Publisher→Magazine→Journalist→Publisher)::should not recurse infinitely with circular eager relations and query strategy
+relations > load-strategy > query > eager relation inside an embedded::should load an eager relation inside an embedded when the find options name another relation
+relations > load-strategy > query > eager relation inside an embedded::should load an eager relation inside an embedded when the find options only select columns
+relations > load-strategy > query DataSource-level strategy::should propagate DataSource-level strategy for self-referencing relations
+relations > load-strategy > query DataSource-level strategy::should respect relationLoadStrategy set at DataSource level
+relations > load-strategy > query ManyToMany eager::should load eager ManyToMany relations via query strategy
+relations > load-strategy > query ManyToOne eager::should load eager ManyToOne relations via query strategy
+relations > load-strategy > query OneToMany eager (nested)::should load nested eager OneToMany relations via query strategy
+relations > load-strategy > query OneToOne eager::should load eager OneToOne relations via query strategy
+relations > load-strategy > query empty relations::should return empty array for ManyToMany with no related entities
+relations > load-strategy > query empty relations::should return empty array for OneToMany with no related entities
+relations > load-strategy > query find() with multiple results::should load eager relations for all entities returned by find()
+relations > load-strategy > query loadEagerRelations::should load explicit relations but suppress nested eager when loadEagerRelations is false
+relations > load-strategy > query loadEagerRelations::should not load any eager relations when loadEagerRelations is false and no explicit relations
+relations > load-strategy > query self-referencing::should load self-referencing parent relation via query strategy
+relations > load-strategy > query self-referencing::should load three levels of self-referencing relations via query strategy
+relations > many-to-many > junction foreign keys default to CASCADE (#11738)::both junction foreign keys fall back to onDelete/onUpdate CASCADE for bidirectional relations
+relations > many-to-many > save from both sides::should save many-to-many relation from both owning and inverse sides
+relations > multiple-primary-keys > many-to-many > explicit join entity::should persist and load join entity with extra columns
+relations > multiple-primary-keys > many-to-many > implicit join entity inverse side::should load related entity when JoinTable references with non-primary columns
+relations > multiple-primary-keys > many-to-many > implicit join entity inverse side::should load related entity when JoinTable used with options
+relations > multiple-primary-keys > many-to-many > implicit join entity inverse side::should load related entity when JoinTable used without options
+relations > multiple-primary-keys > many-to-many > implicit join entity inverse side::should load related entity when both entities have multiple primary columns and JoinTable references with non-primary columns
+relations > multiple-primary-keys > many-to-many > implicit join entity inverse side::should load related entity when both entities have multiple primary columns and JoinTable used with options
+relations > multiple-primary-keys > many-to-many > implicit join entity inverse side::should load related entity when both entities have multiple primary columns and JoinTable used without options
+relations > multiple-primary-keys > many-to-many > implicit join entity owning side::should load related entity when JoinTable references with non-primary columns
+relations > multiple-primary-keys > many-to-many > implicit join entity owning side::should load related entity when JoinTable used with options
+relations > multiple-primary-keys > many-to-many > implicit join entity owning side::should load related entity when JoinTable used without options
+relations > multiple-primary-keys > many-to-many > implicit join entity owning side::should load related entity when both entities have multiple primary columns and JoinTable references with non-primary columns
+relations > multiple-primary-keys > many-to-many > implicit join entity owning side::should load related entity when both entities have multiple primary columns and JoinTable used with options
+relations > multiple-primary-keys > many-to-many > implicit join entity owning side::should load related entity when both entities have multiple primary columns and JoinTable used without options
+relations > multiple-primary-keys > many-to-one inverse side::should load related entity when JoinColumn is not specified
+relations > multiple-primary-keys > many-to-one inverse side::should load related entity when JoinColumn is specified with options
+relations > multiple-primary-keys > many-to-one inverse side::should load related entity when JoinColumn is specified without options
+relations > multiple-primary-keys > many-to-one inverse side::should load related entity when JoinColumn references on to non-primary columns
+relations > multiple-primary-keys > many-to-one owning side::should load related entity when JoinColumn is not specified
+relations > multiple-primary-keys > many-to-one owning side::should load related entity when JoinColumn is specified with options
+relations > multiple-primary-keys > many-to-one owning side::should load related entity when JoinColumn is specified without options
+relations > multiple-primary-keys > many-to-one owning side::should load related entity when JoinColumn references on to non-primary columns
+relations > multiple-primary-keys > one-to-many::should correctly delete relation items
+relations > multiple-primary-keys > one-to-many::should correctly insert relation items
+relations > multiple-primary-keys > one-to-many::should correctly load relation items
+relations > multiple-primary-keys > one-to-many::should correctly update relation items
+relations > multiple-primary-keys > one-to-one inverse side::should load related entity when JoinColumn is specified without options
+relations > multiple-primary-keys > one-to-one inverse side::should load related entity when JoinColumns references on to non-primary columns
+relations > multiple-primary-keys > one-to-one inverse side::should load related entity when both entities have multiple primary columns and JoinColumn defined with options
+relations > multiple-primary-keys > one-to-one inverse side::should load related entity when both entities have multiple primary columns and JoinColumn defined without options
+relations > multiple-primary-keys > one-to-one inverse side::should load related entity when both entities have multiple primary columns and JoinColumn references on to non-primary columns
+relations > multiple-primary-keys > one-to-one owning side::should load related entity when JoinColumn is specified with options
+relations > multiple-primary-keys > one-to-one owning side::should load related entity when JoinColumn is specified without options
+relations > multiple-primary-keys > one-to-one owning side::should load related entity when JoinColumn references on to non-primary columns
+relations > multiple-primary-keys > one-to-one owning side::should load related entity when both entities have multiple primary columns and JoinColumn defined with options
+relations > multiple-primary-keys > one-to-one owning side::should load related entity when both entities have multiple primary columns and JoinColumn defined without options
+relations > multiple-primary-keys > one-to-one owning side::should load related entity when both entities have multiple primary columns and JoinColumn references on to non-primary columns
+relations > multiple-primary-keys > other-cases::should load related entity when entity uses relation ids as primary id
+relations > on-delete cascade one-to-many::should remove related entities via onDelete CASCADE when parent is removed
+relations > orphaned row action soft-delete::removing a Post from a Category
+relations > relation with primary key many-to-one with primary key in relation::should work perfectly
+repository > aggregate methods average::should return null when 0 rows match the query
+repository > aggregate methods average::should return the aggregate average
+repository > aggregate methods maximum::should return null when 0 rows match the query
+repository > aggregate methods maximum::should return the aggregate maximum
+repository > aggregate methods minimum::should return null when 0 rows match the query
+repository > aggregate methods minimum::should return the aggregate minimum
+repository > aggregate methods sum::should return null when 0 rows match the query
+repository > aggregate methods sum::should return the aggregate sum
+repository > aggregate methods with relations aggregate methods with multiple tables having same column name::should correctly qualify column names to avoid ambiguous references
+repository > aggregate methods with relations aggregate methods with nested relation filters::should handle complex relation filters correctly
+repository > aggregate methods with relations average with relation filter::should return null when no records match relation filter
+repository > aggregate methods with relations average with relation filter::should return the aggregate average when filtering by relation
+repository > aggregate methods with relations maximum with relation filter::should return null when no records match relation filter
+repository > aggregate methods with relations maximum with relation filter::should return the aggregate maximum when filtering by relation
+repository > aggregate methods with relations minimum with relation filter::should return null when no records match relation filter
+repository > aggregate methods with relations minimum with relation filter::should return the aggregate minimum when filtering by relation
+repository > aggregate methods with relations sum with relation filter::should return null when no records match relation filter
+repository > aggregate methods with relations sum with relation filter::should return the aggregate sum when filtering by relation
+repository > basic methods create::should create a new empty object if entity schema is used
+repository > basic methods create::should create a new empty object if entity schema with a target is used
+repository > basic methods create::should create a new instance of the object we are working with
+repository > basic methods create::should create an entity and copy to it all properties of the given plain object if its given
+repository > basic methods createMany::should create entities and copy to them all properties of the given plain object if its given
+repository > basic methods createQueryBuilder::should create a new query builder with the given alias
+repository > basic methods hasId::should return false if entity does not have an id
+repository > basic methods hasId::should return true if entity has an id
+repository > basic methods merge::should merge both entities and plain objects
+repository > basic methods merge::should merge multiple entities
+repository > basic methods preload also should also implement merge functionality::if we preload entity from the plain object and merge preloaded object with plain object we'll have an object from the db with the replaced properties by a plain object's properties
+repository > basic methods preload::should preload entity and all relations given in the object
+repository > basic methods preload::should preload entity from the given object with only id
+repository > basic methods query::should execute the query natively and it should return the result
+repository > basic methods save::should update existing entity using transformers
+repository > basic methods target::should return instance of the object it manages
+repository > basic methods upsert::github issues > #10889: should not update columns with update:false during upsert
+repository > basic methods upsert::should bulk upsert
+repository > basic methods upsert::should bulk upsert with embedded columns
+repository > basic methods upsert::should first create then update an entity
+repository > basic methods upsert::should not overwrite unspecified properties
+repository > basic methods upsert::should skip update when nothing has changed
+repository > basic methods upsert::should throw if using an unsupported driver
+repository > basic methods upsert::should throw if using indexPredicate with an unsupported driver
+repository > basic methods upsert::should upsert on one-to-one relation
+repository > basic methods upsert::should upsert with embedded columns
+repository > clear cascade clear with cascade false::fails with dependent tables
+repository > clear cascade clear with cascade false::truncates independent table
+repository > clear cascade clear with cascade true::truncates dependent tables
+repository > clear method::called from entity managed should remove everything as well
+repository > clear method::should remove everything
+repository > decrement method basic::should accept string as input and decrement value
+repository > decrement method basic::should decrement value
+repository > decrement method basic::should return UpdateResult
+repository > decrement method basic::should throw an error if column property path was not found
+repository > decrement method basic::should throw an error if input value is not number
+repository > decrement method basic::should throw on empty criteria and not touch any rows
+repository > decrement method embeded entities::should decrement value
+repository > decrement method invalidWhereValuesBehavior::should throw on a null value in the criteria
+repository > delete methods::remove multiple rows using delete method should delete successfully
+repository > delete methods::remove row using delete method with partial criteria should delete successfully
+repository > delete methods::remove using delete method should delete successfully
+repository > delete methods::removes all rows using deleteAll method
+repository > find methods count::should return a count of posts that match both criteria and find options
+repository > find methods count::should return a count of posts that match given criteria
+repository > find methods count::should return a count of posts that match given find options
+repository > find methods count::should return a count of posts that match given multiple criteria
+repository > find methods count::should return a full count when no criteria given
+repository > find methods count::should support distinct count when select is provided
+repository > find methods count::should support distinct count with embed
+repository > find methods count::should support distinct count with embedded relation select
+repository > find methods count::should support distinct count with relation select
+repository > find methods exists::should return True when matches both criteria and find options
+repository > find methods exists::should return True when matches the given criteria
+repository > find methods exists::should return True when matches the given find options
+repository > find methods exists::should return True when matches the given multiple criteria
+repository > find methods exists::should return a True when no criteria given
+repository > find methods find and findAndCount::should return everything when no criteria given
+repository > find methods find and findAndCount::should return posts that match both criteria and find options
+repository > find methods find and findAndCount::should return posts that match given criteria
+repository > find methods find and findAndCount::should return posts that match given find options
+repository > find methods find and findAndCount::should return posts that match given multiple criteria
+repository > find methods findOne::should return entity by a given id
+repository > find methods findOne::should return entity by a given id and find options
+repository > find methods findOne::should return when criteria given
+repository > find methods findOne::should return when find options given
+repository > find methods findOne::should throw an error when no criteria given
+repository > find methods findOneOrFail::should return entity by a given id
+repository > find methods findOneOrFail::should return entity by a given id and find options
+repository > find methods findOneOrFail::should throw an error if nothing was found
+repository > find options > cache::repository should cache results properly
+repository > find options > comment::repository should insert comment
+repository > find options > locking::should allow locking a relation of a relation
+repository > find options > locking::should allow on a left join
+repository > find options > locking::should allow using lockTables on all types of locking
+repository > find options > locking::should attach NOWAIT for pessimistic_write
+repository > find options > locking::should attach SKIP LOCKED for pessimistic_read
+repository > find options > locking::should attach dirty read lock statement on query if locking enabled
+repository > find options > locking::should attach for key share lock statement on query if locking enabled
+repository > find options > locking::should attach for no key update lock statement on query if locking enabled
+repository > find options > locking::should attach pessimistic read lock statement on query if locking enabled
+repository > find options > locking::should attach pessimistic write lock statement on query if locking enabled
+repository > find options > locking::should not allow empty array for lockTables
+repository > find options > locking::should not throw error if actual updated date and expected updated date are equal
+repository > find options > locking::should not throw error if actual version and expected versions are equal
+repository > find options > locking::should not throw error if optimistic lock used with `findOne` method
+repository > find options > locking::should not throw error if pessimistic lock used with transaction
+repository > find options > locking::should throw error if actual updated date does not equal expected updated date
+repository > find options > locking::should throw error if actual version does not equal expected version
+repository > find options > locking::should throw error if entity does not have version and update date columns
+repository > find options > locking::should throw error if optimistic lock used with `find` method
+repository > find options > locking::should throw error if pessimistic lock used without transaction
+repository > find options > locking::should throw error if pessimistic locking not supported by given driver
+repository > find options > locking::should throw error when specifying a table that is not part of the query
+repository > find options > locking::should work if both version and update date columns applied
+repository > find options > operators raw with jsonb columns::should work with #> (get object field as JSON) operator
+repository > find options > operators raw with jsonb columns::should work with #>> (get object field as text) operator
+repository > find options > operators raw with jsonb columns::should work with -> (get object field) operator
+repository > find options > operators raw with jsonb columns::should work with ->> (get object field) operator
+repository > find options > operators raw with jsonb columns::should work with <@ (contained by) operator
+repository > find options > operators raw with jsonb columns::should work with ?& (all keys exist) operator
+repository > find options > operators raw with jsonb columns::should work with ?| (any keys exist) operator
+repository > find options > operators raw with jsonb columns::should work with @> (contains) operator
+repository > find options > operators::any
+repository > find options > operators::between
+repository > find options > operators::equal
+repository > find options > operators::ilike
+repository > find options > operators::in
+repository > find options > operators::isNull
+repository > find options > operators::lessThan
+repository > find options > operators::lessThanOrEqual
+repository > find options > operators::like
+repository > find options > operators::moreThan
+repository > find options > operators::moreThanOrEqual
+repository > find options > operators::not
+repository > find options > operators::not(any)
+repository > find options > operators::not(between)
+repository > find options > operators::not(equal)
+repository > find options > operators::not(ilike)
+repository > find options > operators::not(in)
+repository > find options > operators::not(isNull)
+repository > find options > operators::not(lessThan)
+repository > find options > operators::not(lessThanOrEqual)
+repository > find options > operators::not(like)
+repository > find options > operators::not(moreThan)
+repository > find options > operators::not(moreThanOrEqual)
+repository > find options > operators::or (array syntax)
+repository > find options > operators::raw
+repository > find options > operators::raw (function with object literal parameters)
+repository > find options > operators::raw (function)
+repository > find options > operators::should work with ActiveRecord model
+repository > find options > relations::should load specified relations and their sub-relations case 1
+repository > find options > relations::should load specified relations and their sub-relations case 2
+repository > find options > relations::should load specified relations and their sub-relations case 3
+repository > find options > relations::should load specified relations case 1
+repository > find options > relations::should load specified relations case 2
+repository > find options > relations::should not any relations if they are not specified
+repository > find options > relations::should throw error if specified relations were not found case 1
+repository > find options > relations::should throw error if specified relations were not found case 2
+repository > find options > relations::should throw error if specified relations were not found case 3
+repository > find options > relations::should throw error if specified relations were not found case 4
+repository > find options > relations::should throw error if specified relations were not found case 5
+repository > find options > relations::should throw error if specified relations were not found case 6
+repository > find options::should execute select query inside transaction
+repository > find options::should load relations
+repository > find options::should select by given conditions
+repository > find options::should select specific columns
+repository > increment method basic::should accept string as input and increment value
+repository > increment method basic::should increment value
+repository > increment method basic::should return UpdateResult
+repository > increment method basic::should throw an error if column property path was not found
+repository > increment method basic::should throw an error if input value is not number
+repository > increment method basic::should throw on empty criteria and not touch any rows
+repository > increment method embeded entities::should increment value
+repository > increment method invalidWhereValuesBehavior::should throw on a null value in the criteria
+repository > soft-delete::should perform soft deletion and restoration correctly
+repository > soft-remove::should perform soft removal and recovery correctly
+repository > soft-remove::should throw error when delete date column is missing
+repository > sql injection find::should prevent injection with: "; DROP TABLE post; --
+repository > sql injection find::should prevent injection with: ' OR SLEEP(5)--
+repository > sql injection find::should prevent injection with: ' UNION SELECT * FROM post --
+repository > sql injection find::should prevent injection with: '' OR ''='
+repository > sql injection find::should prevent injection with: '/**/OR/**/1=1--
+repository > sql injection find::should prevent injection with: '; DROP TABLE post; --
+repository > sql injection find::should prevent injection with: '; DROP TABLE post;--
+repository > sql injection find::should prevent injection with: 0x27 OR 1=1--
+repository > sql injection find::should prevent injection with: 1 OR 1=1
+repository > sql injection find::should prevent injection with: 1; DELETE FROM post;
+repository > sql injection find::should prevent injection with: \'; DROP TABLE post; --
+repository > sql injection find::should prevent injection with: test' OR '1'='1
+repository > sql injection findOne::should prevent injection with: "; DROP TABLE post; --
+repository > sql injection findOne::should prevent injection with: ' OR SLEEP(5)--
+repository > sql injection findOne::should prevent injection with: ' UNION SELECT * FROM post --
+repository > sql injection findOne::should prevent injection with: '' OR ''='
+repository > sql injection findOne::should prevent injection with: '/**/OR/**/1=1--
+repository > sql injection findOne::should prevent injection with: '; DROP TABLE post; --
+repository > sql injection findOne::should prevent injection with: '; DROP TABLE post;--
+repository > sql injection findOne::should prevent injection with: 0x27 OR 1=1--
+repository > sql injection findOne::should prevent injection with: 1 OR 1=1
+repository > sql injection findOne::should prevent injection with: 1; DELETE FROM post;
+repository > sql injection findOne::should prevent injection with: \'; DROP TABLE post; --
+repository > sql injection findOne::should prevent injection with: test' OR '1'='1
+repository > the global condtion of "non-deleted" with eager relation::The global condition of "non-deleted" should be set for the entity with delete date columns and eager relation
+repository > the global condtion of "non-deleted" with eager relation::The global condition of "non-deleted" should not be set when the option "withDeleted" is set to true
+repository > the global condtion of "non-deleted"::The global condition of "non-deleted" should be set for the entity with delete date columns
+repository > the global condtion of "non-deleted"::The global condition of "non-deleted" should not be set when the option "withDeleted" is set to true
+repository > update methods::mutate multiple rows using update method should update successfully
+repository > update methods::mutate multiple rows using update method with partial criteria should update successfully
+repository > update methods::mutate using update method should update successfully
+repository > update methods::mutates all rows using updateAll method
+repository > update methods::should use = operator instead of IN when updating by a single uuid primary key
+schema builder > add column::should correctly add column
+schema builder > change check constraint::should correctly add new check constraint
+schema builder > change check constraint::should correctly change check
+schema builder > change check constraint::should correctly drop removed check
+schema builder > change column::should correctly change column `isGenerated` property when column is on foreign key
+schema builder > change column::should correctly change column comment
+schema builder > change column::should correctly change column default value
+schema builder > change column::should correctly change column length
+schema builder > change column::should correctly change column name
+schema builder > change column::should correctly change column type
+schema builder > change column::should correctly change column type when FK relationships impact it
+schema builder > change column::should correctly change generated column generation strategy
+schema builder > change column::should correctly change non-generated column on to uuid-generated column
+schema builder > change column::should correctly make column primary and generated
+schema builder > change index::should correctly add new index
+schema builder > change index::should correctly change index
+schema builder > change index::should correctly drop removed index
+schema builder > change index::should ignore index synchronization when `synchronize` set to false
+schema builder > change unique constraint::should correctly add new unique constraint
+schema builder > change unique constraint::should correctly change unique constraint
+schema builder > change unique constraint::should correctly drop removed unique constraint
+schema builder > column > change > default null null default and nullable::can recognize model changes
+schema builder > column > change > default null null default and nullable::does not generate when no model changes
+schema builder > column > change > default null null default::can recognize model changes
+schema builder > column > change > default null null default::does not generate when no model changes
+schema builder > column > change > default value format::can recognize model changes
+schema builder > column > change > default value format::does not generate when no model changes
+schema builder > column type > datetime > create and update date columns better-sqlite3::should not generate queries when no model changes
+schema builder > column type > datetime > create and update date columns better-sqlite3::should recognize model changes
+schema builder > column type > decimal > with FK::should not generate queries when no model changes
+schema builder > column type > decimal > with FK::should recognize model changes
+schema builder > column type > enum > enum mssql constraint::should not generate queries when no model changes
+schema builder > column type > enum > enum mssql constraint::should recognize model changes
+schema builder > column type > enum > enum simple sync::should update 'CHECK' constraint to match enum values
+schema builder > constraint > unique > existing unique constraint::should not generate queries when no model changes
+schema builder > constraint > unique > existing unique constraint::should recognize model changes
+schema builder > create foreign key::should correctly create foreign key
+schema builder > create table::should correctly create tables with all dependencies
+schema builder > drop column::should correctly drop column
+schema builder > foreign key > constraint names sqlite schema builder > foreign key > constraint names sqlite > check constraint::should not generate queries when created check constraint with queryRunnner.createCheckConstraint
+schema builder > foreign key > constraint names sqlite schema builder > foreign key > constraint names sqlite > foreign keys::should not generate queries when created foreign key with queryRunnner.createForeignKey
+schema builder > foreign key > constraint names sqlite schema builder > foreign key > constraint names sqlite > unique constraint::should not generate queries when created unique constraint with queryRunnner.createUniqueConstraint
+schema builder > foreign key > join table sync option::Should set synchronize: false for @JoinTable when passed to options
+schema builder > idempotency > fulltext recreate::should not create migrations for fulltext indices
+schema builder > idempotency > function default uppercase::MSSQL, Sqljs, Sqlite
+schema builder > idempotency > same name across tables::should not recreate indices
+schema builder > idempotency > scale precision::should not create migrations columns with precision
+schema builder > idempotency > sync twice::can recognize model changes
+schema builder > idempotency > unsigned integer::should not create migrations for unsigned indices
+schema builder > index > drop > drop without name::should drop the index as expected
+schema builder > primary key > multiple primary keys::schema should include two primary keys
+schema builder > update primary keys::should correctly update composite primary keys
+schema builder > update primary keys::should correctly update composite primary keys when table already have primary generated column
+schema-builder > drop column with index::should drop the column and its referenced index during synchronize
+schema-builder > sync-unique-constraint-names::should sync when multiple entities have unique constraints on similarly named columns
+sql tag parameters (better-sqlite3)::should handle SQL tag parameters with NULL values
+sql tag parameters (better-sqlite3)::should handle SQL tag parameters with array values
+sql tag parameters (better-sqlite3)::should handle SQL tag parameters with boolean values
+sql tag parameters (better-sqlite3)::should handle SQL tag parameters with complex conditions and ordering
+sql tag parameters (better-sqlite3)::should handle basic SQL tag parameters
+sql tag parameters (better-sqlite3)::should handle complex SQL with nested queries and parameters
+sql tag parameters (better-sqlite3)::should handle multiple parameters in a single query
+sql tag parameters (sqlite)::should handle SQL tag parameters with NULL values
+sql tag parameters (sqlite)::should handle SQL tag parameters with array values
+sql tag parameters (sqlite)::should handle SQL tag parameters with boolean values
+sql tag parameters (sqlite)::should handle SQL tag parameters with complex conditions and ordering
+sql tag parameters (sqlite)::should handle basic SQL tag parameters
+sql tag parameters (sqlite)::should handle complex SQL with nested queries and parameters
+sql tag parameters (sqlite)::should handle multiple parameters in a single query
+sqlite driver > busy-timeout::should set the busy_timeout as expected
+sqlite driver > enable wal::should set the journal mode as expected
+sqlite driver > throws an error when queried after closing connection::should throw
+table inheritance > regular inheritance using extends keyword::should work correctly
+table-inheritance > single-table > basic-functionality table-inheritance > single-table > basic-functionality with custom database schema::should correctly upsert data with single-table-inheritance pattern
+table-inheritance > single-table > basic-functionality::should be able to find correct child entities when base class is used as entity metadata
+table-inheritance > single-table > basic-functionality::should be able to save different child entities in bulk
+table-inheritance > single-table > basic-functionality::should correctly insert, update and delete data with single-table-inheritance pattern
+table-inheritance > single-table > basic-functionality::should correctly upsert data with single-table-inheritance pattern
+table-inheritance > single-table > database-option-inherited::should correctly inherit database option
+table-inheritance > single-table > discriminator-index-with-embedded::should index the discriminator column of an entity with an embedded column
+table-inheritance > single-table > discriminator-index-with-embedded::should keep indexing the discriminator column of an entity without embedded columns
+table-inheritance > single-table > discriminator-index-with-embedded::should not add a second index when the discriminator column is already indexed
+table-inheritance > single-table > no-type-column::should return subclass in relations
+table-inheritance > single-table > non-virtual-discriminator-column::should return non virtual discriminator column as well
+table-inheritance > single-table > numeric types::should allow numeric types for the discriminator, including 0
+table-inheritance > single-table > relations > many-to-many inverse side::should work correctly with ManyToMany relations
+table-inheritance > single-table > relations > many-to-many owner side::should work correctly with ManyToMany relations
+table-inheritance > single-table > relations > one-to-many-cascade-save::should work correctly with OneToMany relations
+table-inheritance > single-table > relations > one-to-many::should work correctly with OneToMany relations
+transaction > isolation level > sqlite defined for transaction supported::READ UNCOMMITTED
+transaction > isolation level > sqlite defined for transaction supported::SERIALIZABLE
+transaction > isolation level > sqlite defined for transaction unsupported::READ COMMITTED
+transaction > isolation level > sqlite defined for transaction unsupported::REPEATABLE READ
+transaction > isolation level > sqlite defined for transaction unsupported::SNAPSHOT
+transaction > isolation level > sqlite defined in data source READ UNCOMMITTED::should apply READ UNCOMMITTED as default
+transaction > isolation level > sqlite defined in data source SERIALIZABLE::should apply SERIALIZABLE as default
+transaction > nested transaction::should execute operations based on conditions in deeply nested scenario
+transaction > nested transaction::should fail operations when first transaction fails
+transaction > return data from transaction::should allow to return typed data from transaction
+transaction > return data from transaction::should allow to return typed data from transaction using type inference
+transaction > single query runner::should execute all operations in the method in a transaction
+transaction > single query runner::should execute all operations in the method in a transaction (#804)
+transaction > transaction with entity manager::should execute all operations in a single transaction
+transaction > transaction with entity manager::should not save anything if any of operation in transaction fail
+tree-tables > closure-table > custom column names::categories should be attached via children and saved properly
+tree-tables > closure-table > custom column names::categories should be attached via children and saved properly and everything must be saved in cascades
+tree-tables > closure-table > custom column names::categories should be attached via parent and saved properly
+tree-tables > closure-table > custom join column findDescendantsTree::should filter by depth if optionally provided
+tree-tables > closure-table > custom join column findDescendantsTree::should load all category descendants and nested children
+tree-tables > closure-table > custom join column findTrees::should filter by depth if optionally provided
+tree-tables > closure-table > custom join column findTrees::should load all category roots and attached children
+tree-tables > closure-table > custom join column findTrees::should load multiple category roots if they exist
+tree-tables > closure-table > custom join column::categories should be attached via children and saved properly
+tree-tables > closure-table > custom join column::categories should be attached via children and saved properly and everything must be saved in cascades
+tree-tables > closure-table > custom join column::categories should be attached via parent and saved properly
+tree-tables > closure-table > custom primary column::should persist and retrieve tree with custom primary column names
+tree-tables > closure-table > custom primary column::should remove old ancestry when moving a branch to other root with a renamed primary column
+tree-tables > closure-table > custom primary column::should remove old ancestry when moving a branch to root with a renamed primary column
+tree-tables > closure-table > custom primary column::should remove old ancestry when moving a branch to same tree with a renamed primary column
+tree-tables > closure-table > insert without level column::should be able to retrieve the whole tree
+tree-tables > closure-table > insert without level column::should save and retrieve descendants when using children array
+tree-tables > closure-table > insert without level column::should save and retrieve descendants when using parent reference
+tree-tables > closure-table > relation id property::should load descendants when findDescendantsTree is called for a tree entity
+tree-tables > closure-table > relation id property::should load descendants when findTrees are called
+tree-tables > closure-table > uuid cascade::should save tree via parent reference and retrieve descendants with UUID keys
+tree-tables > closure-table > uuid primary key::should synchronize schema and persist tree with UUID primary column
+tree-tables > closure-table findDescendantsTree::should filter by depth if optionally provided
+tree-tables > closure-table findDescendantsTree::should load all category descendants and nested children
+tree-tables > closure-table findTrees::should filter by depth if optionally provided
+tree-tables > closure-table findTrees::should load all category roots and attached children
+tree-tables > closure-table findTrees::should load multiple category roots if they exist
+tree-tables > closure-table::categories should be attached via children and saved properly
+tree-tables > closure-table::categories should be attached via children and saved properly and everything must be saved in cascades
+tree-tables > closure-table::categories should be attached via parent and saved properly
+tree-tables > materialized-path > all tree queries with relations::should return ancestors tree with member relations
+tree-tables > materialized-path > all tree queries with relations::should return ancestors tree without member relations
+tree-tables > materialized-path > all tree queries with relations::should return ancestors with member relations
+tree-tables > materialized-path > all tree queries with relations::should return ancestors without member relations
+tree-tables > materialized-path > all tree queries with relations::should return descendants tree with member relations
+tree-tables > materialized-path > all tree queries with relations::should return descendants tree without member relations
+tree-tables > materialized-path > all tree queries with relations::should return descendants with member relations
+tree-tables > materialized-path > all tree queries with relations::should return descendants without member relations
+tree-tables > materialized-path > all tree queries with relations::should return roots with member relations
+tree-tables > materialized-path > all tree queries with relations::should return roots without member relations
+tree-tables > materialized-path > all tree queries with relations::should return tree with sites relations
+tree-tables > materialized-path > all tree queries with relations::should return tree without sites relations
+tree-tables > materialized-path > custom join column findDescendantsTree::should filter by depth if optionally provided
+tree-tables > materialized-path > custom join column findDescendantsTree::should load all category descendants and nested children
+tree-tables > materialized-path > custom join column findTrees::should filter by depth if optionally provided
+tree-tables > materialized-path > custom join column findTrees::should load all category roots and attached children
+tree-tables > materialized-path > custom join column findTrees::should load multiple category roots if they exist
+tree-tables > materialized-path > custom join column::categories should be attached via children and saved properly
+tree-tables > materialized-path > custom join column::categories should be attached via children and saved properly and everything must be saved in cascades
+tree-tables > materialized-path > custom join column::should save and retrieve tree via parent reference
+tree-tables > materialized-path > custom primary column::should persist and retrieve roots with custom primary column names
+tree-tables > materialized-path > embedded primary column::should build tree entities with embedded primary columns correctly
+tree-tables > materialized-path > find descendants missing parent::should load descendants when findDescendants is called for a tree entity
+tree-tables > materialized-path > find descendants missing parent::should return empty when findDescendants is called for a non existing tree entity
+tree-tables > materialized-path > findTrees with relations::should return tree with sites relations
+tree-tables > materialized-path > findTrees with relations::should return tree without sites relations
+tree-tables > materialized-path > non-pk parent column findTrees::should load all category roots and attached children
+tree-tables > materialized-path > non-pk parent column::should save tree via parent reference and detach subtree by nulling parent
+tree-tables > materialized-path > query strategy relations::should load relations via query strategy on findDescendants
+tree-tables > materialized-path findDescendantsTree::should filter by depth if optionally provided
+tree-tables > materialized-path findDescendantsTree::should load all category descendants and nested children
+tree-tables > materialized-path findTrees::should filter by depth if optionally provided
+tree-tables > materialized-path findTrees::should load all category roots and attached children
+tree-tables > materialized-path findTrees::should load multiple category roots if they exist
+tree-tables > materialized-path::categories should be attached via children and saved properly
+tree-tables > materialized-path::categories should be attached via children and saved properly and everything must be saved in cascades
+tree-tables > materialized-path::should compute path correctly when tree is implicitly saved (cascade: true) through related entity
+tree-tables > materialized-path::should save and retrieve tree via parent reference
+tree-tables > nested-set > custom join column findDescendantsTree::should filter by depth if optionally provided
+tree-tables > nested-set > custom join column findDescendantsTree::should load all category descendants and nested children
+tree-tables > nested-set > custom join column findTrees::should filter by depth if optionally provided
+tree-tables > nested-set > custom join column findTrees::should load all category roots and attached children
+tree-tables > nested-set > custom join column findTrees::should reject with error when saving multiple roots
+tree-tables > nested-set > custom join column::categories should be attached via children and saved properly
+tree-tables > nested-set > custom join column::categories should be attached via children and saved properly and everything must be saved in cascades
+tree-tables > nested-set > custom join column::should retrieve correct roots and descendants after re-saving via children
+tree-tables > nested-set > custom join column::should save and retrieve tree via parent reference
+tree-tables > nested-set findDescendantsTree::should filter by depth if optionally provided
+tree-tables > nested-set findDescendantsTree::should load all category descendants and nested children
+tree-tables > nested-set findTrees::should filter by depth if optionally provided
+tree-tables > nested-set findTrees::should load all category roots and attached children
+tree-tables > nested-set findTrees::should reject with error when saving multiple roots
+tree-tables > nested-set::categories should be attached via children and saved properly
+tree-tables > nested-set::categories should be attached via children and saved properly and everything must be saved in cascades
+tree-tables > nested-set::should retrieve correct roots and descendants after re-saving via children
+tree-tables > nested-set::should save and retrieve tree via parent reference
+uuid-sqlite::should persist uuid correctly when it is generated non primary column
+view entity > general::should correctly return data from View
+view entity > general::should create entity view from query builder definition
+view entity > sqlite::should correctly return data from View
+view entity > sqlite::should create entity view from string definition

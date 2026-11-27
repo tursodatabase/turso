@@ -1,0 +1,3 @@
+tests/sqlite/better-sqlite.test.ts::common > delete with limit and order by
+tests/sqlite/better-sqlite.test.ts::common > select with group by as sql + column
+tests/sqlite/better-sqlite.test.ts::common > update with limit and order by
