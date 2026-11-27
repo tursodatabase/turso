@@ -1431,7 +1431,8 @@ impl ProgramState {
         matches!(self.execution_state, ProgramExecutionState::Interrupting)
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
+    pub fn bind_at(&mut self, index: NonZero<usize>, mut value: Value) -> Result<()> {
+        self.registers.nan_policy().normalize(&mut value);
         let i = index.get() - 1;
         if i >= self.parameters.len() {
             self.parameters.resize(i + 1, Value::Null);
