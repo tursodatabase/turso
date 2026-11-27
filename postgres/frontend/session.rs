@@ -9,7 +9,7 @@ use crate::catalog::{self, PostgresDialect};
 use crate::error::{
     in_failed_sql_transaction_error, not_supported, sql_parse_error, sqlstate_error,
 };
-use crate::pg_type::type_exists;
+use crate::pg_type::{type_exists, RegClassInput};
 use crate::roles::connection_roles;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
@@ -548,6 +548,7 @@ fn translate_statement<'a>(
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
+    let (sql, parse_result) = resolve_regclass_constants(&pg_conn.conn, sql, parse_result)?;
     let existing_generated = turso_pg_parser::alter_table_add_column_table(&parse_result)
         .and_then(|(schema, table)| {
             relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
@@ -1559,6 +1560,57 @@ fn name_foreign_key_tables<'a>(
     }
     let parse_result = turso_pg_parser::parse(&sql).map_err(sql_parse_error)?;
     Ok((Cow::Owned(sql), parse_result))
+}
+
+/// `sql` with each regclass constant that the statement stores replaced by
+/// the oid of its relation, as PostgreSQL does when it analyzes the
+/// statement: a view, a default or a check then keeps the relation when it is
+/// renamed, and a name with no relation fails the statement with 42P01.
+fn resolve_regclass_constants<'a>(
+    conn: &Arc<Connection>,
+    sql: Cow<'a, str>,
+    parse_result: turso_pg_parser::ParseResult,
+) -> Result<(Cow<'a, str>, turso_pg_parser::ParseResult)> {
+    let constants = turso_pg_parser::regclass_constants_to_resolve(&parse_result);
+    if constants.is_empty() {
+        return Ok((sql, parse_result));
+    }
+    let created = created_table(conn, &parse_result);
+    let mut sql = sql.into_owned();
+    for constant in constants.iter().rev() {
+        // The table that the statement creates does not exist yet, so a
+        // constant that names it keeps its name.
+        if names_created_table(conn, &constant.text, created.as_ref()) {
+            continue;
+        }
+        let oid = crate::catalog::regclass_oid_of_text(conn, &constant.text)?;
+        sql = turso_pg_parser::replace_string_constant(&sql, constant.location, &oid.to_string())
+            .map_err(sql_parse_error)?;
+    }
+    let parse_result = turso_pg_parser::parse(&sql).map_err(sql_parse_error)?;
+    Ok((Cow::Owned(sql), parse_result))
+}
+
+/// Whether the regclass `text` names `created`, the table that the statement
+/// creates.
+fn names_created_table(
+    conn: &Arc<Connection>,
+    text: &str,
+    created: Option<&(Qualifier, String)>,
+) -> bool {
+    let Some((namespace, table)) = created else {
+        return false;
+    };
+    let Ok(RegClassInput::Name { schema, name }) = crate::pg_type::parse_regclass(text) else {
+        return false;
+    };
+    name == *table
+        && match schema {
+            Some(schema) => conn
+                .qualifier(&schema)
+                .is_some_and(|qualifier| qualifier.target.id == namespace.target.id),
+            None => true,
+        }
 }
 
 /// The schema and name of the table that a CREATE TABLE statement creates.

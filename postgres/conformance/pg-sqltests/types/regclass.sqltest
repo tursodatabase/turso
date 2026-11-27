@@ -408,3 +408,151 @@ test regclass-looks-up-an-empty-quoted-schema {
 }
 @sqlstate 42P01
 expect error {}
+
+test regclass-in-a-view-keeps-the-relation-when-it-is-renamed {
+    CREATE TABLE t (a int);
+    CREATE VIEW w AS SELECT 't'::regclass::text AS x;
+    ALTER TABLE t RENAME TO t2;
+    SELECT x FROM w;
+}
+expect {
+    t2
+}
+
+test regclass-in-a-default-keeps-the-relation-when-it-is-renamed {
+    CREATE TABLE t (a int);
+    CREATE TABLE r (c regclass DEFAULT 't');
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO r DEFAULT VALUES;
+    SELECT c::text FROM r;
+}
+expect {
+    t2
+}
+
+test regclass-in-a-check-keeps-the-relation-when-it-is-renamed {
+    CREATE TABLE t (a int);
+    CREATE TABLE r (c regclass, CHECK (c <> 't'::regclass));
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO r VALUES (1259);
+    SELECT c::text FROM r;
+}
+expect {
+    pg_class
+}
+
+test regclass-in-a-default-needs-the-relation {
+    CREATE TABLE r (c regclass DEFAULT 'nope');
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-in-a-view-needs-the-relation {
+    CREATE VIEW w AS SELECT 'nope'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-in-a-domain-keeps-the-relation-when-it-is-renamed {
+    CREATE TABLE h1 (a int);
+    CREATE DOMAIN d AS regclass DEFAULT 'h1'::regclass;
+    CREATE TABLE r (c d);
+    ALTER TABLE h1 RENAME TO h2;
+    INSERT INTO r DEFAULT VALUES;
+    SELECT c::text FROM r;
+}
+expect {
+    h2
+}
+
+test regclass-in-a-domain-needs-the-relation {
+    CREATE DOMAIN d AS regclass CHECK (value <> 'nosuch'::regclass);
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-default-is-printed-as-its-relation {
+    CREATE TABLE src (a int);
+    CREATE TABLE r (c regclass DEFAULT 'src', e regclass DEFAULT 'src'::regclass);
+    ALTER TABLE src RENAME TO src2;
+    SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'r'::regclass ORDER BY adnum;
+}
+expect {
+    1|'src2'::regclass
+    2|'src2'::regclass
+}
+
+test regclass-in-a-check-is-printed-as-its-relation {
+    CREATE TABLE src (a int);
+    CREATE TABLE r (c regclass, CHECK (c <> 'src'::regclass));
+    SELECT pg_get_constraintdef(oid) LIKE '%''src''%' FROM pg_constraint WHERE conrelid = 'r'::regclass;
+}
+expect {
+    t
+}
+
+test regclass-default-may-name-the-table-it-is-created-in {
+    CREATE TABLE r (c regclass DEFAULT 'r', d int, CHECK (c <> 'r'::regclass OR d IS NULL));
+    INSERT INTO r (d) VALUES (NULL);
+    SELECT c::text FROM r;
+}
+expect {
+    r
+}
+
+test regclass-reads-a-unicode-escape-string-in-a-view {
+    CREATE TABLE src (a int);
+    CREATE VIEW w AS SELECT U&'src'::regclass::text AS x, U&'s!0072c' UESCAPE '!'::regclass::text AS y;
+    ALTER TABLE src RENAME TO src2;
+    SELECT x, y FROM w;
+}
+expect {
+    src2|src2
+}
+
+@setup relations
+test regclass-reads-a-vertical-tab-as-white-space {
+    SELECT E'\vt'::regclass::text;
+}
+expect {
+    t
+}
+
+test regclass-cuts-a-name-to-the-longest-identifier {
+    CREATE TABLE aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (a int);
+    SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::regclass::text;
+}
+expect {
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+}
+
+test regclass-default-names-a-table-with-the-case-it-is-created-in {
+    CREATE TABLE q (x oid DEFAULT '"Q"'::regclass, y int);
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-does-not-read-a-no-break-space-as-white-space {
+    SELECT E't9 '::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+@setup relations
+test regclass-in-an-index-is-printed-as-its-relation {
+    CREATE TABLE p (r regclass);
+    CREATE INDEX pi ON p ((r = 'p'::regclass)) WHERE r <> 't'::regclass;
+    ALTER TABLE t RENAME TO t2;
+    SELECT pg_get_indexdef('pi'::regclass) LIKE '%''p''%' AND pg_get_indexdef('pi'::regclass) LIKE '%t2%';
+}
+expect {
+    t
+}
+
+test regclass-prints-the-schema-of-a-relation-named-like-a-catalog {
+    CREATE TABLE pg_type (x int);
+    SELECT 'public.pg_type'::regclass::text, 'pg_type'::regclass::text;
+}
+expect {
+    public.pg_type|pg_type
+}

@@ -1249,7 +1249,7 @@ impl SnapshotRows for PgAttributeTable {
                 ));
             }
         }
-        for index in catalog_indexes(&schema) {
+        for index in catalog_indexes(conn, &schema) {
             let classes = crate::classes::class_catalog(&schema).expect("indexes have classes");
             let class = classes
                 .get_by_oid(index.table_oid)
@@ -1878,7 +1878,7 @@ impl SnapshotRows for PgPolicyTable {
     /// `pg_get_expr` returns as it is.
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
-        catalog_policies(&schema)
+        catalog_policies(conn, &schema)
             .into_iter()
             .map(|policy| {
                 let roles = policy
@@ -1927,7 +1927,7 @@ impl SnapshotRows for PgPoliciesTable {
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let role_catalog = schema_roles(&schema);
-        catalog_policies(&schema)
+        catalog_policies(conn, &schema)
             .into_iter()
             .map(|policy| {
                 let mut roles: Vec<String> = if policy.roles == [RoleId::PUBLIC] {
@@ -1984,7 +1984,7 @@ struct CatalogPolicy<'a> {
 }
 
 /// The policies of every table, ordered by table oid and then as created.
-fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
+fn catalog_policies<'a>(conn: &Connection, schema: &'a Schema) -> Vec<CatalogPolicy<'a>> {
     let Some(catalog) = crate::classes::class_catalog(schema) else {
         return Vec::new();
     };
@@ -2000,7 +2000,7 @@ fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
         // as CREATE POLICY wrote it, which PostgreSQL also reads.
         let condition_text = |condition: &Option<ast::Expr>, written: &Option<String>| {
             let condition = condition.as_ref()?;
-            crate::deparse::condition_text(condition, &table).or_else(|| written.clone())
+            crate::deparse::condition_text(conn, condition, &table).or_else(|| written.clone())
         };
         for (details, policy) in class.relpolicies.iter() {
             let roles = if policy.roles.contains(&RoleId::PUBLIC) {
@@ -2042,7 +2042,7 @@ impl SnapshotRows for PgIndexesTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        for index in catalog_indexes(&schema) {
+        for index in catalog_indexes(conn, &schema) {
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, index.namespace).to_string()),
                 Value::build_text(index.table_name.clone()),
@@ -2279,7 +2279,7 @@ impl SnapshotRows for PgIndexTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        for index in catalog_indexes(&schema) {
+        for index in catalog_indexes(conn, &schema) {
             let indnatts = index.columns.len() as i64;
             let indkey: String = index
                 .columns
@@ -2379,7 +2379,7 @@ impl SnapshotRows for PgConstraintTable {
 
         let tables = user_tables_sorted(&schema);
         let tbl_oid_map = table_oid_map(&schema);
-        let indexes = catalog_indexes(&schema);
+        let indexes = catalog_indexes(conn, &schema);
         let mut constraint_oid = CONSTRAINT_OID_START;
 
         for (namespace, table_name, table) in &tables {
@@ -2639,7 +2639,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(check_condition_text(&chk.expr, btree)), // conbin
+                    Value::build_text(check_condition_text(conn, &chk.expr, btree)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2700,8 +2700,8 @@ impl SnapshotRows for PgAttrdefTable {
                 };
                 // A default with a form the printer does not know is shown
                 // as the engine's SQL.
-                let adbin = crate::deparse::default_text(&default, btree, &col.ty_str)
-                    .unwrap_or_else(|| render_expr(&default));
+                let adbin = crate::deparse::default_text(conn, &default, btree, &col.ty_str)
+                    .unwrap_or_else(|| render_expr(conn, &default));
                 rows.push(vec![
                     Value::from_i64(attrdef_oid),        // oid
                     Value::from_i64(table_oid),          // adrelid
@@ -4519,7 +4519,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
             if constraint_oid == target_oid {
                 return Some(format!(
                     "CHECK ({})",
-                    check_condition_text(&chk.expr, btree)
+                    check_condition_text(conn, &chk.expr, btree)
                 ));
             }
             constraint_oid += 1;
@@ -4581,12 +4581,13 @@ fn constraint_column_list<'a>(
 /// The text of a CHECK condition of `table` as PostgreSQL's `pg_get_expr`
 /// prints it. A condition with a form the printer does not know is shown as
 /// the engine's SQL.
-fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
-    crate::deparse::condition_text(condition, table).unwrap_or_else(|| render_expr(condition))
+fn check_condition_text(conn: &Connection, condition: &ast::Expr, table: &BTreeTable) -> String {
+    crate::deparse::condition_text(conn, condition, table)
+        .unwrap_or_else(|| render_expr(conn, condition))
 }
 
-fn render_expr(expr: &ast::Expr) -> String {
-    let mut expr = expr.clone();
+fn render_expr(conn: &Connection, expr: &ast::Expr) -> String {
+    let mut expr = crate::deparse::name_regclass_constants(conn, expr);
     walk_expr_mut(&mut expr, &mut |expr| {
         // The translator compiles PostgreSQL's binary collations to BINARY.
         if let ast::Expr::Collate(_, collation) = expr {
@@ -4620,7 +4621,7 @@ fn render_expr(expr: &ast::Expr) -> String {
 /// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
 pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    catalog_indexes(&schema)
+    catalog_indexes(conn, &schema)
         .iter()
         .find(|index| index.oid == target_oid)
         .map(|index| index_definition(&schema, index))
@@ -4697,7 +4698,7 @@ struct CatalogIndex {
 
 /// The indexes of the user tables, from their class rows, in the order of
 /// the tables. An index is named as its class row names it.
-fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
+fn catalog_indexes(conn: &Connection, schema: &Schema) -> Vec<CatalogIndex> {
     let Some(classes) = crate::classes::class_catalog(schema) else {
         return Vec::new();
     };
@@ -4764,7 +4765,9 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                                 .expect("index columns have names")
                         },
                         position: column.pos_in_table,
-                        expression: column.expr.as_ref().map(ToString::to_string),
+                        expression: column.expr.as_ref().map(|expr| {
+                            crate::deparse::name_regclass_constants(conn, expr).to_string()
+                        }),
                         order: column.order,
                     })
                     .collect(),
@@ -4773,7 +4776,10 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                 for_constraint: index
                     .name
                     .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX),
-                where_clause: index.where_clause.as_ref().map(ToString::to_string),
+                where_clause: index
+                    .where_clause
+                    .as_ref()
+                    .map(|expr| crate::deparse::name_regclass_constants(conn, expr).to_string()),
             });
         }
     }
