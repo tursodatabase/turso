@@ -453,7 +453,7 @@ set test_files {
   pragma6              fail
   prefixes             fail
   printf               fail
-  printf2              fail
+  printf2              pass
   progress             fail
   ptrchng              fail
   pushdown             fail

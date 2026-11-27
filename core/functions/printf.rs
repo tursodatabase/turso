@@ -1091,9 +1091,10 @@ fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
     let repeat = spec.precision.unwrap_or(1).max(1);
     let s: String = repeat_n(c, repeat).collect();
 
-    // Zero-pad flag is ignored for char specifiers
+    // SQLite counts %c width in characters regardless of the ! flag.
     let mut flags = spec.flags.clone();
     flags.zero_pad = false;
+    flags.alt_form_2 = true;
     apply_width(output, "", &s, spec.width, &flags, false);
 }
 
