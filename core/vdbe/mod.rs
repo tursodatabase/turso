@@ -2126,6 +2126,30 @@ impl ProgramState {
         })
     }
 
+    /// The error that replaces a FAIL error when the rows written before it
+    /// violate a foreign key. FAIL keeps those rows, but SQLite's
+    /// sqlite3VdbeHalt fails the statement with the foreign key error and
+    /// undoes it instead, for an immediate violation always and for a
+    /// deferred violation when the statement commits the transaction.
+    pub(crate) fn foreign_key_error_for_fail(
+        &self,
+        connection: &Connection,
+        commits_txn: bool,
+    ) -> Option<LimboError> {
+        if !connection.foreign_keys_enabled() {
+            return None;
+        }
+        if self.get_fk_immediate_violations_during_stmt() > 0 {
+            return Some(self.immediate_foreign_key_error());
+        }
+        if commits_txn && connection.get_deferred_foreign_key_violations() > 0 {
+            return Some(LimboError::ForeignKeyConstraint(
+                "FOREIGN KEY constraint failed".to_string(),
+            ));
+        }
+        None
+    }
+
     pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);
@@ -3182,8 +3206,9 @@ impl Program {
     }
 
     /// An instruction that failed: a busy error retries at the same PC, a
-    /// trigger's FAIL runs the CDC COMMIT-record subroutine or is staged for
-    /// the loop to prepare (None), and every other error aborts the statement.
+    /// FAIL error runs the CDC COMMIT-record subroutine or is staged for the
+    /// loop to prepare (None), and every other error, or a FAIL error with a
+    /// foreign key violation, aborts the statement.
     #[cold]
     #[inline(never)]
     fn fail_step(
@@ -3209,6 +3234,10 @@ impl Program {
                 && self.resolve_type == ResolveType::Fail)
                 || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
             {
+                let commits_txn = state.can_autocommit_now(connection, true);
+                if let Some(fk_error) = state.foreign_key_error_for_fail(connection, commits_txn) {
+                    return self.fail_step(state, connection, pager, fk_error);
+                }
                 if self.enter_cdc_commit_for_fail(state, |subroutine| {
                     subroutine.fail_resume.as_offset_int()
                 }) {

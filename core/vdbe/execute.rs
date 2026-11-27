@@ -3868,13 +3868,9 @@ pub fn halt(
         }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
-        // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
         if program.resolve_type == ResolveType::Fail && can_autocommit_now {
-            // Check for immediate FK violations - FK errors don't respect ON CONFLICT
-            if connection.foreign_keys_enabled()
-                && state.get_fk_immediate_violations_during_stmt() > 0
-            {
-                return Err(state.immediate_foreign_key_error().into());
+            if let Some(fk_error) = state.foreign_key_error_for_fail(connection, true) {
+                return Err(fk_error.into());
             }
 
             // The subroutine returns to this Halt, which then finds the same

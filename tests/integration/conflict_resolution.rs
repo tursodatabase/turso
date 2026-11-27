@@ -583,6 +583,112 @@ fn test_or_rollback_in_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// FAIL with a foreign key violation
+// ---------------------------------------------------------------------------
+
+/// A FAIL error keeps the rows written before it, unless those rows violate a
+/// foreign key that is checked when the statement ends: an immediate one, or
+/// a deferred one in autocommit mode. Then the statement fails with the
+/// foreign key error and is undone. In an explicit transaction, the rows that
+/// violate a deferred foreign key stay and COMMIT fails.
+#[turso_macros::test]
+fn test_fail_with_foreign_key_violation(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    // Each statement writes a row with a valid parent, a row whose parent is
+    // missing, then a row that fails with FAIL.
+    let cases: &[(&str, &str)] = &[
+        (
+            "raise_fail",
+            "INSERT INTO c VALUES (2, 1, 2), (3, 7, 3), (4, 1, 4)",
+        ),
+        (
+            "column_on_conflict_fail",
+            "INSERT INTO c VALUES (2, 1, 2), (3, 7, 3), (5, 1, 1)",
+        ),
+        (
+            "insert_or_fail",
+            "INSERT OR FAIL INTO c_or VALUES (2, 1, 2), (3, 7, 3), (5, 1, 1)",
+        ),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for deferrable in ["", "DEFERRABLE INITIALLY DEFERRED"] {
+        let ddl = format!(
+            "PRAGMA foreign_keys=ON;
+            CREATE TABLE p(id INTEGER PRIMARY KEY);
+            CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) {deferrable}, u UNIQUE ON CONFLICT FAIL);
+            CREATE TABLE c_or(id INTEGER PRIMARY KEY, pid REFERENCES p(id) {deferrable}, u UNIQUE);
+            CREATE TRIGGER tr BEFORE INSERT ON c WHEN new.id=4 BEGIN SELECT RAISE(FAIL, 'f'); END;
+            INSERT INTO p VALUES (1);
+            INSERT INTO c VALUES (1, 1, 1);
+            INSERT INTO c_or VALUES (1, 1, 1);"
+        );
+        for &(case_name, sql) in cases {
+            for explicit_txn in [false, true] {
+                let label = format!(
+                    "fail_fk__{case_name}__deferred_{}__explicit_txn_{explicit_txn}",
+                    !deferrable.is_empty()
+                );
+
+                let limbo_db = TempDatabase::builder()
+                    .with_db_name(format!("{label}.db"))
+                    .build();
+                let limbo_conn = limbo_db.connect_limbo();
+                limbo_conn.execute(&ddl).unwrap();
+
+                let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+                sqlite_conn.execute_batch(&ddl).unwrap();
+
+                let mut statements = vec![sql];
+                if explicit_txn {
+                    limbo_conn.execute("BEGIN").unwrap();
+                    sqlite_conn.execute_batch("BEGIN").unwrap();
+                    statements.push("COMMIT");
+                }
+                for stmt in statements {
+                    let limbo_result = limbo_try_exec(&limbo_conn, stmt);
+                    let sqlite_result = sqlite_try_exec(&sqlite_conn, stmt);
+                    let is_fk_error = |result: &Result<(), String>| {
+                        result.as_ref().err().map(|e| e.contains("FOREIGN KEY"))
+                    };
+                    if is_fk_error(&sqlite_result) != is_fk_error(&limbo_result) {
+                        failures.push(format!(
+                            "[{label}] {stmt}: results differ: sqlite={sqlite_result:?}, limbo={limbo_result:?}"
+                        ));
+                    }
+                }
+                if explicit_txn && !sqlite_conn.is_autocommit() {
+                    sqlite_conn.execute_batch("ROLLBACK").unwrap();
+                }
+                if explicit_txn && !limbo_conn.get_auto_commit() {
+                    limbo_conn.execute("ROLLBACK").unwrap();
+                }
+                for verify_sql in [
+                    "SELECT id, pid, u FROM c ORDER BY id",
+                    "SELECT id, pid, u FROM c_or ORDER BY id",
+                ] {
+                    if let Some(e) = compare_tables(&label, &sqlite_conn, &limbo_conn, verify_sql) {
+                        failures.push(e);
+                    }
+                }
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{} failure(s) in FAIL with foreign key violation test:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // UPDATE with table-level ON CONFLICT on rowid-alias PKs
 // ---------------------------------------------------------------------------
 
