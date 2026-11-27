@@ -1921,6 +1921,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.null_flag = flag;
     }
 
+    fn current_row_hidden_since_move(&mut self) -> Result<bool> {
+        // The MvStore did not change since the heads were positioned, which is before the
+        // cursor moved to its row.
+        if self.mvcc_rows_epoch() == self.mvcc_peek_epoch {
+            return Ok(false);
+        }
+        let CursorPosition::Loaded {
+            row_id, in_btree, ..
+        } = &self.current_pos
+        else {
+            return Ok(false);
+        };
+        Ok(!self.loaded_row_is_visible(row_id, *in_btree)?)
+    }
+
     fn get_null_flag(&self) -> bool {
         self.null_flag
     }

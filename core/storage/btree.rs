@@ -821,6 +821,13 @@ pub trait CursorTrait: Any + Send + Sync {
     fn delete(&mut self) -> IOResultOr<()>;
     fn set_null_flag(&mut self, flag: bool);
     fn get_null_flag(&self) -> bool;
+    /// Returns true when the row that the cursor is on is no longer visible to the
+    /// cursor's transaction. Under MVCC, a write of the same transaction can delete the
+    /// row, or change its index key, while the statement waits on IO after the cursor
+    /// moved to the row. The default returns false.
+    fn current_row_hidden_since_move(&mut self) -> Result<bool> {
+        Ok(false)
+    }
     /// Check if a key exists.
     fn exists(&mut self, key: &Value) -> IOResultOr<bool>;
     /// Remove every entry but keep the root page. Returns the number of entries removed.

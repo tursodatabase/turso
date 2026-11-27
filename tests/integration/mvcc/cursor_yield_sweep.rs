@@ -1028,21 +1028,7 @@ fn check_count(
 
 /// A cell that fails also on main, because of a bug that this test does not fix. The sweep
 /// reports these cells, but they do not fail the test.
-fn known_failure(cell: &Cell) -> Option<&'static str> {
-    let seek_point = cell.ordinal == CursorYieldPoint::SeekStart.ordinal()
-        || cell.ordinal == CursorYieldPoint::SeekBtreeProgress.ordinal();
-    let index_scan = cell.op.name.starts_with("index_");
-    let changes_index_key = matches!(
-        cell.change,
-        Change::OwnDelete(Target::Next) | Change::OwnMoveKey(Target::Next)
-    );
-    if seek_point && index_scan && changes_index_key {
-        // FIXME: an index scan reads the index entry of the next row before the table
-        // lookup yields. If the write deletes the row or moves its index key, the scan
-        // still returns the row from the old entry, with NULL or stale columns. This
-        // fails on main too.
-        return Some("an index scan returns a row that a write at the yield removed");
-    }
+fn known_failure(_cell: &Cell) -> Option<&'static str> {
     None
 }
 
