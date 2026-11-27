@@ -641,20 +641,27 @@ $ openssl rand -hex 32
 2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d
 ```
 
-Supply both the cipher and key when opening a new or existing encrypted database:
+Specify the key and cipher at the time of db creation to use encryption. Here is [sample test](https://github.com/tursodatabase/turso/blob/main/tests/integration/query_processing/encryption.rs):
+
+```shell
+$ cargo run -- --experimental-encryption database.db
+
+PRAGMA cipher = 'aegis256'; -- or 'aes256gcm'
+PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
+```
+Alternatively you can provide the encryption parameters directly in a **URI**. For example:
+```shell
+$ cargo run -- --experimental-encryption \
+"file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+```
+
+
+> **Note:**  To reopen an already *encrypted database*, the file **must** be opened in URI format with the `cipher` and `hexkey` passed as URI parameters. Now, to reopen `database.db` the command below must be run:
 
 ```shell
 $ cargo run -- --experimental-encryption \
-  "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+   "file:database.db?cipher=aegis256hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 ```
-
-This URI can expose the key through process arguments, shell history, and command-line recording; it is not a protected secret-input channel.
-
-Encryption cannot be enabled or changed after open. Assignments to `PRAGMA cipher` and `PRAGMA hexkey` are rejected during preparation. The encrypted page size is selected in core `OpenOptions::page_size` (4096 by default for new databases); page size and reserved bytes cannot change after open. Every open, connection, and attachment must authenticate its own credentials, including cached opens and empty databases before their first write. Existing encrypted files remain readable with their original cipher and key.
-
-Use an attachment's own `cipher` and `hexkey` URI parameters. `ATTACH ... KEY` rejects non-NULL values before opening a target; use URI credentials instead. `KEY NULL` is accepted. Serialize concurrent opens of a fresh target until ATTACH completes. In-place VACUUM supports an encrypted main database, but rejects encrypted attached databases. VACUUM INTO produces plaintext. External restore hooks reject built-in encrypted databases. Sync encryption is not supported.
-
-Database storage, WAL, and encrypted MVCC logical logs are protected. Raw opens, custom storage, and separate processes must serialize first initialization of a zero-byte encrypted database.
 
 
 ## Vector search
@@ -1548,7 +1555,7 @@ This implies that when a function returns an `IOResult`, it must be called again
 
 1. We do encryption at the page level, i.e., each page is encrypted and decrypted individually.
 2. At db creation, we take key and cipher scheme information. We store the scheme information (also version) in the db file itself.
-3. The database identity and manager do not retain caller keys. Each connection retains its key; the shared MVCC log writer may retain the operational encryption context needed for log I/O. Each connection must authenticate its own key. Trying to open a db with an invalid or empty key should return an error.
+3. The key is not stored anywhere. So each connection should carry an encryption key. Trying to open a db with an invalid or empty key should return an error.
 4. We generate a new randomized, cryptographically safe nonce every time we write a page.
 5. We store the authentication tag and the nonce in the page itself.
 6. We can support different cipher algorithms: AES, ChachaPoly, AEGIS, etc.

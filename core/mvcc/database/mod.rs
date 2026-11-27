@@ -7099,7 +7099,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// invisible to MVCC header lookups even though the pager itself honors `N` for on-disk
     /// page allocation. Only valid before any data has been written; matches the same
     /// precondition `Connection::reset_page_size` enforces via `db.initialized()`.
-    pub(crate) fn set_global_page_size(&self, size: PageSize) {
+    pub fn set_global_page_size(&self, size: PageSize) {
         let mut header = self.global_header.write();
         if let Some(header) = header.as_mut() {
             header.page_size = size;
@@ -7128,15 +7128,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    #[cfg(feature = "test_helper")]
-    pub fn with_global_header_mut_for_testing<T>(
-        &self,
-        f: impl Fn(&mut DatabaseHeader) -> T,
-    ) -> Result<T> {
-        self.with_header_mut(f, None)
-    }
-
-    pub(crate) fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
+    pub fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
     where
         F: Fn(&mut DatabaseHeader) -> T,
     {

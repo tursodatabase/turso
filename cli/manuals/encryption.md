@@ -6,7 +6,7 @@ display_name: "encryption at-rest"
 
 ## Overview
 
-Turso supports transparent at-rest encryption to protect your database files from unauthorized access. Database pages, WAL frames, and MVCC logical logs are encrypted and decrypted with the credentials supplied when opening the database.
+Turso supports transparent at-rest encryption to protect your database files from unauthorized access. When enabled, all data written to disk is automatically encrypted, and decrypted when read, with no changes required to your application code.
 
 ## Supported Ciphers
 
@@ -47,17 +47,31 @@ Example output:
 
 ## Creating an Encrypted Database
 
-Encryption must be selected when the database is opened. Supply both the cipher and key before creating a connection; `PRAGMA cipher = ...` and `PRAGMA hexkey = ...` assignments are rejected, including on empty databases.
+### Method 1: Using PRAGMAs
+
+Start Turso and set encryption parameters before creating tables. Do note that encryption is an experimental feature that must be explicitly enabled:
+
+```bash
+tursodb --experimental-encryption database.db
+```
+
+Then in the SQL shell:
+```sql
+PRAGMA cipher = 'aegis256';
+PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
+
+-- Now create your tables and insert data
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO users VALUES (1, 'Alice');
+```
+
+### Method 2: Using URI Parameters
 
 Specify encryption parameters directly in the database URI:
 
 ```bash
 tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 ```
-
-The key-bearing URI is operationally unsafe: it can expose the key through process arguments, shell history, and command-line recording. A protected secret-input channel is not currently provided by this CLI flow.
-
-After opening, create tables and insert data normally. Encryption identity, page size, and reserved bytes are fixed for the lifetime of the encrypted database object. Opening a live plaintext database with encryption options is rejected, even before its first write.
 
 ## Opening an Encrypted Database
 
@@ -86,19 +100,3 @@ This error occurs when:
 ### "Invalid hex string"
 - Ensure your key is valid hexadecimal (0-9, a-f)
 - Check the key length matches your cipher (32 hex chars for 16 bytes, 64 for 32 bytes)
-
-## Attached Databases and Maintenance
-
-The main and attached databases select encryption independently. A plaintext main database can attach encrypted targets, and an encrypted main database can attach plaintext targets. Provide each encrypted target's own credentials in its URI:
-
-```sql
-ATTACH 'file:aux.db?cipher=aegis256&hexkey=YOUR_HEX_KEY' AS aux;
-```
-
-`ATTACH ... KEY` rejects non-NULL values before opening a target. Use URI credentials for encryption; `KEY NULL` is accepted. Serialize other opens of a new target until ATTACH completes.
-
-In-place VACUUM preserves encryption and page layout for the main database. In-place VACUUM of an encrypted attached database is rejected. VACUUM INTO writes a plaintext destination. External restore hooks reject built-in encrypted databases. Sync encryption is not supported.
-
-The process-wide database manager authenticates every open independently, and each connection and attachment authenticates page 1 with its own pager. Missing keys, wrong keys, and mismatched ciphers are refused before returning a database or connection. Existing encrypted files retain their format and credentials.
-
-Callers using raw opens, custom storage, or separate processes must serialize the first initialization of a zero-byte encrypted database.

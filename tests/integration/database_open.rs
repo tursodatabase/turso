@@ -1203,7 +1203,7 @@ fn page_codec_connection_rejects_builtin_encryption_settings() {
         err,
         LimboError::InvalidArgument(message)
             if message
-                == "encryption must be configured when opening the database"
+                == "cannot configure built-in encryption while an external page codec is installed"
     ));
 }
 

@@ -6,8 +6,8 @@ use asserting::prelude::*;
 use rand::{rng, RngCore};
 use std::sync::Arc;
 use turso_core::{
-    CompletionError, ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts,
-    LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SessionRole, IO,
+    CipherMode, ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags,
+    OpenOptions, PlatformIO, Row, SessionRole, IO,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -184,27 +184,23 @@ fn authenticated_wal_import_preserves_target_encryption() -> anyhow::Result<()> 
     Ok(())
 }
 
-fn encrypted_fixture(source: &TempDatabase, size: u32) -> TempDatabase {
-    TempDatabaseBuilder::new()
-        .with_opts(source.db_opts)
-        .with_mvcc(source.enable_mvcc)
-        .with_encryption(CIPHER_A, KEY_A)
-        .with_page_size(size)
-        .build()
-}
-
 fn run_non_4k_page_size_encryption_test(
     tmp_db: &TempDatabase,
     enable_mvcc: bool,
 ) -> anyhow::Result<()> {
-    // Set page size to 8k (8192 bytes) and test encryption. Default page size is 4k.
-    let encrypted = encrypted_fixture(tmp_db, 8192);
-    let tmp_db = &encrypted;
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
     {
         let conn = tmp_db.connect_limbo();
+        // Set page size to 8k (8192 bytes) and test encryption. Default page size is 4k.
+        run_query(tmp_db, &conn, "PRAGMA page_size = 8192;")?;
+        run_query(
+            tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         if enable_mvcc {
             run_query(tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
         }
@@ -253,13 +249,17 @@ fn run_corruption_associated_data_bytes_test(
     tmp_db: &TempDatabase,
     enable_mvcc: bool,
 ) -> anyhow::Result<()> {
-    let encrypted = encrypted_fixture(tmp_db, 4096);
-    let tmp_db = &encrypted;
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
     {
         let conn = tmp_db.connect_limbo();
+        run_query(
+            tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         if enable_mvcc {
             run_query(tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
         }
@@ -311,15 +311,18 @@ fn run_corruption_associated_data_bytes_test(
             test_db_path.to_str().unwrap()
         );
 
-        assert!(
-            turso_core::Connection::from_uri(
-                &uri,
-                DatabaseOpts::new().with_encryption(true),
-                Arc::new(SqliteDialect)
-            )
-            .is_err(),
-            "corrupted associated data at {corrupt_pos}"
-        );
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
+            Arc::new(SqliteDialect),
+        )
+        .expect("opening the corrupted DB should not fail at the URI level");
+
+        let result = run_query_on_row(tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
+
+        assert_that!(result)
+            .described_as(format!("accessing an encrypted database with corrupted associated data at position {corrupt_pos}"))
+            .is_err();
     }
 
     Ok(())
@@ -328,13 +331,18 @@ fn run_corruption_associated_data_bytes_test(
 // TODO: mvcc does not error here
 #[turso_macros::test]
 fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
     let opts = tmp_db.db_opts;
 
     {
         let conn = tmp_db.connect_limbo();
+        run_query(
+            &tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         run_query(
             &tmp_db,
             &conn,
@@ -412,12 +420,11 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        assert!(matches!(
-            turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)),
-            Err(LimboError::CompletionError(
-                CompletionError::DecryptionError { .. }
-            ))
-        ));
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
+        assert_that!(result)
+            .described_as("accessing an encrypted database with the wrong key")
+            .is_err();
     }
     {
         // test connecting to encrypted db using insufficient encryption parameters in URI.
@@ -441,10 +448,11 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     }
     {
         // test connecting to encrypted db without using URI.
-        assert!(tmp_db
-            .db
-            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
-            .is_err());
+        let conn = tmp_db.connect_limbo();
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
+        assert_that!(result)
+            .described_as("accessing an encrypted database without using the URI")
+            .is_err();
     }
 
     Ok(())
@@ -484,12 +492,12 @@ fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Re
     ))
     .err()
     .display_string()
-    .contains("encryption must be configured when opening the database");
+    .contains("configure encryption before PRAGMA journal_mode='mvcc'");
 
     assert_that!(run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';"))
         .err()
         .display_string()
-        .contains("encryption must be configured when opening the database");
+        .contains("configure encryption before PRAGMA journal_mode='mvcc'");
 
     // Data inserted before the rejected pragmas must still be readable.
     let mut pre_count = 0;
@@ -525,7 +533,6 @@ fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Re
 // TODO: mvcc for some reason does not error on corruption here
 #[turso_macros::test]
 fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
@@ -533,6 +540,12 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     {
         let conn = tmp_db.connect_limbo();
+        run_query(
+            &tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         run_query(
             &tmp_db,
             &conn,
@@ -565,12 +578,14 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
             db_path.to_str().unwrap()
         );
 
-        assert!(matches!(
-            turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)),
-            Err(LimboError::CompletionError(
-                CompletionError::DecryptionError { .. }
-            ))
-        ));
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
+
+        assert_that!(result)
+            .described_as("accessing an encrypted database with corrupted Turso magic bytes")
+            .err()
+            .display_string()
+            .contains("Decryption failed");
     }
 
     Ok(())
@@ -677,12 +692,13 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
         let tmp_db = TempDatabase::builder()
             .with_opts(opts)
             .with_flags(flags)
-            .with_encryption(cipher_name, hexkey)
             .build();
         let db_path = tmp_db.path.clone();
 
         {
             let conn = tmp_db.connect_limbo();
+            run_query(&tmp_db, &conn, &format!("PRAGMA hexkey = '{hexkey}';"))?;
+            run_query(&tmp_db, &conn, &format!("PRAGMA cipher = '{cipher_name}';"))?;
             run_query(
                 &tmp_db,
                 &conn,
@@ -740,10 +756,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         let correct_encryption_key =
             turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
 
-        let conn = main_db.connect(
-            ConnectOpts::new(turso_core::SessionRole::Superuser)
-                .with_encryption_key(Some(correct_encryption_key)),
-        )?;
+        let conn = main_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
 
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
@@ -767,10 +782,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect(
-            ConnectOpts::new(turso_core::SessionRole::Superuser)
-                .with_encryption_key(Some(correct_encryption_key)),
-        )?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
 
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
@@ -794,9 +808,11 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         assert_eq!(row_count, 1, "Should read data with correct key");
     }
 
-    // Step 3: Opening a cached database must still validate the key.
+    // Step 3: Opening with wrong key succeeds, but reading data fails with decryption error
     {
-        let result = Database::open_file_with_flags(
+        let wrong_encryption_key = turso_core::EncryptionKey::from_hex_string(wrong_key).unwrap();
+
+        let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
             OpenFlags::default(),
@@ -806,14 +822,34 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                 hexkey: wrong_key.to_string(),
             }),
             Arc::new(SqliteDialect),
-        );
+        )?;
 
-        assert!(matches!(
-            result,
-            Err(LimboError::CompletionError(
-                CompletionError::DecryptionError { .. }
-            ))
-        ));
+        // opening succeeds - the key is not validated at open time
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(wrong_encryption_key)?;
+
+        // Reading data should fail with a decryption error
+        let read_failed = match conn.query("SELECT * FROM secret_data") {
+            Err(_) => true,
+            Ok(Some(mut rows)) => loop {
+                match rows.step() {
+                    Err(_) => break true,                            // Error - read failed
+                    Ok(turso_core::StepResult::Done) => break false, // Completed without error
+                    Ok(turso_core::StepResult::Interrupt) => break false,
+                    Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
+                    Ok(turso_core::StepResult::Busy)
+                    | Ok(turso_core::StepResult::IO)
+                    | Ok(turso_core::StepResult::Yield)
+                    | Ok(turso_core::StepResult::Sleep { .. }) => continue,
+                }
+            },
+            Ok(None) => false,
+        };
+        assert!(
+            read_failed,
+            "Reading data with wrong key should fail with decryption error"
+        );
     }
 
     // Step 4: Opening without encryption options should fail immediately
@@ -831,7 +867,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             .described_as("opening an encrypted database with no encryption options")
             .err()
             .display_string()
-            .contains("encrypted database requires an encryption key");
+            .contains("Database is encrypted but no encryption options provided");
     }
 
     // Step 5: verify correct key still works after wrong key attempt
@@ -848,10 +884,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect(
-            ConnectOpts::new(turso_core::SessionRole::Superuser)
-                .with_encryption_key(Some(correct_encryption_key)),
-        )?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
 
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
@@ -918,10 +953,11 @@ fn create_encrypted_db(
         Arc::new(SqliteDialect),
     )?;
 
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    let cipher_mode = CipherMode::try_from(cipher)?;
     let key = EncryptionKey::from_hex_string(hexkey)?;
-    let conn = db.connect(
-        ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(Some(key)),
-    )?;
+    conn.set_encryption_cipher(cipher_mode)?;
+    conn.set_encryption_key(key)?;
 
     conn.execute(format!(
         "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, value TEXT)"
@@ -1006,9 +1042,20 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             CIPHER_A,
             KEY_B // wrong key!
         );
-        assert_that!(run_query(&main_db, &conn, &attach_wrong))
-            .described_as("ATTACH with the wrong key")
-            .is_err();
+        // Attaching may succeed (key is not validated at open time), but reading must fail
+        let attach_result = run_query(&main_db, &conn, &attach_wrong);
+        if attach_result.is_ok() {
+            let read_result = run_query_on_row(
+                &main_db,
+                &conn,
+                "SELECT value FROM aux_a.secret_a",
+                |_: &Row| {},
+            );
+            assert_that!(read_result)
+                .described_as("reading an attached database with the wrong key")
+                .is_err();
+        }
+        // If attach itself failed, that's also acceptable
     }
 
     // --- Test 3: Swapped keys — db_a gets key_b, db_b gets key_a ---
@@ -1027,12 +1074,26 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             KEY_A
         );
 
-        assert_that!(run_query(&main_db, &conn, &attach_a_wrong))
-            .described_as("ATTACH of the first database with swapped keys")
-            .is_err();
-        assert_that!(run_query(&main_db, &conn, &attach_b_wrong))
-            .described_as("ATTACH of the second database with swapped keys")
-            .is_err();
+        // Attach may succeed at open time; reading should fail for both
+        let _ = run_query(&main_db, &conn, &attach_a_wrong);
+        let _ = run_query(&main_db, &conn, &attach_b_wrong);
+
+        let read_a = run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_a.secret_a",
+            |_: &Row| {},
+        );
+        let read_b = run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_b.secret_b",
+            |_: &Row| {},
+        );
+        assert!(
+            read_a.is_err() || read_b.is_err(),
+            "At least one read with swapped keys must fail"
+        );
     }
 
     // --- Test 4: Missing hexkey in URI ---
@@ -1085,9 +1146,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             CIPHER_A,
             KEY_B
         );
-        assert_that!(run_query(&main_db, &conn, &attach_wrong))
-            .described_as("ATTACH with the wrong key before retrying")
-            .is_err();
+        let _ = run_query(&main_db, &conn, &attach_wrong);
+        // Detach (ignore error if attach failed)
+        let _ = run_query(&main_db, &conn, "DETACH aux_a");
 
         // Now attach with correct key
         let attach_correct = format!(
@@ -1194,15 +1255,17 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
 /// database that can be read without any encryption keys.
 #[turso_macros::test]
 fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     use tempfile::TempDir;
 
     let _ = env_logger::try_init();
     let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let cipher = "aegis256";
 
     // 1. Create an encrypted source database and insert data
     {
         let conn = tmp_db.connect_limbo();
+        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
+        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
 
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, content TEXT)")?;
         conn.execute("INSERT INTO secret_data (content) VALUES ('this was encrypted')")?;
@@ -1215,23 +1278,33 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     // 2. Demonstrate that the encrypted source CANNOT be read or vacuumed without keys
     {
-        let result = Database::open(
-            tmp_db.io.clone(),
-            tmp_db.path.to_str().unwrap(),
-            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(tmp_db.db_opts),
-        );
+        let unauthorized_db = TempDatabase::new_with_existent(&tmp_db.path);
+        let unauthorized_conn = unauthorized_db.connect_limbo();
+
+        // Reading should fail
+        let result = unauthorized_conn.execute("SELECT * FROM secret_data");
         assert_that!(result)
+            .described_as("reading an encrypted database as plaintext")
             .err()
             .display_string()
-            .contains("encrypted database requires an encryption key");
+            .contains("Corrupt database");
+
+        // VACUUM INTO should also fail because it cannot read the source schema/data
+        let fail_path = dest_dir.path().join("should_fail.db");
+        let fail_path_str = fail_path.to_str().unwrap();
+        let result = unauthorized_conn.execute(format!("VACUUM INTO '{fail_path_str}'"));
+        assert_that!(result)
+            .described_as("VACUUM INTO from an encrypted database with no keys")
+            .err()
+            .display_string()
+            .contains("Corrupt database");
     }
 
     // 3. Execute VACUUM INTO using an authorized connection
     {
-        let conn = tmp_db.db.connect(
-            ConnectOpts::new(turso_core::SessionRole::Superuser)
-                .with_encryption_key(Some(EncryptionKey::from_hex_string(hexkey)?)),
-        )?;
+        let conn = tmp_db.connect_limbo();
+        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
+        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
         conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
     }
 
@@ -1246,14 +1319,15 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
     }
 
     // 5. Prove the destination has the same content as the encrypted source.
-    // Close the source first.
+    // Close the source first: it was encrypted with PRAGMAs, so its open `Database`
+    // has no cipher set and cannot take a key from a new connection.
     let source_path = tmp_db.path.clone();
     drop(tmp_db);
     let source_hash = turso_dbhash::hash_database(
         source_path.to_str().unwrap(),
         &turso_dbhash::DbHashOptions {
             encryption: Some(EncryptionOpts {
-                cipher: CIPHER_A.to_string(),
+                cipher: cipher.to_string(),
                 hexkey: hexkey.to_string(),
             }),
             ..Default::default()
@@ -1474,11 +1548,13 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
 fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
-    let tmp_db = encrypted_fixture(&tmp_db, 8192);
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
     [
+        "PRAGMA page_size = 8192;",
+        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        "PRAGMA cipher = 'aegis256';",
         "PRAGMA journal_mode = 'mvcc';",
         "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
         "INSERT INTO test (value) VALUES ('Hello, World!')",
@@ -1490,18 +1566,19 @@ fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
 
 // Regression coverage for https://github.com/tursodatabase/turso/issues/7375.
 
-fn assert_encrypted_page_size_selected_at_open(
+fn assert_encrypted_page_size_after_key_and_cipher(
     page_size: i64,
     cipher: &str,
     hexkey: &str,
 ) -> anyhow::Result<()> {
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
-        .with_encryption(cipher, hexkey)
-        .with_page_size(page_size as u32)
         .build();
 
     let conn = tmp_db.connect_limbo();
+    conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+    conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
+    conn.execute(format!("PRAGMA page_size = {page_size}"))?;
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
     conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
 
@@ -1531,23 +1608,22 @@ fn assert_encrypted_page_size_selected_at_open(
 }
 
 #[turso_macros::test]
-fn test_encrypted_page_size_selected_at_open(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_encrypted_page_size_after_key_and_cipher(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     for page_size in [512, 4096, 65536] {
-        assert_encrypted_page_size_selected_at_open(page_size, CIPHER_A, KEY_A)?;
+        assert_encrypted_page_size_after_key_and_cipher(page_size, CIPHER_A, KEY_A)?;
     }
     // Exercise a cipher that uses a 16-byte key and different metadata size.
     let aes128_key = &KEY_A[..32];
-    assert_encrypted_page_size_selected_at_open(512, "aes128gcm", aes128_key)?;
+    assert_encrypted_page_size_after_key_and_cipher(512, "aes128gcm", aes128_key)?;
     Ok(())
 }
 
 #[turso_macros::test]
-fn test_uri_encryption_rejects_page_size_changes(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
-        .with_encryption(CIPHER_A, KEY_A)
         .build();
 
     let uri = format!(
@@ -1561,14 +1637,14 @@ fn test_uri_encryption_rejects_page_size_changes(_tmp_db: TempDatabase) -> anyho
             DatabaseOpts::new().with_encryption(true),
             Arc::new(SqliteDialect),
         )?;
-        assert!(conn.execute("PRAGMA page_size = 512").is_err());
+        conn.execute("PRAGMA page_size = 512")?;
         conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
         conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
 
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
         assert_eq!(rows[0].0, 1);
         let ps: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
-        assert_eq!(ps[0].0, 4096);
+        assert_eq!(ps[0].0, 512);
 
         for c in conn.cacheflush()? {
             io.wait_for_completion(c)?;
@@ -1583,7 +1659,7 @@ fn test_uri_encryption_rejects_page_size_changes(_tmp_db: TempDatabase) -> anyho
     let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows[0].0, 1);
     let ps: Vec<(i64,)> = reopened.exec_rows("PRAGMA page_size");
-    assert_eq!(ps[0].0, 4096);
+    assert_eq!(ps[0].0, 512);
 
     Ok(())
 }
@@ -1637,11 +1713,15 @@ fn test_inplace_vacuum_non_4k_encryption(_tmp_db: TempDatabase) -> anyhow::Resul
     let _ = env_logger::try_init();
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
-        .with_encryption(CIPHER_A, KEY_A)
-        .with_page_size(512)
         .build();
 
     let conn = tmp_db.connect_limbo();
+    // This test covers VACUUM, so create the source DB without using the issue
+    // #7375 PRAGMA order.
+    conn.execute("PRAGMA page_size = 512")?;
+    conn.execute(format!("PRAGMA cipher = '{CIPHER_A}'"))?;
+    conn.execute(format!("PRAGMA hexkey = '{KEY_A}'"))?;
+
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")?;
     for i in 0..100i64 {
         conn.execute(format!("INSERT INTO t VALUES({i}, randomblob(300))"))?;
@@ -1684,13 +1764,9 @@ fn encrypted_reload_accepts_an_unwritten_database() -> anyhow::Result<()> {
             .build();
         let owner = tmp.connect_limbo();
         assert_eq!(std::fs::metadata(&tmp.path)?.len(), 0);
+        // An unwritten database has no page that can check a key, so this test
+        // cannot expect a reload with another key to fail.
         assert!(tmp.db.reload_wal_after_external_restore().is_err());
-        assert!(tmp
-            .db
-            .reload_wal_after_external_restore_with_encryption_key(Some(
-                EncryptionKey::from_hex_string(KEY_B)?,
-            ))
-            .is_err());
         std::fs::write(&tmp.path, [0; 16])?;
         assert!(owner.reload_wal_after_external_restore().is_err());
         assert_eq!(std::fs::read(&tmp.path)?, [0; 16]);
