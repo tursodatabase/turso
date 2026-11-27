@@ -98,7 +98,7 @@ pub(crate) static BUILT_IN_TYPES: [BuiltInType; 20] = built_in_types! {
     (650, "cidr", "I", false, -1, false, "i", "m", 651, ",", Support::NotRegistered),
     // FIXME(registered-types): float4 is stored as the REAL of the engine, so it keeps the digits of a float8. A float4 type registered in the frontend, with its INPUT, replaces this.
     (700, "float4", "N", false, 4, true, "i", "p", 1021, ",", Support::NotRegistered),
-    // FIXME(registered-types): float8 is the REAL of the engine and has no registered type, so it cannot store NaN. A float8 type registered in the frontend, with its INPUT, replaces this.
+    // FIXME(pg-catalog): float8 uses engine REAL and has no registered INPUT function. A registered float8 type replaces this.
     (701, "float8", "N", true, 8, true, "d", "p", 1022, ",", Support::NotRegistered),
     // FIXME(registered-types): macaddr: the frontend uses the type that core registers, which does not check its text. A macaddr type registered in the frontend, with its INPUT, replaces this.
     (829, "macaddr", "U", false, 6, false, "i", "p", 1040, ",", Support::NotRegistered),
