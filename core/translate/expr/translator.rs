@@ -1172,18 +1172,16 @@ fn translate_function_call_expr(
                     let env = TypeEnv::new(referenced_tables, resolver);
                     let written_types: Vec<ExprType> =
                         args.iter().map(|arg| type_of(arg, &env)).collect();
+                    let base_names: Vec<String> = written_types
+                        .iter()
+                        .map(|ty| name_without_domains(ty.clone(), resolver.schema()))
+                        .collect();
                     if let Some(check) = external.func.check_argument_types() {
-                        // A domain is checked as its base type, as PostgreSQL resolves it.
-                        let names: Vec<String> = written_types
-                            .iter()
-                            .map(|ty| name_without_domains(ty.clone(), resolver.schema()))
-                            .collect();
-                        check(&names)?;
+                        let written_names: Vec<String> =
+                            written_types.iter().map(|ty| ty.to_string()).collect();
+                        check(args, &written_names, &base_names)?;
                     }
-                    written_types
-                        .into_iter()
-                        .map(|ty| name_without_domains(ty, resolver.schema()))
-                        .collect()
+                    base_names
                 }
                 _ => Vec::new(),
             };

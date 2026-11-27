@@ -11,6 +11,7 @@ use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFuncti
 use turso_core::security::roles::RoleId;
 
 use crate::roles::{connection_roles, RoleCatalog};
+use turso_core::ast;
 use turso_core::dialect::ScalarFuncContext;
 use turso_core::types::IOResultOr;
 use turso_core::{
@@ -96,16 +97,22 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
 }
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
-/// timestamptz. `types` are the argument type names, with a domain replaced by
-/// its base type; the first is the left side. Every other type gets 0A000, including the ones that have no operator
-/// in PostgreSQL (which gives 42883), because the type name does not say
-/// whether PostgreSQL has one. The translator turns `-` into `+` of the
+/// timestamptz. `_args` are the argument expressions, `_types` their type
+/// names with domain names kept, and `types` the same names with a domain
+/// replaced by its base type, as PostgreSQL resolves it; the first is the
+/// left side. Every other type gets 0A000, including the ones that have no
+/// operator in PostgreSQL (which gives 42883), because the type name does not
+/// say whether PostgreSQL has one. The translator turns `-` into `+` of the
 /// negated interval, so the message always says `+`.
 // FIXME(pg-catalog): tursopg refuses every other left type with 0A000 because
 // it cannot tell which have a PostgreSQL operator. Some do, such as date, and
 // an untyped literal or NULL is resolved by PostgreSQL to a type that does. A
 // pg_operator lookup replaces this.
-fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
+fn check_timestamp_plus_interval_types(
+    _args: &[Box<ast::Expr>],
+    _types: &[String],
+    types: &[String],
+) -> Result<()> {
     let time_type = types[0].as_str();
     match time_type {
         "timestamp" | "timestamptz" => Ok(()),
@@ -127,8 +134,9 @@ fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
 }
 
 /// Refuses date_trunc when its second argument is not timestamp or
-/// timestamptz. `types` are the argument type names, with a domain replaced by
-/// its base type, as PostgreSQL resolves it.
+/// timestamptz. `_args` are the argument expressions, `_types` their type
+/// names with domain names kept, and `types` the same names with a domain
+/// replaced by its base type, as PostgreSQL resolves it.
 // FIXME(pg-catalog): HACK. This is a hand-written overload rule: the second
 // argument of date_trunc is timestamp or timestamptz, and the result has that
 // type (see `returning_argument_type(1)` where date_trunc is registered). It
@@ -136,7 +144,11 @@ fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
 // and date_trunc(text, timestamptz) returns timestamptz. It refuses with 0A000
 // arguments that PostgreSQL accepts, such as a date, which PostgreSQL casts to
 // timestamptz. A pg_proc lookup replaces it.
-fn check_date_trunc_types(types: &[String]) -> Result<()> {
+fn check_date_trunc_types(
+    _args: &[Box<ast::Expr>],
+    _types: &[String],
+    types: &[String],
+) -> Result<()> {
     let time_type = types[1].as_str();
     match time_type {
         "timestamp" | "timestamptz" => Ok(()),
