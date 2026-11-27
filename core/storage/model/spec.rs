@@ -87,6 +87,9 @@ pub enum Token<P> {
     },
     /// The last move was `SeekEnd` or `NewRowid`: an insert of a key above every key is legal.
     Append,
+    /// The last op was a `Delete` by this cursor: an insert of the deleted key is legal. A
+    /// one-pass `UPDATE` deletes the row and inserts it again, like SQLite.
+    Deleted,
 }
 
 /// The state of one cursor.
@@ -270,7 +273,12 @@ pub fn step<T: Tree>(t: &T, c: &TShape<T>, op: &TOp<T>) -> Result<TOutcome<T>, I
         Op::Prev => advance(t, c, Dir::Bwd),
         Op::NewRowid => Ok(keep(Shape::new(Pos::Lost, Dir::None, Token::Append))),
         Op::Insert { key, use_seek } => {
-            if *use_seek && !token_allows(t, &c.token, key) {
+            // Without its own seek an insert is legal at the place of the key: the seek token
+            // of the key, the entry of the key under the cursor (an update in place), or the
+            // gap of the key that this cursor just deleted.
+            let in_place = matches!(&c.pos, Pos::At(k) if k == key);
+            let reinsert = c.token == Token::Deleted && c.pos == Pos::Gone(key.clone());
+            if *use_seek && !in_place && !reinsert && !token_allows(t, &c.token, key) {
                 return illegal(Rule::U5, "an insert without the seek token of its key");
             }
             let shape = Shape::new(Pos::At(key.clone()), c.dir, Token::None);
@@ -279,7 +287,7 @@ pub fn step<T: Tree>(t: &T, c: &TShape<T>, op: &TOp<T>) -> Result<TOutcome<T>, I
         Op::InsertNoop => Ok(keep(Shape::lost())),
         Op::Delete => match &c.pos {
             Pos::At(k) if t.contains(k) => {
-                let shape = Shape::new(Pos::Gone(k.clone()), c.dir, Token::None);
+                let shape = Shape::new(Pos::Gone(k.clone()), c.dir, Token::Deleted);
                 Ok(write(shape, Write::Remove(k.clone())))
             }
             _ => illegal(Rule::U4, "Delete with no entry under the cursor"),
@@ -427,5 +435,6 @@ fn token_allows<T: Tree>(t: &T, tok: &Token<T::Probe>, k: &T::Key) -> bool {
         Token::None => false,
         Token::Key { key, hit } => t.token_allows(key, *hit, k),
         Token::Append => t.above_all(k),
+        Token::Deleted => false,
     }
 }
