@@ -10532,7 +10532,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut automatic_indices = HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
+        let mut materialized_view_info: HashMap<String, crate::schema::StoredView> =
             HashMap::default();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();

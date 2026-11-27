@@ -997,9 +997,9 @@ pub(crate) fn check_type_param_use(
     Ok(())
 }
 
-/// A materialized view the loader met, before it is built: its namespace,
+/// A view the loader met, before it is built: its namespace,
 /// its SQL text and its root page.
-pub type StoredMaterializedView = (NamespaceId, String, i64);
+pub type StoredView = (NamespaceId, String, i64);
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
 struct MakeFromBtreeAccumulators {
@@ -1009,8 +1009,8 @@ struct MakeFromBtreeAccumulators {
     dbsp_state_roots: HashMap<String, i64>,
     /// Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
     dbsp_state_index_roots: HashMap<String, i64>,
-    /// The materialized views met, by view key: namespace, SQL and root page
-    materialized_view_info: HashMap<String, StoredMaterializedView>,
+    /// The deferred views met, by view key: namespace, SQL and root page
+    view_info: HashMap<String, StoredView>,
 }
 
 /// Phase tracking for async schema loading
@@ -1290,9 +1290,9 @@ pub struct Schema {
     /// namespaces table, which is read after the schema rows.
     namespace_names_loaded: bool,
 
-    /// The materialized views met before the names of the namespaces were
+    /// The views met before the names of the namespaces were
     /// loaded, built once they are.
-    pending_materialized_views: Option<PendingMaterializedViews>,
+    pending_views: Option<PendingViews>,
 
     /// What the dialect loaded from its own tables, such as the classes and
     /// roles of the PostgreSQL frontend. The steps of
@@ -1307,12 +1307,12 @@ pub struct Schema {
 /// `ALTER ... OWNER TO` names a kind.
 pub use crate::ast::RelationKind;
 
-/// Materialized views the loader read before the names of the namespaces,
+/// Views the loader read before the names of the namespaces,
 /// with the roots of their state tables. A view body names tables by their
 /// namespace, so a view cannot be built until the names are known.
 #[derive(Debug, Clone, Default)]
-struct PendingMaterializedViews {
-    materialized_view_info: HashMap<String, StoredMaterializedView>,
+struct PendingViews {
+    view_info: HashMap<String, StoredView>,
     dbsp_state_roots: HashMap<String, i64>,
     dbsp_state_index_roots: HashMap<String, i64>,
 }
@@ -1415,7 +1415,7 @@ impl SchemaBuilder {
                 supports_namespaces: false,
                 default_namespaces: &[],
                 namespace_names_loaded: true,
-                pending_materialized_views: None,
+                pending_views: None,
                 dialect_schema: None,
             },
         })
@@ -1666,10 +1666,10 @@ impl Schema {
             self.name_namespace(NamespaceId::new(id), name);
         }
         self.namespace_names_loaded = true;
-        if let Some(pending) = self.pending_materialized_views.take() {
-            self.populate_materialized_views(
+        if let Some(pending) = self.pending_views.take() {
+            self.populate_views(
                 dialect,
-                pending.materialized_view_info,
+                pending.view_info,
                 pending.dbsp_state_roots,
                 pending.dbsp_state_index_roots,
             )?;
@@ -3443,7 +3443,7 @@ impl Schema {
                         automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
                         dbsp_state_roots: HashMap::default(),
                         dbsp_state_index_roots: HashMap::default(),
-                        materialized_view_info: HashMap::default(),
+                        view_info: HashMap::default(),
                     });
 
                     state.phase = MakeFromBtreePhase::Rewinding;
@@ -3535,7 +3535,7 @@ impl Schema {
                         &mut acc.automatic_indices,
                         &mut acc.dbsp_state_roots,
                         &mut acc.dbsp_state_index_roots,
-                        &mut acc.materialized_view_info,
+                        &mut acc.view_info,
                         &|_| None,
                         dialect,
                     )?;
@@ -3682,7 +3682,7 @@ impl Schema {
                         dialect,
                         syms,
                         &type_sqls,
-                        acc.materialized_view_info,
+                        acc.view_info,
                         acc.dbsp_state_roots,
                         acc.dbsp_state_index_roots,
                         acc.from_sql_indexes,
@@ -3870,11 +3870,11 @@ impl Schema {
         Ok(())
     }
 
-    fn order_persisted_materialized_views(
+    fn order_persisted_views(
         &self,
         dialect: &dyn crate::dialect::Dialect,
-        view_info: HashMap<String, StoredMaterializedView>,
-    ) -> Result<Vec<(String, StoredMaterializedView)>> {
+        view_info: HashMap<String, StoredView>,
+    ) -> Result<Vec<(String, StoredView)>> {
         let mut view_info = view_info;
         let keys = view_info.keys().cloned().collect::<HashSet<_>>();
         let mut indegree = keys
@@ -3885,14 +3885,17 @@ impl Schema {
 
         for (view_key, (namespace, sql, _)) in &view_info {
             let cmd = crate::dialect::parse_statement(dialect, sql)?.ok_or_else(|| {
-                LimboError::Corrupt(format!(
-                    "materialized view {view_key} has an empty schema definition"
-                ))
+                LimboError::Corrupt(format!("view {view_key} has an empty schema definition"))
             })?;
-            let Cmd::Stmt(Stmt::CreateMaterializedView { select, .. }) = cmd else {
-                return Err(LimboError::Corrupt(format!(
-                    "materialized view {view_key} has a non-view schema definition"
-                )));
+            let select = match cmd {
+                Cmd::Stmt(
+                    Stmt::CreateMaterializedView { select, .. } | Stmt::CreateView { select, .. },
+                ) => select,
+                _ => {
+                    return Err(LimboError::Corrupt(format!(
+                        "view {view_key} has a non-view schema definition"
+                    )))
+                }
             };
             for (table_namespace, table_name) in
                 self.materialized_view_dependencies(*namespace, &select)
@@ -3901,7 +3904,7 @@ impl Schema {
                 if keys.contains(&dependency) {
                     *indegree.get_mut(view_key).ok_or_else(|| {
                         LimboError::Corrupt(format!(
-                            "materialized view {view_key} disappeared while ordering schema"
+                            "view {view_key} disappeared while ordering schema"
                         ))
                     })? += 1;
                     dependents
@@ -3915,29 +3918,27 @@ impl Schema {
         let mut ready = indegree
             .iter()
             .filter_map(|(key, degree)| (*degree == 0).then_some(key.clone()))
-            .try_collect::<Vec<_>>()?;
-        ready.sort_by(|left, right| right.cmp(left));
+            .collect::<std::collections::BTreeSet<_>>();
         let mut order = Vec::try_with_capacity_ext(keys.len())?;
-        while let Some(view_key) = ready.pop() {
+        while let Some(view_key) = ready.pop_first() {
             order.push(view_key.clone());
             if let Some(children) = dependents.get(&view_key) {
                 for child in children {
                     let degree = indegree.get_mut(child).ok_or_else(|| {
                         LimboError::Corrupt(format!(
-                            "materialized view {child} disappeared while ordering schema"
+                            "view {child} disappeared while ordering schema"
                         ))
                     })?;
                     *degree -= 1;
                     if *degree == 0 {
-                        ready.push(child.clone());
-                        ready.sort_by(|left, right| right.cmp(left));
+                        ready.insert(child.clone());
                     }
                 }
             }
         }
         if order.len() != keys.len() {
             return Err(LimboError::Corrupt(
-                "circular materialized-view dependency in schema".to_string(),
+                "circular view dependency in schema".to_string(),
             ));
         }
 
@@ -3948,28 +3949,34 @@ impl Schema {
                     .remove(&key)
                     .map(|info| (key.clone(), info))
                     .ok_or_else(|| {
-                        LimboError::Corrupt(format!(
-                            "materialized view {key} disappeared while ordering schema"
-                        ))
+                        LimboError::Corrupt(format!("view {key} disappeared while ordering schema"))
                     })
             })
             .try_collect::<Result<Vec<_>>>()?
     }
 
-    /// Populate materialized views parsed from the schema.
-    /// Builds the materialized views the loader met, keyed by their view
+    /// Populate deferred ordinary and materialized views parsed from the schema.
+    /// Builds the views the loader met in dependency order, keyed by their view
     /// keys, with the namespace, SQL text and root page of each.
-    pub fn populate_materialized_views(
+    pub fn populate_views(
         &mut self,
         dialect: &dyn crate::dialect::Dialect,
-        materialized_view_info: HashMap<String, StoredMaterializedView>,
+        view_info: HashMap<String, StoredView>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
         for (view_key, (namespace, sql, main_root)) in
-            self.order_persisted_materialized_views(dialect, materialized_view_info)?
+            self.order_persisted_views(dialect, view_info)?
         {
             let view_name = self.demangle_name(&view_key).1.to_string();
+            if let Some(Cmd::Stmt(Stmt::CreateView {
+                columns, select, ..
+            })) = crate::dialect::parse_statement(dialect, &sql)?
+            {
+                self.populate_view(namespace, view_name, sql, &columns, select)?;
+                continue;
+            }
+
             // The marker is mandatory even when the circuit has no stateful
             // operators, so absence and mismatched operator storage are both
             // incompatible.
@@ -4107,6 +4114,30 @@ impl Schema {
         Ok(())
     }
 
+    /// Builds an ordinary view after its source relations and namespaces are known.
+    fn populate_view(
+        &mut self,
+        namespace: NamespaceId,
+        name: String,
+        sql: String,
+        column_names: &[ast::IndexedColumn],
+        select: ast::Select,
+    ) -> Result<()> {
+        let mut columns = view::extract_view_columns(namespace, &select, self)?;
+        columns.rename_columns(column_names);
+        let view = View::new(
+            name,
+            sql,
+            select,
+            columns.flat_columns()?,
+            column_names
+                .iter()
+                .map(|column| column.col_name.as_str().to_string())
+                .try_collect()?,
+        );
+        self.add_view(namespace, view)
+    }
+
     /// Every name a materialized view's dependency must be registered under:
     /// the tables its query reads (including tables read only inside
     /// subqueries, see [view::referenced_tables]), with each
@@ -4201,7 +4232,7 @@ impl Schema {
         dialect: &dyn crate::dialect::Dialect,
         syms: &SymbolTable,
         type_sqls: &[String],
-        materialized_view_info: HashMap<String, StoredMaterializedView>,
+        view_info: HashMap<String, StoredView>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
@@ -4214,16 +4245,12 @@ impl Schema {
         if !type_sqls.is_empty() {
             self.load_type_definitions(dialect, type_sqls, syms)?;
         }
-        if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
+        if !self.namespace_names_loaded && !view_info.is_empty() {
             // A view body names tables by their namespace, so the views wait
             // for the names of the namespaces. No index is on a view: CREATE
             // INDEX refuses views.
-            let pending = self
-                .pending_materialized_views
-                .get_or_insert_with(PendingMaterializedViews::default);
-            pending
-                .materialized_view_info
-                .extend(materialized_view_info);
+            let pending = self.pending_views.get_or_insert_with(PendingViews::default);
+            pending.view_info.extend(view_info);
             pending.dbsp_state_roots.extend(dbsp_state_roots);
             pending
                 .dbsp_state_index_roots
@@ -4236,12 +4263,7 @@ impl Schema {
                 mvcc_enabled,
             );
         }
-        self.populate_materialized_views(
-            dialect,
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-        )?;
+        self.populate_views(dialect, view_info, dbsp_state_roots, dbsp_state_index_roots)?;
         self.populate_indices(
             dialect,
             syms,
@@ -4376,7 +4398,7 @@ impl Schema {
         automatic_indices: &mut HashMap<String, Vec<(String, i64)>>,
         dbsp_state_roots: &mut HashMap<String, i64>,
         dbsp_state_index_roots: &mut HashMap<String, i64>,
-        materialized_view_info: &mut HashMap<String, StoredMaterializedView>,
+        view_info: &mut HashMap<String, StoredView>,
         // Resolves an attached database name (case-insensitive) to its
         // connection-local database id. Used when reparsing temp trigger
         // SQL that qualifies its target with an attached db name like
@@ -4459,7 +4481,7 @@ impl Schema {
                             // version still owns a real btree that integrity_check
                             // and DROP VIEW must be able to find; incompatibility
                             // is tracked separately (dbsp_storage_version_mismatch)
-                            // and still makes populate_materialized_views refuse to
+                            // and still makes populate_views refuse to
                             // wire the view up for live maintenance.
                             if let Ok(stored_version) = version_str.parse::<u32>() {
                                 dbsp_state_roots.insert(view_name.to_string(), root_page);
@@ -4552,7 +4574,6 @@ impl Schema {
             }
             "view" => {
                 use crate::ast::{Cmd, Stmt};
-                use crate::schema::View;
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let (namespace, view_name) = self.demangle_name(name);
@@ -4579,7 +4600,7 @@ impl Schema {
                             // The view is built in a later pass, when the
                             // root pages of its hidden state tables are known.
                             // Its key is the row's name, namespace and all.
-                            materialized_view_info
+                            view_info
                                 .insert(name.to_string(), (namespace, sql.to_string(), root_page));
                         }
                         Stmt::CreateView {
@@ -4588,20 +4609,20 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                dialect.load_view_columns(namespace, &select, self)?;
-                            view_column_schema.rename_columns(&column_names);
-                            let view = View::new(
-                                view_name,
-                                sql.to_string(),
-                                select,
-                                view_column_schema.flat_columns()?,
-                                column_names
-                                    .iter()
-                                    .map(|column| column.col_name.as_str().to_string())
-                                    .try_collect()?,
-                            );
-                            self.add_view(namespace, view)?;
+                            if !self.namespace_names_loaded {
+                                view_info.insert(
+                                    name.to_string(),
+                                    (namespace, sql.to_string(), root_page),
+                                );
+                            } else {
+                                self.populate_view(
+                                    namespace,
+                                    view_name,
+                                    sql.to_string(),
+                                    &column_names,
+                                    select,
+                                )?;
+                            }
                         }
                         _ => {}
                     }
@@ -5246,7 +5267,7 @@ impl TryClone for Schema {
             supports_namespaces: self.supports_namespaces,
             default_namespaces: self.default_namespaces,
             namespace_names_loaded: self.namespace_names_loaded,
-            pending_materialized_views: self.pending_materialized_views.clone(),
+            pending_views: self.pending_views.clone(),
             dialect_schema: self.dialect_schema.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
@@ -9500,7 +9521,44 @@ mod tests {
         ]);
 
         let ordered = Schema::new()
-            .order_persisted_materialized_views(&dialect, views)
+            .order_persisted_views(&dialect, views)
+            .unwrap();
+        assert_eq!(
+            ordered
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<std::vec::Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn ordinary_and_materialized_views_share_dependency_order() {
+        let (views, mut dialect) = stored_views_selecting_from(&[
+            ("third", "second", 0),
+            ("first", "base", 0),
+            ("second", "first", 4),
+        ]);
+        for index in [0, 1] {
+            let Stmt::CreateMaterializedView {
+                view_name,
+                columns,
+                select,
+                ..
+            } = dialect.views[index].1.clone()
+            else {
+                unreachable!()
+            };
+            dialect.views[index].1 = Stmt::CreateView {
+                temporary: false,
+                if_not_exists: false,
+                view_name,
+                columns,
+                select,
+            };
+        }
+        let ordered = Schema::new()
+            .order_persisted_views(&dialect, views)
             .unwrap();
         assert_eq!(
             ordered
@@ -9519,7 +9577,7 @@ mod tests {
         ]);
 
         let error = Schema::new()
-            .order_persisted_materialized_views(&dialect, views)
+            .order_persisted_views(&dialect, views)
             .unwrap_err();
         assert!(matches!(error, LimboError::Corrupt(_)));
     }
@@ -9529,7 +9587,7 @@ mod tests {
     /// that reads their SQL.
     fn stored_views_selecting_from(
         views: &[(&str, &str, i64)],
-    ) -> (HashMap<String, StoredMaterializedView>, StoredViewsDialect) {
+    ) -> (HashMap<String, StoredView>, StoredViewsDialect) {
         let mut stored = HashMap::default();
         let mut dialect = StoredViewsDialect { views: vec![] };
         for &(view, table, root_page) in views {

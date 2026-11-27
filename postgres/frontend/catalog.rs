@@ -159,24 +159,6 @@ impl Dialect for PostgresDialect {
         }
     }
 
-    fn load_view_columns(
-        &self,
-        namespace: NamespaceId,
-        select: &ast::Select,
-        schema: &Schema,
-    ) -> Result<turso_core::schema::view::ViewColumnSchema> {
-        // Stored queries qualify their sources by schema name. Resolving a
-        // JOIN USING before those names are loaded mistakes its columns for
-        // missing columns. The catalog loader resolves views after this step.
-        if !schema.namespace_names_loaded() {
-            return Ok(turso_core::schema::view::ViewColumnSchema {
-                tables: Vec::new(),
-                columns: Vec::new(),
-            });
-        }
-        turso_core::schema::view::extract_view_columns(namespace, select, schema)
-    }
-
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_core::ast::Stmt> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
