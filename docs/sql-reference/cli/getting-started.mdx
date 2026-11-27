@@ -54,7 +54,7 @@ tursodb> SELECT *
 
 ### Command History
 
-Command history is saved automatically to `~/.limbo_history` and accessible with up/down arrow keys.
+Command history is saved automatically to `~/.limbo_history` and accessible with up/down arrow keys. The history keeps `***` in place of an encryption key, that is, the value of a `hexkey` URI parameter, of `PRAGMA hexkey`, or of the `KEY` clause of `ATTACH`. If the file name of `ATTACH` is an expression and not one string, for example `'file:b.db?cipher=aegis256&hexkey=' || '...'`, the history keeps `***` in place of all of the expression. Thus a line that you get with the arrow keys also has `***` in place of the key. A value that you set with `.parameter set` stays in the history, also if a statement then uses it as a key.
 
 ### Exiting
 

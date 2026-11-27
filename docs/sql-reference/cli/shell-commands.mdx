@@ -37,7 +37,7 @@ tursodb> .open 'file:secret.db?cipher=aegis256&hexkey=YOUR_HEX_KEY'
 
 If the shell already has the file open, for example when you open the current database again, `.open` uses that database, and the `mode` and `vfs` parameters have no effect. `.open` does not use the `--readonly` option. For a URI, it does not use the `--vfs` option either.
 
-The interactive shell saves each line that you type in `~/.limbo_history`, so the history file keeps a key that you type in a URI.
+The interactive shell saves each line that you type in `~/.limbo_history`. It writes `***` in place of the value of a `hexkey` parameter, so the history file does not keep the key.
 
 ### .quit
 
@@ -464,7 +464,7 @@ employees... done
 
 For a URI, `.clone` looks for the file that the URI names before it opens the URI, and it does not open that file if it exists. If a URI parameter is not correct, `.clone` shows an error. Some errors, for example a key that is not valid, can leave an empty file with that name. Remove the file before the next `.clone` to that name.
 
-Without the `cipher` and `hexkey` parameters, the copy is not encrypted. This is also true when the current database is encrypted. As for `.open`, the history file of the interactive shell keeps a key that you type.
+Without the `cipher` and `hexkey` parameters, the copy is not encrypted. This is also true when the current database is encrypted. As for `.open`, the history file of the interactive shell does not keep the key.
 
 ### .read
 
