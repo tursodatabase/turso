@@ -1138,7 +1138,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(_) if order.is_lt() => self.dual_peek.mvcc_peek = CursorPeek::Stale,
                 _ => {
                     let key = btree_key.expect("the B-tree head comes first or ties");
-                    if self.btree_head_is_valid(&key, dir)? {
+                    let valid = if order.is_eq() {
+                        self.tied_btree_head_is_valid()?
+                    } else {
+                        self.btree_head_is_valid(&key, dir)?
+                    };
+                    if valid {
                         self.land(key, true, None, dir);
                         return Ok(IOResult::Done(()));
                     }
@@ -1195,6 +1200,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 ..
             })
         )
+    }
+
+    /// Whether the B-tree head is visible when the MvStore head has the same key. The
+    /// MvStore head holds the chain of that key, so no skiplist search is necessary.
+    fn tied_btree_head_is_valid(&self) -> Result<bool> {
+        let CursorPeek::Raw {
+            versions: Some(versions),
+            ..
+        } = &self.dual_peek.mvcc_peek
+        else {
+            unreachable!("the MvStore head holds an entry");
+        };
+        cursor_work(&self.work).visibility_check();
+        self.db
+            .btree_row_valid_under_chain(self.tx_id, self.table_id, versions)
     }
 
     /// Whether the B-tree row `key` is visible: no MvStore version hides it.

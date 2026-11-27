@@ -1844,3 +1844,65 @@ fn test_cursor_work_counts_mvstore_iterators_exactly() {
         );
     }
 }
+
+/// Runs `sql` at state size N and 4N with `build`, and returns the work of each run.
+fn work_at_n_and_4n(
+    build: impl Fn(usize) -> (MvccTestDbNoConn, Arc<Connection>),
+    sql: &str,
+) -> (CursorWork, CursorWork) {
+    let mut works = [N, 4 * N].map(|n| {
+        let (_db, conn) = build(n);
+        run_measured(&conn, sql, &[]).1
+    });
+    let large = std::mem::take(&mut works[1]);
+    let small = std::mem::take(&mut works[0]);
+    (small, large)
+}
+
+/// An index seek that walks B-tree entries whose MvStore chains hide them must decide each
+/// one from the chain that the MvStore head holds. A skiplist lookup for each entry made a
+/// job queue query (`WHERE status = 'pending'` after the jobs moved to 'done') 4.5 times
+/// slower than main.
+#[test]
+fn test_index_seek_over_hidden_btree_entries_does_no_point_lookups() {
+    let moved_keys = |n: usize| {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+        run(
+            &conn,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, k INT, v TEXT)",
+        );
+        run(&conn, "CREATE INDEX t_k ON t(k)");
+        run(
+            &conn,
+            &format!("INSERT INTO t SELECT value, 7, 'a' FROM generate_series(1, {n})"),
+        );
+        run(
+            &conn,
+            &format!(
+                "INSERT INTO t SELECT value + {n}, value % 50 + 100, 'b' \
+                 FROM generate_series(1, 100)"
+            ),
+        );
+        run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        run(&conn, &format!("UPDATE t SET k = 8 WHERE id < {n}"));
+        (db, conn)
+    };
+    let deleted_rows = |n: usize| {
+        let (db, conn) = moved_keys(n);
+        run(&conn, &format!("DELETE FROM t WHERE id <= {n}"));
+        (db, conn)
+    };
+    let eq_seek = "SELECT count(*) FROM t INDEXED BY t_k WHERE k = 7";
+    let range_seek = "SELECT k FROM t INDEXED BY t_k WHERE k > 0 ORDER BY k LIMIT 1";
+    for (sql, (small, large)) in [
+        (eq_seek, work_at_n_and_4n(moved_keys, eq_seek)),
+        (range_seek, work_at_n_and_4n(deleted_rows, range_seek)),
+    ] {
+        assert!(
+            Class::Constant.allows(small.mvcc_point_lookups, large.mvcc_point_lookups),
+            "`{sql}`: MvStore point lookups grow with the hidden entries: {small:?} -> {large:?}"
+        );
+    }
+}

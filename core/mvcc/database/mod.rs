@@ -6181,6 +6181,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    /// Whether the B-tree row with the key of the chain `versions` is valid for `tx_id`: no
+    /// version in the chain hides it. The caller already holds the chain, so this does not
+    /// search the skiplist.
+    pub(crate) fn btree_row_valid_under_chain(
+        &self,
+        tx_id: TxID,
+        table_id: MVTableId,
+        versions: &RowVersions<A>,
+    ) -> Result<bool> {
+        let versions = versions.read();
+        self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
+    }
+
     fn chain_leaves_btree_row_valid(
         &self,
         tx_id: TxID,
