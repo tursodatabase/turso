@@ -7,6 +7,11 @@
 
 @database :memory:
 
+setup t_b_n_ts_j_jb_arr_u_with_rows {
+    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
+    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+}
+
 setup t_id_s_n_arr_ia_j_ok_with_rows {
     CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
     INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
@@ -2914,6 +2919,14 @@ test to-json-t-of-table-alias {
 }
 expect {
     {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
+}
+
+@setup t_b_n_ts_j_jb_arr_u_with_rows
+test row-to-json-of-whole-row {
+    SELECT row_to_json(t) FROM t;
+}
+expect {
+    {"b":true,"n":1.50,"ts":"2026-10-08T12:00:00+00:00","j":{"x": 1},"jb":{"y": 2},"arr":["a"],"u":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
 }
 
 test table-function-argument-cannot-name-a-table-listed-after-it {
