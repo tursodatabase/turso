@@ -2,6 +2,7 @@ use crate::sync::Arc;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 use crate::storage::encryption::{SQLITE_HEADER, TURSO_HEADER_PREFIX};
 use crate::storage::sqlite3_ondisk::Version;
 use crate::{alloc::DynAllocator, mvcc, LimboError, MvStore, OpenFlags, Result, IO};
@@ -147,15 +148,12 @@ pub fn find_logical_log_path(io: &dyn IO, db_path: impl AsRef<Path>) -> Result<P
     if std::fs::metadata(&old_log_path).is_err() {
         return Ok(old_log_path);
     }
-    if log_path.exists()
-        || matches!(
-            database_file_kind(db_path),
-            DatabaseFileKind::NoPage1 | DatabaseFileKind::NotMvcc
-        )
-    {
+    // The header of this database is not read: the database is in MVCC mode,
+    // and closing a second descriptor of its file would release its lock.
+    if log_path.exists() {
         return Ok(log_path);
     }
-    let others = other_old_log_writers(db_path, &old_log_path)?;
+    let others = other_old_log_writers(io, db_path, &old_log_path)?;
     if others.is_empty() {
         return Ok(old_log_path);
     }
@@ -239,7 +237,7 @@ fn database_file_kind(path: &Path) -> DatabaseFileKind {
 /// Returns the names of the other database files in the directory of
 /// `db_path` that an older version could have opened in MVCC mode with the
 /// log at `old_log_path`.
-fn other_old_log_writers(db_path: &Path, old_log_path: &Path) -> Result<Vec<String>> {
+fn other_old_log_writers(io: &dyn IO, db_path: &Path, old_log_path: &Path) -> Result<Vec<String>> {
     let dir = match db_path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -259,6 +257,7 @@ fn other_old_log_writers(db_path: &Path, old_log_path: &Path) -> Result<Vec<Stri
         let path = entry.path();
         if Some(entry.file_name().as_os_str()) == db_path.file_name()
             || path.with_extension("db-log").file_name() != old_log_path.file_name()
+            || is_sidecar_file(&entry.file_name().to_string_lossy())
         {
             continue;
         }
@@ -268,10 +267,44 @@ fn other_old_log_writers(db_path: &Path, old_log_path: &Path) -> Result<Vec<Stri
         if log_path.file_name() != old_log_path.file_name() && log_path.exists() {
             continue;
         }
-        if database_file_kind(&path) == DatabaseFileKind::MaybeMvcc {
+        // Do not read the header of a database that this process has open,
+        // because closing a second descriptor of its file would release its
+        // lock.
+        let kind = open_database_kind(io, &path).unwrap_or_else(|| database_file_kind(&path));
+        if kind == DatabaseFileKind::MaybeMvcc {
             others.push(path.display().to_string());
         }
     }
     others.sort();
     Ok(others)
+}
+
+/// Returns true if `name` is the name of a file that a database keeps next to
+/// its database file. Such a file is not a database, and the database that
+/// owns it can have it open.
+fn is_sidecar_file(name: &str) -> bool {
+    ["-wal", "-shm", "-log", "-journal"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// Returns the kind of the database at `path` if this process has it open,
+/// or `None` if it does not. A database that is opening can be in any mode.
+fn open_database_kind(io: &dyn IO, path: &Path) -> Option<DatabaseFileKind> {
+    let file_id = io.file_id(path.to_str()?).ok()?;
+    let db = {
+        let registry = DATABASE_MANAGER.lock();
+        match registry.get(&DatabaseKey::File(file_id))? {
+            RegistryEntry::Opening => return Some(DatabaseFileKind::MaybeMvcc),
+            RegistryEntry::Ready(db) => db.clone(),
+        }
+    };
+    // Upgrade the reference after the registry is unlocked, because dropping
+    // the last reference to a database locks the registry.
+    let db = db.upgrade()?;
+    Some(if db.mvcc_enabled() {
+        DatabaseFileKind::MaybeMvcc
+    } else {
+        DatabaseFileKind::NotMvcc
+    })
 }

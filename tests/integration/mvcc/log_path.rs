@@ -169,6 +169,63 @@ fn test_database_with_other_io_continues_to_use_its_log_from_an_older_version() 
     conn.close().unwrap();
 }
 
+/// Opening a database that uses its old log keeps the file locks of the
+/// database and of another database that this process has open. Unix file
+/// locks belong to the process, so closing any descriptor of a locked file
+/// releases them, and then a second process can open the database.
+#[cfg(unix)]
+#[test]
+fn test_old_log_lookup_keeps_file_locks() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    let wal_db = dir.path().join("app.bak");
+    create_wal_database(&wal_db);
+    let path = create_with_old_log(dir.path(), &template, "app.sqlite");
+
+    let wal_conn = try_open(&wal_db).unwrap();
+    let conn = try_open(&path).unwrap();
+    for locked in [&path, &wal_db] {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(LOCKED_DATABASE_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(LOCKED_DATABASE_ENV, locked)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "a second process opened {}: stdout={}; stderr={}",
+            locked.display(),
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+    assert_eq!(notes(&conn), vec![("app.sqlite".to_string(),)]);
+    conn.close().unwrap();
+    wal_conn.close().unwrap();
+}
+
+#[cfg(unix)]
+const LOCKED_DATABASE_CHILD_TEST: &str = "mvcc::log_path::open_locked_database_child_process";
+#[cfg(unix)]
+const LOCKED_DATABASE_ENV: &str = "TURSO_LOG_PATH_LOCKED_DATABASE";
+
+/// Runs in the child process of `test_old_log_lookup_keeps_file_locks`, and
+/// checks that the database is locked.
+#[cfg(unix)]
+#[test]
+fn open_locked_database_child_process() {
+    let Some(path) = std::env::var_os(LOCKED_DATABASE_ENV) else {
+        return;
+    };
+    let err = try_open(Path::new(&path)).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(err, turso_core::LimboError::LockingError(_)),
+        "{err:?}"
+    );
+}
+
 /// Creates an MVCC database at `path` with an empty `notes` table and no
 /// commits in its logical log.
 fn create_template(path: &Path) {
