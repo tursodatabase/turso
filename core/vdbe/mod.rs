@@ -4416,18 +4416,32 @@ pub trait ValueIteratorExt {
     /// Skips `n` elements and writes the value directly to the register.
     /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on parse error,
     /// or `None` if there are fewer than `n+1` elements.
-    fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>>;
+    fn nth_into_register(
+        &mut self,
+        n: usize,
+        dest: &mut Register,
+        nan_policy: NanPolicy,
+    ) -> Option<Result<()>>;
 
     /// Skips `skip` elements, then decodes one value into each register of `dests` in order.
     /// Returns the number of registers filled, which is less than `dests.len()` when the record
     /// has fewer elements; registers past the returned count are left untouched.
-    fn decode_into_registers_after(&mut self, skip: usize, dests: &mut [Register])
-        -> Result<usize>;
+    fn decode_into_registers_after(
+        &mut self,
+        skip: usize,
+        dests: &mut [Register],
+        nan_policy: NanPolicy,
+    ) -> Result<usize>;
 }
 
 impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     #[inline(always)]
-    fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>> {
+    fn nth_into_register(
+        &mut self,
+        n: usize,
+        dest: &mut Register,
+        nan_policy: NanPolicy,
+    ) -> Option<Result<()>> {
         let mut header = self.header_section_ref();
         let mut data = self.data_section_ref();
 
@@ -4444,7 +4458,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         };
         // Update iterator state
         self.set_header_section(header);
-        let result = decode_serial_type_into_register(serial_type, &mut data, dest);
+        let result = decode_serial_type_into_register(serial_type, &mut data, dest, nan_policy);
         self.set_data_section(data);
         Some(result)
     }
@@ -4457,6 +4471,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         &mut self,
         skip: usize,
         dests: &mut [Register],
+        nan_policy: NanPolicy,
     ) -> Result<usize> {
         let mut header = self.header_section_ref();
         let mut data = self.data_section_ref();
@@ -4467,7 +4482,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 break;
             }
             let serial_type = read_serial_type(&mut header)?;
-            decode_serial_type_into_register(serial_type, &mut data, dest)?;
+            decode_serial_type_into_register(serial_type, &mut data, dest, nan_policy)?;
             decoded += 1;
         }
         self.set_header_section(header);
@@ -4541,6 +4556,7 @@ pub(crate) fn decode_serial_type_into_register(
     serial_type: u64,
     data: &mut &[u8],
     dest: &mut Register,
+    nan_policy: NanPolicy,
 ) -> Result<()> {
     use crate::types::Extendable;
     match serial_type {
@@ -4614,13 +4630,17 @@ pub(crate) fn decode_serial_type_into_register(
             if unlikely(data.len() < 8) {
                 return Err(LimboError::Corrupt("Invalid 8-byte float".into()));
             }
-            let val = f64::from_be_bytes([
+            match crate::Double::from_record_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ]);
-            if let Some(nn) = Double::non_nan(val) {
-                dest.set_float(nn);
-            } else {
-                dest.set_null();
+            ]) {
+                Some(real) if real.is_nan() && nan_policy == NanPolicy::Null => {
+                    mark_unlikely();
+                    return Err(LimboError::Corrupt(
+                        "a REAL field holds a NaN, which this database cannot store".into(),
+                    ));
+                }
+                Some(real) => dest.set_float(real),
+                None => dest.set_null(),
             }
             *data = &data[8..];
         }
@@ -4735,7 +4755,7 @@ mod tests {
     fn decode_one_text(payload: &[u8], destination: &mut Register) -> Result<()> {
         let mut iterator = crate::types::ValueIterator::new(payload)?;
         iterator
-            .nth_into_register(0, destination)
+            .nth_into_register(0, destination, NanPolicy::Null)
             .expect("record contains one value")
     }
 
@@ -4827,7 +4847,7 @@ mod tests {
         let mut destination = Register::Value(Value::Null);
 
         let result = iterator
-            .nth_into_register(0, &mut destination)
+            .nth_into_register(0, &mut destination, NanPolicy::Null)
             .expect("record contains one value");
 
         assert!(

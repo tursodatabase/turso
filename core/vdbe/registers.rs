@@ -99,7 +99,7 @@ impl Registers {
         dest: usize,
     ) -> crate::Result<bool> {
         Ok(ValueIterator::new(payload)?
-            .nth_into_register(column, &mut self.values[dest])
+            .nth_into_register(column, &mut self.values[dest], self.nan_policy)
             .transpose()?
             .is_some())
     }
@@ -112,7 +112,11 @@ impl Registers {
         column: usize,
         dests: std::ops::Range<usize>,
     ) -> crate::Result<usize> {
-        ValueIterator::new(payload)?.decode_into_registers_after(column, &mut self.values[dests])
+        ValueIterator::new(payload)?.decode_into_registers_after(
+            column,
+            &mut self.values[dests],
+            self.nan_policy,
+        )
     }
 
     /// Decode a value whose serial type was read separately from its data.
@@ -123,7 +127,7 @@ impl Registers {
         data: &mut &[u8],
         dest: usize,
     ) -> crate::Result<()> {
-        decode_serial_type_into_register(serial_type, data, &mut self.values[dest])
+        decode_serial_type_into_register(serial_type, data, &mut self.values[dest], self.nan_policy)
     }
 
     /// Decode a record held in a register into a distinct range of registers.
@@ -133,11 +137,13 @@ impl Registers {
         column: usize,
         dests: std::ops::Range<usize>,
     ) -> crate::Result<usize> {
+        let nan_policy = self.nan_policy;
         let (source, dests) = self.read_and_write(source, dests);
         let Register::Record(record) = source else {
             crate::bail_parse_error!("non-register register in pseudo-record ({source:?})");
         };
-        ValueIterator::new(record.get_payload())?.decode_into_registers_after(column, dests)
+        ValueIterator::new(record.get_payload())?
+            .decode_into_registers_after(column, dests, nan_policy)
     }
 
     /// Decode a field from a blob register, or write NULL for a missing field.
@@ -148,11 +154,12 @@ impl Registers {
         column: usize,
         dest: usize,
     ) -> crate::Result<()> {
+        let nan_policy = self.nan_policy;
         let (source, dests) = self.read_and_write(source, dest..dest + 1);
         let dest = &mut dests[0];
         if let Value::Blob(blob) = source.get_value() {
             if let Some(result) =
-                ValueIterator::new(&blob[offset..])?.nth_into_register(column, dest)
+                ValueIterator::new(&blob[offset..])?.nth_into_register(column, dest, nan_policy)
             {
                 return result;
             }
@@ -299,6 +306,119 @@ impl<const N: usize> Drop for DisjointWrites<'_, N> {
 mod tests {
     use super::*;
     use crate::{Double, Numeric};
+
+    const NAN_BITS: [u64; 3] = [
+        0x7ff8_0000_0000_0000,
+        0xfff8_0000_0000_0001,
+        0x7ff0_0000_0000_0001,
+    ];
+
+    fn record_with_nan(bits: u64) -> crate::types::ImmutableRecord {
+        let values = [Value::from_i64(7), Value::from_f64(f64::from_bits(bits))];
+        crate::types::ImmutableRecord::from_values(&values, values.len()).unwrap()
+    }
+
+    #[test]
+    fn decoders_keep_a_stored_nan_where_nan_is_a_value() {
+        for bits in NAN_BITS {
+            let record = record_with_nan(bits);
+            let mut registers = Registers::new(5, NanPolicy::Preserve);
+            registers.set_int(3, 99);
+            assert!(registers.decode_column(record.get_payload(), 1, 1).unwrap());
+            assert_eq!(
+                registers
+                    .decode_columns(record.get_payload(), 1, 2..4)
+                    .unwrap(),
+                1
+            );
+            let stored = Double::new(f64::from_bits(bits)).to_record_bytes();
+            registers.decode_serial(7, &mut &stored[..], 4).unwrap();
+            for index in [1, 2, 4] {
+                assert!(registers[index].get_value().is_nan());
+            }
+            assert_eq!(registers[3].get_value(), &Value::from_i64(99));
+            assert!(!registers.decode_column(record.get_payload(), 2, 3).unwrap());
+            assert_eq!(registers[3].get_value(), &Value::from_i64(99));
+
+            // A pseudo record can be on either side of its output range.
+            for source in [0, 4] {
+                *registers.write(source) = Register::Record(record.clone());
+                assert_eq!(registers.decode_record_columns(source, 1, 1..3).unwrap(), 1);
+                assert!(registers[1].get_value().is_nan());
+            }
+
+            // Struct and union fields arrive inside opaque blobs, not scalar values.
+            let mut blob = crate::alloc::vec![42];
+            blob.extend_from_slice(record.get_payload());
+            registers.set_blob(0, blob).unwrap();
+            registers.decode_blob_column(0, 1, 1, 1).unwrap();
+            assert!(registers[1].get_value().is_nan());
+            registers.decode_blob_column(0, 1, 2, 1).unwrap();
+            assert!(registers[1].is_null());
+        }
+    }
+
+    #[test]
+    fn decoders_refuse_a_stored_nan_where_nan_is_not_a_value() {
+        let is_corrupt = |result: crate::Result<()>| {
+            assert!(matches!(result, Err(crate::LimboError::Corrupt(_))));
+        };
+        for bits in NAN_BITS {
+            let record = record_with_nan(bits);
+            let mut registers = Registers::new(5, NanPolicy::Null);
+            is_corrupt(
+                registers
+                    .decode_column(record.get_payload(), 1, 1)
+                    .map(drop),
+            );
+            is_corrupt(
+                registers
+                    .decode_columns(record.get_payload(), 1, 2..4)
+                    .map(drop),
+            );
+            let stored = Double::new(f64::from_bits(bits)).to_record_bytes();
+            is_corrupt(registers.decode_serial(7, &mut &stored[..], 4));
+            *registers.write(0) = Register::Record(record.clone());
+            is_corrupt(registers.decode_record_columns(0, 1, 1..3).map(drop));
+            let mut blob = crate::alloc::vec![42];
+            blob.extend_from_slice(record.get_payload());
+            registers.set_blob(0, blob).unwrap();
+            is_corrupt(registers.decode_blob_column(0, 1, 1, 1));
+            for index in 1..5 {
+                assert!(!registers[index].get_value().is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn decoders_read_other_nan_bits_as_null() {
+        for policy in [NanPolicy::Null, NanPolicy::Preserve] {
+            for bits in NAN_BITS {
+                let mut registers = Registers::new(1, policy);
+                registers
+                    .decode_serial(7, &mut &bits.to_be_bytes()[..], 0)
+                    .unwrap();
+                assert!(registers[0].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn a_decode_error_keeps_completed_values() {
+        let values = [Value::from_f64(1.5), Value::from_i64(42)];
+        let record = crate::types::ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let mut payload = record.into_payload();
+        payload.pop();
+        let mut registers = Registers::new(3, NanPolicy::Null);
+        registers.set_int(2, 99);
+        assert!(registers.decode_columns(&payload, 0, 1..3).is_err());
+        assert_eq!(registers[1].get_value(), &Value::from_f64(1.5));
+        assert_eq!(registers[2].get_value(), &Value::from_i64(99));
+
+        // A truncated REAL must leave its destination untouched too.
+        assert!(registers.decode_serial(7, &mut &[0; 7][..], 2).is_err());
+        assert_eq!(registers[2].get_value(), &Value::from_i64(99));
+    }
 
     #[test]
     fn writes_apply_the_policy_even_on_an_early_return() {

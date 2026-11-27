@@ -953,10 +953,7 @@ impl Value {
                     _ => unreachable!(),
                 }
             }
-            Value::Numeric(Numeric::Float(f)) => {
-                let fval: f64 = (*f).into();
-                out.extend_from_slice(&fval.to_be_bytes());
-            }
+            Value::Numeric(Numeric::Float(f)) => out.extend_from_slice(&f.to_record_bytes()),
             Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
@@ -1618,10 +1615,7 @@ mod immutable_record {
                 SerialTypeKind::I64 => out.extend_from_slice(&i.to_be_bytes()),
                 other => panic!("Serial type is not an integer: {other:?}"),
             },
-            ValueRef::Numeric(Numeric::Float(f)) => {
-                let fval: f64 = f.into();
-                out.extend_from_slice(&fval.to_be_bytes());
-            }
+            ValueRef::Numeric(Numeric::Float(f)) => out.extend_from_slice(&f.to_record_bytes()),
             ValueRef::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             ValueRef::Blob(b) => out.extend_from_slice(b),
         }
@@ -2561,7 +2555,7 @@ impl<'a> ValueRef<'a> {
 
     /// Reads the 8 bytes of a REAL in a record.
     pub const fn from_record_real(bytes: [u8; 8]) -> Self {
-        match Double::non_nan(f64::from_be_bytes(bytes)) {
+        match Double::from_record_bytes(bytes) {
             Some(real) => Self::Numeric(Numeric::Float(real)),
             None => Self::Null,
         }
@@ -3653,9 +3647,7 @@ impl Record {
                         }
                     }
                 }
-                Value::Numeric(Numeric::Float(f)) => {
-                    buf.extend_from_slice(&f64::from(*f).to_be_bytes())
-                }
+                Value::Numeric(Numeric::Float(f)) => buf.extend_from_slice(&f.to_record_bytes()),
                 Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };
@@ -5198,6 +5190,31 @@ mod tests {
         assert_eq!(float, 3.15555);
         // Check that buffer length is correct
         assert_eq!(buf.len(), header_length + size_of::<f64>());
+    }
+
+    #[test]
+    fn a_nan_in_a_record_is_read_back_as_a_nan() {
+        let values = [Value::from_f64(-f64::NAN), Value::from_f64(1.5)];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        assert!(!record.contains_null().unwrap());
+        let read = record.get_values_owned().unwrap();
+        assert!(read[0].is_nan());
+        assert_eq!(read[1], Value::from_f64(1.5));
+
+        let mut serialized = std::vec::Vec::new();
+        Record::new(vec![Value::from_f64(-f64::NAN), Value::from_f64(1.5)])
+            .serialize(&mut serialized);
+        assert_eq!(serialized, record.get_payload());
+    }
+
+    #[test]
+    fn nan_bits_that_no_record_writer_makes_are_read_as_null() {
+        for bits in [0x7ff8_0000_0000_0000u64, 0xfff8_0000_0000_0001] {
+            let mut payload = vec![2, 7];
+            payload.extend_from_slice(&bits.to_be_bytes());
+            let record = ImmutableRecordRef::from_bin_record(&payload);
+            assert_eq!(record.get_values_owned().unwrap(), vec![Value::Null]);
+        }
     }
 
     #[test]
