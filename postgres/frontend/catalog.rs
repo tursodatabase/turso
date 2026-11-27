@@ -510,6 +510,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn nan_is_a_value(&self) -> bool {
+        true
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }
@@ -4715,6 +4719,189 @@ mod tests {
             am[18].as_int(),
             Some(builtin_catalog_columns(&schema, "pg_am").len() as i64)
         );
+    }
+
+    #[test]
+    fn nan_survives_postgres_registers_and_sorting() {
+        use turso_core::function::ExternalFunc;
+        use turso_core::native_ext::FunctionArity;
+        let db = Database::open(
+            Arc::new(turso_core::MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(PostgresDialect)).extension_function(
+                ExternalFunc::new_native_scalar(
+                    "test_nan".into(),
+                    FunctionArity::Exact(0),
+                    false,
+                    TestNan,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let rows = conn
+            .prepare("SELECT test_nan(), test_nan() IS NULL")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert!(rows[0][0].is_nan());
+        assert_eq!(rows[0][1], Value::from_i64(0));
+
+        // UNION and ORDER BY encode and decode temporary records. The NaN
+        // must survive both routes and sort after finite numbers.
+        for sql in [
+            "SELECT $1 AS v UNION ALL SELECT $2 ORDER BY v",
+            "SELECT $1 AS v UNION SELECT $2 ORDER BY v",
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.bind_at(
+                std::num::NonZeroUsize::new(1).unwrap(),
+                Value::from_f64(f64::NAN),
+            )
+            .unwrap();
+            stmt.bind_at(
+                std::num::NonZeroUsize::new(2).unwrap(),
+                Value::from_f64(1.5),
+            )
+            .unwrap();
+            let rows = stmt.run_collect_rows().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::from_f64(1.5));
+            assert!(rows[1][0].is_nan(), "{sql}: {rows:?}");
+        }
+        for bits in [
+            0xfff8_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+            0x7fff_ffff_ffff_ffff,
+        ] {
+            for (direction, expected) in [("ASC", [0, 1, 2]), ("DESC", [1, 2, 0])] {
+                let sql = format!("SELECT id FROM (SELECT $1 AS v, 2 AS id UNION ALL SELECT $2, 1 UNION ALL SELECT $3, 0) AS t ORDER BY v {direction}, id");
+                let mut stmt = conn.prepare(&sql).unwrap();
+                for (index, value) in [f64::from_bits(bits), f64::NAN, f64::INFINITY]
+                    .into_iter()
+                    .enumerate()
+                {
+                    stmt.bind_at(
+                        std::num::NonZeroUsize::new(index + 1).unwrap(),
+                        Value::from_f64(value),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    expected.map(|id| vec![Value::from_i64(id)])
+                );
+            }
+            for sql in [
+                "SELECT count(*) FROM (SELECT $1 AS v UNION SELECT $2) AS t",
+                "SELECT ARRAY[$1] = ARRAY[$2]",
+                "SELECT ARRAY[$1] <> ARRAY[NULL]",
+            ] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                stmt.bind_at(
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                    Value::from_f64(f64::from_bits(bits)),
+                )
+                .unwrap();
+                if sql.contains("$2") {
+                    stmt.bind_at(
+                        std::num::NonZeroUsize::new(2).unwrap(),
+                        Value::from_f64(f64::NAN),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    vec![vec![Value::from_i64(1)]],
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn array_orderings_survive_postgres_schema_reload() {
+        use std::num::NonZeroUsize;
+        use turso_core::types::ImmutableRecord;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("array-orderings.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let array = |value| {
+            Value::Blob(
+                ImmutableRecord::from_values(&[value], 1)
+                    .unwrap()
+                    .into_payload(),
+            )
+        };
+        let nan = array(Value::from_f64(f64::NAN));
+        let null = array(Value::Null);
+        for reopen in [false, true] {
+            let db = crate::session::open_database_with_io(
+                io.clone(),
+                path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_custom_types(true),
+            )
+            .unwrap();
+            let conn = connect_with_public(&db);
+            if !reopen {
+                conn.execute("CREATE TABLE t(a integer[])").unwrap();
+                conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+            }
+            let schema = conn.current_schema();
+            let namespace = schema.namespace_named("public").unwrap();
+            let index = schema.get_index(namespace, "t", "t_a").unwrap();
+            // Index metadata must select the same array order after reloading SQL.
+            assert_eq!(
+                index.columns[0]
+                    .collation
+                    .compare(nan.as_ref(), null.as_ref()),
+                std::cmp::Ordering::Less,
+            );
+            // A bound blob bypasses array construction. Its elements still use
+            // the order selected by the expression's type.
+            for (sql, expected) in [
+                ("SELECT $1 <> ARRAY[NULL]", 1),
+                (
+                    "SELECT count(DISTINCT a) FROM (VALUES ($1), (ARRAY[NULL])) AS t(a)",
+                    2,
+                ),
+            ] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                stmt.bind_at(NonZeroUsize::new(1).unwrap(), nan.clone())
+                    .unwrap();
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    vec![vec![Value::from_i64(expected)]],
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestNan;
+
+    impl turso_core::native_ext::ScalarFunction for TestNan {
+        type Call = Self;
+        fn create_call(&self) -> Result<Self> {
+            Ok(*self)
+        }
+    }
+
+    impl turso_core::native_ext::ScalarCall for TestNan {
+        type Output = f64;
+        fn step(
+            &mut self,
+            _context: &ScalarFuncContext<'_>,
+            _args: &[Register],
+        ) -> turso_core::types::IOResultOr<f64> {
+            Ok(IOResult::Done(f64::NAN))
+        }
     }
 
     #[test]

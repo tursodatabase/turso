@@ -1881,6 +1881,9 @@ fn write_json_string(text: &str, json: &mut String) {
 /// the same number, in scientific notation when the exponent is below -4 or
 /// 15 or more, as in `1e+20` and `1e-05`.
 pub(crate) fn float8_text(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
     if value.is_infinite() {
         return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
@@ -2293,6 +2296,13 @@ fn exec_to_char(value: &Value, format: &str) -> Result<Option<String>> {
         },
         _ => return Err(to_char_not_supported()),
     };
+    if num.is_nan() {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "to_char does not support NaN",
+            None,
+        ));
+    }
     Ok(Some(pg_to_char_numeric(num, format)))
 }
 
@@ -2845,14 +2855,15 @@ mod tests {
     }
 
     #[test]
-    fn array_to_json_writes_infinite_floats_as_strings() {
+    fn array_to_json_writes_nonfinite_floats_as_strings() {
         let record = turso_core::types::ImmutableRecord::from_values(
             &[
                 Value::from_f64(f64::INFINITY),
                 Value::from_f64(f64::NEG_INFINITY),
+                Value::from_f64(f64::NAN),
                 Value::from_f64(1.5),
             ],
-            3,
+            4,
         )
         .unwrap();
         let layout = JsonArrayLayout {
@@ -2862,12 +2873,15 @@ mod tests {
         };
         let mut json = String::new();
         write_json_array(&Value::Blob(record.as_blob().clone()), &layout, &mut json).unwrap();
-        assert_eq!(json, r#"["Infinity","-Infinity",1.5]"#);
+        assert_eq!(json, r#"["Infinity","-Infinity","NaN",1.5]"#);
     }
 
     #[test]
     fn float8_text_is_postgres_float8_output() {
         for (value, text) in [
+            (f64::NAN, "NaN"),
+            (f64::from_bits(0xfff8_0000_0000_0001), "NaN"),
+            (f64::from_bits(0x7ff0_0000_0000_0001), "NaN"),
             (1.0, "1"),
             (-0.0, "-0"),
             (0.1 + 0.2, "0.30000000000000004"),
