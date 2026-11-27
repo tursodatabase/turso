@@ -1359,3 +1359,32 @@ expect {
 expect @tursopg {
     t
 }
+
+# chr() checks the value of arithmetic, not its type, because Turso types
+# arithmetic by SQLite's rules. PostgreSQL resolves `bigint + NULL` as bigint
+# and `NULL + 1.5` as numeric, and finds no chr() for either.
+@compat-gap "function:chr of arithmetic"
+test chr-bigint-arithmetic-with-null-operand {
+    CREATE TABLE chr_bigint_operand(b bigint);
+    INSERT INTO chr_bigint_operand VALUES (65);
+    SELECT coalesce(chr(b + NULL), '<null>') FROM chr_bigint_operand;
+}
+@sqlstate 42883
+expect error {
+    function chr\(bigint\) does not exist
+}
+expect @tursopg {
+    <null>
+}
+
+@compat-gap "function:chr of arithmetic"
+test chr-numeric-arithmetic-with-null-operand {
+    SELECT coalesce(chr(NULL + 1.5), '<null>');
+}
+@sqlstate 42883
+expect error {
+    function chr\(numeric\) does not exist
+}
+expect @tursopg {
+    <null>
+}

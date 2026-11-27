@@ -129,10 +129,9 @@ pub enum ExtFunc {
         receives_argument_types: bool,
         /// FIXME(pg-catalog): HACK. Set only by
         /// `ExternalFunc::checking_argument_types`, for
-        /// pg_timestamp_plus_interval and date_trunc. Called at compile time
-        /// with the type name of each argument, with a domain replaced by its
-        /// base type, as `receives_argument_types` passes it; an error refuses
-        /// the statement.
+        /// pg_timestamp_plus_interval, date_trunc and chr. Called at compile
+        /// time with the type names of the arguments, as
+        /// [`ArgumentTypeCheck`] describes; an error refuses the statement.
         check_argument_types: Option<ArgumentTypeCheck>,
         /// FIXME(pg-catalog): HACK. Set only by
         /// `ExternalFunc::returning_argument_type`, for
@@ -149,12 +148,13 @@ pub enum ExtFunc {
 
 /// FIXME(pg-catalog): HACK. The type of the check that
 /// `ExternalFunc::checking_argument_types` sets, for
-/// pg_timestamp_plus_interval and date_trunc. A function called at
-/// compile time with the type name of each argument, with a domain replaced
-/// by its base type;
-/// an error refuses the statement. A pg_proc and pg_operator lookup replaces
-/// it.
-pub type ArgumentTypeCheck = fn(&[String]) -> crate::Result<()>;
+/// pg_timestamp_plus_interval, date_trunc and chr. A function called at
+/// compile time with the argument expressions and the type name of each
+/// argument twice: first with domain names kept, then with each domain
+/// replaced by its base type, as `receives_argument_types` passes them. An
+/// error refuses the statement. A pg_proc and pg_operator lookup replaces it.
+pub type ArgumentTypeCheck =
+    fn(&[Box<crate::ast::Expr>], &[String], &[String]) -> crate::Result<()>;
 
 #[derive(Debug)]
 pub struct ExternalContext {

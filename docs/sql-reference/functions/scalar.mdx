@@ -139,6 +139,8 @@ SELECT abs(NULL);      -- NULL
 
 `chr` is a single-argument alias provided for PostgreSQL and SQL-standard compatibility. It is identical to `char(X)`.
 
+The PostgreSQL frontend uses PostgreSQL's `chr` instead: it takes exactly one argument, returns NULL for a NULL argument, and fails for 0, for a negative number, and for a number that is not a Unicode character. Its argument must be an `integer`, a `smallint`, a domain over one of them, or a string literal (also when it is cast to `unknown`); another type fails with `function chr(...) does not exist` when the statement is compiled. The results of `count()` and `sum()` are accepted, where PostgreSQL refuses them as `bigint`, because Turso does not tell them apart from `integer`. The type of arithmetic, such as `b + 1`, is not checked, because Turso does not give arithmetic its PostgreSQL type: the value is checked when the statement runs, so a `bigint` or `numeric` result that is NULL or a whole number in the range of `integer` is accepted. An expression index on `chr` made by an earlier version holds the value of `char` for NULL and for the numbers that now fail, and a change to such a row can fail with `IdxDelete: no matching index entry found`. Drop the index, then delete or change the rows whose `chr` now fails, then create the index again.
+
 ```sql
 SELECT char(72, 101, 108, 108, 111);   -- 'Hello'
 SELECT char(9731);                       -- snowman character

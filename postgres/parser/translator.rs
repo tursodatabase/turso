@@ -3733,8 +3733,26 @@ impl PostgreSQLTranslator {
                         None => error,
                     });
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
+                let cast_type = extract_type_name_from_typename(pg_type_name)?;
+                if cast_type.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
+                }
+                // PostgreSQL folds a string literal or NULL cast to unknown into
+                // the literal itself, which keeps the type unknown and its text.
+                // A COLLATE on the literal keeps it unknown too. Cast planning
+                // refuses a cast to unknown with 0A000, so without this the
+                // statement would fail.
+                let mut operand = &*expr;
+                while let ast::Expr::Collate(collated, _) = operand {
+                    operand = collated;
+                }
+                if cast_type.eq_ignore_ascii_case("unknown")
+                    && matches!(
+                        operand,
+                        ast::Expr::Literal(ast::Literal::String(_) | ast::Literal::Null)
+                    )
+                {
+                    return Ok(*expr);
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {

@@ -54,16 +54,15 @@ impl ExternalFunc {
         self
     }
 
-    /// FIXME(pg-catalog): HACK. Its only callers are pg_timestamp_plus_interval and date_trunc in
-    /// postgres/frontend/functions.rs. It stands in for PostgreSQL choosing an
-    /// operator or function by its argument types from pg_operator or pg_proc
-    /// when it plans the statement, which tursopg cannot do yet. A pg_proc and
-    /// pg_operator lookup replaces it; remove it then.
+    /// FIXME(pg-catalog): HACK. Its only callers are pg_timestamp_plus_interval,
+    /// date_trunc and chr in postgres/frontend/functions.rs. It stands in for
+    /// PostgreSQL choosing an operator or function by its argument types from
+    /// pg_operator or pg_proc when it plans the statement, which tursopg cannot
+    /// do yet. A pg_proc and pg_operator lookup replaces it; remove it then.
     ///
-    /// Sets a function that is called at compile time with the type name of
-    /// each argument, with a domain replaced by its base type, the same names
-    /// `receiving_argument_types` passes; an error refuses the statement. Needs
-    /// `receiving_argument_types`.
+    /// Sets a function that is called at compile time with the type names of
+    /// the arguments, as [`crate::function::ArgumentTypeCheck`] describes; an
+    /// error refuses the statement. Needs `receiving_argument_types`.
     pub fn checking_argument_types(mut self, check: crate::function::ArgumentTypeCheck) -> Self {
         let ExtFunc::NativeScalar {
             receives_argument_types,

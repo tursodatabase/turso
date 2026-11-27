@@ -1062,3 +1062,40 @@ fn test_pg_key_and_path_operators_with_parameters(db: TempDatabase) {
         );
     }
 }
+
+/// PostgreSQL gives a parameter in arithmetic the type of the other operand,
+/// so chr() accepts it; the value is checked when the statement runs.
+#[turso_macros::test(mvcc)]
+fn test_pg_chr_of_parameter_arithmetic(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE chr_param(i int)").unwrap();
+    conn.execute("INSERT INTO chr_param VALUES (1)").unwrap();
+    for sql in [
+        "SELECT chr($1 + 1)",
+        "SELECT chr(1 + $1)",
+        "SELECT chr(($1 * 1) + 1)",
+        "SELECT chr(i + $1) FROM chr_param",
+        "SELECT chr($1 + $1 - 65)",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        for (code, expected) in [
+            (Value::from_i64(66), Value::build_text("C")),
+            (Value::Null, Value::Null),
+        ] {
+            stmt.bind_at(std::num::NonZero::new(1).unwrap(), code)
+                .unwrap();
+            assert_eq!(
+                stmt.run_collect_rows().unwrap(),
+                vec![vec![expected]],
+                "{sql}"
+            );
+            stmt.reset().unwrap();
+        }
+    }
+
+    let mut stmt = conn.prepare("SELECT chr($1 - 66)").unwrap();
+    stmt.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(66))
+        .unwrap();
+    let error = stmt.run_collect_rows().unwrap_err().to_string();
+    assert!(error.contains("null character not permitted"), "{error}");
+}
