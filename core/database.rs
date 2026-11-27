@@ -3737,7 +3737,18 @@ impl Database {
                         if let Some(page_size) =
                             self.pager_state.page_size().filter(|_| use_cached_header)
                         {
+                            // The key check needs no I/O, so a wrong key fails before any read.
                             let mut context = self.pager_state.verify_encryption_key(key)?;
+                            // Then read the header of an initialized database, although the page
+                            // size is cached. A connect then first waits for this read, before
+                            // its pager takes the WAL read lock for page 1, as for a plaintext
+                            // database. A host that suspends a connect in its first read
+                            // suspends it without that lock, so a blocking checkpoint that runs
+                            // meanwhile does not find a WAL reader. An MVCC checkpoint checks for
+                            // WAL readers only at its WAL step, after it has started.
+                            if self.initialized() {
+                                return_if_io!(self.read_db_header_buf(hdr_st));
+                            }
                             context.set_page_size(page_size);
                             let mut io_ctx = IOContext::default();
                             io_ctx.set_encryption(context);
