@@ -1073,6 +1073,9 @@ pub fn translate_alter_table(
                 for c in &col_def.constraints {
                     match &c.constraint {
                         ast::ColumnConstraint::Generated { expr, .. } => {
+                            resolver
+                                .catalog
+                                .check_no_expanded_function_calls(expr, "a generated column")?;
                             crate::schema::validate_generated_expr(expr)?;
                             validate_generated_function_calls(expr, &resolver.catalog)?;
                             // FIXME(pg-catalog): HACK. See refuse_timestamp_timestamptz_comparison_in_schema_expr.
@@ -1665,6 +1668,9 @@ pub fn translate_alter_table(
 
                 for constraint in &definition.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &constraint.constraint {
+                        resolver
+                            .catalog
+                            .check_no_expanded_function_calls(expr, "a generated column")?;
                         crate::schema::validate_generated_expr(expr)?;
                         validate_generated_function_calls(expr, &resolver.catalog)?;
                     }

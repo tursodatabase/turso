@@ -2700,6 +2700,7 @@ impl PostgreSQLTranslator {
                     select: self.translate_select(stmt)?,
                     alias: None,
                     lateral: false,
+                    closed: false,
                 }),
                 joins: vec![],
             }),
@@ -2951,6 +2952,7 @@ impl PostgreSQLTranslator {
             select,
             alias,
             lateral: range_sub.lateral,
+            closed: false,
         })
     }
 
@@ -3015,6 +3017,9 @@ impl PostgreSQLTranslator {
             }
         };
 
+        // A function that a user defines returns one value, so none can be
+        // in the FROM clause, and the functions of tursopg are in no schema.
+        object_name(&func_call.funcname, is_pg_catalog, "function")?;
         let func_name = function_name(&func_call.funcname)?;
         let func_name = func_name.as_str();
         if func_call.func_variadic
@@ -3119,6 +3124,7 @@ impl PostgreSQLTranslator {
                 select,
                 alias,
                 lateral: false,
+                closed: false,
             });
         }
 
@@ -3270,6 +3276,7 @@ impl PostgreSQLTranslator {
             },
             alias: Some(ast::As::Elided(exact_name("arg"))),
             lateral: false,
+            closed: false,
         };
         let arg_json = ast::Expr::Qualified(exact_name("arg"), exact_name("json"));
         let (source, joins) = if is_recordset {
@@ -3398,6 +3405,7 @@ impl PostgreSQLTranslator {
             },
             alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)))),
             lateral: true,
+            closed: false,
         })
     }
 
@@ -3738,8 +3746,22 @@ impl PostgreSQLTranslator {
                         None => error,
                     });
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
-                    expr = Box::new(int8_cast_operand(arg, *expr));
+                match extract_type_name_from_typename(pg_type_name)?.as_str() {
+                    "int8" => expr = Box::new(int8_cast_operand(arg, *expr)),
+                    // The engine's cast to jsonb does not check text by
+                    // PostgreSQL's rules. An index expression and a
+                    // generation expression can use only core functions, so
+                    // there the text is not checked. A number or a boolean
+                    // has no text to check, and a call around a boolean
+                    // would make `true` reach the cast as 1.
+                    "jsonb"
+                        if !self.translating_index.get()
+                            && self.generation_expression_table.borrow().is_none()
+                            && !is_number_or_boolean_literal(&expr) =>
+                    {
+                        expr = Box::new(function_call("jsonb_in", vec![*expr]))
+                    }
+                    _ => {}
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -4823,6 +4845,73 @@ impl PostgreSQLTranslator {
             not,
             start: Box::new(start),
             end: Box::new(end),
+        })
+    }
+
+    /// The expression that a call of a function with the body `source`
+    /// computes: the one expression the body selects, cast to `return_type`.
+    fn translate_function_body(
+        &self,
+        source: &str,
+        return_type: &pg_query::protobuf::TypeName,
+    ) -> Result<ast::Expr, ParseError> {
+        use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::SetOperation;
+
+        let unsupported = || {
+            ParseError::not_supported("a function body that is not one SELECT of one expression")
+        };
+        let parse_result = crate::parse(source)?;
+        let [statement] = parse_result.protobuf.stmts.as_slice() else {
+            return Err(unsupported());
+        };
+        let Some(Node::SelectStmt(select)) = statement.stmt.as_ref().and_then(|s| s.node.as_ref())
+        else {
+            return Err(unsupported());
+        };
+        let has_other_clauses = !select.from_clause.is_empty()
+            || select.where_clause.is_some()
+            || !select.group_clause.is_empty()
+            || select.having_clause.is_some()
+            || !select.window_clause.is_empty()
+            || !select.distinct_clause.is_empty()
+            || !select.values_lists.is_empty()
+            || !select.sort_clause.is_empty()
+            || select.limit_count.is_some()
+            || select.limit_offset.is_some()
+            || !select.locking_clause.is_empty()
+            || select.with_clause.is_some()
+            || select.into_clause.is_some()
+            || select.op() != SetOperation::SetopNone;
+        if has_other_clauses {
+            return Err(unsupported());
+        }
+        let [target] = select.target_list.as_slice() else {
+            return Err(unsupported());
+        };
+        if is_bare_star(target) {
+            return Err(unsupported());
+        }
+        let Some(Node::ResTarget(target)) = &target.node else {
+            return Err(unsupported());
+        };
+        let value = target.val.as_deref().ok_or_else(unsupported)?;
+        // A body that already ends in a cast to the return type needs no
+        // second one.
+        let is_cast_to_return_type = matches!(
+            &value.node,
+            Some(Node::TypeCast(cast)) if cast.type_name.as_ref() == Some(return_type)
+        );
+        if is_cast_to_return_type {
+            return self.translate_expr(value);
+        }
+        // FIXME(pg-catalog): The body is cast to the return type with an explicit cast, so a body of another type is accepted: `RETURNS int AS 'SELECT ''abc''::text'` is created, and a call fails when the text is not a number. PostgreSQL's check_sql_fn_retval accepts the body only when its type is the return type or has an implicit or assignment cast to it (pg_cast.castcontext 'i' or 'a'), and fails with 42P13 "return type mismatch" otherwise; there is no such cast from text to integer. An expression tree that carries PostgreSQL types, with the casts of pg_cast, replaces the explicit cast.
+        self.translate_expr(&pg_query::protobuf::Node {
+            node: Some(Node::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                arg: Some(Box::new(value.clone())),
+                type_name: Some(return_type.clone()),
+                location: -1,
+            }))),
         })
     }
 
@@ -6370,6 +6459,7 @@ fn translate_rewritten_function(
         ),
         alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(function.name)))),
         lateral: true,
+        closed: false,
     })
 }
 
@@ -7979,6 +8069,22 @@ fn json_type_or_raise(
             )
             .collect(),
         else_expr: Some(raise(error)),
+    }
+}
+
+/// Whether `expr` is a number literal or a boolean literal, which the
+/// translator writes as `CAST(1 AS boolean)`.
+fn is_number_or_boolean_literal(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(_)) => true,
+        ast::Expr::Cast {
+            expr,
+            type_name: Some(type_name),
+        } => {
+            type_name.name == "boolean"
+                && matches!(**expr, ast::Expr::Literal(ast::Literal::Numeric(_)))
+        }
+        _ => false,
     }
 }
 
@@ -10033,6 +10139,7 @@ fn description_subquery(conditions: Vec<(&str, ast::Expr)>) -> ast::Expr {
                         select: pg_description,
                         alias: None,
                         lateral: false,
+                        closed: false,
                     }),
                     joins: vec![],
                 }),
@@ -10058,6 +10165,7 @@ fn catalog_oid(catalog: &ast::Expr) -> ast::Expr {
         when_then_pairs: [
             ("pg_class", PG_CLASS_OID),
             ("pg_namespace", PG_NAMESPACE_OID),
+            ("pg_proc", PG_PROC_OID),
         ]
         .iter()
         .map(|(name, oid)| {
@@ -10080,6 +10188,10 @@ pub const PG_CLASS_OID: i64 = 1259;
 /// PostgreSQL's oid of `pg_namespace`, the `classoid` of a comment on a
 /// schema.
 pub const PG_NAMESPACE_OID: i64 = 2615;
+
+/// PostgreSQL's oid of `pg_proc`, the `classoid` of a comment on a
+/// function.
+pub const PG_PROC_OID: i64 = 1255;
 
 /// A COMMENT ON statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10105,6 +10217,7 @@ pub enum PgCommentObject {
         column: String,
     },
     Schema(String),
+    Function(PgFunctionTarget),
     /// A kind of object whose comments are not stored, named as the
     /// statement names it, such as `TYPE`.
     Unsupported(&'static str),
@@ -10158,6 +10271,17 @@ pub fn try_extract_comment_on(parse_result: &ParseResult) -> Option<PgCommentOnS
             }
         }
         (None, Some(ObjectType::ObjectSchema), [schema]) => PgCommentObject::Schema(schema.clone()),
+        (None, Some(ObjectType::ObjectFunction), [_] | [_, _]) => {
+            let Some(pg_query::NodeEnum::ObjectWithArgs(function)) =
+                comment.object.as_ref().and_then(|node| node.node.as_ref())
+            else {
+                return None;
+            };
+            match function_target(function) {
+                Ok(target) => PgCommentObject::Function(target),
+                Err(_) => PgCommentObject::Unsupported("FUNCTION"),
+            }
+        }
         _ => PgCommentObject::Unsupported(match object_type {
             Some(ObjectType::ObjectType) => "TYPE",
             Some(ObjectType::ObjectDomain) => "DOMAIN",
@@ -10371,6 +10495,8 @@ pub enum FrontendStmt {
     CreateSchema(PgCreateSchemaStmt),
     DropSchema(PgDropSchemaStmt),
     DropRelations(PgDropRelationsStmt),
+    CreateFunction(Box<PgCreateFunctionStmt>),
+    DropFunction(PgDropFunctionStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
     Grant(PgGrantStmt),
@@ -10384,10 +10510,8 @@ pub fn frontend_stmt(
     sql: &str,
     parse_result: &ParseResult,
 ) -> Result<Option<FrontendStmt>, ParseError> {
-    if let Some(NodeRef::CreateFunctionStmt(stmt)) =
-        parse_result.protobuf.nodes().first().map(|(node, ..)| node)
-    {
-        return Err(crate::create_function::reject_create_function(sql, stmt));
+    if let Some(stmt) = try_extract_create_function(sql, parse_result)? {
+        return Ok(Some(FrontendStmt::CreateFunction(Box::new(stmt))));
     }
     if let Some(stmt) = try_extract_set(parse_result) {
         return Ok(Some(FrontendStmt::Set(stmt)));
@@ -10410,6 +10534,9 @@ pub fn frontend_stmt(
     if let Some(stmt) = try_extract_drop_schema(parse_result) {
         return Ok(Some(FrontendStmt::DropSchema(stmt)));
     }
+    if let Some(stmt) = try_extract_drop_function(parse_result)? {
+        return Ok(Some(FrontendStmt::DropFunction(stmt)));
+    }
     if let Some(stmt) = try_extract_drop_relations(parse_result) {
         return Ok(Some(FrontendStmt::DropRelations(stmt)));
     }
@@ -10429,6 +10556,356 @@ pub fn frontend_stmt(
         return Ok(Some(FrontendStmt::CopyTo(stmt)));
     }
     Ok(None)
+}
+
+/// A CREATE FUNCTION statement for a function written in SQL.
+#[derive(Debug, Clone)]
+pub struct PgCreateFunctionStmt {
+    /// The schema the statement names, None when it names none.
+    pub schema: Option<String>,
+    pub name: String,
+    pub or_replace: bool,
+    pub definition: SqlFunctionDefinition,
+    /// The statement's own text, which is what the frontend stores.
+    pub sql: String,
+}
+
+/// What a `CREATE FUNCTION ... LANGUAGE sql` statement defines, apart from
+/// the function's name.
+#[derive(Debug, Clone)]
+pub struct SqlFunctionDefinition {
+    pub parameters: Vec<SqlFunctionParameter>,
+    /// The return type as PostgreSQL names it, such as `uuid` or `int4`.
+    pub return_type: String,
+    pub volatility: FunctionVolatility,
+    /// The body as written, PostgreSQL's `pg_proc.prosrc`.
+    pub source: String,
+    /// The expression that the body selects, cast to the return type. A
+    /// parameter is in it as written: `$1` as a variable, a name as a column.
+    pub body: ast::Expr,
+    pub hints: FunctionPlannerHints,
+}
+
+/// What CREATE FUNCTION says about how the planner may treat a function.
+/// tursopg expands the function where it is called, so these only show in
+/// `pg_proc`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionPlannerHints {
+    /// STRICT, which tursopg allows only for a function without parameters.
+    pub strict: bool,
+    pub leakproof: bool,
+    /// The letter of `pg_proc.proparallel`: `s`afe, `r`estricted or `u`nsafe.
+    pub parallel: char,
+    pub cost: f64,
+}
+
+impl Default for FunctionPlannerHints {
+    /// PostgreSQL's defaults for a function in the SQL language.
+    fn default() -> Self {
+        Self {
+            strict: false,
+            leakproof: false,
+            parallel: 'u',
+            cost: 100.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SqlFunctionParameter {
+    pub name: Option<String>,
+    /// The type as PostgreSQL names it, such as `text` or `int4`.
+    pub type_name: String,
+    /// What the body reads for the parameter: the argument, which is the
+    /// variable with the parameter's number in this expression, cast to the
+    /// parameter's type.
+    pub value: ast::Expr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionVolatility {
+    Immutable,
+    Stable,
+    Volatile,
+}
+
+impl FunctionVolatility {
+    /// The letter of `pg_proc.provolatile`.
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Immutable => "i",
+            Self::Stable => "s",
+            Self::Volatile => "v",
+        }
+    }
+}
+
+/// The CREATE FUNCTION statement of `parse_result`, whose text is `sql`, or
+/// None if the statement is another kind. Errors for a function that
+/// tursopg cannot define: only a function in the SQL language, whose body
+/// is one SELECT of one expression without FROM, can be expanded where it is
+/// called.
+pub fn try_extract_create_function(
+    sql: &str,
+    parse_result: &ParseResult,
+) -> Result<Option<PgCreateFunctionStmt>, ParseError> {
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::CreateFunctionStmt(create), ..)) = nodes.first() else {
+        return Ok(None);
+    };
+    crate::create_function::check_create_function(create)?;
+    let (schema, name) = match extract_key_columns(&create.funcname)?.as_slice() {
+        [name] => (None, name.clone()),
+        [schema, name] => (Some(schema.clone()), name.clone()),
+        names => unreachable!("check_create_function rejects the function name {names:?}"),
+    };
+    // A call names a function of a schema by the schema and the function in
+    // one name, so a dot in either would read as another schema and
+    // function. Function names are looked up without regard to case.
+    if name.contains(QUALIFIED_FUNCTION_NAME_SEPARATOR)
+        || schema
+            .as_deref()
+            .is_some_and(|schema| schema.contains(QUALIFIED_FUNCTION_NAME_SEPARATOR))
+    {
+        return Err(ParseError::not_supported(
+            "a dot in the function or schema name of CREATE FUNCTION",
+        ));
+    }
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(ParseError::not_supported(
+            "an uppercase letter in the name of CREATE FUNCTION",
+        ));
+    }
+    let definition = sql_function_definition(create)?;
+    Ok(Some(PgCreateFunctionStmt {
+        schema,
+        name,
+        or_replace: create.replace,
+        definition,
+        sql: sql.trim().trim_end_matches(';').trim_end().to_string(),
+    }))
+}
+
+/// What the CREATE FUNCTION statement text `sql` defines. The frontend
+/// stores the statement's text and reads the definition back from it.
+pub fn parse_sql_function_definition(sql: &str) -> Result<SqlFunctionDefinition, ParseError> {
+    let parse_result = crate::parse(sql)?;
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::CreateFunctionStmt(create), ..)) = nodes.first() else {
+        return Err(ParseError::internal_error(
+            "not a CREATE FUNCTION statement",
+        ));
+    };
+    sql_function_definition(create)
+}
+
+/// What `create` defines. `create` has passed
+/// [`crate::create_function::check_create_function`].
+fn sql_function_definition(
+    create: &pg_query::protobuf::CreateFunctionStmt,
+) -> Result<SqlFunctionDefinition, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let parameters = create
+        .parameters
+        .iter()
+        .zip(1..)
+        .map(|(parameter, number)| match &parameter.node {
+            Some(Node::FunctionParameter(parameter)) => sql_function_parameter(parameter, number),
+            _ => Err(ParseError::internal_error("expected a function parameter")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let return_type = create
+        .return_type
+        .as_ref()
+        .ok_or_else(|| ParseError::internal_error("a function without RETURNS"))?;
+    let return_type_name = extract_type_name_from_typename(return_type)?;
+    let mut source = None;
+    let mut volatility = FunctionVolatility::Volatile;
+    let mut hints = FunctionPlannerHints::default();
+    for option in &create.options {
+        let Some(Node::DefElem(option)) = &option.node else {
+            continue;
+        };
+        match option.defname.as_str() {
+            "as" => source = Some(function_source(option)?),
+            "volatility" => {
+                volatility = match def_elem_string_val(option).as_deref() {
+                    Some("immutable") => FunctionVolatility::Immutable,
+                    Some("stable") => FunctionVolatility::Stable,
+                    _ => FunctionVolatility::Volatile,
+                }
+            }
+            "strict" => hints.strict = extract_def_elem_bool(option),
+            "leakproof" => hints.leakproof = extract_def_elem_bool(option),
+            "parallel" => {
+                hints.parallel = match def_elem_string_val(option).as_deref() {
+                    Some("safe") => 's',
+                    Some("restricted") => 'r',
+                    _ => 'u',
+                }
+            }
+            "cost" => {
+                hints.cost = match option.arg.as_ref().and_then(|arg| arg.node.as_ref()) {
+                    Some(Node::Integer(integer)) => f64::from(integer.ival),
+                    Some(Node::Float(float)) => float.fval.parse().map_err(|_| {
+                        ParseError::sqlstate(
+                            SQLSTATE_FEATURE_NOT_SUPPORTED,
+                            format!("invalid number: {}", float.fval),
+                        )
+                    })?,
+                    _ => return Err(ParseError::internal_error("COST requires a number")),
+                }
+            }
+            _ => {}
+        }
+    }
+    let source = source.ok_or_else(|| ParseError::internal_error("a function without a body"))?;
+    let body = PostgreSQLTranslator::new().translate_function_body(&source, return_type)?;
+    Ok(SqlFunctionDefinition {
+        parameters,
+        return_type: return_type_name,
+        volatility,
+        source,
+        body,
+        hints,
+    })
+}
+
+// FIXME(pg-catalog): The value of a parameter is its argument with an explicit cast to the type of the parameter, so a call is found by its number of arguments and takes an argument of any type that the cast converts: `add_one(1.5)` for `add_one(integer)` is 3. PostgreSQL finds a function by the types of the arguments (pg_proc.proargtypes) and converts an argument only with an implicit cast (pg_cast.castcontext 'i'), so that call fails with 42883: the cast from numeric to integer is an assignment cast. A lookup of the function in pg_proc by argument types, with the casts of pg_cast, replaces the explicit cast.
+fn sql_function_parameter(
+    parameter: &pg_query::protobuf::FunctionParameter,
+    number: i32,
+) -> Result<SqlFunctionParameter, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let type_name = parameter
+        .arg_type
+        .as_ref()
+        .ok_or_else(|| ParseError::internal_error("function parameter has no type"))?;
+    let type_name_text = extract_type_name_from_typename(type_name)?;
+    let argument = pg_query::protobuf::Node {
+        node: Some(Node::ParamRef(pg_query::protobuf::ParamRef {
+            number,
+            location: -1,
+        })),
+    };
+    // PostgreSQL ignores a type modifier of a parameter: an argument for a
+    // varchar(3) parameter is not cut to three characters.
+    let cast_type = pg_query::protobuf::TypeName {
+        typmods: Vec::new(),
+        ..type_name.clone()
+    };
+    let value = PostgreSQLTranslator::new().translate_expr(&pg_query::protobuf::Node {
+        node: Some(Node::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(argument)),
+            type_name: Some(cast_type),
+            location: -1,
+        }))),
+    })?;
+    Ok(SqlFunctionParameter {
+        name: (!parameter.name.is_empty()).then(|| parameter.name.clone()),
+        type_name: type_name_text,
+        value,
+    })
+}
+
+/// The body in the AS clause of CREATE FUNCTION.
+fn function_source(option: &pg_query::protobuf::DefElem) -> Result<String, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let Some(Node::List(list)) = option.arg.as_ref().and_then(|arg| arg.node.as_ref()) else {
+        return Err(ParseError::internal_error("function body is not text"));
+    };
+    match list.items.as_slice() {
+        [pg_query::protobuf::Node {
+            node: Some(Node::String(source)),
+        }] => Ok(source.sval.clone()),
+        _ => Err(ParseError::not_supported("a function in an object file")),
+    }
+}
+
+/// A DROP FUNCTION statement.
+#[derive(Debug, Clone)]
+pub struct PgDropFunctionStmt {
+    pub functions: Vec<PgFunctionTarget>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+/// A function that DROP FUNCTION or COMMENT ON FUNCTION names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgFunctionTarget {
+    /// The schema the statement names, None when it names none.
+    pub schema: Option<String>,
+    pub name: String,
+    /// The types of the arguments the statement lists, as it names them,
+    /// None when it has no list, as in `DROP FUNCTION f`.
+    pub argument_types: Option<Vec<String>>,
+}
+
+/// Extracts a DROP FUNCTION statement.
+pub fn try_extract_drop_function(
+    parse_result: &ParseResult,
+) -> Result<Option<PgDropFunctionStmt>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::ObjectType;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::DropStmt(drop), ..)) = nodes.first() else {
+        return Ok(None);
+    };
+    if ObjectType::try_from(drop.remove_type) != Ok(ObjectType::ObjectFunction) {
+        return Ok(None);
+    }
+    let functions = drop
+        .objects
+        .iter()
+        .map(|object| {
+            let Some(Node::ObjectWithArgs(function)) = &object.node else {
+                return Err(ParseError::internal_error("expected a function name"));
+            };
+            function_target(function)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(PgDropFunctionStmt {
+        functions,
+        if_exists: drop.missing_ok,
+        cascade: drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32,
+    }))
+}
+
+/// The function that `function` names in DROP FUNCTION or COMMENT ON
+/// FUNCTION.
+fn function_target(
+    function: &pg_query::protobuf::ObjectWithArgs,
+) -> Result<PgFunctionTarget, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let (schema, name) = match extract_key_columns(&function.objname)?.as_slice() {
+        [name] => (None, name.clone()),
+        [schema, name] => (Some(schema.clone()), name.clone()),
+        _ => return Err(ParseError::not_supported("a function name with a database")),
+    };
+    let argument_types = if function.args_unspecified {
+        None
+    } else {
+        Some(
+            function
+                .objargs
+                .iter()
+                .map(|argument| match &argument.node {
+                    Some(Node::TypeName(type_name)) => extract_type_name_from_typename(type_name),
+                    _ => Err(ParseError::internal_error("expected a type name")),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    };
+    Ok(PgFunctionTarget {
+        schema,
+        name,
+        argument_types,
+    })
 }
 
 fn copy_string_option(def: &pg_query::protobuf::DefElem) -> Result<String, ParseError> {
@@ -11134,19 +11611,25 @@ fn no_such_function(name: &str) -> ParseError {
     )
 }
 
-/// The name of a function call, in the FROM clause or in an expression.
+/// The name of a function call, in the FROM clause or in an expression. A
+/// function of a schema other than the catalog is one that a user defined,
+/// and is named `schema.function`, which is how the frontend looks it up.
 fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
     if let [schema, name] = extract_key_columns(names)?.as_slice() {
-        if schema == "auth" {
-            let qualified_name = format!("{schema}.{name}");
-            return match name.as_str() {
-                "uid" | "email" | "jwt" => Ok(qualified_name),
-                _ => Err(no_such_function(&qualified_name)),
-            };
+        if !is_pg_catalog(schema) {
+            let qualified_name = qualified_function_name(schema, name);
+            // CREATE FUNCTION refuses a name with a dot, which would read
+            // as another schema and function.
+            if schema.contains(QUALIFIED_FUNCTION_NAME_SEPARATOR)
+                || name.contains(QUALIFIED_FUNCTION_NAME_SEPARATOR)
+            {
+                return Err(no_such_function(&qualified_name));
+            }
+            return Ok(qualified_name);
         }
     }
     let name = object_name(names, is_pg_catalog, "function")?;
-    if name.contains('.') {
+    if name.contains(QUALIFIED_FUNCTION_NAME_SEPARATOR) {
         return Err(no_such_function(&name));
     }
     // libpg_query lowercases unquoted names, so an uppercase letter means the
@@ -11163,6 +11646,55 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
         ));
     }
     Ok(name)
+}
+
+const QUALIFIED_FUNCTION_NAME_SEPARATOR: char = '.';
+
+/// The name and number of arguments of each call in `parse_result` of a
+/// function named with the schema pg_catalog. The translator drops that
+/// schema, so a frontend that knows functions of other schemas checks
+/// these calls.
+// FIXME(pg-search-path): A function call of the translated statement names
+// no schema when the statement names pg_catalog, so it finds a function of
+// the search path too. Keeping the schema in the call, for the lookup to
+// search only pg_catalog, would replace this list.
+pub fn catalog_qualified_function_calls(parse_result: &ParseResult) -> Vec<(String, usize)> {
+    use pg_query::protobuf::node::Node;
+
+    parse_result
+        .protobuf
+        .nodes()
+        .into_iter()
+        .filter_map(|(node, ..)| {
+            let NodeRef::FuncCall(call) = node else {
+                return None;
+            };
+            let [schema, name] = call.funcname.as_slice() else {
+                return None;
+            };
+            let (Some(Node::String(schema)), Some(Node::String(name))) = (&schema.node, &name.node)
+            else {
+                return None;
+            };
+            is_pg_catalog(&schema.sval).then(|| (name.sval.clone(), call.args.len()))
+        })
+        .collect()
+}
+
+/// The name that a call of function `name` of schema `schema` has in the
+/// translated statement.
+pub fn qualified_function_name(schema: &str, name: &str) -> String {
+    format!("{schema}{QUALIFIED_FUNCTION_NAME_SEPARATOR}{name}")
+}
+
+/// The schema and the function that the function name `name` of a
+/// translated statement stands for. The schema is None for a name that was
+/// written without one.
+pub fn split_function_name(name: &str) -> (Option<&str>, &str) {
+    match name.split_once(QUALIFIED_FUNCTION_NAME_SEPARATOR) {
+        Some((schema, name)) => (Some(schema), name),
+        None => (None, name),
+    }
 }
 
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
@@ -11207,6 +11739,8 @@ mod tests {
                 FrontendStmt::CreateSchema(_) => "create schema",
                 FrontendStmt::DropSchema(_) => "drop schema",
                 FrontendStmt::DropRelations(_) => "drop relations",
+                FrontendStmt::CreateFunction(_) => "create function",
+                FrontendStmt::DropFunction(_) => "drop function",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
                 FrontendStmt::Grant(_) => "grant",
@@ -11226,6 +11760,11 @@ mod tests {
             ("DISCARD ALL", "discard all"),
             ("CREATE SCHEMA IF NOT EXISTS app", "create schema"),
             ("DROP SCHEMA app CASCADE", "drop schema"),
+            (
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+                "create function",
+            ),
+            ("DROP FUNCTION IF EXISTS app.f(int)", "drop function"),
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
             ("GRANT SELECT ON t TO alice", "grant"),
@@ -13887,8 +14426,20 @@ mod tests {
                 PgCommentObject::Unsupported("TYPE"),
             ),
             (
-                "COMMENT ON FUNCTION f(int) IS 'x'",
-                PgCommentObject::Unsupported("FUNCTION"),
+                "COMMENT ON FUNCTION s.f(int) IS 'x'",
+                PgCommentObject::Function(PgFunctionTarget {
+                    schema: Some("s".to_string()),
+                    name: "f".to_string(),
+                    argument_types: Some(vec!["int4".to_string()]),
+                }),
+            ),
+            (
+                "COMMENT ON FUNCTION f IS 'x'",
+                PgCommentObject::Function(PgFunctionTarget {
+                    schema: None,
+                    name: "f".to_string(),
+                    argument_types: None,
+                }),
             ),
             (
                 "COMMENT ON ROLE r IS 'x'",
@@ -15096,8 +15647,17 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_schema_qualified_functions() {
-        assert_not_supported("SELECT myschema.f(1)", "schema-qualified function");
+    fn schema_qualified_functions_are_scalar_only() {
+        // A function of a schema is one that a user defined. The frontend
+        // looks it up by the schema and the name together.
+        let parsed = crate::parse("SELECT myschema.f(1)").unwrap();
+        let translated = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        assert!(
+            translated.to_string().contains("myschema.f"),
+            "{translated}"
+        );
+        assert_eq!(split_function_name("myschema.f"), (Some("myschema"), "f"));
+        assert_eq!(split_function_name("f"), (None, "f"));
         assert_not_supported(
             "SELECT * FROM myschema.generate_series(1, 3)",
             "schema-qualified function",

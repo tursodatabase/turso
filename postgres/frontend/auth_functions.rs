@@ -1,8 +1,14 @@
 use crate::error::sqlstate_error;
 use crate::functions::{invalid_json, pg_scalar_function, unsupported_unicode_escape, Uuid};
+use crate::pg_type::jsonb::has_nul_escape;
 use turso_core::native_ext::FunctionArity;
 use turso_core::{Connection, OpenOptions, Result};
 use turso_pg_parser::sqlstate::SQLSTATE_INVALID_TEXT_REPRESENTATION;
+
+/// The schema of the functions of this module. The functions exist in a
+/// database that has no such schema, so a call of a function of the schema
+/// is not an error for the missing schema.
+pub(crate) const SCHEMA: &str = "auth";
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     options
@@ -76,14 +82,4 @@ fn parse_claims(claims: &str) -> Result<serde_json::Value> {
         return Err(unsupported_unicode_escape());
     }
     Ok(parsed_claims)
-}
-
-fn has_nul_escape(json: &str) -> bool {
-    let mut bytes = json.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte == b'\\' && bytes.next() == Some(b'u') && bytes.by_ref().take(4).eq(*b"0000") {
-            return true;
-        }
-    }
-    false
 }

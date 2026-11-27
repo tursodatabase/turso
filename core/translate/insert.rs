@@ -383,6 +383,13 @@ pub fn translate_insert(
     let updates_on_conflict = upsert_actions
         .iter()
         .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
+    // A call that stands for an expression with a subquery counts as a
+    // subquery.
+    for column in returning.iter_mut() {
+        if let ResultColumn::Expr(expr, _) = column {
+            resolver.catalog.expand_calls_with_subqueries(expr)?;
+        }
+    }
     // Emitting a subquery consumes its plan, so each DO UPDATE arm plans the
     // RETURNING subqueries again from the clause as written.
     let upsert_returning = if updates_on_conflict
@@ -2327,6 +2334,11 @@ fn bind_insert(
                     OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
                         if values_expr.is_empty() {
                             crate::bail_parse_error!("no values to insert");
+                        }
+                        // A call that stands for an expression with a
+                        // subquery counts as a subquery.
+                        for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                            resolver.catalog.expand_calls_with_subqueries(expr)?;
                         }
                         // Check if any VALUES expression contains a subquery.
                         // If so, route through multi-row path which handles subqueries.

@@ -66,6 +66,17 @@ pub fn check_statement_privileges(
         | ast::Stmt::CreateMaterializedView { view_name, .. } => create_in_schema_denial(view_name),
         ast::Stmt::CreateVirtualTable(create) => create_in_schema_denial(&create.tbl_name),
         ast::Stmt::CreateSequence { seq_name, .. } => create_in_schema_denial(seq_name),
+        ast::Stmt::CreateFunction { name, .. } => create_in_schema_denial(name),
+        // Only the owner may drop a function. A function belongs to the role
+        // that made it, which only a superuser can do until GRANT on
+        // schemas exists.
+        ast::Stmt::DropFunction { functions, .. } => {
+            let name = functions
+                .first()
+                .map(|function| function.name.name.as_str().to_string())
+                .unwrap_or_default();
+            PermissionDenied::owner(Action::Drop, Object::Function(name))
+        }
         ast::Stmt::AlterSequenceOwnedBy { seq_name, .. } => {
             let namespace = crate::translate::sequence::sequence_namespace(seq_name, resolver)
                 .ok()

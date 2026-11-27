@@ -27,17 +27,17 @@ pub use crate::functions::builtin::{
 pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
-    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSchema, CreateSequence,
-    CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent,
-    DependentObject, DropColumn, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
-    DropType, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn, RenameTable,
-    RewrittenTrigger, RewrittenView, TableText, TempTriggerOfRenamedTable,
+    CmdContext, CmdOrigin, CreateFunction, CreateIndex, CreateMaterializedView, CreateSchema,
+    CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable,
+    Dependent, DependentObject, DropColumn, DropFunction, DropIndex, DropSchema, DropSequence,
+    DropTable, DropTrigger, DropType, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn,
+    RenameTable, RewrittenTrigger, RewrittenView, TableText, TempTriggerOfRenamedTable,
 };
 
-use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
+use crate::ast::{self, Cmd, CreateTableBody, Expr, IdentityKind, Privilege, QualifiedName, Stmt};
 use crate::{
     function::ScalarFunc,
-    namespace::NamespaceId,
+    namespace::{NamespaceId, NamespaceRef, Qualifiers},
     schema::{BTreeTable, Schema, SchemaBuilder, TypeDef},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::Register,
@@ -49,6 +49,16 @@ use std::{cell::Cell, ops::Range, sync::Arc};
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
+
+/// What a dialect looks its own functions up in when a statement calls one.
+pub struct FunctionScope<'a> {
+    pub schema: &'a Schema,
+    /// The names that can qualify a function name, with their namespaces.
+    pub qualifiers: &'a Qualifiers,
+    /// The namespaces that a function name without a qualifier is looked up
+    /// in, in order.
+    pub search_order: &'a [NamespaceRef],
+}
 
 /// What a scalar function may read besides its arguments.
 pub struct ScalarFuncContext<'a> {
@@ -313,6 +323,52 @@ pub trait Dialect: Send + Sync + 'static {
         Err(LimboError::ParseError(format!("no such function: {name}")))
     }
 
+    /// The expression that a call of function `name` with `args` stands
+    /// for, or None when `name` is not a function that the dialect expands.
+    /// The engine compiles the expression in place of the call, so the
+    /// optimizer sees what the function computes. A dialect uses it for
+    /// functions that users define with an SQL expression, as PostgreSQL's
+    /// `CREATE FUNCTION ... LANGUAGE sql` does. Consulted for a name that
+    /// [`Dialect::resolve_function`] does not resolve, before extension
+    /// functions.
+    ///
+    /// The engine expands the calls inside the expression too, and fails
+    /// when the expression that takes the place of the call is nested too
+    /// deeply or has too many expanded calls. It compiles a subquery on its
+    /// own, though, so it cannot tell when a call inside a subquery of the
+    /// expression expands into the same call again. The dialect has to
+    /// refuse such a call.
+    ///
+    /// A subquery of the expression sees the tables and the WITH queries of
+    /// the statement that has the call. A dialect whose function is a query
+    /// of its own puts the subquery in a closed subquery in FROM
+    /// (`SelectTable::Select::closed`).
+    fn expand_function_call(
+        &self,
+        scope: &FunctionScope<'_>,
+        name: &str,
+        args: &[Box<Expr>],
+    ) -> Result<Option<Expr>> {
+        let _ = (scope, name, args);
+        Ok(None)
+    }
+
+    /// The name that an expression stored in the schema has for a call of
+    /// function `name` with `argument_count` arguments, when the dialect
+    /// expands the call and finds the function by the search path: a name
+    /// that finds the same function with any search path. None when the
+    /// expression stores `name`. Consulted when
+    /// [`Dialect::binds_names_at_create`] is true.
+    fn stored_function_name(
+        &self,
+        scope: &FunctionScope<'_>,
+        name: &str,
+        argument_count: usize,
+    ) -> Result<Option<String>> {
+        let _ = (scope, name, argument_count);
+        Ok(None)
+    }
+
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
     /// affinity metadata) regardless of the experimental database flag.
     /// A dialect whose type system leans on custom types (e.g. PostgreSQL)
@@ -352,9 +408,9 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a sequence named without a schema in an expression stored in
-    /// the schema is bound to the schema it is found in when the expression
-    /// is created.
+    /// Whether a sequence, or a function that the dialect expands, named
+    /// without a schema in an expression stored in the schema is bound to
+    /// the schema it is found in when the expression is created.
     fn binds_names_at_create(&self) -> bool {
         false
     }

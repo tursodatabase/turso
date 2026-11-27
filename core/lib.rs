@@ -97,7 +97,7 @@ pub mod vtab;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
-pub use function::{ExternalFunc, Func, ScalarFunc};
+pub use function::{Deterministic, ExternalFunc, Func, ScalarFunc};
 /// The ENCODE of the built-in date and time types, also used by the PostgreSQL
 /// frontend to check input in `pg_input_is_valid`.
 pub use functions::datetime_input::exec_temporal_encode;
@@ -152,12 +152,12 @@ pub(crate) use database::{DatabaseCatalog, InitState};
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
-    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSchema, CreateSequence,
-    CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent,
-    DependentObject, Dialect, DropColumn, DropIndex, DropSchema, DropSequence, DropTable,
-    DropTrigger, DropType, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn,
-    RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes, TableText,
-    TempTriggerOfRenamedTable,
+    CmdContext, CmdOrigin, CreateFunction, CreateIndex, CreateMaterializedView, CreateSchema,
+    CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable,
+    Dependent, DependentObject, Dialect, DropColumn, DropFunction, DropIndex, DropSchema,
+    DropSequence, DropTable, DropTrigger, DropType, DropView, FunctionScope, NewOwner, OwnerColumn,
+    RelationName, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog,
+    StatementTimes, TableText, TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
@@ -215,7 +215,10 @@ pub use turso_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
-pub use util::{database_path_from_uri, IOExt};
+pub use util::{
+    database_path_from_uri, walk_expr_with_subqueries, walk_schema_expressions, IOExt,
+    SchemaExprOwner,
+};
 pub use vdbe::array::{
     array_contains_all, array_values_from_any, parse_text_array_of_texts, text_array_literal,
 };

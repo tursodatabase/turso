@@ -698,6 +698,7 @@ mod rename_column_view {
                 select,
                 alias,
                 lateral,
+                ..
             } => {
                 let before_cols = select_output_columns(select, ctx, false)?;
                 let lateral_scopes: Vec<&[ViewSourceInfo]> = if *lateral {

@@ -235,6 +235,29 @@ pub enum Stmt {
     /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
     /// frontend with roles translates its own GRANT into this.
     Grant(Grant),
+    /// `CREATE [OR REPLACE] FUNCTION`: a function that a user defines. Not
+    /// SQLite syntax; a frontend with such functions translates its own
+    /// statement into this. The dialect's catalog stores the function.
+    CreateFunction {
+        /// `OR REPLACE`
+        or_replace: bool,
+        /// The function's name, with the schema that the statement names.
+        name: QualifiedName,
+        /// The number of parameters. A schema has one function of a name
+        /// for each number of parameters.
+        argument_count: usize,
+        /// The text of the statement in the frontend's syntax. The engine
+        /// does not read it; the dialect stores it.
+        sql: String,
+    },
+    /// `DROP FUNCTION`. Not SQLite syntax; a frontend with functions that
+    /// users define translates its own DROP FUNCTION into this.
+    DropFunction {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// The functions to drop, as the statement names them.
+        functions: Vec<FunctionSignature>,
+    },
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -1296,6 +1319,12 @@ pub enum SelectTable {
         select: Select,
         alias: Option<As>,
         lateral: bool,
+        /// The subquery sees none of the tables and none of the WITH queries
+        /// of the queries around it, as the query of a view does. No SQL
+        /// text says this: a dialect sets it on a subquery that it puts into
+        /// a statement and that is a query of its own, such as the body of a
+        /// function.
+        closed: bool,
     },
     /// subquery
     Sub(FromClause, Option<As>),
@@ -1523,6 +1552,17 @@ impl Name {
     pub const fn quoted(&self) -> bool {
         self.quote.is_some()
     }
+}
+
+/// A function that `DROP FUNCTION` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FunctionSignature {
+    /// The function's name, with the schema that the statement names.
+    pub name: QualifiedName,
+    /// The types of the parameters, as the statement names them, or None
+    /// when the statement lists none, as in `DROP FUNCTION f`.
+    pub argument_types: Option<Vec<String>>,
 }
 
 /// Qualified name

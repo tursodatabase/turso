@@ -1,11 +1,13 @@
-//! CREATE FUNCTION and CREATE PROCEDURE, which tursopg does not support yet.
+//! The checks of CREATE FUNCTION and CREATE PROCEDURE.
 //!
-//! Every statement is rejected. A statement that PostgreSQL also rejects gets
-//! PostgreSQL's error. Otherwise the error names the first feature that
-//! tursopg does not support, so that each feature can be enabled on its own.
+//! tursopg supports functions in the SQL language whose body is one query,
+//! which it expands where they are called. A statement that PostgreSQL
+//! rejects gets PostgreSQL's error. Otherwise a statement that tursopg cannot
+//! run gets an error that names the first feature that tursopg does not
+//! support, so that each feature can be enabled on its own.
 
 use crate::cmdtag::CommandTag;
-use crate::names::{extract_key_columns, is_default_schema, object_name};
+use crate::names::extract_key_columns;
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_FUNCTION_DEFINITION,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_OBJECT,
@@ -18,30 +20,25 @@ use pg_query::protobuf::{
 use pg_query::NodeEnum;
 use std::collections::HashMap;
 
-/// The error for `stmt`, a CREATE FUNCTION or CREATE PROCEDURE statement of
-/// `sql`.
-pub(crate) fn reject_create_function(sql: &str, stmt: &CreateFunctionStmt) -> ParseError {
-    match check_create_function(sql, stmt) {
-        Err(error) => error,
-        Ok(()) => ParseError::not_supported("CREATE FUNCTION"),
-    }
-}
-
 /// Raises the errors of PostgreSQL in the order PostgreSQL raises them, then
-/// the error for the first feature that tursopg does not support.
-fn check_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Result<(), ParseError> {
+/// the error for the first feature that tursopg does not support. Ok when
+/// tursopg can define the function of `stmt`.
+pub(crate) fn check_create_function(stmt: &CreateFunctionStmt) -> Result<(), ParseError> {
     if stmt.is_procedure {
         return Err(ParseError::not_supported("CREATE PROCEDURE"));
     }
-    object_name(&stmt.funcname, is_default_schema, "function")?;
+    if extract_key_columns(&stmt.funcname)?.len() > 2 {
+        return Err(ParseError::not_supported("a cross-database reference"));
+    }
     let options = function_options(&stmt.options)?;
     let language = function_language(&options, stmt)?;
     let is_sql = language == "sql";
     let parameters = function_parameters(stmt)?;
-    let parameter_types = parameters
-        .iter()
-        .map(|parameter| check_parameter_type(parameter, is_sql))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut parameter_types = Vec::with_capacity(parameters.len());
+    for (position, parameter) in parameters.iter().enumerate() {
+        parameter_types.push(check_parameter_type(parameter, is_sql)?);
+        check_parameter_name(parameter, &parameters[..position])?;
+    }
     let result_type = check_result_type(stmt, &parameters, &parameter_types, is_sql)?;
     let returns_set = stmt.return_type.as_ref().is_some_and(|t| t.setof);
     if options.contains_key("rows") && !returns_set {
@@ -73,13 +70,6 @@ fn check_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Result<(), Par
     if options.contains_key("window") {
         return Err(ParseError::not_supported("WINDOW in CREATE FUNCTION"));
     }
-    if let Some(as_item) = options.get("as") {
-        if !is_dollar_quoted_after(sql, as_item.location)? {
-            return Err(ParseError::not_supported(
-                "a function body that is not dollar-quoted",
-            ));
-        }
-    }
     if let Some(statements) = &body_statements {
         check_body_statements(statements)?;
     }
@@ -89,11 +79,7 @@ fn check_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Result<(), Par
     if let Some(class) = &result_type {
         check_result_features(stmt, class)?;
     }
-    check_option_features(&stmt.options)?;
-    if stmt.replace {
-        return Err(ParseError::not_supported("CREATE OR REPLACE FUNCTION"));
-    }
-    Ok(())
+    check_option_features(&stmt.options, !parameters.is_empty())
 }
 
 /// The options of CREATE FUNCTION by name, such as `language` or
@@ -335,18 +321,6 @@ fn parse_body(body: &str) -> Result<pg_query::ParseResult, ParseError> {
     })
 }
 
-/// Whether the token after the AS keyword at `as_location` of `sql` is a
-/// dollar-quoted string.
-fn is_dollar_quoted_after(sql: &str, as_location: i32) -> Result<bool, ParseError> {
-    let scan = pg_query::scan(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
-    let body = scan
-        .tokens
-        .iter()
-        .find(|token| token.start > as_location)
-        .ok_or_else(|| ParseError::internal_error("AS requires a function body".to_string()))?;
-    Ok(sql[body.start as usize..].starts_with('$'))
-}
-
 /// Rejects a body that is not a single query.
 fn check_body_statements(statements: &pg_query::ParseResult) -> Result<(), ParseError> {
     let [statement] = statements.protobuf.stmts.as_slice() else {
@@ -380,6 +354,44 @@ fn check_body_statements(statements: &pg_query::ParseResult) -> Result<(), Parse
     }
 }
 
+/// Rejects a parameter with the name of one of the parameters `earlier` in
+/// the list, as interpret_function_parameter_list of PostgreSQL does. An
+/// input parameter and an output parameter can have the same name.
+fn check_parameter_name(
+    parameter: &FunctionParameter,
+    earlier: &[&FunctionParameter],
+) -> Result<(), ParseError> {
+    if parameter.name.is_empty() {
+        return Ok(());
+    }
+    let is_input_only = |parameter: &FunctionParameter| {
+        matches!(
+            parameter.mode(),
+            FunctionParameterMode::FuncParamIn
+                | FunctionParameterMode::FuncParamDefault
+                | FunctionParameterMode::FuncParamVariadic
+        )
+    };
+    let is_output_only = |parameter: &FunctionParameter| {
+        matches!(
+            parameter.mode(),
+            FunctionParameterMode::FuncParamOut | FunctionParameterMode::FuncParamTable
+        )
+    };
+    let used = earlier.iter().any(|earlier| {
+        earlier.name == parameter.name
+            && !(is_input_only(parameter) && is_output_only(earlier))
+            && !(is_input_only(earlier) && is_output_only(parameter))
+    });
+    if used {
+        return Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_FUNCTION_DEFINITION,
+            format!("parameter name \"{}\" used more than once", parameter.name),
+        ));
+    }
+    Ok(())
+}
+
 fn check_parameter_features(
     parameter: &FunctionParameter,
     class: &TypeClass,
@@ -405,9 +417,6 @@ fn check_parameter_features(
         return Err(ParseError::not_supported(
             "a function parameter with a DEFAULT",
         ));
-    }
-    if !parameter.name.is_empty() {
-        return Err(ParseError::not_supported("a named function parameter"));
     }
     match class {
         TypeClass::Base => Ok(()),
@@ -445,21 +454,23 @@ fn check_result_features(stmt: &CreateFunctionStmt, class: &TypeClass) -> Result
     }
 }
 
-/// Rejects the first option other than LANGUAGE and AS, in the order of the
-/// statement.
-fn check_option_features(options: &[pg_query::protobuf::Node]) -> Result<(), ParseError> {
+/// Rejects the first option that tursopg does not support, in the order of
+/// the statement. The options that say how the planner may treat the
+/// function, such as its volatility or cost, are supported. A STRICT
+/// function returns NULL for a NULL argument without computing its body,
+/// which an expanded function cannot do, so STRICT is supported only
+/// without parameters.
+fn check_option_features(
+    options: &[pg_query::protobuf::Node],
+    has_parameters: bool,
+) -> Result<(), ParseError> {
     for def in def_elems(options)? {
         let clause = match def.defname.as_str() {
-            "language" | "as" => continue,
-            "volatility" => string_value(def)?.to_uppercase(),
-            "strict" if bool_value(def) => "STRICT".to_string(),
-            "strict" => "CALLED ON NULL INPUT".to_string(),
+            "language" | "as" | "volatility" | "leakproof" | "parallel" | "cost" => continue,
+            "strict" if bool_value(def) && has_parameters => "STRICT".to_string(),
+            "strict" => continue,
             "security" if bool_value(def) => "SECURITY DEFINER".to_string(),
-            "security" => "SECURITY INVOKER".to_string(),
-            "leakproof" if bool_value(def) => "LEAKPROOF".to_string(),
-            "leakproof" => "NOT LEAKPROOF".to_string(),
-            "parallel" => format!("PARALLEL {}", string_value(def)?.to_uppercase()),
-            "cost" => "COST".to_string(),
+            "security" => continue,
             "rows" => unreachable!("ROWS needs SETOF, which is rejected first"),
             "support" => "SUPPORT".to_string(),
             "set" => match def.arg.as_ref().and_then(|arg| arg.node.as_ref()) {

@@ -56,6 +56,7 @@ use crate::auth_members::role_does_not_exist;
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
 use crate::descriptions::{emit_delete_comments, Dropped};
 use crate::error::{not_supported, sqlstate_error};
+use crate::function_catalog;
 use crate::policies::{self, TablePolicies};
 use crate::roles::schema_roles;
 use crate::schema_init::{is_stored_catalog_table, TableInit};
@@ -494,6 +495,16 @@ impl Catalog for PostgresCatalog {
         ctx: &CmdContext<'_>,
         cmd: &CatalogCmd<'_>,
     ) -> turso_core::Result<()> {
+        // SQLite's catalog stores no functions.
+        match cmd {
+            CatalogCmd::CreateFunction(create) => {
+                return function_catalog::emit_create_function(program, ctx, create)
+            }
+            CatalogCmd::DropFunction(drop) => {
+                return function_catalog::emit_drop_function(program, ctx, drop)
+            }
+            _ => {}
+        }
         SqliteCatalog.emit(program, ctx, cmd)?;
         match cmd {
             CatalogCmd::CreateTable(table) => {
@@ -638,8 +649,15 @@ impl Catalog for PostgresCatalog {
             | CatalogCmd::CreateVirtualTable(_)
             | CatalogCmd::CreateType(_)
             | CatalogCmd::DropType(_)
-            | CatalogCmd::CreateSchema(_)
-            | CatalogCmd::DropSchema(_) => {}
+            | CatalogCmd::CreateSchema(_) => {}
+            // The frontend dropped the schema's other objects with
+            // statements of their own before this one.
+            CatalogCmd::DropSchema(schema) => {
+                function_catalog::emit_drop_schema_functions(program, ctx, schema.id)?
+            }
+            CatalogCmd::CreateFunction(_) | CatalogCmd::DropFunction(_) => {
+                unreachable!("functions are stored above")
+            }
         }
         Ok(())
     }
@@ -1463,14 +1481,57 @@ fn emit_allocate_oid(program: &mut ProgramBuilder, cursors: &ClassTableCursors) 
     let seq_cursor_id = cursors
         .seq_cursor_id
         .expect("the caller opened the cursors with allocates_oids");
+    let seq_table = cursors
+        .seq_table
+        .clone()
+        .expect("the caller opened the cursors with allocates_oids");
+    emit_allocate_oid_in(program, cursors.table_cursor_id, seq_cursor_id, seq_table)
+}
 
+/// Allocates the oid of a new object that is not a relation, whose row the
+/// statement inserts into the table of `table_cursor_id`, with the oid as
+/// its rowid. Opens `sqlite_sequence` of `schema` for it.
+pub(crate) fn emit_allocate_object_oid(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    table_cursor_id: usize,
+) -> turso_core::Result<usize> {
+    let Some(seq_table) = schema.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
+    else {
+        return Err(LimboError::Corrupt(format!(
+            "a database with {CLASSES_TABLE_NAME} has no {SQLITE_SEQUENCE_TABLE_NAME}"
+        )));
+    };
+    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: seq_cursor_id,
+        root_page: seq_table.root_page,
+        db: MAIN_DB_ID,
+    });
+    Ok(emit_allocate_oid_in(
+        program,
+        table_cursor_id,
+        seq_cursor_id,
+        seq_table,
+    ))
+}
+
+/// Allocates an oid for a row of the table of `table_cursor_id`. Every
+/// object with an oid takes it from the same counter in `sqlite_sequence`,
+/// so no two objects share one.
+fn emit_allocate_oid_in(
+    program: &mut ProgramBuilder,
+    table_cursor_id: usize,
+    seq_cursor_id: usize,
+    seq_table: Arc<BTreeTable>,
+) -> usize {
     // oid = max(largest oid in the table + 1, highest oid ever used + 1,
     // FIRST_NORMAL_OBJECT_ID), so an oid is never reused even after the
-    // relation or policy with the largest oid is dropped.
+    // object with the largest oid is dropped.
     let watermark_reg = emit_read_oid_watermark(program, seq_cursor_id);
     let oid_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
-        cursor: cursors.table_cursor_id,
+        cursor: table_cursor_id,
         rowid_reg: oid_reg,
         prev_largest_reg: 0,
     });
@@ -1492,16 +1553,7 @@ fn emit_allocate_oid(program: &mut ProgramBuilder, cursors: &ClassTableCursors) 
         src_reg: watermark_reg,
     });
 
-    emit_sqlite_sequence_row_write(
-        program,
-        cursors
-            .seq_table
-            .clone()
-            .expect("the caller opened the cursors with allocates_oids"),
-        MAIN_DB_ID,
-        CLASSES_TABLE_NAME,
-        oid_reg,
-    );
+    emit_sqlite_sequence_row_write(program, seq_table, MAIN_DB_ID, CLASSES_TABLE_NAME, oid_reg);
     oid_reg
 }
 

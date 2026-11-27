@@ -169,6 +169,7 @@ impl LateralSelect {
                 select: self.lateral_subquery(join, None),
                 alias: Some(alias(&join.alias)),
                 lateral: true,
+                closed: false,
             },
             LateralForm::JsonEach => ast::SelectTable::TableCall(
                 ast::QualifiedName::single(ast::Name::exact("json_each".to_string())),
@@ -213,6 +214,7 @@ impl LateralSelect {
                 select: self.lateral_subquery(join, Some(ast::Indexed::NotIndexed)),
                 alias: Some(alias(LATERAL_ROWS_ALIAS)),
                 lateral: false,
+                closed: false,
             }),
             joins: Vec::new(),
         };

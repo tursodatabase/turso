@@ -1,5 +1,6 @@
 use super::*;
 use crate::dialect::CastDecision;
+use crate::translate::catalog::AggregateClauses;
 use crate::types::StrictType;
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
@@ -1129,13 +1130,34 @@ fn translate_function_call_expr(
         unreachable!("translate_function_call_expr expects Expr::FunctionCall");
     };
     let args_count = args.len();
-    let func_type = resolver.resolve_function(name.as_str(), args_count)?;
-
-    if func_type.is_none() {
-        crate::bail_parse_error!("no such function: {}", name.as_str());
+    // Binding expands the calls it sees. An expression that is compiled
+    // without binding, like a column default, gets here.
+    if let Some(expansion) =
+        resolver
+            .catalog
+            .expand_function_call(name.as_str(), args, AggregateClauses::of(expr))?
+    {
+        // A clause that plans subqueries expands such a call before. One
+        // that cannot run a subquery, such as a column default or a CHECK
+        // constraint, gets here with it.
+        if crate::translate::insert::expr_contains_subquery(&expansion) {
+            return Err(LimboError::NotSupported(format!(
+                "a call of function {}, whose body has a subquery, is not supported in a \
+                 column default or a CHECK constraint",
+                name.as_str()
+            )));
+        }
+        return translate_expr(
+            program,
+            referenced_tables,
+            &expansion,
+            target_register,
+            resolver,
+        );
     }
-
-    let func = func_type.unwrap();
+    let Some(func) = resolver.resolve_function(name.as_str(), args_count)? else {
+        crate::bail_parse_error!("no such function: {}", name.as_str());
+    };
     let collation = if func.needs_collation() {
         first_collation(
             args.iter()

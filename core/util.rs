@@ -1725,6 +1725,8 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
         | ast::Stmt::DropRole { .. }
+        | ast::Stmt::CreateFunction { .. }
+        | ast::Stmt::DropFunction { .. }
         | ast::Stmt::Grant(_)
         | ast::Stmt::CreatePolicy(_)
         | ast::Stmt::DropPolicy { .. }
@@ -2072,10 +2074,10 @@ pub fn validate_select_for_views(
                 filter_over,
                 ..
             } if !order_by.is_empty() && filter_over.over_clause.is_some() => {
-                crate::bail_parse_error!(
+                return Err(crate::LimboError::WrongObjectType(format!(
                     "ORDER BY may not be used with non-aggregate {}()",
                     name.as_str()
-                );
+                )));
             }
             ast::Expr::Subquery(subquery) | ast::Expr::Exists(subquery) => {
                 visit_select(

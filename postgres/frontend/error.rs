@@ -372,6 +372,8 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         LimboError::Dialect(error) => error.code,
+        LimboError::NotSupported(_) => SQLSTATE_FEATURE_NOT_SUPPORTED,
+        LimboError::WrongObjectType(_) => SQLSTATE_WRONG_OBJECT_TYPE,
         LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         LimboError::DependentObjects(_) => SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
         _ => SQLSTATE_INTERNAL_ERROR,
