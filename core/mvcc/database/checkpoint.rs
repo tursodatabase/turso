@@ -1946,9 +1946,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // flushed to the physical database.
         for (sqlite_schema_rowid, created_btree) in self.created_btrees.drain() {
             let CreatedBtree {
+                table_id,
                 root_page,
                 sqlite_schema_row: row_version,
-                ..
             } = created_btree;
             let key = RowID {
                 table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
@@ -1960,7 +1960,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .get(&key)
                 .expect("sqlite_schema row not found");
             let mut row_versions = sqlite_schema_row.value().write();
-            // Patch payload in place (same version id), don't append: a duplicate
+            // Patch payloads in place (same version ids), don't append: a duplicate
             // (id, begin, end) would leave a phantom current version after a later
             // DELETE (which ends only the first match), causing spurious write-write
             // conflicts at commit time.
@@ -1968,15 +1968,38 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // Only replace the row payload (positive rootpage). Preserve begin/end so a
             // DROP that committed after our snapshot keeps its end stamp — wholesale
             // replace of the collected clone would resurrect the table (#7956).
-            let vid = row_version.id;
-            if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                existing.data = row_version.data;
-                if existing.end().is_some() {
+            //
+            // Patch every version that still has the placeholder rootpage, not only the
+            // collected one: an ALTER TABLE that wrote this row after our snapshot copied
+            // the placeholder into its version. If that version kept it, the next checkpoint
+            // would take the patched version for a DROP and the ALTER's version for a CREATE,
+            // and replace the B-tree with an empty one (#8077).
+            let mut newest_patched_ended = None;
+            for existing in row_versions.iter_mut() {
+                let refers_to_created_btree = existing.id == row_version.id
+                    || sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, existing)
+                        .expect("sqlite_schema rows in the MVCC store are valid records")
+                        .is_some_and(|identity| identity.root_page == i64::from(table_id));
+                if !refers_to_created_btree {
+                    continue;
+                }
+                let record = SqliteSchemaRow::from_record_bytes(existing.payload(&key))
+                    .and_then(|row| row.with_root_page(root_page as i64).to_record())
+                    .expect("sqlite_schema rows in the MVCC store are valid records");
+                existing.data = Some(crate::alloc::try_arc_slice_from_slice_in(
+                    record.get_payload(),
+                    self.mvstore.allocator(),
+                )?);
+                newest_patched_ended = Some(existing.end().is_some());
+            }
+            match newest_patched_ended {
+                Some(true) => {
                     self.ended_created_roots.insert(root_page as i64);
                 }
-            } else {
-                self.mvstore
-                    .insert_version_raw(&mut row_versions, row_version)?;
+                Some(false) => {}
+                None => self
+                    .mvstore
+                    .insert_version_raw(&mut row_versions, row_version)?,
             }
         }
 

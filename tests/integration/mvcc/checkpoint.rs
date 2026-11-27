@@ -4755,6 +4755,257 @@ fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
     );
 }
 
+/// Runs `during` while an auto-checkpoint that materializes `t` is paused before its pager
+/// commit, then lets the checkpoint finish. `t` (and every table or index created with it)
+/// has a negative placeholder rootpage until that checkpoint publishes its real root.
+fn run_while_checkpoint_creating_t_is_paused(
+    db: &MvccTestDbNoConn,
+    create_sql: &[&str],
+    during: impl FnOnce(),
+) {
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE anchor(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO anchor VALUES (1, 'seed')")
+        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    for sql in create_sql {
+        setup.execute(*sql).unwrap();
+    }
+    assert!(
+        get_rows(
+            &setup,
+            "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+        )[0][0]
+            .as_int()
+            .unwrap()
+            < 0,
+        "t must not have a B-tree before the paused checkpoint"
+    );
+
+    let checkpoint_conn = db.connect();
+    checkpoint_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    checkpoint_conn.set_yield_injector(Some(injector.clone()));
+    let mut checkpoint = checkpoint_conn
+        .prepare("UPDATE anchor SET v = v WHERE id = 1")
+        .unwrap();
+    let pager_io = checkpoint_conn.get_pager().io.clone();
+    let mut paused = false;
+    for _ in 0..200_000 {
+        match checkpoint.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                if injector.is_empty() {
+                    paused = true;
+                    break;
+                }
+                pager_io.step().unwrap();
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected checkpoint step: {other:?}"),
+        }
+    }
+    assert!(paused, "the checkpoint must pause before its pager commit");
+
+    during();
+
+    checkpoint.run_ignore_rows().unwrap();
+    checkpoint_conn.set_yield_injector(None);
+    assert!(
+        get_rows(
+            &setup,
+            "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+        )[0][0]
+            .as_int()
+            .unwrap()
+            > 0,
+        "the paused checkpoint must publish a real rootpage for t"
+    );
+}
+
+/// Repro for https://github.com/tursodatabase/turso/issues/8077.
+///
+/// An ALTER TABLE that commits while the checkpoint that creates the table's B-tree is
+/// paused must not make the next checkpoint replace that B-tree with an empty one.
+#[test]
+fn test_followup_checkpoint_keeps_table_altered_during_checkpoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    let alter = db.connect();
+    run_while_checkpoint_creating_t_is_paused(
+        &db,
+        &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO t VALUES (1, 'before-alter')",
+        ],
+        || {
+            alter
+                .execute("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'added'")
+                .unwrap();
+        },
+    );
+
+    let expected = vec![vec![
+        Value::from_i64(1),
+        Value::build_text("before-alter"),
+        Value::build_text("added"),
+    ]];
+    let ok = vec![vec![Value::build_text("ok")]];
+    let observer = db.connect();
+    assert_eq!(get_rows(&observer, "SELECT id, v, extra FROM t"), expected);
+    observer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(get_rows(&observer, "SELECT id, v, extra FROM t"), expected);
+    assert_eq!(get_rows(&observer, "PRAGMA integrity_check"), ok);
+    drop(observer);
+    drop(alter);
+
+    db.restart();
+    let reopened = db.connect();
+    assert_eq!(get_rows(&reopened, "SELECT id, v, extra FROM t"), expected);
+    assert_eq!(get_rows(&reopened, "PRAGMA integrity_check"), ok);
+}
+
+/// Same as `test_followup_checkpoint_keeps_table_altered_during_checkpoint`, for an index:
+/// RENAME COLUMN rewrites the sqlite_schema rows of the table and of its index.
+#[test]
+fn test_followup_checkpoint_keeps_index_rewritten_during_checkpoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    let alter = db.connect();
+    run_while_checkpoint_creating_t_is_paused(
+        &db,
+        &[
+            "CREATE TABLE x(a)",
+            "DROP TABLE x",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE INDEX t_v ON t(v)",
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b')",
+            "CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO u VALUES (7, 'uu')",
+        ],
+        || {
+            alter.execute("ALTER TABLE t RENAME COLUMN v TO w").unwrap();
+        },
+    );
+
+    let expected = vec![vec![Value::from_i64(2), Value::build_text("b")]];
+    let u_rows = vec![vec![Value::from_i64(7), Value::build_text("uu")]];
+    let ok = vec![vec![Value::build_text("ok")]];
+    let observer = db.connect();
+    observer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(
+        get_rows(&observer, "SELECT id, w FROM t WHERE w = 'b'"),
+        expected
+    );
+    assert_eq!(get_rows(&observer, "SELECT id, v FROM u"), u_rows);
+    assert_eq!(get_rows(&observer, "PRAGMA integrity_check"), ok);
+    drop(observer);
+    drop(alter);
+
+    db.restart();
+    let reopened = db.connect();
+    assert_eq!(
+        get_rows(&reopened, "SELECT id, w FROM t WHERE w = 'b'"),
+        expected
+    );
+    assert_eq!(
+        get_rows(
+            &reopened,
+            "SELECT count(*) FROM t INDEXED BY t_v WHERE w > ''"
+        ),
+        vec![vec![Value::from_i64(2)]]
+    );
+    assert_eq!(get_rows(&reopened, "SELECT id, v FROM u"), u_rows);
+    assert_eq!(get_rows(&reopened, "PRAGMA integrity_check"), ok);
+}
+
+/// An ALTER TABLE that has written its sqlite_schema row but not committed when the
+/// checkpoint publishes the real rootpage must keep the table's rows whether it commits
+/// or rolls back.
+#[test]
+fn test_followup_checkpoint_keeps_table_after_uncommitted_alter_during_checkpoint() {
+    for end in ["COMMIT", "ROLLBACK"] {
+        let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+        let alter = db.connect();
+        run_while_checkpoint_creating_t_is_paused(
+            &db,
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+                "INSERT INTO t VALUES (1, 'kept')",
+            ],
+            || {
+                alter.execute("BEGIN CONCURRENT").unwrap();
+                alter
+                    .execute("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'added'")
+                    .unwrap();
+            },
+        );
+        alter.execute(end).unwrap();
+
+        let ok = vec![vec![Value::build_text("ok")]];
+        let observer = db.connect();
+        observer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        assert_eq!(
+            get_rows(&observer, "SELECT id, v FROM t"),
+            vec![vec![Value::from_i64(1), Value::build_text("kept")]],
+            "{end}"
+        );
+        assert_eq!(get_rows(&observer, "PRAGMA integrity_check"), ok, "{end}");
+        drop(observer);
+        drop(alter);
+
+        db.restart();
+        let reopened = db.connect();
+        assert_eq!(
+            get_rows(&reopened, "SELECT id, v FROM t"),
+            vec![vec![Value::from_i64(1), Value::build_text("kept")]],
+            "{end}"
+        );
+        assert_eq!(get_rows(&reopened, "PRAGMA integrity_check"), ok, "{end}");
+    }
+}
+
+/// A table altered while the checkpoint that creates its B-tree is paused, and dropped
+/// after it, must have that B-tree freed by the next checkpoint.
+#[test]
+fn test_followup_checkpoint_frees_table_altered_during_checkpoint_then_dropped() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    let alter = db.connect();
+    run_while_checkpoint_creating_t_is_paused(
+        &db,
+        &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO t VALUES (1, 'x')",
+        ],
+        || {
+            alter
+                .execute("ALTER TABLE t ADD COLUMN extra TEXT")
+                .unwrap();
+        },
+    );
+    alter.execute("DROP TABLE t").unwrap();
+
+    let ok = vec![vec![Value::build_text("ok")]];
+    let observer = db.connect();
+    observer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(get_rows(&observer, "PRAGMA integrity_check"), ok);
+    drop(observer);
+    drop(alter);
+
+    db.restart();
+    let reopened = db.connect();
+    assert_eq!(
+        get_rows(&reopened, "SELECT name FROM sqlite_schema WHERE name = 't'"),
+        Vec::<Vec<Value>>::new()
+    );
+    assert_eq!(get_rows(&reopened, "PRAGMA integrity_check"), ok);
+}
+
 #[test]
 fn issue_8467_seek_after_checkpoint_publish_does_not_read_negative_root() {
     let db = MvccTestDbNoConn::new_with_random_db_passive();
