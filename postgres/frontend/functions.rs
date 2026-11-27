@@ -99,6 +99,41 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types(),
         )
+        // `->`, `#>` and jsonb_extract_path() give a value of the type of the
+        // document, json or jsonb, so that to_json() and the casts of jsonb
+        // read it as that type.
+        .extension_function(
+            pg_scalar_function("jsonb_field", FunctionArity::Exact(2), true, |_, args| {
+                Ok(text_or_null(exec_jsonb_field(
+                    args[0].get_value(),
+                    args[1].get_value(),
+                )?))
+            })
+            .returning_argument_type(0),
+        )
+        .extension_function(
+            pg_scalar_function(
+                "jsonb_extract_path",
+                FunctionArity::Variadic,
+                true,
+                |_, args| Ok(text_or_null(exec_jsonb_extract_path(args)?)),
+            )
+            .returning_argument_type(0),
+        )
+        .extension_function(
+            pg_scalar_function(
+                "jsonb_extract_path_op",
+                FunctionArity::Exact(2),
+                true,
+                |_, args| {
+                    Ok(text_or_null(exec_jsonb_extract_path_op(
+                        args[0].get_value(),
+                        args[1].get_value(),
+                    )?))
+                },
+            )
+            .returning_argument_type(0),
+        )
         .extension_function(
             pg_scalar_function(
                 "date_trunc",
@@ -126,6 +161,11 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             .checking_argument_types(check_timestamp_plus_interval_types)
             .returning_argument_type(0),
         )
+}
+
+/// The text `text` as a value, or NULL.
+fn text_or_null(text: Option<String>) -> Value {
+    text.map_or(Value::Null, Value::build_text)
 }
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
@@ -409,23 +449,14 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
         },
-        "jsonb_field"(FunctionArity::Exact(2), true) => {
-            exec_jsonb_field(args[0].get_value(), args[1].get_value())?
-        },
         "jsonb_field_text"(FunctionArity::Exact(2), true) => {
             exec_jsonb_field_text(args[0].get_value(), args[1].get_value())?
         },
         "jsonb_contains"(FunctionArity::Exact(2), true) => {
             exec_jsonb_contains(args[0].get_value(), args[1].get_value())?
         },
-        "jsonb_extract_path"(FunctionArity::Variadic, true) => {
-            exec_jsonb_extract_path(args)?
-        },
         "jsonb_extract_path_text"(FunctionArity::Variadic, true) => {
             exec_jsonb_extract_path_text(args)?
-        },
-        "jsonb_extract_path_op"(FunctionArity::Exact(2), true) => {
-            exec_jsonb_extract_path_op(args[0].get_value(), args[1].get_value())?
         },
         "jsonb_extract_path_text_op"(FunctionArity::Exact(2), true) => {
             exec_jsonb_extract_path_text_op(args[0].get_value(), args[1].get_value())?

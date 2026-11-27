@@ -749,6 +749,18 @@ expect {
     {"b": 1}
 }
 
+# -> and #> give a value of the type of the document, which to_json() writes
+# as JSON and a cast of jsonb reads as jsonb.
+test arrow-gives-a-value-of-the-type-of-the-document {
+    SELECT to_json('{"a":[1]}'::jsonb -> 'a'), to_json('{"a":[1]}'::json -> 'a'),
+           to_json('{"a":{"b": [1,2]}}'::jsonb #> '{a}'), ('{"a":1}'::jsonb -> 'a')::int,
+           ('{"a":"x"}'::jsonb -> 'a')::text,
+           jsonb_extract_path('{"a":{"b":2}}'::jsonb, 'a', 'b')::int;
+}
+expect {
+    [1]|[1]|{"b": [1, 2]}|1|"x"|2
+}
+
 # Known differences of @> and <@
 
 # tursopg compares a json or text value as jsonb, where PostgreSQL has @> only

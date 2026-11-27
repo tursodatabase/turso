@@ -2089,9 +2089,10 @@ pub enum ResultType {
     /// The first argument, unchanged: `nullif(x, y)` and `likely(x)` return x.
     FirstArgument,
     /// FIXME(pg-catalog): HACK. Only `ExternalFunc::returning_argument_type`
-    /// gives it, for pg_timestamp_plus_interval (index 0) and date_trunc
-    /// (index 1); a pg_proc and pg_operator lookup replaces it. The argument
-    /// at this index, unchanged.
+    /// gives it, for pg_timestamp_plus_interval (index 0), date_trunc
+    /// (index 1), and jsonb_field, jsonb_extract_path and
+    /// jsonb_extract_path_op (index 0); a pg_proc and pg_operator lookup
+    /// replaces it. The argument at this index, unchanged.
     Argument(usize),
     /// One of the arguments, unchanged: `coalesce`, `ifnull`, `min`, `max`.
     OneOfTheArguments,
