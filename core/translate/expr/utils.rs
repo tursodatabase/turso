@@ -82,6 +82,40 @@ pub fn skip_parens_and_collate(mut expr: &ast::Expr) -> &ast::Expr {
     }
 }
 
+/// Skip parentheses, COLLATE, and calls to likely(), unlikely() and
+/// likelihood() around an expression, as SQLite's
+/// sqlite3ExprSkipCollateAndLikely() does after it resolves names. A view
+/// or CREATE TABLE AS names its column `x` for `likely(x)`.
+pub fn skip_parens_collate_and_likely(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        expr = skip_parens_and_collate(expr);
+        match expr {
+            ast::Expr::FunctionCall {
+                name,
+                distinctness: None,
+                args,
+                order_by,
+                within_group,
+                filter_over,
+            } if !args.is_empty()
+                && order_by.is_empty()
+                && within_group.is_empty()
+                && filter_over.filter_clause.is_none()
+                && filter_over.over_clause.is_none()
+                && matches!(
+                    crate::functions::builtin::resolve_builtin_function(name.as_str(), args.len()),
+                    Ok(Some(Func::Scalar(
+                        ScalarFunc::Likely | ScalarFunc::Unlikely | ScalarFunc::Likelihood
+                    )))
+                ) =>
+            {
+                expr = &args[0]
+            }
+            _ => return expr,
+        }
+    }
+}
+
 /// The name, as written, of `expr` if it is a column reference: `X` in
 /// `t.X`, `(X)` or `X COLLATE nocase`.
 pub(crate) fn column_reference_name(expr: &ast::Expr) -> Option<&ast::Name> {

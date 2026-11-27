@@ -129,7 +129,7 @@ pub use translator::{
 pub(crate) use utils::column_reference_name;
 pub use utils::{
     as_binary_components, maybe_apply_affinity, sanitize_string, skip_parens_and_collate,
-    truth_test_rhs, unwrap_parens, unwrap_parens_owned,
+    skip_parens_collate_and_likely, truth_test_rhs, unwrap_parens, unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
 pub(crate) use walk::expression_can_fail_on_input;

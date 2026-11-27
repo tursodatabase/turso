@@ -3,7 +3,7 @@ use crate::ast;
 use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::schema::ColDef;
-use crate::translate::expr::{column_reference_name, skip_parens_and_collate, WalkControl};
+use crate::translate::expr::{column_reference_name, skip_parens_collate_and_likely, WalkControl};
 use crate::translate::plan::{
     left_using_column_sources, star_column_uses_merged_value, stored_column_name,
     unqualified_column_sources, ColumnLookup, JoinInfo, JoinType, OutputColumnNames,
@@ -697,7 +697,7 @@ fn view_result_column_name(
         None => None,
     };
     if names == OutputColumnNames::Resolved {
-        let reference = skip_parens_and_collate(expr);
+        let reference = skip_parens_collate_and_likely(expr);
         if let Some(name) = view_referenced_column(reference, sources, schema)
             .and_then(|column| column.column.name)
             .or_else(|| view_rowid_column_name(reference, sources, schema))

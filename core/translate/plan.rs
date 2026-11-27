@@ -41,7 +41,7 @@ use crate::ast::TableInternalId;
 
 use super::emitter::OperationMode;
 use super::expr::expr_type::{query_column_type, type_ordering, ExprType};
-use super::expr::{skip_parens_and_collate, unwrap_parens};
+use super::expr::{skip_parens_and_collate, skip_parens_collate_and_likely, unwrap_parens};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -142,15 +142,15 @@ impl ResultSetColumn {
 
     /// The name of the column this result column gives CREATE TABLE AS.
     /// SQLite's sqlite3ColumnsFromExprList() names it after it resolves
-    /// names: unlike `name`, it also looks through COLLATE, so
-    /// `t.x COLLATE nocase` is named x. The result set itself is named by
+    /// names: unlike `name`, it also looks through COLLATE and likely(), so
+    /// `t.x COLLATE nocase` and `likely(t.x)` are named x. The result set itself is named by
     /// `name`, as SQLite's sqlite3GenerateColumnNames() names it
     /// `t.x COLLATE nocase`.
     pub fn output_column_name<'a>(&'a self, tables: &'a TableReferences) -> Option<&'a str> {
         if let Some(alias) = &self.alias {
             return Some(alias);
         }
-        self.expr_name(skip_parens_and_collate(&self.expr), tables)
+        self.expr_name(skip_parens_collate_and_likely(&self.expr), tables)
     }
 
     /// The name of the column this result column gives a FROM subquery or a
@@ -165,7 +165,9 @@ impl ResultSetColumn {
         if let Some(name) = self.alias.as_ref().or(self.written_name.as_ref()) {
             return Some(name);
         }
-        self.output_column_name(tables)
+        // SQLite skips likely() only after it resolves names, so unlike
+        // `output_column_name`, `likely(x)` keeps its text.
+        self.expr_name(skip_parens_and_collate(&self.expr), tables)
     }
 
     /// The name of `expr`, which is this column's expression or a part of it

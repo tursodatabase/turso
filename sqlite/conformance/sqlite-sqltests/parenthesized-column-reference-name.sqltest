@@ -128,3 +128,32 @@ expect {
     r.rowid|r.rowid
     1|1
 }
+
+# A view and CREATE TABLE AS name their columns after SQLite resolves names,
+# and sqlite3ExprSkipCollateAndLikely() then skips likely(), unlikely() and
+# likelihood(). A FROM subquery is named before, so it keeps the text.
+@setup schema
+test view-and-create-table-as-likely-column-name {
+    CREATE VIEW v AS SELECT likely(x), unlikely(x) COLLATE nocase, likelihood((x), 0.5), x FROM t;
+    SELECT name FROM pragma_table_info('v');
+    CREATE TABLE t2 AS SELECT likely(x), (unlikely(t.x)), likelihood(x, 0.5), likely(x || y) FROM t;
+    SELECT name FROM pragma_table_info('t2');
+}
+expect {
+    x
+    x:1
+    x:2
+    x:3
+    x
+    x:1
+    x:2
+    likely(x || y)
+}
+
+@setup schema
+test subquery-likely-column-is-not-named-after-the-column {
+    SELECT x FROM (SELECT likely(x) FROM t);
+}
+expect error {
+    no such column: x
+}
