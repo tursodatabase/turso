@@ -5,7 +5,7 @@ use crate::casts::{resolve, wraps_negative_integers, CastType};
 use crate::catalog::{pg_type_category, pg_type_name, pg_type_oid};
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, format_type, undefined_operator_of};
-use crate::pg_type::{built_in_type, IntegerOperator, IntegerType};
+use crate::pg_type::{built_in_type, type_input, IntegerOperator, IntegerType};
 use turso_core::ast;
 use turso_core::dialect::{
     CastContext, ChosenOperator, EngineType, OperandType, OperatorChoice, OperatorFunction,
@@ -43,17 +43,29 @@ pub(crate) struct Operator {
 /// 3. No row can take the operands: the operator is refused with 42883.
 /// 4. A string literal is next to an operand of a number type, and a row
 ///    takes two operands of that type: the literal is read as that type.
-/// 5. Otherwise the engine runs its own operator.
+/// 5. An operand is of type bytea: the row of bytea takes the operands, and a
+///    string literal is read as bytea. A comparison runs in the engine, and
+///    `||` runs the function of the row (`byteacat`).
+/// 6. Otherwise the engine runs its own operator.
 pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<OperatorChoice> {
     let Some(types) = checked_operand_types(operands) else {
         return Ok(OperatorChoice::LeftToTheEngine);
     };
+    // FIXME(pg-catalog): `OPERATORS` has the row of `||` for text and bytea only, and none for `@>`, where PostgreSQL has rows for arrays, jsonb and a text next to any non-array type. Until it has them all, the engine runs these operators when no operand is bytea.
+    if matches!(op, "||" | "@>") && !has_bytea(&types) {
+        return Ok(OperatorChoice::LeftToTheEngine);
+    }
     if !is_run_by_core(op, &types) {
         let oids: Vec<Option<i64>> = types
             .iter()
             .map(|ty| ty.as_ref().map(|ty| ty.oid))
             .collect();
         check_operator(op, &oids)?;
+    }
+    if has_bytea(&types) {
+        if let Some(choice) = bytea_operator_choice(op, &types) {
+            return choice;
+        }
     }
     let (literal, ty) = match (operands, types.as_slice()) {
         ([OperandType::StringLiteral(literal), _], [_, Some(ty)])
@@ -97,6 +109,78 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
         cast_operands: vec![],
         function: integer_operator_function(op, &[ty, ty]),
     }))
+}
+
+fn has_bytea(types: &[Option<Checked>]) -> bool {
+    types.iter().flatten().any(|ty| ty.oid == BYTEA)
+}
+
+/// The choice of the operator `op` when an operand is of type bytea:
+///
+/// - The operands are bytea, or a string literal or parameter: the row of
+///   bytea that `op` names takes them, and a string literal is read as bytea.
+/// - `||` with an operand that is text, or casts to text implicitly: the
+///   bytea is cast to text, and the engine joins the two texts.
+/// - Otherwise no row takes the operands: the operator is refused with 42883.
+///
+/// `None` when bytea has no row for `op` and the operands are only bytea.
+fn bytea_operator_choice(op: &str, types: &[Option<Checked>]) -> Option<Result<OperatorChoice>> {
+    let [left, right] = types else {
+        return None;
+    };
+    let oids = [left, right].map(|ty| ty.as_ref().map(|ty| ty.oid));
+    if oids.iter().flatten().all(|oid| *oid == BYTEA) {
+        let row = OPERATORS
+            .iter()
+            .find(|row| row.name == op && row.left == BYTEA && row.right == BYTEA)?;
+        return Some(Ok(bytea_row_choice(row)));
+    }
+    let bytea_is_left = oids[0] == Some(BYTEA);
+    let other = if bytea_is_left { oids[1] } else { oids[0] };
+    // FIXME(pg-catalog): PostgreSQL has the rows `anynonarray || text` (2780, `anytextcat`) and `text || anynonarray` (2779, `textanycat`) for this, and their functions convert the operand with its output function. Their operand type is a pseudo-type, which pg_type of tursopg does not have, so the rows are not in `OPERATORS` and this hand-codes them for bytea. A pg_type with the pseudo-types lets the rows decide, for every type.
+    let joins_text = op == "||" && other.is_some_and(|oid| implicitly_casts(oid, TEXT));
+    if !joins_text {
+        let names: Vec<String> = oids
+            .iter()
+            .map(|oid| match oid {
+                Some(oid) => format_type(*oid, -1),
+                None => "unknown".to_string(),
+            })
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        return Some(Err(undefined_operator_of(op, &names)));
+    }
+    let text = ast::Type {
+        name: "text".to_string(),
+        size: None,
+        array_dimensions: 0,
+    };
+    Some(Ok(OperatorChoice::Chosen(ChosenOperator {
+        id: if bytea_is_left { 2780 } else { 2779 },
+        operands: vec![text.clone(), text],
+        cast_operands: vec![bytea_is_left, !bytea_is_left],
+        function: None,
+    })))
+}
+
+/// The choice of the row `row` of bytea: both operands are read as bytea.
+fn bytea_row_choice(row: &Operator) -> OperatorChoice {
+    let bytea = ast::Type {
+        name: "bytea".to_string(),
+        size: None,
+        array_dimensions: 0,
+    };
+    // FIXME(pg-catalog): This hand-codes the oprcode of the rows of bytea that need a function of the frontend. The comparisons run in the engine, which compares blobs as `byteaeq` and its kin do. The function a row names, once pg_proc has the functions of every row, replaces this.
+    let function = (row.name == "||").then(|| OperatorFunction {
+        name: "byteacat".to_string(),
+        result: bytea.clone(),
+    });
+    OperatorChoice::Chosen(ChosenOperator {
+        id: row.oid,
+        operands: vec![bytea.clone(), bytea],
+        cast_operands: vec![],
+        function,
+    })
 }
 
 /// FIXME(registered-types): The engine casts an operand that is not a string literal only when the choice says so (`cast_operands`), and this says so only for a cast that wraps a negative integer, which is the cast of an integer to oid. The cast of any other operand to the type of the row is left to the engine, which compares the stored numbers. Once the operand casts come from the operator that `id` names, the choice of any operator says so.
@@ -219,8 +303,8 @@ fn integer_type(oid: i64) -> Option<IntegerType> {
 /// 2. There is one such value, or the operands have no common type
 ///    (`select_common_type`): each value is compared with `x` alone, which
 ///    `choose_operator` decides.
-/// 3. The common type is a number type, and a row takes two operands of that
-///    type: each string literal is read as that type.
+/// 3. The common type is a number type, or has an INPUT, and a row takes two
+///    operands of that type: each string literal is read as that type.
 /// 4. Otherwise the engine runs its own comparisons.
 ///
 /// Every type of `CHECKED_TYPES` but regclass and regtype has a row for `=` and
@@ -249,7 +333,8 @@ pub(crate) fn choose_list_operator(
     let Some(ty) = types.iter().flatten().find(|ty| ty.oid == common) else {
         return Ok(Some(OperatorChoice::LeftToTheEngine));
     };
-    let Some(row) = row.filter(|_| pg_type_category(common) == Some("N")) else {
+    let is_number = pg_type_category(common) == Some("N");
+    let Some(row) = row.filter(|_| is_number || type_input(common).is_some()) else {
         return Ok(Some(OperatorChoice::LeftToTheEngine));
     };
     let literals: Vec<&String> = operands
@@ -260,7 +345,7 @@ pub(crate) fn choose_list_operator(
         })
         .collect();
     let mut left_to_the_engine = literals.is_empty();
-    for literal in literals {
+    for literal in literals.iter().filter(|_| is_number) {
         if is_oid_alias(common) {
             continue;
         }
@@ -563,13 +648,14 @@ fn check_operator(op: &str, types: &[Option<i64>]) -> Result<()> {
     Err(undefined_operator_of(op, &names))
 }
 
-/// FIXME(pg-catalog): `OPERATORS` has no rows for interval, time, bytea, json, jsonb, inet, arrays and enums, and for a comparison of date with timestamp or timestamptz (which tursopg refuses with 0A000), so an operand of those types is not checked. Once pg_operator has all 799 rows, every operand is checked and a type with no row is an error.
+/// FIXME(pg-catalog): `OPERATORS` has no rows for interval, time, json, jsonb, inet, arrays and enums, and for a comparison of date with timestamp or timestamptz (which tursopg refuses with 0A000), so an operand of those types is not checked. Once pg_operator has all 799 rows, every operand is checked and a type with no row is an error.
 /// FIXME(pg-catalog): The rule that regclass and regtype take the operators of oid is hand-coded here and in `fits`, `choose_operator` and `choose_list_operator`, by the type's name. PostgreSQL has no `pg_operator` rows for them: it takes those of oid through the binary-coercible `pg_cast` row from regclass to oid. A lookup of the implicit casts of `pg_cast` from an operand type to a type that has rows replaces this, and the same lookup gives varchar the operators of text.
 /// The types whose operators are decided by the rows of `OPERATORS`. Varchar
 /// has no rows of its own: it takes the operators of text. Regclass and regtype
 /// have none either: they take the operators of oid.
-const CHECKED_TYPES: [i64; 16] = [
+const CHECKED_TYPES: [i64; 17] = [
     BOOL,
+    BYTEA,
     OID,
     REGCLASS,
     REGTYPE,
@@ -649,6 +735,7 @@ const COMPARISONS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
 
 const NONE: i64 = 0;
 const BOOL: i64 = 16;
+const BYTEA: i64 = 17;
 const INT8: i64 = 20;
 const INT2: i64 = 21;
 const INT4: i64 = 23;
@@ -897,6 +984,15 @@ pub(crate) const OPERATORS: &[Operator] = operators![
     (1919, "+", NONE, FLOAT4, FLOAT4, 0, 0, false, false),
     (1920, "+", NONE, FLOAT8, FLOAT8, 0, 0, false, false),
     (1921, "+", NONE, NUMERIC, NUMERIC, 0, 0, false, false),
+    (1955, "=", BYTEA, BYTEA, BOOL, 1955, 1956, true, true),
+    (1956, "<>", BYTEA, BYTEA, BOOL, 1956, 1955, false, false),
+    (1957, "<", BYTEA, BYTEA, BOOL, 1959, 1960, false, false),
+    (1958, "<=", BYTEA, BYTEA, BOOL, 1960, 1959, false, false),
+    (1959, ">", BYTEA, BYTEA, BOOL, 1957, 1958, false, false),
+    (1960, ">=", BYTEA, BYTEA, BOOL, 1958, 1957, false, false),
+    (2016, "~~", BYTEA, BYTEA, BOOL, 0, 2017, false, false),
+    (2017, "!~~", BYTEA, BYTEA, BOOL, 0, 2016, false, false),
+    (2018, "||", BYTEA, BYTEA, BYTEA, 0, 0, false, false),
     (2060, "=", TIMESTAMP, TIMESTAMP, BOOL, 2060, 2061, true, true),
     (2061, "<>", TIMESTAMP, TIMESTAMP, BOOL, 2061, 2060, false, false),
     (2062, "<", TIMESTAMP, TIMESTAMP, BOOL, 2064, 2065, false, false),

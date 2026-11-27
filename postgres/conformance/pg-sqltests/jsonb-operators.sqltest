@@ -629,15 +629,11 @@ test jsonb-contains-of-number-beyond-numeric-limits-errors {
 @sqlstate 22003
 expect error {}
 
-@compat-gap "operator:jsonb @> jsonb"
 test bytea-contains-errors {
     SELECT '\x01'::bytea @> '{}';
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    t
-}
 
 # Core does not know that a column of a VALUES list or of a table that CREATE
 # TABLE AS made is an array, so it runs the jsonb function for @> and <@ on
