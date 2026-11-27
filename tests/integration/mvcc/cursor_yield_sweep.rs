@@ -1031,22 +1031,17 @@ fn check_count(
 fn known_failure(cell: &Cell) -> Option<&'static str> {
     let seek_point = cell.ordinal == CursorYieldPoint::SeekStart.ordinal()
         || cell.ordinal == CursorYieldPoint::SeekBtreeProgress.ordinal();
-    let writes_next_row = matches!(
+    let index_scan = cell.op.name.starts_with("index_");
+    let changes_index_key = matches!(
         cell.change,
-        Change::OwnUpdate(Target::Next)
-            | Change::OwnDelete(Target::Next)
-            | Change::OwnMoveKey(Target::Next)
+        Change::OwnDelete(Target::Next) | Change::OwnMoveKey(Target::Next)
     );
-    if seek_point && writes_next_row {
-        // FIXME: a seek that yields at SeekStart or SeekBtreeProgress does not see a write
-        // of its own transaction made at the yield. When the write gives a B-tree row a new
-        // MvStore version, the seek finds the B-tree row hidden and the stale MvStore head
-        // empty, so it misses the row (`rowid_eq_btree`), or the table lookup of an index
-        // scan returns NULL columns. Also, an index scan reads the index entry of the next
-        // row before the table lookup yields. If the write deletes the row or moves its
-        // index key, the scan still returns the row from the old entry, with NULL or stale
-        // columns. Both fail on main too.
-        return Some("a seek does not see a write of its own transaction made at the yield");
+    if seek_point && index_scan && changes_index_key {
+        // FIXME: an index scan reads the index entry of the next row before the table
+        // lookup yields. If the write deletes the row or moves its index key, the scan
+        // still returns the row from the old entry, with NULL or stale columns. This
+        // fails on main too.
+        return Some("an index scan returns a row that a write at the yield removed");
     }
     None
 }
