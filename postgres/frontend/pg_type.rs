@@ -5,6 +5,7 @@
 
 mod boolean;
 mod bytea;
+mod bytea_functions;
 mod integer;
 mod integer_operators;
 mod oid;
@@ -13,6 +14,7 @@ mod regclass;
 mod regtype;
 mod uuid;
 
+pub(crate) use bytea_functions::register_bytea_functions;
 pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
 pub(crate) use oid::{check_oid_range, oid_input};
