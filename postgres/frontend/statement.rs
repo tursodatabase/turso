@@ -461,6 +461,10 @@ impl Statement {
         }
     }
 
+    pub fn connection(&self) -> &Arc<Connection> {
+        self.inner.get_connection()
+    }
+
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
         self.inner.bind_at(index, value).map_err(Into::into)
     }

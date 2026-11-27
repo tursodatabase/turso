@@ -8,10 +8,10 @@
 //! Nothing here reads a statement: `resolve` and `convert` take the types as
 //! `CastType`. cast_planning.rs finds the `CastType` of an expression.
 
-use crate::catalog::{regclass_oid, regclass_text};
+use crate::catalog::{regclass_oid_of_text, regclass_text};
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text};
-use crate::pg_type::{check_oid_range, parse_regclass, type_input, RegClassInput};
+use crate::pg_type::{check_oid_range, type_input};
 use crate::text::{value_text, TextType};
 use std::sync::Arc;
 use turso_core::dialect::CastContext;
@@ -268,11 +268,7 @@ fn to_regclass(connection: &Arc<Connection>, value: &Value, source: CastType) ->
     let Value::Text(text) = value else {
         return to_oid(value, source);
     };
-    let oid = match parse_regclass(text.as_str())? {
-        RegClassInput::Oid(oid) => oid,
-        RegClassInput::Name { schema, name } => regclass_oid(connection, schema.as_deref(), &name)?,
-    };
-    Ok(Value::from_i64(oid))
+    regclass_oid_of_text(connection, text.as_str()).map(Value::from_i64)
 }
 
 fn to_oid(value: &Value, source: CastType) -> Result<Value> {
@@ -444,10 +440,12 @@ fn to_text(connection: &Arc<Connection>, value: &Value, source: CastType) -> Res
         (Value::Numeric(Numeric::Float(f)), CastType::Float4 | CastType::Float8) => {
             float8_text(f64::from(*f))
         }
-        (Value::Text(_), CastType::TimestampTz) => match value_text(value, TextType::TimestampTz) {
-            Some(text) => text.into_owned(),
-            None => return Ok(value.clone()),
-        },
+        (Value::Text(_), CastType::TimestampTz) => {
+            match value_text(value, TextType::TimestampTz, connection) {
+                Some(text) => text.into_owned(),
+                None => return Ok(value.clone()),
+            }
+        }
         _ => return Ok(value.clone()),
     };
     Ok(Value::build_text(text))

@@ -169,6 +169,33 @@ expect error {
     operator does not exist: regclass = numeric
 }
 
+test regclass-result-column-prints-the-name {
+    SELECT 'pg_class'::regclass, NULL::regclass;
+}
+expect {
+    pg_class|
+}
+
+@setup relations
+test regclass-result-column-prints-the-schema-off-the-search-path {
+    SELECT 'other.only_there'::regclass, 'public.t'::regclass;
+}
+expect {
+    other.only_there|t
+}
+
+@setup relations
+test regclass-column-prints-the-name {
+    CREATE TABLE uses (id int, r regclass);
+    INSERT INTO uses VALUES (1, 't'), (2, 'other.t'), (3, '"Mixed Case"');
+    SELECT r FROM uses ORDER BY id;
+}
+expect {
+    t
+    other.t
+    "Mixed Case"
+}
+
 @setup relations
 test regclass-casts-to-integers {
     SELECT 'pg_class'::regclass::int4, 'pg_class'::regclass::int8, 'pg_class'::regclass::oid;
@@ -317,3 +344,67 @@ test regclass-column-refuses-a-missing-relation {
 expect error {
     relation "nosuch" does not exist
 }
+
+@setup relations
+test regclass-finds-a-view {
+    CREATE VIEW v AS SELECT id FROM t;
+    SELECT 'v'::regclass::text, (SELECT relkind FROM pg_class WHERE oid = 'v'::regclass);
+}
+expect {
+    v|v
+}
+
+@setup relations
+test regclass-finds-a-catalog-view {
+    SELECT 'pg_tables'::regclass::text, 'pg_catalog.pg_tables'::regclass = (SELECT oid FROM pg_class WHERE relname = 'pg_tables');
+}
+expect {
+    pg_tables|t
+}
+
+@setup relations
+test regclass-in-list-reads-names {
+    SELECT 'pg_class'::regclass IN ('pg_class', 'pg_type'), 't'::regclass IN ('other.t', 'pg_type'), 't'::regclass NOT IN ('t', 'pg_type');
+}
+expect {
+    t|f|f
+}
+
+test regclass-reads-a-dash-as-no-relation {
+    SELECT '-'::regclass::int, '-'::regclass::text;
+}
+expect {
+    0|-
+}
+
+test regclass-folds-only-ascii-letters {
+    CREATE TABLE "é" (a int);
+    SELECT 'É'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-reads-digits-with-spaces-as-a-name {
+    SELECT ' 12 '::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-reads-the-catalog-tables-of-every-database {
+    SELECT 'pg_authid'::regclass::oid, 'pg_enum'::regclass::oid, 'pg_statistic'::regclass::oid;
+}
+expect {
+    1260|3501|2619
+}
+
+test regclass-looks-up-an-empty-quoted-name {
+    SELECT '""'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-looks-up-an-empty-quoted-schema {
+    SELECT '"".t'::regclass;
+}
+@sqlstate 42P01
+expect error {}

@@ -52,9 +52,11 @@ pub(crate) enum RegClassInput {
 /// and anything else is a relation name with an optional schema, where an
 /// unquoted part is lowercase and a quoted part keeps its case.
 pub(crate) fn parse_regclass(text: &str) -> Result<RegClassInput> {
-    let trimmed = text.trim();
-    if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
-        return match oid_input(trimmed)? {
+    if text == "-" {
+        return Ok(RegClassInput::Oid(0));
+    }
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        return match oid_input(text)? {
             Value::Numeric(Numeric::Integer(oid)) => Ok(RegClassInput::Oid(oid)),
             other => unreachable!("oid input gives an integer, not {other:?}"),
         };

@@ -12,7 +12,8 @@
 use crate::error::sqlstate_error;
 use crate::session::relation_lookup_namespaces;
 use crate::text::{value_text, TextType};
-use turso_core::{LimboError, Result, Row};
+use std::sync::Arc;
+use turso_core::{Connection, LimboError, Result, Row};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_BAD_COPY_FILE_FORMAT, SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE, SQLSTATE_UNDEFINED_COLUMN,
     SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
@@ -21,6 +22,7 @@ use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
 
 pub struct CopyTextEncoder {
     columns: Vec<TextType>,
+    connection: Arc<Connection>,
 }
 
 impl CopyTextEncoder {
@@ -28,7 +30,10 @@ impl CopyTextEncoder {
         let columns = (0..stmt.num_columns())
             .map(|index| TextType::of_column(stmt, index))
             .collect();
-        Self { columns }
+        Self {
+            columns,
+            connection: stmt.connection().clone(),
+        }
     }
 
     /// Append one COPY text record, including its trailing newline.
@@ -38,7 +43,7 @@ impl CopyTextEncoder {
             if index > 0 {
                 output.push(b'\t');
             }
-            match value_text(value, *text_type) {
+            match value_text(value, *text_type, &self.connection) {
                 None => output.extend_from_slice(b"\\N"),
                 Some(text) => escape_copy_text(text.as_bytes(), output),
             }

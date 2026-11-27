@@ -728,41 +728,39 @@ fn user_tables_with_oids(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>
         .collect()
 }
 
-/// The oid of the relation that a regclass input names: a table, an index or
-/// a sequence, or a catalog table when the name is not qualified with another
-/// schema than pg_catalog. Fails with 42P01 when there is none.
+/// The oid of the relation that a regclass input names, as pg_class lists it:
+/// a table, view, index, sequence or catalog. A catalog table that pg_class
+/// does not list has its PostgreSQL oid. Fails with 42P01 when there is no such
+/// relation, as it does for a catalog view that this frontend does not have.
 pub(crate) fn regclass_oid(
     conn: &Arc<Connection>,
     schema: Option<&str>,
     name: &str,
 ) -> Result<i64> {
     if schema.is_none_or(|schema| schema == "pg_catalog") {
+        let listed = conn.with_schema(MAIN_DB_ID, |schema| {
+            crate::classes::class_catalog(schema)?
+                .get_by_relname(NamespaceId::ROOT, name)
+                .map(|class| class.oid)
+        });
+        if let Some(oid) = listed {
+            return Ok(oid);
+        }
         if let Some(&(_, oid)) = CATALOG_TABLE_OIDS.iter().find(|(table, _)| *table == name) {
             return Ok(oid);
         }
     }
-    if schema.is_none_or(|schema| schema == "pg_catalog") && is_catalog_view_name(name) {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            format!("regclass of \"{name}\" is not supported: it is a view"),
-            None,
-        ));
-    }
-    let namespaces = crate::session::relation_lookup_namespaces(conn, schema);
-    for namespace in namespaces {
+    for namespace in crate::session::relation_lookup_namespaces(conn, schema) {
+        if namespace.target.id.is_root() {
+            continue;
+        }
         let found = conn.with_schema(namespace.database_id(), |schema| {
-            find_relation(schema, namespace.target.id, name)
+            crate::classes::class_catalog(schema)?
+                .get_by_relname(namespace.target.id, name)
+                .map(|class| class.oid)
         });
-        match found {
-            RelationLookup::Oid(oid) => return Ok(oid),
-            RelationLookup::Unsupported => {
-                return Err(sqlstate_error(
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    format!("regclass of \"{name}\" is not supported: only tables, indexes and sequences have an oid"),
-                    None,
-                ))
-            }
-            RelationLookup::Missing => {}
+        if let Some(oid) = found {
+            return Ok(oid);
         }
     }
     let written = match schema {
@@ -776,165 +774,110 @@ pub(crate) fn regclass_oid(
     ))
 }
 
-enum RelationLookup {
-    Oid(i64),
-    Unsupported,
-    Missing,
-}
-
-/// The oid that pg_class gives the relation `name` of `namespace`. A view has
-/// no row in pg_class, so it has no oid.
-fn find_relation(schema: &Schema, namespace: NamespaceId, name: &str) -> RelationLookup {
-    if namespace.is_root() {
-        return if schema.relation_kind(namespace, name).is_some() {
-            RelationLookup::Unsupported
-        } else {
-            RelationLookup::Missing
-        };
-    }
-    match class_relations(schema)
-        .into_iter()
-        .find(|relation| relation.namespace == namespace && relation.name == name)
-    {
-        Some(relation) => RelationLookup::Oid(relation.oid),
-        None if is_view_kind(schema.relation_kind(namespace, name)) => RelationLookup::Unsupported,
-        None => RelationLookup::Missing,
-    }
-}
-
-fn is_view_kind(kind: Option<RelationKind>) -> bool {
-    matches!(
-        kind,
-        Some(RelationKind::View | RelationKind::MaterializedView)
-    )
-}
-
 /// The text of the regclass value `oid`: the name of the relation, with its
 /// schema when the relation is not on the search path, or the number when no
 /// relation has that oid. 0 is `-`.
-pub(crate) fn regclass_text(conn: &Arc<Connection>, oid: i64) -> String {
+pub(crate) fn regclass_text(conn: &Connection, oid: i64) -> String {
     if oid == 0 {
         return "-".to_string();
     }
-    if let Some(&(name, _)) = CATALOG_TABLE_OIDS
-        .iter()
-        .find(|(_, table_oid)| *table_oid == oid)
-    {
-        return name.to_string();
-    }
     let schema = conn.current_schema();
-    let relations = class_relations(&schema);
-    let Some(relation) = relations.iter().find(|relation| relation.oid == oid) else {
+    let Some(catalog) = crate::classes::class_catalog(&schema) else {
         return oid.to_string();
     };
-    let first_visible = conn
-        .search_order()
-        .into_iter()
-        .filter(|namespace| namespace.database_id() == MAIN_DB_ID)
-        .map(|namespace| namespace.target.id)
-        .find(|namespace| {
-            relations
-                .iter()
-                .any(|other| other.namespace == *namespace && other.name == relation.name)
-        });
-    if first_visible == Some(relation.namespace) {
-        quote_identifier(&relation.name)
-    } else {
-        format!(
+    let Some(relation) = catalog.get_by_oid(oid) else {
+        return match CATALOG_TABLE_OIDS
+            .iter()
+            .find(|(_, table_oid)| *table_oid == oid)
+        {
+            Some(&(name, _)) => name.to_string(),
+            None => oid.to_string(),
+        };
+    };
+    if relation.relnamespace.is_root() {
+        return quote_identifier(&relation.relname);
+    }
+    // pg_catalog is searched first, so a relation that has the name of a
+    // catalog is not found by that name alone.
+    let hides_catalog = catalog
+        .get_by_relname(NamespaceId::ROOT, &relation.relname)
+        .is_some()
+        || CATALOG_TABLE_OIDS
+            .iter()
+            .any(|(name, _)| *name == relation.relname);
+    if hides_catalog {
+        return format!(
             "{}.{}",
-            quote_identifier(schema_name_of(&schema, relation.namespace)),
-            quote_identifier(&relation.name)
-        )
+            quote_identifier(schema_name_of(&schema, relation.relnamespace)),
+            quote_identifier(&relation.relname)
+        );
+    }
+    let engine_name = relation.engine_name.as_deref().unwrap_or(&relation.relname);
+    relation_name(conn, &schema, relation.relnamespace, engine_name)
+}
+
+/// The oid that the text of a regclass names: digits are an oid, and anything
+/// else is the name of a relation, which must exist.
+pub(crate) fn regclass_oid_of_text(conn: &Arc<Connection>, text: &str) -> Result<i64> {
+    match crate::pg_type::parse_regclass(text)? {
+        crate::pg_type::RegClassInput::Oid(oid) => Ok(oid),
+        crate::pg_type::RegClassInput::Name { schema, name } => {
+            regclass_oid(conn, schema.as_deref(), &name)
+        }
     }
 }
 
-/// A table, index or sequence as pg_class lists it.
-struct ClassRelation {
-    namespace: NamespaceId,
-    name: String,
-    oid: i64,
-}
-
-fn class_relations(schema: &Schema) -> Vec<ClassRelation> {
-    let tables =
-        user_tables_with_oids(schema)
-            .into_iter()
-            .filter_map(|(namespace, _, table, oid)| match table.as_ref() {
-                Table::BTree(btree) => Some(ClassRelation {
-                    namespace,
-                    name: btree.declared_name.clone(),
-                    oid,
-                }),
-                _ => None,
-            });
-    let indexes = catalog_indexes(schema)
-        .into_iter()
-        .map(|index| ClassRelation {
-            namespace: index.namespace,
-            name: index.name,
-            oid: index.oid,
-        });
-    let sequences =
-        sequence_catalog_entries(schema)
-            .into_iter()
-            .map(|(oid, namespace, sequence)| ClassRelation {
-                namespace,
-                name: sequence.name.clone(),
-                oid,
-            });
-    tables.chain(indexes).chain(sequences).collect()
-}
-
-/// The catalog tables, with the oid that PostgreSQL gives each. PostgreSQL
-/// fixes these oids, unlike those of its catalog views.
+/// FIXME(pg-catalog): These oids were copied by hand from the pg_class of
+/// PostgreSQL 18. When pg_class lists these catalogs, its rows replace them.
+/// The catalog tables that this frontend does not implement, with the oid
+/// that PostgreSQL gives each. The implemented ones have their oid in
+/// `BUILTIN_CATALOGS`, which pg_class lists.
 const CATALOG_TABLE_OIDS: &[(&str, i64)] = &[
-    ("pg_am", 2601),
+    ("pg_aggregate", 2600),
     ("pg_amop", 2602),
     ("pg_amproc", 2603),
-    ("pg_attrdef", 2604),
-    ("pg_attribute", 1249),
-    ("pg_auth_members", 1261),
-    ("pg_cast", 2605),
-    ("pg_class", 1259),
+    ("pg_authid", 1260),
     ("pg_collation", 3456),
-    ("pg_constraint", 2606),
     ("pg_conversion", 2607),
-    ("pg_database", 1262),
+    ("pg_db_role_setting", 2964),
     ("pg_default_acl", 826),
-    ("pg_depend", 2608),
-    ("pg_description", 2609),
+    ("pg_enum", 3501),
     ("pg_event_trigger", 3466),
     ("pg_extension", 3079),
     ("pg_foreign_data_wrapper", 2328),
     ("pg_foreign_server", 1417),
     ("pg_foreign_table", 3118),
-    ("pg_index", 2610),
     ("pg_inherits", 2611),
     ("pg_init_privs", 3394),
-    ("pg_language", 2612),
+    ("pg_largeobject", 2613),
     ("pg_largeobject_metadata", 2995),
-    ("pg_namespace", 2615),
     ("pg_opclass", 2616),
-    ("pg_operator", 2617),
     ("pg_opfamily", 2753),
+    ("pg_parameter_acl", 6243),
     ("pg_partitioned_table", 3350),
-    ("pg_policy", 3256),
-    ("pg_proc", 1255),
     ("pg_publication", 6104),
     ("pg_publication_namespace", 6237),
     ("pg_publication_rel", 6106),
     ("pg_range", 3541),
-    ("pg_rewrite", 2618),
-    ("pg_sequence", 2224),
+    ("pg_replication_origin", 6000),
+    ("pg_seclabel", 3596),
+    ("pg_shdepend", 1214),
+    ("pg_shdescription", 2396),
+    ("pg_shseclabel", 3592),
+    ("pg_statistic", 2619),
+    ("pg_statistic_ext", 3381),
+    ("pg_statistic_ext_data", 3429),
     ("pg_subscription", 6100),
+    ("pg_subscription_rel", 6102),
     ("pg_tablespace", 1213),
     ("pg_transform", 3576),
     ("pg_trigger", 2620),
     ("pg_ts_config", 3602),
+    ("pg_ts_config_map", 3603),
     ("pg_ts_dict", 3600),
     ("pg_ts_parser", 3601),
     ("pg_ts_template", 3764),
-    ("pg_type", 1247),
+    ("pg_user_mapping", 1418),
 ];
 
 /// Build a mapping from namespace and table name to OID for all user tables.
@@ -4863,6 +4806,18 @@ mod tests {
     use tempfile::tempdir;
     use turso_core::{ConnectOpts, SessionRole};
     use turso_sqlite::SqliteDialect;
+
+    #[test]
+    fn catalog_table_oids_leave_out_the_implemented_catalogs() {
+        for (name, oid) in CATALOG_TABLE_OIDS {
+            assert!(
+                BUILTIN_CATALOGS
+                    .iter()
+                    .all(|&(builtin_oid, builtin, _, _)| builtin != *name && builtin_oid != *oid),
+                "{name} is implemented: its oid comes from BUILTIN_CATALOGS"
+            );
+        }
+    }
 
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.

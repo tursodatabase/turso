@@ -224,7 +224,9 @@ fn integer_type(oid: i64) -> Option<IntegerType> {
 /// 4. Otherwise the engine runs its own comparisons.
 ///
 /// Every type of `CHECKED_TYPES` but regclass has a row for `=` and `<>` with
-/// itself, so a common type never makes the operator undefined.
+/// itself, and regclass takes the rows of oid, so a common type never makes the
+/// operator undefined. A string literal in a list with a regclass is read as a
+/// regclass, as PostgreSQL does, where `=` reads it as an oid.
 pub(crate) fn choose_list_operator(
     op: &str,
     operands: &[OperandType],
@@ -240,7 +242,9 @@ pub(crate) fn choose_list_operator(
     let Some(common) = common_type(&oids).filter(|_| values.len() > 1) else {
         return Ok(None);
     };
-    let takes_two = |row: &&Operator| row.name == op && row.left == common && row.right == common;
+    let row_type = if common == REGCLASS { OID } else { common };
+    let takes_two =
+        |row: &&Operator| row.name == op && row.left == row_type && row.right == row_type;
     let row = OPERATORS.iter().find(takes_two);
     let Some(ty) = types.iter().flatten().find(|ty| ty.oid == common) else {
         return Ok(Some(OperatorChoice::LeftToTheEngine));
@@ -257,6 +261,9 @@ pub(crate) fn choose_list_operator(
         .collect();
     let mut left_to_the_engine = literals.is_empty();
     for literal in literals {
+        if common == REGCLASS {
+            continue;
+        }
         if is_spelling_left_to_the_engine(literal, common) {
             left_to_the_engine = true;
         } else {
