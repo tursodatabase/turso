@@ -99,6 +99,9 @@ in the same transaction, and schema loading rejects missing or orphaned user
 identities. Column counts, check counts, index presence and ACL display text
 are derived from the current schema and roles instead of stored a second time.
 Changes to built-in catalog definitions do not require file updates.
+Views report zero pages and an unknown row estimate (`reltuples = -1`). Stored
+relations report initial estimates; collected PostgreSQL planner statistics are
+not implemented.
 Catalog indexes are not implemented, so built-in catalogs report
 `relhasindex = false`; PostgreSQL reports true for its indexed catalogs.
 `pg_description` is a stored table. It has the comments that `COMMENT ON`

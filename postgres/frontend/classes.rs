@@ -561,11 +561,14 @@ fn public_class_row(
     checks: usize,
     shared: bool,
 ) -> Vec<Value> {
-    let (access_method, replica_identity, reltuples) = match class.relkind {
-        RelationKind::Table | RelationKind::MaterializedView => (2, "d", 0.0),
-        RelationKind::Index => (403, "d", 0.0),
-        RelationKind::Sequence => (0, "n", 1.0),
-        RelationKind::View => (0, "n", 0.0),
+    // Views have no storage and use PostgreSQL's unknown row estimate (-1).
+    // FIXME(pg-statistics): Stored relations use PostgreSQL's initial estimates.
+    // Collected planner statistics should replace the estimates for stored relations.
+    let (access_method, replica_identity, relpages, reltuples) = match class.relkind {
+        RelationKind::Table | RelationKind::MaterializedView => (2, "d", 0, -1.0),
+        RelationKind::Index => (403, "d", 1, 0.0),
+        RelationKind::Sequence => (0, "n", 1, 1.0),
+        RelationKind::View => (0, "n", 0, -1.0),
     };
     let acl = class.relacl.as_ref().map_or(Value::Null, |acl| {
         Value::build_text(acl.display_text(&|oid| {
@@ -583,7 +586,7 @@ fn public_class_row(
         Value::from_i64(access_method), // relam
         Value::from_i64(0),             // relfilenode
         Value::from_i64(0),             // reltablespace
-        Value::from_i64(1),             // relpages
+        Value::from_i64(relpages),
         Value::from_f64(reltuples),
         Value::from_i64(0), // relallvisible
         Value::from_i64(0), // relallfrozen

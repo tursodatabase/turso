@@ -2879,6 +2879,40 @@ expect {
     catalog_self|1
 }
 
+test pg-class-initial-relation-statistics {
+    CREATE TABLE stats_source (x int);
+    CREATE INDEX stats_ix ON stats_source(x);
+    CREATE VIEW stats_view AS SELECT * FROM stats_source;
+    CREATE SEQUENCE stats_seq;
+    SELECT relname, relpages, reltuples::int FROM pg_class
+        WHERE relname IN ('stats_source', 'stats_ix', 'stats_view', 'stats_seq')
+        ORDER BY relname;
+    INSERT INTO stats_source VALUES (1), (2);
+    SELECT relpages, reltuples::int FROM pg_class WHERE relname = 'stats_view';
+}
+expect {
+    stats_ix|1|0
+    stats_seq|1|1
+    stats_source|0|-1
+    stats_view|0|-1
+    0|-1
+}
+
+test pg-class-builtin-view-statistics {
+    SELECT relname, relpages, reltuples::int FROM pg_class
+        WHERE relnamespace = 11 AND relname IN
+            ('pg_indexes', 'pg_policies', 'pg_roles', 'pg_sequences', 'pg_settings', 'pg_tables')
+        ORDER BY relname;
+}
+expect {
+    pg_indexes|0|-1
+    pg_policies|0|-1
+    pg_roles|0|-1
+    pg_sequences|0|-1
+    pg_settings|0|-1
+    pg_tables|0|-1
+}
+
 # PostgreSQL indexes its physical catalogs. These catalog indexes are not
 # implemented by tursopg's virtual catalogs and must not be advertised.
 @compat-gap "syntax:catalog"

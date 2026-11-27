@@ -706,10 +706,10 @@ fn every_new_class_row_has_all_the_columns_of_pg_class(db: TempDatabase) {
     pg.execute("CREATE INDEX t_x ON t (x)").unwrap();
     pg.execute("CREATE VIEW v AS SELECT x FROM t").unwrap();
 
-    let table = "0,0,2,0,0,1,0,0,0,1,0,p,r,2,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
+    let table = "0,0,2,0,0,0,-1,0,0,1,0,p,r,2,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
     let index = "0,0,403,0,0,1,0,0,0,0,0,p,i,1,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
     let sequence = "0,0,0,0,0,1,1,0,0,0,0,p,S,3,0,0,0,0,0,1,n,0,0,0,0,NULL,NULL";
-    let view = "0,0,0,0,0,1,0,0,0,0,0,p,v,1,0,1,0,0,0,1,n,0,0,0,0,NULL,NULL";
+    let view = "0,0,0,0,0,0,-1,0,0,0,0,p,v,1,0,1,0,0,0,1,n,0,0,0,0,NULL,NULL";
     assert_eq!(stored_pg_class_columns(&conn, "t"), table);
     assert_eq!(stored_pg_class_columns(&conn, "t_x"), index);
     assert_eq!(stored_pg_class_columns(&conn, "t_id_seq"), sequence);
