@@ -745,35 +745,56 @@ fn ref_act_to_char(act: &RefAct) -> &'static str {
     }
 }
 
-/// Implemented catalog relations. Empty compatibility placeholders have no row. The OIDs and kinds were
-/// checked against PostgreSQL 18's pg_class after initdb.
-pub(crate) const BUILTIN_CATALOGS: &[(i64, &str, RelationKind, bool)] = &[
-    (2601, "pg_am", RelationKind::Table, false),
-    (2604, "pg_attrdef", RelationKind::Table, false),
-    (1249, "pg_attribute", RelationKind::Table, false),
-    (1261, "pg_auth_members", RelationKind::Table, true),
-    (2605, "pg_cast", RelationKind::Table, false),
-    (1259, "pg_class", RelationKind::Table, false),
-    (2606, "pg_constraint", RelationKind::Table, false),
-    (1262, "pg_database", RelationKind::Table, true),
-    (2608, "pg_depend", RelationKind::Table, false),
-    (2609, "pg_description", RelationKind::Table, false),
-    (2610, "pg_index", RelationKind::Table, false),
-    (12043, "pg_indexes", RelationKind::View, false),
-    (2612, "pg_language", RelationKind::Table, false),
-    (2615, "pg_namespace", RelationKind::Table, false),
-    (2617, "pg_operator", RelationKind::Table, false),
-    (12018, "pg_policies", RelationKind::View, false),
-    (3256, "pg_policy", RelationKind::Table, false),
-    (1255, "pg_proc", RelationKind::Table, false),
-    (2618, "pg_rewrite", RelationKind::Table, false),
-    (12000, "pg_roles", RelationKind::View, false),
-    (2224, "pg_sequence", RelationKind::Table, false),
-    (12048, "pg_sequences", RelationKind::View, false),
-    (12104, "pg_settings", RelationKind::View, false),
-    (12033, "pg_tables", RelationKind::View, false),
-    (1247, "pg_type", RelationKind::Table, false),
-];
+// Each implemented virtual catalog is registered and given its pg_class
+// identity here. Empty compatibility modules use the separate path below.
+// The OIDs and kinds were checked against PostgreSQL 18 after initdb.
+macro_rules! builtin_catalogs {
+    ($(($oid:expr, $name:literal, $table:ident, $kind:ident, $shared:expr)),* $(,)?) => {
+        $(impl $table {
+            const CATALOG_OID: i64 = $oid;
+        })*
+
+        pub(crate) const BUILTIN_CATALOGS: &[(i64, &str, RelationKind, bool)] = &[
+            $(($table::CATALOG_OID, $name, RelationKind::$kind, $shared),)*
+            // pg_description is stored; schema_init registers its TableInit.
+            (2609, crate::descriptions::DESCRIPTION_TABLE_NAME, RelationKind::Table, false),
+        ];
+
+        fn register_builtin_catalogs(mut options: OpenOptions) -> OpenOptions {
+            $(options = options.native_module(
+                $name, VTabKind::TableValuedFunction, SnapshotCatalog::<$table>(PhantomData)
+            );)*
+            options
+        }
+    };
+}
+
+builtin_catalogs! {
+    (2601, "pg_am", PgAmTable, Table, false),
+    (2604, "pg_attrdef", PgAttrdefTable, Table, false),
+    (1249, "pg_attribute", PgAttributeTable, Table, false),
+    (1261, "pg_auth_members", PgAuthMembersTable, Table, true),
+    (2605, "pg_cast", PgCastTable, Table, false),
+    (PG_CLASS_OID, "pg_class", PgClassTable, Table, false),
+    (2606, "pg_constraint", PgConstraintTable, Table, false),
+    (1262, "pg_database", PgDatabaseTable, Table, true),
+    (2608, "pg_depend", PgDependTable, Table, false),
+    (2610, "pg_index", PgIndexTable, Table, false),
+    (12043, "pg_indexes", PgIndexesTable, View, false),
+    (2612, "pg_language", PgLanguageTable, Table, false),
+    (PG_NAMESPACE_OID, "pg_namespace", PgNamespaceTable, Table, false),
+    (2617, "pg_operator", PgOperatorTable, Table, false),
+    (12018, "pg_policies", PgPoliciesTable, View, false),
+    (3256, "pg_policy", PgPolicyTable, Table, false),
+    (1255, "pg_proc", PgProcTable, Table, false),
+    (PG_REWRITE_OID, "pg_rewrite", PgRewriteTable, Table, false),
+    (12000, "pg_roles", PgRolesTable, View, false),
+    (2224, "pg_sequence", PgSequenceTable, Table, false),
+    (12048, "pg_sequences", PgSequencesTable, View, false),
+    (12104, "pg_settings", PgSettingsTable, View, false),
+    (12033, "pg_tables", PgTablesTable, View, false),
+    (1247, "pg_type", PgTypeTable, Table, false),
+}
 
 /// The exposed columns, excluding hidden implementation and system columns.
 pub(crate) fn builtin_catalog_columns(
@@ -846,7 +867,7 @@ impl SnapshotRows for PgClassTable {
     tableoid INTEGER HIDDEN)";
     /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -872,7 +893,7 @@ impl SnapshotRows for PgNamespaceTable {
         )";
     /// Fixed PostgreSQL OID of pg_namespace, which describes schemas.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(PG_NAMESPACE_OID);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -1002,7 +1023,7 @@ impl SnapshotRows for PgAttributeTable {
             attmissingval TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(1249);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 1000;
 
@@ -1410,7 +1431,7 @@ impl SnapshotRows for PgProcTable {
             proacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(1255);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -1486,7 +1507,7 @@ impl SnapshotRows for PgDatabaseTable {
             datacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(1262);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -1538,7 +1559,7 @@ impl SnapshotRows for PgAmTable {
         )";
     /// Fixed PostgreSQL OID of pg_am, which lists table and index access methods.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2601);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -1694,7 +1715,7 @@ impl SnapshotRows for PgPolicyTable {
             tableoid INTEGER HIDDEN
         )";
     /// PostgreSQL's oid of pg_policy.
-    const TABLE_OID: Option<i64> = Some(3256);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1952,7 +1973,7 @@ struct PgTypeTable;
 
 impl SnapshotRows for PgTypeTable {
     const SCHEMA: &'static str = PG_TYPE_SQL;
-    const TABLE_OID: Option<i64> = Some(1247);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2095,7 +2116,7 @@ struct PgIndexTable;
 
 impl SnapshotRows for PgIndexTable {
     const SCHEMA: &'static str = PG_INDEX_SQL;
-    const TABLE_OID: Option<i64> = Some(2610);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2193,7 +2214,7 @@ impl SnapshotRows for PgConstraintTable {
     /// Fixed PostgreSQL OID of pg_constraint, which describes primary keys,
     /// unique constraints, foreign keys and checks.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2606);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2485,7 +2506,7 @@ impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
     /// Fixed PostgreSQL OID of pg_attrdef, which describes column default expressions.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2604);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2548,7 +2569,7 @@ impl SnapshotRows for PgSequenceTable {
         seqmax BIGINT, seqmin BIGINT, seqcache BIGINT, seqcycle BOOLEAN,
         tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2224);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
@@ -2671,6 +2692,7 @@ impl SnapshotRows for PgSequencesTable {
 }
 
 pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
+    options = register_builtin_catalogs(options);
     options = options.native_module(
         "unnest",
         VTabKind::TableValuedFunction,
@@ -2692,56 +2714,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             append_rows: crate::options::append_options,
         },
     );
-    options = options.native_module(
-        "pg_class",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgClassTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_namespace",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgNamespaceTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_attribute",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAttributeTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_roles",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgRolesTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_auth_members",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAuthMembersTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_am",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAmTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_proc",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgProcTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_database",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgDatabaseTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_tables",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgTablesTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_indexes",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgIndexesTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_information_schema_schemata",
         VTabKind::TableValuedFunction,
@@ -2755,26 +2728,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             create: PgGetTableDefTable::new,
         },
     );
-    options = options.native_module(
-        "pg_index",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgIndexTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_constraint",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgConstraintTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_type",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgTypeTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_attrdef",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAttrdefTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_input_error_info",
         VTabKind::TableValuedFunction,
@@ -2783,21 +2737,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             create: PgInputErrorInfoTable::new,
         },
     );
-    options = options.native_module(
-        "pg_sequence",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgSequenceTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_sequences",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgSequencesTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_settings",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgSettingsTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_extension",
         VTabKind::TableValuedFunction,
@@ -2810,16 +2750,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
-    options = options.native_module(
-        "pg_policy",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgPolicyTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_policies",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgPoliciesTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
@@ -2835,11 +2766,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)".to_string() },
     );
-    options = options.native_module(
-        "pg_rewrite",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgRewriteTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_foreign_table",
         VTabKind::TableValuedFunction,
@@ -2893,11 +2820,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
-    options = options.native_module(
-        "pg_depend",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgDependTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_tablespace",
         VTabKind::TableValuedFunction,
@@ -2920,11 +2843,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
-    options = options.native_module(
-        "pg_cast",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgCastTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_transform",
         VTabKind::TableValuedFunction,
@@ -2936,16 +2855,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
-    options = options.native_module(
-        "pg_language",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgLanguageTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_operator",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgOperatorTable>(PhantomData),
-    );
+
     for (name, create_sql) in [
         (
             "pg_opclass",
@@ -3087,7 +2997,7 @@ impl SnapshotRows for PgLanguageTable {
         lanpltrusted BOOLEAN, lanplcallfoid INTEGER, laninline INTEGER,
         lanvalidator INTEGER, lanacl TEXT[], tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2612);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -3121,7 +3031,7 @@ impl SnapshotRows for PgOperatorTable {
         oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
         oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2617);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 200;
 
@@ -3163,7 +3073,7 @@ impl SnapshotRows for PgCastTable {
         oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
         castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2605);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -3302,7 +3212,7 @@ impl SnapshotRows for PgDependTable {
     )";
     /// Fixed PostgreSQL OID of pg_depend, which records dependencies between objects.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2608);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -3573,7 +3483,7 @@ struct PgRewriteTable;
 
 impl SnapshotRows for PgRewriteTable {
     const SCHEMA: &'static str = "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead BOOLEAN, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)";
-    const TABLE_OID: Option<i64> = Some(PG_REWRITE_OID);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
