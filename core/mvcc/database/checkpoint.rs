@@ -1100,20 +1100,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         result
     }
 
-    /// Returns all checkpointable [RowVersion]s for that `table_id`
-    fn maybe_get_checkpointable_versions(
-        &self,
-        versions: &[RowVersion],
-        table_id: MVTableId,
-    ) -> Result<smallvec::SmallVec<[RowVersion; 1]>> {
-        Ok(self
-            .checkpointable_versions_and_db_file_presence(versions, table_id)?
-            .0)
-    }
-
     /// Returns all checkpointable [RowVersion]s for that `table_id`, and whether the row is in
     /// the database file before this checkpoint writes anything.
-    fn checkpointable_versions_and_db_file_presence(
+    fn maybe_get_checkpointable_versions(
         &self,
         versions: &[RowVersion],
         table_id: MVTableId,
@@ -1309,7 +1298,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // deleted, and only once. Thus this tracks whether the rowid has a row in the database
         // file while the versions are added to the write set.
         let (versions_to_checkpoint, mut row_in_db_file) =
-            self.checkpointable_versions_and_db_file_presence(row_versions, key.table_id)?;
+            self.maybe_get_checkpointable_versions(row_versions, key.table_id)?;
         for version in versions_to_checkpoint {
             let is_delete = version.end().is_some();
 
@@ -1639,7 +1628,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let index_destroyed = self.destroyed_indexes.contains(&index_id);
         let index_write_set_len_before = self.index_write_set.len();
         if !index_destroyed {
-            for version in self.maybe_get_checkpointable_versions(versions, index_id)? {
+            for version in self
+                .maybe_get_checkpointable_versions(versions, index_id)?
+                .0
+            {
                 let is_delete = version.end().is_some();
                 if is_delete && !self.table_exists_for_snapshot(index_id) {
                     continue;
@@ -1709,6 +1701,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             let versions = entry.value().read();
             if self
                 .maybe_get_checkpointable_versions(&versions, key.table_id)?
+                .0
                 .is_empty()
             {
                 continue;
@@ -1735,6 +1728,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 let versions = entry.value().read();
                 if self
                     .maybe_get_checkpointable_versions(&versions, index_id)?
+                    .0
                     .is_empty()
                 {
                     continue;
