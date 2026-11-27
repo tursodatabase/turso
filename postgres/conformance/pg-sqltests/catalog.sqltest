@@ -2928,3 +2928,25 @@ expect @tursopg {
     pg_class|0
     pg_type|0
 }
+
+# Constraint indexes have SQL names even when their engine storage is a rowid
+# or an automatic index. Unnamed indexes must avoid those names in their schema.
+test pg-unnamed-index-avoids-constraint-names {
+    CREATE TABLE x (y int CONSTRAINT x_y_idx PRIMARY KEY);
+    CREATE INDEX ON x (y);
+    CREATE INDEX ON x (y);
+    CREATE SCHEMA other;
+    CREATE TABLE other.x (y text CONSTRAINT x_y_idx UNIQUE);
+    CREATE INDEX ON other.x (y);
+    SELECT n.nspname, c.relname FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'i' AND n.nspname IN ('public', 'other')
+    ORDER BY n.nspname, c.relname;
+}
+expect {
+    other|x_y_idx
+    other|x_y_idx1
+    public|x_y_idx
+    public|x_y_idx1
+    public|x_y_idx2
+}

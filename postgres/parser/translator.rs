@@ -9393,12 +9393,9 @@ pub fn unnamed_index_name<E>(
     }
 
     let columns = column_names.join("_");
-    let mut name = make_object_name(&table, Some(&columns), "idx");
-    let mut number = 0;
-    while name_is_taken(schema, &table, &name)? {
-        number += 1;
-        name = make_object_name(&table, Some(&columns), &format!("idx{number}"));
-    }
+    let name = available_object_name(&table, Some(&columns), "idx", |name| {
+        name_is_taken(schema, &table, name)
+    })?;
     let on_location = pg_query::scan(sql)
         .expect("a statement that parses also scans")
         .tokens
@@ -9415,6 +9412,23 @@ pub fn unnamed_index_name<E>(
 /// PostgreSQL keeps only the first 63 bytes (NAMEDATALEN - 1) of an
 /// identifier, and refuses an enum label longer than that.
 const MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// Chooses a generated relation name, adding a suffix until the namespace
+/// accepts it. Rebuild each candidate so the suffix fits in the identifier limit.
+pub fn available_object_name<E>(
+    table: &str,
+    columns: Option<&str>,
+    label: &str,
+    mut is_taken: impl FnMut(&str) -> Result<bool, E>,
+) -> Result<String, E> {
+    let mut name = make_object_name(table, columns, label);
+    let mut number = 0;
+    while is_taken(&name)? {
+        number += 1;
+        name = make_object_name(table, columns, &format!("{label}{number}"));
+    }
+    Ok(name)
+}
 
 /// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, omitting the
 /// column part for primary keys. Shorten the longer part first, preserving

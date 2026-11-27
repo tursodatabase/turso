@@ -1271,7 +1271,7 @@ fn constraint_index_name(
     key: ConstraintKey<'_>,
     chosen_names: &[String],
 ) -> turso_core::Result<String> {
-    use turso_pg_parser::translator::make_object_name;
+    use turso_pg_parser::translator::available_object_name;
 
     let table_name = table.written_name.as_str();
     let (written, columns, label) = match key {
@@ -1313,13 +1313,9 @@ fn constraint_index_name(
         }
         return Ok(name);
     }
-    let mut name = make_object_name(table_name, columns.as_deref(), label);
-    let mut number = 0;
-    while is_taken(&name) {
-        number += 1;
-        name = make_object_name(table_name, columns.as_deref(), &format!("{label}{number}"));
-    }
-    Ok(name)
+    available_object_name(table_name, columns.as_deref(), label, |name| {
+        Ok(is_taken(name))
+    })
 }
 
 /// Deletes the comment of the column that `column.table` no longer has, and
