@@ -51,6 +51,8 @@ pub(crate) fn register_bytea_functions(options: OpenOptions) -> OpenOptions {
 }
 
 /// The two bytea arguments of a function, or None when one is NULL.
+///
+/// FIXME(registered-types): A string literal reaches here as text when the expression is compiled without the binding pass that reads it as bytea: a DEFAULT, a generation expression and an index predicate. A typed expression tree that every context analyzes once reads it.
 fn byteas(args: &[Register]) -> Result<Option<(&[u8], &[u8])>> {
     match (args[0].get_value(), args[1].get_value()) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
