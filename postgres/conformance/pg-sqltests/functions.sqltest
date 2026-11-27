@@ -2908,6 +2908,14 @@ expect {
     {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
 }
 
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test to-json-t-of-table-alias {
+    SELECT to_json(x.*) FROM t x WHERE id = 2;
+}
+expect {
+    {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
+}
+
 test table-function-argument-cannot-name-a-table-listed-after-it {
     CREATE TABLE json_each_later (j json);
     SELECT * FROM json_each(json_each_later.j), json_each_later;

@@ -568,15 +568,6 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-69: to_json(t.*) of table alias
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test to-json-t-of-table-alias {
-    SELECT to_json(x.*) FROM t x WHERE id = 2;
-}
-expect {
-    {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
-}
-
 # B-70: array_to_json
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test array-to-json {
