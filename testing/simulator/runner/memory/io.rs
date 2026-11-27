@@ -384,7 +384,7 @@ impl IO for MemorySimIO {
     fn open_file(
         &self,
         path: &str,
-        _flags: OpenFlags, // TODO: ignoring open flags for now as we don't test read only mode in the simulator yet
+        flags: OpenFlags,
         _direct: bool,
     ) -> Result<Arc<dyn turso_core::File>> {
         self.ensure_io_allowed()?;
@@ -399,6 +399,11 @@ impl IO for MemorySimIO {
                 file
             }
         } else {
+            if !flags.contains(OpenFlags::Create) {
+                return Err(turso_core::LimboError::CompletionError(
+                    turso_core::CompletionError::IOError(std::io::ErrorKind::NotFound, "open"),
+                ));
+            }
             let file = Arc::new(MemorySimFile::new(
                 self.callbacks.clone(),
                 self.seed,

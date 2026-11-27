@@ -4,6 +4,8 @@ pub mod io;
 #[cfg(test)]
 mod alter_table_pk_order;
 #[cfg(test)]
+mod hot_journal;
+#[cfg(test)]
 mod mvcc_recovery;
 #[cfg(test)]
 mod mvcc_upsert_pk;

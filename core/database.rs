@@ -356,6 +356,58 @@ pub fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
 }
 
+/// SQLite rollback journal magic bytes found at offset 0 of an active/hot rollback journal header.
+pub const SQLITE_JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+
+/// Checks whether a hot SQLite rollback journal (`<path>-journal`) exists.
+///
+/// An SQLite rollback journal is only "hot" (meaning it contains uncommitted
+/// transactions that must be rolled back by SQLite) if:
+/// 1. The path is not in-memory (`:memory:`, etc.).
+/// 2. The `<path>-journal` file exists and its first 8 bytes match `SQLITE_JOURNAL_MAGIC`.
+///
+/// If the journal file does not exist, is 0 bytes, or its first 8 bytes are zeroed
+/// (e.g. SQLite committed with `PRAGMA journal_mode = PERSIST`), the journal is not hot
+/// and the database can be safely opened.
+///
+/// If a journal file exists but cannot be opened or read (e.g. permission denied),
+/// it is treated as hot to prevent opening and corrupting dirty database state.
+pub(crate) fn is_hot_rollback_journal(io: &Arc<dyn IO>, path: &str) -> bool {
+    if is_memory_like(path) {
+        return false;
+    }
+    let journal_path = format!("{path}-journal");
+
+    let file = match io.open_file(&journal_path, OpenFlags::None, false) {
+        Ok(file) => file,
+        Err(LimboError::CompletionError(CompletionError::IOError(
+            std::io::ErrorKind::NotFound,
+            _,
+        ))) => return false,
+        #[cfg(target_family = "unix")]
+        Err(LimboError::CompletionError(CompletionError::RustixIOError(
+            rustix::io::Errno::NOENT,
+        ))) => return false,
+        Err(_) => {
+            // A journal that exists but cannot be opened (e.g. permission denied)
+            // must be treated as hot (not absent) to avoid opening dirty state.
+            return true;
+        }
+    };
+
+    let buf = Arc::new(Buffer::new(vec![0u8; SQLITE_JOURNAL_MAGIC.len()]));
+    let completion = match file.pread(0, Completion::new_read(buf.clone(), |_| None)) {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+
+    if io.wait_for_completion(completion).is_err() {
+        return true;
+    }
+
+    buf.as_slice() == SQLITE_JOURNAL_MAGIC
+}
+
 /// Creates a read completion for database header reads that checks for short reads.
 /// The header is always on page 1, so this function hardcodes that page index.
 fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
@@ -2353,6 +2405,16 @@ impl Database {
                             "cannot open MVCC database '{}' with experimental multiprocess WAL: MVCC does not support multiprocess access",
                             self.path
                         )).into());
+                    }
+
+                    // Check for an active hot rollback journal regardless of the header version
+                    // (e.g. legacy mode with uncommitted changes, or WAL mode left by a crash during SQLite's switch to WAL).
+                    if is_hot_rollback_journal(&self.io, &self.path) {
+                        return Err(LimboError::Corrupt(format!(
+                            "cannot open database '{}': hot rollback journal '{}-journal' must be recovered by SQLite first",
+                            self.path, self.path
+                        ))
+                        .into());
                     }
 
                     // Now check the Header Version to see which mode the DB file really is on
