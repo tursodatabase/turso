@@ -8,6 +8,7 @@ mod integer;
 mod integer_operators;
 mod oid;
 mod regclass;
+mod uuid;
 
 pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
@@ -117,8 +118,7 @@ pub(crate) static BUILT_IN_TYPES: [BuiltInType; 21] = built_in_types! {
     // FIXME(registered-types): numeric with a precision is the type that core registers, and without one it is the REAL of the engine, which does not keep all its digits. A numeric type registered in the frontend, with its INPUT, replaces this.
     (1700, "numeric", "N", false, -1, false, "i", "m", 1231, ",", Support::NotRegistered),
     (2205, "regclass", "N", false, 4, true, "i", "p", 2210, ",", Support::Registered(&regclass::RegClass)),
-    // FIXME(registered-types): uuid: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A uuid type registered in the frontend, with its INPUT, replaces this.
-    (2950, "uuid", "U", false, 16, false, "c", "p", 2951, ",", Support::NotRegistered),
+    (2950, "uuid", "U", false, 16, false, "c", "p", 2951, ",", Support::Registered(&uuid::Uuid)),
     // FIXME(registered-types): jsonb: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A jsonb type registered in the frontend, with its INPUT, replaces this.
     (3802, "jsonb", "U", false, -1, false, "i", "x", 3807, ",", Support::NotRegistered),
 };
