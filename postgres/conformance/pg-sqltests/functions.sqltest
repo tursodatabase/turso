@@ -2895,6 +2895,25 @@ expect {
     {"id":null,"v":null}
 }
 
+test to-jsonb-of-the-rows-of-on-conflict-do-update {
+    CREATE TABLE to_jsonb_upsert (id int PRIMARY KEY, n int, j jsonb);
+    INSERT INTO to_jsonb_upsert VALUES (1, 1, NULL);
+    INSERT INTO to_jsonb_upsert VALUES (1, 5, NULL)
+        ON CONFLICT (id) DO UPDATE SET j = to_jsonb(excluded);
+    SELECT j FROM to_jsonb_upsert;
+    INSERT INTO to_jsonb_upsert VALUES (1, 6, NULL)
+        ON CONFLICT (id) DO UPDATE SET j = to_jsonb(to_jsonb_upsert);
+    SELECT j FROM to_jsonb_upsert;
+    INSERT INTO to_jsonb_upsert AS t VALUES (1, 7, NULL)
+        ON CONFLICT (id) DO UPDATE SET j = to_json(excluded.*) WHERE to_jsonb(t) IS NOT NULL;
+    SELECT j FROM to_jsonb_upsert;
+}
+expect {
+    {"j": null, "n": 5, "id": 1}
+    {"j": {"j": null, "n": 5, "id": 1}, "n": 1, "id": 1}
+    {"j": null, "n": 7, "id": 1}
+}
+
 test row-to-json-of-a-number {
     SELECT row_to_json(1);
 }
