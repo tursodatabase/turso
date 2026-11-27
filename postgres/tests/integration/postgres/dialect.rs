@@ -1,6 +1,44 @@
 use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
+#[test]
+fn postgres_cannot_attach_a_sqlite_database() {
+    use std::sync::Arc;
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenOptions, SessionRole};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sqlite.db");
+    {
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE t(a REAL, b INTEGER); CREATE INDEX t_a ON t(a); \
+             INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);",
+            )
+            .unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let db = Database::open(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true)),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(format!("ATTACH '{}' AS aux", path.display()))
+        .expect_err("a PostgreSQL connection must not attach a SQLite file");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    assert_eq!(sqlite.execute("DELETE FROM t WHERE b = 1", []).unwrap(), 1);
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_ctes_ignore_search_path(db: TempDatabase) {
     let conn = db.connect_postgres();
