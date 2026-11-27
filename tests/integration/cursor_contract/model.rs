@@ -1,7 +1,8 @@
 //! Reference model of table cursors (SPEC section 2).
 //!
-//! The model has these parts: `pos`, `dir`, `cursor`, `step`, `run`, `key_ge`, and so on.
-//! A caller comes before the functions it calls.
+//! The rules are in `turso_core::storage::model::spec`, the step function that the model
+//! storage of the VDBE runs too. This file maps the table ops of the harness onto it, keeps
+//! the table as a sorted list of `(rowid, value)`, and says what an op may observe.
 //!
 //! The model is the oracle of the random walk tester. It decides which ops are legal
 //! (`step` returns `None` for an illegal op) and what an op may observe. A value that the
@@ -9,71 +10,24 @@
 
 use super::program::{Obs, Op};
 use super::{run as run_engine, DbKind, Layout};
+use turso_core::storage::model::spec::{self, Tree, Write};
+use turso_core::types::SeekOp;
 
 // ---------------------------------------------------------------------------------------
-// Types (tbl, pos, dir, cursor, state, op, action, spec, obs)
+// Types (tbl, pos, cursor, state, op, action, spec, obs)
 // ---------------------------------------------------------------------------------------
 
 /// A list of `(rowid, value)` pairs sorted by rowid.
 pub type Tbl = Vec<(i64, i64)>;
 
-/// `Invalid`: not on a row. `At(k)`: on key `k`; if `k` is gone this is a gap between its
-/// neighbours. `Seeked(k)`: an exact seek for `k` missed (or `NewRowid` chose `k`); only a
-/// no-seek `Insert` of `k` may follow. `Gone(k)`: this cursor deleted `k`; like `At(k)` but
-/// reading is undefined. `Lost`: position undefined (after `Count` and `SeekEnd`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Pos {
-    Invalid,
-    At(i64),
-    Seeked(i64),
-    Gone(i64),
-    Lost,
-}
+/// The position of a table cursor (`spec::Pos`): keys and seek keys are rowids.
+pub type Pos = spec::Pos<i64, i64>;
 
-/// Which way the last move went. SQLite only allows `Next` after a forward move and
-/// `Prev` after a backward move.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Dir {
-    DNone,
-    Fwd,
-    Bwd,
-}
+/// The seek token of a table cursor.
+pub type Tok = spec::Token<i64>;
 
-/// The seek token. `TKey(k)`: the last move was an exact seek (or `NewRowid`) for `k`.
-/// `TApp`: the last move was `SeekEnd`; a no-seek `Insert` is then legal iff its key is above
-/// every key in the table. `TNone`: no token.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(clippy::enum_variant_names)] // variant names are the token names of the contract
-pub enum Tok {
-    TNone,
-    TKey(i64),
-    TApp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Cursor {
-    pub cpos: Pos,
-    pub cdir: Dir,
-    /// The NullRow flag.
-    pub cnull: bool,
-    /// The seek token, for a no-seek `Insert`.
-    pub ctok: Tok,
-}
-
-/// A cursor without a position.
-const LOST: Cursor = Cursor {
-    cpos: Pos::Lost,
-    cdir: Dir::DNone,
-    cnull: false,
-    ctok: Tok::TNone,
-};
-
-pub const FRESH_CURSOR: Cursor = Cursor {
-    cpos: Pos::Invalid,
-    cdir: Dir::DNone,
-    cnull: false,
-    ctok: Tok::TNone,
-};
+/// The state of one table cursor.
+pub type Cursor = spec::Shape<i64, i64>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
@@ -138,7 +92,7 @@ pub struct MObs {
 pub fn init(rs: Tbl, n: usize) -> State {
     State {
         rows: rs,
-        curs: vec![FRESH_CURSOR; n],
+        curs: vec![Cursor::fresh(); n],
     }
 }
 
@@ -156,281 +110,124 @@ pub fn run(st: &State, p: &[Action]) -> Option<(State, Vec<MObs>)> {
 
 /// One action. `None` means the action is illegal in this state.
 pub fn step(st: &State, a: &Action) -> Option<(State, MObs)> {
-    let c = *st.curs.get(a.acur)?;
+    let c = st.curs.get(a.acur)?;
     let s = &st.rows;
-    let put = |c2: Cursor, j: bool| put_cursor(st, a.acur, c2, j);
-    let seek = |o: Option<i64>, d: Dir| {
-        let (c2, j) = move_to(o, d);
-        put(c2, j)
+    let eq = SeekOp::GE { eq_only: true };
+    let (op, value) = match a.aop {
+        MOp::Rewind => (spec::Op::Rewind, 0),
+        MOp::Last => (spec::Op::Last, 0),
+        MOp::Next => (spec::Op::Next, 0),
+        MOp::Prev => (spec::Op::Prev, 0),
+        MOp::SeekGE(k) => (spec::Op::Seek(k, SeekOp::GE { eq_only: false }), 0),
+        MOp::SeekGT(k) => (spec::Op::Seek(k, SeekOp::GT), 0),
+        MOp::SeekLE(k) => (spec::Op::Seek(k, SeekOp::LE { eq_only: false }), 0),
+        MOp::SeekLT(k) => (spec::Op::Seek(k, SeekOp::LT), 0),
+        MOp::SeekRowid(k) | MOp::NotExists(k) => (spec::Op::Seek(k, eq), 0),
+        // The engine chooses the rowid; it must be unused and above every key (D6).
+        MOp::NewRowid(r) if !fresh(r, s) => return None,
+        MOp::NewRowid(_) => (spec::Op::NewRowid, 0),
+        MOp::Insert(k, v, req) => (
+            spec::Op::Insert {
+                key: k,
+                use_seek: !req,
+            },
+            v,
+        ),
+        MOp::Delete => (spec::Op::Delete, 0),
+        MOp::NullRow => (spec::Op::NullRow, 0),
+        MOp::Count => (spec::Op::Count, 0),
+        MOp::SeekEnd => (spec::Op::SeekEnd, 0),
+        MOp::Clear => (spec::Op::Clear, 0),
+        MOp::Observe => (spec::Op::Read, 0),
     };
-    // Next and Prev: a move that finds no row ends the scan and does not jump.
-    let advance = |o: Option<i64>| match o {
-        Some(k) => put(
-            Cursor {
-                cpos: Pos::At(k),
-                cdir: c.cdir,
-                cnull: false,
-                ctok: Tok::TNone,
-            },
-            true,
-        ),
-        None => put(
-            Cursor {
-                cpos: Pos::Invalid,
-                cdir: c.cdir,
-                cnull: false,
-                ctok: Tok::TNone,
-            },
-            false,
-        ),
+    let out = spec::step(&Table(s), c, &op).ok()?;
+    let rows = match &out.write {
+        None => s.clone(),
+        Some(Write::Put(k)) => ins(*k, value, s),
+        Some(Write::Remove(k)) => del(*k, s),
+        Some(Write::Clear) => Vec::new(),
     };
-    let exact = |k: i64| match lookup(k, s) {
-        Some(_) => put(
-            Cursor {
-                cpos: Pos::At(k),
-                cdir: Dir::Fwd,
-                cnull: false,
-                ctok: Tok::TKey(k),
-            },
-            false,
-        ),
-        None => put(
-            Cursor {
-                cpos: Pos::Seeked(k),
-                cdir: Dir::DNone,
-                cnull: false,
-                ctok: Tok::TKey(k),
-            },
-            true,
-        ),
-    };
-    match a.aop {
-        MOp::Rewind => seek(key_min(s), Dir::Fwd),
-        MOp::Last => seek(key_max(s), Dir::Bwd),
-        MOp::SeekGE(k) => seek(key_ge(k, s), Dir::Fwd),
-        MOp::SeekGT(k) => seek(key_gt(k, s), Dir::Fwd),
-        MOp::SeekLE(k) => seek(key_le(k, s), Dir::Bwd),
-        MOp::SeekLT(k) => seek(key_lt(k, s), Dir::Bwd),
-        MOp::SeekRowid(k) | MOp::NotExists(k) => exact(k),
-        // `Next` and `Prev` after `NullRow` find no row (SQLite: `OP_Next` on an invalid
-        // cursor). The position afterwards is none.
-        MOp::Next | MOp::Prev if c.cnull => put(LOST, false),
-        MOp::Next => {
-            if !c.cnull && c.cdir == Dir::Fwd {
-                match c.cpos {
-                    Pos::Invalid => put(c, false),
-                    Pos::At(k) | Pos::Gone(k) => advance(key_gt(k, s)),
-                    Pos::Seeked(_) | Pos::Lost => None,
-                }
-            } else {
-                None
-            }
-        }
-        MOp::Prev => {
-            if !c.cnull && c.cdir == Dir::Bwd {
-                match c.cpos {
-                    Pos::Invalid => put(c, false),
-                    Pos::At(k) | Pos::Gone(k) => advance(key_lt(k, s)),
-                    Pos::Seeked(_) | Pos::Lost => None,
-                }
-            } else {
-                None
-            }
-        }
-        MOp::NewRowid(r) => {
-            if !c.cnull && fresh(r, s) {
-                put(
-                    Cursor {
-                        cpos: Pos::Seeked(r),
-                        cdir: Dir::DNone,
-                        cnull: false,
-                        ctok: Tok::TKey(r),
-                    },
-                    false,
-                )
-            } else {
-                None
-            }
-        }
-        MOp::Insert(k, v, req) => {
-            if !c.cnull && (req || tok_allows_insert(c.ctok, k, s)) {
-                let s2 = ins(k, v, s);
-                let c2 = Cursor {
-                    cpos: Pos::At(k),
-                    cdir: c.cdir,
-                    cnull: false,
-                    ctok: Tok::TNone,
-                };
-                Some(write_cursor(st, s2, a.acur, c2))
-            } else {
-                None
-            }
-        }
-        MOp::Delete => match c.cpos {
-            Pos::At(k) => {
-                if !c.cnull && lookup(k, s).is_some() {
-                    let s2 = del(k, s);
-                    let c2 = Cursor {
-                        cpos: Pos::Gone(k),
-                        cdir: c.cdir,
-                        cnull: false,
-                        ctok: Tok::TNone,
-                    };
-                    Some(write_cursor(st, s2, a.acur, c2))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        },
-        // A cursor without a position (`Lost`) cannot be set to the null row: Undefined (U9).
-        MOp::NullRow => match c.cpos {
-            Pos::Lost => None,
-            _ => put(Cursor { cnull: true, ..c }, false),
-        },
-        MOp::Count => {
-            if c.cnull {
-                return None;
-            }
-            let c2 = Cursor {
-                cpos: Pos::Lost,
-                cdir: Dir::DNone,
-                cnull: false,
-                ctok: Tok::TNone,
-            };
-            let st2 = State {
-                rows: s.clone(),
-                curs: set_nth_cursor(&st.curs, a.acur, c2),
-            };
-            Some((
-                st2,
-                MObs {
-                    jumped: false,
-                    orid: Spec::Is(Some(s.len() as i64)),
-                    ocol: Spec::Unspec,
-                },
-            ))
-        }
-        MOp::SeekEnd => {
-            if c.cnull {
-                return None;
-            }
-            put(
-                Cursor {
-                    cpos: Pos::Lost,
-                    cdir: Dir::DNone,
-                    cnull: false,
-                    ctok: Tok::TApp,
-                },
-                false,
-            )
-        }
-        MOp::Clear => {
-            if c.cnull {
-                return None;
-            }
-            let ended = Cursor {
-                cpos: Pos::Invalid,
-                cdir: Dir::Fwd,
-                cnull: false,
-                ctok: Tok::TNone,
-            };
-            Some((
-                State {
-                    rows: Vec::new(),
-                    curs: vec![ended; st.curs.len()],
-                },
-                MObs {
-                    jumped: false,
-                    orid: Spec::Is(None),
-                    ocol: Spec::Is(None),
-                },
-            ))
-        }
-        // A read needs a defined position. At `Seeked`, `Gone` and `Lost` it is Undefined (U8).
-        MOp::Observe => match read_row(s, &c) {
-            Spec::Unspec => None,
-            Spec::Is(_) => put(c, false),
-        },
-    }
-}
-
-/// May a no-seek `Insert` of `k` go ahead? The cursor holds the token for `k`, or an append
-/// token and `k` is above every key.
-fn tok_allows_insert(t: Tok, k: i64, s: &Tbl) -> bool {
-    match t {
-        Tok::TKey(t) => t == k,
-        Tok::TApp => fresh(k, s),
-        Tok::TNone => false,
-    }
-}
-
-/// The table stays the same, one cursor changes.
-fn put_cursor(st: &State, i: usize, c2: Cursor, j: bool) -> Option<(State, MObs)> {
-    Some((
-        State {
-            rows: st.rows.clone(),
-            curs: set_nth_cursor(&st.curs, i, c2),
-        },
-        obs_of(&st.rows, &c2, j),
-    ))
-}
-
-/// A write: new table, and every pending seek token ends.
-fn write_cursor(st: &State, s2: Tbl, i: usize, c2: Cursor) -> (State, MObs) {
-    let o = obs_of(&s2, &c2, false);
-    (
-        State {
-            rows: s2,
-            curs: set_nth_cursor(&lose_peers(&st.curs), i, c2),
-        },
-        o,
-    )
-}
-
-fn move_to(o: Option<i64>, d: Dir) -> (Cursor, bool) {
-    match o {
-        Some(k) => (
-            Cursor {
-                cpos: Pos::At(k),
-                cdir: d,
-                cnull: false,
-                ctok: Tok::TNone,
-            },
-            false,
-        ),
-        None => (
-            Cursor {
-                cpos: Pos::Invalid,
-                cdir: d,
-                cnull: false,
-                ctok: Tok::TNone,
-            },
-            true,
-        ),
-    }
-}
-
-/// A write by a cursor leaves every cursor of the tree without a position, and ends every
-/// pending seek token (U9). The writer gets its own position afterwards. A cursor without a
-/// position can only be placed again by a seek, `Rewind` or `Last`. SQLite saves the other
-/// cursors by key; Turso does not promise that, so a read or a move from the old position
-/// is Undefined.
-fn lose_peers(cs: &[Cursor]) -> Vec<Cursor> {
-    cs.iter()
-        .map(|_| Cursor {
-            cpos: Pos::Lost,
-            cdir: Dir::DNone,
-            cnull: false,
-            ctok: Tok::TNone,
+    let cleared = matches!(out.write, Some(Write::Clear));
+    let curs = st
+        .curs
+        .iter()
+        .enumerate()
+        .map(|(i, cj)| match () {
+            _ if i == a.acur => out.shape.clone(),
+            _ if out.write.is_some() => spec::after_peer_write(&Table(&rows), cj, cleared),
+            _ => cj.clone(),
         })
-        .collect()
+        .collect();
+    // Seeks jump when they find nothing; `Next` and `Prev` jump when they find a row.
+    let jumped = match a.aop {
+        MOp::Next | MOp::Prev => out.hit,
+        MOp::Rewind
+        | MOp::Last
+        | MOp::SeekGE(_)
+        | MOp::SeekGT(_)
+        | MOp::SeekLE(_)
+        | MOp::SeekLT(_)
+        | MOp::SeekRowid(_)
+        | MOp::NotExists(_) => !out.hit,
+        _ => false,
+    };
+    let o = match a.aop {
+        MOp::Count => MObs {
+            jumped,
+            orid: Spec::Is(Some(s.len() as i64)),
+            ocol: Spec::Unspec,
+        },
+        _ => obs_of(&rows, &out.shape, jumped),
+    };
+    Some((State { rows, curs }, o))
 }
 
-fn set_nth_cursor(cs: &[Cursor], i: usize, c: Cursor) -> Vec<Cursor> {
-    let mut out = cs.to_vec();
-    out[i] = c;
-    out
+/// The table as the spec sees it.
+struct Table<'a>(&'a Tbl);
+
+impl Tree for Table<'_> {
+    type Key = i64;
+    type Probe = i64;
+
+    fn first(&self) -> Option<i64> {
+        key_min(self.0)
+    }
+
+    fn last(&self) -> Option<i64> {
+        key_max(self.0)
+    }
+
+    fn after(&self, k: &i64) -> Option<i64> {
+        key_gt(*k, self.0)
+    }
+
+    fn before(&self, k: &i64) -> Option<i64> {
+        key_lt(*k, self.0)
+    }
+
+    fn seek(&self, k: &i64, op: SeekOp) -> Option<i64> {
+        match op {
+            SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true } => {
+                lookup(*k, self.0).map(|_| *k)
+            }
+            SeekOp::GE { .. } => key_ge(*k, self.0),
+            SeekOp::GT => key_gt(*k, self.0),
+            SeekOp::LE { .. } => key_le(*k, self.0),
+            SeekOp::LT => key_lt(*k, self.0),
+        }
+    }
+
+    fn contains(&self, k: &i64) -> bool {
+        lookup(*k, self.0).is_some()
+    }
+
+    fn token_allows(&self, token: &i64, _hit: bool, k: &i64) -> bool {
+        token == k
+    }
+
+    fn above_all(&self, k: &i64) -> bool {
+        fresh(*k, self.0)
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -459,10 +256,10 @@ fn obs_of(s: &Tbl, c: &Cursor, j: bool) -> MObs {
 }
 
 fn read_row(s: &Tbl, c: &Cursor) -> Spec<Option<(i64, i64)>> {
-    if c.cnull {
+    if c.null_row {
         return Spec::Is(None);
     }
-    match c.cpos {
+    match c.pos {
         Pos::Invalid => Spec::Is(None),
         Pos::At(k) => Spec::Is(lookup(k, s).map(|v| (k, v))),
         Pos::Seeked(_) | Pos::Gone(_) | Pos::Lost => Spec::Unspec,
@@ -908,19 +705,28 @@ mod tests {
         assert_eq!(got, [is(5, 50), jumped(is(3, 30)), OPEN, jumped(is(1, 10))]);
     }
 
-    /// A write by another cursor leaves our cursor without a position (U9): a read or a move
-    /// from the old position is illegal. A seek places it again.
+    /// A write by another cursor keeps our cursor at its position by key. If the peer deleted
+    /// our row, the cursor is in the gap: `Next` goes on, a read or a `Delete` is illegal.
     #[test]
-    fn example_peer_write_loses_the_position() {
+    fn example_peer_write_keeps_the_position() {
+        let p = [
+            (0, Rewind),
+            (0, Next),
+            (1, SeekRowid(4)),
+            (1, Insert(4, 40, false)),
+        ];
+        let mut q = p.to_vec();
+        q.push((0, Next));
+        assert_eq!(obs_of_run(2, &q)[4], jumped(is(4, 40)));
         let before = [(0, Rewind), (0, Next), (1, SeekRowid(3)), (1, Delete)];
-        for op in [Observe, Next, Prev, Delete] {
+        for op in [Observe, Prev, Delete] {
             let mut p = before.to_vec();
             p.push((0, op));
             assert!(!legal(2, &p), "{op:?}");
         }
         let mut p = before.to_vec();
-        p.extend([(0, SeekGE(3)), (0, Observe)]);
-        assert!(legal(2, &p));
+        p.push((0, Next));
+        assert_eq!(obs_of_run(2, &p)[4], jumped(is(5, 50)));
     }
 
     fn legal(n: usize, p: &[(usize, MOp)]) -> bool {

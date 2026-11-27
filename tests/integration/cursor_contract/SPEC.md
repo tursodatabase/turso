@@ -1,7 +1,8 @@
 # Cursor contract: B-tree and B-tree + MVCC overlay
 
-This file defines what each cursor opcode promises. The reference model (`model.rs`,
-`index_model.rs`) and the test programs follow it. SQLite is the reference: `vdbe.c` and
+This file defines what each cursor opcode promises. The step function
+`core/storage/model/spec.rs` is the contract in code (section 2e). The reference models
+(`model.rs`, `index_model.rs`) call it, and the test programs follow it. SQLite is the reference: `vdbe.c` and
 `btree.c` at master `9a938e2e8d`.
 
 Status: draft. Every rule marked **DECISION** needs a human OK.
@@ -11,9 +12,9 @@ Status: draft. Every rule marked **DECISION** needs a human OK.
 | File | Purpose |
 |---|---|
 | `program.rs`, `index_program.rs`, `mod.rs` | Harness. Builds a VDBE program from a list of table or index operations, runs it on one engine, returns what each operation saw. Engines: WAL, MVCC, ephemeral. Layouts: all in memory, checkpointed. |
-| `model.rs`, `index_model.rs` | Reference model: the contract as a pure Rust function. No database. |
+| `model.rs`, `index_model.rs` | Reference models: the table and index stores with their compare functions, on top of the step function `turso_core::storage::model::spec`. No database. |
 | `walk.rs`, `index_walk.rs` | Random walks. Generate operations, run them on all engines and on the model, compare, shrink a failure. Known bugs are filtered by name; `NO_FILTER=1` turns the filters off. |
-| `index_tests.rs`, `overlay_tests.rs`, tests in `mod.rs` | Fixed scenarios. A test named `known_bug_*` asserts that a bug is still open (section 5b). `index_tests.rs::collation` has the scenarios of section 2c: DESC and NOCASE seeks, scans and range loops, `Found`, and the replacement of a key by a case variant. |
+| `index_tests.rs`, `overlay_tests.rs`, `defined_tests.rs`, tests in `mod.rs` | Fixed scenarios. `defined_tests.rs` has the peer writes of section 1 and the `Found`-style seeks of section 2b. A test named `known_bug_*` asserts that a bug is still open (section 5b). `index_tests.rs::collation` has the scenarios of section 2c: DESC and NOCASE seeks, scans and range loops, `Found`, and the replacement of a key by a case variant. |
 
 Run: `cargo test -p core_tester --test integration_tests cursor_contract`. Walk parameters:
 `SEED`, `ITERS`; the index walk also has `IDEF` (`default`, `desc`, `nocase`, `rtrim`,
@@ -39,10 +40,12 @@ A cursor has a position and a null-row flag. The position is one of:
 
 Rules that hold for all opcodes:
 
-- A write through a cursor changes the store and leaves every other cursor of the tree
-  without a position (U9). SQLite saves the other cursors by key and restores them; Turso
-  does not promise this. Only a seek, `Rewind` or `Last` places such a cursor again. A
-  read, `Next`, `Prev`, `Delete` or an `Idx*` compare from the old position is Undefined.
+- A write through a cursor changes the store. Every other cursor of the tree keeps its
+  position by key, as SQLite's saved cursors do (D5): a cursor `At k` stays `At k` if `k` is
+  still in the store, and goes to the gap `Gone k` if the write deleted `k` (`Next` and
+  `Prev` go on from the gap, a read and `Delete` are Undefined, U8 and U4). A cursor at the
+  end stays at the end. The null-row flag and the direction stay. Every write ends every seek
+  token. A `Clear` puts every cursor at the end.
 - `Column` and `RowId` return NULL when the null-row flag is set, and when the position is
   `Invalid`. They return the row when the position is `At k`. At any other position the read
   is Undefined (U8).
@@ -60,17 +63,17 @@ Rules that hold for all opcodes:
 | `OpenRead/OpenWrite` | none | position `Invalid`, null-row flag clear. Re-opening a cursor id resets it |
 | `Rewind` | none | `At min`, else `Invalid` and jump. Clears null-row |
 | `Last` | none | `At max`, else `Invalid` and jump. Clears null-row |
-| `Next` | last move was `Rewind`, `SeekGE/GT`, `Next`, `Found`, `SeekRowid` hit | `At succ`, no jump on end; jump taken when a row was found; end gives `Invalid` and stays ended |
+| `Next` | last move was `Rewind`, `SeekGE/GT`, `Next`, `Found`/`NotFound`/`NoConflict` (hit or miss), `SeekRowid` hit | `At succ`, no jump on end; jump taken when a row was found; end gives `Invalid` and stays ended |
 | `Prev` | last move was `Last`, `SeekLE/LT`, `Prev` | symmetric to `Next` |
 | `Next/Prev` from `Gap(lo,hi)` | as above | `Next` gives `At hi`. `Prev` gives `At lo`. No row is skipped and none is repeated |
 | `SeekGE k` | none | `At (min key >= k)`, else `Invalid` and jump |
 | `SeekGT k` | none | `At (min key > k)`, else `Invalid` and jump |
 | `SeekLE k` / `SeekLT k` | none | `At (max key <= k)` / `(max key < k)`, else `Invalid` and jump |
 | `SeekRowid`, `NotExists` | table | hit: `At k`. Miss: `Seeked k` and jump |
-| `Found`, `NotFound`, `NoConflict` | index | match means some entry has the given prefix. Hit gives `Matched p`: the cursor is on some match, but a read or a move from it is Undefined (U2, U8), so the entry cannot be seen. Miss gives `Seeked key`. `NoConflict` also jumps when the key has a NULL, even if an entry matches |
+| `Found`, `NotFound`, `NoConflict` | index | an eq-only `SeekGE` on the key as a prefix. Hit: `At` the first matching entry, forward direction, so a read and `Next` are defined and `Prev` is Undefined (U1). Miss: `Seeked key`, a read is Undefined (U8), `Next` goes to the first entry after the key. `NoConflict` also jumps when the key has a NULL, even if an entry matches, and then the cursor has no position |
 | `IdxGE/GT/LE/LT k` | position is `At` | jump if the entry compares `>=`, `>`, `<=`, `<` the prefix `k`. No state change. On a non-`At` position the model returns jump (Turso behaviour; SQLite asserts) |
 | `Column`, `RowId` | none | see section 1. Position unchanged |
-| `NullRow` | not after a peer write (U9) | null-row flag set. Only `Column`, `RowId`, `Next`, `Prev`, `Rewind`, `Last`, `Seek*`, `NotExists` may follow. `Next` and `Prev` find no row and do not jump (SQLite: `OP_Next` on an invalid cursor, used by LEFT JOIN loops); afterwards the cursor has no position. `Insert`, `Delete` after it are Undefined |
+| `NullRow` | none | null-row flag set. Only `Column`, `RowId`, `Next`, `Prev`, `Rewind`, `Last`, `Seek*`, `NotExists` may follow. `Next` and `Prev` find no row and do not jump (SQLite: `OP_Next` on an invalid cursor, used by LEFT JOIN loops); afterwards the cursor has no position. `Insert`, `Delete` after it are Undefined |
 | `NewRowid` | table | returns `r` with `r` not in the store and `r > max key` (D6). Position after it: no position; a read is Undefined (U8). Only a no-seek `Insert` of `r` may follow |
 | `Insert k v` | see section 3 | store has `k -> v` (overwrite if present). Position: `At k` (**DECISION D1**) |
 | `Delete` | position is `At` | key removed. Position: `Gap(pred, succ)` (**DECISION D2**). `Column`/`RowId` before the next move: Undefined |
@@ -85,21 +88,19 @@ An index store is a finite set of keys `(cols, rowid)`. `cols` is a list of valu
 may be NULL. Order: compare `cols` one by one (NULL is smallest, NULL equals NULL), then
 `rowid`. A prefix `p` is a list of values, at most as long as `cols`. `cmp_prefix k p`
 compares only the first `|p|` columns of `k`; equal prefix means equal. The position
-rules of section 1 are the same. Two more states: `Matched p` (a `Found`-style opcode hit:
-the cursor is on some entry with prefix `p`, not always the first; reads and
-`Next`/`Prev` are Undefined, so which entry it is cannot be seen) and the seek token holds a prefix instead of a rowid.
+rules of section 1 are the same. The seek token holds a prefix instead of a rowid.
 
 | Opcode | Precondition | Result |
 |---|---|---|
 | `SeekGE p` / `SeekGT p` | none | first key with `cmp_prefix k p` `>= 0` / `> 0`; else `Invalid` and jump |
 | `SeekLE p` / `SeekLT p` | none | last key with `cmp_prefix k p` `<= 0` / `< 0`; else `Invalid` and jump |
-| `Found p` / `NotFound p` | none | some key has prefix `p`. `Found` jumps iff yes, `NotFound` iff no. Hit gives `Matched p`, miss gives `Seeked p` (token `p`). On a unique index, when `p` covers all unique columns and has no NULL, only one entry can match: a hit is `At` that entry, so a read is defined (a move is not) |
+| `Found p` / `NotFound p` | none | an eq-only `SeekGE p`. `Found` jumps iff some key has prefix `p`, `NotFound` iff none. Hit: `At` the first key with prefix `p`, direction forward, token `p` (a hit token allows an insert of the same whole key only, so with a prefix it allows nothing, U5). Miss: `Seeked p`, direction forward, token `p`; `Next` goes to the first key after `p` |
 | `NoConflict p` | none | if `p` has a NULL: jump, no position (a read is Undefined, U8). Else like `NotFound` |
 | `IdxGE/GT/LE/LT p` | position is `At` | jump iff `cmp_prefix k p` is `>= 0`, `> 0`, `<= 0`, `< 0`. State unchanged. On `Invalid` the model jumps (Turso) |
 | `IdxInsert key use_seek` | null-row clear | key added (an equal key is replaced, the new bytes win), position `At key`, all tokens cleared. Without `use_seek` it always seeks. With `use_seek` the cursor must hold the token for `key.cols`, unless `key.cols` has a NULL (Turso seeks then). A token of a hit allows only the same whole key |
 | `IdxDelete key` | with P5: key is in the set | key removed, no position (`Lost`): a read or a move is Undefined (U2, U8). All tokens cleared. Without P5 a missing key is a no-op, also with the position `Lost` |
 | `Delete` | position `At k`, `k` in the set | same as for tables: position `Gone k` |
-| `Column i`, `IdxRowId` | none | `cols[i]` and `rowid` of the entry at `At k`; NULL on `Invalid` or null-row; Undefined (U8) at `Seeked`, `Matched`, `Gone` and `Lost` |
+| `Column i`, `IdxRowId` | none | `cols[i]` and `rowid` of the entry at `At k`; NULL on `Invalid` or null-row; Undefined (U8) at `Seeked`, `Gone` and `Lost` |
 | `SeekEnd` | none | position `Lost`, token "append": the next `Insert`/`IdxInsert` without a seek is legal iff its key is above every key in the store |
 | `Clear` | WAL only | store empty; every cursor on the tree (also ours) is `Invalid` |
 | `DeferredSeek idx tbl` | idx cursor `At k`; table has rowid `k.rowid` | table cursor behaves like `SeekRowid` hit, with no jump. A missing row is corruption: Undefined |
@@ -144,7 +145,7 @@ prefix, in index order, and `Next` moves along the index order, so for a `DESC` 
 moves to smaller values. `Seek*` and `Idx*` use this compare as in 2b.
 
 **Equality opcodes.** `Found`, `NotFound` and `NoConflict` test `cmp_prefix = 0` under the
-column collations. `DESC` does not matter. A hit gives `Matched` (section 2b): the entry it lands on cannot be seen.
+column collations. `DESC` does not matter. A hit is on the first match in index order (section 2b).
 
 **Same key.** Two full keys that are equal under the collations and have the same rowid are
 the same entry. An `IdxInsert` of a key that is equal to a stored key replaces the entry, also
@@ -168,18 +169,17 @@ engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 | Id | Undefined sequence | Decision |
 |---|---|---|
 | U1 | `Next` without a forward position, or `Prev` without a backward one (`Rewind` then `Prev`, `Last` then `Next`, `Next` then `Prev`). Also `Prev` after a `SeekRowid` or `NotExists` hit: only `Next` may follow it, and a backward scan starts with `Last`, `SeekLE` or `SeekLT` | D3 |
-| U2 | `Next` or `Prev` from a position that has no direction: after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete` | section 1 |
+| U2 | `Next` or `Prev` from a position that has no direction: after `Count`, `NewRowid`, `IdxDelete`, a `SeekRowid` or `NotExists` that missed | section 1 |
 | U3 | After `NullRow`: `Insert`, `IdxInsert`, `Delete`, `Count`, `NewRowid` (`Next` and `Prev` are legal and find no row) | section 2 |
 | U4 | `Delete` with no entry under the cursor: fresh cursor, scan ended, failed seek | D4 |
-| U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key. A `Found` or `NotFound` hit gives no token (SQLite seeks again); a miss does | section 3 |
+| U5 | `Insert` without `REQUIRE_SEEK`, or `IdxInsert` with `use_seek`, without the seek token of the same key. The token of a `Found` or `NotFound` hit allows only the same whole key, so with a prefix it allows nothing (SQLite seeks again); a miss allows every key with that prefix | section 3 |
 | U6 | `IdxGE/GT/LE/LT` on a cursor whose entry was deleted (by itself or by another cursor) | SQLite asserts, `vdbe.c:7112` |
 | U7 | `IdxDelete` with P5 of a key that is not in the index, and of a key that is equal under the collation but not identical (section 2c). The opcode reports a corrupt index | section 2c |
-| U8 | A read (`Column`, `RowId`, `IdxRowId`) at a position that is not defined: after `Count`, `SeekEnd`, `NewRowid`, an own `Delete`, `IdxDelete`, a seek that missed, `Found`, `NotFound`, `NoConflict` with a NULL | section 1 |
-| U9 | After a write by another cursor on the same tree: a read, `Next`, `Prev`, `Delete`, `IdxGE/GT/LE/LT` or `DeferredSeek` from the old position. Only a seek, `Rewind` or `Last` places the cursor again | section 1 |
+| U8 | A read (`Column`, `RowId`, `IdxRowId`) at a position that is not defined: after `Count`, `SeekEnd`, `NewRowid`, a `Delete` (own, or of the entry by a peer), `IdxDelete`, an exact seek that missed (also `Found`, `NotFound`), `NoConflict` with a NULL | section 1 |
+| U9 | Retired. It was: a use of the old position after a write by another cursor. A peer now keeps its position by key (section 1). The id is not used again | D5 |
 
 The goal is that no op sequence has an open result: it has one defined result, or it is in
-this list. The entry that a `Found` hit lands on cannot be seen, because a read or a move
-from it is Undefined. `NewRowid` is defined by a predicate (D6): any rowid that is unused and
+this list. `NewRowid` is defined by a predicate (D6): any rowid that is unused and
 above every key. SQLite documents only "not previously used as a key". A column with
 AUTOINCREMENT needs a stricter rule (never below an earlier rowid); it is not modelled.
 
@@ -198,15 +198,18 @@ open their trees on the model. The variable sets the default of a connection fla
 (trees, steps per opcode) to stderr at exit. Run the corpus:
 `TURSO_MODEL_EPHEMERAL=1 make -C sqlite/conformance run-rust ARGS="--snapshot-filter __never__"`.
 
-An opcode can make several cursor calls (`IdxInsert` seeks, reads and inserts), and two
-opcodes can make the same call (`Found` and an eq-only `SeekGE`). In debug builds the VDBE
-tells the cursor which opcode starts (`CursorTrait::note_opcode`). The calls inside the opcode
-are not checked one by one; the opcode is one step.
+An opcode can make several cursor calls (`IdxInsert` seeks, reads and inserts), and
+`NoConflict` with a NULL makes none. In debug builds the VDBE tells the cursor which opcode
+starts (`CursorTrait::note_opcode`) for `NoConflict` with a NULL, `NewRowid`, `Insert`,
+`IdxInsert` and `IdxDelete`. The calls inside the opcode are not checked one by one; the
+opcode is one step. On an index, every eq-only `SeekGE` gets the rules of `Found`.
 
-A write by one cursor makes the other cursors of the tree `Stale`: only a seek, `Rewind` or
-`Last` is legal on them (U9). The debug aid `TURSO_MODEL_PEER_RESTORE=1` turns U9 off: the
-other cursors keep their position by key, as SQLite's saved cursors do. It lets a run go past
-U9 to show what comes after it.
+`spec::after_peer_write` gives the shape of the other cursors after a write (section 1).
+The model storage applies it lazily, when a cursor sees that the tree version moved.
+
+The test models use the same step function. They differ from the model storage only in the
+store and the compare: a list of `(rowid, value)` and a list of `(cols, rowid)` with the
+compare of section 2c.
 
 `NewRowid` gives `max + 1`, or 1 for an empty table (D6). The model accepts it with an append
 token: the next no-seek `Insert` must be above every key.
@@ -235,8 +238,11 @@ caller must have left the cursor at a `Seeked k` or `At k` position for the same
   debug build refuses it (U1, section 2d).
 - **D4.** `Delete` with no current row is Undefined. Today BTree ignores it and MVCC
   panics. A debug build refuses it with an `unsupported` message (U4).
-- **D5.** Another cursor's write leaves our cursor without a position (U9). SQLite saves
-  the other cursors by key. Turso does not promise this, and no translator plan needs it.
+- **D5.** Another cursor's write leaves our cursor at its position by key, as SQLite's saved
+  cursors do. If the write deleted our entry, we are in the gap. (This was U9, Undefined.
+  Window functions need it: the corpus has 2,096 tests where an `OpenDup` reader of the
+  window buffer stays on its row while the writer cursor runs `NewRowid`, `Insert` and
+  `Delete`.)
 - **D6.** `NewRowid` returns a value with a predicate, not an exact number.
 
 ## 5. Known gaps between this contract and the code
@@ -247,8 +253,8 @@ unclear, write the test and see, **by design** = contract already accounts for i
 | # | Gap | Source | Class |
 |---|---|---|---|
 | G1 | `Prev` after a non-balancing `Delete` skips one row | btree.rs notes 6.1 | bug |
-| G2 | After a peer deletes our row, `RowId`/`Column` read the next row and `Delete` removes it | 6.5 | by design (U9) |
-| G3 | Peer write clears the null-row flag, then `Column` reads the real row | 6.4 | by design (U9) |
+| G2 | After a peer deletes our row, `RowId`/`Column` read the next row and `Delete` removes it | 6.5 | by design (U8, U4: the cursor is in the gap) |
+| G3 | Peer write clears the null-row flag, then `Column` reads the real row | 6.4 | bug, see 5b |
 | G4 | MVCC `Column` after `Insert` that updates a B-tree-resident row reads the old record | mvcc 3.8 | probe, likely bug (D1) |
 | G5 | Overlay key dropped when a chain becomes "covered" and the B-tree peek differs | mvcc D3 | probe |
 | G6 | B-tree rows already skipped as shadowed are not revisited after rollback to a savepoint | mvcc D14 | probe |
@@ -286,19 +292,24 @@ ephemeral table) wherever one cursor would write and another would read the same
 | G4 | MVCC, checkpointed | After an overwrite by `Insert` on the same cursor, `Column` reads the old record |
 | R1 | all | `RowData` and `Column` disagree: on a null row, after `IdxInsert`, on a cursor without an entry, and with a pending `DeferredSeek` |
 | O1 | ephemeral | `OpenDup` rejects index cursors |
-| OV1 | MVCC | Index: an equality-only prefix seek, then `Next`, skips overlay keys or ends early |
+| OV1 | MVCC | Index: an equality-only prefix seek, then `Next`, skips overlay keys or ends early. `Found` and `NotFound` hits reach it too: `Found (1)`, `Next`, `Next`: the second `Next` ends the scan (entries in memory) |
 | N1 | MVCC | `SeekRowid` or `NotExists` hit, then `Next`: rows are lost (overlay tests T1 to T3 show the cases) |
 | N4 | MVCC, checkpointed | `Delete` of a row written in this run, then `Next` or `Prev`: nothing is found |
 | CL1 | MVCC | Index, NOCASE or RTRIM: `IdxDelete` of `('a', 1)` and `IdxInsert` of `('A', 1)` (equal under the collation, same rowid): a later read of the entry returns the old bytes `'a'`, not `'A'`. SQLite and WAL return the new bytes. Needs no checkpointed row. Reachable from SQL (`UPDATE t SET a='A'`, then a covering index scan): issue 9285 |
 | U1 | all | Undefined: `Next` or `Prev` in the wrong direction (D3). No engine refuses it with `unsupported` |
-| U2 | all | Undefined: `Next` or `Prev` after `Count`, `NewRowid`, `Found`, `NotFound`, `IdxDelete`. No engine refuses it |
+| U2 | all | Undefined: `Next` or `Prev` after `Count`, `NewRowid`, `IdxDelete`. No engine refuses it |
 | U3 | all | Undefined: `Insert`, `IdxInsert`, `Delete`, `Count` or `NewRowid` after `NullRow`. WAL answers a `NewRowid` with 1 (was N3). No engine refuses it. (`Next` and `Prev` after `NullRow` were U3; the corpus emits them in LEFT JOIN loops, and SQLite allows them) |
 | U4 | WAL, MVCC | Undefined: `Delete` without an entry (D4). WAL panics on `current_page >= 0`, MVCC with "Cannot delete: no current row". Neither message says `unsupported` |
 | U5 | all | Undefined: an insert without the seek token of its key, also after a `Found` or `NotFound` hit (was N11: WAL and ephemeral write the new key at the hit and leave the index out of order). No engine refuses it |
 | U6 | all | Undefined: `IdxGE/GT/LE/LT` after the entry was deleted (was N8; SQLite asserts, `vdbe.c:7112`). The engines compare the next entry or the end |
 | U7 | all | Undefined: `IdxDelete` of a missing key, and the collation-equal variant (section 2c). WAL and MVCC report a corrupt index, not `unsupported`. (`IdxInsert` of an existing key was U7; it is now defined as a replace) |
 | U8 | all | Undefined: a read at an undefined position (was N2 and N7: WAL panics with an overflow after `Count`, and reports "Corrupt database" after `SeekEnd`). No engine refuses it |
-| U9 | all | Undefined: a read or a move after another cursor wrote (was G2, G3, N5, N6, N9, N10, N12, IDX_G2, IDX_G3 and IDX_N6). WAL reads or moves to the wrong entry, loses the cell index, panics, or clears the null-row flag; MVCC keeps a deleted row. No engine refuses it. Not reachable from SQL: about 16 statements for IDX_N6 gave only two-pass plans for every plan with a second writer |
+| U9 | - | Retired: a peer now keeps its position by key (D5). The rows that were U9 (G2, G3, N5, N6, N9, N10, N12, IDX_G2, IDX_G3, IDX_N6) are now defined: `defined_tests.rs` runs them, and the engines that disagree are G3, G4, PW2, PD1 and PD2 below. G4 is reached by a peer overwrite too: `SeekRowid(0, 20)`, `Insert(1, 20, 999)`, `Column(0)` reads 200 in MVCC checkpointed |
+| G3 | WAL, ephemeral | A cursor with the null-row flag reads the real row after a peer write. `Rewind(0)`, `NullRow(0)`, `Insert(1, 5)`, `RowId(0)` gives 10, not NULL. The ephemeral engine also ignores a `NullRow` that comes after the peer write. Table and index |
+| PW2 | WAL | Index: after an own `IdxInsert` and a write by a peer, the cursor is not on its new entry. `IdxInsert(0, (0,0,70))`, `IdxInsert(1, (8,8,80))`, `Observe(0)` gives NULL, not `(0,0,70)`; in walks `Prev` also returns the new entry again |
+| PD1 | WAL | `Prev` from the gap of an own `Delete`, after a peer insert, panics (`self.current_page >= 0`). `SeekRowid(0, 30)`, `Delete(0)`, `Last(1)`, `Prev(1)` twice, `Delete(1)`, `Insert(0, 16)`, `Prev(1)` |
+| PD2 | WAL | Index: `Delete` of the entry under the cursor after a peer `IdxDelete` panics (`idx < cell_count`). Index `(a NOCASE, b)`, entries `(NULL,'[')`, `('B',NULL)`, `('_','É')`: `Found(1, 'B')`, `IdxDelete(0, ('_','É'))`, `Delete(1)` |
+| FM1 | all | Index: `Next` after a `Found`, `NotFound` or `NoConflict` that missed does not go to the first entry after the key. MVCC ends the scan: `NotFound (1, 15)`, `Next` gives nothing, not `(2, 10)`. WAL and ephemeral skip an entry: entries `(3,2,10)`, `(3,2,13)`, `Found (3, 1)` (miss), `Next` gives rowid 13, not 10 |
 
 Not modelled: `DeferredSeek`, direction switches (D3), covered-chain drops in the overlay,
 a failed eq-only seek that leaves the cursor on a neighbour. An eq-only `SeekGE` for a key

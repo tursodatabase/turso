@@ -1,19 +1,22 @@
 //! Reference model of index cursors (SPEC 2b) with the sort order and the collation of the index
 //! columns (SPEC 2c, `IdxDef`).
 //!
-//! The model has these parts: `ipos`, `itok`, `icursor`, `istep`, `irun`, `iseek_ge`,
-//! `cmp_prefix`, and so on. A caller comes before the functions it calls. The unit tests at
-//! the end are examples with hand-checked expected values.
+//! The rules are in `turso_core::storage::model::spec`, the step function that the model
+//! storage of the VDBE runs too. `istep` maps the index ops onto it. This file keeps the
+//! index as a sorted list of keys with the compare of SPEC 2c (`cmp_prefix` and so on). The
+//! unit tests at the end are examples with hand-checked expected values.
 //!
 //! The model is the oracle of the index random walk (`index_walk.rs`). `istep` returns `None`
 //! for an illegal op, and a value that the contract leaves open is `Spec::Unspec`, which the
 //! comparison with an engine skips.
 
 use super::index_program::{run_index, IObs, IOp, IndexRun, Outcome, Row};
-use super::model::{Dir, Spec};
+use super::model::Spec;
 use super::program::ReadMode;
 use super::{DbKind, Layout};
 use std::cmp::Ordering;
+use turso_core::storage::model::spec::{self, Tree, Write};
+use turso_core::types::SeekOp;
 
 // ---------------------------------------------------------------------------------------
 // Types (cols, ikey, istore, ipos, itok, icursor, istate, iop, iaction, iobs)
@@ -135,36 +138,15 @@ pub type IKey = (Cols, i64);
 /// The keys of the index, sorted by `cmp_key`.
 pub type IStore = Vec<IKey>;
 
-/// Like `Pos` in `model.rs`, with two more states. `Matched(p)`: a `Found`-style opcode hit,
-/// the cursor is on some entry with prefix `p`, reads are `Unspec`, `Next` and `Prev` are
-/// illegal. `Seeked(p)`: such an opcode missed.
-#[derive(Debug, Clone, PartialEq)]
-pub enum IPos {
-    Invalid,
-    At(IKey),
-    Matched(Cols),
-    Seeked(Cols),
-    Gone(IKey),
-    Lost,
-}
+/// The position of an index cursor (`spec::Pos`). An entry key is `IKey`, a seek key is a
+/// prefix of the columns.
+pub type IPos = spec::Pos<IKey, Cols>;
 
-/// The seek token holds the prefix of the last `Found`-style opcode, or "append".
-#[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::enum_variant_names)] // variant names are the token names of the contract
-pub enum ITok {
-    ITNone,
-    ITKey(Cols),
-    ITApp,
-}
+/// The seek token holds the prefix of the last exact seek, or "append".
+pub type ITok = spec::Token<Cols>;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ICursor {
-    pub icpos: IPos,
-    pub icdir: Dir,
-    /// The NullRow flag.
-    pub icnull: bool,
-    pub ictok: ITok,
-}
+/// The state of one index cursor.
+pub type ICursor = spec::Shape<IKey, Cols>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IState {
@@ -219,19 +201,8 @@ pub struct IMObs {
     pub icolv: Spec<Option<Cols>>,
 }
 
-impl ICursor {
-    fn new(icpos: IPos, icdir: Dir, icnull: bool, ictok: ITok) -> ICursor {
-        ICursor {
-            icpos,
-            icdir,
-            icnull,
-            ictok,
-        }
-    }
-}
-
 pub fn fresh_icursor() -> ICursor {
-    ICursor::new(IPos::Invalid, Dir::DNone, false, ITok::ITNone)
+    ICursor::fresh()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -262,270 +233,151 @@ pub fn irun(st: &IState, p: &[IAction]) -> Option<(IState, Vec<IMObs>)> {
     Some((st, os))
 }
 
-/// One action. `None` means the action is illegal in this state.
+/// One action. `None` means the action is illegal in this state. The rules are in
+/// `turso_core::storage::model::spec`; this function maps the op onto it.
 pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
-    let c = st.icurs.get(a.iacur)?.clone();
-    if c.icnull && !ok_after_null(&a.iaop) {
-        return None;
-    }
-    let s = &st.irows;
-    let d = st.idef;
-    let put = |c2: ICursor, j: bool| iput(st, a.iacur, c2, j);
-    let seek = |o: Option<IKey>, d: Dir| {
-        let (c2, j) = imove_to(o, d);
-        put(c2, j)
+    let c = st.icurs.get(a.iacur)?;
+    let (d, s) = (st.idef, &st.irows);
+    let op = match &a.iaop {
+        IMOp::IRewind => spec::Op::Rewind,
+        IMOp::ILast => spec::Op::Last,
+        IMOp::INext => spec::Op::Next,
+        IMOp::IPrev => spec::Op::Prev,
+        IMOp::ISeekGE(p) => spec::Op::Seek(p.clone(), SeekOp::GE { eq_only: false }),
+        IMOp::ISeekGT(p) => spec::Op::Seek(p.clone(), SeekOp::GT),
+        IMOp::ISeekLE(p) => spec::Op::Seek(p.clone(), SeekOp::LE { eq_only: false }),
+        IMOp::ISeekLT(p) => spec::Op::Seek(p.clone(), SeekOp::LT),
+        // `Found` and `NotFound` are eq-only seeks on the prefix.
+        IMOp::IFound(p) | IMOp::INotFound(p) => spec::Op::Found(p.clone()),
+        IMOp::INoConflict(p) if has_null(p) => spec::Op::NoConflictNull,
+        IMOp::INoConflict(p) => spec::Op::Found(p.clone()),
+        IMOp::IdxGE(_) | IMOp::IdxGT(_) | IMOp::IdxLE(_) | IMOp::IdxLT(_) => spec::Op::Compare,
+        // With a NULL in the key Turso seeks, so no token is needed.
+        IMOp::IdxInsert(key, use_seek) => spec::Op::Insert {
+            key: key.clone(),
+            use_seek: *use_seek && !has_null(&key.0),
+        },
+        // The harness sets P5. Only the stored bytes name the entry: a key that is equal under
+        // the collations but not identical is missing (SPEC 2c).
+        IMOp::IdxDelete(key) => spec::Op::IdxDelete {
+            key: s.contains(key).then(|| key.clone()),
+            must_exist: true,
+        },
+        IMOp::IDelete => spec::Op::Delete,
+        IMOp::ISeekEnd => spec::Op::SeekEnd,
+        IMOp::IClear => spec::Op::Clear,
+        IMOp::INullRow => spec::Op::NullRow,
+        IMOp::ICount => spec::Op::Count,
+        IMOp::IObserve => spec::Op::Read,
     };
-    // Next and Prev: a move that finds no entry ends the scan and does not jump.
-    let advance = |o: Option<IKey>| match o {
-        Some(k) => put(
-            ICursor::new(IPos::At(k), c.icdir, false, ITok::ITNone),
-            true,
-        ),
-        None => put(
-            ICursor::new(IPos::Invalid, c.icdir, false, ITok::ITNone),
-            false,
-        ),
+    let out = spec::step(&IndexTree { d, s }, c, &op).ok()?;
+    let rows = match &out.write {
+        None => s.clone(),
+        Some(Write::Put(k)) => iins(d, k, s),
+        Some(Write::Remove(k)) => idel(d, k, s),
+        Some(Write::Clear) => Vec::new(),
     };
-    // `Found`-style opcodes: `hit_jump` is the jump flag on a hit.
-    let found = |p: &Cols, hit_jump: bool| {
-        if has_prefix(d, p, s) {
-            put(
-                ICursor::new(
-                    IPos::Matched(p.clone()),
-                    Dir::DNone,
-                    false,
-                    // A hit gives no seek token: an insert with `use_seek` is Undefined (U5).
-                    ITok::ITNone,
-                ),
-                hit_jump,
-            )
-        } else {
-            put(
-                ICursor::new(
-                    IPos::Seeked(p.clone()),
-                    Dir::DNone,
-                    false,
-                    ITok::ITKey(p.clone()),
-                ),
-                !hit_jump,
-            )
-        }
+    let cleared = matches!(out.write, Some(Write::Clear));
+    let peers = IndexTree { d, s: &rows };
+    let icurs = st
+        .icurs
+        .iter()
+        .enumerate()
+        .map(|(i, cj)| match () {
+            _ if i == a.iacur => out.shape.clone(),
+            _ if out.write.is_some() => spec::after_peer_write(&peers, cj, cleared),
+            _ => cj.clone(),
+        })
+        .collect();
+    // `Idx*` compares the entry under the cursor with the prefix. A cursor on no entry jumps
+    // (Turso behaviour; SQLite asserts).
+    let idx = |p: &Cols, f: fn(Ordering) -> bool| match &c.pos {
+        IPos::At(k) if !c.null_row => f(cmp_prefix(d, k, p)),
+        _ => true,
     };
-    // `Idx*`: compare the entry under the cursor with the prefix; no state change.
-    // The entry under the cursor must still exist: after a delete by another cursor the
-    // position is `At` a key that is gone, and the compare is Undefined (U6).
-    let idx = |p: &Cols, f: fn(Ordering) -> bool| match &c.icpos {
-        IPos::At(k) if imem(d, k, s) => put(c.clone(), f(cmp_prefix(d, k, p))),
-        IPos::At(_) => None,
-        IPos::Invalid => put(c.clone(), true),
-        _ => None,
-    };
-    match &a.iaop {
-        IMOp::IRewind => seek(imin(s), Dir::Fwd),
-        IMOp::ILast => seek(imax(s), Dir::Bwd),
-        IMOp::ISeekGE(p) => seek(iseek_ge(d, p, s), Dir::Fwd),
-        IMOp::ISeekGT(p) => seek(iseek_gt(d, p, s), Dir::Fwd),
-        IMOp::ISeekLE(p) => seek(iseek_le(d, p, s), Dir::Bwd),
-        IMOp::ISeekLT(p) => seek(iseek_lt(d, p, s), Dir::Bwd),
-        IMOp::IFound(p) => found(p, true),
-        IMOp::INotFound(p) => found(p, false),
-        IMOp::INoConflict(p) => {
-            if has_null(p) {
-                put(
-                    ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone),
-                    true,
-                )
-            } else {
-                found(p, false)
-            }
-        }
+    let ijumped = match &a.iaop {
+        IMOp::INext | IMOp::IPrev | IMOp::IFound(_) => out.hit,
+        IMOp::INoConflict(p) => has_null(p) || !out.hit,
+        IMOp::IRewind
+        | IMOp::ILast
+        | IMOp::ISeekGE(_)
+        | IMOp::ISeekGT(_)
+        | IMOp::ISeekLE(_)
+        | IMOp::ISeekLT(_)
+        | IMOp::INotFound(_) => !out.hit,
         IMOp::IdxGE(p) => idx(p, is_ge),
         IMOp::IdxGT(p) => idx(p, is_gt),
         IMOp::IdxLE(p) => idx(p, is_le),
         IMOp::IdxLT(p) => idx(p, is_lt),
-        // `Next` and `Prev` after `NullRow` find no row (SQLite: `OP_Next` on an invalid
-        // cursor). The position afterwards is none.
-        IMOp::INext | IMOp::IPrev if c.icnull => put(
-            ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone),
-            false,
-        ),
-        IMOp::INext => {
-            if c.icdir != Dir::Fwd {
-                return None;
-            }
-            match &c.icpos {
-                IPos::Invalid => put(c.clone(), false),
-                IPos::At(k) | IPos::Gone(k) => advance(isucc(d, k, s)),
-                _ => None,
-            }
-        }
-        IMOp::IPrev => {
-            if c.icdir != Dir::Bwd {
-                return None;
-            }
-            match &c.icpos {
-                IPos::Invalid => put(c.clone(), false),
-                IPos::At(k) | IPos::Gone(k) => advance(ipred(d, k, s)),
-                _ => None,
-            }
-        }
-        // A key that is equal to a stored key replaces it: the new bytes win (SPEC 2c).
-        IMOp::IdxInsert(key, use_seek) => {
-            if !*use_seek || tok_ok(d, &c, key, s) {
-                let s2 = iins(d, key, s);
-                let c2 = ICursor::new(IPos::At(key.clone()), c.icdir, false, ITok::ITNone);
-                Some(iwrite(st, s2, a.iacur, c2))
-            } else {
-                None
-            }
-        }
-        IMOp::IdxDelete(key) => {
-            // Only the stored bytes name the entry: a key that is equal under the collations
-            // but not identical is Undefined (SPEC 2c).
-            if s.contains(key) {
-                let s2 = idel(d, key, s);
-                let c2 = ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone);
-                Some(iwrite(st, s2, a.iacur, c2))
-            } else {
-                None
-            }
-        }
-        IMOp::IDelete => match &c.icpos {
-            IPos::At(k) if imem(d, k, s) => {
-                let s2 = idel(d, k, s);
-                let c2 = ICursor::new(IPos::Gone(k.clone()), c.icdir, false, ITok::ITNone);
-                Some(iwrite(st, s2, a.iacur, c2))
-            }
-            _ => None,
+        _ => false,
+    };
+    let o = match &a.iaop {
+        IMOp::ICount => IMObs {
+            ijumped,
+            irid: Spec::Is(Some(s.len() as i64)),
+            icolv: Spec::Unspec,
         },
-        IMOp::ISeekEnd => put(
-            ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITApp),
-            false,
-        ),
-        IMOp::IClear => {
-            let ended = ICursor::new(IPos::Invalid, Dir::Fwd, false, ITok::ITNone);
-            Some((
-                IState {
-                    irows: Vec::new(),
-                    icurs: vec![ended; st.icurs.len()],
-                    idef: d,
-                },
-                IMObs {
-                    ijumped: false,
-                    irid: Spec::Is(None),
-                    icolv: Spec::Is(None),
-                },
-            ))
-        }
-        // A cursor without a position (`Lost`) cannot be set to the null row: Undefined (U9).
-        IMOp::INullRow => match c.icpos {
-            IPos::Lost => None,
-            _ => put(
-                ICursor {
-                    icnull: true,
-                    ..c.clone()
-                },
-                false,
-            ),
-        },
-        IMOp::ICount => {
-            let c2 = ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone);
-            Some((
-                IState {
-                    irows: s.clone(),
-                    icurs: iset_nth(&st.icurs, a.iacur, c2),
-                    idef: d,
-                },
-                IMObs {
-                    ijumped: false,
-                    irid: Spec::Is(Some(s.len() as i64)),
-                    icolv: Spec::Unspec,
-                },
-            ))
-        }
-        // A read needs a defined position. At `Matched`, `Seeked`, `Gone` and `Lost` it is
-        // Undefined (U8).
-        IMOp::IObserve => match iread(d, s, &c) {
-            Spec::Unspec => None,
-            Spec::Is(_) => put(c.clone(), false),
-        },
-    }
-}
-
-/// Opcodes that are still legal after `NullRow`.
-fn ok_after_null(o: &IMOp) -> bool {
-    matches!(
-        o,
-        IMOp::IRewind
-            | IMOp::ILast
-            | IMOp::INext
-            | IMOp::IPrev
-            | IMOp::ISeekGE(_)
-            | IMOp::ISeekGT(_)
-            | IMOp::ISeekLE(_)
-            | IMOp::ISeekLT(_)
-            | IMOp::IObserve
-            | IMOp::INullRow
-    )
-}
-
-/// May an `IdxInsert` with `use_seek` go ahead? The cursor holds the token for exactly the
-/// columns of the key, or an append token and the key is above every key, or the columns have
-/// a NULL (Turso seeks then).
-fn tok_ok(d: IdxDef, c: &ICursor, key: &IKey, s: &IStore) -> bool {
-    (match &c.ictok {
-        ITok::ITKey(p) => cmp_cols(d, p, &key.0) == Ordering::Equal,
-        ITok::ITApp => above_all(d, key, s),
-        ITok::ITNone => false,
-    }) || has_null(&key.0)
-}
-
-/// The store stays the same, one cursor changes.
-fn iput(st: &IState, i: usize, c2: ICursor, j: bool) -> Option<(IState, IMObs)> {
-    let o = iobs_of(st.idef, &st.irows, &c2, j);
+        _ => iobs_of(d, &rows, &out.shape, ijumped),
+    };
     Some((
         IState {
-            irows: st.irows.clone(),
-            icurs: iset_nth(&st.icurs, i, c2),
-            idef: st.idef,
+            irows: rows,
+            icurs,
+            idef: d,
         },
         o,
     ))
 }
 
-/// A write: new store, and every pending seek token ends.
-fn iwrite(st: &IState, s2: IStore, i: usize, c2: ICursor) -> (IState, IMObs) {
-    let o = iobs_of(st.idef, &s2, &c2, false);
-    (
-        IState {
-            irows: s2,
-            icurs: iset_nth(&ilose_peers(&st.icurs), i, c2),
-            idef: st.idef,
-        },
-        o,
-    )
+/// The index as the spec sees it.
+struct IndexTree<'a> {
+    d: IdxDef,
+    s: &'a IStore,
 }
 
-fn imove_to(o: Option<IKey>, d: Dir) -> (ICursor, bool) {
-    match o {
-        Some(k) => (ICursor::new(IPos::At(k), d, false, ITok::ITNone), false),
-        None => (ICursor::new(IPos::Invalid, d, false, ITok::ITNone), true),
+impl Tree for IndexTree<'_> {
+    type Key = IKey;
+    type Probe = Cols;
+
+    fn first(&self) -> Option<IKey> {
+        imin(self.s)
     }
-}
 
-/// A write by a cursor leaves every cursor of the index without a position, and ends every
-/// pending seek token (U9). The writer gets its own position afterwards. See `lose_peers` in
-/// `model.rs`.
-fn ilose_peers(cs: &[ICursor]) -> Vec<ICursor> {
-    cs.iter()
-        .map(|_| ICursor::new(IPos::Lost, Dir::DNone, false, ITok::ITNone))
-        .collect()
-}
+    fn last(&self) -> Option<IKey> {
+        imax(self.s)
+    }
 
-fn iset_nth(cs: &[ICursor], i: usize, c: ICursor) -> Vec<ICursor> {
-    let mut out = cs.to_vec();
-    out[i] = c;
-    out
+    fn after(&self, k: &IKey) -> Option<IKey> {
+        isucc(self.d, k, self.s)
+    }
+
+    fn before(&self, k: &IKey) -> Option<IKey> {
+        ipred(self.d, k, self.s)
+    }
+
+    fn seek(&self, p: &Cols, op: SeekOp) -> Option<IKey> {
+        let (d, s) = (self.d, self.s);
+        let e = match op {
+            SeekOp::GE { .. } => iseek_ge(d, p, s),
+            SeekOp::GT => iseek_gt(d, p, s),
+            SeekOp::LE { .. } => iseek_le(d, p, s),
+            SeekOp::LT => iseek_lt(d, p, s),
+        };
+        e.filter(|k| !op.eq_only() || is_eq(cmp_prefix(d, k, p)))
+    }
+
+    fn contains(&self, k: &IKey) -> bool {
+        imem(self.d, k, self.s)
+    }
+
+    /// A seek key is a prefix of the columns, so a hit never names one whole key.
+    fn token_allows(&self, p: &Cols, hit: bool, k: &IKey) -> bool {
+        !hit && cmp_cols(self.d, p, &k.0) == Ordering::Equal
+    }
+
+    fn above_all(&self, k: &IKey) -> bool {
+        above_all(self.d, k, self.s)
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -556,13 +408,13 @@ fn iobs_of(d: IdxDef, s: &IStore, c: &ICursor, j: bool) -> IMObs {
 /// A cursor `At k` reads the stored entry that equals `k` under the collations. After a peer
 /// deleted `('a', 1)` and inserted `('A', 1)` the cursor reads `('A', 1)` (SPEC 2c).
 fn iread(d: IdxDef, s: &IStore, c: &ICursor) -> Spec<Option<IKey>> {
-    if c.icnull {
+    if c.null_row {
         return Spec::Is(None);
     }
-    match &c.icpos {
+    match &c.pos {
         IPos::Invalid => Spec::Is(None),
         IPos::At(k) => Spec::Is(s.iter().find(|k2| is_eq(cmp_key(d, k2, k))).cloned()),
-        IPos::Matched(_) | IPos::Seeked(_) | IPos::Gone(_) | IPos::Lost => Spec::Unspec,
+        IPos::Seeked(_) | IPos::Gone(_) | IPos::Lost => Spec::Unspec,
     }
 }
 
@@ -665,7 +517,7 @@ fn is_eq(c: Ordering) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------
-// Store (iins, idel, imem, iseek_*, imin, imax, isucc, ipred, has_prefix, ...)
+// Store (iins, idel, imem, iseek_*, imin, imax, isucc, ipred, ...)
 // ---------------------------------------------------------------------------------------
 
 /// A key that is equal to a stored key (under the collations) replaces it.
@@ -724,10 +576,6 @@ pub fn ipred(d: IdxDef, k: &IKey, s: &IStore) -> Option<IKey> {
     s.iter().rev().find(|k2| is_lt(cmp_key(d, k2, k))).cloned()
 }
 
-pub fn has_prefix(d: IdxDef, p: &[Val], s: &IStore) -> bool {
-    s.iter().any(|k| is_eq(cmp_prefix(d, k, p)))
-}
-
 pub fn has_null(p: &[Val]) -> bool {
     p.iter().any(|v| v == &Val::Null)
 }
@@ -759,7 +607,7 @@ impl IReplay {
         keys.sort_by(|x, y| cmp_key(idef, x, y));
         let mut st = iinit_with(keys, nidx, idef);
         if ephemeral && nidx > 0 {
-            st.icurs[0].icpos = IPos::Lost;
+            st.icurs[0].pos = IPos::Lost;
         }
         IReplay { st }
     }
@@ -1246,13 +1094,15 @@ mod tests {
             a(3, INoConflict(some_p(&[1, 2]))),
             a(4, INoConflict(some_p(&[9, 9]))),
         ];
+        // `Found` and `NotFound` are eq-only seeks: NULL equals NULL in an index key, so the
+        // first two hit `k1`. `NoConflict` jumps on a NULL without a seek.
         assert_eq!(
             obs_of_run(5, &p),
             Some(vec![
+                kobs(true, &k1()),
+                kobs(false, &k1()),
                 iunspec(true),
-                iunspec(false),
-                iunspec(true),
-                iunspec(false),
+                kobs(false, &k3()),
                 iunspec(true)
             ])
         );
@@ -1266,8 +1116,21 @@ mod tests {
 
     #[test]
     fn example_ifound_then_next() {
+        // A hit is on the first match, like an eq-only `SeekGE`. `Next` goes on, `Prev` is
+        // illegal (U1).
         let p = [a(0, IFound(some_p(&[1]))), a(0, INext)];
+        assert_eq!(
+            obs_of_run(1, &p),
+            Some(vec![kobs(true, &k2()), kobs(true, &k3())])
+        );
+        let p = [a(0, IFound(some_p(&[1]))), a(0, IPrev)];
         assert_eq!(obs_of_run(1, &p), None);
+        // A miss is at the place of the key: `Next` goes to the first entry after it.
+        let p = [a(0, INotFound(some_p(&[1, 5]))), a(0, INext)];
+        assert_eq!(
+            obs_of_run(1, &p),
+            Some(vec![iunspec(true), kobs(true, &k5())])
+        );
     }
 
     #[test]
@@ -1458,11 +1321,33 @@ mod tests {
 
     #[test]
     fn example_iidxdelete() {
-        // Another cursor loses its position (U9): `Next` and a read are illegal.
-        for op in [INext, IObserve] {
-            let p = [a(0, ISeekGE(some_p(&[1]))), a(1, IdxDelete(k3())), a(0, op)];
-            assert_eq!(obs_of_run(2, &p), None);
-        }
+        // Another cursor keeps its position by key.
+        let p = [
+            a(0, ISeekGE(some_p(&[1]))),
+            a(1, IdxDelete(k3())),
+            a(0, INext),
+        ];
+        assert_eq!(
+            obs_of_run(2, &p),
+            Some(vec![kobs(false, &k2()), iunspec(false), kobs(true, &k4())])
+        );
+        // The peer deleted the entry under the cursor: the cursor is in the gap. A read is
+        // illegal (U8), `Next` goes on.
+        let p = [
+            a(0, ISeekGE(some_p(&[1, 2]))),
+            a(1, IdxDelete(k3())),
+            a(0, IObserve),
+        ];
+        assert_eq!(obs_of_run(2, &p), None);
+        let p = [
+            a(0, ISeekGE(some_p(&[1, 2]))),
+            a(1, IdxDelete(k3())),
+            a(0, INext),
+        ];
+        assert_eq!(
+            obs_of_run(2, &p),
+            Some(vec![kobs(false, &k3()), iunspec(false), kobs(true, &k4())])
+        );
         // The deleting cursor is `Lost`.
         let p = [a(0, IdxDelete(k3())), a(0, INext)];
         assert_eq!(obs_of_run(1, &p), None);
@@ -1513,7 +1398,7 @@ mod tests {
                 kobs(false, &k2())
             ])
         );
-        // `Next` after `NullRow` finds no row. `Count` and `Found` are illegal.
+        // `Next` after `NullRow` finds no row. `Count` is illegal, `Found` is a seek.
         assert_eq!(
             obs_of_run(1, &[a(0, IRewind), a(0, INullRow), a(0, INext)]),
             Some(vec![kobs(false, &k1()), iend(false), iunspec(false)])
@@ -1524,7 +1409,7 @@ mod tests {
         );
         assert_eq!(
             obs_of_run(1, &[a(0, INullRow), a(0, IFound(some_p(&[1])))]),
-            None
+            Some(vec![iend(false), kobs(true, &k2())])
         );
     }
 

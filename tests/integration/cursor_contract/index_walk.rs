@@ -81,8 +81,26 @@ impl IdxGaps {
     /// `('a', 1)`). The overlay keeps the bytes of the first key, so a read gives the old text.
     pub const CL1_MVCC_EQUAL_KEY_REINSERT: IdxGaps = IdxGaps(1 << 14);
 
+    /// FM1: every engine: `Next` after a `Found`, `NotFound` or `NoConflict` that missed does
+    /// not go to the first entry after the key. WAL and ephemeral skip an entry or end the
+    /// scan, MVCC ends the scan.
+    pub const FM1_NEXT_AFTER_FOUND_MISS: IdxGaps = IdxGaps(1 << 15);
+    /// PW2: WAL and ephemeral: after an `IdxInsert` of the cursor and a write by another
+    /// cursor, the cursor is not on the new entry: a read gives NULL, `Prev` returns the new
+    /// entry again.
+    pub const PW2_READ_AFTER_INSERT_AND_PEER_WRITE: IdxGaps = IdxGaps(1 << 16);
+    /// G3: WAL and ephemeral: a cursor with the null-row flag and a write by another cursor
+    /// since its last move reads the real entry instead of NULL.
+    pub const G3_NULL_ROW_AND_PEER_WRITE: IdxGaps = IdxGaps(1 << 17);
+    /// OV1: MVCC: `Next` after a `Found`, `NotFound` or `NoConflict` that hit skips entries or
+    /// ends the scan (the equality seek gap OV1, reached through `Found`).
+    pub const OV1_NEXT_AFTER_FOUND_HIT: IdxGaps = IdxGaps(1 << 18);
+    /// PD2: WAL: `Delete` of the entry under the cursor after another cursor wrote to the
+    /// index panics (`idx < cell_count`).
+    pub const PD2_DELETE_AFTER_PEER_WRITE: IdxGaps = IdxGaps(1 << 19);
+
     pub const NONE: IdxGaps = IdxGaps(0);
-    pub const ALL: IdxGaps = IdxGaps(0b101_0000_0000_1111);
+    pub const ALL: IdxGaps = IdxGaps(0b1111_1101_0000_0000_1111);
 
     pub fn has(self, other: IdxGaps) -> bool {
         self.0 & other.0 == other.0
@@ -108,7 +126,7 @@ impl IdxGaps {
         }
     }
 
-    pub const NAMES: [(&'static str, IdxGaps); 6] = [
+    pub const NAMES: [(&'static str, IdxGaps); 11] = [
         ("IDX_D1_MVCC_CKPT", IdxGaps::IDX_D1_MVCC_CKPT),
         ("IDX_END_INSERT", IdxGaps::IDX_END_INSERT),
         ("ROWDATA_IDX_INSERT", IdxGaps::ROWDATA_IDX_INSERT),
@@ -118,6 +136,11 @@ impl IdxGaps {
             IdxGaps::IDX_N4_MVCC_CKPT_DELETE_OF_WRITTEN,
         ),
         ("CL1", IdxGaps::CL1_MVCC_EQUAL_KEY_REINSERT),
+        ("FM1", IdxGaps::FM1_NEXT_AFTER_FOUND_MISS),
+        ("PW2", IdxGaps::PW2_READ_AFTER_INSERT_AND_PEER_WRITE),
+        ("G3", IdxGaps::G3_NULL_ROW_AND_PEER_WRITE),
+        ("OV1", IdxGaps::OV1_NEXT_AFTER_FOUND_HIT),
+        ("PD2", IdxGaps::PD2_DELETE_AFTER_PEER_WRITE),
     ];
 }
 
@@ -412,7 +435,12 @@ struct Gen {
     /// The last write of the cursor was an `IdxInsert` of a key above every key, and the
     /// cursor did not move since.
     appended: Vec<bool>,
+    /// The last move of the cursor was a `Found`, `NotFound` or `NoConflict` that missed.
+    found_miss: Vec<bool>,
+    /// The last move of the cursor was a `Found`, `NotFound` or `NoConflict` that hit.
+    found_hit: Vec<bool>,
     /// Another cursor wrote to the index since the cursor moved the last time.
+    peer_wrote: Vec<bool>,
     /// Keys that an `IdxInsert` of this run wrote.
     written: Vec<IKey>,
     /// Every key that the index held at some time of the run: the setup rows and `written`.
@@ -431,6 +459,9 @@ impl Gen {
             mode,
             after_insert: vec![false; nidx],
             appended: vec![false; nidx],
+            found_miss: vec![false; nidx],
+            found_hit: vec![false; nidx],
+            peer_wrote: vec![false; nidx],
             written: Vec::new(),
         }
     }
@@ -560,12 +591,12 @@ impl Gen {
             use_seek,
         };
         if rng.random_bool(0.5) {
-            match &cur.ictok {
-                ITok::ITKey(p) if p.len() == 2 => {
+            match &cur.token {
+                ITok::Key { key: p, hit: false } if p.len() == 2 => {
                     let rowid = self.new_rowid(rng, p);
                     return make(p[0].clone(), p[1].clone(), rowid, true);
                 }
-                ITok::ITApp => {
+                ITok::Append => {
                     let (a, b, rowid) = self.above_all_key(rng);
                     return make(a, b, rowid, true);
                 }
@@ -656,7 +687,7 @@ impl Gen {
 
     /// A prefix of the entry under the cursor, or a random prefix.
     fn near_entry(&self, rng: &mut ChaCha8Rng, c: usize) -> Prefix {
-        match &self.replay.st.icurs[c].icpos {
+        match &self.replay.st.icurs[c].pos {
             IPos::At(k) | IPos::Gone(k) if rng.random_bool(0.7) => {
                 let len = rng.random_range(1..=2);
                 perturb(rng, self.pool, k.0[..len].to_vec())
@@ -711,6 +742,20 @@ impl Gen {
             }
             self.after_insert[c] = insert.is_some();
             self.appended[c] = insert.is_some_and(|k| above_all(before.idef, &k, &before.irows));
+            let found = matches!(op, IOp::Found(..) | IOp::NotFound(..) | IOp::NoConflict(..));
+            let pos = &self.replay.st.icurs[c].pos;
+            self.found_miss[c] = found && matches!(pos, IPos::Seeked(_));
+            self.found_hit[c] = found && matches!(pos, IPos::At(_));
+            self.peer_wrote[c] = false;
+        }
+        let writes = matches!(
+            op,
+            IOp::IdxInsert { .. } | IOp::IdxDelete { .. } | IOp::Delete(_) | IOp::Clear(_)
+        );
+        if writes {
+            for (j, w) in self.peer_wrote.iter_mut().enumerate() {
+                *w |= j != c;
+            }
         }
     }
 
@@ -735,6 +780,38 @@ impl Gen {
                 && mvcc_ckpt
                 && self.idx_n4(op))
             || (self.gaps.has(IdxGaps::CL1_MVCC_EQUAL_KEY_REINSERT) && mvcc && self.cl1(op))
+            || (self.gaps.has(IdxGaps::PD2_DELETE_AFTER_PEER_WRITE)
+                && wal_or_eph
+                && matches!(*op, IOp::Delete(c) if self.peer_wrote[c]))
+            || (self.gaps.has(IdxGaps::OV1_NEXT_AFTER_FOUND_HIT)
+                && mvcc
+                && matches!(*op, IOp::Next(c) if self.found_hit[c]))
+            || (self.gaps.has(IdxGaps::FM1_NEXT_AFTER_FOUND_MISS)
+                && matches!(*op, IOp::Next(c) if self.found_miss[c]))
+            || (self.gaps.has(IdxGaps::PW2_READ_AFTER_INSERT_AND_PEER_WRITE)
+                && wal_or_eph
+                && (self.uses_entry(op, |c| self.after_insert[c] && self.peer_wrote[c])
+                    || matches!(*op, IOp::Next(c) | IOp::Prev(c) | IOp::Delete(c)
+                        if self.after_insert[c] && self.peer_wrote[c])))
+            || (self.gaps.has(IdxGaps::G3_NULL_ROW_AND_PEER_WRITE)
+                && wal_or_eph
+                && self.uses_entry(op, |c| {
+                    self.replay.st.icurs[c].null_row && self.peer_wrote[c]
+                }))
+    }
+
+    /// A read or a compare of the entry under a cursor for which `bad` is true.
+    fn uses_entry(&self, op: &IOp, bad: impl Fn(usize) -> bool) -> bool {
+        match op {
+            IOp::Observe(c)
+            | IOp::Column(c, _)
+            | IOp::IdxRowId(c)
+            | IOp::IdxGE(c, _)
+            | IOp::IdxGT(c, _)
+            | IOp::IdxLE(c, _)
+            | IOp::IdxLT(c, _) => bad(*c),
+            _ => false,
+        }
     }
 
     /// CL1: an `IdxInsert` of a key that is equal but not identical to a key that the index
@@ -754,7 +831,7 @@ impl Gen {
     /// wrote.
     fn idx_n4(&self, op: &IOp) -> bool {
         let IOp::Delete(c) = *op else { return false };
-        matches!(&self.replay.st.icurs[c].icpos, IPos::At(k) if self.written.contains(k))
+        matches!(&self.replay.st.icurs[c].pos, IPos::At(k) if self.written.contains(k))
     }
 
     /// IDX_D1_MVCC_CKPT: `Next` or `Prev` right after an `IdxInsert` of the same cursor.
@@ -790,7 +867,7 @@ impl Gen {
     fn rowdata_null_row(&self, op: &IOp) -> bool {
         self.is_row_data()
             && matches!(*op, IOp::Observe(c) | IOp::Column(c, _) | IOp::IdxRowId(c)
-                if self.replay.st.icurs[c].icnull)
+                if self.replay.st.icurs[c].null_row)
     }
 
     fn is_row_data(&self) -> bool {

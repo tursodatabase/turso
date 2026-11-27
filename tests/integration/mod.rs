@@ -13,6 +13,8 @@ mod checkpoint_write_failure;
 mod common;
 mod conflict_resolution;
 mod connection;
+// The models use the cursor spec of the model storage, which exists only in debug builds.
+#[cfg(debug_assertions)]
 mod cursor_contract;
 mod custom_types;
 mod database;
