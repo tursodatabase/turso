@@ -15971,6 +15971,15 @@ pub fn op_set_cookie(
         // Header cookies are global metadata with no row-level conflict keys; they need
         // SQLite-style single-writer semantics (same policy as DDL in MVCC).
         upgrade_mv_tx_to_exclusive(connection, &pager, mv_store, *db, tx_id)?;
+    } else {
+        // Writing the header marks page 1 dirty. Without a write transaction,
+        // no commit or rollback cleans it up, and the next read transaction
+        // finds it.
+        turso_assert!(
+            pager.wal.is_none() || pager.holds_write_lock(),
+            "SetCookie requires a write transaction",
+            { "db": db }
+        );
     }
 
     match with_header_mut(&pager, mv_store.as_ref(), connection, *db, |header| {
