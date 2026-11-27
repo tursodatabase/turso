@@ -1,4 +1,4 @@
-use rand::{rng, seq::SliceRandom, RngCore, SeedableRng};
+use rand::{rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
@@ -599,19 +599,6 @@ pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
     );
     let rng = ChaCha8Rng::seed_from_u64(seed as u64);
     (rng, seed as u64)
-}
-
-/// Set ENCRYPTION_TEST_FULL=1 for every case; SEED replays sampled cases.
-pub fn sample_encryption_cases<T>(mut cases: Vec<T>, count: usize, rng: &mut ChaCha8Rng) -> Vec<T> {
-    if !full_encryption_tests() {
-        cases.shuffle(rng);
-        cases.truncate(count);
-    }
-    cases
-}
-
-pub fn full_encryption_tests() -> bool {
-    std::env::var("ENCRYPTION_TEST_FULL").as_deref() == Ok("1")
 }
 
 pub fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {

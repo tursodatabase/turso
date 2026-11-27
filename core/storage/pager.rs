@@ -1651,38 +1651,7 @@ impl SharedPagerState {
     }
 
     pub(crate) fn initialized(&self) -> bool {
-        #[cfg(all(test, shuttle))]
-        crate::sync::encryption_schedule_point(true);
-        let initialized = self.init_page_1.load().is_none();
-        #[cfg(all(test, shuttle))]
-        {
-            crate::thread::yield_now();
-            crate::sync::encryption_schedule_point(false);
-        }
-        initialized
-    }
-
-    fn initial_page_1(&self) -> Option<PageRef> {
-        #[cfg(all(test, shuttle))]
-        crate::sync::encryption_schedule_point(true);
-        let page = self.init_page_1.load_full();
-        #[cfg(all(test, shuttle))]
-        {
-            crate::thread::yield_now();
-            crate::sync::encryption_schedule_point(false);
-        }
-        page
-    }
-
-    fn set_initial_page_1(&self, page: Option<PageRef>) {
-        #[cfg(all(test, shuttle))]
-        crate::sync::encryption_schedule_point(true);
-        self.init_page_1.store(page);
-        #[cfg(all(test, shuttle))]
-        {
-            crate::thread::yield_now();
-            crate::sync::encryption_schedule_point(false);
-        }
+        self.init_page_1.load().is_none()
     }
 
     pub(crate) fn is_init_locked(&self) -> bool {
@@ -2248,7 +2217,7 @@ impl Pager {
             match state {
                 HeaderRefState::Start => {
                     // If db is not initialized, return the in-memory page
-                    if let Some(page1) = self.shared.initial_page_1() {
+                    if let Some(page1) = self.shared.init_page_1.load_full() {
                         return Ok(IOResult::Done(page1));
                     }
 
@@ -3255,7 +3224,7 @@ impl Pager {
             (size.get() - header.reserved_space as u32) as usize,
         );
 
-        self.shared.set_initial_page_1(Some(page));
+        self.shared.init_page_1.store(Some(page));
         self.set_page_size(size);
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
@@ -6000,7 +5969,7 @@ impl Pager {
             LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
         })?;
         // After we wrote the header page, we may now set this None, to signify we initialized
-        self.shared.set_initial_page_1(None);
+        self.shared.init_page_1.store(None);
         page.unpin();
         *self.allocate_page1_state.write() = AllocatePage1State::Done;
         Ok(IOResult::Done(page))

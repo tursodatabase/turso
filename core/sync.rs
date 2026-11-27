@@ -4,19 +4,6 @@ pub(crate) use shuttle_adapter::*;
 #[cfg(not(shuttle))]
 pub use std_adapter::*;
 
-// These schedule points, and the yields next to them in `SharedPagerState`, are
-// for the encryption shuttle tests of this crate. A yield changes the schedules of
-// every shuttle test that reaches it, because the PCT scheduler gives the lowest
-// priority to a task that yields. Thus only the unit tests of this crate compile them.
-#[cfg(all(test, shuttle))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct EncryptionSchedulePoint(pub bool);
-
-#[cfg(all(test, shuttle))]
-pub(crate) fn encryption_schedule_point(active: bool) {
-    shuttle::current::set_label_for_task(shuttle::current::me(), EncryptionSchedulePoint(active));
-}
-
 #[cfg(shuttle)]
 mod shuttle_adapter {
     pub use shuttle::sync::atomic;
