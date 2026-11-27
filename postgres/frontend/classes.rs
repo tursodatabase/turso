@@ -1,7 +1,7 @@
-//! The relation catalog: one stored `pg_class` row per relation.
+//! The relation catalog: stored user rows and binary-defined built-in rows.
 //!
 //! `sqlite_schema` describes the engine's storage: type, name, root page
-//! and SQL. `pg_class` stores the PostgreSQL columns and hidden fields for
+//! and SQL. A private table stores user relations and hidden fields for
 //! engine names, ownership dependencies and row-level security policies.
 //!
 //! Core knows nothing of this table. [`crate::catalog::PostgresDialect`]
@@ -59,7 +59,7 @@ use crate::schema_state::{change_schema_state, emit_catalog_apply, schema_state}
 use crate::unique_index::emit_unique_index_insert;
 use turso_core::security::policy::RowPolicy;
 
-pub(crate) const CLASSES_TABLE_NAME: &str = "pg_class";
+pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
 pub(crate) const CLASSES_NAME_INDEX_NAME: &str = "__turso_internal_classes_name";
 
@@ -85,7 +85,7 @@ pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 /// every privilege and nobody else has any. `relprivileges` keeps the same
 /// ACL with numeric role OIDs for permission checks. `relenginenamespace`
 /// is the engine namespace ID; `relnamespace` is the PostgreSQL OID.
-pub(crate) const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE pg_class (\
+pub(crate) const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     oid INTEGER PRIMARY KEY, \
     relname TEXT NOT NULL, \
     relnamespace INTEGER NOT NULL, \
@@ -216,7 +216,7 @@ const fn same_text(left: &str, right: &str) -> bool {
 }
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
-     ON pg_class (relenginenamespace, relname)";
+     ON __turso_internal_classes (relenginenamespace, relname)";
 
 /// Hides the implementation columns after parsing either engine SQL or
 /// SQL rewritten by VACUUM. User relations have mangled names on disk.
@@ -252,7 +252,7 @@ const CREATE_SEQUENCE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS sqlite_seque
 /// Stores the highest oid ever used. No oid is used yet, so it is the one
 /// before [`FIRST_NORMAL_OBJECT_ID`].
 const INSERT_HIGHEST_OID_SQL: &str =
-    "INSERT INTO sqlite_sequence (name, seq) VALUES ('pg_class', 16383)";
+    "INSERT INTO sqlite_sequence (name, seq) VALUES ('__turso_internal_classes', 16383)";
 
 // The statement above spells the oid so that it can be a constant.
 const _: () = assert!(FIRST_NORMAL_OBJECT_ID - 1 == 16383);
@@ -267,9 +267,8 @@ pub(crate) const TABLE_INIT: TableInit = TableInit {
     ],
 };
 
-/// Seeds the identities of the catalogs before the first user DDL runs.
-/// The column counts come from the schemas this frontend exposes.
-pub(crate) fn bootstrap_statements(schema: &Schema) -> Vec<String> {
+/// Builds the binary-defined catalog rows without persisting them in the file.
+fn builtin_rows(schema: &Schema) -> Vec<Vec<Value>> {
     crate::catalog::BUILTIN_CATALOGS
         .iter()
         .map(|&(oid, name, kind, shared)| {
@@ -280,21 +279,16 @@ pub(crate) fn bootstrap_statements(schema: &Schema) -> Vec<String> {
             let mut values = new_class_values(&new, RoleId::SUPERUSER, 11);
             values[column_position("oid")] = ClassValue::Int(oid);
             values[column_position("relisshared")] = ClassValue::Int(i64::from(shared));
-            let values = values
+            values
                 .into_iter()
                 .map(|value| match value {
-                    ClassValue::Null => "NULL".to_string(),
-                    ClassValue::Int(value) => value.to_string(),
-                    ClassValue::Real(value) => format!("{value:.1}"),
-                    ClassValue::Text(value) => format!("'{}'", value.replace('\'', "''")),
-                    ClassValue::Register(_) => unreachable!("bootstrap values are constants"),
+                    ClassValue::Null => Value::Null,
+                    ClassValue::Int(value) => Value::from_i64(value),
+                    ClassValue::Real(value) => Value::from_f64(value),
+                    ClassValue::Text(value) => Value::build_text(value),
+                    ClassValue::Register(_) => unreachable!("built-in rows are constants"),
                 })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "INSERT INTO {CLASSES_TABLE_NAME} ({}) VALUES ({values})",
-                CLASS_COLUMNS.join(", ")
-            )
+                .collect()
         })
         .collect()
 }
@@ -375,7 +369,7 @@ impl ClassCatalog {
     /// `schema`, after checking that every user relation of `schema` has a
     /// row.
     pub(crate) fn build(schema: &Schema, rows: &[Vec<Value>]) -> turso_core::Result<Self> {
-        let catalog = Self::new(rows)?;
+        let mut catalog = Self::new(rows)?;
         let relations = schema.user_relations();
         for (namespace, name, _) in &relations {
             if is_stored_catalog_table(*namespace, name) {
@@ -391,12 +385,25 @@ impl ClassCatalog {
         for class in catalog.classes() {
             catalog.check_relation(schema, &relations, class)?;
         }
-        for &(oid, name, _, _) in crate::catalog::BUILTIN_CATALOGS {
-            if catalog.get_by_oid(oid).is_none() {
-                return Err(LimboError::Corrupt(format!(
-                    "catalog {name} has no row in {CLASSES_TABLE_NAME}"
-                )));
-            }
+        // Built-in identities come from this binary, after validating file rows.
+        for row in builtin_rows(schema) {
+            let prefix = vec![
+                row[column_position("oid")].clone(),
+                row[column_position("relname")].clone(),
+                Value::from_i64(0),
+                row[column_position("relkind")].clone(),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::Null,
+                Value::from_i64(0),
+                Value::Null,
+                Value::Null,
+                row[column_position("relenginename")].clone(),
+                Value::from_i64(0),
+            ];
+            let class = class_from_row(&prefix)?;
+            catalog.stored_rows.insert(class.oid, row);
+            catalog.add(class);
         }
         Ok(catalog)
     }
@@ -416,26 +423,10 @@ impl ClassCatalog {
                 class.relname
             ))
         };
-        let (natts, has_index, checks) = if class.oid < FIRST_NORMAL_OBJECT_ID {
-            let Some(&(_, name, kind, _)) = crate::catalog::BUILTIN_CATALOGS
-                .iter()
-                .find(|&&(oid, _, _, _)| oid == class.oid)
-            else {
-                return Err(invalid());
-            };
-            if class.relname != name
-                || class.relkind != kind
-                || !class.relnamespace.is_root()
-                || class.engine_name.as_deref() != Some(name)
-            {
-                return Err(invalid());
-            }
-            (
-                crate::catalog::builtin_catalog_columns(schema, name).len(),
-                false,
-                0,
-            )
-        } else {
+        if class.oid < FIRST_NORMAL_OBJECT_ID {
+            return Err(invalid());
+        }
+        let (natts, has_index, checks) = {
             if let Some(name) = &class.engine_name {
                 if !relations.iter().any(|(namespace, relation_name, kind)| {
                     *namespace == class.relnamespace
@@ -1801,11 +1792,15 @@ pub(crate) fn translate_access_statement(
                 else {
                     // Public catalogs already grant SELECT to every role,
                     // whether their rows are stored or virtual.
-                    if !revoke
-                        && is_stored_catalog_table(*namespace, name)
-                        && privileges.iter().all(|p| *p == ast::Privilege::Select)
+                    if is_stored_catalog_table(*namespace, name)
+                        || (namespace.is_root() && name.eq_ignore_ascii_case("pg_class"))
                     {
-                        continue;
+                        if !revoke && privileges.iter().all(|p| *p == ast::Privilege::Select) {
+                            continue;
+                        }
+                        return Err(not_supported(format!(
+                            "{statement} on system catalog {name}"
+                        )));
                     }
                     if schema.get_btree_table(*namespace, name).is_some() {
                         return Err(not_supported(format!(

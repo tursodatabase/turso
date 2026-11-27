@@ -768,9 +768,6 @@ fn ref_act_to_char(act: &RefAct) -> &'static str {
 
 /// Implemented catalog relations. Empty compatibility placeholders have no row. The OIDs and kinds were
 /// checked against PostgreSQL 18's pg_class after initdb.
-/// FIXME(pg-catalog): These binary-defined relations are seeded into the on-disk
-/// catalog. A virtual part should supply them from the binary, combined with
-/// physical rows for relations that exist in the database.
 pub(crate) const BUILTIN_CATALOGS: &[(i64, &str, RelationKind, bool)] = &[
     (2601, "pg_am", RelationKind::Table, false),
     (2604, "pg_attrdef", RelationKind::Table, false),
@@ -812,7 +809,7 @@ pub(crate) fn builtin_catalog_columns(
         // Stored catalogs do not exist when bootstrap statements are built.
         let sql = match name {
             "pg_description" => crate::descriptions::TABLE_INIT.statements[0],
-            "pg_class" => crate::classes::CREATE_CLASSES_TABLE_SQL,
+            "pg_class" => PgClassTable::SCHEMA,
             _ => panic!("a registered catalog has a schema: {name}"),
         };
         fallback = PostgresDialect
@@ -827,12 +824,47 @@ pub(crate) fn builtin_catalog_columns(
         .collect()
 }
 
-/// Stored class rows used by dependent catalogs in the schema snapshot.
+/// Combines stored user relations with catalog definitions from this binary.
 #[derive(Debug)]
 struct PgClassTable;
 
 impl SnapshotRows for PgClassTable {
-    const SCHEMA: &'static str = crate::classes::CREATE_CLASSES_TABLE_SQL;
+    const SCHEMA: &'static str = "CREATE TABLE pg_class (\
+    oid INTEGER PRIMARY KEY, \
+    relname TEXT NOT NULL, \
+    relnamespace INTEGER NOT NULL, \
+    reltype INTEGER NOT NULL, \
+    reloftype INTEGER NOT NULL, \
+    relowner INTEGER NOT NULL, \
+    relam INTEGER NOT NULL, \
+    relfilenode INTEGER NOT NULL, \
+    reltablespace INTEGER NOT NULL, \
+    relpages INTEGER NOT NULL, \
+    reltuples REAL NOT NULL, \
+    relallvisible INTEGER NOT NULL, \
+    relallfrozen INTEGER NOT NULL, \
+    reltoastrelid INTEGER NOT NULL, \
+    relhasindex BOOLEAN NOT NULL, \
+    relisshared BOOLEAN NOT NULL, \
+    relpersistence TEXT NOT NULL, \
+    relkind TEXT NOT NULL, \
+    relnatts INTEGER NOT NULL, \
+    relchecks INTEGER NOT NULL, \
+    relhasrules BOOLEAN NOT NULL, \
+    relhastriggers BOOLEAN NOT NULL, \
+    relhassubclass BOOLEAN NOT NULL, \
+    relrowsecurity BOOLEAN NOT NULL, \
+    relforcerowsecurity BOOLEAN NOT NULL, \
+    relispopulated BOOLEAN NOT NULL, \
+    relreplident TEXT NOT NULL, \
+    relispartition BOOLEAN NOT NULL, \
+    relrewrite INTEGER NOT NULL, \
+    relfrozenxid INTEGER NOT NULL, \
+    relminmxid INTEGER NOT NULL, \
+    relacl TEXT, \
+    reloptions TEXT, \
+    relpartbound TEXT, \
+    tableoid INTEGER HIDDEN)";
     /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
@@ -2669,6 +2701,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             schema: "CREATE TABLE pg_options_to_table (option_name TEXT, option_value TEXT, options_array TEXT HIDDEN)",
             append_rows: crate::options::append_options,
         },
+    );
+    options = options.native_module(
+        "pg_class",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgClassTable>(PhantomData),
     );
     options = options.native_module(
         "pg_namespace",
@@ -4720,6 +4757,50 @@ mod tests {
             .unwrap();
         conn.set_search_path(Some(vec!["public".to_string()]));
         conn
+    }
+
+    #[test]
+    fn builtin_catalog_column_changes_preserve_stored_relations() {
+        let db = crate::session::open_database_with_io(
+            Arc::new(turso_core::MemoryIO::new()),
+            "builtin-catalog-column-changes.db",
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute("CREATE TABLE kept (id int PRIMARY KEY)")
+            .unwrap();
+        let mut schema =
+            turso_core::alloc::TryClone::try_clone(conn.current_schema().as_ref()).unwrap();
+        let rows = conn
+            .prepare_engine_schema_statement(&crate::classes::schema_state_query(&schema).unwrap())
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let oid = crate::classes::class_catalog(&schema)
+            .unwrap()
+            .classes()
+            .find(|class| class.relname == "kept")
+            .unwrap()
+            .oid;
+        // Simulate a new binary exposing fewer columns without changing the file.
+        let table = schema.table_mut(NamespaceId::ROOT, "pg_am").unwrap();
+        let Table::Virtual(table) = Arc::make_mut(table) else {
+            panic!("pg_am is virtual")
+        };
+        Arc::make_mut(table).columns[0].set_hidden(true);
+        let catalog = crate::classes::ClassCatalog::build(&schema, &rows).unwrap();
+        assert_eq!(catalog.get_by_oid(oid).unwrap().relname, "kept");
+        let am = catalog
+            .stored_rows()
+            .into_iter()
+            .find(|row| row[0].as_int() == Some(2601))
+            .unwrap();
+        assert_eq!(
+            am[crate::classes::column_position("relnatts")].as_int(),
+            Some(builtin_catalog_columns(&schema, "pg_am").len() as i64)
+        );
     }
 
     #[test]

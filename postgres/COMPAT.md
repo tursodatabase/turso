@@ -92,9 +92,11 @@ as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Pr
 always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
-`pg_class` is a stored table with all 34 PostgreSQL 18 columns. Its engine
-fields and `tableoid` are hidden from `SELECT *`. DDL updates its rows in the
-same transaction, and schema loading rejects missing, orphaned or stale rows.
+`pg_class` is a virtual table with all 34 PostgreSQL 18 columns and a hidden
+`tableoid`. It combines user relation rows from a private physical table with
+built-in catalog rows from the running binary. DDL updates the physical rows
+in the same transaction, and schema loading rejects missing, orphaned or stale
+user rows. Changes to built-in catalog definitions do not require file updates.
 `pg_description` is a stored table. It has the comments that `COMMENT ON`
 stored, and the default `standard public schema` comment for `public`, so
 pg_dump does not emit a command to clear that comment on restore. Dropping a
@@ -842,7 +844,6 @@ platform Turso supports; PostgreSQL's platform/compiler feature entries do
 not carry over.
 
 Only implemented catalogs have relation identities in `pg_class`; empty
-compatibility placeholders do not. Catalog relation identities are stored when
-a database is created. They use
+compatibility placeholders do not. Catalog relation identities come from the running binary. They use
 PostgreSQL 18's OIDs in `pg_catalog`. Their attribute counts describe the columns
 that this frontend exposes, and `pg_attribute` lists those same columns.

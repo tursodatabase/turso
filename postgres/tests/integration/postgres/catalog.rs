@@ -313,12 +313,14 @@ fn a_table_without_a_class_row_fails_the_load_at_open_and_when_the_schema_is_rea
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE docs (id int)").unwrap();
     conn.inner()
-        .prepare_engine_schema_statement("DELETE FROM pg_class WHERE relname = 'docs'")
+        .prepare_engine_schema_statement(
+            "DELETE FROM __turso_internal_classes WHERE relname = 'docs'",
+        )
         .unwrap()
         .run_ignore_rows()
         .unwrap();
     let expected = format!(
-        "relation \"docs\" of namespace {} has no row in pg_class",
+        "relation \"docs\" of namespace {} has no row in __turso_internal_classes",
         public_namespace(&conn)
     );
 

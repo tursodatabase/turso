@@ -27,7 +27,7 @@ static TABLE_INITS: [TableInit; 4] = [
 
 /// The catalog tables that this frontend stores under their PostgreSQL
 /// names.
-const STORED_CATALOG_TABLES: [&str; 2] = [DESCRIPTION_TABLE_NAME, classes::CLASSES_TABLE_NAME];
+const STORED_CATALOG_TABLES: [&str; 1] = [DESCRIPTION_TABLE_NAME];
 
 /// The statements that create the frontend's tables that `schema` lacks.
 /// A read-only database gets none.
@@ -37,14 +37,11 @@ pub(crate) fn initialize_statements(
 ) -> Result<std::vec::IntoIter<String>> {
     classes::refuse_relations_without_class_table(schema)?;
     let is_missing = |table| schema.get_btree_table(NamespaceId::ROOT, table).is_none();
-    let mut statements: Vec<String> = TABLE_INITS
+    let statements: Vec<String> = TABLE_INITS
         .iter()
         .filter(|init| !read_only && is_missing(init.table))
         .flat_map(|init| init.statements.iter().map(|sql| sql.to_string()))
         .collect();
-    if !read_only && is_missing(classes::CLASSES_TABLE_NAME) {
-        statements.extend(classes::bootstrap_statements(schema));
-    }
     Ok(statements.into_iter())
 }
 

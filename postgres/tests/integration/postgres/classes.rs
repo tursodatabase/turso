@@ -11,7 +11,7 @@ use turso_core::{Connection, Numeric, SessionRole, Value};
 /// ordered by oid.
 fn class_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, String, i64)> {
     let rows = conn
-        .prepare_engine_schema_statement("SELECT oid, relname, relenginenamespace, relkind, CASE WHEN relowner=10 THEN 0 ELSE relowner-16384 END FROM pg_class WHERE oid >= 16384 ORDER BY oid")
+        .prepare_engine_schema_statement("SELECT oid, relname, relenginenamespace, relkind, CASE WHEN relowner=10 THEN 0 ELSE relowner-16384 END FROM __turso_internal_classes WHERE oid >= 16384 ORDER BY oid")
         .unwrap()
         .run_collect_rows()
         .unwrap();
@@ -637,7 +637,7 @@ fn relacl(conn: &turso_pg::Connection, relname: &str) -> Option<String> {
 fn stored_relacl(conn: &Arc<Connection>, relname: &str) -> Option<String> {
     let rows = conn
         .prepare(format!(
-            "SELECT relprivileges FROM pg_class WHERE relname = '{relname}'"
+            "SELECT relprivileges FROM __turso_internal_classes WHERE relname = '{relname}'"
         ))
         .unwrap()
         .run_collect_rows()
@@ -655,7 +655,7 @@ fn stored_relacl(conn: &Arc<Connection>, relname: &str) -> Option<String> {
 fn stored_relownedbycolumn(conn: &Arc<Connection>, relname: &str) -> Option<String> {
     let rows = conn
         .prepare(format!(
-            "SELECT relownedbycolumn FROM pg_class WHERE relname = '{relname}'"
+            "SELECT relownedbycolumn FROM __turso_internal_classes WHERE relname = '{relname}'"
         ))
         .unwrap()
         .run_collect_rows()
@@ -1008,7 +1008,7 @@ fn stored_policy_oids(conn: &Arc<Connection>, relname: &str) -> Vec<(String, i64
     conn.prepare(format!(
         "SELECT json_extract(c.relpolicies, '$[' || p.i || '].polname'), \
                 json_extract(c.relpolicies, '$[' || p.i || '].oid') \
-         FROM pg_class c, \
+         FROM __turso_internal_classes c, \
               generate_series(0, json_array_length(c.relpolicies) - 1) AS p(i) \
          WHERE c.relname = '{relname}' ORDER BY p.i"
     ))
@@ -1389,7 +1389,9 @@ fn a_missing_rowid_primary_key_class_fails_schema_load() {
     pg.execute("CREATE TABLE t (id int PRIMARY KEY, x int UNIQUE)")
         .unwrap();
     pg.inner()
-        .prepare_engine_schema_statement("DELETE FROM pg_class WHERE relname='t_pkey'")
+        .prepare_engine_schema_statement(
+            "DELETE FROM __turso_internal_classes WHERE relname='t_pkey'",
+        )
         .unwrap()
         .run_ignore_rows()
         .unwrap();
@@ -1435,13 +1437,13 @@ fn user_tables_with_catalog_names_have_attributes(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn pg_class_is_a_read_only_stored_catalog(db: TempDatabase) {
+fn pg_class_is_a_read_only_virtual_catalog(db: TempDatabase) {
     let pg = db.connect_postgres();
     assert!(pg
         .inner()
         .current_schema()
         .get_btree_table(turso_core::NamespaceId::ROOT, "pg_class")
-        .is_some());
+        .is_none());
     assert_eq!(
         pg.prepare("SELECT * FROM pg_catalog.pg_class")
             .unwrap()
@@ -1580,10 +1582,27 @@ fn stored_system_catalogs_reject_policy_and_owner_changes(db: TempDatabase) {
             format!("ALTER TABLE {table} OWNER TO CURRENT_USER"),
         ] {
             let error = pg.execute(&sql).unwrap_err();
-            assert_eq!(error.sqlstate, "42501", "{sql}: {error:?}");
+            assert_eq!(
+                error.sqlstate,
+                if table == "pg_class" && sql.starts_with("CREATE POLICY") {
+                    "42809"
+                } else {
+                    "42501"
+                },
+                "{sql}: {error:?}"
+            );
         }
-        pg.execute(format!("DROP POLICY IF EXISTS p ON {table}"))
-            .unwrap();
+        if table == "pg_class" {
+            assert_eq!(
+                pg.execute(format!("DROP POLICY IF EXISTS p ON {table}"))
+                    .unwrap_err()
+                    .sqlstate,
+                "42809"
+            );
+        } else {
+            pg.execute(format!("DROP POLICY IF EXISTS p ON {table}"))
+                .unwrap();
+        }
         pg.execute(format!("GRANT SELECT ON {table} TO PUBLIC"))
             .unwrap();
         for privilege in ["GRANT INSERT ON", "REVOKE SELECT ON"] {
@@ -1653,7 +1672,7 @@ fn quoted_relation_names_keep_engine_lookup(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn stored_catalog_lists_only_implemented_relations(db: TempDatabase) {
+fn virtual_catalog_lists_only_implemented_relations(db: TempDatabase) {
     let pg = db.connect_postgres();
     assert_implemented_catalog_rows(pg.inner());
     drop(pg);
@@ -1663,6 +1682,14 @@ fn stored_catalog_lists_only_implemented_relations(db: TempDatabase) {
 }
 
 fn assert_implemented_catalog_rows(conn: &Arc<Connection>) {
+    let stored_builtins = conn
+        .prepare_engine_schema_statement(
+            "SELECT count(*) FROM __turso_internal_classes WHERE oid < 16384",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(stored_builtins, vec![vec![Value::from_i64(0)]]);
     let rows = conn
         .prepare_engine_schema_statement(
             "SELECT relname FROM pg_class WHERE oid < 16384 ORDER BY relname",
