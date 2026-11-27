@@ -35,6 +35,7 @@ use crate::schema::{
     Table,
 };
 use crate::security::roles::RoleId;
+use crate::statement::StatementOrigin;
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
@@ -199,6 +200,9 @@ pub struct Resolver<'a> {
     /// engine makes it for the statements it runs on its own behalf and
     /// inside [`Resolver::as_superuser`].
     pub(crate) row_security_role: RoleId,
+    /// Who prepared the statement being compiled: the connection's user or
+    /// the engine. Every caller of [`Resolver::new`] says which.
+    pub(crate) origin: StatementOrigin,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -397,6 +401,7 @@ impl Resolver<'static> {
             Arc::new(crate::dialect::cannot_parse::DialectThatCannotParse),
             None,
             RoleId::SUPERUSER,
+            StatementOrigin::InternalHelper,
         )
     }
 }
@@ -426,6 +431,7 @@ impl<'a> Resolver<'a> {
         dialect: Arc<dyn crate::dialect::Dialect>,
         search_path: Option<&[String]>,
         row_security_role: RoleId,
+        origin: StatementOrigin,
     ) -> Self {
         Self {
             catalog: CatalogContext::new(
@@ -455,6 +461,7 @@ impl<'a> Resolver<'a> {
             query_nesting_depth: Rc::default(),
             role_is_not_superuser: false,
             row_security_role,
+            origin,
         }
     }
 
@@ -515,6 +522,7 @@ impl<'a> Resolver<'a> {
             query_nesting_depth: self.query_nesting_depth.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
             row_security_role: self.row_security_role,
+            origin: self.origin,
         }
     }
 
@@ -537,6 +545,7 @@ impl<'a> Resolver<'a> {
             query_nesting_depth: self.query_nesting_depth.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
             row_security_role: self.row_security_role,
+            origin: self.origin,
         }
     }
 
@@ -799,6 +808,33 @@ impl<'a> Resolver<'a> {
         qualified_name: &ast::QualifiedName,
     ) -> Result<NamespaceRef> {
         self.catalog.resolve_queried_table(qualified_name)
+    }
+
+    /// The overlay that a statement reads where it names `table_name` of
+    /// `namespace` (see [`crate::OpenOptions::table_overlay`]). None when
+    /// the statement is a statement of the engine, which reads and writes
+    /// the stored table, or when the name is not that of a stored table with
+    /// an overlay.
+    pub(crate) fn table_overlay(
+        &self,
+        namespace: NamespaceRef,
+        table_name: &str,
+    ) -> Option<Arc<crate::vtab::VirtualTable>> {
+        if self.origin.is_engine()
+            || namespace.database_id != crate::MAIN_DB_ID
+            || !namespace.id.is_root()
+        {
+            return None;
+        }
+        let overlay = self
+            .catalog
+            .symbol_table
+            .table_overlays
+            .get(&normalize_ident(table_name))?;
+        self.with_schema(namespace.database_id, |schema| {
+            schema.get_btree_table(namespace.id, table_name)
+        })?;
+        Some(overlay.clone())
     }
 
     pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<NamespaceRef> {

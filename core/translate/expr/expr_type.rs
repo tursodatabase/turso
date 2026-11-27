@@ -1906,6 +1906,7 @@ mod tests {
             Arc::new(DialectThatCannotParse),
             None,
             crate::security::roles::RoleId::SUPERUSER,
+            crate::statement::StatementOrigin::InternalHelper,
         );
         let env = TypeEnv::new(None, &resolver);
         let mismatches: Vec<String> = cases

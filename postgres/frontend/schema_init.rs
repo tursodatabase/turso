@@ -8,7 +8,7 @@ use turso_core::schema::Schema;
 use turso_core::Result;
 
 use crate::descriptions::DESCRIPTION_TABLE_NAME;
-use crate::{auth_members, classes, descriptions, roles};
+use crate::{auth_members, catalog_table, classes, descriptions, roles};
 
 /// The statements that create `table`. They run when the database has no
 /// such table.
@@ -18,6 +18,7 @@ pub(crate) struct TableInit {
 }
 
 /// Every table of the frontend, in the order in which they are created.
+/// The stored tables of the catalog tables come after them.
 static TABLE_INITS: [TableInit; 4] = [
     classes::TABLE_INIT,
     roles::TABLE_INIT,
@@ -37,10 +38,22 @@ pub(crate) fn initialize_statements(
 ) -> Result<std::vec::IntoIter<String>> {
     classes::refuse_relations_without_class_table(schema)?;
     let is_missing = |table| schema.get_btree_table(NamespaceId::ROOT, table).is_none();
+    if read_only {
+        return Ok(Vec::new().into_iter());
+    }
     let statements: Vec<String> = TABLE_INITS
         .iter()
-        .filter(|init| !read_only && is_missing(init.table))
-        .flat_map(|init| init.statements.iter().map(|sql| sql.to_string()))
+        .filter(|init| is_missing(init.table))
+        .inspect(|init| {
+            assert!(
+                !catalog_table::is_catalog_table(init.table),
+                "{} is a catalog table, which create_missing_catalog_tables creates",
+                init.table
+            )
+        })
+        .flat_map(|init| init.statements.iter().copied())
+        .chain(catalog_table::create_missing_catalog_tables(schema))
+        .map(str::to_owned)
         .collect();
     Ok(statements.into_iter())
 }
