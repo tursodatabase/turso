@@ -1,0 +1,34 @@
+# A column of a subquery in FROM, of a CTE or of CREATE TABLE AS can have the
+# name "true" or "false". SQLite renames such a column to columnN, because it
+# parses TRUE and FALSE as identifiers. PostgreSQL does not.
+
+@database :memory:
+
+test true-false-subquery-column {
+    SELECT s."true", s."false" FROM (SELECT 1 AS "true", 2 AS "false") s;
+}
+expect {
+    1|2
+}
+
+test true-false-cte-column-list {
+    WITH w("true", "false") AS (SELECT 1, 2) SELECT "true", "false" FROM w;
+}
+expect {
+    1|2
+}
+
+test true-false-cte-column-alias {
+    WITH w AS (SELECT 1 AS "true") SELECT w."true" FROM w;
+}
+expect {
+    1
+}
+
+test true-false-create-table-as-column {
+    CREATE TABLE c AS SELECT 1 AS "true", 2 AS "false";
+    SELECT "true", "false" FROM c;
+}
+expect {
+    1|2
+}

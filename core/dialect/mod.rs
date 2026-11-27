@@ -591,6 +591,18 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether the parser reads TRUE and FALSE as identifiers that name the
+    /// boolean values.
+    ///
+    /// SQLite does, so it names a FROM subquery or CTE column `SELECT TRUE`
+    /// true, and it does not let a column of a FROM subquery, a CTE, a view
+    /// or CREATE TABLE AS have the name true or false, because the name would
+    /// read as the boolean value. In PostgreSQL, TRUE and FALSE are keywords
+    /// and "true" is a usual column name.
+    fn parses_true_false_as_identifiers(&self) -> bool {
+        true
+    }
+
     /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
     /// in its indexed terms.
     ///

@@ -37,7 +37,9 @@ use crate::translate::expr::expr_type::{
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_drop_child_table_check, emit_fk_drop_table_check};
-use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
+use crate::translate::plan::{
+    compound_column_affinity, stored_column_name, Plan, QueryDestination,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
@@ -967,9 +969,12 @@ fn derive_ctas_schema(
     // Collect names first, then deduplicate using SQLite's :N suffix convention.
     let mut names: Vec<String> = result_columns
         .iter()
-        .map(|col| {
-            col.output_column_name(table_refs)
-                .map_or_else(|| col.expr.to_string(), String::from)
+        .enumerate()
+        .map(|(index, col)| {
+            let name = col
+                .output_column_name(table_refs)
+                .map_or_else(|| col.expr.to_string(), String::from);
+            stored_column_name(name, index, resolver)
         })
         .collect();
 

@@ -120,7 +120,9 @@ pub struct ResultSetColumn {
     pub implicit_column_name: Option<String>,
     /// The name of a column reference without an alias, as written and
     /// without its table: `X` in `SELECT t.X`, `rowid` in `SELECT rowid`.
-    /// It names the column in a FROM subquery or a CTE.
+    /// The keywords TRUE and FALSE have the names true and false, as SQLite
+    /// parses them as identifiers. It names the column in a FROM subquery or
+    /// a CTE.
     pub(crate) written_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
@@ -3579,6 +3581,20 @@ pub(super) fn query_output_columns(
     Ok((columns, column_types))
 }
 
+/// The name a stored column gets from the name `name` of the column at the
+/// 0-based `index`. SQLite's sqlite3ColumnsFromExprList() does not name a
+/// column true or false, also when an alias or a column list gives that
+/// name, and uses columnN instead.
+pub(crate) fn stored_column_name(name: String, index: usize, resolver: &Resolver) -> String {
+    if resolver.catalog.dialect.parses_true_false_as_identifiers()
+        && (name.eq_ignore_ascii_case("true") || name.eq_ignore_ascii_case("false"))
+    {
+        format!("column{}", index + 1)
+    } else {
+        name
+    }
+}
+
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
@@ -3587,6 +3603,12 @@ fn subquery_output_columns(
 ) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
     let (mut columns, column_types) =
         query_output_columns(plan, explicit_columns, names, resolver)?;
+    for (index, column) in columns.iter_mut().enumerate() {
+        column.name = column
+            .name
+            .take()
+            .map(|name| stored_column_name(name, index, resolver));
+    }
     make_column_names_unique(&mut columns);
     Ok((columns, column_types))
 }
