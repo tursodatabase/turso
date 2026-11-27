@@ -1075,7 +1075,6 @@ expect {
     0
 }
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-joins-using-integer-column {
     SELECT count(*) FROM t JOIN t2 USING (o);
@@ -1083,22 +1082,13 @@ test oid-joins-using-integer-column {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
-}
 
-@compat-gap "operator:oid = int4"
 @setup oid_paths
 test oid-natural-joins-integer-column {
     SELECT count(*) FROM t NATURAL JOIN t2;
 }
 expect {
     1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type oid with type int4
 }
 
 @setup oid_paths
@@ -1283,13 +1273,38 @@ expect @tursopg error {
     operator does not exist: oid = double precision
 }
 
-@setup oid_paths
-test row-in-subquery-with-too-few-columns-errors {
-    SELECT count(*) FROM t WHERE (o, 1) IN (SELECT i FROM t);
+setup oid_right_join {
+    CREATE TABLE t3 (o oid, y text);
+    INSERT INTO t3 VALUES (4294967295, 'p'), (1, 'q');
+    CREATE TABLE t4 (o int4, x text);
+    INSERT INTO t4 VALUES (-1, 'a'), (1, 'b');
 }
-@sqlstate 42601
-expect error {
-    columns
+
+@compat-gap "operator:oid = int4"
+@setup oid_right_join
+test oid-right-join-using-integer-column {
+    SELECT o FROM t3 RIGHT JOIN t4 USING (o) ORDER BY x;
+}
+expect {
+    4294967295
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type oid with type int4
+}
+
+@compat-gap "operator:int4 = oid"
+@setup oid_paths
+test oid-joins-using-integer-column-on-the-left {
+    SELECT o FROM t2 JOIN t USING (o);
+}
+expect {
+    4294967295
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type int4 with type oid
 }
 
 @setup oid_paths

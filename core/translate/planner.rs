@@ -20,6 +20,7 @@ use crate::ast::{
 };
 use crate::security::permission::Object;
 use crate::translate::collate::check_comparable_results;
+use crate::translate::expr::read_literal_operands;
 use crate::translate::expr_context::ExprContext;
 use crate::translate::plan::BitSet;
 use crate::translate::{
@@ -3725,18 +3726,31 @@ fn plan_join_constraint(
                         is_rowid_alias: right_col.is_rowid_alias(),
                     };
 
-                    // USING makes one merged column whose type PostgreSQL derives
-                    // from both sides, so the pair must pass the result check even
-                    // where a comparison of it is allowed.
-                    check_comparable_results(
-                        [&left_column.expr, &right_column_expr].into_iter(),
-                        &ExprContext::new(Some(&*table_references), resolver),
-                    )?;
-                    let expr = Expr::Binary(
+                    let mut expr = Expr::Binary(
                         Box::new(left_column.expr),
                         ast::Operator::Equals,
                         Box::new(right_column_expr),
                     );
+                    read_literal_operands(&mut expr, Some(&*table_references), resolver)?;
+                    // USING makes one merged column whose type PostgreSQL derives
+                    // from both sides, so the pair must pass the result check even
+                    // where a comparison of it is allowed.
+                    let Expr::Binary(left_operand, _, right_operand) = &expr else {
+                        unreachable!("the expression is a comparison");
+                    };
+                    let uncast = |operand: &'_ Expr| match operand {
+                        Expr::Cast { expr, .. } => expr.as_ref().clone(),
+                        operand => operand.clone(),
+                    };
+                    let merged_right = if has_right_or_full_join {
+                        uncast(right_operand)
+                    } else {
+                        right_operand.as_ref().clone()
+                    };
+                    check_comparable_results(
+                        [&uncast(left_operand), &merged_right].into_iter(),
+                        &ExprContext::new(Some(&*table_references), resolver),
+                    )?;
 
                     for (left_table_id, left_col_idx) in left_column.source_columns {
                         table_references.mark_column_used(left_table_id, left_col_idx);
