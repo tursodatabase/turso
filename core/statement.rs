@@ -1875,6 +1875,18 @@ impl Statement {
         &self.program.sql
     }
 
+    /// Whether the statement is in the part of a commit that can no longer be undone: the
+    /// commit's data is written, or another connection can write it.
+    pub fn is_finishing_commit(&self) -> bool {
+        self.state.is_finishing_commit(&self.connection)
+    }
+
+    /// Makes the statement's MVCC commit of the main database finish without its
+    /// auto-checkpoint, and abandons that checkpoint if it has started.
+    pub fn skip_commit_checkpoint(&mut self) {
+        self.state.skip_commit_checkpoint();
+    }
+
     pub fn is_busy(&self) -> bool {
         self.busy
     }

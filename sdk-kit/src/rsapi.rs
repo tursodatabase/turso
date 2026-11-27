@@ -770,6 +770,27 @@ fn sync_busy_error() -> TursoError {
     TursoError::Busy("database is locked".to_string())
 }
 
+/// Fails with Busy if a sync operation is active, unless `statement` is in a commit that can no
+/// longer be undone: a Busy would tell the app that a transaction failed that the database keeps.
+/// An MVCC commit reaches that point when it queues its log record for group commit or starts to
+/// write the record itself. It does not hold the WAL write lock, so it is refused before that
+/// point, and dropping the statement rolls it back. A WAL commit holds the write lock until it is durable, then releases it for its
+/// auto-checkpoint. A commit that is let through skips its MVCC auto-checkpoint, which would
+/// change the main database's WAL while the sync operation reads and changes it.
+fn check_sync_operation_allows_step(
+    sync_busy: Option<&Arc<SyncBusyGate>>,
+    statement: &mut Statement,
+) -> Result<(), TursoError> {
+    if !sync_operation_active(sync_busy, statement.get_connection()) {
+        return Ok(());
+    }
+    if !statement.is_finishing_commit() {
+        return Err(sync_busy_error());
+    }
+    statement.skip_commit_checkpoint();
+    Ok(())
+}
+
 /// While a sync operation is active, statements fail with Busy, except on a connection that
 /// holds the WAL write lock. The sync operation needs that lock to change the database, so it
 /// cannot do so before that connection's COMMIT or ROLLBACK, and refusing them would only make
@@ -1682,9 +1703,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
-            return Err(sync_busy_error());
-        }
+        check_sync_operation_allows_step(self.sync_busy.as_ref(), stmt)?;
         step_inner(stmt, self.async_io, waker)
             .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
@@ -1699,9 +1718,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
-            return Err(sync_busy_error());
-        }
+        check_sync_operation_allows_step(self.sync_busy.as_ref(), stmt)?;
 
         loop {
             let status = step_inner(stmt, self.async_io, waker)
