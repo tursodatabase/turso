@@ -722,4 +722,17 @@ mod tests {
             .insert_statement(&row)
             .is_err());
     }
+
+    /// A built-in object has an oid below `FirstNormalObjectId`, so a
+    /// comment on an object that a user creates never has the key of a
+    /// built-in comment.
+    #[test]
+    fn each_builtin_comment_names_a_builtin_object() {
+        for row in &turso_pg_catalog::PG_DESCRIPTION {
+            assert!(
+                i64::from(row.objoid) < crate::classes::FIRST_NORMAL_OBJECT_ID,
+                "{row:?}"
+            );
+        }
+    }
 }
