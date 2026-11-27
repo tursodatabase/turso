@@ -109,7 +109,7 @@ fn check_indexed_real_nan(mvcc: bool) {
 }
 
 // Only a dialect that keeps NaN writes these bits. A database that has no NaN
-// must not read them as NULL from the table and as NaN from an index.
+// must not read them as NULL from the table and compare them as NaN in an index.
 #[test]
 #[cfg(not(feature = "checksum"))]
 fn the_nan_bits_of_another_dialect_are_corrupt() {
@@ -139,6 +139,11 @@ fn the_nan_bits_of_another_dialect_are_corrupt() {
         "SELECT a FROM t NOT INDEXED",
         "SELECT a FROM t INDEXED BY t_a",
         "SELECT b FROM t NOT INDEXED WHERE a IS NULL",
+        "SELECT b FROM t INDEXED BY t_a WHERE a IS NULL",
+        "SELECT count(*) FROM t INDEXED BY t_a WHERE a > 5",
+        "DELETE FROM t WHERE rowid = 1",
+        "INSERT OR REPLACE INTO t(rowid, a, b) VALUES (1, 2.5, 2)",
+        "SELECT bin_record_json_object('[\"a\"]', x'02077ff800545552534f')",
         "PRAGMA integrity_check",
     ] {
         let error = conn

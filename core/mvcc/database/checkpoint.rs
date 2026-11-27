@@ -2755,6 +2755,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                     known_root_page as i64,
                                     index.as_ref(),
                                     num_columns,
+                                    self.connection.nan_policy(),
                                 )?;
                                 let cursor = Arc::new(RwLock::new(cursor));
                                 self.cursors.insert(root_page, cursor.clone());
@@ -3056,6 +3057,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         root_page as i64,
                         index.as_ref(),
                         index.columns.len(),
+                        self.connection.nan_policy(),
                     )?;
                     let cursor = Arc::new(RwLock::new(cursor));
                     self.cursors.insert(root_page, cursor.clone());
@@ -4174,6 +4176,7 @@ mod tests {
                 true,
                 2,
                 true,
+                crate::types::NanPolicy::Null,
             )
             .unwrap(),
         );

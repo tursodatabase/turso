@@ -1372,8 +1372,9 @@ impl BTreeCursor {
         root_page: i64,
         table: &BTreeTable,
         num_columns: usize,
+        nan_policy: crate::types::NanPolicy,
     ) -> Self {
-        let index_info = Self::without_rowid_index_info(table);
+        let index_info = Self::without_rowid_index_info(table, nan_policy);
         Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
     }
 
@@ -1384,13 +1385,17 @@ impl BTreeCursor {
         root_page: i64,
         table: &BTreeTable,
         num_columns: usize,
+        nan_policy: crate::types::NanPolicy,
     ) -> Box<Self> {
-        let index_info = Self::without_rowid_index_info(table);
+        let index_info = Self::without_rowid_index_info(table, nan_policy);
         Self::new_boxed_with_index_info(pager, root_page, num_columns, Some(index_info))
     }
 
     /// The key of a WITHOUT ROWID table: its primary key columns.
-    fn without_rowid_index_info(table: &BTreeTable) -> Arc<IndexInfo> {
+    fn without_rowid_index_info(
+        table: &BTreeTable,
+        nan_policy: crate::types::NanPolicy,
+    ) -> Arc<IndexInfo> {
         let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
             let (_, column) = table
                 .get_column(col_name)
@@ -1402,8 +1407,14 @@ impl BTreeCursor {
             }
         });
         Arc::new(
-            IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
-                .expect(crate::alloc::ALLOC_ERR_MSG),
+            IndexInfo::new(
+                key_info,
+                false,
+                table.primary_key_columns.len(),
+                true,
+                nan_policy,
+            )
+            .expect(crate::alloc::ALLOC_ERR_MSG),
         )
     }
 
@@ -1412,8 +1423,9 @@ impl BTreeCursor {
         root_page: i64,
         index: &Index,
         num_columns: usize,
+        nan_policy: crate::types::NanPolicy,
     ) -> Result<Self> {
-        let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+        let index_info = Arc::new(IndexInfo::new_from_index(index, nan_policy)?);
         Ok(Self::new_with_index_info(
             pager,
             root_page,
@@ -1427,8 +1439,9 @@ impl BTreeCursor {
         root_page: i64,
         index: &Index,
         num_columns: usize,
+        nan_policy: crate::types::NanPolicy,
     ) -> Result<Box<Self>> {
-        let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+        let index_info = Arc::new(IndexInfo::new_from_index(index, nan_policy)?);
         Ok(Self::new_boxed_with_index_info(
             pager,
             root_page,
@@ -12137,9 +12150,14 @@ mod tests {
                 constraint_name: None,
             };
             let num_columns = index_def.columns.len();
-            let mut cursor =
-                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, num_columns)
-                    .unwrap();
+            let mut cursor = BTreeCursor::new_index(
+                pager.clone(),
+                index_root_page,
+                &index_def,
+                num_columns,
+                crate::types::NanPolicy::Null,
+            )
+            .unwrap();
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
@@ -12310,8 +12328,14 @@ mod tests {
                 on_conflict: None,
                 constraint_name: None,
             };
-            let mut cursor =
-                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
+            let mut cursor = BTreeCursor::new_index(
+                pager.clone(),
+                index_root_page,
+                &index_def,
+                1,
+                crate::types::NanPolicy::Null,
+            )
+            .unwrap();
 
             // Track expected keys that should be present in the tree
             let mut expected_keys = Vec::new();
@@ -12712,8 +12736,14 @@ mod tests {
                 on_conflict: None,
                 constraint_name: None,
             };
-            let mut cursor =
-                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
+            let mut cursor = BTreeCursor::new_index(
+                pager.clone(),
+                index_root_page,
+                &index_def,
+                1,
+                crate::types::NanPolicy::Null,
+            )
+            .unwrap();
 
             let key_bytes = |i: u64| -> Vec<u8> {
                 let mut k = vec![0u8; 128];
@@ -14460,7 +14490,14 @@ mod tests {
             on_conflict: None,
             constraint_name: None,
         };
-        let mut cursor = BTreeCursor::new_index(pager.clone(), root_page, &index, 1).unwrap();
+        let mut cursor = BTreeCursor::new_index(
+            pager.clone(),
+            root_page,
+            &index,
+            1,
+            crate::types::NanPolicy::Null,
+        )
+        .unwrap();
         let registers = [Register::Value(Value::from_i64(10))];
         let record = ImmutableRecord::from_registers(&registers, registers.len()).unwrap();
 
@@ -15294,8 +15331,16 @@ mod tests {
                 constraint_name: None,
             };
             let new_cursor = || {
-                let cursor =
-                    Box::new(BTreeCursor::new_index(pager.clone(), root_page, &index, 2).unwrap());
+                let cursor = Box::new(
+                    BTreeCursor::new_index(
+                        pager.clone(),
+                        root_page,
+                        &index,
+                        2,
+                        crate::types::NanPolicy::Null,
+                    )
+                    .unwrap(),
+                );
                 (*cursor).register_with_pager();
                 cursor
             };

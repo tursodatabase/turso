@@ -819,6 +819,29 @@ impl NanPolicy {
         }
     }
 
+    pub(crate) fn stored_nan_error() -> LimboError {
+        LimboError::Corrupt("a REAL field holds a NaN, which this database cannot store".into())
+    }
+
+    /// Fails for a stored value that a database with this rule cannot hold.
+    #[inline(always)]
+    pub(crate) fn check_stored(self, value: &ValueRef) -> Result<()> {
+        if self == Self::Null && matches!(value, ValueRef::Numeric(Numeric::Float(f)) if f.is_nan())
+        {
+            mark_unlikely();
+            return Err(Self::stored_nan_error());
+        }
+        Ok(())
+    }
+
+    /// Fails for a stored row that a database with this rule cannot hold.
+    pub(crate) fn check_stored_row(self, values: &[Value]) -> Result<()> {
+        if self == Self::Null && values.iter().any(Value::is_nan) {
+            return Err(Self::stored_nan_error());
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn normalize(self, value: &mut Value) {
         if self == Self::Null && value.is_nan() {
@@ -2729,6 +2752,8 @@ pub type IndexKeyInfo = Vec<KeyInfo, DynAllocator>;
 /// whether the index includes a row ID, and the total number of columns
 /// in the index.
 pub struct IndexInfo {
+    /// What the database of this index does with NaN.
+    pub nan_policy: NanPolicy,
     /// Specifies the sorting order (ascending or descending) for each column in the index.
     pub key_info: IndexKeyInfo,
     /// Indicates whether the index includes a row ID column.
@@ -2739,18 +2764,13 @@ pub struct IndexInfo {
     pub is_unique: bool,
 }
 
-impl Default for IndexInfo {
-    fn default() -> Self {
-        Self {
-            key_info: Self::key_info_in(TursoAllocator),
-            has_rowid: true,
-            num_cols: 1,
-            is_unique: false,
-        }
-    }
-}
-
 impl IndexInfo {
+    /// Fails for a key value that the database of this index cannot hold.
+    #[inline(always)]
+    pub fn check_stored(&self, value: &ValueRef) -> Result<()> {
+        self.nan_policy.check_stored(value)
+    }
+
     pub fn key_info_in<A: ConcurrentAllocator>(alloc: A) -> IndexKeyInfo {
         <IndexKeyInfo as TursoVecInExt<KeyInfo, DynAllocator>>::new_in(DynAllocator::new(alloc))
     }
@@ -2786,11 +2806,19 @@ impl IndexInfo {
         has_rowid: bool,
         num_cols: usize,
         is_unique: bool,
+        nan_policy: NanPolicy,
     ) -> Result<Self, TryReserveError>
     where
         I: IntoIterator<Item = KeyInfo>,
     {
-        Self::new_in(key_info, has_rowid, num_cols, is_unique, TursoAllocator)
+        Self::new_in(
+            key_info,
+            has_rowid,
+            num_cols,
+            is_unique,
+            nan_policy,
+            TursoAllocator,
+        )
     }
 
     pub fn new_in<A, I>(
@@ -2798,6 +2826,7 @@ impl IndexInfo {
         has_rowid: bool,
         num_cols: usize,
         is_unique: bool,
+        nan_policy: NanPolicy,
         alloc: A,
     ) -> Result<Self, TryReserveError>
     where
@@ -2805,6 +2834,7 @@ impl IndexInfo {
         I: IntoIterator<Item = KeyInfo>,
     {
         Ok(Self {
+            nan_policy,
             key_info: Self::key_info_from_iter_in(key_info, alloc)?,
             has_rowid,
             num_cols,
@@ -2812,12 +2842,13 @@ impl IndexInfo {
         })
     }
 
-    pub fn new_from_index(index: &Index) -> Result<Self, TryReserveError> {
-        Self::new_from_index_in(index, TursoAllocator)
+    pub fn new_from_index(index: &Index, nan_policy: NanPolicy) -> Result<Self, TryReserveError> {
+        Self::new_from_index_in(index, nan_policy, TursoAllocator)
     }
 
     pub fn new_from_index_in<A: ConcurrentAllocator>(
         index: &Index,
+        nan_policy: NanPolicy,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
         // A backing_btree stores the index method's complete opaque key. Unlike
@@ -2844,6 +2875,7 @@ impl IndexInfo {
             has_rowid,
             index.columns.len() + (has_rowid as usize),
             index.unique,
+            nan_policy,
             alloc,
         )
     }
@@ -3346,6 +3378,7 @@ where
             _ => {
                 let (value, field_size) = read_value(&left_packed[data_pos..], serial_type)?;
                 data_pos += field_size;
+                index_info.check_stored(&value)?;
                 value
             }
         };
@@ -4479,6 +4512,7 @@ mod tests {
             false,
             num_cols,
             false,
+            crate::types::NanPolicy::Null,
         )
         .unwrap()
     }
@@ -5215,6 +5249,37 @@ mod tests {
             let record = ImmutableRecordRef::from_bin_record(&payload);
             assert_eq!(record.get_values_owned().unwrap(), vec![Value::Null]);
         }
+    }
+
+    #[test]
+    fn a_key_comparison_refuses_a_stored_nan_where_nan_is_not_a_value() {
+        let stored = [Value::from_i64(1), Value::from_f64(f64::NAN)];
+        let stored = ImmutableRecord::from_values(&stored, stored.len()).unwrap();
+        let sought = [Value::from_i64(1), Value::from_f64(2.5)];
+        let key_info = || {
+            [KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::BINARY,
+                nulls_order: None,
+            }; 2]
+        };
+        let compare = |nan_policy| {
+            let index_info = IndexInfo::new(key_info(), false, 2, false, nan_policy).unwrap();
+            compare_record(
+                stored.get_payload(),
+                sought.iter(),
+                &index_info,
+                std::cmp::Ordering::Equal,
+            )
+        };
+        assert_eq!(
+            compare(NanPolicy::Preserve).unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert!(matches!(
+            compare(NanPolicy::Null),
+            Err(LimboError::Corrupt(_))
+        ));
     }
 
     #[test]

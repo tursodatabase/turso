@@ -4635,9 +4635,7 @@ pub(crate) fn decode_serial_type_into_register(
             ]) {
                 Some(real) if real.is_nan() && nan_policy == NanPolicy::Null => {
                     mark_unlikely();
-                    return Err(LimboError::Corrupt(
-                        "a REAL field holds a NaN, which this database cannot store".into(),
-                    ));
+                    return Err(NanPolicy::stored_nan_error());
                 }
                 Some(real) => dest.set_float(real),
                 None => dest.set_null(),

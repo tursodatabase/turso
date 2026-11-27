@@ -1885,6 +1885,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                         index_info.has_rowid,
                                         num_cols,
                                         index_info.is_unique,
+                                        index_info.nan_policy,
                                         self.db.allocator(),
                                     )?)
                                 }
