@@ -68,6 +68,18 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             .receiving_argument_types(),
         )
         .extension_function(
+            pg_scalar_function("to_json", FunctionArity::Exact(1), true, |_, args| {
+                exec_to_json(args)
+            })
+            .receiving_argument_types(),
+        )
+        .extension_function(
+            pg_scalar_function("to_jsonb", FunctionArity::Exact(1), true, |_, args| {
+                exec_to_jsonb(args)
+            })
+            .receiving_argument_types(),
+        )
+        .extension_function(
             pg_scalar_function(
                 "date_trunc",
                 FunctionArity::OneOf(&[2, 3]),
@@ -584,6 +596,18 @@ struct Json(String);
 
 impl ScalarReturn for Json {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("json"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `jsonb` value in its text form. Returning one gives the function the
+/// type `jsonb`, as in PostgreSQL, instead of text.
+struct Jsonb(String);
+
+impl ScalarReturn for Jsonb {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("jsonb"));
 
     fn into_value(self) -> Value {
         Value::build_text(self.0)
@@ -1763,12 +1787,62 @@ fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
     Ok(Some(Json(json)))
 }
 
+/// `to_json(value)`: the value as JSON, written by its type as array_to_json
+/// writes an element, and an array as array_to_json writes it. After the
+/// argument comes its type name, because a stored value doesn't tell its type.
+fn exec_to_json(args: &[Register]) -> Result<Option<Json>> {
+    let [value, type_name] = args else {
+        unreachable!("to_json takes one argument and its type name");
+    };
+    let value = value.get_value();
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let mut json = String::new();
+    write_json_of_type(value, &type_name.get_value().to_string(), &mut json)?;
+    Ok(Some(Json(json)))
+}
+
+/// `to_jsonb(value)`: the JSON that to_json gives, as a jsonb value. jsonb
+/// keeps one field of each name, orders the fields, and writes numbers as
+/// numeric does, so `to_jsonb(1e20::float8)` is `100000000000000000000`.
+fn exec_to_jsonb(args: &[Register]) -> Result<Option<Jsonb>> {
+    let [value, type_name] = args else {
+        unreachable!("to_jsonb takes one argument and its type name");
+    };
+    let value = value.get_value();
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let mut json = String::new();
+    write_json_of_type(value, &type_name.get_value().to_string(), &mut json)?;
+    Ok(Some(Jsonb(jsonb_text(&json)?)))
+}
+
 /// The JSON document `json` in the form PostgreSQL's jsonb_out writes it,
 /// read with the errors of jsonb_in. It is the stored form of a jsonb value.
 pub(crate) fn jsonb_text(json: &str) -> Result<String> {
     let mut text = String::new();
     write_jsonb_text(&read_json_document(json)?, &mut text);
     Ok(text)
+}
+
+/// Writes `value`, whose type is `type_name`, as JSON. An array type such as
+/// `integer[]` gives a JSON array. When the type is not known, a blob that
+/// holds an array is written as an array too.
+fn write_json_of_type(value: &Value, type_name: &str, json: &mut String) -> Result<()> {
+    let element_type = type_name.trim_end_matches("[]");
+    let dimensions = (type_name.len() - element_type.len()) / 2;
+    let element = JsonElement::of_type(element_type);
+    if dimensions > 0 || (matches!(element, JsonElement::Unknown) && holds_array(value)) {
+        let layout = JsonArrayLayout {
+            element,
+            dimensions,
+            separator: ",",
+        };
+        return write_json_array(value, &layout, json);
+    }
+    write_json_element(value, element, json)
 }
 
 /// Writes the jsonb value `node` as PostgreSQL's jsonb_out writes it: a space

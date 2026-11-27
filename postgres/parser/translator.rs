@@ -11,15 +11,15 @@ use crate::names::{
 };
 use crate::policy_condition::written_condition;
 use crate::sqlstate::{
-    SQLSTATE_DUPLICATE_COLUMN, SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED,
-    SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_RECURSION,
-    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_PARAMETER,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
-    SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_DUPLICATE_COLUMN, SQLSTATE_DUPLICATE_OBJECT,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME,
+    SQLSTATE_INVALID_OBJECT_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_RECURSION, SQLSTATE_INVALID_SCHEMA_DEFINITION,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -4835,6 +4835,12 @@ impl PostgreSQLTranslator {
         {
             return Err(ParseError::not_supported(
                 "substring() with a regular expression or SIMILAR pattern",
+            ));
+        }
+        if takes_anyelement(&func_name) && func_call.args.iter().any(is_untyped_literal) {
+            return Err(ParseError::sqlstate(
+                SQLSTATE_DATATYPE_MISMATCH,
+                "could not determine polymorphic type because input has type unknown",
             ));
         }
         if func_call.func_variadic {
@@ -11056,6 +11062,32 @@ fn reject_column_aliases(
 }
 
 // FIXME(pg-catalog): This guesses from the shape of the second argument whether substring() resolves to the pg_proc entry substring(text, text), which takes a regular expression, instead of substring(text, integer). Function resolution in pg_proc on a typed expression tree replaces this.
+/// Whether the function `name` has one parameter of the type anyelement,
+/// whose type PostgreSQL takes from the argument.
+// FIXME(pg-catalog): This hand-codes the proargtypes of to_json and to_jsonb
+// in pg_proc, which are (anyelement). Function resolution in pg_proc, which
+// refuses an argument of the type unknown for a polymorphic parameter,
+// replaces this list.
+fn takes_anyelement(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "to_json" | "to_jsonb")
+}
+
+/// Whether `node` is a quoted literal or NULL without a type. PostgreSQL gives
+/// such a literal the type unknown until something decides its type.
+fn is_untyped_literal(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+    matches!(
+        &node.node,
+        Some(Node::AConst(pg_query::protobuf::AConst {
+            isnull: true,
+            ..
+        })) | Some(Node::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Sval(_)),
+            ..
+        }))
+    )
+}
+
 fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::node::Node;
     match &node.node {

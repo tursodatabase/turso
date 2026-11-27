@@ -2732,6 +2732,98 @@ expect {
     [{"a": [1, {"x": 2.50, "yy": 1}], "b": 1}]
 }
 
+test to-json-writes-each-type-as-postgresql-does {
+    SELECT to_json(1), to_json(true), to_json('a "b"\'::text), to_json(1e20::float8),
+           to_json('Infinity'::float8), to_json('2024-01-02'::date),
+           to_json('2024-01-02 03:04:05.5'::timestamp), to_json('abc'::bytea),
+           to_json(ARRAY[[true], [false]]), to_json(ARRAY['a', NULL]);
+}
+expect {
+    1|true|"a \"b\"\\\\"|1e+20|"Infinity"|"2024-01-02"|"2024-01-02T03:04:05.5"|"\\\\x616263"|[[true],[false]]|["a",null]
+}
+
+test to-json-of-columns {
+    CREATE TABLE to_json_columns (id int, i int, n numeric(5, 2), b boolean, ts timestamptz, u uuid, ia int[], jb jsonb);
+    INSERT INTO to_json_columns VALUES
+        (1, 7, 1.50, true, '2024-01-02 03:04:05', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{1,2}', '{"b": 1, "a": 2}');
+    SELECT to_json(i), to_json(n), to_json(b), to_json(ts), to_json(u), to_json(ia), to_json(jb)
+    FROM to_json_columns;
+}
+expect {
+    7|1.50|true|"2024-01-02T03:04:05+00:00"|"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"|[1,2]|{"a": 2, "b": 1}
+}
+
+test to-jsonb-writes-the-jsonb-output-format {
+    CREATE TABLE to_jsonb_documents (j json);
+    INSERT INTO to_jsonb_documents VALUES ('{"b": 1,  "a":2, "aa": [1,{"y":1,"x":2.50}], "b": 3}');
+    SELECT to_jsonb(j), to_jsonb(1e20::float8), to_jsonb(ARRAY[1, 2]), to_jsonb('x'::text), to_jsonb(1.1::real)
+    FROM to_jsonb_documents;
+}
+expect {
+    {"a": 2, "b": 3, "aa": [1, {"x": 2.50, "y": 1}]}|100000000000000000000|[1, 2]|"x"|1.1
+}
+
+test to-json-and-to-jsonb-of-a-typed-null-are-null {
+    SELECT to_json(NULL::int) IS NULL, to_jsonb(NULL::text) IS NULL;
+}
+expect {
+    t|t
+}
+
+test to-json-result-is-json-and-to-jsonb-result-is-jsonb {
+    SELECT to_json(ARRAY[1, 2]) -> 1, to_jsonb(ARRAY['a', 'b']) ->> 0, to_json(to_json(1));
+}
+expect {
+    2|a|1
+}
+
+test to-json-of-a-null-without-a-type {
+    SELECT to_json(NULL);
+}
+@sqlstate 42804
+expect error {
+    could not determine polymorphic type because input has type unknown
+}
+
+test to-jsonb-of-a-null-without-a-type {
+    SELECT to_jsonb(NULL);
+}
+@sqlstate 42804
+expect error {
+    could not determine polymorphic type because input has type unknown
+}
+
+test to-json-of-a-cast-to-json-and-jsonb {
+    SELECT to_json('{"b":1}'::json), to_jsonb('{"b": 1, "a": 2}'::jsonb);
+}
+expect {
+    {"b":1}|{"a": 2, "b": 1}
+}
+
+test to-json-of-a-literal-without-a-type {
+    SELECT to_json('abc');
+}
+@sqlstate 42804
+expect error {
+    could not determine polymorphic type because input has type unknown
+}
+
+test to-json-of-a-json-column-keeps-its-text {
+    CREATE TABLE to_json_spaces (j json);
+    INSERT INTO to_json_spaces VALUES ('{"b": 1,  "a":2}');
+    SELECT j, to_json(j) FROM to_json_spaces;
+}
+expect {
+    {"b": 1,  "a":2}|{"b": 1,  "a":2}
+}
+
+test to-json-takes-one-argument {
+    SELECT to_json(1, 2);
+}
+@sqlstate 42883
+expect error {
+}
+
 test table-function-argument-cannot-name-a-table-listed-after-it {
     CREATE TABLE json_each_later (j json);
     SELECT * FROM json_each(json_each_later.j), json_each_later;

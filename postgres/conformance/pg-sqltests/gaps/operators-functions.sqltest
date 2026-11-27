@@ -570,15 +570,12 @@ expect @tursopg error {}
 
 # B-67: to_json(scalar)
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "function:to_json"
 test to-json-scalar {
     SELECT to_json(s), to_jsonb(n) FROM t WHERE id = 1;
 }
 expect {
     "abc"|10
 }
-@sqlstate 42883
-expect @tursopg error {}
 
 # B-68: row_to_json / to_json(row)
 @setup t_id_s_n_arr_ia_j_ok_with_rows
