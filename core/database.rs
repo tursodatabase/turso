@@ -3044,6 +3044,7 @@ impl Database {
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),
+            attached_read_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             explicit_transaction_start: RwLock::new(None),
             command_times: RwLock::new(None),

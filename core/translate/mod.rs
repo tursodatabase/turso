@@ -138,6 +138,9 @@ pub fn translate(
         connection.search_path()
     };
     let qualifiers = connection.qualifiers(schema);
+    let mut non_main_schemas = connection.attached_read_schemas().read().clone();
+    non_main_schemas.extend(connection.database_schemas().read().clone());
+    let non_main_schemas = crate::sync::RwLock::new(non_main_schemas);
     // Only a statement of the connection's user is limited by row-level
     // security. The engine's own statements read every row.
     let row_security_role = if matches!(origin, crate::statement::StatementOrigin::Root) {
@@ -147,7 +150,7 @@ pub fn translate(
     };
     let mut resolver = Resolver::new(
         schema,
-        connection.database_schemas(),
+        &non_main_schemas,
         &connection.temp.database,
         connection.attached_databases(),
         &qualifiers,
@@ -199,6 +202,7 @@ pub fn translate(
         stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
 
+    program.used_non_main_schemas = resolver.catalog.used_non_main_schemas();
     program.epilogue(schema);
 
     build_program(program, &connection, change_cnt_on, input)
