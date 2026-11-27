@@ -221,6 +221,7 @@ pub use vdbe::array::{
 };
 pub use vdbe::builder::{CursorType, ProgramBuilder};
 pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
+pub use vdbe::metrics::CursorWork;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,
