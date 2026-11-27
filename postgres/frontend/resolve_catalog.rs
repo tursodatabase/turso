@@ -155,7 +155,8 @@ static TABLES: LazyLock<Tables> = LazyLock::new(|| {
                 left: operator.left,
                 right: operator.right,
                 result: operator.result,
-                function: 0,
+                // FIXME(pg-catalog): The rows of OPERATORS have no oprcode, so the oid of the operator stands in for its function.
+                function: operator.oid,
             });
     }
     Tables {
