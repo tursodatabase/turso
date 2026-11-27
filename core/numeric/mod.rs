@@ -1,9 +1,9 @@
 use crate::{turso_debug_assert, types::AsValueRef, Value, ValueRef};
 
 pub mod decimal;
-pub mod nonnan;
+pub mod double;
 
-use nonnan::NonNan;
+use double::Double;
 
 // TODO: Remove when https://github.com/rust-lang/libs-team/issues/230 is available
 trait SaturatingShl {
@@ -43,7 +43,7 @@ impl SaturatingShr for i64 {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Numeric {
     Integer(i64),
-    Float(NonNan),
+    Float(Double),
 }
 
 impl Numeric {
@@ -256,7 +256,7 @@ impl Ord for Numeric {
             (Numeric::Float(a), Numeric::Float(b)) => {
                 let fa: f64 = (*a).into();
                 let fb: f64 = (*b).into();
-                // NonNan guarantees no NaN, so partial_cmp always returns Some.
+                // Double guarantees no NaN, so partial_cmp always returns Some.
                 // SQLite's float-vs-float uses raw IEEE 754 < and > operators,
                 // which both return false for NaN, resulting in "equal".
                 fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
@@ -273,7 +273,7 @@ impl Ord for Numeric {
 
 /// Compare an integer and a float following SQLite semantics.
 ///
-/// SQLite treats NaN as NULL, so int > NaN. In practice, NonNan prevents NaN
+/// SQLite treats NaN as NULL, so int > NaN. In practice, Double prevents NaN
 /// from appearing in Numeric::Float, but we check defensively.
 ///
 /// See sqlite3IntFloatCompare in src/vdbeaux.c.
@@ -569,10 +569,10 @@ pub fn str_to_i64_checked(input: impl AsRef<str>) -> Result<i64, IntOverflow> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum StrToF64 {
-    Fractional(NonNan),
-    Decimal(NonNan),
-    FractionalPrefix(NonNan),
-    DecimalPrefix(NonNan),
+    Fractional(Double),
+    Decimal(Double),
+    FractionalPrefix(Double),
+    DecimalPrefix(Double),
 }
 
 impl From<StrToF64> for f64 {
@@ -736,8 +736,8 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         }
     }
 
-    let result = NonNan::new(f64::from(result) * sign)
-        .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
+    let result = Double::non_nan(f64::from(result) * sign)
+        .unwrap_or_else(|| Double::non_nan(sign * f64::INFINITY).unwrap());
 
     if !valid_exponent || pos < input.len() {
         if is_fractional {

@@ -186,7 +186,7 @@ pub use io::{
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{
     decimal::{format_numeric_text, Decimal},
-    nonnan::NonNan,
+    double::Double,
     Numeric,
 };
 pub use schema::load::{LoadQuery, LoadStep, QueryFailure, SchemaLoad};
