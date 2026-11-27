@@ -526,12 +526,6 @@ expect {
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 }
 
-test regclass-default-names-a-table-with-the-case-it-is-created-in {
-    CREATE TABLE q (x oid DEFAULT '"Q"'::regclass, y int);
-}
-@sqlstate 42P01
-expect error {}
-
 test regclass-does-not-read-a-no-break-space-as-white-space {
     SELECT E't9 '::regclass;
 }
@@ -556,3 +550,29 @@ test regclass-prints-the-schema-of-a-relation-named-like-a-catalog {
 expect {
     public.pg_type|pg_type
 }
+
+test foreign-key-prints-a-relation-named-like-a-catalog-with-its-schema {
+    CREATE TABLE pg_trigger (id int PRIMARY KEY);
+    CREATE TABLE f (x int REFERENCES public.pg_trigger (id));
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'f'::regclass AND contype = 'f';
+}
+expect {
+    FOREIGN KEY (x) REFERENCES public.pg_trigger(id)
+}
+
+test regclass-prints-a-quoted-name-bare-when-the-exact-name-is-found-first {
+    CREATE SCHEMA s1;
+    CREATE TABLE up (a int);
+    CREATE TABLE s1."Up" (a int);
+    SET search_path = public, s1;
+    SELECT '"Up"'::regclass::text, 'up'::regclass::text;
+}
+expect {
+    "Up"|up
+}
+
+test regclass-default-names-a-table-with-the-case-it-is-created-in {
+    CREATE TABLE q (x oid DEFAULT '"Q"'::regclass, y int);
+}
+@sqlstate 42P01
+expect error {}

@@ -794,19 +794,6 @@ pub(crate) fn regclass_text(conn: &Connection, oid: i64) -> String {
     if relation.relnamespace.is_root() {
         return quote_identifier(&relation.relname);
     }
-    // pg_catalog is searched first, so a relation that has the name of a
-    // catalog is not found by that name alone.
-    let hides_catalog = catalog
-        .get_by_relname(NamespaceId::ROOT, &relation.relname)
-        .is_some()
-        || catalog_oid_by_name(&relation.relname).is_some();
-    if hides_catalog {
-        return format!(
-            "{}.{}",
-            quote_identifier(schema_name_of(&schema, relation.relnamespace)),
-            quote_identifier(&relation.relname)
-        );
-    }
     let engine_name = relation.engine_name.as_deref().unwrap_or(&relation.relname);
     relation_name(conn, &schema, relation.relnamespace, engine_name)
 }
@@ -4498,19 +4485,19 @@ pub(crate) fn relation_name(
     namespace: NamespaceId,
     name: &str,
 ) -> String {
-    let declared_name = schema
-        .get_btree_table(namespace, name)
-        .map_or_else(|| name.to_string(), |table| table.declared_name.clone());
-    let found = conn
-        .search_order()
-        .into_iter()
-        .filter(|qualifier| qualifier.target.database_id == MAIN_DB_ID)
-        .map(|qualifier| qualifier.target.id)
-        .find(|search_namespace| {
-            crate::classes::class_catalog(schema)
-                .is_some_and(|catalog| catalog.get_by_name(*search_namespace, name).is_some())
-        });
-    if found == Some(namespace) {
+    let class = crate::classes::class_catalog(schema)
+        .and_then(|catalog| catalog.get_by_name(namespace, name));
+    let declared_name = match class {
+        Some(class) => class.relname.clone(),
+        None => schema
+            .get_btree_table(namespace, name)
+            .map_or_else(|| name.to_string(), |table| table.declared_name.clone()),
+    };
+    // The name alone finds this relation when the exact lookup of the name
+    // does, as the cast to regclass does it.
+    if class
+        .is_some_and(|class| visible_relation_oid(conn, schema, &declared_name) == Some(class.oid))
+    {
         return quote_identifier(&declared_name);
     }
     format!(
@@ -4518,6 +4505,40 @@ pub(crate) fn relation_name(
         quote_identifier(schema_name_of(schema, namespace)),
         quote_identifier(&declared_name)
     )
+}
+
+/// The oid of the relation that the name `name`, written without a schema,
+/// finds: a catalog, since pg_catalog is searched first, or else the first
+/// relation of that name in the search path. Names are compared exactly.
+fn visible_relation_oid(conn: &Connection, schema: &Schema, name: &str) -> Option<i64> {
+    let catalog = crate::classes::class_catalog(schema)?;
+    if let Some(class) = catalog.get_by_relname(NamespaceId::ROOT, name) {
+        return Some(class.oid);
+    }
+    if let Some(oid) = catalog_oid_by_name(name) {
+        return Some(oid);
+    }
+    conn.search_order()
+        .into_iter()
+        .filter(|qualifier| qualifier.target.database_id == MAIN_DB_ID)
+        .map(|qualifier| qualifier.target.id)
+        .filter(|namespace| !namespace.is_root())
+        .find_map(|namespace| {
+            catalog
+                .classes()
+                .find(|class| class.relnamespace == namespace && is_named(class, name))
+                .map(|class| class.oid)
+        })
+}
+
+/// Whether the relation of `class` has the name `name`.
+fn is_named(class: &crate::classes::RelationClass, name: &str) -> bool {
+    // FIXME(pg-identifiers): The engine folds the name of a sequence to
+    // lowercase, so pg_class shows `ss` for `CREATE SEQUENCE "Ss"`, and the
+    // name written is not known. A sequence is found by its name in any case.
+    // PostgreSQL compares every name exactly.
+    class.relname == name
+        || (class.relkind == RelationKind::Sequence && class.relname == name.to_ascii_lowercase())
 }
 
 fn constraint_column_list<'a>(
