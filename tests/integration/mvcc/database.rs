@@ -6915,7 +6915,7 @@ fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
 
 /// A scan that stops inside a step, at `point`, must follow a `ROLLBACK TO` of
 /// its own transaction that runs on the same connection during the stop. Rows
-/// 10, 30 and 50 are in the B-tree. The rolled-back rows (20 and 40) are in
+/// 10, 30 and 50 are in the B-tree. The rolled-back rows (5, 20 and 40) are in
 /// MVCC memory only: they are not returned, and the scan does not end early.
 #[test]
 fn test_scan_stopped_inside_step_follows_rollback_to() {
@@ -6968,6 +6968,21 @@ fn test_scan_stopped_inside_step_follows_rollback_to() {
             1,
             CursorYieldPoint::PrevBtreeAdvance,
             vec![50, 30, 10],
+        ),
+        // The seek of the first step takes row 5 from MVCC memory, then stops.
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            "(5,1),(20,1)",
+            0,
+            CursorYieldPoint::SeekStart,
+            vec![10, 30, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            "(5,1),(20,1)",
+            0,
+            CursorYieldPoint::SeekBtreeProgress,
+            vec![10, 30, 50],
         ),
     ] {
         let db = MvccTestDb::new();

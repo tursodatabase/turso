@@ -106,7 +106,7 @@ enum PrevState {
 
 #[derive(Debug, Clone, Copy)]
 enum SeekBtreeState {
-    /// Seeking in btree (MVCC seek already done)
+    /// Seeking in btree
     SeekBtree,
     /// Advance to next key in btree (if we got [SeekResult::TryAdvance], or the current row is shadowed by MVCC)
     AdvanceBTree,
@@ -116,9 +116,9 @@ enum SeekBtreeState {
 
 #[derive(Debug, Clone, Copy)]
 enum SeekState {
-    /// Seeking in btree (MVCC seek already done)
+    /// Seeking in btree
     SeekBtree(SeekBtreeState),
-    /// Pick winner and finalize
+    /// Seek in MVCC, pick winner and finalize
     PickWinner,
 }
 
@@ -1843,7 +1843,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let state = self.state.clone();
             match state {
                 None => {
-                    // Initial state: Reset and do MVCC seek
+                    // Initial state: reset the peeks and start the B-tree seek
                     let _ = self.table_iterator.take();
                     let _ = self.index_iterator.take();
                     self.reset_dual_peek();
@@ -1854,6 +1854,26 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     self.set_null_flag(false);
 
                     let direction = op.iteration_direction();
+
+                    // Move to btree seek state
+                    self.state.replace(MvccLazyCursorState::Seek(
+                        SeekState::SeekBtree(SeekBtreeState::SeekBtree),
+                        direction,
+                    ));
+                    inject_io_yield!(self, CursorYieldPoint::SeekStart);
+                }
+                Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(_), direction)) => {
+                    return_if_io!(self.seek_btree_and_set_peek(seek_key.clone(), op));
+                    self.state
+                        .replace(MvccLazyCursorState::Seek(SeekState::PickWinner, direction));
+                    inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
+                }
+                Some(MvccLazyCursorState::Seek(SeekState::PickWinner, direction)) => {
+                    // The MVCC seek runs after the B-tree seek, in the same call as
+                    // the merge of the two peeks. The B-tree seek can stop for I/O,
+                    // and during the stop the connection can change MVCC rows, for
+                    // example with ROLLBACK TO.
+                    self.mvcc_peek_epoch = self.mvcc_rows_epoch();
                     let inclusive = matches!(op, SeekOp::GE { .. } | SeekOp::LE { .. });
 
                     match &seek_key {
@@ -1865,7 +1885,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_rowid(
-                                rowid.clone(),
+                                rowid,
                                 inclusive,
                                 op.eq_only(),
                                 op.eq_only(),
@@ -1919,7 +1939,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_index(
                                 self.table_id,
-                                sortable_key.clone(),
+                                sortable_key,
                                 inclusive,
                                 op.eq_only(),
                                 direction,
@@ -1941,20 +1961,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         }
                     }
 
-                    // Move to btree seek state
-                    self.state.replace(MvccLazyCursorState::Seek(
-                        SeekState::SeekBtree(SeekBtreeState::SeekBtree),
-                        direction,
-                    ));
-                    inject_io_yield!(self, CursorYieldPoint::SeekStart);
-                }
-                Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(_), direction)) => {
-                    return_if_io!(self.seek_btree_and_set_peek(seek_key.clone(), op));
-                    self.state
-                        .replace(MvccLazyCursorState::Seek(SeekState::PickWinner, direction));
-                    inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
-                }
-                Some(MvccLazyCursorState::Seek(SeekState::PickWinner, direction)) => {
                     // Pick winner and return result
                     // Now pick the winner based on direction
                     let winner_pos = self.position_from_peeks(direction);
