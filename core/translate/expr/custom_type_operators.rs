@@ -16,8 +16,9 @@ use crate::translate::expr::expr_type::{
 
 /// The operators that only the dialect decides: the signatures of a custom type
 /// have none for them, so the engine runs them unless the dialect chooses a
-/// function.
-const DIALECT_ONLY_OPERATORS: [&str; 1] = ["||"];
+/// function. The dialect is asked even when no operand has a custom type, since
+/// it may run its own function on plain values, as PostgreSQL does for LIKE.
+const DIALECT_ONLY_OPERATORS: [&str; 2] = ["||", "~~"];
 
 /// The function that runs the operator expression `expr`, such as `a + b` or
 /// `-a`, for code that has not computed the operands' types yet. See
@@ -234,7 +235,7 @@ enum UseKind {
 }
 
 /// The operands of `expr` and the operators it applies to them: the
-/// arithmetic, bit and comparison operators, the prefix `-` and `~`, the two
+/// arithmetic, bit and comparison operators, `||`, `LIKE` as `~~`, the prefix `-` and `~`, the two
 /// comparisons of a BETWEEN, the `=` of each value of an IN list and of each
 /// WHEN of a CASE with a base, the `=` of NULLIF, a comparison of two row
 /// values as one comparison of each pair, and `IS [NOT] DISTINCT FROM` next
@@ -370,6 +371,16 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
             let operands = args.iter_mut().map(|arg| arg.as_mut()).collect();
             (operands, first_with_each("=", 1..2))
         }
+        ast::Expr::Like {
+            lhs,
+            rhs,
+            op: ast::LikeOperator::Like,
+            escape: None,
+            ..
+        } => (
+            vec![lhs.as_mut(), rhs.as_mut()],
+            first_with_each("~~", 1..2),
+        ),
         // The comparison with the values of a subquery is asked when the
         // subquery is planned: see `in_subquery_collation`.
         ast::Expr::InSelect { .. }
@@ -516,7 +527,7 @@ pub(super) fn find_operator_call(
         .iter()
         .filter_map(|operand| operand.value_type.as_ref())
         .collect();
-    if custom_types.is_empty() {
+    if custom_types.is_empty() && !DIALECT_ONLY_OPERATORS.contains(&op) {
         return Ok(None);
     }
     if let Some(call) = call_the_dialect_chose(op, &operands, env)? {
@@ -620,6 +631,13 @@ fn decided_operator<'a>(
             vec![operand.as_ref()],
             PREFIX_OPERATORS.as_slice(),
         ),
+        ast::Expr::Like {
+            lhs,
+            rhs,
+            op: ast::LikeOperator::Like,
+            escape: None,
+            ..
+        } => ("~~", vec![lhs.as_ref(), rhs.as_ref()], [].as_slice()),
         _ => return None,
     };
     assert!(
@@ -857,6 +875,7 @@ pub(super) fn emit_operator_call(
     let operands: Vec<&ast::Expr> = match expr {
         ast::Expr::Binary(lhs, _, rhs) => vec![lhs, rhs],
         ast::Expr::Unary(_, operand) => vec![operand],
+        ast::Expr::Like { lhs, rhs, .. } => vec![lhs, rhs],
         _ => unreachable!("a custom type's function only runs operators"),
     };
     assert_eq!(
