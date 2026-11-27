@@ -15,8 +15,8 @@ use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
 use turso_core::{LimboError, Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,14 +338,6 @@ fn to_float(value: &Value, source: CastType, target: CastType) -> Result<Value> 
         Value::Text(text) => parse_float(text.as_str(), target)?,
         _ => return Ok(value.clone()),
     };
-    // FIXME(pg-catalog): The legacy float casts still reject NaN input. Registered float4 and float8 conversion functions replace this path.
-    if number.is_nan() {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "the value NaN is not supported",
-            None,
-        ));
-    }
     if target == Float4 {
         let narrowed = number as f32;
         if narrowed.is_infinite() && number.is_finite() {

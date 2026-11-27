@@ -26,3 +26,37 @@ expect {
     NaN|NaN|["NaN"]
     NaN
 }
+
+test cast-nan-to-float8 {
+    SELECT 'NaN'::float8;
+}
+expect {
+    NaN
+}
+
+test cast-nan-text-to-float8 {
+    SELECT 'NaN'::text::float8;
+}
+expect {
+    NaN
+}
+
+test cast-nan-to-float4 {
+    SELECT 'nan'::real;
+}
+expect {
+    NaN
+}
+
+test cast-a-nan-float8-to-real {
+    SELECT ('Infinity'::float8 - 'Infinity'::float8)::real::text;
+}
+expect {
+    NaN
+}
+
+test cast-a-nan-float8-to-integer {
+    SELECT ('Infinity'::float8 - 'Infinity'::float8)::int4;
+}
+@sqlstate 22003
+expect error {}

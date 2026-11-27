@@ -437,10 +437,6 @@ expect {
 @sqlstate 23000
 expect @tursopg error {}
 
-# The engine's float cannot hold NaN, so every write of NaN fails. PostgreSQL
-# stores NaN.
-
-@compat-gap "type:float8"
 test insert-nan-into-a-float8-column {
     CREATE TABLE t (x float8);
     INSERT INTO t VALUES ('NaN');
@@ -449,10 +445,7 @@ test insert-nan-into-a-float8-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float8"
 test insert-nan-into-a-not-null-float8-column {
     CREATE TABLE t (x float8 NOT NULL);
     INSERT INTO t VALUES ('NaN');
@@ -461,10 +454,7 @@ test insert-nan-into-a-not-null-float8-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float4"
 test insert-nan-into-a-real-column {
     CREATE TABLE t (x real);
     INSERT INTO t VALUES ('NaN');
@@ -473,10 +463,7 @@ test insert-nan-into-a-real-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:numeric"
 test insert-nan-into-a-numeric-column {
     CREATE TABLE t (x numeric);
     INSERT INTO t VALUES ('NaN');
@@ -485,10 +472,7 @@ test insert-nan-into-a-numeric-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float8"
 test insert-many-rows-with-nan-into-a-float8-column {
     CREATE TABLE t (id int, x float8);
     INSERT INTO t VALUES (1, 1.5), (2, 'NaN');
@@ -497,10 +481,7 @@ test insert-many-rows-with-nan-into-a-float8-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float8"
 test update-sets-nan-in-a-float8-column {
     CREATE TABLE t (x float8);
     INSERT INTO t VALUES (1.5);
@@ -510,10 +491,7 @@ test update-sets-nan-in-a-float8-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float8"
 test update-sets-nan-in-a-not-null-float8-column {
     CREATE TABLE t (x float8 NOT NULL);
     INSERT INTO t VALUES (1.5);
@@ -523,10 +501,7 @@ test update-sets-nan-in-a-not-null-float8-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float8"
 test upsert-sets-nan-in-a-float8-column {
     CREATE TABLE t (id int PRIMARY KEY, x float8);
     INSERT INTO t VALUES (1, 1.5);
@@ -536,10 +511,7 @@ test upsert-sets-nan-in-a-float8-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float8"
 test upsert-sets-nan-in-a-not-null-float8-column {
     CREATE TABLE t (id int PRIMARY KEY, x float8 NOT NULL);
     INSERT INTO t VALUES (1, 1.5);
@@ -549,10 +521,7 @@ test upsert-sets-nan-in-a-not-null-float8-column {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:float8"
 test column-default-of-nan {
     CREATE TABLE t (id int, x float8 DEFAULT 'NaN');
     INSERT INTO t (id) VALUES (1);
@@ -561,8 +530,6 @@ test column-default-of-nan {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 test write-infinity-to-float8-and-real-columns {
     CREATE TABLE t (x float8, y real);
@@ -612,7 +579,6 @@ expect {
 @sqlstate 22003
 expect @tursopg error {}
 
-@compat-gap "type:float8"
 test add-column-default-of-nan-for-the-rows-that-exist {
     CREATE TABLE t (id int);
     INSERT INTO t VALUES (1);
@@ -622,8 +588,6 @@ test add-column-default-of-nan-for-the-rows-that-exist {
 expect {
     NaN
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # The value is converted before NOT NULL is checked, so a value that cannot
 # be converted fails with the error of the conversion.
