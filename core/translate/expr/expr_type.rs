@@ -533,6 +533,12 @@ fn column_ty_annotation(
     env: &TypeEnv,
 ) -> Option<ast::TypeAnnotation> {
     let (_, table) = env.tables()?.find_table_by_internal_id(table)?;
+    if matches!(
+        table,
+        Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+    ) {
+        return None;
+    }
     let column = table.get_column_at(column)?;
     env.dialect()?.type_annotation(&declared_type(
         &column.ty_str,
