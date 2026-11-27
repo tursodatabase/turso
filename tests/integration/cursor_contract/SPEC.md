@@ -29,6 +29,14 @@ One store per tree, in one snapshot:
 - index: finite set of keys. A key is `(columns..., rowid)`. Order is the record order
   with collation and sort flags. NULL equals NULL and sorts first.
 
+All cursors of a program share one transaction. Other transactions are outside this
+contract: the harness has no second connection. In MVCC a write of another transaction is
+not visible in our snapshot, so an entry that another transaction deleted is still there for
+our cursor. A `Delete` of it is legal. It ends with the defined error `WriteWriteConflict`
+when the other transaction committed or holds the row (`core/mvcc/database/mod.rs`, around
+line 2167). So "the entry is under the cursor" means "in our snapshot". Only a delete by a
+cursor of our own transaction (a peer, see below) moves our cursor into the gap.
+
 A cursor has a position and a null-row flag. The position is one of:
 
 | Position | Meaning |
