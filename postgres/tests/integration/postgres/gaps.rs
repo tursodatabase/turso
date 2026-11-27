@@ -139,17 +139,15 @@ fn gap_a_41_date_n_param(db: TempDatabase) {
 }
 
 // A-49 (S1): invalid jsonb param
-// tursopg: an invalid jsonb param is accepted.
-// PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
-fn gap_a_49_tursopg_returns_wrong_result_invalid_jsonb_param(db: TempDatabase) {
+fn gap_a_49_invalid_jsonb_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::jsonb",
         params: &[P::Text("{bad")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "{bad");
+    assert_eq!(out, "ERROR 22P02");
 }
 
 // A-53: = ANY($1::bigint[]) text param
@@ -267,12 +265,8 @@ fn gap_a_69_untyped_1_2026_10_08_14_00_02_into_timestamptz_c(db: TempDatabase) {
 }
 
 // A-70 (S1): insert jsonb text param into jsonb column
-// tursopg: a jsonb param is not normalized.
-// PostgreSQL: {"a": 2, "b": 1}
 #[turso_macros::test(views)]
-fn gap_a_70_tursopg_returns_wrong_result_insert_jsonb_text_param_into_jsonb_column(
-    db: TempDatabase,
-) {
+fn gap_a_70_insert_jsonb_text_param_into_jsonb_column(db: TempDatabase) {
     let out = GapCase {
         setup: &["CREATE TABLE t (j jsonb)"],
         sql: "INSERT INTO t VALUES ($1) RETURNING j",
@@ -280,7 +274,7 @@ fn gap_a_70_tursopg_returns_wrong_result_insert_jsonb_text_param_into_jsonb_colu
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, r#"{"b":1,"a":2}"#);
+    assert_eq!(out, r#"{"a": 2, "b": 1}"#);
 }
 
 // A-71: where bool col = $1 text 'true'

@@ -4229,9 +4229,10 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
+    // PostgreSQL's message names no text; its DETAIL names the token.
     assert_eq!(
         row.get_value(0).to_string(),
-        "invalid input syntax for type json: \"not json\""
+        "invalid input syntax for type json"
     );
     assert_eq!(row.get_value(1).to_string(), "22P02");
     drop(rows);
