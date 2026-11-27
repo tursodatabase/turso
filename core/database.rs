@@ -2469,21 +2469,13 @@ impl Database {
                             let flags = self.open_flags;
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
-                                if !authority.frame_index_overflowed() {
-                                    WalFileShared::open_shared_from_authority_if_exists(
-                                        &self.io,
-                                        &self.wal_path,
-                                        flags,
-                                        authority,
-                                        &self.db_file,
-                                    )?
-                                } else {
-                                    WalFileShared::open_shared_if_exists(
-                                        &self.io,
-                                        &self.wal_path,
-                                        flags,
-                                    )?
-                                }
+                                WalFileShared::open_shared_from_authority_if_exists(
+                                    &self.io,
+                                    &self.wal_path,
+                                    flags,
+                                    authority,
+                                    &self.db_file,
+                                )?
                             } else {
                                 WalFileShared::open_shared_if_exists(
                                     &self.io,
@@ -2627,17 +2619,13 @@ impl Database {
             #[cfg(host_shared_wal)]
             {
                 if let Some(authority) = shared_authority.as_ref() {
-                    if !authority.frame_index_overflowed() {
-                        WalFileShared::open_shared_from_authority_if_exists(
-                            &self.io,
-                            &self.wal_path,
-                            flags,
-                            authority,
-                            &self.db_file,
-                        )?
-                    } else {
-                        WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
-                    }
+                    WalFileShared::open_shared_from_authority_if_exists(
+                        &self.io,
+                        &self.wal_path,
+                        flags,
+                        authority,
+                        &self.db_file,
+                    )?
                 } else {
                     WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
                 }

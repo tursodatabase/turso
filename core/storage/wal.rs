@@ -5865,7 +5865,23 @@ impl WalFileShared {
                     ?reason,
                     "rebuilding WAL state from disk because persisted authority is not provably reusable"
                 );
-                return sqlite3_ondisk::build_shared_wal(&file, io);
+                let shared = sqlite3_ondisk::build_shared_wal(&file, io)?;
+                if snapshot.max_frame > 0
+                    && authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+                {
+                    // The snapshot claims frames that do not match the WAL file, for
+                    // example because a crash lost them. No other process has the
+                    // WAL open, so no writer can add them later. Like SQLite's
+                    // wal-index recovery, let the WAL file decide: publish the disk
+                    // scan, so that readers do not look up frames that do not exist.
+                    authority.install_snapshot(
+                        ShmWalCoordination::local_authority_snapshot_from_shared(
+                            &shared.read(),
+                            snapshot,
+                        ),
+                    );
+                }
+                return Ok(shared);
             }
         }
         if authority.frame_index_overflowed() {
