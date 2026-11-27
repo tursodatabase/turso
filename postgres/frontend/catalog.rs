@@ -2794,6 +2794,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
+    options = crate::catalog_table::register_catalog_tables(options);
     options = options.native_module(
         "pg_seclabels",
         VTabKind::TableValuedFunction,
