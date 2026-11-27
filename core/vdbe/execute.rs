@@ -3980,13 +3980,12 @@ pub fn halt(
             let result =
                 program.commit_txn(connection, pager.clone(), state, mv_store.as_ref(), false);
             let result = state.done_or_suspend(result);
-            // Apply deferred CDC state and reset CDC txn ID after successful commit
+            // Apply deferred CDC state after successful commit
             if matches!(result, Ok(InsnFunctionStepResult::Done)) {
                 index_method_on_transaction_committed_all(state, connection);
                 if let Some(cdc_info) = state.pending_cdc_info.take() {
                     connection.set_capture_data_changes_info(cdc_info);
                 }
-                connection.set_cdc_transaction_id(-1);
             }
             result
         } else {
@@ -5640,8 +5639,6 @@ pub fn op_auto_commit(
         conn.clear_deferred_foreign_key_violations();
     }
 
-    // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
-    conn.set_cdc_transaction_id(-1);
     if matches!(tx_op, TxOp::Commit) {
         conn.index_methods_on_transaction_committed();
     }

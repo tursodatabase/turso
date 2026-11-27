@@ -3295,6 +3295,10 @@ impl Program {
             self.commit_txn_wal(connection, pager, program_state, rollback)
         }?;
         if !res.is_io() {
+            // The next transaction gets a new CDC transaction id. Every commit
+            // goes through here, including the commit of the rows that a
+            // FAIL-mode error keeps.
+            connection.set_cdc_transaction_id(-1);
             if self.change_cnt_on {
                 connection.set_changes(program_state.n_change.load(Ordering::SeqCst));
                 connection.add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
