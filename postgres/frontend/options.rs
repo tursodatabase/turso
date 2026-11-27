@@ -17,6 +17,8 @@ use turso_pg_parser::sqlstate::SQLSTATE_NULL_VALUE_NOT_ALLOWED;
 pub(crate) struct TwoColumnFunction {
     /// The CREATE TABLE statement that names the function and its columns.
     pub(crate) schema: &'static str,
+    /// The columns whose declared type is the type PostgreSQL gives them.
+    pub(crate) columns_of_their_postgres_type: &'static [&'static str],
     /// Appends the rows of the function for its argument.
     pub(crate) append_rows: fn(&Value, &mut Vec<[Value; 2]>) -> Result<()>,
 }
@@ -34,6 +36,10 @@ impl VirtualTableModule for TwoColumnFunction {
 
     fn innocuous(&self) -> bool {
         true
+    }
+
+    fn declares_column_type(&self, column: &str) -> bool {
+        self.columns_of_their_postgres_type.contains(&column)
     }
 }
 

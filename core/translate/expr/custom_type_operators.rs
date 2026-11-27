@@ -10,8 +10,8 @@ use crate::dialect::{ChosenOperator, Dialect, EngineType, OperandType, OperatorC
 use crate::function::Deterministic;
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
-    dialect_operand_type, same_type_def, sqlite_operand_type, type_of, without_wrappers,
-    BuiltinType, ColumnCustomType, ExprType, TypeEnv,
+    column_has_declared_type, dialect_operand_type, same_type_def, sqlite_operand_type, type_of,
+    without_wrappers, BuiltinType, ColumnCustomType, ExprType, TypeEnv,
 };
 
 /// The function that runs the operator expression `expr`, such as `a + b` or
@@ -100,6 +100,9 @@ pub(crate) fn check_in_subquery_operator(
     if matches!(lhs_type, ExprType::Null) || matches!(rhs_type, ExprType::Null) {
         return Ok(());
     }
+    if is_left_to_the_engine(lhs, lhs_env) || is_left_to_the_engine(rhs, rhs_env) {
+        return Ok(());
+    }
     let operand_types = || {
         let rhs_operand = match dialect_operand_type(rhs, rhs_type.clone(), rhs_env) {
             OperandType::StringLiteral(_) => OperandType::Engine {
@@ -134,7 +137,8 @@ pub(crate) fn check_in_subquery_operator(
 
 /// Asks the dialect to choose `operator` and records, for each string literal
 /// among its operands, the type the dialect chose for it. The first type
-/// recorded for an operand stays.
+/// recorded for an operand stays. An operator on an operand that
+/// `is_left_to_the_engine` is not asked.
 fn read_as_chosen_types(
     operator: &OperatorUse,
     operands: &[&ast::Expr],
@@ -150,9 +154,16 @@ fn read_as_chosen_types(
     };
     let choose_pair = |slots: &[usize]| {
         dialect.choose_operator(operator.name, &|| {
-            operand_types(slots, OperandType::Unnamed)
+            operand_types(slots, OperandType::Untyped)
         })
     };
+    if operator
+        .operands
+        .iter()
+        .any(|&slot| is_left_to_the_engine(operands[slot], env))
+    {
+        return Ok(());
+    }
     match operator.kind {
         UseKind::Each => {
             let choice = choose_pair(&operator.operands)?;
@@ -181,7 +192,7 @@ fn read_as_chosen_types(
 /// What the dialect is told about `expr`: its type, `null` when it is NULL,
 /// and no type when it is a hidden column, which the engine compares with the
 /// argument itself.
-fn operand_type(expr: &ast::Expr, env: &TypeEnv, null: OperandType) -> OperandType {
+pub(super) fn operand_type(expr: &ast::Expr, env: &TypeEnv, null: OperandType) -> OperandType {
     if is_hidden_column(expr, env) {
         return OperandType::Unnamed;
     }
@@ -456,6 +467,42 @@ fn distinct_from_symbol(op: &ast::Operator, rhs: &ast::Expr) -> Option<&'static 
     is_distinct_from.then_some("=")
 }
 
+/// Whether the engine runs an operator on `expr` without asking the dialect: a
+/// hidden column, or a value with no type that is read from a scalar subquery,
+/// a row value, a name that is not resolved yet, or a column with no declared
+/// type.
+///
+/// FIXME(registered-types): Each of these has no type before the engine plans it, or is a column of a table that is not STRICT, of a virtual table that does not vouch for it, or of a subquery that reads such a column. So a dialect that refuses an operand with no type would refuse `x = (SELECT ...)`, `(a, b) = (1, 2)`, `generate_series.value + 1` and a column of a CREATE TABLE AS table. A type for each value replaces this.
+fn is_left_to_the_engine(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    if is_hidden_column(expr, env) {
+        return true;
+    }
+    if !matches!(
+        dialect_operand_type(expr, type_of(expr, env), env),
+        OperandType::Unnamed
+    ) {
+        return false;
+    }
+    let mut reads_untyped_source = false;
+    let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        reads_untyped_source |= match expr {
+            ast::Expr::Id(_)
+            | ast::Expr::Qualified(..)
+            | ast::Expr::DoublyQualified(..)
+            | ast::Expr::Subquery(_)
+            | ast::Expr::SubqueryResult { .. } => true,
+            ast::Expr::Parenthesized(values) => values.len() > 1,
+            ast::Expr::Column { table, column, .. } => env
+                .tables()
+                .and_then(|tables| tables.find_table_by_internal_id(*table))
+                .is_some_and(|(_, table)| !column_has_declared_type(table, *column, env)),
+            _ => false,
+        };
+        Ok(WalkControl::Continue)
+    });
+    reads_untyped_source
+}
+
 /// Whether `expr` is a hidden column, such as the argument of a table
 /// function, which the engine compares with the argument itself.
 fn is_hidden_column(expr: &ast::Expr, env: &TypeEnv) -> bool {
@@ -551,6 +598,12 @@ fn call_the_dialect_chose(
     let Some(resolver) = env.resolver() else {
         return Ok(None);
     };
+    if operands
+        .iter()
+        .any(|operand| is_left_to_the_engine(operand.expr, env))
+    {
+        return Ok(None);
+    }
     let operand_types = || {
         operands
             .iter()

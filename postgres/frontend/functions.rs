@@ -56,6 +56,23 @@ macro_rules! scalar_functions {
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
     let options = crate::pg_type::register_integer_operator_functions(options);
+    let options = [
+        "date_trunc",
+        "timestamp_trunc",
+        "timestamptz_trunc",
+        "timestamptz_trunc_zone",
+    ]
+    .into_iter()
+    .fold(options, |options, name| {
+        options.extension_function(
+            pg_scalar_function(name, FunctionArity::OneOf(&[2, 3]), true, |_, args| {
+                exec_date_trunc(args)
+            })
+            .receiving_argument_types()
+            .checking_argument_types(check_date_trunc_types)
+            .returning_argument_type(1),
+        )
+    });
     options
         .extension_function(
             pg_scalar_function(
@@ -65,17 +82,6 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
                 |_, args| exec_array_to_json(args),
             )
             .receiving_argument_types(),
-        )
-        .extension_function(
-            pg_scalar_function(
-                "date_trunc",
-                FunctionArity::OneOf(&[2, 3]),
-                true,
-                |_, args| exec_date_trunc(args),
-            )
-            .receiving_argument_types()
-            .checking_argument_types(check_date_trunc_types)
-            .returning_argument_type(1),
         )
         // FIXME(pg-interval): PostgreSQL has no function of this name. It exists
         // because tursopg has no interval type: the translator rewrites
@@ -408,13 +414,20 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
-        "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
+        "pg_get_constraintdef" | "pg_get_constraintdef_ext"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
-        "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
+        "pg_get_indexdef" | "pg_get_indexdef_ext"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid)),
-        "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
+        "pg_get_triggerdef" | "pg_get_triggerdef_ext"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
-        "to_char"(FunctionArity::Exact(2), true) => {
+        "to_char"
+        | "timestamp_to_char"
+        | "timestamptz_to_char"
+        | "int4_to_char"
+        | "int8_to_char"
+        | "float4_to_char"
+        | "float8_to_char"
+        | "numeric_to_char"(FunctionArity::Exact(2), true) => {
             // to_char is strict: a NULL argument gives NULL for every argument type.
             if args.iter().any(|arg| matches!(arg.get_value(), Value::Null)) {
                 None
@@ -424,7 +437,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         },
         // Registered so that the core time extension's to_timestamp, which
         // returns a blob, never answers a PostgreSQL query.
-        "to_timestamp"(FunctionArity::OneOf(&[1, 2]), true) => Err::<Timestamptz, _>(
+        "to_timestamp" | "float8_timestamptz"(FunctionArity::OneOf(&[1, 2]), true) => Err::<Timestamptz, _>(
             sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 "to_timestamp is not supported", None,
@@ -441,13 +454,27 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
+        "byteaoctetlen"(FunctionArity::Exact(1), true) => crate::bytea_functions::bytea_octet_length(args)?,
+        "bytea_reverse"(FunctionArity::Exact(1), true) => crate::bytea_functions::bytea_reverse(args)?,
+        "byteatrim"(FunctionArity::Exact(2), true) => crate::bytea_functions::bytea_trim(args, true, true)?,
+        "bytealtrim"(FunctionArity::Exact(2), true) => crate::bytea_functions::bytea_trim(args, true, false)?,
+        "byteartrim"(FunctionArity::Exact(2), true) => crate::bytea_functions::bytea_trim(args, false, true)?,
+        "bytea_substr"(FunctionArity::Exact(3), true) => crate::bytea_functions::bytea_substring(args, true)?,
+        "bytea_substr_no_len"(FunctionArity::Exact(2), true) => crate::bytea_functions::bytea_substring(args, false)?,
+        "text_substr"(FunctionArity::Exact(3), true) => crate::text_functions::text_substring(args, true)?,
+        "text_substr_no_len"(FunctionArity::Exact(2), true) => crate::text_functions::text_substring(args, false)?,
+        "dsqrt" | "numeric_sqrt"(FunctionArity::Exact(1), true) => crate::math_functions::square_root(args)?,
+        "dlog1" | "numeric_ln"(FunctionArity::Exact(1), true) => crate::math_functions::natural_log(args)?,
+        "dlog10"(FunctionArity::Exact(1), true) => crate::math_functions::log_base_10(args)?,
+        "numeric_log"(FunctionArity::Exact(2), true) => crate::math_functions::log_with_base(args)?,
+        "dpow" | "numeric_power"(FunctionArity::Exact(2), true) => crate::math_functions::power(args)?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
-        "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
-        "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
+        "set_config" | "set_config_by_name"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
+        "current_setting" | "show_config_by_name" | "show_config_by_name_missing_ok"(FunctionArity::OneOf(&[1, 2]), false) => {
             exec_current_setting(connection, args)?
         },
-        "version"(FunctionArity::Exact(0), true) => exec_version(),
+        "version" | "pgsql_version"(FunctionArity::Exact(0), true) => exec_version(),
         "current_database"(FunctionArity::Exact(0), false) => {
             crate::catalog::db_name_from_path(connection.db_file_path())
         },
@@ -476,7 +503,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
         // A double precision number in [0, 1), unlike SQLite's random integer.
-        "random"(FunctionArity::Exact(0), false) => {
+        "random" | "drandom"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
         // The time the transaction started, or the statement outside a

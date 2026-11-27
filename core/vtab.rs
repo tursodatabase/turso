@@ -31,6 +31,9 @@ pub struct VirtualTable {
     // Whether this virtual table is safe to use from within triggers and views.
     // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
     pub innocuous: bool,
+    /// For each column, whether it holds only values of its declared type, as
+    /// a column of a STRICT table does. Empty when no column does.
+    pub(crate) columns_with_declared_type: Vec<bool>,
 }
 
 impl VirtualTable {
@@ -80,6 +83,7 @@ impl VirtualTable {
             vtab_id: 0,
             is_droppable: false,
             innocuous: true,
+            columns_with_declared_type: Vec::new(),
         })
     }
 
@@ -128,7 +132,9 @@ impl VirtualTable {
             vtab_id: 0,
             is_droppable: false,
             innocuous: module.is_some_and(|module| module.implementation.innocuous()),
+            columns_with_declared_type: Vec::new(),
         };
+        let vtab = vtab.with_declared_column_types(module);
         Ok(Arc::new(vtab))
     }
 
@@ -169,8 +175,26 @@ impl VirtualTable {
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
             is_droppable: true,
             innocuous: module.is_some_and(|module| module.implementation.innocuous()),
+            columns_with_declared_type: Vec::new(),
         };
+        let vtab = vtab.with_declared_column_types(module);
         Ok(Arc::new(vtab))
+    }
+
+    fn with_declared_column_types(mut self, module: Option<&Arc<crate::ext::VTabImpl>>) -> Self {
+        if let Some(module) = module {
+            self.columns_with_declared_type = self
+                .columns
+                .iter()
+                .map(|column| {
+                    column
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| module.implementation.declares_column_type(name))
+                })
+                .collect();
+        }
+        self
     }
 
     pub(crate) fn resolve_columns(

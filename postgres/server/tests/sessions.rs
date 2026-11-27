@@ -108,8 +108,8 @@ fn refusal_hint_reaches_the_client() {
         ),
         (
             // Refused by the frontend, after translation.
-            "SELECT date_trunc('month', DATE '2020-02-03')",
-            "Cast the value to timestamptz: date_trunc(unit, d::timestamptz).",
+            "SELECT DATE '2020-02-03' + INTERVAL '1 day'",
+            "Cast the date to timestamp first: d::timestamp + interval.",
         ),
     ] {
         let fields = error_fields(&mut client, sql);

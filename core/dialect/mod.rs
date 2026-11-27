@@ -682,6 +682,17 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(OperatorChoice::LeftToTheEngine)
     }
 
+    /// Chooses the function that runs the call `name(arguments)` from the types
+    /// of its arguments. An error refuses the call. `arguments` gives the
+    /// types, and is only called by a dialect that needs them.
+    fn choose_function(
+        &self,
+        _name: &str,
+        _arguments: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<FunctionChoice> {
+        Ok(FunctionChoice::LeftToTheEngine)
+    }
+
     /// Chooses the `=` of `x IN (a, b, ...)` for the values that read no
     /// column, when the dialect picks one type for `x` and all of them at
     /// once. `operands` gives the types of `x` and then of each value, and is
@@ -780,6 +791,29 @@ pub struct OperatorFunction {
     pub name: String,
     /// The type of the value the function returns.
     pub result: ast::Type,
+}
+
+/// What a dialect decided for a function call.
+#[derive(Debug, Clone)]
+pub enum FunctionChoice {
+    /// The engine's own rules run the call. SQLite always gives this.
+    LeftToTheEngine,
+    /// The dialect's function runs. The engine casts each argument to the type
+    /// the dialect gives for it.
+    Chosen(ChosenFunction),
+}
+
+/// The function a dialect chose for a call.
+#[derive(Debug, Clone)]
+pub struct ChosenFunction {
+    /// The name the function is registered under.
+    pub implementation: String,
+    /// The type each argument is cast to, in order. `None` leaves the
+    /// argument as it is.
+    pub argument_types: Vec<Option<ast::Type>>,
+    /// The type of the value the function returns. `None` leaves it to the
+    /// function.
+    pub result_type: Option<ast::Type>,
 }
 
 /// What is known about the type of an operand.

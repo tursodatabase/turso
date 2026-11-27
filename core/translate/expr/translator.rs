@@ -1,3 +1,4 @@
+use super::dialect_functions::choose_function_call;
 use super::*;
 use crate::dialect::CastDecision;
 use crate::types::StrictType;
@@ -1128,8 +1129,16 @@ fn translate_function_call_expr(
     else {
         unreachable!("translate_function_call_expr expects Expr::FunctionCall");
     };
+    let chosen = choose_function_call(
+        name.as_str(),
+        args,
+        &TypeEnv::new(referenced_tables, resolver),
+    )?;
+    let (func_type, args) = match &chosen {
+        Some(call) => (Some(call.func.clone()), &call.arguments),
+        None => (resolver.resolve_function(name.as_str(), args.len())?, args),
+    };
     let args_count = args.len();
-    let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
     if func_type.is_none() {
         crate::bail_parse_error!("no such function: {}", name.as_str());

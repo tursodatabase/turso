@@ -294,6 +294,14 @@ impl Dialect for PostgresDialect {
         crate::operators::choose_operator(op, &operands())
     }
 
+    fn choose_function(
+        &self,
+        name: &str,
+        arguments: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Result<turso_core::dialect::FunctionChoice> {
+        crate::function_choice::choose_function(name, &arguments())
+    }
+
     fn choose_list_operator(
         &self,
         op: &str,
@@ -1436,7 +1444,6 @@ impl SnapshotRows for PgProcTable {
     const ESTIMATED_ROWS: u32 = 100;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        const INTERNAL_LANGUAGE: i64 = 12;
         crate::procs::PROCS
             .iter()
             .map(|proc| {
@@ -1451,7 +1458,7 @@ impl SnapshotRows for PgProcTable {
                     Value::build_text(proc.name),
                     Value::from_i64(11),
                     Value::from_i64(SUPERUSER_OID),
-                    Value::from_i64(INTERNAL_LANGUAGE),
+                    Value::from_i64(proc.language),
                     Value::from_f64(proc.cost),
                     Value::from_f64(proc.rows),
                     Value::from_i64(proc.variadic_type),
@@ -1471,7 +1478,7 @@ impl SnapshotRows for PgProcTable {
                     Value::Null,
                     Value::Null,
                     Value::Null,
-                    Value::Null,
+                    Value::build_text(proc.source),
                     Value::Null,
                     Value::Null,
                     Value::Null,
@@ -1601,6 +1608,10 @@ impl VirtualTableModule for EmptyPgCatalogTable {
 
     fn innocuous(&self) -> bool {
         true
+    }
+
+    fn declares_column_type(&self, column: &str) -> bool {
+        crate::catalog_column_types::has_postgres_type(&self.create_sql, column)
     }
 }
 
@@ -2703,6 +2714,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         crate::options::TwoColumnFunction {
             schema: "CREATE TABLE pg_json_each (key TEXT, value TEXT, input TEXT HIDDEN)",
+            columns_of_their_postgres_type: &["key"],
             append_rows: crate::functions::exec_json_each,
         },
     );
@@ -2711,6 +2723,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         crate::options::TwoColumnFunction {
             schema: "CREATE TABLE pg_options_to_table (option_name TEXT, option_value TEXT, options_array TEXT HIDDEN)",
+            columns_of_their_postgres_type: &["option_name", "option_value"],
             append_rows: crate::options::append_options,
         },
     );
@@ -3000,18 +3013,18 @@ impl SnapshotRows for PgLanguageTable {
     )";
     const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 2;
+    const ESTIMATED_ROWS: u32 = 3;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        [(12, "internal"), (13, "c")]
+        [(12, "internal", false), (13, "c", false), (14, "sql", true)]
             .into_iter()
-            .map(|(oid, name)| {
+            .map(|(oid, name, trusted)| {
                 vec![
                     Value::from_i64(oid),
                     Value::build_text(name),
                     Value::from_i64(10),
                     Value::from_i64(0),
-                    Value::from_i64(0),
+                    Value::from_i64(i64::from(trusted)),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::from_i64(0),
@@ -3079,16 +3092,16 @@ impl SnapshotRows for PgCastTable {
     const ESTIMATED_ROWS: u32 = 50;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        crate::casts::cast_rows()
-            .enumerate()
-            .map(|(index, (source, target, context, method))| {
+        crate::casts::PG_CASTS
+            .iter()
+            .map(|cast| {
                 vec![
-                    Value::from_i64(crate::casts::FIRST_CAST_OID + index as i64),
-                    Value::from_i64(source.oid()),
-                    Value::from_i64(target.oid()),
-                    Value::from_i64(0),
-                    Value::build_text(context),
-                    Value::build_text(method),
+                    Value::from_i64(cast.oid),
+                    Value::from_i64(cast.source),
+                    Value::from_i64(cast.target),
+                    Value::from_i64(cast.function),
+                    Value::build_text(crate::casts::context_letter(cast.context)),
+                    Value::build_text(cast.method.letter()),
                 ]
             })
             .collect()
@@ -3746,6 +3759,10 @@ impl<T: SnapshotRows> VirtualTableModule for SnapshotCatalog<T> {
     fn innocuous(&self) -> bool {
         true
     }
+
+    fn declares_column_type(&self, column: &str) -> bool {
+        crate::catalog_column_types::has_postgres_type(T::SCHEMA, column)
+    }
 }
 
 impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
@@ -3851,6 +3868,10 @@ where
 
     fn innocuous(&self) -> bool {
         true
+    }
+
+    fn declares_column_type(&self, column: &str) -> bool {
+        crate::catalog_column_types::has_postgres_type(&(self.schema)(), column)
     }
 }
 

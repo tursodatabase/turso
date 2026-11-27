@@ -60,6 +60,8 @@ As in PostgreSQL, a boolean has no arithmetic operators: `(1 < 2) + 1` fails wit
 
 The PostgreSQL frontend refuses a comparison, an arithmetic operator or a bit operator that PostgreSQL does not have for the types of its operands. `text_column = 1`, `timestamptz_column > 5`, `true = 1` and `-date_column` fail with `operator does not exist` (SQLSTATE `42883`). Cast an operand to the type of the other, as in `text_column = 1::text`. A string literal takes the type of the other operand, so `text_column = '1'`, `timestamptz_column > '2024-01-01'` and `1 = '1'` work, and a literal that is not a value of that type fails: `1 = 'a'` fails with `invalid input syntax for type integer` (SQLSTATE `22P02`).
 
+The PostgreSQL frontend picks the function of a call, and the operator above, with PostgreSQL's own rules for the types of the arguments. A call that no overload takes fails with `function abs(text) does not exist` (SQLSTATE `42883`), as in `abs('abc'::text)` and `lower(7)`. A call that two overloads fit equally well, such as `mod('7', '7')`, fails with `function mod(unknown, unknown) is not unique` (SQLSTATE `42725`). An argument whose type is not known fails with SQLSTATE `42P18`. Aggregates, window functions, and functions with variadic or polymorphic parameters are not checked this way yet. The cost of types that are not registered yet is in `postgres/COMPAT.md`.
+
 `CREATE TABLE ... AS SELECT` of a boolean, such as `CREATE TABLE c AS SELECT 1 < 2 AS x`, is not supported in the PostgreSQL frontend and fails with SQLSTATE `0A000`.
 
 ## Operators

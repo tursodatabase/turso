@@ -355,7 +355,7 @@ test now-minus-untyped-literal {
 }
 @sqlstate 22007
 expect error {}
-@sqlstate 42883
+@sqlstate 42P18
 expect @tursopg error {}
 
 @compat-gap "operator:timestamptz - timestamptz"
@@ -877,7 +877,6 @@ expect @tursopg {
     2020.0
 }
 
-@compat-gap "function:abs"
 test abs-of-date {
     SELECT abs(DATE '2020-01-01');
 }
@@ -885,22 +884,14 @@ test abs-of-date {
 expect error {
     function abs\(date\) does not exist
 }
-expect @tursopg {
-    2020.0
-}
 
-# length has no date version in PostgreSQL. tursopg applies it to the text
-# the date is stored as.
-@compat-gap "function:length"
+# length has no date version in PostgreSQL.
 test length-of-date {
     SELECT length(DATE '2020-01-05');
 }
 @sqlstate 42883
 expect error {
     function length\(date\) does not exist
-}
-expect @tursopg {
-    10
 }
 
 # PostgreSQL has no LIKE operator for a date.

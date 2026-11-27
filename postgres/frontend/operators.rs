@@ -1,20 +1,26 @@
 //! The operators of PostgreSQL's `pg_operator` that the frontend has, and
-//! the refusal of an operator that has no row for the types of its operands.
+//! the choice of the operator that runs for the types of the operands.
 
-use crate::casts::{resolve, wraps_negative_integers, CastType};
-use crate::catalog::{pg_type_category, pg_type_name, pg_type_oid};
+use crate::casts::{wraps_negative_integers, CastType};
+use crate::catalog::{pg_type_category, pg_type_name};
 use crate::error::sqlstate_error;
-use crate::functions::{built_in_input_error, format_type, undefined_operator_of};
-use crate::pg_type::{built_in_type, IntegerOperator, IntegerType};
+use crate::function_choice::{cast_type, engine_type_oid, resolve_error};
+use crate::functions::built_in_input_error;
+use crate::pg_type::{IntegerOperator, IntegerType};
+use crate::resolve::{
+    casts_implicitly, common_type, resolve_operator, ArgCoercion, ArgType, Resolution,
+    ResolvedOperator,
+};
+use crate::resolve_catalog::FrontendCatalog;
 use turso_core::ast;
 use turso_core::dialect::{
-    CastContext, ChosenOperator, EngineType, OperandType, OperatorChoice, OperatorFunction,
+    ChosenOperator, EngineType, OperandType, OperatorChoice, OperatorFunction,
 };
 use turso_core::types::Type as _;
-use turso_core::Result;
+use turso_core::{DialectError, LimboError, Result};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INDETERMINATE_DATATYPE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
 /// A row of `pg_operator`. A type is the `oid` of its `pg_type` row, and
@@ -31,155 +37,85 @@ pub(crate) struct Operator {
     pub can_hash: bool,
 }
 
-/// PostgreSQL's choice of an operator named `op` for operands of these types
-/// (`oper_select` in parse_oper.c), as far as the rows of `OPERATORS` decide
-/// it:
-///
-/// 1. An operand has a type that `CHECKED_TYPES` does not name, or has no
-///    type at all: the engine runs its own operator.
-/// 2. The operator is not a comparison and an operand is of a type in
-///    `OPERATORS_RUN_BY_CORE`: the operator signatures of that type in core
-///    decide whether the operator exists. The rows are not asked.
-/// 3. No row can take the operands: the operator is refused with 42883.
-/// 4. A string literal is next to an operand of a number type, and a row
-///    takes two operands of that type: the literal is read as that type.
-/// 5. Otherwise the engine runs its own operator.
+/// Chooses the operator that runs `op` on these operands with the rules of
+/// PostgreSQL (`oper` in parse_oper.c). An operand of a type that no row of
+/// `OPERATORS` takes is left to the engine, and so is an operator that
+/// the resolver cannot choose. A string literal next to a number is read as
+/// the number type the operator takes.
 pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<OperatorChoice> {
-    let Some(types) = checked_operand_types(operands) else {
+    let Some(known) = known_operand_types(op, operands)? else {
         return Ok(OperatorChoice::LeftToTheEngine);
     };
-    if !is_run_by_core(op, &types) {
-        let oids: Vec<Option<i64>> = types
-            .iter()
-            .map(|ty| ty.as_ref().map(|ty| ty.oid))
-            .collect();
-        check_operator(op, &oids)?;
-    }
-    let (literal, ty) = match (operands, types.as_slice()) {
-        ([OperandType::StringLiteral(literal), _], [_, Some(ty)])
-        | ([_, OperandType::StringLiteral(literal)], [Some(ty), _]) => (literal, ty),
-        _ => {
-            let choice = implicit_cast_choice(op, &types);
-            return Ok(choice.unwrap_or_else(|| integer_operator_choice(op, &types)));
+    let arg_types: Vec<ArgType> = known.iter().map(argument_type).collect();
+    let (left, right) = match arg_types[..] {
+        [right] => (None, right),
+        [left, right] => (Some(left), right),
+        _ => unreachable!("an operator has one or two operands"),
+    };
+    let operator = match resolve_operator(&FrontendCatalog, op, left, right) {
+        Resolution::Resolved(operator) => operator,
+        Resolution::Unsupported(_) => return Ok(OperatorChoice::LeftToTheEngine),
+        Resolution::Error(error) => return Err(resolve_error(error)),
+    };
+    for (slot, operand) in operands.iter().enumerate() {
+        let OperandType::StringLiteral(literal) = operand else {
+            continue;
+        };
+        let oid = operator.operand_types[slot];
+        if pg_type_category(oid) != Some("N") {
+            continue;
         }
-    };
-    // The engine reads a literal next to a value of another type as that
-    // type already, with the input function of the type.
-    if pg_type_category(ty.oid) != Some("N") {
-        return Ok(OperatorChoice::LeftToTheEngine);
+        if is_spelling_left_to_the_engine(literal, oid) {
+            return Ok(OperatorChoice::LeftToTheEngine);
+        }
+        check_number_literal(literal, oid, engine_type_of(&known, oid))?;
     }
-    let takes_two = |row: &&Operator| row.name == op && row.left == ty.oid && row.right == ty.oid;
-    let Some(row) = OPERATORS.iter().find(takes_two) else {
-        return Ok(OperatorChoice::LeftToTheEngine);
-    };
-    if is_spelling_left_to_the_engine(literal, ty.oid) {
-        return Ok(OperatorChoice::LeftToTheEngine);
-    }
-    check_number_literal(literal, ty)?;
     Ok(OperatorChoice::Chosen(ChosenOperator {
-        id: row.oid,
-        operands: vec![ty.cast_to.clone(), ty.cast_to.clone()],
-        cast_operands: vec![],
-        function: integer_operator_function(op, &[ty, ty]),
-    }))
-}
-
-/// FIXME(registered-types): The engine casts an operand that is not a string literal only when the choice says so (`cast_operands`), and this says so only for a cast that wraps a negative integer, which is the cast of an integer to oid. The cast of any other operand to the type of the row is left to the engine, which compares the stored numbers. Once the operand casts come from the operator that `id` names, the choice of any operator says so.
-/// PostgreSQL's choice of an operator for operands that no row takes as they
-/// are (`oper_select_candidate` in parse_oper.c): of the rows named `op` that
-/// every operand converts to with an implicit cast, the one that most operands
-/// have the type of. An operand of unknown type is taken to have the type of
-/// the other. A choice is only given when a cast wraps a negative integer,
-/// as an integer next to an oid does, and the operands that it casts are those.
-fn implicit_cast_choice(op: &str, types: &[Option<Checked>]) -> Option<OperatorChoice> {
-    let [left, right] = types else {
-        return None;
-    };
-    let (left_oid, right_oid) = match (left, right) {
-        (Some(left), Some(right)) => (left.oid, right.oid),
-        (Some(known), None) | (None, Some(known)) => (known.oid, known.oid),
-        (None, None) => return None,
-    };
-    let exact_matches =
-        |row: &Operator| usize::from(row.left == left_oid) + usize::from(row.right == right_oid);
-    let candidates = || {
-        OPERATORS.iter().filter(|row| {
-            row.name == op
-                && row.left != NONE
-                && implicitly_casts(left_oid, row.left)
-                && implicitly_casts(right_oid, row.right)
-        })
-    };
-    let most = candidates().map(exact_matches).max()?;
-    let mut best = candidates().filter(|row| exact_matches(row) == most);
-    let row = best.next().filter(|_| best.next().is_none())?;
-    let cast_operands = vec![
-        casts_wrapping(left.as_ref(), row.left),
-        casts_wrapping(right.as_ref(), row.right),
-    ];
-    if !cast_operands.contains(&true) {
-        return None;
-    }
-    let wanted = |oid: i64| ast::Type {
-        name: pg_type_name(oid)
-            .expect("a row names types of pg_type")
-            .to_string(),
-        size: None,
-        array_dimensions: 0,
-    };
-    Some(OperatorChoice::Chosen(ChosenOperator {
-        id: row.oid,
-        operands: vec![wanted(row.left), wanted(row.right)],
-        cast_operands,
-        function: None,
+        id: operator.oid,
+        operands: (0..operands.len())
+            .map(|slot| cast_to(&known, operator.operand_types[slot]))
+            .collect(),
+        cast_operands: cast_operands(&known, &operator),
+        function: integer_operator_function(op, operands, &known, &operator),
     }))
 }
 
 /// FIXME(registered-types): Two integers that have no registered type, such as two integers written in the statement or count(*), are left to the engine, because one engine type stands for integer and bigint (see `engine_type_oid`). So `2147483647 + 1` gives 2147483648, where PostgreSQL fails with 22003. A type for an integer literal by its value, and for a function result from prorettype of its pg_proc row, replace this.
-/// The choice of the operator that runs `op` on operands that are all
-/// integers, one of them at least of a registered integer type.
-fn integer_operator_choice(op: &str, types: &[Option<Checked>]) -> OperatorChoice {
-    let Some(types) = types.iter().map(Option::as_ref).collect::<Option<Vec<_>>>() else {
-        return OperatorChoice::LeftToTheEngine;
-    };
-    let Some(function) = integer_operator_function(op, &types) else {
-        return OperatorChoice::LeftToTheEngine;
-    };
-    let oids: Vec<i64> = types.iter().map(|ty| ty.oid).collect();
-    let takes_these = |row: &&Operator| match oids[..] {
-        [right] => row.name == op && row.left == NONE && row.right == right,
-        [left, right] => row.name == op && row.left == left && row.right == right,
-        _ => false,
-    };
-    let row = OPERATORS
-        .iter()
-        .find(takes_these)
-        .expect("an integer operator function is the oprcode of a row");
-    OperatorChoice::Chosen(ChosenOperator {
-        id: row.oid,
-        operands: types.iter().map(|ty| ty.cast_to.clone()).collect(),
-        cast_operands: vec![],
-        function: Some(function),
-    })
-}
-
-fn integer_operator_function(op: &str, types: &[&Checked]) -> Option<OperatorFunction> {
-    if types.iter().all(|ty| ty.engine.is_some()) {
+/// The function that runs an operator on integers of a registered type, when
+/// every operand has the type the operator takes already.
+fn integer_operator_function(
+    op: &str,
+    operands: &[OperandType],
+    known: &[Option<Known>],
+    operator: &ResolvedOperator,
+) -> Option<OperatorFunction> {
+    let takes_operands_as_they_are =
+        operator
+            .coercions
+            .iter()
+            .zip(operands)
+            .all(|(coercion, operand)| match coercion {
+                ArgCoercion::None => true,
+                ArgCoercion::Literal => matches!(operand, OperandType::StringLiteral(_)),
+                _ => false,
+            });
+    if !takes_operands_as_they_are || known.iter().flatten().all(|ty| ty.engine.is_some()) {
         return None;
     }
-    let integer_types = types
+    let integer_types = operator
+        .operand_types
         .iter()
-        .map(|ty| integer_type(ty.oid))
+        .map(|&oid| integer_type(oid))
         .collect::<Option<Vec<_>>>()?;
-    let operator = match integer_types[..] {
+    let integer_operator = match integer_types[..] {
         [right] => IntegerOperator::find(op, None, right),
         [left, right] => IntegerOperator::find(op, Some(left), right),
         _ => None,
     }?;
     Some(OperatorFunction {
-        name: operator.function_name(),
+        name: integer_operator.function_name(),
         result: ast::Type {
-            name: operator.result().name().to_string(),
+            name: integer_operator.result().name().to_string(),
             size: None,
             array_dimensions: 0,
         },
@@ -195,44 +131,79 @@ fn integer_type(oid: i64) -> Option<IntegerType> {
     }
 }
 
-/// PostgreSQL's choice of the `=` (`<>` for NOT IN) of `x IN (a, b, ...)` for
-/// the values that read no column (`transformAExprIn` in parse_expr.c). The
-/// operands are `x` and then each of those values:
-///
-/// 1. An operand has a type that `CHECKED_TYPES` does not name, or has no
-///    type at all: the engine runs its own comparisons.
-/// 2. There is one such value, or the operands have no common type
-///    (`select_common_type`): each value is compared with `x` alone, which
-///    `choose_operator` decides.
-/// 3. The common type is a number type, and a row takes two operands of that
-///    type: each string literal is read as that type.
-/// 4. Otherwise the engine runs its own comparisons.
-///
-/// Every type of `CHECKED_TYPES` has a row for `=` and `<>` with itself, so
-/// a common type never makes the operator undefined.
+/// FIXME(registered-types): The engine casts an operand that is not a string literal only when the choice says so, and this says so only for a cast that wraps a negative integer, which is the cast of an integer to oid. The other coercions are left to the engine, which compares the stored numbers. Once the engine applies every coercion of the resolver, each coerced operand is cast.
+/// Which operands the engine casts to the type the operator takes: those that
+/// the resolver coerces with a cast that wraps a negative integer around.
+fn cast_operands(known: &[Option<Known>], operator: &ResolvedOperator) -> Vec<bool> {
+    operator
+        .coercions
+        .iter()
+        .zip(known)
+        .zip(&operator.operand_types)
+        .map(|((coercion, operand), &wanted)| {
+            *coercion != ArgCoercion::None && casts_wrapping(operand.as_ref(), wanted)
+        })
+        .collect()
+}
+
+/// Whether casting `operand`, an operand of unknown type when it is `None`, to
+/// the type `wanted` wraps a negative integer around.
+fn casts_wrapping(operand: Option<&Known>, wanted: i64) -> bool {
+    let source = match operand {
+        Some(operand) => match cast_type_of(operand.oid) {
+            Some(source) => Some(source),
+            None => return false,
+        },
+        None => None,
+    };
+    cast_type_of(wanted).is_some_and(|target| wraps_negative_integers(source, target))
+}
+
+fn cast_type_of(oid: i64) -> Option<CastType> {
+    CastType::from_name(pg_type_name(oid)?)
+}
+
+/// Chooses the `=` (`<>` for NOT IN) of `x IN (a, b, ...)` for the values that
+/// read no column (`transformAExprIn` in parse_expr.c). It gives `None` when
+/// there is one value or the operands have no common type: each value is then
+/// compared with `x` alone, which `choose_operator` decides. When the common
+/// type is a number type, each string literal is read as that type.
 pub(crate) fn choose_list_operator(
     op: &str,
     operands: &[OperandType],
 ) -> Result<Option<OperatorChoice>> {
-    let Some(types) = checked_operand_types(operands) else {
+    let Some(known) = known_operand_types(op, operands)? else {
         return Ok(Some(OperatorChoice::LeftToTheEngine));
     };
-    let oids: Vec<Option<i64>> = types
-        .iter()
-        .map(|ty| ty.as_ref().map(|ty| ty.oid))
-        .collect();
-    let values = &oids[1..];
-    let Some(common) = common_type(&oids).filter(|_| values.len() > 1) else {
+    if known.len() < 3 {
         return Ok(None);
+    }
+    let arg_types: Vec<ArgType> = known.iter().map(argument_type).collect();
+    let common = match common_type(&FrontendCatalog, &arg_types) {
+        Ok(Some(common)) => common,
+        Ok(None) => return Ok(None),
+        Err(_) => return Ok(Some(OperatorChoice::LeftToTheEngine)),
     };
-    let takes_two = |row: &&Operator| row.name == op && row.left == common && row.right == common;
-    let row = OPERATORS.iter().find(takes_two);
-    let Some(ty) = types.iter().flatten().find(|ty| ty.oid == common) else {
+    let all_cast_to_it = known.iter().flatten().all(|ty| {
+        ty.oid == common || casts_implicitly(&FrontendCatalog, ty.oid, common) == Ok(true)
+    });
+    if !all_cast_to_it {
+        return Ok(None);
+    }
+    let row = resolve_operator(
+        &FrontendCatalog,
+        op,
+        Some(ArgType::Known(common)),
+        ArgType::Known(common),
+    );
+    let (Resolution::Resolved(row), Some(ty)) =
+        (row, known.iter().flatten().find(|ty| ty.oid == common))
+    else {
         return Ok(Some(OperatorChoice::LeftToTheEngine));
     };
-    let Some(row) = row.filter(|_| pg_type_category(common) == Some("N")) else {
+    if pg_type_category(common) != Some("N") {
         return Ok(Some(OperatorChoice::LeftToTheEngine));
-    };
+    }
     let literals: Vec<&String> = operands
         .iter()
         .filter_map(|operand| match operand {
@@ -240,12 +211,16 @@ pub(crate) fn choose_list_operator(
             _ => None,
         })
         .collect();
-    let mut left_to_the_engine = literals.is_empty();
+    let cast_operands: Vec<bool> = known
+        .iter()
+        .map(|operand| casts_wrapping(operand.as_ref(), common))
+        .collect();
+    let mut left_to_the_engine = literals.is_empty() && !cast_operands.contains(&true);
     for literal in literals {
         if is_spelling_left_to_the_engine(literal, common) {
             left_to_the_engine = true;
         } else {
-            check_number_literal(literal, ty)?;
+            check_number_literal(literal, common, ty.engine)?;
         }
     }
     if left_to_the_engine {
@@ -254,93 +229,9 @@ pub(crate) fn choose_list_operator(
     Ok(Some(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
         operands: vec![ty.cast_to.clone(); operands.len()],
-        cast_operands: types
-            .iter()
-            .map(|operand| casts_wrapping(operand.as_ref(), common))
-            .collect(),
+        cast_operands,
         function: None,
     })))
-}
-
-/// The type that `select_common_type` (parse_coerce.c) gives these operands, a
-/// string literal or parameter being `None`: the first type, replaced by a
-/// later one of its category when the first casts to the later implicitly and
-/// not the other way, unless the first is the preferred type of the category.
-/// It is `None` when two types are of different categories or a type does not
-/// cast implicitly to the one chosen, and text when no operand has a type.
-fn common_type(types: &[Option<i64>]) -> Option<i64> {
-    let mut chosen: Option<i64> = None;
-    for &ty in types.iter().flatten() {
-        let Some(current) = chosen else {
-            chosen = Some(ty);
-            continue;
-        };
-        if ty == current {
-            continue;
-        }
-        if pg_type_category(ty) != pg_type_category(current) {
-            return None;
-        }
-        if !built_in_type(current).is_some_and(|ty| ty.is_preferred)
-            && casts_implicitly(current, ty)
-            && !casts_implicitly(ty, current)
-        {
-            chosen = Some(ty);
-        }
-    }
-    let chosen = chosen.unwrap_or(TEXT);
-    let all_cast = types
-        .iter()
-        .flatten()
-        .all(|&ty| ty == chosen || casts_implicitly(ty, chosen));
-    all_cast.then_some(chosen)
-}
-
-fn casts_implicitly(from: i64, to: i64) -> bool {
-    IMPLICIT_CASTS.contains(&(from, to))
-}
-
-/// FIXME(pg-catalog): This hand-codes the rows of pg_cast with castcontext 'i' between the types of `CHECKED_TYPES`. A lookup in pg_cast replaces it, and `fits`, which takes the implicit casts to be every cast within a typcategory, uses the same lookup.
-const IMPLICIT_CASTS: [(i64, i64); 20] = [
-    (DATE, TIMESTAMP),
-    (DATE, TIMESTAMPTZ),
-    (TIMESTAMP, TIMESTAMPTZ),
-    (FLOAT4, FLOAT8),
-    (INT2, INT4),
-    (INT2, INT8),
-    (INT2, FLOAT4),
-    (INT2, FLOAT8),
-    (INT2, NUMERIC),
-    (INT4, INT8),
-    (INT4, FLOAT4),
-    (INT4, FLOAT8),
-    (INT4, NUMERIC),
-    (INT8, FLOAT4),
-    (INT8, FLOAT8),
-    (INT8, NUMERIC),
-    (NUMERIC, FLOAT4),
-    (NUMERIC, FLOAT8),
-    (TEXT, VARCHAR),
-    (VARCHAR, TEXT),
-];
-
-/// The operand types whose operators are decided by core's operator signatures
-/// for the arithmetic and bit operators, and the prefix `-` and `~`. Core has
-/// no signature for a comparison, so `OPERATORS` decides every comparison.
-///
-/// FIXME(pg-catalog): Core runs these operators with its own functions (`date_plus`, `numeric_add`) and decides which operand types they take. Once `pg_operator` names the function of each row (`oprcode`, with `pg_proc` under PostgreSQL's oids) and `pg_cast` gives the implicit casts, the rows decide these operators too and this list goes away.
-const OPERATORS_RUN_BY_CORE: [i64; 2] = [DATE, NUMERIC];
-
-/// Whether core's operator signatures, and not `OPERATORS`, decide whether
-/// `op` exists for these operands: an operand is a registered type of
-/// `OPERATORS_RUN_BY_CORE`. A decimal written in the statement is not
-/// registered, so it does not count.
-fn is_run_by_core(op: &str, types: &[Option<Checked>]) -> bool {
-    !COMPARISONS.contains(&op)
-        && types
-            .iter()
-            .flatten()
-            .any(|ty| ty.engine.is_none() && OPERATORS_RUN_BY_CORE.contains(&ty.oid))
 }
 
 /// FIXME(registered-types): The engine stores numeric and double precision both as REAL, and cannot hold NaN or an exponent past a double, so these spellings are compared as text and give false. Once numeric is a registered type with its own storage, the input function of the type reads every spelling and this function goes away.
@@ -379,10 +270,10 @@ fn is_spelling_left_to_the_engine(literal: &str, oid: i64) -> bool {
 }
 
 /// FIXME(registered-types): TEMPORARY. This check goes away once numeric and double precision are registered types. The engine stores a numeric and a double precision both as REAL, and cannot tell them apart, so a literal next to one of them is cast to a double. PostgreSQL keeps all the digits of a numeric, so a literal that a double does not keep gives another answer: `n = '9007199254740993'` is true for a numeric column that holds 9007199254740992. A registered numeric stores the value exactly, and a registered double precision rounds it, as PostgreSQL does.
-/// Fails with 0A000 when `ty` is a number that the engine stores as a double
-/// and a double does not keep `literal` exactly.
-fn check_a_double_keeps(literal: &str, ty: &Checked) -> Result<()> {
-    let is_stored_as_a_double = ty.engine.is_some() && [FLOAT8, NUMERIC].contains(&ty.oid);
+/// Fails with 0A000 when the type `oid` is a number that the engine stores as
+/// a double and a double does not keep `literal` exactly.
+fn check_a_double_keeps(literal: &str, oid: i64, engine: Option<EngineType>) -> Result<()> {
+    let is_stored_as_a_double = engine.is_some() && [FLOAT8, NUMERIC].contains(&oid);
     if !is_stored_as_a_double || a_double_keeps(literal) {
         return Ok(());
     }
@@ -417,14 +308,14 @@ fn a_double_keeps(text: &str) -> bool {
     digits_of(&format!("{value}")) == (digits, fraction_digits)
 }
 
-/// Fails when `literal` is not a value of the number type `ty`.
-fn check_number_literal(literal: &str, ty: &Checked) -> Result<()> {
-    let type_name = pg_type_name(ty.oid).expect("an operand type is a row of pg_type");
+/// Fails when `literal` is not a value of the number type `oid`.
+fn check_number_literal(literal: &str, oid: i64, engine: Option<EngineType>) -> Result<()> {
+    let type_name = pg_type_name(oid).expect("an operand type is a row of pg_type");
     let Some((message, sqlstate)) = built_in_input_error(type_name, literal) else {
-        return check_a_double_keeps(literal, ty);
+        return check_a_double_keeps(literal, oid, engine);
     };
     let out_of_range = sqlstate == SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE;
-    let is_engine_integer = ty.engine == Some(EngineType::Integer);
+    let is_engine_integer = engine == Some(EngineType::Integer);
     if out_of_range && is_engine_integer && built_in_input_error("int8", literal).is_none() {
         return Ok(());
     }
@@ -436,8 +327,8 @@ fn check_number_literal(literal: &str, ty: &Checked) -> Result<()> {
     Err(sqlstate_error(sqlstate, message, None))
 }
 
-/// An operand whose type the rows of `OPERATORS` decide.
-struct Checked {
+/// An operand that has a type.
+struct Known {
     oid: i64,
     /// The type that a string literal next to the operand is cast to.
     cast_to: ast::Type,
@@ -445,175 +336,106 @@ struct Checked {
     engine: Option<EngineType>,
 }
 
-/// Each operand as a `Checked`, `None` for an operand that fits any type: a
-/// string literal or a parameter. Gives `None` itself when an operand has no
-/// type, or a type that `CHECKED_TYPES` does not name.
-fn checked_operand_types(operands: &[OperandType]) -> Option<Vec<Option<Checked>>> {
-    operands
+fn argument_type(operand: &Option<Known>) -> ArgType {
+    match operand {
+        Some(ty) => ArgType::Known(ty.oid),
+        None => ArgType::Unknown,
+    }
+}
+
+fn engine_type_of(known: &[Option<Known>], oid: i64) -> Option<EngineType> {
+    known
         .iter()
-        .map(|operand| match operand {
-            OperandType::StringLiteral(_) | OperandType::Untyped => Some(None),
-            OperandType::Registered(ty) => checked_registered_type(ty).map(Some),
+        .flatten()
+        .find(|ty| ty.oid == oid)
+        .and_then(|ty| ty.engine)
+}
+
+/// The type to read a string literal as when the operator takes the type `oid`.
+fn cast_to(known: &[Option<Known>], oid: i64) -> ast::Type {
+    known
+        .iter()
+        .flatten()
+        .find(|ty| ty.oid == oid)
+        .map(|ty| ty.cast_to.clone())
+        .or_else(|| cast_type(oid))
+        .expect("an operator takes a type that has a name")
+}
+
+/// The type of each operand, `None` for a string literal or a parameter, which
+/// PostgreSQL reads as `unknown`. Gives `None` itself when an operand has a type
+/// that the engine runs the operator for. Fails with 42P18 when an operand has
+/// no type at all.
+///
+/// FIXME(registered-types): A column of a table that is not STRICT, a catalog column whose declared type is not PostgreSQL's and a recursive CTE column have no type yet, so an operator on one fails with 42P18. An engine type stands for several PostgreSQL types: the operator gets the one in `engine_type_oid`. Typing those columns and registering the types removes both.
+///
+/// FIXME(pg-catalog): `OPERATORS` has no rows for interval, time, bytea, json, jsonb, inet, arrays and enums, and for a comparison of date with timestamp or timestamptz (which tursopg refuses with 0A000), so an operand of a type that no row takes, or of an array type, is left to the engine. Once pg_operator has all 799 rows, the resolver decides these too.
+fn known_operand_types(op: &str, operands: &[OperandType]) -> Result<Option<Vec<Option<Known>>>> {
+    let mut known = Vec::with_capacity(operands.len());
+    let mut unnamed = None;
+    for (index, operand) in operands.iter().enumerate() {
+        let ty = match operand {
+            OperandType::StringLiteral(_) | OperandType::Untyped => None,
+            OperandType::Registered(ty) => {
+                let oid = crate::catalog::pg_type_oid(&ty.name);
+                match oid
+                    .filter(|&oid| ty.array_dimensions == 0 && FrontendCatalog::has_operators(oid))
+                {
+                    Some(oid) => Some(Known {
+                        oid,
+                        cast_to: ty.clone(),
+                        engine: None,
+                    }),
+                    None => return Ok(None),
+                }
+            }
             OperandType::Engine {
                 ty,
                 array_dimensions,
-            } => checked_engine_type(*ty, *array_dimensions).map(Some),
-            OperandType::Unnamed => None,
-        })
-        .collect()
-}
-
-fn checked_registered_type(ty: &ast::Type) -> Option<Checked> {
-    if ty.array_dimensions > 0 {
-        return None;
+            } => {
+                let oid = engine_type_oid(*ty);
+                if *array_dimensions > 0 || !FrontendCatalog::has_operators(oid) {
+                    return Ok(None);
+                }
+                Some(Known {
+                    oid,
+                    cast_to: engine_cast_type(*ty),
+                    engine: Some(*ty),
+                })
+            }
+            OperandType::Unnamed => {
+                unnamed.get_or_insert(index);
+                None
+            }
+        };
+        known.push(ty);
     }
-    let oid = pg_type_oid(&ty.name).filter(|oid| CHECKED_TYPES.contains(oid))?;
-    Some(Checked {
-        oid,
-        cast_to: ty.clone(),
-        engine: None,
-    })
+    if let Some(index) = unnamed {
+        return Err(LimboError::Dialect(Box::new(DialectError {
+            code: SQLSTATE_INDETERMINATE_DATATYPE,
+            message: format!(
+                "could not determine data type of operand {} of operator {op}",
+                index + 1
+            ),
+            detail: None,
+            hint: None,
+        })));
+    }
+    Ok(Some(known))
 }
 
 /// FIXME(registered-types): An integer that has no registered type is taken to be an integer (int4), but it may be a bigint, such as count(*) or an integer written with more digits. So a string literal next to it is cast to bigint, and `check_number_literal` only refuses one out of the range of int4 when it is out of the range of int8. A type for each value replaces this.
-fn checked_engine_type(ty: EngineType, array_dimensions: u32) -> Option<Checked> {
-    if array_dimensions > 0 {
-        return None;
-    }
-    let oid = engine_type_oid(ty)?;
-    let cast_to = match ty {
+fn engine_cast_type(ty: EngineType) -> ast::Type {
+    let name = match ty {
         EngineType::Integer => "bigint",
         _ => ty.sql_name(),
     };
-    Some(Checked {
-        oid,
-        cast_to: ast::Type {
-            name: cast_to.to_string(),
-            size: None,
-            array_dimensions: 0,
-        },
-        engine: Some(ty),
-    })
-}
-
-/// FIXME(registered-types): The engine type stands for several PostgreSQL types, and this takes the one that PostgreSQL gives a literal of that kind, or the widest: an integer may also be a bigint (`count(*)`), and a real may also be a real. A type for each value replaces this.
-/// The PostgreSQL type that an engine type is taken to be, `None` for one that
-/// `CHECKED_TYPES` does not name.
-fn engine_type_oid(ty: EngineType) -> Option<i64> {
-    match ty {
-        EngineType::Integer => Some(INT4),
-        EngineType::Real => Some(FLOAT8),
-        EngineType::Decimal | EngineType::Number => Some(NUMERIC),
-        EngineType::Text => Some(TEXT),
-        EngineType::Blob => None,
+    ast::Type {
+        name: name.to_string(),
+        size: None,
+        array_dimensions: 0,
     }
 }
-
-/// Fails with SQLSTATE 42883 when no row of `OPERATORS` named `op` takes
-/// operands of these types.
-fn check_operator(op: &str, types: &[Option<i64>]) -> Result<()> {
-    if types.iter().all(Option::is_none) {
-        return Ok(());
-    }
-    // FIXME(registered-types): See `fits`. A text operand may be a uuid, json or inet value, so only its comparisons are decided.
-    if types.contains(&Some(TEXT)) && !COMPARISONS.contains(&op) {
-        return Ok(());
-    }
-    let takes_operands = |row: &Operator| match types {
-        [right] => row.left == NONE && fits(*right, row.right),
-        [left, right] => row.left != NONE && fits(*left, row.left) && fits(*right, row.right),
-        _ => false,
-    };
-    if OPERATORS
-        .iter()
-        .any(|row| row.name == op && takes_operands(row))
-    {
-        return Ok(());
-    }
-    let names: Vec<String> = types
-        .iter()
-        .map(|ty| match ty {
-            Some(oid) => format_type(*oid, -1),
-            None => "unknown".to_string(),
-        })
-        .collect();
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    Err(undefined_operator_of(op, &names))
-}
-
-/// FIXME(pg-catalog): `OPERATORS` has no rows for interval, time, bytea, json, jsonb, inet, arrays and enums, and for a comparison of date with timestamp or timestamptz (which tursopg refuses with 0A000), so an operand of those types is not checked. Once pg_operator has all 799 rows, every operand is checked and a type with no row is an error.
-/// The types whose operators are decided by the rows of `OPERATORS`. Varchar
-/// has no rows of its own: it takes the operators of text.
-const CHECKED_TYPES: [i64; 14] = [
-    BOOL,
-    OID,
-    INT2,
-    INT4,
-    INT8,
-    FLOAT4,
-    FLOAT8,
-    NUMERIC,
-    TEXT,
-    VARCHAR,
-    DATE,
-    TIMESTAMP,
-    TIMESTAMPTZ,
-    UUID,
-];
-
-/// FIXME(pg-catalog): This hand-codes the implicit casts of pg_cast, which is not filled yet: a type is taken to cast implicitly to every type of its typcategory, and so varchar, which has no operators of its own, to text. A lookup in a pg_cast table replaces this.
-/// FIXME(pg-catalog): The engine gives the type text to a uuid, json, jsonb, inet, cidr or macaddr value that a cast or a function returns. So a text operand is taken to be of any string, network or user-defined type, and only its comparisons are decided: those types have other operators in pg_operator that are not rows here. A type for each value, from pg_type, replaces this.
-/// Whether an operand of type `operand` may be given to an operator that
-/// takes `expected`. `None` is an operand that fits any type.
-fn fits(operand: Option<i64>, expected: i64) -> bool {
-    if operand == Some(OID) || expected == OID {
-        return fits_oid(operand, expected);
-    }
-    let expected = pg_type_category(expected);
-    match operand {
-        None => true,
-        Some(TEXT) => matches!(expected, Some("S" | "I" | "U")),
-        Some(operand) => pg_type_category(operand) == expected,
-    }
-}
-
-/// An oid has the same typcategory as the integers but takes none of their
-/// operators, so it fits an operand that casts to oid implicitly.
-fn fits_oid(operand: Option<i64>, expected: i64) -> bool {
-    expected == OID && operand.is_none_or(|operand| implicitly_casts(operand, OID))
-}
-
-/// Whether casting `operand`, an operand of unknown type when it is `None`, to
-/// the type `wanted` wraps a negative integer around.
-fn casts_wrapping(operand: Option<&Checked>, wanted: i64) -> bool {
-    let source = match operand {
-        Some(operand) => match cast_type_of(operand.oid) {
-            Some(source) => Some(source),
-            None => return false,
-        },
-        None => None,
-    };
-    cast_type_of(wanted).is_some_and(|target| wraps_negative_integers(source, target))
-}
-
-fn cast_type_of(oid: i64) -> Option<CastType> {
-    CastType::from_name(pg_type_name(oid)?)
-}
-
-/// Whether a value of the type `from` converts to the type `to` with an
-/// implicit cast: the rows of `pg_cast` of `casts.rs` for the types that have
-/// them, and `IMPLICIT_CASTS` for the others.
-fn implicitly_casts(from: i64, to: i64) -> bool {
-    from == to
-        || casts_implicitly(from, to)
-        || matches!(
-            (cast_type_of(from), cast_type_of(to)),
-            (Some(source), Some(target))
-                if resolve(source, target, CastContext::Implicit).is_ok()
-        )
-}
-
-const COMPARISONS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
 
 const NONE: i64 = 0;
 const BOOL: i64 = 16;
@@ -629,7 +451,6 @@ const TIMESTAMP: i64 = 1114;
 const TIMESTAMPTZ: i64 = 1184;
 const NUMERIC: i64 = 1700;
 const UUID: i64 = 2950;
-const VARCHAR: i64 = 1043;
 
 macro_rules! operators {
     ($((
@@ -910,11 +731,21 @@ mod tests {
         }
     }
 
-    fn chosen_id(op: &str, operands: &[OperandType]) -> Option<i64> {
+    fn chosen(op: &str, operands: &[OperandType]) -> Option<ChosenOperator> {
         match choose_operator(op, operands).unwrap() {
-            OperatorChoice::Chosen(chosen) => Some(chosen.id),
+            OperatorChoice::Chosen(chosen) => Some(chosen),
             OperatorChoice::LeftToTheEngine => None,
         }
+    }
+
+    fn chosen_id(op: &str, operands: &[OperandType]) -> Option<i64> {
+        chosen(op, operands).map(|chosen| chosen.id)
+    }
+
+    fn refusal(op: &str, operands: &[OperandType]) -> String {
+        choose_operator(op, operands)
+            .expect_err("a refusal")
+            .to_string()
     }
 
     #[test]
@@ -935,7 +766,25 @@ mod tests {
             chosen_id("=", &[engine(EngineType::Decimal), literal()]),
             Some(1752)
         );
-        assert_eq!(chosen_id("=", &[integer(), integer()]), None);
+    }
+
+    #[test]
+    fn an_operator_on_registered_integers_runs_the_function_of_its_row() {
+        let function = |op: &str, operands: &[OperandType]| {
+            chosen(op, operands)
+                .and_then(|chosen| chosen.function)
+                .map(|function| function.name)
+        };
+        let literal = || OperandType::StringLiteral("1".to_string());
+        assert!(function("+", &[registered("smallint"), literal()]).is_some());
+        assert!(function("+", &[registered("smallint"), registered("int4")]).is_some());
+        assert!(function("=", &[engine(EngineType::Integer), literal()]).is_none());
+        assert!(function(
+            "+",
+            &[engine(EngineType::Integer), engine(EngineType::Integer)]
+        )
+        .is_none());
+        assert!(function("%", &[registered("smallint"), registered("int4")]).is_none());
     }
 
     fn list_choice(op: &str, operands: &[OperandType]) -> Option<OperatorChoice> {
@@ -1003,56 +852,45 @@ mod tests {
     }
 
     #[test]
-    fn the_common_type_follows_the_implicit_casts() {
-        assert_eq!(
-            common_type(&[Some(INT4), None, Some(NUMERIC)]),
-            Some(NUMERIC)
-        );
-        assert_eq!(common_type(&[Some(NUMERIC), Some(INT4)]), Some(NUMERIC));
-        assert_eq!(
-            common_type(&[Some(INT2), Some(INT8), Some(INT4)]),
-            Some(INT8)
-        );
-        assert_eq!(
-            common_type(&[Some(INT4), Some(FLOAT8), Some(NUMERIC)]),
-            Some(FLOAT8)
-        );
-        assert_eq!(
-            common_type(&[Some(DATE), Some(TIMESTAMPTZ)]),
-            Some(TIMESTAMPTZ)
-        );
-        assert_eq!(common_type(&[Some(INT4), Some(TEXT)]), None);
-        assert_eq!(common_type(&[None, None]), Some(TEXT));
-    }
-
-    #[test]
-    fn core_decides_the_arithmetic_of_a_registered_date_or_numeric() {
+    fn the_rows_decide_every_operator_of_a_type_they_name() {
         let integer = || engine(EngineType::Integer);
-        for op in ["+", "*", "&"] {
-            for operands in [
-                [registered("date"), integer()],
-                [integer(), registered("numeric")],
-                [registered("date"), engine(EngineType::Decimal)],
-            ] {
-                assert_eq!(chosen_id(op, &operands), None, "{op}");
-            }
+        let text = || engine(EngineType::Text);
+        for (op, operands) in [
+            ("<", [registered("date"), integer()]),
+            ("=", [registered("numeric"), registered("uuid")]),
+            ("+", [integer(), registered("uuid")]),
+            ("*", [engine(EngineType::Decimal), registered("uuid")]),
+            ("=", [text(), integer()]),
+            ("+", [text(), integer()]),
+            ("%", [engine(EngineType::Real), integer()]),
+            ("=", [registered("uuid"), text()]),
+        ] {
+            assert!(
+                refusal(op, &operands).contains("operator does not exist"),
+                "{op}"
+            );
         }
     }
 
     #[test]
-    fn the_rows_decide_what_core_does_not() {
-        let integer = || engine(EngineType::Integer);
-        let refused = |op: &str, operands: &[OperandType]| {
-            let error = choose_operator(op, operands).expect_err("a refusal");
-            error.to_string().contains("operator does not exist")
-        };
-        assert!(refused("<", &[registered("date"), integer()]));
-        assert!(refused("=", &[registered("numeric"), registered("uuid")]));
-        assert!(refused("+", &[integer(), registered("uuid")]));
-        assert!(refused(
-            "*",
-            &[engine(EngineType::Decimal), registered("uuid")]
-        ));
+    fn an_operand_with_no_type_fails_with_42p18() {
+        let error = choose_operator("+", &[engine(EngineType::Integer), OperandType::Unnamed])
+            .expect_err("a refusal");
+        assert!(error
+            .to_string()
+            .contains("could not determine data type of operand 2 of operator +"));
+    }
+
+    #[test]
+    fn an_operand_of_a_type_without_rows_is_left_to_the_engine() {
+        assert_eq!(
+            chosen_id("=", &[engine(EngineType::Blob), engine(EngineType::Blob)]),
+            None
+        );
+        assert_eq!(
+            chosen_id("+", &[registered("date"), registered("interval")]),
+            None
+        );
     }
 
     #[test]
@@ -1065,30 +903,6 @@ mod tests {
                     row.oid
                 );
             }
-        }
-    }
-
-    #[test]
-    fn checked_types_are_the_types_of_the_rows() {
-        let in_rows = |oid: i64| {
-            OPERATORS
-                .iter()
-                .any(|row| row.left == oid || row.right == oid)
-        };
-        for row in OPERATORS {
-            for oid in [row.left, row.right] {
-                assert!(
-                    oid == NONE || CHECKED_TYPES.contains(&oid),
-                    "row {} takes a type that CHECKED_TYPES does not name",
-                    row.oid
-                );
-            }
-        }
-        for oid in CHECKED_TYPES {
-            assert!(
-                oid == VARCHAR || in_rows(oid),
-                "no row takes type {oid}, which CHECKED_TYPES names"
-            );
         }
     }
 }

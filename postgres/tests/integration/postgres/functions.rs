@@ -176,11 +176,11 @@ fn test_pg_set_config_validates_arguments(db: TempDatabase) {
         ),
         (
             "SELECT set_config('search_path', 5, false)",
-            "set_config requires a text value",
+            "function set_config(unknown, integer, boolean) does not exist",
         ),
         (
             "SELECT set_config('search_path', '', 2)",
-            "set_config requires a boolean",
+            "function set_config(unknown, unknown, integer) does not exist",
         ),
         (
             "SELECT set_config('search_path', 'public,', false)",
@@ -603,10 +603,6 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         ("SELECT booleq(1, 0)", Value::from_i64(0)),
         ("SELECT boolne(1, 0)", Value::from_i64(1)),
         (
-            "SELECT format_type(1043)",
-            Value::build_text("character varying"),
-        ),
-        (
             "SELECT format_type(1043, 17)",
             Value::build_text("character varying(13)"),
         ),
@@ -632,6 +628,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         "SELECT statement_timestamp('x')",
         "SELECT quote_ident()",
         "SELECT format_type()",
+        "SELECT format_type(1043)",
         "SELECT format_type(23, -1, 0)",
         "SELECT pg_get_expr('x')",
         "SELECT pg_get_expr('x', 1, 1, 1)",
@@ -1061,4 +1058,61 @@ fn test_pg_key_and_path_operators_with_parameters(db: TempDatabase) {
             "{sql} with $1 = {value}"
         );
     }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_bytea_functions_work_on_bytes(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE blobs (data bytea, trimmed bytea)")
+        .unwrap();
+    let mut insert = conn.prepare("INSERT INTO blobs VALUES ($1, $2)").unwrap();
+    insert
+        .bind_at(
+            1.try_into().unwrap(),
+            Value::from_blob(vec![0x41, 0x42, 0x43, 0x41]),
+        )
+        .unwrap();
+    insert
+        .bind_at(2.try_into().unwrap(), Value::from_blob(vec![0x41]))
+        .unwrap();
+    insert.run_ignore_rows().unwrap();
+
+    let blob = |bytes: &[u8]| vec![vec![Value::from_blob(bytes.to_vec())]];
+    let integer = |value: i64| vec![vec![Value::from_i64(value)]];
+    for (sql, expected) in [
+        ("SELECT length(data) FROM blobs", integer(4)),
+        ("SELECT octet_length(data) FROM blobs", integer(4)),
+        (
+            "SELECT reverse(data) FROM blobs",
+            blob(&[0x41, 0x43, 0x42, 0x41]),
+        ),
+        (
+            "SELECT btrim(data, trimmed) FROM blobs",
+            blob(&[0x42, 0x43]),
+        ),
+        (
+            "SELECT ltrim(data, trimmed) FROM blobs",
+            blob(&[0x42, 0x43, 0x41]),
+        ),
+        (
+            "SELECT rtrim(data, trimmed) FROM blobs",
+            blob(&[0x41, 0x42, 0x43]),
+        ),
+        (
+            "SELECT ltrim(data, '\\x4142') FROM blobs",
+            blob(&[0x43, 0x41]),
+        ),
+        ("SELECT substr(data, 2, 2) FROM blobs", blob(&[0x42, 0x43])),
+        ("SELECT substr(data, 3) FROM blobs", blob(&[0x43, 0x41])),
+        ("SELECT substr(data, -1, 3) FROM blobs", blob(&[0x41])),
+        ("SELECT substr(data, 9) FROM blobs", blob(&[])),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(stmt.run_collect_rows().unwrap(), expected, "{sql}");
+    }
+
+    let error = conn
+        .execute("SELECT substr(data, 1, -1) FROM blobs")
+        .unwrap_err();
+    assert_eq!(error.sqlstate, "22011");
 }

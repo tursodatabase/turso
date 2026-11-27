@@ -13,7 +13,7 @@ use super::{
     select::first_aggregate_without_over_clause,
 };
 use crate::translate::expr::comparison_affinity;
-use crate::translate::expr::expr_type::query_column_type;
+use crate::translate::expr::expr_type::{query_column_has_declared_type, query_column_type};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
@@ -965,6 +965,7 @@ fn get_subquery_parser<'a>(
                             &ExprContext::new(Some(plan.select_table_references()), resolver),
                         ),
                         expr_type: query_column_type(&plan, i, resolver),
+                        has_declared_type: query_column_has_declared_type(&plan, i, resolver),
                     })
                     .collect();
                 if let [column] = columns.as_slice() {

@@ -1026,7 +1026,7 @@ test jsonb-set-operators {
 expect {
     {"a": 2}|{"a": 1, "b": 2}|{"b": 2}
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # B-123: jsonb_typeof / jsonb_array_length
@@ -1131,10 +1131,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# PostgreSQL has no to_char for boolean, text or jsonb. tursopg decides from
-# each row's value, so it formats a row that holds a number and returns NULL
-# for a NULL row.
-@compat-gap "function:to_char"
+# PostgreSQL has no to_char for boolean, text or jsonb.
 test to-char-boolean-column {
     CREATE TABLE to_char_flags (flag boolean);
     INSERT INTO to_char_flags VALUES (true);
@@ -1144,11 +1141,7 @@ test to-char-boolean-column {
 expect error {
     function to_char\(boolean, unknown\) does not exist
 }
-expect @tursopg raw {
-  1
-}
 
-@compat-gap "function:to_char"
 test to-char-text-column {
     CREATE TABLE to_char_texts (t text);
     INSERT INTO to_char_texts VALUES ('12');
@@ -1158,11 +1151,7 @@ test to-char-text-column {
 expect error {
     function to_char\(text, unknown\) does not exist
 }
-expect @tursopg raw {
- 12
-}
 
-@compat-gap "function:to_char"
 test to-char-jsonb-column {
     CREATE TABLE to_char_documents (doc jsonb);
     INSERT INTO to_char_documents VALUES ('12');
@@ -1171,9 +1160,6 @@ test to-char-jsonb-column {
 @sqlstate 42883
 expect error {
     function to_char\(jsonb, unknown\) does not exist
-}
-expect @tursopg raw {
- 12
 }
 
 # to_timestamp(double precision)
@@ -1234,8 +1220,9 @@ test jsonb-removes-a-key {
 expect {
     {"b": 2}
 }
-expect @tursopg {
-    0
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: text - unknown
 }
 
 # B-130: 16 nested scalar subqueries
@@ -1307,16 +1294,12 @@ expect @tursopg raw {
  12345| 100.0
 }
 
-@compat-gap "function:to_char"
 test to-char-unknown-literal-is-ambiguous {
     SELECT to_char('12', '99');
 }
 @sqlstate 42725
 expect error {
     function to_char\(unknown, unknown\) is not unique
-}
-expect @tursopg raw {
- 12
 }
 
 # Unquoted C folds to c, and PostgreSQL has no collation named "c".
@@ -1359,3 +1342,179 @@ expect {
 expect @tursopg {
     t
 }
+
+# Functions that ignore argument types: PostgreSQL 18's answers.
+# A cast to bytea keeps the text of its input as the bytes, so these differ
+# even though each bytea function now works on bytes.
+
+@compat-gap "function:length"
+test length-of-bytea-counts-bytes {
+    SELECT length('\x41'::bytea);
+}
+expect {
+    1
+}
+expect @tursopg {
+    4
+}
+
+@compat-gap "function:octet_length"
+test octet-length-of-bytea-counts-bytes {
+    SELECT octet_length('\x41'::bytea);
+}
+expect {
+    1
+}
+expect @tursopg {
+    4
+}
+
+@compat-gap "function:reverse"
+test reverse-of-bytea-reverses-bytes {
+    SELECT reverse('\x41'::bytea);
+}
+expect {
+    \x41
+}
+expect @tursopg {
+    \x3134785c
+}
+
+@compat-gap "function:btrim"
+test btrim-of-bytea-trims-bytes {
+    SELECT btrim('\x4142'::bytea, '\x41'::bytea);
+}
+expect {
+    \x42
+}
+expect @tursopg {
+    \x32
+}
+
+@compat-gap "function:ltrim"
+test ltrim-of-bytea-trims-bytes {
+    SELECT ltrim('\x4142'::bytea, '\x41'::bytea);
+}
+expect {
+    \x42
+}
+expect @tursopg {
+    \x32
+}
+
+@compat-gap "function:rtrim"
+test rtrim-of-bytea-trims-bytes {
+    SELECT rtrim('\x4142'::bytea, '\x32'::bytea);
+}
+expect {
+    \x4142
+}
+expect @tursopg {
+    \x5c78343134
+}
+
+test abs-of-text-does-not-exist {
+    SELECT abs('abc'::text);
+}
+@sqlstate 42883
+expect error {}
+
+test round-of-text-does-not-exist {
+    SELECT round('abc'::text);
+}
+@sqlstate 42883
+expect error {}
+
+test sqrt-of-text-does-not-exist {
+    SELECT sqrt('abc'::text);
+}
+@sqlstate 42883
+expect error {}
+
+test quote-ident-of-integer-does-not-exist {
+    SELECT quote_ident(7);
+}
+@sqlstate 42883
+expect error {}
+
+test lower-of-integer-does-not-exist {
+    SELECT lower(7);
+}
+@sqlstate 42883
+expect error {}
+
+test upper-of-integer-does-not-exist {
+    SELECT upper(7);
+}
+@sqlstate 42883
+expect error {}
+
+test length-of-integer-does-not-exist {
+    SELECT length(7);
+}
+@sqlstate 42883
+expect error {}
+
+@compat-gap "function:ceil"
+test ceil-of-numeric-has-no-fraction-digits {
+    SELECT ceil(2.5::numeric);
+}
+expect {
+    3
+}
+expect @tursopg {
+    3.0
+}
+
+@compat-gap "function:floor"
+test floor-of-numeric-has-no-fraction-digits {
+    SELECT floor(2.5::numeric);
+}
+expect {
+    2
+}
+expect @tursopg {
+    2.0
+}
+
+@compat-gap "function:round"
+test round-of-numeric-has-no-fraction-digits {
+    SELECT round(2.5::numeric);
+}
+expect {
+    3
+}
+expect @tursopg {
+    3.0
+}
+
+# tursopg reads a numeric cast as a double precision, which has no round
+# with a scale.
+@compat-gap "function:round"
+test round-of-numeric-keeps-the-scale {
+    SELECT round(2.5::numeric, 7);
+}
+expect {
+    2.5000000
+}
+@sqlstate 42883
+expect @tursopg error {
+    function round\(double precision, integer\) does not exist
+}
+
+@compat-gap "function:trunc"
+test trunc-of-numeric-has-no-fraction-digits {
+    SELECT trunc(2.5::numeric);
+}
+expect {
+    2
+}
+expect @tursopg {
+    2.0
+}
+
+test mod-of-two-quoted-literals-is-ambiguous {
+    SELECT mod('7', '7');
+}
+@sqlstate 42725
+expect error {}

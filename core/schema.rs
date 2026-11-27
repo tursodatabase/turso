@@ -5164,6 +5164,7 @@ impl TryClone for VirtualTable {
             vtab_id: self.vtab_id,
             is_droppable: self.is_droppable,
             innocuous: self.innocuous,
+            columns_with_declared_type: self.columns_with_declared_type.try_clone()?,
         })
     }
 }
@@ -5577,6 +5578,20 @@ impl Table {
             Self::Virtual(_) => false,
             Self::FromClauseSubquery(_) => false,
             Self::RecursiveCteInput(_) => false,
+        }
+    }
+
+    /// Whether column `column` holds only values of its declared type: a
+    /// column of a STRICT table, or of a virtual table whose module says so.
+    pub(crate) fn column_has_declared_type(&self, column: usize) -> bool {
+        match self {
+            Self::BTree(table) => table.is_strict,
+            Self::Virtual(table) => table
+                .columns_with_declared_type
+                .get(column)
+                .copied()
+                .unwrap_or(false),
+            Self::FromClauseSubquery(_) | Self::RecursiveCteInput(_) => false,
         }
     }
 

@@ -213,6 +213,9 @@ pub struct RegisterColumn {
     pub collation: Option<TextCollation>,
     /// The column's declared type, such as `integer[]` or `numeric(10, 2)`.
     pub(crate) column_type: ExprType,
+    /// Whether the register holds only values of `column_type`: a column of a
+    /// STRICT table, or the rowid.
+    pub(crate) has_declared_type: bool,
 }
 
 impl RegisterColumn {
@@ -223,6 +226,7 @@ impl RegisterColumn {
             affinity: column.affinity(),
             collation: crate::translate::collate::column_collation(column),
             column_type: column_type(column, is_strict, schema),
+            has_declared_type: is_strict,
         }
     }
 
@@ -247,6 +251,7 @@ impl RegisterColumn {
             },
             collation: crate::translate::collate::column_collation(column),
             column_type: column_type(column, is_strict, schema),
+            has_declared_type: is_strict,
         }
     }
 
@@ -255,6 +260,7 @@ impl RegisterColumn {
             affinity: Affinity::Integer,
             collation: None,
             column_type: ExprType::Builtin(BuiltinType::Integer),
+            has_declared_type: true,
         }
     }
 }
@@ -315,6 +321,8 @@ pub(crate) struct RowValueSubqueryColumn {
     /// The column's type, which decides custom-type operators: in
     /// `d - (SELECT e FROM u)` with `e` a date, the result is a number of days.
     pub(crate) expr_type: ExprType,
+    /// Whether every value of the column has a declared type.
+    pub(crate) has_declared_type: bool,
 }
 
 impl RowValueSubquery {

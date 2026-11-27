@@ -8131,7 +8131,6 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
-/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (oid and the serial types to INTEGER; numeric and money to REAL; varchar, json and inet to TEXT; every array element type), so the PostgreSQL type is gone before the cast is checked. float4, float8, text and uuid keep their PostgreSQL name, which the cast table of the frontend reads, and the integer types keep the name they are registered with. Once every type is registered, each cast keeps the name of its type and this map goes away.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// A type that the frontend registers, such as boolean, keeps its name, and
 /// so do other names, so that enums and domains resolve to their custom type.
@@ -8140,7 +8139,21 @@ fn pg_type_name_to_ast_type(
 ) -> Result<ast::Type, ParseError> {
     let pg_type = supported_type_name(type_name)?;
     let is_array = !type_name.array_bounds.is_empty();
+    let name = cast_type_name(&pg_type, is_array);
 
+    let array_dimensions = type_name.array_bounds.len() as u32;
+    check_array_dimensions(array_dimensions)?;
+    Ok(ast::Type {
+        name,
+        size: None,
+        array_dimensions,
+    })
+}
+
+/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (oid and the serial types to INTEGER; numeric and money to REAL; varchar, json and inet to TEXT; every array element type), so the PostgreSQL type is gone before the cast is checked. float4, float8, text and uuid keep their PostgreSQL name, which the cast table of the frontend reads, and the integer types keep the name they are registered with. Once every type is registered, each cast keeps the name of its type and this map goes away.
+/// The name that a CAST to the PostgreSQL type `pg_type` gives core, for an
+/// array of it when `is_array`.
+pub fn cast_type_name(pg_type: &str, is_array: bool) -> String {
     let name = match (pg_type.to_uppercase().as_str(), is_array) {
         // The dialect applies the casts to these types, and tells them apart
         // by their PostgreSQL names. An array keeps the SQLite name of its
@@ -8173,16 +8186,9 @@ fn pg_type_name_to_ast_type(
             _,
         ) => "TEXT",
         ("BYTEA" | "BLOB", _) => "BLOB",
-        _ => &pg_type,
+        _ => pg_type,
     };
-
-    let array_dimensions = type_name.array_bounds.len() as u32;
-    check_array_dimensions(array_dimensions)?;
-    Ok(ast::Type {
-        name: name.to_string(),
-        size: None,
-        array_dimensions,
-    })
+    name.to_string()
 }
 
 fn extract_type_name_from_typename(
