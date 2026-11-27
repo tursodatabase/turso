@@ -512,6 +512,11 @@ pub trait Dialect: Send + Sync + 'static {
         &[]
     }
 
+    /// Checks whether this dialect permits ATTACH and DETACH.
+    fn validate_attach(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether `PRAGMA capture_data_changes_conn` may create its change
     /// tables in a database of this dialect.
     ///

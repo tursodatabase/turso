@@ -8,6 +8,11 @@ sidebarTitle: ATTACH DATABASE
 
 The ATTACH DATABASE statement adds another database file to the current connection under a schema name. Once attached, tables in the external database can be queried alongside tables in the main database.
 
+The PostgreSQL frontend does not support ATTACH or DETACH and returns SQLSTATE
+`0A000`, even when the experimental ATTACH option is enabled. PostgreSQL schemas
+live inside one database and do not use attached files. SQLite connections can
+attach compatible SQLite databases; they cannot attach PostgreSQL databases.
+
 ## Syntax
 
 ```sql
