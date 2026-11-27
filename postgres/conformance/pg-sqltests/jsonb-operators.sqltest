@@ -733,6 +733,14 @@ expect {
     {"b": 1}
 }
 
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test jsonb-double-arrow-key-output {
+    SELECT j ->> 'a', j ->> 'n' FROM t WHERE id = 1;
+}
+expect {
+    {"b": 1}|1
+}
+
 # Known differences of @> and <@
 
 # tursopg compares a json or text value as jsonb, where PostgreSQL has @> only
