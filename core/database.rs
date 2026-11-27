@@ -2550,7 +2550,8 @@ impl Database {
                     if open_mv_store {
                         let canonical_path = self.get_database_canonical_path();
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
-                        let log_path = journal_mode::find_logical_log_path(&canonical_path)?;
+                        let log_path =
+                            journal_mode::find_logical_log_path(&*self.io, &canonical_path)?;
                         let mv_store = journal_mode::open_mv_store(
                             self.io.clone(),
                             &log_path,
@@ -2636,7 +2637,7 @@ impl Database {
             self.validate_external_restore_wal(&new_shared_wal.read(), context)?;
         }
         let log_path = if self.mvcc_enabled() {
-            journal_mode::find_logical_log_path(&self.path)?
+            journal_mode::find_logical_log_path(&*self.io, &self.path)?
         } else {
             // A database that is not in MVCC mode has no log with the old name.
             journal_mode::logical_log_path(&self.path)

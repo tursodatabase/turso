@@ -118,7 +118,7 @@ pub fn logical_log_path(db_path: impl AsRef<Path>) -> PathBuf {
 }
 
 /// Returns the path of the MVCC logical log of the database at `db_path`,
-/// which is in MVCC mode.
+/// which is in MVCC mode and whose files `io` opens.
 ///
 /// Older versions named the log `db_path.with_extension("db-log")`. That name
 /// replaces the last extension of the database file, so `app.1`, `app.2` and
@@ -127,13 +127,27 @@ pub fn logical_log_path(db_path: impl AsRef<Path>) -> PathBuf {
 /// exist, the database continues to use the old log until a checkpoint empties
 /// it. If another database file in the directory can also have written the old
 /// log, the log can hold commits of each of them, and this returns an error.
-pub fn find_logical_log_path(db_path: impl AsRef<Path>) -> Result<PathBuf> {
+pub fn find_logical_log_path(io: &dyn IO, db_path: impl AsRef<Path>) -> Result<PathBuf> {
     let db_path = db_path.as_ref();
     let log_path = logical_log_path(db_path);
     let old_log_path = db_path.with_extension("db-log");
+    // The size checks go through `io`, because the files can be in a place
+    // that only `io` can open, such as MemoryIO or the browser storage.
     if old_log_path == log_path
-        || log_path.exists()
-        || !file_has_data(&old_log_path)
+        || io_file_len(io, &old_log_path) == 0
+        || io_file_len(io, &log_path) > 0
+    {
+        return Ok(log_path);
+    }
+    // The checks below read the files directly. If the old log is not in the
+    // OS file system, they cannot run. Also, `io` can show an empty new log
+    // that was not written, because the browser storage creates each file
+    // before the database opens. Then the database uses the old log, as older
+    // versions did.
+    if std::fs::metadata(&old_log_path).is_err() {
+        return Ok(old_log_path);
+    }
+    if log_path.exists()
         || matches!(
             database_file_kind(db_path),
             DatabaseFileKind::NoPage1 | DatabaseFileKind::NotMvcc
@@ -151,6 +165,22 @@ pub fn find_logical_log_path(db_path: impl AsRef<Path>) -> Result<PathBuf> {
         db_path.display(),
         others.join(", "),
     )))
+}
+
+/// Returns the size of the file at `path`, or 0 if the file does not exist.
+fn io_file_len(io: &dyn IO, path: &Path) -> u64 {
+    // Read the size without opening the file when the OS file system has it.
+    // Unix file locks belong to the process, so closing a second descriptor
+    // of the file would release the lock that an open log holds.
+    if let Ok(metadata) = std::fs::metadata(path) {
+        return metadata.len();
+    }
+    let Some(path) = path.to_str() else {
+        return 0;
+    };
+    io.open_file(path, OpenFlags::ReadOnly | OpenFlags::NoLock, false)
+        .and_then(|file| file.size())
+        .unwrap_or(0)
 }
 
 /// Returns true if `path` is a file of one byte or more.

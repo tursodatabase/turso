@@ -1,8 +1,8 @@
 use crate::common::ExecRows;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use turso_core::io::{PlatformIO, IO};
-use turso_core::{ConnectOpts, Connection, Database, SessionRole};
+use turso_core::io::{Buffer, Completion, MemoryIO, PlatformIO, IO};
+use turso_core::{ConnectOpts, Connection, Database, OpenFlags, SessionRole};
 use turso_sqlite::SqliteDialect;
 
 /// Two database files whose names differ only after the last dot must not
@@ -139,6 +139,36 @@ fn test_journal_mode_change_next_to_an_old_log() {
     assert_eq!(with_conn(&one, notes), vec![("app.1".to_string(),)]);
 }
 
+/// A database whose files are not in the OS file system, for example with
+/// MemoryIO or the browser IO, continues to use its log from an older version.
+#[test]
+fn test_database_with_other_io_continues_to_use_its_log_from_an_older_version() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    create_with_old_log(dir.path(), &template, "app.1");
+
+    // This directory does not exist, so the files are only in the MemoryIO.
+    let mem_dir = format!(
+        "not-on-disk-{}",
+        dir.path().file_name().unwrap().to_string_lossy()
+    );
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    for name in ["app.1", "app.1-wal", "app.db-log"] {
+        let from = dir.path().join(name);
+        if from.exists() {
+            copy_into_io(&io, &from, &format!("{mem_dir}/{name}"));
+        }
+    }
+
+    let db = Database::open_file(io, &format!("{mem_dir}/app.1"), Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(notes(&conn), vec![("app.1".to_string(),)]);
+    conn.close().unwrap();
+}
+
 /// Creates an MVCC database at `path` with an empty `notes` table and no
 /// commits in its logical log.
 fn create_template(path: &Path) {
@@ -194,6 +224,23 @@ fn try_open(path: &Path) -> turso_core::Result<Arc<Connection>> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
     db.connect(ConnectOpts::new(SessionRole::Superuser))
+}
+
+/// Writes the content of the file at `from` to a new file at `to` in `io`.
+fn copy_into_io(io: &Arc<dyn IO>, from: &Path, to: &str) {
+    let data = std::fs::read(from).unwrap();
+    let file = io.open_file(to, OpenFlags::Create, false).unwrap();
+    if data.is_empty() {
+        return;
+    }
+    let c = file
+        .pwrite(
+            0,
+            Arc::new(Buffer::new(data)),
+            Completion::new_write(|_| {}),
+        )
+        .unwrap();
+    io.wait_for_completion(c).unwrap();
 }
 
 fn notes(conn: &Arc<Connection>) -> Vec<(String,)> {
