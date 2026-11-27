@@ -960,7 +960,8 @@ impl TursoDatabase {
                     Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
                 IoBackend::Default => match self.config.path.as_str() {
-                    ":memory:" => Arc::new(turso_core::MemoryIO::new()),
+                    // `:model:` is an in-memory database too (`turso_core::is_memory_like`).
+                    ":memory:" | ":model:" => Arc::new(turso_core::MemoryIO::new()),
                     _ => Arc::new(turso_core::PlatformIO::new()?),
                 },
             }

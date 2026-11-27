@@ -105,11 +105,8 @@ use turso_macros::turso_debug_assert;
 
 use crate::pseudo::PseudoCursor;
 
-#[cfg(debug_assertions)]
-use crate::storage::btree::CursorOpcode;
 use crate::storage::btree::{BTreeCursor, BTreeKey};
-#[cfg(debug_assertions)]
-use crate::storage::model::ModelCursor;
+use crate::storage::tree_store::TreeKind;
 
 #[inline]
 fn btree_cursor_with_yield_context(
@@ -1232,6 +1229,31 @@ fn ensure_index_method_context(
     Ok(context)
 }
 
+/// A cursor on the tree `root` of the tree storage of `pager` (`storage::tree_store`). `None`
+/// when the trees of `pager` are B-trees in its pages, and for cursor types that live
+/// elsewhere.
+fn open_tree_store_cursor(
+    pager: &Arc<Pager>,
+    cursor_type: &CursorType,
+    root: i64,
+) -> Result<Option<Cursor>> {
+    let Some(store) = pager.tree_store() else {
+        return Ok(None);
+    };
+    let kind = match cursor_type {
+        CursorType::BTreeTable(table) if table.has_rowid => TreeKind::Table,
+        CursorType::BTreeTable(_) => TreeKind::WithoutRowidTable,
+        CursorType::BTreeIndex(index) => TreeKind::Index(index),
+        CursorType::MaterializedView(..) => {
+            store.check_feature("materialized views")?;
+            return Ok(None);
+        }
+        _ => return Ok(None),
+    };
+    let cursor = store.open_cursor(pager.clone(), root, kind)?;
+    Ok(Some(Cursor::new_btree_dyn(cursor)))
+}
+
 pub fn op_open_read(
     program: &Program,
     state: &mut ProgramState,
@@ -1293,6 +1315,15 @@ pub fn op_open_read(
         CursorType::ViewDelta { table, .. } => table.columns().len(),
         _ => unreachable!("This should not have happened"),
     };
+
+    if let Some(cursor) = open_tree_store_cursor(&pager, cursor_type, *root_page)? {
+        cursors
+            .get_mut(*cursor_id)
+            .expect("cursor_id should be valid")
+            .replace(cursor);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     let maybe_promote_to_mvcc_cursor =
         |btree_cursor: Box<BTreeCursor>, mv_cursor_type: MvccCursorType| -> Result<OpenedBTree> {
@@ -12269,14 +12300,6 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                #[cfg(debug_assertions)]
-                note_cursor_opcode(
-                    state,
-                    *cursor_id,
-                    CursorOpcode::Insert {
-                        require_seek: flag.has(InsertFlags::REQUIRE_SEEK),
-                    },
-                );
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, connection, *cursor_id)?
                 } else {
@@ -12422,23 +12445,19 @@ pub fn op_insert(
                     };
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    let existing_key = return_if_io!(state, cursor.rowid());
-                    if existing_key == Some(key) {
-                        let record = match &state.registers[*record_reg] {
-                            Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                            Register::Value(value) => {
-                                let values = [value];
-                                let record = ImmutableRecord::from_values(values, values.len())?;
-                                std::borrow::Cow::Owned(record)
-                            }
-                            Register::Aggregate(..) => {
-                                unreachable!("Cannot insert an aggregate value.")
-                            }
-                        };
-                        let existing_payload = return_if_io!(state, cursor.record_payload());
-                        if existing_payload.is_some_and(|p| p == record.as_ref().get_payload()) {
-                            state.active_op_state.insert().is_noop_update = true;
+                    let record = match &state.registers[*record_reg] {
+                        Register::Record(r) => std::borrow::Cow::Borrowed(r),
+                        Register::Value(value) => {
+                            let values = [value];
+                            let record = ImmutableRecord::from_values(values, values.len())?;
+                            std::borrow::Cow::Owned(record)
                         }
+                        Register::Aggregate(..) => {
+                            unreachable!("Cannot insert an aggregate value.")
+                        }
+                    };
+                    if return_if_io!(state, cursor.holds_row(key, record.as_ref().get_payload())) {
+                        state.active_op_state.insert().is_noop_update = true;
                     }
                 }
                 state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
@@ -12928,8 +12947,6 @@ pub fn op_idx_delete(
         );
         match state.active_op_state.idx_delete() {
             OpIdxDeleteState::Seeking => {
-                #[cfg(debug_assertions)]
-                note_cursor_opcode(state, *cursor_id, CursorOpcode::IdxDelete);
                 let found = match seek_internal(
                     program,
                     state,
@@ -13057,16 +13074,6 @@ pub fn op_idx_insert(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    #[cfg(debug_assertions)]
-    if *state.active_op_state.idx_insert() == OpIdxInsertState::MaybeSeek {
-        note_cursor_opcode(
-            state,
-            cursor_id,
-            CursorOpcode::IdxInsert {
-                use_seek: flags.has(IdxInsertFlags::USE_SEEK),
-            },
-        );
-    }
     let record_to_insert = match &state.registers[record_reg] {
         Register::Record(ref r) => r,
         o => {
@@ -13256,8 +13263,6 @@ fn new_rowid_inner(
     loop {
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
-                #[cfg(debug_assertions)]
-                note_cursor_opcode(state, *cursor, CursorOpcode::NewRowid);
                 if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
@@ -13295,7 +13300,7 @@ fn new_rowid_inner(
                         // DB cursor without MVCC (e.g., :memory: attached DBs skip MVCC).
                         // Keep the downcast check as a safety net against unexpected cursor types.
                         assert!(
-                            cursor.downcast_ref::<BTreeCursor>().is_some() || is_model(&*cursor),
+                            cursor.downcast_ref::<BTreeCursor>().is_some(),
                             "Expected MvCursor or BTreeCursor in op_new_rowid"
                         );
                         *state.active_op_state.new_rowid() = OpNewRowidState::SeekingToLast {
@@ -13628,8 +13633,6 @@ pub fn op_no_conflict(
                 };
 
                 if contains_nulls {
-                    #[cfg(debug_assertions)]
-                    note_cursor_opcode(state, *cursor_id, CursorOpcode::NoConflictNull);
                     state.pc = target_pc.as_offset_int();
                     state.active_op_state.clear();
                     return Ok(InsnFunctionStepResult::Step);
@@ -13831,7 +13834,17 @@ pub fn op_open_write(
         _ => false,
     };
 
-    if !can_reuse_cursor {
+    let store_cursor = if can_reuse_cursor {
+        None
+    } else {
+        open_tree_store_cursor(&pager, cursor_type, root_page)?
+    };
+    if let Some(cursor) = store_cursor {
+        cursors
+            .get_mut(*cursor_id)
+            .expect("cursor_id should be valid")
+            .replace(cursor);
+    } else if !can_reuse_cursor {
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<OpenedBTree> {
@@ -14029,6 +14042,9 @@ pub fn op_create_btree(
     let pager = connection.get_pager_from_database_index(db)?;
     // FIXME: handle page cache is full
     let root_page = return_if_io!(state, pager.btree_create(flags));
+    if let Some(store) = pager.tree_store() {
+        store.create_tree(root_page as i64);
+    }
     state.registers[*root].set_int(root_page as i64);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14224,6 +14240,9 @@ pub fn op_destroy(
             OpDestroyState::DestroyBtree(ref mut cursor) => {
                 let destroyed = cursor.write().btree_destroy();
                 let maybe_former_root_page = return_if_io!(state, destroyed);
+                if let Some(store) = destroy_pager.tree_store() {
+                    store.destroy_tree(*root);
+                }
                 state.registers[*former_root_reg]
                     .set_int(maybe_former_root_page.unwrap_or(0) as i64);
                 state.active_op_state.clear();
@@ -14294,7 +14313,10 @@ fn op_clear_btree_inner(
             }
             OpClearBtreeState::ClearBtree { pager, cursor } => {
                 let cleared = cursor.write().clear_btree();
-                let removed_entries = return_if_io!(state, cleared);
+                let mut removed_entries = return_if_io!(state, cleared);
+                if let Some(store) = pager.tree_store() {
+                    removed_entries = store.clear_tree(*root);
+                }
                 for other_cursor_opt in state.cursors.iter_mut().flatten() {
                     if let Cursor::BTree(..) | Cursor::Dyn(..) = other_cursor_opt {
                         let btree_cursor = other_cursor_opt.as_btree_mut();
@@ -16376,21 +16398,17 @@ pub fn op_open_ephemeral(
                 *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::ClearExisting;
                 return Ok(InsnFunctionStepResult::Step);
             }
-            #[cfg(debug_assertions)]
-            if connection.model_ephemeral() {
+            if let Some(store) = pager.tree_store() {
                 let (_, cursor_type) = program
                     .cursor_ref
                     .get(cursor_id)
                     .expect("cursor_id should exist in cursor_ref");
-                let cursor = match cursor_type {
-                    CursorType::BTreeTable(_) => ModelCursor::new_table(pager.clone()),
-                    CursorType::BTreeIndex(index) => ModelCursor::new_index(
-                        pager.clone(),
-                        Arc::new(IndexInfo::new_from_index(index)?),
-                    ),
-                    other => panic!("OpenEphemeral on {other:?}"),
+                let kind = match cursor_type {
+                    CursorType::BTreeIndex(index) => TreeKind::Index(index),
+                    _ => TreeKind::Table,
                 };
-                state.cursors[cursor_id] = Some(Cursor::new_btree_dyn(Box::new(cursor)));
+                let cursor = store.open_ephemeral(pager.clone(), kind)?;
+                state.cursors[cursor_id] = Some(Cursor::new_btree_dyn(cursor));
                 state.pc += 1;
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
@@ -16581,10 +16599,8 @@ pub fn op_open_dup(
     let original_cursor = state.get_cursor(*original_cursor_id);
     let original_cursor = original_cursor.as_btree_mut();
 
-    #[cfg(debug_assertions)]
-    if let Some(model) = (original_cursor as &mut dyn Any).downcast_mut::<ModelCursor>() {
-        let cursor = Cursor::new_btree_dyn(Box::new(model.dup()));
-        state.cursors[*new_cursor_id] = Some(cursor);
+    if let Some(cursor) = original_cursor.duplicate() {
+        state.cursors[*new_cursor_id] = Some(Cursor::new_btree_dyn(cursor));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -16717,25 +16733,6 @@ pub fn op_reset_once(
     state.once.retain(|pc| *pc <= start || *pc >= end);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
-}
-
-/// Debug builds: tell a cursor behind a trait object which opcode calls it next.
-#[cfg(debug_assertions)]
-fn note_cursor_opcode(state: &mut ProgramState, cursor_id: usize, op: CursorOpcode) {
-    if let Some(Some(Cursor::Dyn(cursor, _))) = state.cursors.get_mut(cursor_id) {
-        cursor.note_opcode(op);
-    }
-}
-
-/// True for a cursor of the model storage (debug builds).
-fn is_model(cursor: &dyn Any) -> bool {
-    #[cfg(debug_assertions)]
-    return cursor.is::<ModelCursor>();
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = cursor;
-        false
-    }
 }
 
 pub fn op_found(

@@ -448,9 +448,6 @@ pub struct Connection {
     /// when the transaction ends, so it is safe to use for BEGIN READ ONLY.
     pub(super) tx_read_only: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
-    /// Debug builds: open ephemeral trees on the model storage (`storage::model`).
-    #[cfg(debug_assertions)]
-    pub(super) model_ephemeral: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
     /// PRAGMA count_changes: when ON, each INSERT, UPDATE and DELETE returns
@@ -3576,18 +3573,6 @@ impl Connection {
 
     pub fn get_vdbe_trace(&self) -> bool {
         self.vdbe_trace.load(Ordering::SeqCst)
-    }
-
-    /// Debug builds: open the ephemeral trees of later statements on the model storage.
-    /// The default comes from `TURSO_MODEL_EPHEMERAL=1`.
-    #[cfg(debug_assertions)]
-    pub fn set_model_ephemeral(&self, value: bool) {
-        self.model_ephemeral.store(value, Ordering::Relaxed);
-    }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn model_ephemeral(&self) -> bool {
-        self.model_ephemeral.load(Ordering::Relaxed)
     }
 
     pub fn get_dml_require_where(&self) -> bool {

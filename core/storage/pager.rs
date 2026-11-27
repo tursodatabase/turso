@@ -6,6 +6,7 @@ use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
+use crate::storage::tree_store::{SavedTrees, TreeStore};
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
 use crate::storage::{
     buffer_pool::BufferPool,
@@ -1491,6 +1492,7 @@ struct SavepointSnapshot {
     db_size: u32,
     wal_pos: Option<SavepointWalPos>,
     deferred_fk_violations: isize,
+    trees: Option<SavedTrees>,
 }
 
 struct Savepoint {
@@ -1513,6 +1515,8 @@ struct Savepoint {
     wal_pos: RwLock<Option<SavepointWalPos>>,
     /// Deferred FK counter value at the start of this savepoint.
     deferred_fk_violations: AtomicIsize,
+    /// The trees at the start of this savepoint, when a tree storage holds them.
+    trees: Option<SavedTrees>,
 }
 
 impl Savepoint {
@@ -1531,6 +1535,7 @@ impl Savepoint {
             db_size: AtomicU32::new(db_size),
             wal_pos: RwLock::new(wal_pos),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
+            trees: None,
         }
     }
 
@@ -1561,6 +1566,7 @@ impl Savepoint {
             db_size: self.db_size.load(Ordering::Acquire),
             wal_pos: *self.wal_pos.read(),
             deferred_fk_violations: self.deferred_fk_violations.load(Ordering::Acquire),
+            trees: self.trees.clone(),
         }
     }
 
@@ -1573,6 +1579,7 @@ impl Savepoint {
             db_size: AtomicU32::new(snapshot.db_size),
             wal_pos: RwLock::new(snapshot.wal_pos),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
+            trees: snapshot.trees,
         }
     }
 }
@@ -1778,6 +1785,10 @@ pub struct Pager {
     /// The boxes are the point: each one is a cursor-sized allocation.
     #[allow(clippy::vec_box)]
     cursor_allocations: Mutex<Vec<Box<std::mem::MaybeUninit<crate::storage::btree::BTreeCursor>>>>,
+    /// Where the trees live when they are not B-trees in the pages of this pager
+    /// (`storage::tree_store`). `None` for every pager but the main pager of a database that
+    /// has a tree storage.
+    tree_store: Option<Arc<dyn TreeStore>>,
 }
 
 /// Retired record buffers kept per pager. Each holds a page-sized allocation.
@@ -2010,6 +2021,16 @@ pub struct CollectingState {
 }
 
 impl Pager {
+    /// The tree storage of this pager, if its trees are not B-trees in its pages.
+    #[inline]
+    pub fn tree_store(&self) -> Option<&Arc<dyn TreeStore>> {
+        self.tree_store.as_ref()
+    }
+
+    pub(crate) fn set_tree_store(&mut self, store: Arc<dyn TreeStore>) {
+        self.tree_store = Some(store);
+    }
+
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Arc<dyn Wal>>,
@@ -2075,6 +2096,7 @@ impl Pager {
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
             record_pool: Mutex::new(Vec::new()),
             cursor_allocations: Mutex::new(Vec::new()),
+            tree_store: None,
         })
     }
 
@@ -2613,13 +2635,14 @@ impl Pager {
                 checksum: wal.get_last_checksum(),
                 checkpoint_seq: wal.get_checkpoint_seq(),
             });
-        let savepoint = Savepoint::new(
+        let mut savepoint = Savepoint::new(
             kind,
             subjournal_offset,
             db_size,
             wal_pos,
             deferred_fk_violations,
         );
+        savepoint.trees = self.tree_store.as_ref().map(|store| store.save());
         self.savepoints.write().push(savepoint);
         Ok(())
     }
@@ -2644,6 +2667,9 @@ impl Pager {
         journal_end_offset: u64,
     ) -> Result<()> {
         self.reset_internal_states();
+        if let (Some(store), Some(trees)) = (&self.tree_store, &savepoint.trees) {
+            store.restore(trees);
+        }
 
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
@@ -3427,6 +3453,9 @@ impl Pager {
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn begin_read_tx(&self) -> Result<()> {
+        if let Some(store) = &self.tree_store {
+            store.begin_read();
+        }
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
@@ -3481,9 +3510,15 @@ impl Pager {
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
+            if let Some(store) = &self.tree_store {
+                store.begin_write();
+            }
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
+        if let Some(store) = &self.tree_store {
+            store.begin_write();
+        }
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
@@ -3553,6 +3588,9 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             self.clear_savepoints()?;
+            if let Some(store) = &self.tree_store {
+                store.commit();
+            }
             return Ok(IOResult::Done(()));
         };
 
@@ -3605,6 +3643,9 @@ impl Pager {
 
                     wal.end_write_tx();
                     wal.end_read_tx();
+                    if let Some(store) = &self.tree_store {
+                        store.commit();
+                    }
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
@@ -3640,6 +3681,9 @@ impl Pager {
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            if let Some(store) = &self.tree_store {
+                store.rollback();
+            }
             return;
         };
         let (is_write, schema_did_change) = match connection.get_tx_state() {
@@ -3673,6 +3717,9 @@ impl Pager {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn end_read_tx(&self) {
+        if let Some(store) = &self.tree_store {
+            store.end_read();
+        }
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -6309,6 +6356,9 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
+        if let Some(store) = &self.tree_store {
+            store.rollback();
+        }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
                 wal.rollback(None);

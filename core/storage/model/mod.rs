@@ -2,21 +2,15 @@
 //! (`tests/integration/cursor_contract/SPEC.md`). It is the spec in code, an oracle for SQL
 //! results, and a checker that panics with `unsupported: U<n>: ...` on an Undefined sequence.
 //!
-//! It exists only in debug builds. With `TURSO_MODEL_EPHEMERAL=1`, new connections open their
-//! ephemeral trees (`OpenEphemeral`, `OpenAutoindex`, `OpenDup`) on it.
+//! It exists only in debug builds. A database opened at the path `:model:` keeps all its
+//! trees here (`ModelStorage`, through the `TreeStorage` seam of `storage::tree_store`).
 
 mod cursor;
 pub mod spec;
+mod store;
 
 pub use cursor::ModelCursor;
-
-use crate::sync::OnceLock;
-
-/// The default of the per-connection flag that opens ephemeral trees on the model.
-pub fn ephemeral_default() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TURSO_MODEL_EPHEMERAL").is_ok_and(|v| v == "1"))
-}
+pub use store::ModelStorage;
 
 /// Counters that show how much of the model a run used. A process that opened a model tree
 /// prints them to stderr when it exits.
@@ -28,6 +22,7 @@ mod stats {
     static TABLES: AtomicU64 = AtomicU64::new(0);
     static INDEXES: AtomicU64 = AtomicU64::new(0);
     static DUPS: AtomicU64 = AtomicU64::new(0);
+    static CURSORS: AtomicU64 = AtomicU64::new(0);
     static STEPS: LazyLock<Mutex<BTreeMap<&'static str, u64>>> =
         LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
@@ -35,6 +30,11 @@ mod stats {
         report_at_exit();
         let counter = if index { &INDEXES } else { &TABLES };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn cursor_opened() {
+        report_at_exit();
+        CURSORS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn dup_opened() {
@@ -53,9 +53,11 @@ mod stats {
             .map(|(name, n)| format!("{name}={n}"))
             .collect();
         format!(
-            "model storage: {} table trees, {} index trees, {} OpenDup cursors; steps: {}",
+            "model storage: {} ephemeral table trees, {} ephemeral index trees, {} cursors on \
+             database trees, {} OpenDup cursors; steps: {}",
             TABLES.load(Ordering::Relaxed),
             INDEXES.load(Ordering::Relaxed),
+            CURSORS.load(Ordering::Relaxed),
             DUPS.load(Ordering::Relaxed),
             steps.join(" "),
         )

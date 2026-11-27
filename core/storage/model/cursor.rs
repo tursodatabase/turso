@@ -1,14 +1,16 @@
 //! `ModelCursor`: a `CursorTrait` implementation that keeps the tree in memory and runs each
 //! opcode through the spec layer (`spec.rs`). It does no I/O.
 //!
-//! The VDBE calls the cursor at a finer grain than the contract: one opcode can make several
-//! calls (`IdxInsert` seeks, reads and inserts). `note_opcode` tells the cursor which opcode
-//! starts. The calls inside that opcode are answered from the tree without a spec step, and
-//! the opcode is one spec step when it ends.
+//! The VDBE calls the cursor at a finer grain than the contract, and some opcodes make the
+//! same calls. The cursor infers the opcode from the call pattern: `seek_to_last` starts a
+//! `NewRowid` (its `rowid` and `next` are part of it), an eq-only `SeekGE` on an index is a
+//! `Found`, and an `Insert` or `IdxInsert` that does not seek uses the seek token of the last
+//! move. Facts that no call shows are listed in SPEC section 2e.
 
 use super::spec::{self, Outcome, Pos, Tree, Write};
 use super::stats;
-use crate::storage::btree::{BTreeKey, CursorOpcode, CursorStep, CursorTrait};
+use super::store::ConnTrees;
+use crate::storage::btree::{BTreeKey, CursorStep, CursorTrait};
 use crate::storage::pager::Pager;
 use crate::sync::{Arc, RwLock};
 use crate::types::{
@@ -21,7 +23,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 
 /// The key of an entry: the rowid of a table row, or the whole record of an index entry.
 /// A seek key of an index is a record too, and can be shorter than an entry.
@@ -45,252 +47,64 @@ impl fmt::Debug for Key {
 }
 
 /// The entries of a tree. An index keeps its records sorted with the compare of the B-tree.
-enum Rows {
+#[derive(Clone)]
+pub(super) enum Rows {
     Table(BTreeMap<i64, ImmutableRecord>),
     Index(Arc<IndexInfo>, Vec<ImmutableRecord>),
 }
 
-/// A tree that a cursor and its `OpenDup` copies share.
-struct SharedTree {
-    rows: Rows,
-    /// Goes up by one at each write. A cursor that saw an older value must catch up.
+/// A tree and its write counter.
+#[derive(Clone)]
+pub(super) struct SharedTree {
+    pub(super) rows: Rows,
+    /// Changes at each write. A cursor that saw another value must catch up.
     version: u64,
     /// The version of the last clear, or 0.
     last_clear: u64,
 }
 
-type Shape = spec::Shape<Key, Key>;
-type Op = spec::Op<Key, Key>;
-
-/// What the cursor knows about the opcode that runs now.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Pending {
-    None,
-    /// `NewRowid`: it reads the last rowid with `seek_to_last`, `rowid` and `next`.
-    NewRowid,
-    Insert {
-        use_seek: bool,
-    },
-    IdxInsert {
-        use_seek: bool,
-    },
-    IdxDelete,
-}
-
-impl Pending {
-    /// The cursor calls of these opcodes are not opcodes of their own.
-    fn is_internal(self) -> bool {
-        self != Pending::None
-    }
-}
-
-/// The fake root pages of model trees. They are far above the page numbers of real trees.
-static NEXT_ROOT: AtomicI64 = AtomicI64::new(1 << 40);
-
-/// How many ops a panic message lists.
-const RECENT: usize = 12;
-
-pub struct ModelCursor {
-    tree: Arc<RwLock<SharedTree>>,
-    info: Option<Arc<IndexInfo>>,
-    root: i64,
-    /// The tree version after the last op of this cursor.
-    seen: u64,
-    shape: Shape,
-    pending: Pending,
-    /// Where the calls inside a pending opcode put the cursor.
-    scratch: Option<Key>,
-    /// The record that `record` returned.
-    record: Option<ImmutableRecord>,
-    /// The main pager of the connection. Only `ClearBtree` asks for it.
-    pager: Arc<Pager>,
-    recent: VecDeque<&'static str>,
-}
-
-impl ModelCursor {
-    pub fn new_table(pager: Arc<Pager>) -> Self {
-        stats::tree_opened(false);
-        Self::open(pager, None, Rows::Table(BTreeMap::new()))
-    }
-
-    pub fn new_index(pager: Arc<Pager>, info: Arc<IndexInfo>) -> Self {
-        stats::tree_opened(true);
-        Self::open(pager, Some(info.clone()), Rows::Index(info, Vec::new()))
-    }
-
-    /// A second cursor on the same tree (`OpenDup`).
-    pub fn dup(&self) -> Self {
-        stats::dup_opened();
-        let version = self.tree.read().version;
-        Self {
-            tree: self.tree.clone(),
-            info: self.info.clone(),
-            root: self.root,
-            seen: version,
-            shape: Shape::fresh(),
-            pending: Pending::None,
-            scratch: None,
-            record: None,
-            pager: self.pager.clone(),
-            recent: VecDeque::new(),
-        }
-    }
-
-    fn open(pager: Arc<Pager>, info: Option<Arc<IndexInfo>>, rows: Rows) -> Self {
-        let root = NEXT_ROOT.fetch_add(1, AtomicOrdering::Relaxed);
-        let tree = SharedTree {
-            rows,
-            version: 0,
-            last_clear: 0,
-        };
-        Self {
-            tree: Arc::new(RwLock::new(tree)),
-            info,
-            root,
-            seen: 0,
-            shape: Shape::fresh(),
-            pending: Pending::None,
-            scratch: None,
-            record: None,
-            pager,
-            recent: VecDeque::new(),
-        }
-    }
-
-    /// One spec step. An illegal op panics with `unsupported: U<n>: ...`.
-    fn run(&mut self, op: Op, value: Option<&ImmutableRecord>) -> bool {
-        self.catch_up();
-        stats::step(op.name());
-        if self.recent.len() == RECENT {
-            self.recent.pop_front();
-        }
-        self.recent.push_back(op.name());
-        let result = spec::step(&self.tree.read().rows, &self.shape, &op);
-        let Outcome { shape, hit, write } = match result {
-            Ok(outcome) => outcome,
-            Err(e) => panic!(
-                "unsupported: {}: {} (ephemeral {}, root {}, op {op:?}, shape {:?}, recent ops: {})",
-                e.rule,
-                e.why,
-                if self.info.is_some() { "index" } else { "table" },
-                self.root,
-                self.shape,
-                Vec::from(self.recent.clone()).join(" "),
-            ),
-        };
-        if let Some(w) = write {
-            let mut tree = self.tree.write();
-            tree.apply(w, value);
-            self.seen = tree.version;
-        }
-        self.shape = shape;
-        self.record = None;
-        hit
-    }
-
-    /// After writes by other cursors the cursor keeps its position by key, or is at the end
-    /// after a clear (`spec::after_peer_write`).
-    fn catch_up(&mut self) {
-        let tree = self.tree.read();
-        if self.seen == tree.version {
-            return;
-        }
-        let cleared = tree.last_clear > self.seen;
-        self.shape = spec::after_peer_write(&tree.rows, &self.shape, cleared);
-        self.seen = tree.version;
-        self.record = None;
-    }
-
-    /// The opcode noted before ended without the call that finishes it: an `IdxInsert` that
-    /// found a duplicate, an `IdxDelete` that found no key, an `Insert` that saw the same bytes.
-    fn finish_pending(&mut self) {
-        let pending = std::mem::replace(&mut self.pending, Pending::None);
-        let scratch = self.scratch.take();
-        match pending {
-            Pending::None | Pending::NewRowid => {}
-            Pending::IdxInsert { .. } => {
-                self.run(Op::InsertNoop, None);
-            }
-            Pending::IdxDelete => {
-                self.run(
-                    Op::IdxDelete {
-                        key: None,
-                        must_exist: false,
-                    },
-                    None,
-                );
-            }
-            Pending::Insert { use_seek } => {
-                // The no-op check of an UPDATE found the same bytes and skipped the write.
-                self.catch_up();
-                match scratch.or_else(|| self.entry()) {
-                    Some(key) => self.run(Op::Insert { key, use_seek }, None),
-                    None => self.run(Op::InsertNoop, None),
-                };
-            }
-        }
-    }
-
-    /// The key under the cursor, if a read gives an entry.
-    fn entry(&self) -> Option<Key> {
-        match &self.shape.pos {
-            Pos::At(k) if self.shape.on_entry() => Some(k.clone()),
-            _ => None,
-        }
-    }
-
-    /// A read. Inside an opcode it reads where the opcode's own seek went.
-    fn read_entry(&mut self) -> Option<Key> {
-        self.catch_up();
-        if self.pending.is_internal() {
-            return self.scratch.clone().or_else(|| self.entry());
-        }
-        self.finish_pending();
-        self.run(Op::Read, None);
-        self.entry()
-    }
-
-    fn seek_key(&mut self, key: Key, op: SeekOp) -> SeekResult {
-        self.catch_up();
-        let hit = match self.pending {
-            p if p.is_internal() => {
-                self.scratch = self.tree.read().rows.seek(&key, op);
-                self.scratch.is_some()
-            }
-            // On an index an eq-only `SeekGE` is also the seek of `Found`, `NotFound` and
-            // `NoConflict`: the model cannot tell them apart, so it gives every such seek the
-            // rules of `Found`.
-            _ if matches!(key, Key::Record(_)) && op == (SeekOp::GE { eq_only: true }) => {
-                self.run(Op::Found(key), None)
-            }
-            _ => self.run(Op::Seek(key, op), None),
-        };
-        if hit {
-            SeekResult::Found
-        } else {
-            SeekResult::NotFound
-        }
-    }
-
-    /// `Next` and `Prev` as one opcode.
-    fn advance(&mut self, op: Op) -> CursorStep {
-        self.finish_pending();
-        self.run(op, None);
-        if self.shape.on_entry() {
-            CursorStep::Row
-        } else {
-            CursorStep::Empty
-        }
-    }
-
-    fn is_current(&self) -> bool {
-        self.seen == self.tree.read().version
-    }
-}
-
 impl SharedTree {
+    pub(super) fn new(info: Option<Arc<IndexInfo>>) -> Self {
+        let rows = match info {
+            Some(info) => Rows::Index(info, Vec::new()),
+            None => Rows::Table(BTreeMap::new()),
+        };
+        Self {
+            rows,
+            version: next_version(),
+            last_clear: 0,
+        }
+    }
+
+    /// A tree that does not exist yet: it reads as empty, and its version never changes.
+    pub(super) fn missing(info: Option<Arc<IndexInfo>>) -> Self {
+        Self {
+            version: 0,
+            ..Self::new(info)
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        match &self.rows {
+            Rows::Table(map) => map.len(),
+            Rows::Index(_, rows) => rows.len(),
+        }
+    }
+
+    /// True when the tree holds index records exactly when a cursor with `info` expects them.
+    pub(super) fn fits(&self, info: &Option<Arc<IndexInfo>>) -> bool {
+        matches!(
+            (&self.rows, info),
+            (Rows::Table(_), None) | (Rows::Index(..), Some(_))
+        )
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.apply(Write::Clear, None);
+    }
+
     fn apply(&mut self, w: Write<Key>, value: Option<&ImmutableRecord>) {
-        self.version += 1;
+        self.version = next_version();
         if matches!(w, Write::Clear) {
             self.last_clear = self.version;
         }
@@ -318,6 +132,245 @@ impl SharedTree {
             (Rows::Table(map), Write::Clear) => map.clear(),
             (Rows::Index(_, rows), Write::Clear) => rows.clear(),
             (_, w) => unreachable!("model: write {w:?} does not fit the tree"),
+        }
+    }
+}
+
+/// Versions come from one counter, so a tree that a savepoint rollback puts back never has
+/// the version that a cursor saw last.
+fn next_version() -> u64 {
+    static VERSION: AtomicU64 = AtomicU64::new(1);
+    VERSION.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// Where a cursor finds its tree.
+#[derive(Clone)]
+enum TreeRef {
+    /// An ephemeral tree: the cursor and its `OpenDup` copies share it.
+    Own(Arc<RwLock<SharedTree>>),
+    /// A tree of the database, looked up by root in the version the connection sees now.
+    Db { trees: Arc<ConnTrees>, root: i64 },
+}
+
+impl TreeRef {
+    fn read<R>(&self, info: &Option<Arc<IndexInfo>>, f: impl FnOnce(&SharedTree) -> R) -> R {
+        match self {
+            TreeRef::Own(tree) => f(&tree.read()),
+            TreeRef::Db { trees, root } => trees.read_tree(*root, info, f),
+        }
+    }
+
+    fn write<R>(&self, info: &Option<Arc<IndexInfo>>, f: impl FnOnce(&mut SharedTree) -> R) -> R {
+        match self {
+            TreeRef::Own(tree) => f(&mut tree.write()),
+            TreeRef::Db { trees, root } => trees.write_tree(*root, info, f),
+        }
+    }
+}
+
+type Shape = spec::Shape<Key, Key>;
+type Op = spec::Op<Key, Key>;
+
+/// The fake root pages of ephemeral trees. They are far above the page numbers of real trees.
+static NEXT_ROOT: AtomicI64 = AtomicI64::new(1 << 40);
+
+/// How many ops a panic message lists.
+const RECENT: usize = 12;
+
+pub struct ModelCursor {
+    tree: TreeRef,
+    info: Option<Arc<IndexInfo>>,
+    root: i64,
+    /// The tree version after the last op of this cursor.
+    seen: u64,
+    shape: Shape,
+    /// A `NewRowid` runs: `seek_to_last` started it, `next` or a missed seek ends it.
+    in_new_rowid: bool,
+    /// Where the calls inside `NewRowid` put the cursor.
+    scratch: Option<Key>,
+    /// The record that `record` returned.
+    record: Option<ImmutableRecord>,
+    /// The main pager of the connection. Only `ClearBtree` asks for it.
+    pager: Arc<Pager>,
+    recent: VecDeque<&'static str>,
+}
+
+impl ModelCursor {
+    /// A cursor on a new ephemeral tree.
+    pub fn ephemeral(pager: Arc<Pager>, info: Option<Arc<IndexInfo>>) -> Self {
+        stats::tree_opened(info.is_some());
+        let tree = TreeRef::Own(Arc::new(RwLock::new(SharedTree::new(info.clone()))));
+        let root = NEXT_ROOT.fetch_add(1, AtomicOrdering::Relaxed);
+        Self::open(pager, tree, root, info)
+    }
+
+    /// A cursor on the tree `root` of a database.
+    pub(super) fn on_tree(
+        pager: Arc<Pager>,
+        trees: Arc<ConnTrees>,
+        root: i64,
+        info: Option<Arc<IndexInfo>>,
+    ) -> Self {
+        stats::cursor_opened();
+        Self::open(pager, TreeRef::Db { trees, root }, root, info)
+    }
+
+    fn open(pager: Arc<Pager>, tree: TreeRef, root: i64, info: Option<Arc<IndexInfo>>) -> Self {
+        let seen = tree.read(&info, |t| t.version);
+        Self {
+            tree,
+            info,
+            root,
+            seen,
+            shape: Shape::fresh(),
+            in_new_rowid: false,
+            scratch: None,
+            record: None,
+            pager,
+            recent: VecDeque::new(),
+        }
+    }
+
+    /// One spec step. An illegal op panics with `unsupported: U<n>: ...`.
+    fn run(&mut self, op: Op, value: Option<&ImmutableRecord>) -> bool {
+        self.catch_up();
+        stats::step(op.name());
+        if self.recent.len() == RECENT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(op.name());
+        let shape = &self.shape;
+        let result = self
+            .tree
+            .read(&self.info, |t| spec::step(&t.rows, shape, &op));
+        let Outcome { shape, hit, write } = match result {
+            Ok(outcome) => outcome,
+            Err(e) => panic!(
+                "unsupported: {}: {} ({}, root {}, op {op:?}, shape {:?}, recent ops: {})",
+                e.rule,
+                e.why,
+                match (&self.tree, &self.info) {
+                    (TreeRef::Own(_), Some(_)) => "ephemeral index",
+                    (TreeRef::Own(_), None) => "ephemeral table",
+                    (TreeRef::Db { .. }, Some(_)) => "index",
+                    (TreeRef::Db { .. }, None) => "table",
+                },
+                self.root,
+                self.shape,
+                Vec::from(self.recent.clone()).join(" "),
+            ),
+        };
+        if let Some(w) = write {
+            self.seen = self.tree.write(&self.info, |t| {
+                t.apply(w, value);
+                t.version
+            });
+        }
+        self.shape = shape;
+        self.record = None;
+        hit
+    }
+
+    /// After writes by other cursors the cursor keeps its position by key, or is at the end
+    /// after a clear (`spec::after_peer_write`).
+    fn catch_up(&mut self) {
+        let seen = self.seen;
+        let shape = &self.shape;
+        let caught = self.tree.read(&self.info, |t| {
+            (t.version != seen).then(|| {
+                let cleared = t.last_clear > seen;
+                (spec::after_peer_write(&t.rows, shape, cleared), t.version)
+            })
+        });
+        if let Some((shape, version)) = caught {
+            self.shape = shape;
+            self.seen = version;
+            self.record = None;
+        }
+    }
+
+    /// Ends a `NewRowid` whose last call (`next`) did not come.
+    fn finish_new_rowid(&mut self) {
+        self.in_new_rowid = false;
+        self.scratch = None;
+    }
+
+    /// The key under the cursor, if a read gives an entry.
+    fn entry(&self) -> Option<Key> {
+        match &self.shape.pos {
+            Pos::At(k) if self.shape.on_entry() => Some(k.clone()),
+            _ => None,
+        }
+    }
+
+    /// A read. Inside `NewRowid` it reads the last entry.
+    fn read_entry(&mut self) -> Option<Key> {
+        self.catch_up();
+        if self.in_new_rowid {
+            return self.scratch.clone();
+        }
+        self.run(Op::Read, None);
+        self.entry()
+    }
+
+    /// The stored record of `key`.
+    fn load(&self, key: &Key) -> Option<ImmutableRecord> {
+        self.tree.read(&self.info, |t| match (&t.rows, key) {
+            (Rows::Table(map), Key::Rowid(r)) => map.get(r).cloned(),
+            (Rows::Index(info, rows), Key::Record(k)) => rows
+                .iter()
+                .find(|s| cmp(info, s, k, Ordering::Equal).is_eq())
+                .cloned(),
+            _ => unreachable!("model: key and tree differ"),
+        })
+    }
+
+    fn seek_key(&mut self, key: Key, op: SeekOp) -> SeekResult {
+        self.catch_up();
+        let hit = if self.in_new_rowid {
+            // `NewRowid` looks for a free random rowid.
+            let found = self.tree.read(&self.info, |t| t.rows.seek(&key, op));
+            if found.is_none() {
+                self.finish_new_rowid();
+            }
+            found.is_some()
+        } else if matches!(key, Key::Record(_)) && op == (SeekOp::GE { eq_only: true }) {
+            // On an index an eq-only `SeekGE` is also the seek of `Found`, `NotFound`,
+            // `NoConflict`, `IdxInsert` and `IdxDelete`: they all get the rules of `Found`.
+            self.run(Op::Found(key), None)
+        } else {
+            self.run(Op::Seek(key, op), None)
+        };
+        if hit {
+            SeekResult::Found
+        } else {
+            SeekResult::NotFound
+        }
+    }
+
+    /// `Next` and `Prev` as one opcode.
+    fn advance(&mut self, op: Op) -> CursorStep {
+        self.finish_new_rowid();
+        self.run(op, None);
+        if self.shape.on_entry() {
+            CursorStep::Row
+        } else {
+            CursorStep::Empty
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        self.seen == self.tree.read(&self.info, |t| t.version)
+    }
+
+    fn rowid_of_key(&self, key: Key) -> Option<i64> {
+        match key {
+            Key::Rowid(r) => Some(r),
+            Key::Record(_) if !self.has_rowid() => None,
+            Key::Record(rec) => match rec.last_value() {
+                Some(Ok(ValueRef::Numeric(Numeric::Integer(r)))) => Some(r),
+                other => panic!("model: an index entry ends with {other:?}, not a rowid"),
+            },
         }
     }
 }
@@ -472,16 +525,15 @@ fn copy_record(payload: &[u8]) -> ImmutableRecord {
 
 impl CursorTrait for ModelCursor {
     fn last(&mut self) -> IOResultOr<()> {
-        self.finish_pending();
+        self.finish_new_rowid();
         self.run(Op::Last, None);
         Ok(IOResult::Done(()))
     }
 
     fn next(&mut self) -> IOResultOr<()> {
-        if self.pending == Pending::NewRowid {
+        if self.in_new_rowid {
             // The last call of `NewRowid`.
-            self.pending = Pending::None;
-            self.scratch = None;
+            self.finish_new_rowid();
             return Ok(IOResult::Done(()));
         }
         let _ = self.advance(Op::Next);
@@ -505,31 +557,29 @@ impl CursorTrait for ModelCursor {
         let Some(key) = self.read_entry() else {
             return Ok(IOResult::Done(None));
         };
-        let rowid = match key {
-            Key::Rowid(r) => Some(r),
-            Key::Record(_) if !self.has_rowid() => None,
-            Key::Record(rec) => match rec.last_value() {
-                Some(Ok(ValueRef::Numeric(Numeric::Integer(r)))) => Some(r),
-                other => panic!("model: an index entry ends with {other:?}, not a rowid"),
-            },
-        };
-        Ok(IOResult::Done(rowid))
+        Ok(IOResult::Done(self.rowid_of_key(key)))
     }
 
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
-        let record = self.read_entry().and_then(|key| {
-            let tree = self.tree.read();
-            match (&tree.rows, key) {
-                (Rows::Table(map), Key::Rowid(r)) => map.get(&r).cloned(),
-                (Rows::Index(info, rows), Key::Record(k)) => rows
-                    .iter()
-                    .find(|s| cmp(info, s, &k, Ordering::Equal).is_eq())
-                    .cloned(),
-                _ => unreachable!("model: key and tree differ"),
-            }
-        });
+        let record = self.read_entry().and_then(|key| self.load(&key));
         self.record = record;
         Ok(IOResult::Done(self.record.as_ref()))
+    }
+
+    fn holds_row(&mut self, rowid: i64, payload: &[u8]) -> IOResultOr<bool> {
+        // Part of `Insert`: it asks before it writes, also when the cursor is in the gap of
+        // its own `Delete`. It is not a read of the contract.
+        self.catch_up();
+        let Some(key) = self.entry() else {
+            return Ok(IOResult::Done(false));
+        };
+        if key != Key::Rowid(rowid) {
+            return Ok(IOResult::Done(false));
+        }
+        let same = self
+            .load(&key)
+            .is_some_and(|stored| stored.get_payload() == payload);
+        Ok(IOResult::Done(same))
     }
 
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
@@ -553,39 +603,28 @@ impl CursorTrait for ModelCursor {
                 (Key::Record(rec.clone()), Some(rec))
             }
         };
-        self.catch_up();
-        let use_seek = match self.pending {
-            Pending::Insert { use_seek } | Pending::IdxInsert { use_seek } => use_seek,
-            _ => true,
-        };
-        self.pending = Pending::None;
-        self.scratch = None;
-        self.run(Op::Insert { key, use_seek }, value.as_ref());
+        self.finish_new_rowid();
+        // An opcode that seeks made the seek call already, so an insert always checks the
+        // seek token of the last move.
+        self.run(
+            Op::Insert {
+                key,
+                use_seek: true,
+            },
+            value.as_ref(),
+        );
         Ok(IOResult::Done(()))
     }
 
     fn delete(&mut self) -> IOResultOr<()> {
-        self.catch_up();
-        if self.pending == Pending::IdxDelete {
-            self.pending = Pending::None;
-            let key = self.scratch.take();
-            self.run(
-                Op::IdxDelete {
-                    key,
-                    must_exist: false,
-                },
-                None,
-            );
-        } else {
-            self.finish_pending();
-            self.run(Op::Delete, None);
-        }
+        self.finish_new_rowid();
+        self.run(Op::Delete, None);
         Ok(IOResult::Done(()))
     }
 
     fn set_null_flag(&mut self, flag: bool) {
         if flag {
-            self.finish_pending();
+            self.finish_new_rowid();
             self.run(Op::NullRow, None);
         } else {
             self.catch_up();
@@ -606,25 +645,22 @@ impl CursorTrait for ModelCursor {
     }
 
     fn clear_btree(&mut self) -> IOResultOr<u64> {
-        self.finish_pending();
-        let n = match &self.tree.read().rows {
-            Rows::Table(map) => map.len(),
-            Rows::Index(_, rows) => rows.len(),
-        };
+        self.finish_new_rowid();
+        let n = self.tree.read(&self.info, |t| t.len());
         self.run(Op::Clear, None);
         Ok(IOResult::Done(n as u64))
     }
 
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
-        panic!("unsupported: Destroy of a model tree (root {})", self.root)
+        panic!(
+            "unsupported in model storage: Destroy through a cursor (root {})",
+            self.root
+        )
     }
 
     fn count(&mut self) -> IOResultOr<usize> {
-        self.finish_pending();
-        let n = match &self.tree.read().rows {
-            Rows::Table(map) => map.len(),
-            Rows::Index(_, rows) => rows.len(),
-        };
+        self.finish_new_rowid();
+        let n = self.tree.read(&self.info, |t| t.len());
         self.run(Op::Count, None);
         Ok(IOResult::Done(n))
     }
@@ -638,13 +674,13 @@ impl CursorTrait for ModelCursor {
     }
 
     fn rewind(&mut self) -> IOResultOr<()> {
-        self.finish_pending();
+        self.finish_new_rowid();
         self.run(Op::Rewind, None);
         Ok(IOResult::Done(()))
     }
 
     fn has_record(&self) -> bool {
-        if self.pending.is_internal() {
+        if self.in_new_rowid {
             return self.scratch.is_some();
         }
         self.is_current() && self.shape.on_entry()
@@ -652,7 +688,7 @@ impl CursorTrait for ModelCursor {
 
     fn set_has_record(&mut self, _has_record: bool) {
         panic!(
-            "unsupported: set_has_record on a model tree (root {})",
+            "unsupported in model storage: set_has_record (root {})",
             self.root
         )
     }
@@ -662,18 +698,18 @@ impl CursorTrait for ModelCursor {
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
-        self.finish_pending();
+        self.finish_new_rowid();
         self.run(Op::SeekEnd, None);
         Ok(IOResult::Done(()))
     }
 
     fn seek_to_last(&mut self) -> IOResultOr<()> {
-        if self.pending == Pending::NewRowid {
-            self.catch_up();
-            self.scratch = self.tree.read().rows.last();
-            return Ok(IOResult::Done(()));
-        }
-        self.last()
+        // Only `NewRowid` calls this. It then reads the rowid and calls `next`.
+        self.finish_new_rowid();
+        self.run(Op::NewRowid, None);
+        self.in_new_rowid = true;
+        self.scratch = self.tree.read(&self.info, |t| t.rows.last());
+        Ok(IOResult::Done(()))
     }
 
     fn invalidate_record(&mut self) {}
@@ -690,25 +726,13 @@ impl CursorTrait for ModelCursor {
         false
     }
 
-    fn note_opcode(&mut self, op: CursorOpcode) {
-        self.finish_pending();
-        match op {
-            CursorOpcode::NoConflictNull => {
-                self.run(Op::NoConflictNull, None);
-            }
-            CursorOpcode::NewRowid => {
-                self.run(Op::NewRowid, None);
-                self.pending = Pending::NewRowid;
-            }
-            CursorOpcode::Insert { require_seek } => {
-                self.pending = Pending::Insert {
-                    use_seek: !require_seek,
-                };
-            }
-            CursorOpcode::IdxInsert { use_seek } => {
-                self.pending = Pending::IdxInsert { use_seek };
-            }
-            CursorOpcode::IdxDelete => self.pending = Pending::IdxDelete,
-        }
+    fn duplicate(&self) -> Option<Box<dyn CursorTrait>> {
+        stats::dup_opened();
+        Some(Box::new(Self::open(
+            self.pager.clone(),
+            self.tree.clone(),
+            self.root,
+            self.info.clone(),
+        )))
     }
 }

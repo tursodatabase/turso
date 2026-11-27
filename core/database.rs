@@ -353,7 +353,10 @@ impl OpenOptions {
 /// Turso treats every path with the `:memory:` prefix as a named
 /// in-memory database.
 pub fn is_memory_like(path: &str) -> bool {
-    path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
+    path.starts_with(":memory:")
+        || path.starts_with("file::memory:")
+        || path.is_empty()
+        || path == crate::storage::tree_store::MODEL_PATH
 }
 
 /// Creates a read completion for database header reads that checks for short reads.
@@ -802,6 +805,9 @@ pub struct Database<
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
+    /// Where the trees live when they are not B-trees in the database pages
+    /// (`storage::tree_store`). `Some` only for a `:model:` database.
+    pub(crate) tree_storage: Option<Arc<dyn crate::storage::tree_store::TreeStorage>>,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
@@ -973,8 +979,10 @@ impl Database {
             .map(|options| EncryptionKey::from_hex_string(&options.hexkey))
             .transpose()?;
 
+        let tree_storage = crate::storage::tree_store::tree_storage_for_path(&path)?;
         let db = Database {
             mv_store,
+            tree_storage,
             allocators,
             path,
             wal_path,
@@ -3073,8 +3081,6 @@ impl Database {
             query_only: AtomicBool::new(false),
             tx_read_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
-            #[cfg(debug_assertions)]
-            model_ephemeral: AtomicBool::new(crate::storage::model::ephemeral_default()),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
             fts_merge_threshold: AtomicI64::new(crate::index_method::DEFAULT_FTS_MERGE_THRESHOLD),
@@ -3694,6 +3700,9 @@ impl Database {
         )?;
         pager.set_authenticated_header(header)?;
         pager.enable_encryption(self.opts.enable_encryption);
+        if let Some(storage) = &self.tree_storage {
+            pager.set_tree_store(storage.connect());
+        }
         if self.initialized() {
             self.buffer_pool
                 .finalize_with_page_size(pager.get_page_size_unchecked().get() as usize)?;

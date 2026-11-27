@@ -720,31 +720,7 @@ impl CursorStep {
     }
 }
 
-/// An opcode that is about to call a cursor. Some facts of the cursor contract belong to the
-/// opcode and not to the cursor calls: `IdxInsert` makes a seek, a read and an insert, and
-/// `NoConflict` with a NULL makes no call. Debug builds tell the cursor with
-/// [CursorTrait::note_opcode].
-#[cfg(debug_assertions)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CursorOpcode {
-    /// `NoConflict` with a NULL in the key: it jumps and does not seek.
-    NoConflictNull,
-    NewRowid,
-    /// `Insert`. Without `REQUIRE_SEEK` it does not seek.
-    Insert {
-        require_seek: bool,
-    },
-    /// `IdxInsert`. With `USE_SEEK` it does not seek.
-    IdxInsert {
-        use_seek: bool,
-    },
-    IdxDelete,
-}
-
 pub trait CursorTrait: Any + Send + Sync {
-    /// Tells the cursor which opcode makes the next calls. Debug builds only.
-    #[cfg(debug_assertions)]
-    fn note_opcode(&mut self, _op: CursorOpcode) {}
     /// Move cursor to last entry.
     fn last(&mut self) -> IOResultOr<()>;
     /// Move cursor to next entry.
@@ -847,6 +823,20 @@ pub trait CursorTrait: Any + Send + Sync {
     fn get_null_flag(&self) -> bool;
     /// Check if a key exists.
     fn exists(&mut self, key: &Value) -> IOResultOr<bool>;
+    /// True when the cursor is on the row `rowid` and its record has the bytes `payload`, so
+    /// an `Insert` of that row would change nothing. `Insert` asks this before it writes.
+    fn holds_row(&mut self, rowid: i64, payload: &[u8]) -> IOResultOr<bool> {
+        if return_if_io!(self.rowid()) != Some(rowid) {
+            return Ok(IOResult::Done(false));
+        }
+        let existing = return_if_io!(self.record_payload());
+        Ok(IOResult::Done(existing == Some(payload)))
+    }
+    /// A second cursor on the same tree, for `OpenDup`. `None`: the caller opens a cursor on
+    /// the same root page of the same pager.
+    fn duplicate(&self) -> Option<Box<dyn CursorTrait>> {
+        None
+    }
     /// Remove every entry but keep the root page. Returns the number of entries removed.
     fn clear_btree(&mut self) -> IOResultOr<u64>;
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>>;
