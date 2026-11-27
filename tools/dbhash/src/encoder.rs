@@ -209,8 +209,34 @@ mod tests {
     #[test]
     fn test_float_nan() {
         let mut buf = Vec::new();
-        // NaN is not representable in Double, so from_f64(NaN) returns Null
+        // Constructing a value does not apply the SQL dialect's NaN policy.
         encode_value(&Value::from_f64(f64::NAN), &mut buf);
+        assert_eq!(buf[0], b'2');
+        assert_eq!(buf[1..], f64::NAN.to_bits().to_be_bytes());
+    }
+
+    #[test]
+    fn test_sqlite_nan_result_encodes_as_null() {
+        use std::sync::Arc;
+        use turso_core::{ConnectOpts, Database, MemoryIO, OpenOptions, SessionRole};
+
+        let db = Database::open(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(turso_sqlite::SqliteDialect)),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let rows = conn
+            .prepare("SELECT 1e999 - 1e999")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::Null]]);
+        let mut buf = Vec::new();
+        encode_value(&rows[0][0], &mut buf);
         assert_eq!(buf, vec![b'0']);
     }
 

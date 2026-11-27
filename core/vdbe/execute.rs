@@ -3428,6 +3428,16 @@ pub fn op_make_record<C, P>(
     // paths become allocation-free once the buffer has grown to the row size.
     let buf = state.registers.write(dest_reg).take_buf();
     let regs = &state.registers[start_reg..start_reg + count];
+    // Check before the record is written, because a record written with a NaN
+    // cannot be undone: SQLite has no NaN, and reads the bits of one as NULL,
+    // so a database that held one would give a different answer to SQLite
+    // than to us. In a dialect where a REAL cannot be NaN, register writes
+    // turn NaN into NULL, so none reaches this point.
+    turso_debug_assert!(
+        state.registers.nan_policy() == crate::types::NanPolicy::Preserve
+            || !regs.iter().any(|register| register.get_value().is_nan()),
+        "a NaN is about to be written to a record in a dialect that has no NaN"
+    );
     let record = ImmutableRecord::build_from_registers(regs, buf)?;
     state
         .registers
@@ -8620,7 +8630,7 @@ fn ordered_set_percentile_cont(values: &[Value], fraction: f64) -> Value {
     if floats.is_empty() {
         return Value::Null;
     }
-    floats.sort_by(|a, b| a.total_cmp(b));
+    floats.sort_by(|a, b| Double::new(*a).cmp(&Double::new(*b)));
     let n = floats.len() as f64;
     let index = fraction * (n - 1.0);
     let lower = index.floor() as usize;
@@ -9578,7 +9588,9 @@ fn inverse_agg_payload(
 }
 
 /// If `arg` is +Inf or -Inf, adds `delta` to the number of such inputs in
-/// `pos_inf` or `neg_inf` and returns true. Returns false for any other input.
+/// `pos_inf` or `neg_inf` and returns true. A NaN is counted in both, as it
+/// makes the sum NaN as +Inf with -Inf does, and leaves it when the NaN is
+/// removed. Returns false for any other input.
 fn add_to_infinity_count(
     arg: &NumericArg,
     pos_inf: &mut Value,
@@ -9588,29 +9600,41 @@ fn add_to_infinity_count(
     let NumericArg::Float(f) = arg else {
         return Ok(false);
     };
+    if f.is_nan() {
+        add_to_count(pos_inf, delta)?;
+        add_to_count(neg_inf, delta)?;
+        return Ok(true);
+    }
     if !f.is_infinite() {
         return Ok(false);
     }
-    let slot = if f.is_sign_positive() {
-        pos_inf
-    } else {
-        neg_inf
-    };
+    add_to_count(
+        if f.is_sign_positive() {
+            pos_inf
+        } else {
+            neg_inf
+        },
+        delta,
+    )?;
+    Ok(true)
+}
+
+fn add_to_count(slot: &mut Value, delta: i64) -> Result<()> {
     let Value::Numeric(Numeric::Integer(n)) = slot else {
         unreachable!("sum/avg infinity counts are Integer per init_agg_payload");
     };
     *n = n.checked_add(delta).or_overflow()?;
     debug_assert!(*n >= 0, "infinite input removed without a matching add");
-    Ok(true)
+    Ok(())
 }
 
 /// The sum of the infinite inputs counted by `add_to_infinity_count`: +Inf,
-/// -Inf, or NULL (NaN) when there are both. `None` when there are none.
+/// -Inf, or NaN when there are both. `None` when there are none.
 fn sum_of_infinite_inputs(pos_inf: &Value, neg_inf: &Value) -> Option<Value> {
     let has_pos_inf = pos_inf.as_int().unwrap_or(0) > 0;
     let has_neg_inf = neg_inf.as_int().unwrap_or(0) > 0;
     match (has_pos_inf, has_neg_inf) {
-        (true, true) => Some(Value::Null),
+        (true, true) => Some(Value::from_f64(f64::NAN)),
         (true, false) => Some(Value::from_f64(f64::INFINITY)),
         (false, true) => Some(Value::from_f64(f64::NEG_INFINITY)),
         (false, false) => None,
@@ -21135,5 +21159,25 @@ mod tests {
             result.is_err(),
             "Should error on count exceeding payload length"
         );
+    }
+}
+
+#[cfg(test)]
+mod percentile_nan_tests {
+    use super::*;
+
+    #[test]
+    fn nan_percentile_uses_numeric_order_for_both_nan_signs() {
+        for nan in [f64::NAN, -f64::NAN] {
+            let values = [
+                Value::Numeric(Numeric::Float(Double::new(nan))),
+                Value::from_i64(1),
+            ];
+            assert_eq!(
+                ordered_set_percentile_cont(&values, 0.0),
+                Value::from_f64(1.0)
+            );
+            assert!(ordered_set_percentile_cont(&values, 1.0).is_nan());
+        }
     }
 }
