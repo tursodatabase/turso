@@ -218,6 +218,13 @@ to a tree copies that tree. Commit publishes the copy, rollback drops it. A save
 the statement savepoint) keeps the copy of its start, and a rollback to it puts that copy
 back. Temp tables stay on a real B-tree: the temp database has no tree store.
 
+**The model has the WAL rules only.** One write transaction runs at a time and a read
+transaction sees the version it started with. MVCC (concurrent writers, row-level
+`WriteWriteConflict`, `BEGIN CONCURRENT`) is not modelled yet. The data structure would not
+change. Only the commit rule would: check the write set against the versions published since
+the snapshot. For now `PRAGMA journal_mode = 'mvcc'` does nothing, and the sqltest tests that
+need MVCC carry `@skip-if model` or `@skip-file-if model`.
+
 These features return the error `unsupported in model storage: <feature>`: `ATTACH`,
 `VACUUM INTO`, `WITHOUT ROWID` tables, materialized views, the page pragmas `page_count`,
 `page_size`, `freelist_count`, `max_page_count`, and the encryption pragmas. `VACUUM` does
