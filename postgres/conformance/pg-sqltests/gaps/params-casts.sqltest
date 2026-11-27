@@ -254,13 +254,6 @@ expect {
     {"b": 2,  "a":1}
 }
 
-# A-48: invalid jsonb literal
-test invalid-jsonb-literal {
-    SELECT 'not json'::jsonb;
-}
-@sqlstate 22P02
-expect error {}
-
 # A-50: jsonb number precision
 test jsonb-number-precision {
     SELECT '1.50'::jsonb, '12345678901234567890'::jsonb;

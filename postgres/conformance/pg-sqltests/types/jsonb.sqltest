@@ -18,3 +18,9 @@ test jsonb-duplicate-keys-keep-last {
 expect {
     {"a": 2}
 }
+
+test invalid-jsonb-literal {
+    SELECT 'not json'::jsonb;
+}
+@sqlstate 22P02
+expect error {}
