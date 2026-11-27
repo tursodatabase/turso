@@ -8176,6 +8176,7 @@ fn pg_type_name_to_ast_type(
             | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY",
             _,
         ) => "TEXT",
+        ("BYTEA", false) => "bytea",
         ("BYTEA" | "BLOB", _) => "BLOB",
         _ => &pg_type,
     };

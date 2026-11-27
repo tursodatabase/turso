@@ -13,7 +13,7 @@ use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text};
 use crate::pg_type::regtype_text;
 use crate::pg_type::{check_oid_range, type_input};
-use crate::text::{value_text, TextType};
+use crate::text::{encode_bytea, value_text, TextType};
 use std::sync::Arc;
 use turso_core::dialect::CastContext;
 use turso_core::{Connection, LimboError, Numeric, Result, Value};
@@ -36,7 +36,7 @@ pub(crate) enum CastType {
     RegClass,
     Uuid,
     RegType,
-    // FIXME(pg-catalog): bytea is not a registered type yet, so the engine casts it as before. It is listed here and in CASTS once bytea has a pg_type row.
+    Bytea,
     Timestamp,
     TimestampTz,
 }
@@ -56,6 +56,7 @@ impl CastType {
             Self::RegClass => "regclass",
             Self::Uuid => "uuid",
             Self::RegType => "regtype",
+            Self::Bytea => "bytea",
             Self::Timestamp => "timestamp",
             Self::TimestampTz => "timestamptz",
         }
@@ -80,6 +81,7 @@ impl CastType {
             "regclass" => Self::RegClass,
             "uuid" => Self::Uuid,
             "regtype" => Self::RegType,
+            "bytea" => Self::Bytea,
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::TimestampTz,
             _ => return None,
@@ -445,6 +447,7 @@ fn to_text(connection: &Arc<Connection>, value: &Value, source: CastType) -> Res
         (Value::Numeric(Numeric::Float(f)), CastType::Float4 | CastType::Float8) => {
             float8_text(f64::from(*f))
         }
+        (Value::Blob(bytes), CastType::Bytea) => encode_bytea(bytes, false),
         (Value::Text(_), CastType::TimestampTz) => {
             match value_text(value, TextType::TimestampTz, connection) {
                 Some(text) => text.into_owned(),

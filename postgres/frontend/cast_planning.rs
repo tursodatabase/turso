@@ -207,6 +207,7 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
         "regclass" => RegClass,
         "uuid" => Uuid,
         "regtype" => RegType,
+        "bytea" => Bytea,
         "timestamp" => Timestamp,
         "timestamptz" => TimestampTz,
         // FIXME(pg-catalog): numeric is registered only with a type modifier. Without one it is REAL, which `is_lowered_type_name` leaves to the engine. A numeric type that needs no modifier lets every numeric go through CASTS.
@@ -238,6 +239,7 @@ fn named_cast_type(name: &str, place: NamePlace) -> Option<CastType> {
     Some(match (name, place) {
         // FIXME(pg-catalog): An integer written in the statement and the result of a function have no registered type, and core types them INTEGER. They are read as int4, also when PostgreSQL types them bigint, so `count(*)::boolean` is accepted where PostgreSQL has no cast from bigint. The target type still checks its range. Result types from pg_proc, and a literal typed by its size, give the expression its real type.
         ("integer", Value) => Int4,
+        ("bytea", _) => Bytea,
         ("float4", _) => Float4,
         ("float8", _) => Float8,
         // FIXME(pg-catalog): A float4 column is REAL in the schema, so it is only checked for the range of float8, and a float4 expression is typed float8. A registered float4 type fixes both.
@@ -257,7 +259,6 @@ const ENGINE_RULE_TYPES: &[&str] = &[
     "time",
     "json",
     "jsonb",
-    "bytea",
     "inet",
     "cidr",
     "macaddr",

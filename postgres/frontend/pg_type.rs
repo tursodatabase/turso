@@ -4,6 +4,7 @@
 //! relations.
 
 mod boolean;
+mod bytea;
 mod integer;
 mod integer_operators;
 mod oid;
@@ -131,8 +132,7 @@ macro_rules! built_in_types {
 /// has no row.
 pub(crate) static BUILT_IN_TYPES: [BuiltInType; 22] = built_in_types! {
     (16, "bool", "B", true, 1, true, "c", "p", 1000, ",", Support::Registered(&boolean::Boolean)),
-    // FIXME(registered-types): bytea: the frontend uses the type that core registers, which stores text as its bytes and does not read the hex and escape formats. A bytea type registered in the frontend, with its INPUT, replaces this.
-    (17, "bytea", "U", false, -1, false, "i", "x", 1001, ",", Support::NotRegistered(FormatName::Plain("bytea"))),
+    (17, "bytea", "U", false, -1, false, "i", "x", 1001, ",", Support::Registered(&bytea::Bytea)),
     (20, "int8", "N", false, 8, true, "d", "p", 1016, ",", Support::Registered(&IntegerType::Int8)),
     (21, "int2", "N", false, 2, true, "s", "p", 1005, ",", Support::Registered(&IntegerType::Int2)),
     (23, "int4", "N", false, 4, true, "i", "p", 1007, ",", Support::Registered(&IntegerType::Int4)),
