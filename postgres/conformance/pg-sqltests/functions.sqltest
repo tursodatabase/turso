@@ -7,6 +7,11 @@
 
 @database :memory:
 
+setup t_id_s_n_arr_ia_j_ok_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
+    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
+}
+
 test quote-ident-plain-lowercase {
     SELECT quote_ident('abc');
 }
@@ -2885,6 +2890,14 @@ test to-json-takes-one-argument {
 }
 @sqlstate 42883
 expect error {
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test to-json-scalar {
+    SELECT to_json(s), to_jsonb(n) FROM t WHERE id = 1;
+}
+expect {
+    "abc"|10
 }
 
 test table-function-argument-cannot-name-a-table-listed-after-it {
