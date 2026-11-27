@@ -786,7 +786,7 @@ impl Gen {
             .has(IdxGaps::MI1_MODEL_NO_CONFLICT_NULL_AFTER_NULL_ROW)
             && model
             && matches!(op, IOp::NoConflict(c, p)
-                if self.replay.st.icurs[*c].null_row && p.iter().any(|v| *v == Val::Null)))
+                if self.replay.st.icurs[*c].null_row && p.contains(&Val::Null)))
             || (self.gaps.has(IdxGaps::IDX_D1_MVCC_CKPT) && mvcc_ckpt && self.idx_d1(op))
             || (self.gaps.has(IdxGaps::IDX_END_INSERT) && wal_or_eph && self.idx_end_insert(op))
             || (self.gaps.has(IdxGaps::ROWDATA_IDX_INSERT)

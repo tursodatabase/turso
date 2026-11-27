@@ -375,10 +375,7 @@ impl ModelCursor {
             if found.is_none() {
                 // The rowid is free, and the insert that follows uses this seek.
                 self.finish_new_rowid();
-                self.shape.token = Token::Key {
-                    key: key.clone(),
-                    hit: false,
-                };
+                self.shape.token = Token::Key { key, hit: false };
             }
             found.is_some()
         } else if op == (SeekOp::GE { eq_only: true }) {

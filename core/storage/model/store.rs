@@ -210,7 +210,7 @@ impl TreeStore for ConnStore {
         let trees = saved
             .downcast_ref::<Option<Trees>>()
             .expect("a model savepoint holds model trees");
-        self.trees.tx.lock().write = trees.clone();
+        self.trees.tx.lock().write.clone_from(trees);
     }
 
     fn check_feature(&self, feature: &str) -> Result<()> {
