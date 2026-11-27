@@ -1906,3 +1906,41 @@ fn test_index_seek_over_hidden_btree_entries_does_no_point_lookups() {
         );
     }
 }
+
+/// A loop that probes a UNIQUE index in key order finds each row on the B-tree head that
+/// the `Next` of the probe before it left. A seek of both sources for each probe made a
+/// join on a UNIQUE column 2 times slower than main.
+#[test]
+fn test_unique_index_probes_in_key_order_do_not_seek_again() {
+    let build = |n: usize| {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+        run(
+            &conn,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, v TEXT)",
+        );
+        run(&conn, "CREATE TABLE p(id INTEGER PRIMARY KEY, x INT)");
+        run(
+            &conn,
+            &format!("INSERT INTO t SELECT value, value, 'b' FROM generate_series(1, {n})"),
+        );
+        run(
+            &conn,
+            &format!("INSERT INTO p SELECT value, value FROM generate_series(1, {n})"),
+        );
+        run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        (db, conn)
+    };
+    let sql = "SELECT count(*), count(t.u) FROM p LEFT JOIN t ON t.u = p.x";
+    for n in [N, 4 * N] {
+        let (_db, conn) = build(n);
+        let (rows, _) = run_measured(&conn, sql, &[]);
+        assert_eq!(rows, vec![vec![int(n as i64), int(n as i64)]]);
+    }
+    let (small, large) = work_at_n_and_4n(build, sql);
+    assert!(
+        Class::Constant.allows(small.seeks(), large.seeks()),
+        "`{sql}`: each probe seeks again: {small:?} -> {large:?}"
+    );
+}

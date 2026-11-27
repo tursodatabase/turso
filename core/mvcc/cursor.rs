@@ -1489,6 +1489,85 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
+    /// The key of `seek_key` as the cursor compares it with its heads.
+    fn seek_row_key(&self, seek_key: &SeekKey<'_>) -> Result<RowKey> {
+        Ok(match seek_key {
+            SeekKey::TableRowId(row_id) => RowKey::Int(*row_id),
+            SeekKey::IndexKey(index_key) => {
+                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                    panic!("SeekKey::IndexKey requires Index cursor type");
+                };
+                let num_cols = index_key.column_count();
+                // A key with all the columns of the index, such as the key that IdxInsert
+                // seeks with, has the same IndexInfo as the cursor, so the cursor shares its
+                // own.
+                let index_info = if num_cols == index_info.num_cols {
+                    index_info.clone()
+                } else {
+                    Arc::new(IndexInfo::new_in(
+                        index_info.key_info.iter().cloned(),
+                        index_info.has_rowid,
+                        num_cols,
+                        index_info.is_unique,
+                        self.db.allocator(),
+                    )?)
+                };
+                RowKey::Record(Arc::new(SortableIndexKey::new_from_payload_in(
+                    index_key,
+                    index_info,
+                    self.db.allocator(),
+                )?))
+            }
+        })
+    }
+
+    /// Lands an equality seek on the B-tree head without a seek of either source, when the
+    /// last walk ended at the bound of the last equality seek and the B-tree head that it
+    /// left is the one row of `seek_key`. A loop that probes a UNIQUE index in key order
+    /// does this: each `Next` stops at the bound, and the next probe asks for the key of
+    /// the B-tree head.
+    fn seek_parked_btree_head(&mut self, seek_key: &SeekKey<'_>, op: SeekOp) -> Result<bool> {
+        let dir = op.iteration_direction();
+        let walk_ended = match dir {
+            IterationDirection::Forwards => matches!(self.current_pos, CursorPosition::End),
+            IterationDirection::Backwards => {
+                matches!(self.current_pos, CursorPosition::BeforeFirst)
+            }
+        };
+        // Only a walk under a bound leaves a B-tree head at the end: without a bound, the
+        // walk returns that head.
+        if !walk_ended
+            || self.eq_bound.is_none()
+            || self.heads != Heads::Next(dir)
+            || self.mvcc_rows_epoch() != self.mvcc_peek_epoch
+            || !matches!(self.dual_peek.btree_peek, CursorPeek::Raw { .. })
+            || !seek_key_names_one_row(seek_key, &self.mv_cursor_type)?
+        {
+            return Ok(false);
+        }
+        let key = self.seek_row_key(seek_key)?;
+        let Some(btree_key) = self.dual_peek.btree_peek.raw_key().cloned() else {
+            return Ok(false);
+        };
+        // For an index, the seek key can be a prefix of the B-tree key. The comparison of
+        // SortableIndexKey compares only the columns that both keys have.
+        if !btree_key.cmp(&key).is_eq() || !self.query_btree_version_is_valid(&btree_key)? {
+            return Ok(false);
+        }
+        self.set_null_flag(false);
+        self.invalidate_record();
+        self.eq_bound = Some(EqBound {
+            key: key.clone(),
+            one_row: true,
+            kept: false,
+        });
+        // The MvStore has no visible row with this key, because the B-tree row is valid and
+        // the key names one row. A step past the bound positions the MvStore after the key.
+        self.dual_peek.mvcc_peek = CursorPeek::SeekPast(key);
+        self.land(btree_key, true, None, dir);
+        Ok(true)
+    }
+
     /// Reset dual peek state (called on rewind/last/seek)
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
@@ -1647,6 +1726,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             }
         }
 
+        if self.state.is_none() && op.eq_only() && self.seek_parked_btree_head(&seek_key, op)? {
+            return Ok(IOResult::Done(SeekResult::Found));
+        }
+
         loop {
             match self.state.clone() {
                 None => {
@@ -1658,34 +1741,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     self.set_null_flag(false);
 
                     let direction = op.iteration_direction();
-                    let key = match &seek_key {
-                        SeekKey::TableRowId(row_id) => RowKey::Int(*row_id),
-                        SeekKey::IndexKey(index_key) => {
-                            let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                                panic!("SeekKey::IndexKey requires Index cursor type");
-                            };
-                            let num_cols = index_key.column_count();
-                            // A key with all the columns of the index, such as the
-                            // key that IdxInsert seeks with, has the same IndexInfo
-                            // as the cursor, so the cursor shares its own.
-                            let index_info = if num_cols == index_info.num_cols {
-                                index_info.clone()
-                            } else {
-                                Arc::new(IndexInfo::new_in(
-                                    index_info.key_info.iter().cloned(),
-                                    index_info.has_rowid,
-                                    num_cols,
-                                    index_info.is_unique,
-                                    self.db.allocator(),
-                                )?)
-                            };
-                            RowKey::Record(Arc::new(SortableIndexKey::new_from_payload_in(
-                                index_key,
-                                index_info,
-                                self.db.allocator(),
-                            )?))
-                        }
-                    };
+                    let key = self.seek_row_key(&seek_key)?;
                     let mut end = None;
                     if op.eq_only() {
                         // An equality seek returns only rows with this key, so the walk
