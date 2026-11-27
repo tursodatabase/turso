@@ -2690,6 +2690,9 @@ impl PostgreSQLTranslator {
         stmt: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::OneSelect, ParseError> {
         if !is_set_operation(stmt) && !has_own_select_clauses(stmt) {
+            if !stmt.values_lists.is_empty() {
+                return Ok(self.translate_select(stmt)?.body.select);
+            }
             return self.translate_one_select(stmt);
         }
         Ok(ast::OneSelect::Select {
