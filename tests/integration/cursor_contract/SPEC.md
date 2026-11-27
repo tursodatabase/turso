@@ -159,10 +159,11 @@ compound selects) stores only the columns. Two keys with equal columns are the s
 
 ## 2d. Undefined sequences
 
-**Rule.** When an op violates its precondition, a debug build of the engine returns an
-error or panics with a message that contains `unsupported`. The model storage (section 2e)
-panics with `unsupported: U<n>: <why>`. A release build may do
-anything (for now). The model calls the op illegal (`step` returns `None`) and the generator
+**Rule.** When an op violates its precondition, a debug build of the engine panics with a
+message that starts with `unsupported: U<n>: <why>`. It must be a panic, not an error:
+an error is a defined outcome (for example "UNIQUE constraint failed") that a caller can
+handle or ignore, and a panic cannot be mistaken for one. The model storage (section 2e)
+does this. A release build may do anything (for now). The model calls the op illegal (`step` returns `None`) and the generator
 never emits it. `undefined_tests.rs` checks both sides: the model says illegal, and every
 engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 
@@ -237,7 +238,7 @@ caller must have left the cursor at a `Seeked k` or `At k` position for the same
   own asserts forbid it. The MVCC overlay has no direction state. Do not make it work: a
   debug build refuses it (U1, section 2d).
 - **D4.** `Delete` with no current row is Undefined. Today BTree ignores it and MVCC
-  panics. A debug build refuses it with an `unsupported` message (U4).
+  panics. A debug build refuses it with an `unsupported` panic (U4).
 - **D5.** Another cursor's write leaves our cursor at its position by key, as SQLite's saved
   cursors do. If the write deleted our entry, we are in the gap. (This was U9, Undefined.
   Window functions need it: the corpus has 2,096 tests where an `OpenDup` reader of the
