@@ -246,14 +246,6 @@ expect {
     t
 }
 
-# A-46: jsonb duplicate keys keep last
-test jsonb-duplicate-keys-keep-last {
-    SELECT '{"a":1,"a":2}'::jsonb;
-}
-expect {
-    {"a": 2}
-}
-
 # A-47: json literal preserved verbatim
 test json-literal-preserved-verbatim {
     SELECT '{"b": 2,  "a":1}'::json;

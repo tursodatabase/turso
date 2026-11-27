@@ -11,3 +11,10 @@ test jsonb-literal-key-order-whitespace {
 expect {
     {"a": 1, "b": 2, "aa": [1, 2]}
 }
+
+test jsonb-duplicate-keys-keep-last {
+    SELECT '{"a":1,"a":2}'::jsonb;
+}
+expect {
+    {"a": 2}
+}
