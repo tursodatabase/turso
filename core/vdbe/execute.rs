@@ -1325,6 +1325,7 @@ pub fn op_open_read(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    let cursor_work = state.cursor_work.clone();
     let maybe_promote_to_mvcc_cursor =
         |btree_cursor: Box<BTreeCursor>, mv_cursor_type: MvccCursorType| -> Result<OpenedBTree> {
             // Without an MvStore there is no MVCC transaction to look up.
@@ -1332,14 +1333,17 @@ pub fn op_open_read(
                 return Ok(OpenedBTree::Plain(btree_cursor));
             };
             if let Some(tx_id) = connection.get_mv_tx_id_for_db(*db) {
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                    mv_store.clone(),
-                    connection,
-                    tx_id,
-                    *root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?)))
+                Ok(OpenedBTree::Mvcc(Box::new(
+                    MvCursor::new(
+                        mv_store.clone(),
+                        connection,
+                        tx_id,
+                        *root_page,
+                        mv_cursor_type,
+                        btree_cursor,
+                    )?
+                    .with_work_counters(cursor_work.clone()),
+                )))
             } else {
                 Ok(OpenedBTree::Plain(btree_cursor))
             }
@@ -13845,6 +13849,7 @@ pub fn op_open_write(
             .expect("cursor_id should be valid")
             .replace(cursor);
     } else if !can_reuse_cursor {
+        let cursor_work = state.cursor_work.clone();
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<OpenedBTree> {
@@ -13853,14 +13858,17 @@ pub fn op_open_write(
                     .as_ref()
                     .expect("mv_store should be Some when MVCC transaction is active")
                     .clone();
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                    mv_store,
-                    connection,
-                    tx_id,
-                    root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?)))
+                Ok(OpenedBTree::Mvcc(Box::new(
+                    MvCursor::new(
+                        mv_store,
+                        connection,
+                        tx_id,
+                        root_page,
+                        mv_cursor_type,
+                        btree_cursor,
+                    )?
+                    .with_work_counters(cursor_work.clone()),
+                )))
             } else if mv_store.is_some() {
                 Err(LimboError::InternalError(
                     "OpenWrite requires an active MVCC transaction".to_string(),
@@ -16013,6 +16021,15 @@ pub fn op_set_cookie(
         // Header cookies are global metadata with no row-level conflict keys; they need
         // SQLite-style single-writer semantics (same policy as DDL in MVCC).
         upgrade_mv_tx_to_exclusive(connection, &pager, mv_store, *db, tx_id)?;
+    } else {
+        // Writing the header marks page 1 dirty. Without a write transaction,
+        // no commit or rollback cleans it up, and the next read transaction
+        // finds it.
+        turso_assert!(
+            pager.wal.is_none() || pager.holds_write_lock(),
+            "SetCookie requires a write transaction",
+            { "db": db }
+        );
     }
 
     match with_header_mut(&pager, mv_store.as_ref(), connection, *db, |header| {
@@ -16648,14 +16665,17 @@ pub fn op_open_dup(
                         .as_ref()
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                        mv_store,
-                        connection,
-                        tx_id,
-                        root_page,
-                        MvccCursorType::Table,
-                        cursor,
-                    )?))
+                    OpenedBTree::Mvcc(Box::new(
+                        MvCursor::new(
+                            mv_store,
+                            connection,
+                            tx_id,
+                            root_page,
+                            MvccCursorType::Table,
+                            cursor,
+                        )?
+                        .with_work_counters(state.cursor_work.clone()),
+                    ))
                 } else {
                     OpenedBTree::Plain(cursor)
                 }

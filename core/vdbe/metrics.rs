@@ -1,4 +1,230 @@
 use std::fmt;
+// The cursor work counters are statistics, not synchronization. They use std atomics
+// because under shuttle each access to a shuttle atomic is a scheduling step: the
+// counters would add about 2.6M steps to an iteration of the shuttle stress tests.
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The work that the MVCC cursors of a statement did inside their operations. Counted in
+/// debug builds only; all zero in release builds.
+///
+/// One cursor operation (a `Next` or a seek) can look at many entries that the
+/// transaction cannot see. The opcode counters of [`StatementMetrics`] count the
+/// operation once. These counters count the work inside it, so a test can see
+/// when the cost of an operation grows with the hidden entries.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CursorWork {
+    /// Raw MvStore entries that cursors took from a skiplist iterator, visible or not.
+    pub mvcc_entries_examined: u64,
+    /// Raw B-tree rows whose key cursors read, shadowed by MVCC or not.
+    pub btree_rows_examined: u64,
+    /// Positionings of an MvStore skiplist iterator (a seek, a rewind or a re-seek).
+    pub mvcc_seeks: u64,
+    /// Root-to-leaf positionings of the B-tree cursor (a seek, a rewind, a last or an exists).
+    pub btree_seeks: u64,
+    /// Visibility decisions: whether an MvStore entry is visible, or whether MVCC shadows
+    /// a B-tree row. A check can include one MvStore point lookup.
+    pub visibility_checks: u64,
+}
+
+impl CursorWork {
+    pub fn merge(&mut self, other: &CursorWork) {
+        self.mvcc_entries_examined = self
+            .mvcc_entries_examined
+            .wrapping_add(other.mvcc_entries_examined);
+        self.btree_rows_examined = self
+            .btree_rows_examined
+            .wrapping_add(other.btree_rows_examined);
+        self.mvcc_seeks = self.mvcc_seeks.wrapping_add(other.mvcc_seeks);
+        self.btree_seeks = self.btree_seeks.wrapping_add(other.btree_seeks);
+        self.visibility_checks = self.visibility_checks.wrapping_add(other.visibility_checks);
+    }
+
+    /// The raw entries of both sources that cursors looked at.
+    pub fn entries_examined(&self) -> u64 {
+        self.mvcc_entries_examined
+            .wrapping_add(self.btree_rows_examined)
+    }
+
+    /// The positionings of both sources.
+    pub fn seeks(&self) -> u64 {
+        self.mvcc_seeks.wrapping_add(self.btree_seeks)
+    }
+}
+
+/// The live [`CursorWork`] counters of one statement. The statement shares them with
+/// each MVCC cursor that it opens. Code reads and changes them through a
+/// [`CursorWorkRef`].
+///
+/// The counters exist in debug builds only. In release builds the type is empty.
+///
+/// Only the thread that steps the statement changes the counters, so an increment is a
+/// load and a store, not an atomic read-modify-write. The atomics only make the type
+/// `Sync`.
+#[derive(Debug, Default)]
+pub struct CursorWorkCounters {
+    #[cfg(debug_assertions)]
+    mvcc_entries_examined: AtomicU64,
+    #[cfg(debug_assertions)]
+    btree_rows_examined: AtomicU64,
+    #[cfg(debug_assertions)]
+    mvcc_seeks: AtomicU64,
+    #[cfg(debug_assertions)]
+    btree_seeks: AtomicU64,
+    #[cfg(debug_assertions)]
+    visibility_checks: AtomicU64,
+}
+
+/// The handle to the [`CursorWorkCounters`] of a statement that the statement and its
+/// cursors keep. It is empty in release builds, so they allocate nothing for it.
+#[cfg(debug_assertions)]
+pub(crate) type CursorWorkHandle = crate::sync::Arc<CursorWorkCounters>;
+/// The handle to the [`CursorWorkCounters`] of a statement that the statement and its
+/// cursors keep. It is empty in release builds, so they allocate nothing for it.
+#[cfg(not(debug_assertions))]
+#[derive(Debug, Clone)]
+pub(crate) struct CursorWorkHandle;
+
+/// Makes counters for a new statement or cursor.
+pub(crate) fn new_cursor_work_handle() -> CursorWorkHandle {
+    #[cfg(debug_assertions)]
+    {
+        crate::sync::Arc::new(CursorWorkCounters::default())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        CursorWorkHandle
+    }
+}
+
+/// The counters that `handle` refers to.
+#[inline(always)]
+pub(crate) fn cursor_work(handle: &CursorWorkHandle) -> CursorWorkRef<'_> {
+    #[cfg(debug_assertions)]
+    {
+        CursorWorkRef::new(handle)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        CursorWorkRef::new(handle)
+    }
+}
+
+/// A reference to [`CursorWorkCounters`] that functions take by value.
+///
+/// In release builds it is a zero-size type. The Rust calling convention passes no
+/// zero-size argument, so a function that takes it gets no extra argument, inlined or
+/// not, and each increment compiles to nothing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CursorWorkRef<'a> {
+    #[cfg(debug_assertions)]
+    counters: &'a CursorWorkHandle,
+    #[cfg(not(debug_assertions))]
+    counters: std::marker::PhantomData<&'a CursorWorkHandle>,
+}
+
+// A release build passes no argument for a `CursorWorkRef` only if it has zero size.
+#[cfg(not(debug_assertions))]
+const _: () = assert!(std::mem::size_of::<CursorWorkRef<'static>>() == 0);
+
+impl<'a> CursorWorkRef<'a> {
+    #[inline(always)]
+    pub(crate) fn new(counters: &'a CursorWorkHandle) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            Self { counters }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let CursorWorkHandle = counters;
+            Self {
+                counters: std::marker::PhantomData,
+            }
+        }
+    }
+
+    /// An owned handle to the same counters, for an object that outlives this reference,
+    /// such as an MvStore iterator that counts its own entries.
+    #[cfg(debug_assertions)]
+    pub(crate) fn handle(self) -> CursorWorkHandle {
+        self.counters.clone()
+    }
+
+    #[cfg(debug_assertions)]
+    #[inline]
+    fn bump(counter: &AtomicU64) {
+        counter.store(
+            counter.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Counted by the iterator of [`crate::mvcc::cursor::counted_mvcc_iterator`].
+    #[cfg(debug_assertions)]
+    pub(crate) fn mvcc_entry_examined(self) {
+        Self::bump(&self.counters.mvcc_entries_examined);
+    }
+
+    #[inline(always)]
+    pub(crate) fn btree_row_examined(self) {
+        #[cfg(debug_assertions)]
+        Self::bump(&self.counters.btree_rows_examined);
+    }
+
+    #[inline(always)]
+    pub(crate) fn mvcc_seek(self) {
+        #[cfg(debug_assertions)]
+        Self::bump(&self.counters.mvcc_seeks);
+    }
+
+    #[inline(always)]
+    pub(crate) fn btree_seek(self) {
+        #[cfg(debug_assertions)]
+        Self::bump(&self.counters.btree_seeks);
+    }
+
+    #[inline(always)]
+    pub(crate) fn visibility_check(self) {
+        #[cfg(debug_assertions)]
+        Self::bump(&self.counters.visibility_checks);
+    }
+
+    /// The counts. All zero in release builds.
+    pub(crate) fn get(self) -> CursorWork {
+        #[cfg(debug_assertions)]
+        {
+            let c = self.counters;
+            CursorWork {
+                mvcc_entries_examined: c.mvcc_entries_examined.load(Ordering::Relaxed),
+                btree_rows_examined: c.btree_rows_examined.load(Ordering::Relaxed),
+                mvcc_seeks: c.mvcc_seeks.load(Ordering::Relaxed),
+                btree_seeks: c.btree_seeks.load(Ordering::Relaxed),
+                visibility_checks: c.visibility_checks.load(Ordering::Relaxed),
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            CursorWork::default()
+        }
+    }
+
+    pub(crate) fn is_zero(self) -> bool {
+        self.get() == CursorWork::default()
+    }
+
+    pub(crate) fn reset(self) {
+        #[cfg(debug_assertions)]
+        for counter in [
+            &self.counters.mvcc_entries_examined,
+            &self.counters.btree_rows_examined,
+            &self.counters.mvcc_seeks,
+            &self.counters.btree_seeks,
+            &self.counters.visibility_checks,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Hash join spill/probe metrics.
 #[derive(Debug, Default, Clone)]
@@ -103,6 +329,9 @@ pub struct StatementMetrics {
 
     // Hash join spill/probe metrics
     pub hash_join: HashJoinMetrics,
+
+    /// Work inside the operations of MVCC cursors.
+    pub cursor_work: CursorWork,
 }
 
 impl StatementMetrics {
@@ -137,6 +366,7 @@ impl StatementMetrics {
         self.btree_prev = self.btree_prev.wrapping_add(other.btree_prev);
         self.search_count = self.search_count.wrapping_add(other.search_count);
         self.hash_join.merge(&other.hash_join);
+        self.cursor_work.merge(&other.cursor_work);
     }
 
     /// Reset all counters to zero
@@ -218,6 +448,28 @@ impl fmt::Display for StatementMetrics {
             self.hash_join.grace_probe_rows_buffered
         )?;
         writeln!(f, "    Grace matches:     {}", self.hash_join.grace_matches)?;
+        // The cursor work counters exist in debug builds only.
+        #[cfg(debug_assertions)]
+        {
+            writeln!(f, "  MVCC Cursor Work:")?;
+            writeln!(
+                f,
+                "    MvStore entries:  {}",
+                self.cursor_work.mvcc_entries_examined
+            )?;
+            writeln!(
+                f,
+                "    B-tree rows:      {}",
+                self.cursor_work.btree_rows_examined
+            )?;
+            writeln!(f, "    MvStore seeks:    {}", self.cursor_work.mvcc_seeks)?;
+            writeln!(f, "    B-tree seeks:     {}", self.cursor_work.btree_seeks)?;
+            writeln!(
+                f,
+                "    Visibility checks:{}",
+                self.cursor_work.visibility_checks
+            )?;
+        }
         Ok(())
     }
 }

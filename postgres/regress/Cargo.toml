@@ -15,6 +15,7 @@ path = "main.rs"
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 similar.workspace = true
+turso_pg_scanner.workspace = true
 
 [lints]
 workspace = true

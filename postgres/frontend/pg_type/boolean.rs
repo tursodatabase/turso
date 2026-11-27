@@ -3,7 +3,7 @@
 use crate::error::sqlstate_error;
 use crate::functions::parse_pg_bool;
 use turso_core::ast;
-use turso_core::types::{Conversion, StorageClass, Type};
+use turso_core::types::{Conversion, StorageClass, TextInput, Type};
 use turso_core::{Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_INVALID_TEXT_REPRESENTATION};
 
@@ -31,6 +31,10 @@ impl Type for Boolean {
 
     fn base(&self) -> &str {
         "integer"
+    }
+
+    fn input(&self) -> Option<TextInput> {
+        Some(bool_input)
     }
 
     fn encode(&self) -> Option<Conversion> {
@@ -64,22 +68,25 @@ impl Type for Boolean {
     }
 }
 
-/// Text is read as PostgreSQL's boolean input does (see `parse_pg_bool`). A
-/// boolean value is the integer 1 or 0 already.
+/// The boolean that `text` is, as PostgreSQL's boolean input reads it (see
+/// `parse_pg_bool`).
+fn bool_input(text: &str) -> Result<Value> {
+    match parse_pg_bool(text) {
+        Some(truth) => Ok(Value::from_i64(i64::from(truth))),
+        None => Err(sqlstate_error(
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            format!("invalid input syntax for type boolean: \"{text}\""),
+            None,
+        )),
+    }
+}
+
+/// FIXME(pg-catalog): The cast table of casts.rs reads a string literal with the INPUT before the value gets here. Text still gets here from a value whose type core cannot name, such as the result of most functions, and from the elements of an array, and it is read with the INPUT too. A typed expression tree lets the cast table refuse or convert these, and then a boolean stores only 1 and 0 and needs no ENCODE.
+/// A boolean value is the integer 1 or 0 already.
 fn bool_encode(value: &Value, _params: &[Value]) -> Result<Value> {
     match value {
         Value::Numeric(Numeric::Integer(0 | 1)) => Ok(value.clone()),
-        Value::Text(text) => match parse_pg_bool(text.as_str()) {
-            Some(truth) => Ok(Value::from_i64(i64::from(truth))),
-            None => Err(sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!(
-                    "invalid input syntax for type boolean: \"{}\"",
-                    text.as_str()
-                ),
-                None,
-            )),
-        },
+        Value::Text(text) => bool_input(text.as_str()),
         other => Err(sqlstate_error(
             SQLSTATE_DATATYPE_MISMATCH,
             format!("the value {other} is not of type boolean"),

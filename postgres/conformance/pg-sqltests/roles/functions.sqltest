@@ -105,3 +105,10 @@ expect {
     {"\"cr acl,owner\"=UC/\"cr acl,owner\""}
     {"\"cr\"\"acl\"=UC/\"cr\"\"acl\""}
 }
+
+test current-user-current-role {
+    SELECT current_user = current_role;
+}
+expect {
+    t
+}

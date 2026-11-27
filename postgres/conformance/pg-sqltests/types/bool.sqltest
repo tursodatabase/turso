@@ -1,4 +1,6 @@
-# The boolean type reads text as PostgreSQL does, in a column and in a cast.
+# The boolean type. It reads text as PostgreSQL does, in a column and in a
+# cast, and it is the type of a comparison and the other conditions.
+#
 # In each row of a result of a test that writes to a column, the text that was
 # written is on the left and the boolean that the column stored is on the
 # right.
@@ -269,4 +271,45 @@ test condition-cast-to-integer-has-arithmetic {
 }
 expect {
     2|0
+}
+
+# A comparison and the other conditions give a boolean.
+
+setup t_id_s_n_arr_ia_j_ok_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
+    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test is-true-is-not-true-on-bool-col {
+    SELECT id, ok IS TRUE, ok IS NOT TRUE FROM t ORDER BY id;
+}
+expect {
+    1|t|f
+    2|f|t
+    3|f|t
+    4|f|t
+}
+
+test in-with-null-three-valued {
+    SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL);
+}
+expect {
+    t||
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test boolean-comparison-output {
+    SELECT id < 2, n IS NULL FROM t WHERE id = 1;
+}
+expect {
+    t|f
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test exists-subquery-output {
+    SELECT EXISTS (SELECT 1 FROM t WHERE id = 1);
+}
+expect {
+    t
 }

@@ -64,6 +64,7 @@ expect {
 test explain-analyze-errors {
     EXPLAIN ANALYZE SELECT 1;
 }
+@sqlstate 0A000
 expect error {}
 
 test explain-options-error {

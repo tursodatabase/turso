@@ -717,6 +717,13 @@ expect @tursopg {
     -1
 }
 
+test of-a-json-boolean-is-the-text-true {
+    SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
+}
+expect {
+    true|f
+}
+
 # Known differences of @> and <@
 
 # tursopg compares a json or text value as jsonb, where PostgreSQL has @> only
@@ -775,7 +782,7 @@ test jsonb-matches-jsonpath {
 expect {
     t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 @compat-gap "operator:jsonb #- _text"
@@ -785,7 +792,7 @@ test jsonb-delete-path {
 expect {
     {"a": {}}
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # jsonb_insert() of tursopg is the function of SQLite, which takes a JSON

@@ -6564,6 +6564,16 @@ impl BTreeTable {
         self.logical_to_physical_map[logical]
     }
 
+    /// Returns the column stored at record offset `physical`, the reverse of
+    /// [Self::logical_to_physical_column].
+    pub fn column_at_physical_offset(&self, physical: usize) -> Option<&Column> {
+        let logical = self
+            .logical_to_physical_map
+            .iter()
+            .position(|&offset| offset == physical)?;
+        self.columns.get(logical)
+    }
+
     pub fn build_logical_to_physical_map(
         columns: &[Column],
         primary_key_columns: &[(String, SortOrder)],

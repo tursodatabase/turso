@@ -635,32 +635,6 @@ fn update_pragma(
                 ));
             };
             pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
-            let largest_root_page_number_reg = program.alloc_register();
-            program.emit_insn(Insn::ReadCookie {
-                db: database_id,
-                dest: largest_root_page_number_reg,
-                cookie: Cookie::LargestRootPageNumber,
-            });
-            let set_cookie_label = program.allocate_label();
-            program.emit_insn(Insn::If {
-                reg: largest_root_page_number_reg,
-                target_pc: set_cookie_label,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::Halt {
-                constraint_info: None,
-                err_code: 0,
-                description: "Early halt because auto vacuum mode is not enabled".to_string(),
-                on_error: None,
-                description_reg: None,
-            });
-            program.preassign_label_to_next_insn(set_cookie_label);
-            program.emit_insn(Insn::SetCookie {
-                db: database_id,
-                cookie: Cookie::IncrementalVacuum,
-                value: i32::from(u8::from(auto_vacuum_mode)) - 1,
-                p5: 0,
-            });
             Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),

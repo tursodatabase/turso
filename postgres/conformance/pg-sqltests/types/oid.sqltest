@@ -1,0 +1,298 @@
+# The oid type is a number from 0 to 4294967295. It reads text as PostgreSQL
+# does and refuses a number that does not fit, in a column and in a cast.
+
+@database :memory:
+
+test oid-reads-decimal-text {
+    SELECT '0'::oid, '42'::oid, '4294967295'::oid, ' 42 '::oid, '+5'::oid;
+}
+expect {
+    0|42|4294967295|42|5
+}
+
+test oid-reads-hex-and-octal-text {
+    SELECT '0x10'::oid, '0X7fffffff'::oid, '010'::oid;
+}
+expect {
+    16|2147483647|8
+}
+
+# A negative number down to -2147483648 wraps around.
+test oid-wraps-negative-text {
+    SELECT '-1'::oid, '-2147483648'::oid, '-0'::oid;
+}
+expect {
+    4294967295|2147483648|0
+}
+
+test oid-refuses-text-above-the-largest-oid {
+    SELECT '4294967296'::oid;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+test oid-refuses-text-below-the-smallest-negative {
+    SELECT '-2147483649'::oid;
+}
+@sqlstate 22003
+expect error {
+    value "-2147483649" is out of range for type oid
+}
+
+test oid-refuses-letters {
+    SELECT 'abc'::oid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "abc"
+}
+
+test oid-refuses-letters-after-digits {
+    SELECT '12abc'::oid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "12abc"
+}
+
+test oid-refuses-empty-text {
+    SELECT ''::oid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: ""
+}
+
+test oid-refuses-hex-prefix-without-digits {
+    SELECT '0x'::oid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "0x"
+}
+
+test oid-refuses-digit-that-octal-does-not-have {
+    SELECT '08'::oid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "08"
+}
+
+test oid-casts-integers {
+    SELECT 1::int2::oid, 70000::int4::oid, 3000000000::int8::oid, 4294967295::int8::oid;
+}
+expect {
+    1|70000|3000000000|4294967295
+}
+
+# An integer of four bytes that is negative wraps around.
+test oid-wraps-negative-integers {
+    SELECT (-1)::oid, (-5)::int2::oid, (-2147483648)::int4::oid;
+}
+expect {
+    4294967295|4294967291|2147483648
+}
+
+test oid-refuses-integer-above-the-largest-oid {
+    SELECT 4294967296::oid;
+}
+@sqlstate 22003
+expect error {
+    OID out of range
+}
+
+test oid-refuses-negative-bigint {
+    SELECT (-5)::int8::oid;
+}
+@sqlstate 22003
+expect error {
+    OID out of range
+}
+
+test oid-refuses-bigint-below-the-smallest-negative {
+    SELECT (-3000000000)::oid;
+}
+@sqlstate 22003
+expect error {
+    OID out of range
+}
+
+test oid-refuses-cast-from-a-decimal-number {
+    SELECT 1.5::oid;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type numeric to oid
+}
+
+test oid-refuses-cast-from-double-precision {
+    SELECT 1::float8::oid;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type double precision to oid
+}
+@sqlstate 42846
+expect @tursopg error {
+    cannot cast type float8 to oid
+}
+
+test oid-casts-to-bigint {
+    SELECT 4294967295::oid::int8, 5::oid::int8;
+}
+expect {
+    4294967295|5
+}
+
+# An oid above 2147483647 is negative as an integer.
+test oid-casts-to-integer-wraps {
+    SELECT 4294967295::oid::int4, 3000000000::oid::int4, 4294967295::oid::int8;
+}
+expect {
+    -1|-1294967296|4294967295
+}
+
+test oid-refuses-cast-to-smallint {
+    SELECT 5::oid::int2;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type oid to smallint
+}
+@sqlstate 42846
+expect @tursopg error {
+    cannot cast type oid to int2
+}
+
+@compat-gap "type:numeric"
+test oid-refuses-cast-to-numeric {
+    SELECT 5::oid::numeric;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type oid to numeric
+}
+expect @tursopg {
+    5.0
+}
+
+test oid-casts-to-text {
+    SELECT 4294967295::oid::text, 5::oid::varchar;
+}
+expect {
+    4294967295|5
+}
+
+test oid-column-stores-text-and-integers {
+    CREATE TABLE t (id int, o oid);
+    INSERT INTO t VALUES (1, '7'), (2, 3000000000), (3, 5), (4, '-1');
+    SELECT id, o FROM t ORDER BY id;
+}
+expect {
+    1|7
+    2|3000000000
+    3|5
+    4|4294967295
+}
+
+# An oid above 2147483647 sorts after the smaller ones.
+test oid-column-sorts-as-unsigned {
+    CREATE TABLE t (o oid);
+    INSERT INTO t VALUES (4294967295), (3000000000), (7), (5), (2147483648);
+    SELECT o FROM t ORDER BY o;
+    SELECT max(o), min(o) FROM t;
+}
+expect {
+    5
+    7
+    2147483648
+    3000000000
+    4294967295
+    4294967295|5
+}
+
+test oid-column-refuses-integer-above-the-largest-oid {
+    CREATE TABLE t (o oid);
+    INSERT INTO t VALUES (4294967296);
+}
+@sqlstate 22003
+expect error {
+    OID out of range
+}
+
+test oid-column-refuses-letters {
+    CREATE TABLE t (o oid);
+    INSERT INTO t VALUES ('abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "abc"
+}
+
+test oid-column-refuses-text-above-the-largest-oid {
+    CREATE TABLE t (o oid);
+    INSERT INTO t VALUES ('4294967296');
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+test oid-column-refuses-a-decimal-number {
+    CREATE TABLE t (o oid);
+    INSERT INTO t VALUES (1.5);
+}
+@sqlstate 42804
+expect error {
+    column "o" is of type oid but expression is of type numeric
+}
+@sqlstate 42804
+expect @tursopg error {
+    a value of type numeric cannot be assigned to type oid
+}
+
+test oid-column-update-refuses-letters {
+    CREATE TABLE t (o oid);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET o = 'abc';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "abc"
+}
+
+test oid-column-reads-hex-text {
+    CREATE TABLE t (o oid);
+    INSERT INTO t VALUES ('0x10');
+    SELECT o FROM t;
+}
+expect {
+    16
+}
+
+test oid-column-reads-octal-text {
+    CREATE TABLE t (o oid);
+    INSERT INTO t VALUES ('010');
+    SELECT o FROM t;
+}
+expect {
+    8
+}
+
+test pg-input-is-valid-reads-oid-text-as-the-type-does {
+    SELECT pg_input_is_valid('0x10', 'oid'), pg_input_is_valid('-1', 'oid'),
+        pg_input_is_valid('4294967296', 'oid'), pg_input_is_valid('abc', 'oid');
+}
+expect {
+    t|t|f|f
+}
+
+test pg-input-error-info-of-oid-text {
+    SELECT message, sql_error_code FROM pg_input_error_info('4294967296', 'oid');
+}
+expect {
+    value "4294967296" is out of range for type oid|22003
+}

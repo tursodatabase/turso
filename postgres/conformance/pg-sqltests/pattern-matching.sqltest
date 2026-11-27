@@ -1,0 +1,24 @@
+# LIKE, the regular expression operators and SIMILAR TO.
+
+@database :memory:
+
+test like-case-sensitive-literal {
+    SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%', 'abc' LIKE 'A%';
+}
+expect {
+    f|t|f
+}
+
+test regex-classes-d-and-escapes {
+    SELECT 'a1' ~ '^a\d$', 'a.c' ~ '^a\.c$', 'abc' ~ '^a\.c$';
+}
+expect {
+    t|t|f
+}
+
+test similar-to {
+    SELECT 'abc' SIMILAR TO 'a(b|x)c', 'abc' SIMILAR TO 'b';
+}
+expect {
+    t|f
+}

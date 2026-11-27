@@ -202,6 +202,7 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
         "int4" => Int4,
         "bigint" => Int8,
         "boolean" => Bool,
+        "oid" => Oid,
         "timestamp" => Timestamp,
         "timestamptz" => TimestampTz,
         // FIXME(pg-catalog): numeric is registered only with a type modifier. Without one it is REAL, which `is_lowered_type_name` leaves to the engine. A numeric type that needs no modifier lets every numeric go through CASTS.
@@ -245,7 +246,7 @@ fn named_cast_type(name: &str, place: NamePlace) -> Option<CastType> {
     })
 }
 
-/// FIXME(pg-catalog): These built-in types have no rows in `CASTS`, so the engine decides their casts by `Dialect::text_input_types_refuse_other_kinds` and `check_cast_from_text_input_type` of core, and by the CAST function of the type. A type moves from this list to `CASTS` when its pg_cast rows and their conversions are written: date and time first, then json and jsonb, then inet, cidr and the macaddr types. bytea, oid and the reg types need a registered type first. The list is empty when every built-in type is in pg_type and pg_cast.
+/// FIXME(pg-catalog): These built-in types have no rows in `CASTS`, so the engine decides their casts by `Dialect::text_input_types_refuse_other_kinds` and `check_cast_from_text_input_type` of core, and by the CAST function of the type. A type moves from this list to `CASTS` when its pg_cast rows and their conversions are written: date and time first, then json and jsonb, then inet, cidr and the macaddr types. bytea and the reg types need a registered type first. The list is empty when every built-in type is in pg_type and pg_cast.
 /// The built-in types whose casts the engine decides.
 const ENGINE_RULE_TYPES: &[&str] = &[
     "date",
@@ -258,7 +259,6 @@ const ENGINE_RULE_TYPES: &[&str] = &[
     "cidr",
     "macaddr",
     "macaddr8",
-    "oid",
     "regclass",
     "regtype",
     "regproc",
@@ -272,7 +272,7 @@ const ENGINE_RULE_TYPES: &[&str] = &[
     "regcollation",
 ];
 
-/// FIXME(pg-catalog): These are SQLite type names that the translator writes for PostgreSQL types `named_cast_type` cannot tell apart: an INTEGER column is an oid or a reg type, a CAST to INTEGER is a cast to one of those or to a serial type, a CAST to REAL is a cast to numeric, decimal or money, and BLOB is bytea. The engine casts them as it did before. Registered oid, numeric and bytea types, whose names reach the cast, replace this.
+/// FIXME(pg-catalog): These are SQLite type names that the translator writes for PostgreSQL types `named_cast_type` cannot tell apart: an INTEGER column is a reg type or an array of oids, a CAST to INTEGER is a cast to one of those or to a serial type, a CAST to REAL is a cast to numeric, decimal or money, and BLOB is bytea. The engine casts them as it did before. Registered numeric, bytea and reg types, whose names reach the cast, replace this.
 /// Whether the lowercase `name`, written at `place`, is a SQLite type name
 /// that stands for a PostgreSQL type whose casts the engine decides.
 fn is_lowered_type_name(name: &str, place: NamePlace) -> bool {

@@ -767,6 +767,9 @@ pub struct ChosenOperator {
     /// The dialect's own identifier of the operator: the oid of its pg_operator row for PostgreSQL.
     pub id: i64,
     pub operands: Vec<ast::Type>,
+    /// Which operands are cast to their type in `operands` when they are not
+    /// string literals. Empty when only string literals are cast.
+    pub cast_operands: Vec<bool>,
     /// `None` when the engine's own rules run the operator.
     pub function: Option<OperatorFunction>,
 }

@@ -1,6 +1,7 @@
 use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
 use crate::ast::{Expr, UnaryOperator};
+use crate::dialect::{Dialect, OperandType, OperatorChoice};
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
@@ -556,6 +557,7 @@ pub fn in_subquery_collation(
         &types[0],
         &types[1],
         resolver.schema(),
+        resolver.catalog.dialect.as_ref(),
         resolver
             .catalog
             .dialect
@@ -628,12 +630,15 @@ pub(crate) fn expr_text_collation(
 pub fn first_collation<'a, 'c, 's: 'c>(
     exprs: impl IntoIterator<Item = (&'a Expr, ExprContext<'c, 's>)> + Clone,
 ) -> Result<CollationSeq> {
-    check_comparable_types(
-        exprs
-            .clone()
-            .into_iter()
-            .map(|(expr, context)| (type_of(expr, &context.type_env()), context.schema())),
-    )?;
+    if let Some((_, context)) = exprs.clone().into_iter().next() {
+        check_comparable_types(
+            context.catalog().dialect.as_ref(),
+            exprs
+                .clone()
+                .into_iter()
+                .map(|(expr, context)| (type_of(expr, &context.type_env()), context.schema())),
+        )?;
+    }
     if let Some(ordering) = common_type_ordering(exprs.clone())? {
         return Ok(CollationSeq::Type(ordering));
     }
@@ -654,6 +659,7 @@ pub fn compound_column_collation(
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
     check_comparable_types(
+        resolver.catalog.dialect.as_ref(),
         compound_column_exprs(arms, column, resolver)
             .map(|(expr, context)| (type_of(expr, &context.type_env()), context.schema())),
     )?;
@@ -1012,13 +1018,14 @@ fn check_comparable(
     a: &ExprType,
     b: &ExprType,
     schema: &Schema,
+    dialect: &dyn Dialect,
     allow_timestamp_with_timestamptz: bool,
 ) -> Result<()> {
     // Two arrays compare element by element, so their elements must compare.
     // PostgreSQL has no array operator for timestamp[] with timestamptz[], so
     // that pair stays refused.
     if let (ExprType::Array { element: x, .. }, ExprType::Array { element: y, .. }) = (a, b) {
-        return check_comparable(x, y, schema, false).map_err(|_| cannot_compare(a, b));
+        return check_comparable(x, y, schema, dialect, false).map_err(|_| cannot_compare(a, b));
     }
     let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) = (a, b)
     else {
@@ -1030,7 +1037,13 @@ fn check_comparable(
     if allow_timestamp_with_timestamptz && timestamp_compared_with_timestamptz(&x, &y) {
         return Ok(());
     }
-    if same_type_def(&x, &y) || !(x.changes_stored_value() || y.changes_stored_value()) {
+    if same_type_def(&x, &y) {
+        return Ok(());
+    }
+    if dialect_casts_to_compare(dialect, &x, &y) {
+        return Err(cannot_compare(a, b));
+    }
+    if !(x.changes_stored_value() || y.changes_stored_value()) {
         return Ok(());
     }
     // The orders of the types themselves, not of their bases: a domain over
@@ -1039,6 +1052,21 @@ fn check_comparable(
         return Ok(());
     }
     Err(cannot_compare(a, b))
+}
+
+/// Whether the dialect's operator for comparing values of `x` with values of
+/// `y` casts an operand first. The engine compares the stored forms as they
+/// are, so a comparison that does not apply the cast gives a wrong answer.
+fn dialect_casts_to_compare(dialect: &dyn Dialect, x: &TypeDef, y: &TypeDef) -> bool {
+    let operand = |ty: &TypeDef| {
+        OperandType::Registered(crate::ast::Type {
+            name: ty.name.clone(),
+            size: None,
+            array_dimensions: 0,
+        })
+    };
+    let choice = dialect.choose_operator("=", &|| vec![operand(x), operand(y)]);
+    matches!(choice, Ok(OperatorChoice::Chosen(chosen)) if chosen.cast_operands.contains(&true))
 }
 
 /// FIXME(pg-catalog): HACK. This hand-written pair stands in for pg_operator's
@@ -1127,6 +1155,7 @@ fn check_comparable_exprs(
         &type_of(lhs, &lhs_context.type_env()),
         &type_of(rhs, &rhs_context.type_env()),
         lhs_context.schema(),
+        lhs_context.catalog().dialect.as_ref(),
         lhs_context.compares_timestamp_with_timestamptz(),
     )
 }
@@ -1144,6 +1173,7 @@ fn check_in_list_comparable(
             &lhs_type,
             &type_of(item, &env),
             context.schema(),
+            context.catalog().dialect.as_ref(),
             context.compares_timestamp_with_timestamptz(),
         )
     })
@@ -1157,7 +1187,10 @@ pub(crate) fn check_comparable_results<'a>(
     context: &ExprContext<'_, '_>,
 ) -> Result<()> {
     let env = context.type_env();
-    check_comparable_types(exprs.map(|expr| (type_of(expr, &env), context.schema())))
+    check_comparable_types(
+        context.catalog().dialect.as_ref(),
+        exprs.map(|expr| (type_of(expr, &env), context.schema())),
+    )
 }
 
 /// [check_comparable] for every pair of the values of `args`, the arguments
@@ -1170,13 +1203,16 @@ fn check_comparable_array_values<'a>(
     context: &ExprContext<'_, '_>,
 ) -> Result<()> {
     let env = context.type_env();
-    check_comparable_types(args.map(|arg| {
-        let value_type = match type_of(arg, &env) {
-            ExprType::Array { element, .. } => *element,
-            ty => ty,
-        };
-        (value_type, context.schema())
-    }))
+    check_comparable_types(
+        context.catalog().dialect.as_ref(),
+        args.map(|arg| {
+            let value_type = match type_of(arg, &env) {
+                ExprType::Array { element, .. } => *element,
+                ty => ty,
+            };
+            (value_type, context.schema())
+        }),
+    )
 }
 
 /// [check_comparable] for every pair of `types`. This is the one place that
@@ -1184,7 +1220,10 @@ fn check_comparable_array_values<'a>(
 /// column of a compound SELECT or recursive CTE, and the check of an
 /// expression calls it for the arms of a CASE and the arguments of a function
 /// that returns one of them.
-fn check_comparable_types<'s>(types: impl Iterator<Item = (ExprType, &'s Schema)>) -> Result<()> {
+fn check_comparable_types<'s>(
+    dialect: &dyn Dialect,
+    types: impl Iterator<Item = (ExprType, &'s Schema)>,
+) -> Result<()> {
     // Different custom types are few, so keep one type of each name.
     let mut seen: SmallVec<[ExprType; 2]> = SmallVec::new();
     for (ty, schema) in types {
@@ -1200,7 +1239,7 @@ fn check_comparable_types<'s>(types: impl Iterator<Item = (ExprType, &'s Schema)
             continue;
         }
         for other in &seen {
-            check_comparable(other, &ty, schema, false)?;
+            check_comparable(other, &ty, schema, dialect, false)?;
         }
         seen.push(ty);
     }

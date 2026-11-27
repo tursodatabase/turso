@@ -28,11 +28,14 @@ members = [
     "tests",
     "sqlite/frontend",
     "sqlite/parser",
+    "postgres/catalog",
+    "postgres/catalog/generator",
     "postgres/cli",
     "postgres/client",
     "postgres/frontend",
     "postgres/parser",
     "postgres/regress",
+    "postgres/scanner",
     "postgres/dump-fuzzer",
     "postgres/server",
     "postgres/tests",
@@ -132,8 +135,10 @@ turso_macros = { path = "macros", version = "0.9.0-pre.6" }
 turso_parser = { path = "sqlite/parser", version = "0.9.0-pre.6" }
 turso_sqlite = { path = "sqlite/frontend", version = "0.9.0-pre.6" }
 turso_pg = { path = "postgres/frontend", version = "0.9.0-pre.6" }
+turso_pg_catalog = { path = "postgres/catalog", version = "0.9.0-pre.6" }
 turso_pg_client = { path = "postgres/client", version = "0.9.0-pre.6" }
 turso_pg_parser = { path = "postgres/parser", version = "0.9.0-pre.6" }
+turso_pg_scanner = { path = "postgres/scanner", version = "0.9.0-pre.6" }
 turso_pg_server = { path = "postgres/server", version = "0.9.0-pre.6" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }

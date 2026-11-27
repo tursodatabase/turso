@@ -56,18 +56,6 @@ expect {
     2
 }
 
-# B-04: IS TRUE / IS NOT TRUE on bool col
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test is-true-is-not-true-on-bool-col {
-    SELECT id, ok IS TRUE, ok IS NOT TRUE FROM t ORDER BY id;
-}
-expect {
-    1|t|f
-    2|f|t
-    3|f|t
-    4|f|t
-}
-
 # B-05: IS UNKNOWN
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test is-unknown {
@@ -85,14 +73,6 @@ test like-is-case-sensitive {
 }
 expect {
     2
-}
-
-# B-07: LIKE case-sensitive literal
-test like-case-sensitive-literal {
-    SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%', 'abc' LIKE 'A%';
-}
-expect {
-    f|t|f
 }
 
 # B-08: LIKE default escape \_
@@ -165,7 +145,7 @@ expect {
     3
     4
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-16: ILIKE ALL(array)
@@ -179,7 +159,7 @@ expect {
     3
     4
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-17: ~ regex is case-sensitive
@@ -222,38 +202,6 @@ expect {
     4
 }
 
-# B-21: regex classes \d and escapes
-test regex-classes-d-and-escapes {
-    SELECT 'a1' ~ '^a\d$', 'a.c' ~ '^a\.c$', 'abc' ~ '^a\.c$';
-}
-expect {
-    t|t|f
-}
-
-# B-22: SIMILAR TO
-test similar-to {
-    SELECT 'abc' SIMILAR TO 'a(b|x)c', 'abc' SIMILAR TO 'b';
-}
-expect {
-    t|f
-}
-
-# B-23: IN with NULL (three-valued)
-test in-with-null-three-valued {
-    SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL);
-}
-expect {
-    t||
-}
-
-# B-25: = ANY('{..}'::int[])
-test eq-any-int-array-literal {
-    SELECT 1 = ANY('{1,2}'::int[]), 3 = ANY('{1,2}'::int[]);
-}
-expect {
-    t|f
-}
-
 # B-26: > ALL / < ANY (non-equality)
 @compat-gap "syntax:any-all"
 test all-any-non-equality {
@@ -262,7 +210,7 @@ test all-any-non-equality {
 expect {
     t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-28: = ANY(array) with NULL element
@@ -319,14 +267,6 @@ test array-equality-col-literal {
 }
 expect {
     1
-}
-
-# B-35: ARRAY @> ARRAY literal
-test array-array-literal {
-    SELECT ARRAY[1,2] @> ARRAY[1], ARRAY['a'] <@ ARRAY['a','b'], ARRAY[1] && ARRAY[2];
-}
-expect {
-    t|t|f
 }
 
 # B-36: array subscript 1-based + out of range
@@ -511,7 +451,7 @@ test to-tsvector-plainto-tsquery {
 expect {
     t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-56: websearch_to_tsquery
@@ -522,7 +462,7 @@ test websearch-to-tsquery {
 expect {
     t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-57: to_tsquery / phraseto_tsquery
@@ -533,7 +473,7 @@ test to-tsquery-phraseto-tsquery {
 expect {
     t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-58: text col @@ to_tsquery
@@ -545,7 +485,7 @@ test text-col-to-tsquery {
 expect {
     1
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-59: to_tsvector output
@@ -578,7 +518,7 @@ test range-overlap-strictly-left-adjacent {
 expect {
     t|t|t
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-62: tstzrange contains
@@ -761,14 +701,6 @@ expect {
     t
 }
 
-# B-78: gen_random_uuid() format
-test gen-random-uuid-format {
-    SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
-}
-expect {
-    t
-}
-
 # B-79: set_config + current_setting
 test set-config-current-setting {
     SELECT set_config('request.jwt.claims', '{"sub":"u1"}', true);
@@ -815,7 +747,7 @@ test caret-is-the-power-operator {
 expect {
     8
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-84: || with NULL and int
@@ -970,14 +902,6 @@ expect {
     1|2
 }
 
-# B-97: current_user / current_role
-test current-user-current-role {
-    SELECT current_user = current_role;
-}
-expect {
-    t
-}
-
 # B-98: pg_catalog.-qualified function
 test pg-catalog-qualified-function {
     SELECT pg_catalog.lower('A');
@@ -1062,24 +986,6 @@ expect {
     z|0
 }
 
-# B-106: boolean comparison output
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test boolean-comparison-output {
-    SELECT id < 2, n IS NULL FROM t WHERE id = 1;
-}
-expect {
-    t|f
-}
-
-# B-107: EXISTS subquery output
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test exists-subquery-output {
-    SELECT EXISTS (SELECT 1 FROM t WHERE id = 1);
-}
-expect {
-    t
-}
-
 # B-117: VALUES list with column aliases v(x)
 test values-list-with-column-aliases-v-x {
     SELECT x FROM (VALUES (1), (2)) v(x) ORDER BY x;
@@ -1152,7 +1058,7 @@ test with-insert-returning-data-modifying-cte {
 expect {
     9
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-110: row comparison (a,b) > (x,y) (keyset pagination)
@@ -1270,15 +1176,6 @@ expect @tursopg raw {
  12
 }
 
-test to-char-null-timestamptz-row {
-    CREATE TABLE to_char_times (at timestamptz);
-    INSERT INTO to_char_times VALUES (NULL);
-    SELECT to_char(at, 'YYYY') IS NULL FROM to_char_times;
-}
-expect {
-    t
-}
-
 # to_timestamp(double precision)
 @compat-gap "function:to_timestamp"
 test to-timestamp-epoch {
@@ -1314,14 +1211,6 @@ expect {
 }
 @sqlstate 42883
 expect @tursopg error {}
-
-# B-127: ->> of a JSON boolean is the text true
-test of-a-json-boolean-is-the-text-true {
-    SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
-}
-expect {
-    true|f
-}
 
 # B-128: jsonb || concatenates two objects
 # B-122 also uses ||. After a fix, the output still differs because of A-45.

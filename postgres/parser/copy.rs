@@ -12,7 +12,10 @@ pub struct CopyToStdout {
 pub fn parse_copy_to_stdout(sql: &str) -> Result<Option<CopyToStdout>, ParseError> {
     let parsed = crate::parse(sql)?;
     if parsed.protobuf.stmts.len() > 1 {
-        return Err(ParseError::ParseError("expected one statement".to_owned()));
+        return Err(ParseError::sqlstate(
+            crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "expected one statement",
+        ));
     }
     try_extract_copy_to_stdout(sql, &parsed)
 }
@@ -28,25 +31,31 @@ pub(crate) fn try_extract_copy_to_stdout(
         return Ok(None);
     }
     if parsed.protobuf.stmts.len() > 1 {
-        return Err(ParseError::ParseError("expected one statement".to_owned()));
+        return Err(ParseError::sqlstate(
+            crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "expected one statement",
+        ));
     }
     if copy.is_program {
-        return Err(ParseError::ParseError(
-            "COPY TO PROGRAM is not supported".to_owned(),
-        ));
+        return Err(ParseError::not_supported("COPY TO PROGRAM"));
     }
     if !copy.filename.is_empty() {
-        return Err(ParseError::ParseError(
-            "COPY TO only supports STDOUT".to_owned(),
-        ));
+        return Err(ParseError::sqlstate(
+            crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "COPY TO only supports STDOUT",
+        )
+        .with_hint("Use COPY ... TO STDOUT and write the file in the client (psql \\copy)."));
     }
     let table = copy.relation.as_ref().ok_or_else(|| {
-        ParseError::ParseError("COPY TO STDOUT only supports a table, not a query".to_owned())
+        ParseError::sqlstate(
+            crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "COPY TO STDOUT only supports a table, not a query",
+        )
     })?;
     // pg_query's protobuf represents both TO STDOUT (a null filename in PostgreSQL)
     // and TO '' as an empty string. Scan the SQL to reject the empty filename
     // instead of treating it as STDOUT.
-    let scanned = pg_query::scan(sql).map_err(|error| ParseError::ParseError(error.to_string()))?;
+    let scanned = pg_query::scan(sql).map_err(|error| ParseError::PgQuery(error.into()))?;
     let destination = scanned
         .tokens
         .iter()
@@ -55,13 +64,15 @@ pub(crate) fn try_extract_copy_to_stdout(
         .skip_while(|token| *token != Token::To)
         .nth(1);
     if destination != Some(Token::Stdout) {
-        return Err(ParseError::ParseError(
-            "COPY TO only supports STDOUT".to_owned(),
+        return Err(ParseError::sqlstate(
+            crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "COPY TO only supports STDOUT",
         ));
     }
     if !table.catalogname.is_empty() {
-        return Err(ParseError::ParseError(
-            "COPY cannot name another database".to_owned(),
+        return Err(ParseError::sqlstate(
+            crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "COPY cannot name another database",
         ));
     }
     let mut format_seen = false;
@@ -70,22 +81,23 @@ pub(crate) fn try_extract_copy_to_stdout(
             unreachable!("COPY options are DefElem nodes");
         };
         if option.defname != "format" {
-            return Err(ParseError::ParseError(format!(
-                "COPY TO STDOUT option '{}' is not supported",
+            return Err(ParseError::not_supported(format!(
+                "COPY TO STDOUT option '{}'",
                 option.defname
             )));
         }
         if format_seen {
-            return Err(ParseError::ParseError(
-                "COPY format was specified more than once".to_owned(),
+            return Err(ParseError::syntax_error(
+                "COPY format was specified more than once",
             ));
         }
         format_seen = true;
         match option.arg.as_ref().and_then(|arg| arg.node.as_ref()) {
             Some(Node::String(format)) if format.sval == "text" => {}
             _ => {
-                return Err(ParseError::ParseError(
-                    "COPY TO STDOUT only supports text format".to_owned(),
+                return Err(ParseError::sqlstate(
+                    crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    "COPY TO STDOUT only supports text format",
                 ))
             }
         }
@@ -96,10 +108,10 @@ pub(crate) fn try_extract_copy_to_stdout(
             unreachable!("COPY column names are String nodes");
         };
         if columns.contains(&column.sval) {
-            return Err(ParseError::ParseError(format!(
-                "COPY column '{}' was specified more than once",
-                column.sval
-            )));
+            return Err(ParseError::sqlstate(
+                crate::sqlstate::SQLSTATE_DUPLICATE_COLUMN,
+                format!("COPY column '{}' was specified more than once", column.sval),
+            ));
         }
         columns.push(column.sval.clone());
     }

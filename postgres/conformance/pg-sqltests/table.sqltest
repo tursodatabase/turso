@@ -1549,3 +1549,12 @@ test integer-primary-key-refuses-an-upsert-to-null {
 }
 @sqlstate 23502
 expect error {}
+
+test omitted-nullable-uuid-column-stays-null {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT id, u IS NULL FROM t;
+}
+expect {
+    1|t
+}
