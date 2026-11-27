@@ -645,3 +645,80 @@ fn key_of(value: &Value) -> Key {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turso_pg_catalog::PgCollation;
+    use turso_pg_catalog::PgDescription;
+
+    #[test]
+    fn the_stored_table_has_the_name_the_columns_and_the_indexes_of_the_catalog() {
+        let description = Catalog::of::<PgDescription>();
+        assert_eq!(description.name(), "pg_description");
+        assert_eq!(
+            description.create_sql,
+            [
+                "CREATE TABLE pg_description (objoid INTEGER NOT NULL, \
+                 classoid INTEGER NOT NULL, objsubid INTEGER NOT NULL, \
+                 description TEXT NOT NULL)",
+                "CREATE UNIQUE INDEX pg_description_o_c_o_index \
+                 ON pg_description (objoid, classoid, objsubid)",
+            ]
+        );
+        assert_eq!(
+            description.select_sql[2],
+            "SELECT objoid, classoid, objsubid, description, rowid \
+             FROM pg_description WHERE objoid = ?1 AND classoid = ?2"
+        );
+        assert_eq!(description.key_index(), "pg_description_o_c_o_index");
+        // A catalog whose key is its oid. pg_collation is not on the list,
+        // but its stored table would have this SQL.
+        let collation = Catalog::of::<PgCollation>();
+        assert!(collation.key_is_rowid());
+        assert!(collation.create_sql[0]
+            .starts_with("CREATE TABLE pg_collation (oid INTEGER PRIMARY KEY,"));
+        assert_eq!(
+            collation.select_sql[1],
+            format!(
+                "SELECT {}, rowid FROM pg_collation WHERE oid = ?1",
+                collation.columns().join(", ")
+            )
+        );
+    }
+
+    #[test]
+    fn write_statements_insert_and_delete_a_stored_row() {
+        let description = Catalog::of::<PgDescription>();
+        let row = [
+            Value::from_i64(16384),
+            Value::from_i64(1259),
+            Value::from_i64(0),
+            Value::from_text("it's mine"),
+        ];
+        assert_eq!(
+            description.insert_statement(&row).unwrap(),
+            "INSERT INTO pg_description \
+             (objoid, classoid, objsubid, description) VALUES (16384, 1259, 0, 'it''s mine')"
+        );
+        assert_eq!(
+            description.delete_statement(&[16384, 1259, 0]),
+            "DELETE FROM pg_description \
+             WHERE objoid = 16384 AND classoid = 1259 AND objsubid = 0"
+        );
+    }
+
+    /// A statement does not change a built-in row, so a write with the key
+    /// of one is a bug of the frontend.
+    #[test]
+    fn a_write_with_the_key_of_a_builtin_row_fails() {
+        let row = [
+            Value::from_i64(2200),
+            Value::from_i64(2615),
+            Value::from_i64(0),
+            Value::from_text("mine"),
+        ];
+        assert!(Catalog::of::<PgDescription>()
+            .insert_statement(&row)
+            .is_err());
+    }
+}
