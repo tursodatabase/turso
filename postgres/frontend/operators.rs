@@ -903,6 +903,7 @@ mod tests {
             name: name.to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         })
     }
 
@@ -910,7 +911,6 @@ mod tests {
         OperandType::Engine {
             ty,
             array_dimensions: 0,
-            ty_annotation: None,
         }
     }
 
