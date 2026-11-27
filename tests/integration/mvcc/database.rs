@@ -13986,3 +13986,110 @@ fn integrity_check_steps_to_mvstore_entry_after_index_lookup() {
         vec![vec![Value::from_text("ok".to_string())]]
     );
 }
+
+/// Yields once at `point`, the first time the point comes after `armed` is set.
+#[derive(Debug)]
+struct YieldOnceAt {
+    point: YieldPoint,
+    armed: AtomicBool,
+}
+
+impl YieldInjector for YieldOnceAt {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        point == self.point && self.armed.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Runs `scan` in a transaction over checkpointed rows 1..=20. The second step of the scan
+/// yields at `point`, and at the yield the same transaction runs `write`. Returns the
+/// column `id_column` of each row of the scan.
+fn scan_with_own_write_at_step_yield(
+    point: YieldPoint,
+    mvcc_tail: &str,
+    write: &str,
+    scan: &str,
+    id_column: usize,
+) -> Vec<i64> {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v INT, w INT)",
+        "CREATE INDEX tv ON t(v)",
+        "INSERT INTO t SELECT value, value, 0 FROM generate_series(1, 20)",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        mvcc_tail,
+        "BEGIN",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let injector = Arc::new(YieldOnceAt {
+        point,
+        armed: AtomicBool::new(false),
+    });
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut ids = Vec::new();
+    let mut stmt = conn.prepare(scan).unwrap();
+    let mut write = Some(write);
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO => stmt._io().step().unwrap(),
+            StepResult::Yield => conn.execute(write.take().unwrap()).unwrap(),
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                ids.push(row.get_value(id_column).as_int().unwrap());
+                injector.armed.store(ids.len() == 1, Ordering::SeqCst);
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    assert!(write.is_none(), "the scan did not yield at {point:?}");
+    drop(stmt);
+    conn.set_yield_injector(None);
+    conn.execute("ROLLBACK").unwrap();
+    ids
+}
+
+/// A step checked whether the MvStore changed only before its `NextStart` yield. A write of
+/// the same transaction at that yield gave row 2 a new MvStore version after the MvStore
+/// head (row 20). After the yield, the B-tree head found row 2 shadowed, and the MvStore
+/// iterator had already passed it, so the scan skipped row 2.
+#[test]
+fn step_sees_own_write_made_at_yield() {
+    let point = CursorYieldPoint::NextStart.point();
+    let tail = "UPDATE t SET w = 5 WHERE id = 20";
+    let ids = scan_with_own_write_at_step_yield(
+        point,
+        tail,
+        "UPDATE t SET w = 7 WHERE id = 2",
+        "SELECT id FROM t",
+        0,
+    );
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+    let ids = scan_with_own_write_at_step_yield(
+        point,
+        "UPDATE t SET w = 5 WHERE id = 1",
+        "UPDATE t SET w = 7 WHERE id = 19",
+        "SELECT id FROM t ORDER BY id DESC",
+        0,
+    );
+    assert_eq!(ids, (1..=20).rev().collect::<Vec<_>>());
+    // The update rewrites the index entry of row 2 with the same key.
+    let ids = scan_with_own_write_at_step_yield(
+        point,
+        "UPDATE t SET v = 20 WHERE id = 20",
+        "UPDATE t SET v = 2 WHERE id = 2",
+        "SELECT v, id FROM t INDEXED BY tv WHERE v > 0 ORDER BY v",
+        1,
+    );
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+    // The same write while the step waits for the B-tree.
+    let ids = scan_with_own_write_at_step_yield(
+        CursorYieldPoint::AdvanceBtreeForwardProgress.point(),
+        tail,
+        "UPDATE t SET w = 7 WHERE id = 2",
+        "SELECT id FROM t",
+        0,
+    );
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+}

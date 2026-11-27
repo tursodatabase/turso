@@ -949,18 +949,24 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         let current = row_id.row_id.clone();
                         self.dual_peek.mvcc_peek.consume(&current);
                         self.dual_peek.btree_peek.consume(&current);
-                        if self.mvcc_rows_epoch() != self.mvcc_peek_epoch {
-                            // The MvStore iterator does not see a key added between the
-                            // current row and its head, and the head can be gone. A write
-                            // of this cursor's own transaction can do both.
-                            self.position_mvcc_head(Bound::Excluded(current), dir, None)?;
-                        }
                     }
                     // A step from the other edge starts at the first row in `dir`.
                     _ => self.start_at_edge(dir)?,
                 }
                 self.state = Some(MvccLazyCursorState::Walk(dir));
                 inject_io_yield!(self, CursorYieldPoint::NextStart);
+            }
+        }
+        if self.mvcc_rows_epoch() != self.mvcc_peek_epoch {
+            // A write of this cursor's own transaction can add a key between the current row
+            // and the MvStore head, or remove the head, and the MvStore iterator sees neither.
+            // The write can come before the step, or while the step waits on IO.
+            match &self.current_pos {
+                CursorPosition::Loaded { row_id, .. } => {
+                    let current = row_id.row_id.clone();
+                    self.position_mvcc_head(Bound::Excluded(current), dir, None)?;
+                }
+                _ => self.position_mvcc_head(Bound::Unbounded, dir, None)?,
             }
         }
         return_if_io!(self.walk(dir));
