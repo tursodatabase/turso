@@ -1,7 +1,8 @@
 //! Undefined sequences (SPEC 2d). The model has no result for them: `step` returns `None`.
 //! Today an engine does something arbitrary: it works by luck, reads another row or panics
-//! with an assertion. The contract is that a debug build refuses the sequence with an error
-//! or a panic whose message contains `unsupported`, so that the translator never emits it.
+//! with an assertion. The contract is that a debug build refuses the sequence with a panic
+//! whose message starts with `unsupported`, so that the translator never emits it. An error is
+//! not enough: an error is a defined outcome that a caller can handle or ignore.
 //!
 //! Each test checks that the model calls the last op of the program illegal and the ops
 //! before it legal. Then it runs the program on every engine and requires the refusal. Every
@@ -41,10 +42,11 @@ const TABLE_ROWS: &[(i64, i64)] = &[(10, 100), (20, 200), (30, 300)];
 fn judge(config: &str, op: &str, error: Option<&str>) {
     match error {
         None => panic!("{config}: the engine accepted {op}, an undefined sequence"),
-        Some(e) if e.contains("unsupported") => {}
+        // The harness writes a caught panic as `panic: <message>`.
+        Some(e) if e.starts_with("panic: unsupported") => {}
         Some(e) => panic!(
             "{config}: the engine refused {op}, an undefined sequence, \
-             without an `unsupported` message: {e}"
+             but not with an `unsupported` panic: {e}"
         ),
     }
 }

@@ -29,6 +29,14 @@ One store per tree, in one snapshot:
 - index: finite set of keys. A key is `(columns..., rowid)`. Order is the record order
   with collation and sort flags. NULL equals NULL and sorts first.
 
+All cursors of a program share one transaction. Other transactions are outside this
+contract: the harness has no second connection. In MVCC a write of another transaction is
+not visible in our snapshot, so an entry that another transaction deleted is still there for
+our cursor. A `Delete` of it is legal. It ends with the defined error `WriteWriteConflict`
+when the other transaction committed or holds the row (`core/mvcc/database/mod.rs`, around
+line 2167). So "the entry is under the cursor" means "in our snapshot". Only a delete by a
+cursor of our own transaction (a peer, see below) moves our cursor into the gap.
+
 A cursor has a position and a null-row flag. The position is one of:
 
 | Position | Meaning |
@@ -159,10 +167,11 @@ compound selects) stores only the columns. Two keys with equal columns are the s
 
 ## 2d. Undefined sequences
 
-**Rule.** When an op violates its precondition, a debug build of the engine returns an
-error or panics with a message that contains `unsupported`. The model storage (section 2e)
-panics with `unsupported: U<n>: <why>`. A release build may do
-anything (for now). The model calls the op illegal (`step` returns `None`) and the generator
+**Rule.** When an op violates its precondition, a debug build of the engine panics with a
+message that starts with `unsupported: U<n>: <why>`. It must be a panic, not an error:
+an error is a defined outcome (for example "UNIQUE constraint failed") that a caller can
+handle or ignore, and a panic cannot be mistaken for one. The model storage (section 2e)
+does this. A release build may do anything (for now). The model calls the op illegal (`step` returns `None`) and the generator
 never emits it. `undefined_tests.rs` checks both sides: the model says illegal, and every
 engine refuses. These tests are `known_bug_u*` tests until an engine refuses.
 
@@ -211,8 +220,11 @@ The test models use the same step function. They differ from the model storage o
 store and the compare: a list of `(rowid, value)` and a list of `(cols, rowid)` with the
 compare of section 2c.
 
-`NewRowid` gives `max + 1`, or 1 for an empty table (D6). The model accepts it with an append
-token: the next no-seek `Insert` must be above every key.
+The model storage gives `max + 1` for `NewRowid`, or 1 for an empty table. This is a choice of
+the model, not a requirement: the contract is only the predicate of D6 (unused, and above every
+key). The test models check an engine's rowid against that predicate and never against
+`max + 1`. WAL and MVCC may return different values, and both are correct. The model accepts
+the rowid with an append token: the next no-seek `Insert` must be above every key.
 
 ## 3. Insert seek contract
 
@@ -237,7 +249,7 @@ caller must have left the cursor at a `Seeked k` or `At k` position for the same
   own asserts forbid it. The MVCC overlay has no direction state. Do not make it work: a
   debug build refuses it (U1, section 2d).
 - **D4.** `Delete` with no current row is Undefined. Today BTree ignores it and MVCC
-  panics. A debug build refuses it with an `unsupported` message (U4).
+  panics. A debug build refuses it with an `unsupported` panic (U4).
 - **D5.** Another cursor's write leaves our cursor at its position by key, as SQLite's saved
   cursors do. If the write deleted our entry, we are in the gap. (This was U9, Undefined.
   Window functions need it: the corpus has 2,096 tests where an `OpenDup` reader of the
