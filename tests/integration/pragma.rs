@@ -241,8 +241,10 @@ fn test_pragma_cache_size_min_value(db: TempDatabase) {
     let query = format!("PRAGMA cache_size = {min_val}");
     conn.execute(&query).unwrap();
 
-    // Check the value was reset to default (0 in this implementation's logic for overflow)
-    assert_that!(limbo_exec_rows(&conn, "PRAGMA cache_size")).is_equal_to(vec![row![200]]);
+    // Like SQLite, an out-of-range value reads as 0 and the PRAGMA reports the
+    // value that was requested, not the internal page-cache capacity. The
+    // capacity itself is still clamped to `CacheSize::MIN` pages for safety.
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA cache_size")).is_equal_to(vec![row![0]]);
 }
 
 #[turso_macros::test(mvcc)]

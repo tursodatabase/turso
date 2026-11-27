@@ -362,10 +362,7 @@ fn update_pragma(
     };
     match pragma {
         PragmaName::ApplicationId => {
-            let data = parse_signed_number(&value)?;
-            let Some(app_id_value) = pragma_int_value(&value, &data) else {
-                bail_parse_error!("expected integer, got {:?}", data);
-            };
+            let app_id_value = pragma_int_value(&value);
 
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
@@ -376,10 +373,7 @@ fn update_pragma(
             Ok(TransactionMode::Write)
         }
         PragmaName::BusyTimeout => {
-            let data = parse_signed_number(&value)?;
-            let Some(busy_timeout_ms) = pragma_int_value(&value, &data) else {
-                bail_parse_error!("expected integer, got {:?}", data);
-            };
+            let busy_timeout_ms = pragma_int_value(&value);
             let busy_timeout_ms = busy_timeout_ms.max(0);
             connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
             // Like SQLite, the setter also returns the new busy timeout.
@@ -395,10 +389,7 @@ fn update_pragma(
             )
         }
         PragmaName::CacheSize => {
-            let data = parse_signed_number(&value)?;
-            let Some(cache_size) = pragma_int_value(&value, &data) else {
-                bail_parse_error!("Invalid value for cache size pragma");
-            };
+            let cache_size = pragma_int_value(&value);
             update_cache_size(i64::from(cache_size), pager, connection)?;
             Ok(TransactionMode::None)
         }
@@ -468,10 +459,7 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::WalAutocheckpoint => {
-            let data = parse_signed_number(&value)?;
-            let Some(frames) = pragma_int_value(&value, &data) else {
-                bail_parse_error!("expected integer, got {:?}", data);
-            };
+            let frames = pragma_int_value(&value);
             let frames = u32::try_from(frames).unwrap_or(0);
             connection.set_wal_autocheckpoint(frames);
             query_pragma(
@@ -507,12 +495,7 @@ fn update_pragma(
             program,
         ),
         PragmaName::MaxPageCount => {
-            let data = parse_signed_number(&value)?;
-            let max_page_count_value = match data {
-                Value::Numeric(Numeric::Integer(i)) => i as usize,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as usize,
-                _ => unreachable!(),
-            };
+            let max_page_count_value = pragma_max_page_count_value(&value);
 
             let result_reg = program.alloc_register();
             program.emit_insn(Insn::MaxPgcnt {
@@ -525,10 +508,7 @@ fn update_pragma(
             Ok(TransactionMode::Read)
         }
         PragmaName::UserVersion => {
-            let data = parse_signed_number(&value)?;
-            let Some(version_value) = pragma_int_value(&value, &data) else {
-                bail_parse_error!("expected integer, got {:?}", data);
-            };
+            let version_value = pragma_int_value(&value);
 
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
@@ -557,10 +537,7 @@ fn update_pragma(
             unreachable!();
         }
         PragmaName::PageSize => {
-            let data = parse_signed_number(&value)?;
-            let Some(page_size) = pragma_int_value(&value, &data) else {
-                bail_parse_error!("Invalid value for page size pragma");
-            };
+            let page_size = pragma_int_value(&value);
             // A negative size is invalid, so it reads as 0 like an out-of-range one.
             update_page_size(
                 connection,
@@ -2107,32 +2084,58 @@ fn emit_columns_for_table_info(
     }
 }
 
-/// Reads the value of an integer PRAGMA the way SQLite's `sqlite3Atoi` does:
-/// only the leading digits of a float literal count, so `8.192e3` is 8, and a
-/// value outside the 32-bit range reads as 0. Returns `None` for a value that
-/// is not a number.
-fn pragma_int_value(expr: &ast::Expr, data: &Value) -> Option<i32> {
-    let value = match data {
-        Value::Numeric(Numeric::Integer(i)) => *i,
-        Value::Numeric(Numeric::Float(_)) => {
-            let (negative, literal) = match expr {
-                Expr::Unary(ast::UnaryOperator::Negative, inner) => (true, inner.as_ref()),
-                Expr::Unary(_, inner) => (false, inner.as_ref()),
-                literal => (false, literal),
-            };
-            let Expr::Literal(Literal::Numeric(digits)) = literal else {
-                return None;
-            };
-            let leading = crate::numeric::str_to_i64(digits).unwrap_or(0);
-            if negative {
-                leading.checked_neg().unwrap_or(0)
-            } else {
-                leading
-            }
-        }
-        _ => return None,
+/// SQLite accepts a complete signed decimal or hexadecimal integer here.
+/// Invalid and nonpositive values leave the existing page limit unchanged.
+fn pragma_max_page_count_value(expr: &ast::Expr) -> usize {
+    let (negative, literal) = match expr {
+        Expr::Unary(ast::UnaryOperator::Negative, inner) => (true, inner.as_ref()),
+        Expr::Unary(ast::UnaryOperator::Positive, inner) => (false, inner.as_ref()),
+        literal => (false, literal),
     };
-    Some(i32::try_from(value).unwrap_or(0))
+    let text = match literal {
+        Expr::Literal(Literal::Numeric(text)) => text.as_str(),
+        Expr::Literal(Literal::String(text)) => text.trim_matches('\''),
+        Expr::Name(name) | Expr::Id(name) => name.as_str(),
+        _ => return 0,
+    };
+    let text = text.trim();
+    if negative || text.starts_with('-') {
+        return 0;
+    }
+    let text = text.strip_prefix('+').unwrap_or(text);
+    let parsed = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok().map(|value| value as i64)
+    } else {
+        text.parse::<i64>().ok()
+    };
+    parsed
+        .filter(|value| *value > 0)
+        .map_or(0, |value| value.min(0xffff_fffe) as usize)
+}
+
+/// SQLite's integer PRAGMAs parse the leading decimal or hexadecimal digits
+/// of the supplied text, returning zero for invalid or out-of-range values.
+fn pragma_int_value(expr: &ast::Expr) -> i32 {
+    let (sign, literal) = match expr {
+        Expr::Unary(ast::UnaryOperator::Negative, inner) => ("-", inner.as_ref()),
+        Expr::Unary(ast::UnaryOperator::Positive, inner) => ("+", inner.as_ref()),
+        literal => ("", literal),
+    };
+    let literal = match literal {
+        Expr::Literal(Literal::Numeric(text)) => text.as_str(),
+        Expr::Literal(Literal::String(text)) => text.trim_matches('\''),
+        Expr::Name(name) | Expr::Id(name) => name.as_str(),
+        _ => return 0,
+    };
+    let text = format!("{sign}{literal}");
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        let digits: String = hex.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        return i32::from_str_radix(&digits, 16).unwrap_or(0);
+    }
+    let digits = text.trim_start_matches(['+', '-']);
+    let count = digits.bytes().take_while(u8::is_ascii_digit).count();
+    let end = text.len() - digits.len() + count;
+    text[..end].parse::<i32>().unwrap_or(0)
 }
 
 fn update_cache_size(
@@ -2140,13 +2143,8 @@ fn update_cache_size(
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    let mut cache_size_unformatted: i64 = value;
-
-    let mut cache_size = if cache_size_unformatted < 0 {
-        let kb = cache_size_unformatted
-            .checked_abs()
-            .unwrap_or(i64::MAX)
-            .saturating_mul(1024);
+    let mut cache_size = if value < 0 {
+        let kb = value.checked_abs().unwrap_or(i64::MAX).saturating_mul(1024);
         let page_size = pager
             .io
             .block(|| pager.with_header(|header| header.page_size))
@@ -2165,22 +2163,21 @@ fn update_cache_size(
 
     if cache_size > CacheSize::MAX_SAFE {
         cache_size = 0;
-        cache_size_unformatted = 0;
     }
 
     if cache_size < 0 {
         cache_size = 0;
-        cache_size_unformatted = 0;
     }
 
     let final_cache_size = if cache_size < CacheSize::MIN {
-        cache_size_unformatted = CacheSize::MIN;
         CacheSize::MIN
     } else {
         cache_size
     };
 
-    connection.set_cache_size(cache_size_unformatted as i32);
+    // The reported PRAGMA value is distinct from our internal cache capacity,
+    // which is bounded for safety and may be converted from kibibytes to pages.
+    connection.set_cache_size(value as i32);
 
     pager
         .change_page_cache_size(final_cache_size as usize)
