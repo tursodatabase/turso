@@ -436,6 +436,10 @@ They only affect the names reported for result columns, never the data:
   `short_column_names` is also off.
 - With `short_column_names` on (and `full_column_names` off), a column reference is
   named with just its column name.
+- A column reference in parentheses, such as `(x)`, follows the same rules as `x`.
+  `x COLLATE nocase` is not a column reference: it is named by its text.
+- A rowid reference, such as `rowid` or `t.oid`, follows the same rules. Its column name
+  is the name of the `INTEGER PRIMARY KEY` column, else `rowid`.
 - An explicit `AS` alias always wins over both.
 
 SQLite deprecated both pragmas; prefer naming output columns with `AS` aliases in the

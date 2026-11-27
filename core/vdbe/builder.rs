@@ -1555,6 +1555,7 @@ impl ProgramBuilder {
             expr,
             alias: Some(col_name),
             implicit_column_name: None,
+            written_name: None,
             contains_aggregates: false,
             values_condition_type: None,
         });

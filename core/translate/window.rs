@@ -272,6 +272,7 @@ fn split_window_layer(
             expr: Expr::Literal(Literal::Numeric("0".to_string())),
             alias: None,
             implicit_column_name: None,
+            written_name: None,
             contains_aggregates: false,
             values_condition_type: None,
         });
@@ -635,6 +636,7 @@ fn push_new_subquery_column(
         expr: subquery_expr,
         alias: None,
         implicit_column_name: None,
+        written_name: None,
         contains_aggregates,
         values_condition_type: None,
     });

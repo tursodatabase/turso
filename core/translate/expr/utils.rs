@@ -69,6 +69,30 @@ pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
     }
 }
 
+/// Skip parentheses and COLLATE around an expression. SQLite's parser keeps
+/// no node for parentheses, and SQLite's sqlite3ExprSkipCollate() skips
+/// COLLATE, so `(t.x) COLLATE nocase` names a column like `t.x` does.
+pub fn skip_parens_and_collate(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        match expr {
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => expr = &exprs[0],
+            ast::Expr::Collate(inner, _) => expr = inner,
+            _ => return expr,
+        }
+    }
+}
+
+/// The name, as written, of `expr` if it is a column reference: `X` in
+/// `t.X`, `(X)` or `X COLLATE nocase`.
+pub(crate) fn column_reference_name(expr: &ast::Expr) -> Option<&ast::Name> {
+    match skip_parens_and_collate(expr) {
+        ast::Expr::Id(name)
+        | ast::Expr::Qualified(_, name)
+        | ast::Expr::DoublyQualified(_, _, name) => Some(name),
+        _ => None,
+    }
+}
+
 /// If the right-hand side of `IS` / `IS NOT` is the TRUE or FALSE keyword —
 /// possibly inside parentheses or under COLLATE — return its boolean value.
 /// `x IS TRUE` and friends then test the truth of x instead of comparing

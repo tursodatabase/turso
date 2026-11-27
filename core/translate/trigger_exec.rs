@@ -1213,8 +1213,17 @@ where
             }
 
             for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
+                if let ast::ResultColumn::Expr(expr, alias) = col {
+                    let written_name = expr::column_reference_name(expr).cloned();
                     rewrite_expression_tree(expr, rewrite_expr)?;
+                    // A FROM subquery names its column by the name of a column
+                    // reference as written, also after the rewrite replaced it.
+                    if let Some(name) = written_name {
+                        let has_alias = alias.as_ref().is_some_and(ast::As::is_explicit);
+                        if !has_alias && expr::column_reference_name(expr).is_none() {
+                            *alias = Some(ast::As::ReplacedColumnName(name));
+                        }
+                    }
                 }
             }
 

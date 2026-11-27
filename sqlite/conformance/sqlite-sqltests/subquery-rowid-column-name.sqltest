@@ -1,0 +1,97 @@
+@database :memory:
+
+# A FROM subquery and a CTE name a column reference as it is written, as
+# SQLite's sqlite3ColumnsFromExprList() does before it resolves names. Thus
+# rowid, oid and _rowid_ keep these names when the table has a rowid alias.
+# CREATE TABLE AS names the column after it resolves names, so there the
+# rowid gets the name of the rowid alias.
+
+setup schema {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, x);
+    INSERT INTO t VALUES(5, 1);
+}
+
+@setup schema
+test subquery-rowid-spellings-name-with-rowid-alias {
+    SELECT rowid FROM (SELECT rowid FROM t);
+    SELECT oid FROM (SELECT t.oid FROM t);
+    SELECT s._rowid_ FROM (SELECT (_rowid_) FROM t) AS s;
+    SELECT a FROM (SELECT a FROM t);
+}
+expect {
+    5
+    5
+    5
+    5
+}
+
+@setup schema
+test cte-rowid-spellings-name-with-rowid-alias {
+    WITH c AS (SELECT rowid, oid FROM t) SELECT rowid + oid FROM c;
+}
+expect {
+    10
+}
+
+@setup schema
+test subquery-rowid-not-named-by-rowid-alias {
+    SELECT a FROM (SELECT rowid FROM t);
+}
+expect error {
+    no such column: a
+}
+
+@setup schema
+test create-table-as-names-rowid-by-rowid-alias {
+    CREATE TABLE c AS SELECT rowid, x FROM t;
+    SELECT name FROM pragma_table_info('c');
+}
+expect {
+    a
+    x
+}
+
+# A view names its columns after it resolves names, as SQLite's
+# sqlite3ViewGetColumnNames() does, so there the rowid gets the name of the
+# rowid alias, and t.X gets the name of the column x.
+
+@setup schema
+test view-names-rowid-by-rowid-alias {
+    CREATE VIEW v AS SELECT rowid FROM t;
+    SELECT a FROM v;
+}
+expect {
+    5
+}
+
+@setup schema
+test view-rowid-not-named-rowid {
+    CREATE VIEW v AS SELECT rowid FROM t;
+    SELECT rowid FROM v;
+}
+expect error {
+    no such column: rowid
+}
+
+@setup schema
+test view-column-names-are-resolved-names {
+    CREATE VIEW v AS SELECT t.X, rowid, x COLLATE nocase AS y FROM t;
+    CREATE TABLE c AS SELECT * FROM v;
+    SELECT name FROM pragma_table_info('c');
+}
+expect {
+    x
+    a
+    y
+}
+
+@setup schema
+test subquery-column-names-are-written-names {
+    CREATE TABLE c AS SELECT * FROM (SELECT t.X, rowid, (x) FROM t);
+    SELECT name FROM pragma_table_info('c');
+}
+expect {
+    X
+    rowid
+    x:1
+}
