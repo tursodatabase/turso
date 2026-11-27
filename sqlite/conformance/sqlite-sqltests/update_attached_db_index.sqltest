@@ -1,6 +1,6 @@
 @database :memory:
 @skip-file-if mvcc "attach is not supported for mvcc"
-@skip-file-if model "ATTACH is not supported in model storage"
+@skip-file-if spec-model "ATTACH is not supported in spec-model storage"
 
 # Regression test for a bug where UPDATE on an attached database table with
 # a UNIQUE index would panic when the rowid (INTEGER PRIMARY KEY) was modified.

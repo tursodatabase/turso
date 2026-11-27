@@ -1,5 +1,5 @@
 @database :temp:
-@skip-file-if model "PRAGMA page_size is not supported in model storage"
+@skip-file-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 
 # Regression test for #6356: pager panicked with "Attempted to unpin page that
 # was not pinned" when an AFTER INSERT trigger fired during heavy cache spill.

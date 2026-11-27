@@ -1,5 +1,5 @@
 @database :temp:
-@skip-file-if model "VACUUM does nothing in model storage"
+@skip-file-if spec-model "VACUUM does nothing in spec-model storage"
 
 @skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
 test vacuum-basic {

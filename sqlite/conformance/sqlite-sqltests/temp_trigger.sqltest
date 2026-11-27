@@ -158,7 +158,7 @@ expect {
 
 # An unqualified TEMP trigger stays with the table found when it is
 # created. A same-named table created later must not take it over.
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test unqualified-temp-trigger-stays-with-attached-table {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.attached_target (x INTEGER);

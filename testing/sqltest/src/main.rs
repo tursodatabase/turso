@@ -75,11 +75,11 @@ enum Commands {
         #[arg(long)]
         mvcc: bool,
 
-        /// Open every new database as `:model:`, where all trees are in the in-memory model
-        /// of the cursor contract (--backend rust, debug builds only). Tests that need a
-        /// pre-built database file are skipped.
+        /// Open every new database as `:spec-model:`, where all trees are in the in-memory
+        /// spec-model of the cursor contract (--backend rust, debug builds only). Tests that
+        /// need a pre-built database file are skipped.
         #[arg(long)]
-        model_storage: bool,
+        spec_model: bool,
 
         /// Snapshot update mode:
         /// - auto: 'no' in CI, 'new' otherwise (default)
@@ -206,7 +206,7 @@ async fn main() -> ExitCode {
             output,
             timeout,
             mvcc,
-            model_storage,
+            spec_model,
             snapshot_mode,
             snapshot_filter,
             cross_check_binary,
@@ -225,7 +225,7 @@ async fn main() -> ExitCode {
                 output,
                 timeout,
                 mvcc,
-                model_storage,
+                spec_model,
                 snapshot_mode,
                 snapshot_filter,
                 cross_check_binary,
@@ -287,7 +287,7 @@ async fn run_tests(
     output_format: String,
     timeout: u64,
     mvcc: bool,
-    model_storage: bool,
+    spec_model: bool,
     snapshot_mode: SnapshotUpdateMode,
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
@@ -307,8 +307,8 @@ async fn run_tests(
         }
         _ => {}
     }
-    if model_storage && (mvcc || backend_type != "rust") {
-        eprintln!("Error: --model-storage works only with --backend rust and without --mvcc");
+    if spec_model && (mvcc || backend_type != "rust") {
+        eprintln!("Error: --spec-model works only with --backend rust and without --mvcc");
         return ExitCode::from(2);
     }
     if mvcc && backend_type == "tursopg-embedded" {
@@ -419,7 +419,7 @@ async fn run_tests(
     let mut config = RunnerConfig::default()
         .with_max_jobs(jobs)
         .with_mvcc(mvcc)
-        .with_model_storage(model_storage)
+        .with_spec_model(spec_model)
         .with_snapshot_update_mode(snapshot_mode)
         .with_fail_fast(fail_fast);
     if let Some(f) = filter {
@@ -454,7 +454,9 @@ async fn run_tests(
                 .await
         }
         "rust" => {
-            let mut backend = RustBackend::new().with_mvcc(mvcc).with_model(model_storage);
+            let mut backend = RustBackend::new()
+                .with_mvcc(mvcc)
+                .with_spec_model(spec_model);
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }

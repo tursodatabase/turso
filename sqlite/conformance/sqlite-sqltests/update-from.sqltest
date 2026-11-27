@@ -830,7 +830,7 @@ expect {
 # hit the single-table update path during compilation. In SQLite, a non-numeric
 # string in WHERE coerces to 0, so this statement updates no rows.
 @cross-check-integrity
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test update-from-attached-constant-where-literal-set {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, v BLOB);
@@ -851,7 +851,7 @@ expect {
 # Numeric-false WHERE follows the same dead-code path and must likewise avoid
 # the normal two-table UPDATE loop.
 @cross-check-integrity
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test update-from-attached-constant-where-zero {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, v INTEGER);
@@ -871,7 +871,7 @@ expect {
 
 # Same regression shape, but with a numeric constant WHERE.
 @cross-check-integrity
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test update-from-attached-constant-where-one {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, v INTEGER);
@@ -892,7 +892,7 @@ expect {
 # Constant WHERE with a no-op SET should still execute through UPDATE ... FROM
 # without panicking, including on attached databases.
 @cross-check-integrity
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test update-from-attached-constant-where-noop-set {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, v INTEGER);

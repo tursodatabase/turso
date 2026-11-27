@@ -14,7 +14,7 @@ expect {
 }
 
 @skip-if mvcc "MVCC checkpoints in TRUNCATE mode by default, so the frame counts differ"
-@skip-if model "model storage writes a different number of WAL frames"
+@skip-if spec-model "spec-model storage writes a different number of WAL frames"
 test wal-checkpoint-after-begin-copies-wal-frames {
     PRAGMA journal_mode=wal;
     CREATE TABLE t(x);

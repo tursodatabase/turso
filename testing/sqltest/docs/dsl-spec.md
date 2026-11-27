@@ -250,7 +250,7 @@ The `@skip-if` decorator supports the following conditions:
 | `sqlite` | Skip when running with the sqlite CLI backend |
 | `postgres` | Skip when running against a real PostgreSQL server (`--backend postgres`). |
 | `debug` | Skip when the test runner is a debug build. The Makefile builds `tursodb` with the same profile as the runner, so this also skips a debug build of `tursodb`. |
-| `model` | Skip when all B-trees are in the in-memory model (`--model-storage` flag). Use it for features that model storage does not support. |
+| `spec-model` | Skip when all B-trees are in the in-memory spec-model (`--spec-model` flag). Use it for features that spec-model storage does not support. |
 
 #### Capabilities
 
@@ -681,7 +681,7 @@ skip_condition  = "mvcc"
                 | "sqlite"
                 | "postgres"
                 | "debug"
-                | "model"
+                | "spec-model"
 
 capability      = "trigger" | "strict" | "materialized_views"
 

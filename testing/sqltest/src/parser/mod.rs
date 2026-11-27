@@ -699,12 +699,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::SkipCondition::Debug)
             }
-            Some(Token::Identifier(name)) if name == "model" => {
+            Some(Token::Identifier(name)) if name == "spec-model" => {
                 self.advance();
-                Ok(ast::SkipCondition::Model)
+                Ok(ast::SkipCondition::SpecModel)
             }
             Some(token) => Err(self.error(format!(
-                "expected skip condition (mvcc, sqlite, postgres, debug, model), got {token}"
+                "expected skip condition (mvcc, sqlite, postgres, debug, spec-model), got {token}"
             ))),
             None => Err(self.error("expected skip condition, got EOF".to_string())),
         }
@@ -1685,12 +1685,12 @@ expect {
     }
 
     #[test]
-    fn test_parse_skip_if_model() {
+    fn test_parse_skip_if_spec_model() {
         let input = r#"
 @database :memory:
-@skip-file-if model "materialized views are not supported in model storage"
+@skip-file-if spec-model "materialized views are not supported in spec-model storage"
 
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test select-1 {
     SELECT 1;
 }
@@ -1703,15 +1703,15 @@ expect {
         assert_eq!(
             file.global_skip,
             vec![ast::Skip {
-                reason: "materialized views are not supported in model storage".to_string(),
-                condition: Some(ast::SkipCondition::Model),
+                reason: "materialized views are not supported in spec-model storage".to_string(),
+                condition: Some(ast::SkipCondition::SpecModel),
             }]
         );
         assert_eq!(
             file.tests[0].modifiers.skip,
             vec![ast::Skip {
-                reason: "ATTACH is not supported in model storage".to_string(),
-                condition: Some(ast::SkipCondition::Model),
+                reason: "ATTACH is not supported in spec-model storage".to_string(),
+                condition: Some(ast::SkipCondition::SpecModel),
             }]
         );
     }
@@ -1757,7 +1757,7 @@ expect {
         let err = parse(input).unwrap_err();
         assert!(
             err.to_string().contains(
-                "expected skip condition (mvcc, sqlite, postgres, debug, model), got mysql"
+                "expected skip condition (mvcc, sqlite, postgres, debug, spec-model), got mysql"
             ),
             "{err}"
         );

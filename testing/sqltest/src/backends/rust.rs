@@ -44,9 +44,9 @@ pub struct RustBackend {
     default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
     /// Enable MVCC mode
     mvcc: bool,
-    /// Open every new database as `:model:`: all trees are in the in-memory model of the
+    /// Open every new database as `:spec-model:`: all trees are in the in-memory spec-model of the
     /// cursor contract (debug builds only).
-    model: bool,
+    spec_model: bool,
 }
 
 impl RustBackend {
@@ -54,7 +54,7 @@ impl RustBackend {
         Self {
             default_db_resolver: None,
             mvcc: false,
-            model: false,
+            spec_model: false,
         }
     }
 
@@ -70,9 +70,9 @@ impl RustBackend {
         self
     }
 
-    /// Open every new database as `:model:`
-    pub fn with_model(mut self, model: bool) -> Self {
-        self.model = model;
+    /// Open every new database as `:spec-model:`
+    pub fn with_spec_model(mut self, spec_model: bool) -> Self {
+        self.spec_model = spec_model;
         self
     }
 }
@@ -115,13 +115,13 @@ impl SqlBackend for RustBackend {
         config: &DatabaseConfig,
     ) -> Result<Box<dyn DatabaseInstance>, BackendError> {
         let (db_path, temp_file) = match &config.location {
-            // A `:model:` database cannot be in a file, and has no pre-built content.
-            DatabaseLocation::Memory | DatabaseLocation::TempFile if self.model => {
-                (":model:".to_string(), None)
+            // A `:spec-model:` database cannot be in a file, and has no pre-built content.
+            DatabaseLocation::Memory | DatabaseLocation::TempFile if self.spec_model => {
+                (":spec-model:".to_string(), None)
             }
-            _ if self.model => {
+            _ if self.spec_model => {
                 return Err(BackendError::Unsupported(
-                    "unsupported in model storage: pre-built database file".to_string(),
+                    "unsupported in spec-model storage: pre-built database file".to_string(),
                 ));
             }
             DatabaseLocation::Memory => (":memory:".to_string(), None),

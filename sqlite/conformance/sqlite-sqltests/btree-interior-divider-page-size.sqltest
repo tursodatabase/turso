@@ -1,5 +1,5 @@
 @database :memory:
-@skip-file-if model "PRAGMA page_size is not supported in model storage"
+@skip-file-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 
 # When balance_non_root redistributes cells between interior sibling pages, it
 # must not count the parent's divider cell as part of the sibling that sits to

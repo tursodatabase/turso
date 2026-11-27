@@ -1,5 +1,5 @@
 @database :memory:
-@skip-file-if model "PRAGMA page_size and ATTACH are not supported in model storage"
+@skip-file-if spec-model "PRAGMA page_size and ATTACH are not supported in spec-model storage"
 
 test pragma-attached-page-size-independent-of-main {
     ATTACH ':memory:' AS aux;

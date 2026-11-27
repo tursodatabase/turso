@@ -151,7 +151,7 @@ expect {
     1|20
 }
 
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test indexed-by-attached-qualified-table {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t15(a, b);
@@ -177,7 +177,7 @@ expect {
     two
 }
 
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test indexed-by-attached-update-delete {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t17(a, b);

@@ -6,7 +6,7 @@
 # the planner statistics on the same connection, so the next plan still used
 # the default 1000000 row estimate instead of the 100 rows ANALYZE counted.
 
-@skip-if model "MVCC is not supported in model storage"
+@skip-if spec-model "MVCC is not supported in spec-model storage"
 test mvcc-analyze-writes-sqlite-stat1 {
     PRAGMA journal_mode='MVCC';
     CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);

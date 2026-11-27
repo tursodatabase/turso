@@ -1,5 +1,5 @@
 @database :memory:
-@skip-file-if model "PRAGMA page_size is not supported in model storage"
+@skip-file-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 
 # Reading columns of rows whose record spills into overflow pages. Like
 # SQLite's OP_Column, values stored on the b-tree page are decoded in place

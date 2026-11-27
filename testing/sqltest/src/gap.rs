@@ -248,7 +248,7 @@ fn check_gap_test(
                 SkipCondition::Mvcc
                 | SkipCondition::Sqlite
                 | SkipCondition::Debug
-                | SkipCondition::Model,
+                | SkipCondition::SpecModel,
             ) => {}
         }
     }

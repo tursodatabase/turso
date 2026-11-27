@@ -18,7 +18,7 @@ expect {
 # Virtual generated columns on the null-extended side go through IfNullRow,
 # which must read the null-row flag from the MVCC cursor instead of
 # insisting on a btree cursor.
-@skip-if model "MVCC is not supported in model storage"
+@skip-if spec-model "MVCC is not supported in spec-model storage"
 test mvcc-left-join-null-row-generated-column {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE l(x);

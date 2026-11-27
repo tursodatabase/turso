@@ -8,7 +8,7 @@
 # "transaction should exist in txs map".
 
 @database :memory:
-@skip-file-if model "MVCC is not supported in model storage"
+@skip-file-if spec-model "MVCC is not supported in spec-model storage"
 
 test mvcc-pragma-table-list-left-join {
     PRAGMA journal_mode='mvcc';

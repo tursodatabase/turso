@@ -25,7 +25,7 @@ expect {
 }
 
 @cross-check-integrity
-@skip-if model "ATTACH is not supported in model storage"
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test pragma-attached-database-has-its-own-synchronous-mode {
     PRAGMA main.synchronous=OFF;
     ATTACH ':memory:' AS aux;
@@ -135,7 +135,7 @@ expect {
 
 @skip-if mvcc "page_count not implemented for mvcc"
 @cross-check-integrity
-@skip-if model "PRAGMA page_count is not supported in model storage"
+@skip-if spec-model "PRAGMA page_count is not supported in spec-model storage"
 test pragma-page-count-table {
     CREATE TABLE foo (bar);
     PRAGMA page_count
@@ -170,7 +170,7 @@ expect {
 
 # pragma page_size=xxx doesn't change the page size of an initialized database.
 @cross-check-integrity
-@skip-if model "PRAGMA page_size is not supported in model storage"
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test pragma-page-size-set-initialized-db {
     CREATE TABLE "foo bar"(c0);
     PRAGMA page_size=1024;
@@ -182,7 +182,7 @@ expect {
 
 @skip-if mvcc "max_page_count and page_count not implemented for mvcc"
 @cross-check-integrity
-@skip-if model "PRAGMA page_count is not supported in model storage"
+@skip-if spec-model "PRAGMA page_count is not supported in spec-model storage"
 test pragma-max-page-count-clamping-with-data {
     CREATE TABLE test (id INTEGER);
     PRAGMA page_count;
@@ -202,7 +202,7 @@ test pragma-max-page-count-enforcement-error {
 expect error {
 }
 
-@skip-if model "PRAGMA page_count is not supported in model storage"
+@skip-if spec-model "PRAGMA page_count is not supported in spec-model storage"
 test pragma-page-count-empty {
     PRAGMA page_count
 }
@@ -211,7 +211,7 @@ expect {
 }
 
 @skip-if mvcc "page_count not implemented for mvcc"
-@skip-if model "PRAGMA page_count is not supported in model storage"
+@skip-if spec-model "PRAGMA page_count is not supported in spec-model storage"
 test pragma-page-count-empty-2 {
     PRAGMA user_version=1;
     PRAGMA page_count
@@ -307,7 +307,7 @@ expect {
     0
 }
 
-@skip-if model "PRAGMA page_size is not supported in model storage"
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test pragma-page-size-default {
     PRAGMA page_size
 }
@@ -315,7 +315,7 @@ expect {
     4096
 }
 
-@skip-if model "PRAGMA page_size is not supported in model storage"
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test pragma-page-size-set {
     PRAGMA page_size=1024;
     PRAGMA page_size
@@ -324,7 +324,7 @@ expect {
     1024
 }
 
-@skip-if model "PRAGMA max_page_count is not supported in model storage"
+@skip-if spec-model "PRAGMA max_page_count is not supported in spec-model storage"
 test pragma-max-page-count-default {
     PRAGMA max_page_count
 }
@@ -332,7 +332,7 @@ expect {
     4294967294
 }
 
-@skip-if model "PRAGMA max_page_count is not supported in model storage"
+@skip-if spec-model "PRAGMA max_page_count is not supported in spec-model storage"
 test pragma-max-page-count-set-large {
     PRAGMA max_page_count = 1000;
     PRAGMA max_page_count
@@ -342,7 +342,7 @@ expect {
     1000
 }
 
-@skip-if model "PRAGMA max_page_count is not supported in model storage"
+@skip-if spec-model "PRAGMA max_page_count is not supported in spec-model storage"
 test pragma-max-page-count-set-zero-ignored {
     PRAGMA max_page_count = 0;
     PRAGMA max_page_count
@@ -369,7 +369,7 @@ expect {
 
 # pragma page_size=xxx changes the page size of an uninitialized database and persists the change.
 # set user_version to trigger database initialization.
-@skip-if model "PRAGMA page_size is not supported in model storage"
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test pragma-page-size-set-uninitialized-db {
     PRAGMA page_size=1024;
     PRAGMA user_version=1;

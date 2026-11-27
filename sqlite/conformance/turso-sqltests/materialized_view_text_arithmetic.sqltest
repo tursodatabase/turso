@@ -2,7 +2,7 @@
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
 @verify-materialized-views
-@skip-file-if model "materialized views are not supported in model storage"
+@skip-file-if spec-model "materialized views are not supported in spec-model storage"
 
 # Test that materialized views correctly coerce text values to numeric
 # in arithmetic operations, matching SQLite behavior.
