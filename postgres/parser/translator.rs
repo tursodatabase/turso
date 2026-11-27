@@ -8153,6 +8153,11 @@ fn pg_type_name_to_ast_type(
         ("TIME", _) => "time",
         ("TIMESTAMP", _) => "timestamp",
         ("TIMESTAMPTZ", _) => "timestamptz",
+        // A json or jsonb value is checked and stored as a column of the type
+        // does, and the cast gives the value that type, which to_json() and
+        // the operators read.
+        ("JSON", false) => "json",
+        ("JSONB", false) => "jsonb",
         // For CAST expressions, map all text-like PG types to TEXT.
         (
             "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"

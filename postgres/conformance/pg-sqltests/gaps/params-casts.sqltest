@@ -247,27 +247,19 @@ expect {
 }
 
 # A-45: jsonb literal key order/whitespace
-@compat-gap "type:jsonb"
 test jsonb-literal-key-order-whitespace {
     SELECT '{"b": 2,  "a":1, "aa": [1,  2]}'::jsonb;
 }
 expect {
     {"a": 1, "b": 2, "aa": [1, 2]}
 }
-expect @tursopg {
-    {"b": 2,  "a":1, "aa": [1,  2]}
-}
 
 # A-46: jsonb duplicate keys keep last
-@compat-gap "type:jsonb"
 test jsonb-duplicate-keys-keep-last {
     SELECT '{"a":1,"a":2}'::jsonb;
 }
 expect {
     {"a": 2}
-}
-expect @tursopg {
-    {"a":1,"a":2}
 }
 
 # A-47: json literal preserved verbatim
@@ -279,15 +271,11 @@ expect {
 }
 
 # A-48: invalid jsonb literal
-@compat-gap "type:jsonb"
 test invalid-jsonb-literal {
     SELECT 'not json'::jsonb;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    not json
-}
 
 # A-50: jsonb number precision
 test jsonb-number-precision {
@@ -432,15 +420,11 @@ test the-conversion-function-of-a-cast-is-not-callable {
 @sqlstate 42883
 expect error {}
 
-@compat-gap "cast:jsonb -> bytea"
 test jsonb-to-bytea-cast-does-not-exist {
     SELECT '1'::jsonb::bytea;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    \x31
-}
 
 # PostgreSQL 18 has no regdatabase type.
 @compat-gap "type:regdatabase"
@@ -464,7 +448,6 @@ expect @tursopg {
 }
 
 # PostgreSQL has no cast from json to integer.
-@compat-gap "cast:json -> int"
 test json-to-int-cast {
     SELECT '1'::json::int;
 }
@@ -472,8 +455,9 @@ test json-to-int-cast {
 expect error {
     cannot cast type json to integer
 }
-expect @tursopg {
-    1
+@sqlstate 42846
+expect @tursopg error {
+    cannot cast type json to int4
 }
 
 test numeric-with-a-scale-cast-to-an-integer {

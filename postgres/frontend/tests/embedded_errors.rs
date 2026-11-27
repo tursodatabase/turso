@@ -614,7 +614,7 @@ fn constraint_details_show_custom_type_values_as_the_user_wrote_them() {
         ),
         (
             "INSERT INTO t_j VALUES ('{\"a\":1}')",
-            "Key (j)=({\"a\":1}) already exists.",
+            "Key (j)=({\"a\": 1}) already exists.",
         ),
         (
             "UPDATE t_u SET id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' WHERE k = 2",

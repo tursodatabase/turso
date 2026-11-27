@@ -335,15 +335,11 @@ expect @tursopg error {}
 
 # -> gives the text of a number as it is stored, where jsonb of PostgreSQL
 # writes it as numeric does.
-@compat-gap "operator:jsonb -> text"
 test jsonb-arrow-keeps-the-text-of-a-number {
     SELECT '{"n":1e2}'::jsonb -> 'n';
 }
 expect {
     100
-}
-expect @tursopg {
-    1e2
 }
 
 # tursopg checks the types of the operands of -> and ->> for each value when

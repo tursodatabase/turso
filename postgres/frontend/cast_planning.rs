@@ -247,6 +247,8 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
         "bytea" => Bytea,
         "timestamp" => Timestamp,
         "timestamptz" => TimestampTz,
+        "json" => Json,
+        "jsonb" => Jsonb,
         // FIXME(pg-catalog): numeric is registered only with a type modifier. Without one it is REAL, which `is_lowered_type_name` leaves to the engine. A numeric type that needs no modifier lets every numeric go through CASTS.
         "numeric" => Numeric,
         // FIXME(pg-catalog): varchar with a length is cast as text, and its length is checked when the value is stored. A pg_cast row for varchar, with the length coercion function, replaces this.
@@ -289,13 +291,11 @@ fn named_cast_type(name: &str, place: NamePlace) -> Option<CastType> {
     })
 }
 
-/// FIXME(pg-catalog): These built-in types have no rows in `CASTS`, so the engine decides their casts by `Dialect::text_input_types_refuse_other_kinds` and `check_cast_from_text_input_type` of core, and by the CAST function of the type. A type moves from this list to `CASTS` when its pg_cast rows and their conversions are written: date and time first, then json and jsonb, then inet, cidr and the macaddr types. bytea and the reg types other than regclass and regtype need a registered type first. The list is empty when every built-in type is in pg_type and pg_cast.
+/// FIXME(pg-catalog): These built-in types have no rows in `CASTS`, so the engine decides their casts by `Dialect::text_input_types_refuse_other_kinds` and `check_cast_from_text_input_type` of core, and by the CAST function of the type. A type moves from this list to `CASTS` when its pg_cast rows and their conversions are written: date and time first, then inet, cidr and the macaddr types. bytea and the reg types other than regclass and regtype need a registered type first. The list is empty when every built-in type is in pg_type and pg_cast.
 /// The built-in types whose casts the engine decides.
 const ENGINE_RULE_TYPES: &[&str] = &[
     "date",
     "time",
-    "json",
-    "jsonb",
     "inet",
     "cidr",
     "macaddr",

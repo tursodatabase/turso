@@ -19,7 +19,8 @@ use turso_core::dialect::CastContext;
 use turso_core::{Connection, LimboError, Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,8 @@ pub(crate) enum CastType {
     Bytea,
     Timestamp,
     TimestampTz,
+    Json,
+    Jsonb,
 }
 
 impl CastType {
@@ -59,6 +62,24 @@ impl CastType {
             Self::Bytea => "bytea",
             Self::Timestamp => "timestamp",
             Self::TimestampTz => "timestamptz",
+            Self::Json => "json",
+            Self::Jsonb => "jsonb",
+        }
+    }
+
+    /// The name of the type as PostgreSQL's format_type() writes it, which
+    /// some errors use.
+    fn formatted_name(self) -> &'static str {
+        match self {
+            Self::Int2 => "smallint",
+            Self::Int4 => "integer",
+            Self::Int8 => "bigint",
+            Self::Float4 => "real",
+            Self::Float8 => "double precision",
+            Self::Bool => "boolean",
+            Self::Timestamp => "timestamp without time zone",
+            Self::TimestampTz => "timestamp with time zone",
+            other => other.name(),
         }
     }
 
@@ -84,6 +105,8 @@ impl CastType {
             "bytea" => Self::Bytea,
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::TimestampTz,
+            "json" => Self::Json,
+            "jsonb" => Self::Jsonb,
             _ => return None,
         })
     }
@@ -204,6 +227,15 @@ const CASTS: &[Cast] = &[
     cast(Numeric, Float8, I),
     cast(Timestamp, TimestampTz, I),
     cast(TimestampTz, Timestamp, A),
+    cast(Json, Jsonb, A),
+    cast(Jsonb, Json, A),
+    cast(Jsonb, Bool, E),
+    cast(Jsonb, Int2, E),
+    cast(Jsonb, Int4, E),
+    cast(Jsonb, Int8, E),
+    cast(Jsonb, Float4, E),
+    cast(Jsonb, Float8, E),
+    cast(Jsonb, Numeric, E),
 ];
 
 /// The `oid` of the first row of `pg_cast`.
@@ -218,8 +250,9 @@ pub(crate) struct CastRow {
     pub(crate) method: &'static str,
 }
 
-/// The rows of `pg_cast`. Every cast in `CASTS` goes through a conversion
-/// function.
+/// The rows of `pg_cast`. A cast between json and jsonb goes through the
+/// output and input functions of the types, as in PostgreSQL, and every other
+/// cast in `CASTS` through a conversion function.
 pub(crate) fn cast_rows() -> impl Iterator<Item = CastRow> {
     CASTS.iter().map(|cast| {
         let context = match cast.context {
@@ -227,12 +260,16 @@ pub(crate) fn cast_rows() -> impl Iterator<Item = CastRow> {
             CastContext::Assignment => "a",
             CastContext::Explicit => "e",
         };
+        let method = match (cast.source, cast.target) {
+            (Json, Jsonb) | (Jsonb, Json) => "i",
+            _ => "f",
+        };
         CastRow {
             source: cast.source,
             target: cast.target,
             function: cast.function,
             context,
-            method: "f",
+            method,
         }
     })
 }
@@ -303,6 +340,13 @@ pub(crate) fn convert(
     if let (Some(source), Bytea) = (source.integer_type(), target) {
         return to_bytea(value, source);
     }
+    if source == Jsonb && target != Json && target != Text {
+        return from_jsonb(connection, value, target);
+    }
+    if let (Value::Text(text), Json, Jsonb) = (value, source, target) {
+        let read = type_input(target.oid()).expect("jsonb has an INPUT");
+        return read(Some(connection), text.as_str());
+    }
     if target.is_integer() {
         return to_integer(value, source, target);
     }
@@ -331,6 +375,37 @@ fn to_bytea(value: &Value, source: IntegerType) -> Result<Value> {
         Value::Numeric(Numeric::Integer(number)) => Ok(int_to_bytea(*number, source)),
         other => Ok(other.clone()),
     }
+}
+
+/// The cast of a jsonb value to a number type or boolean: a JSON number is
+/// cast as numeric is, true and false are booleans, and null is NULL. Any
+/// other value fails, as in PostgreSQL.
+fn from_jsonb(connection: &Arc<Connection>, value: &Value, target: CastType) -> Result<Value> {
+    let Value::Text(text) = value else {
+        return Ok(value.clone());
+    };
+    let json = text.as_str();
+    let kind = match json.as_bytes().first() {
+        Some(b'n') => return Ok(Value::Null),
+        Some(b't' | b'f') if target == Bool => {
+            return Ok(Value::from_i64(i64::from(json.starts_with('t'))))
+        }
+        Some(b't' | b'f') => "boolean",
+        Some(b'"') => "string",
+        Some(b'[') => "array",
+        Some(b'{') => "object",
+        _ if target == Bool => "numeric",
+        // The stored form of a jsonb number is numeric text.
+        _ => return convert(connection, value, Numeric, target),
+    };
+    Err(sqlstate_error(
+        SQLSTATE_INVALID_PARAMETER_VALUE,
+        format!(
+            "cannot cast jsonb {kind} to type {}",
+            target.formatted_name()
+        ),
+        None,
+    ))
 }
 
 fn to_oid(value: &Value, source: CastType) -> Result<Value> {

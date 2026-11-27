@@ -462,7 +462,7 @@ expect @tursopg error {}
 
 # C-42: ::text cast of each type
 @setup t_b_n_ts_j_jb_arr_u_with_rows
-@compat-gap "cast:jsonb -> text"
+@compat-gap "cast:_text -> text"
 test text-cast-of-each-type {
     SELECT b::text, n::text, ts::text, jb::text, arr::text, u::text FROM t;
 }
@@ -470,7 +470,7 @@ expect {
     true|1.50|2026-10-08 12:00:00+00|{"y": 2}|{a}|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 expect @tursopg {
-    true|1.50|2026-10-08 12:00:00+00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    true|1.50|2026-10-08 12:00:00+00|{"y": 2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
 # C-43: result column type of bool comparison via pg_typeof

@@ -1,7 +1,7 @@
 # Who decides each cast, and what it decides. A cast between two of the types
-# int2, int4, int8, float4, float8, numeric, text, bool, timestamp and
-# timestamptz follows pg_cast. The engine decides the casts of date, json,
-# jsonb, uuid, bytea, inet, cidr, macaddr, oid, arrays, enums and domains by
+# int2, int4, int8, float4, float8, numeric, text, bool, timestamp,
+# timestamptz, json and jsonb follows pg_cast. The engine decides the casts of
+# date, uuid, bytea, inet, cidr, macaddr, oid, arrays, enums and domains by
 # its own rules, and where those differ from PostgreSQL the test is a gap
 # test. A cast of any other built-in type fails with 0A000.
 #
@@ -746,35 +746,23 @@ expect {
     1
 }
 
-@compat-gap "cast:json -> int4"
 test cast-json-to-int4 {
     SELECT '1'::json::int4;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    1
-}
 
-@compat-gap "cast:int4 -> json"
 test cast-int4-to-json {
     SELECT 5::json;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    5
-}
 
-@compat-gap "cast:bool -> json"
 test cast-bool-to-json {
     SELECT true::json;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    true
-}
 
 test cast-text-literal-to-jsonb {
     SELECT '1'::jsonb;
@@ -797,25 +785,17 @@ expect {
     1
 }
 
-@compat-gap "cast:int4 -> jsonb"
 test cast-int4-to-jsonb {
     SELECT 5::jsonb;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    5
-}
 
-@compat-gap "cast:bool -> jsonb"
 test cast-bool-to-jsonb {
     SELECT true::jsonb;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    true
-}
 
 test cast-text-literal-to-uuid {
     SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
@@ -2257,7 +2237,6 @@ expect {
     1
 }
 
-@compat-gap "cast:int4 -> json"
 test assign-int4-to-json-column {
     CREATE TABLE t (c json);
     INSERT INTO t VALUES (5);
@@ -2265,9 +2244,6 @@ test assign-int4-to-json-column {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    5
-}
 
 test assign-json-to-int4-column {
     CREATE TABLE t (c int);
@@ -2295,7 +2271,6 @@ expect {
     1
 }
 
-@compat-gap "cast:int4 -> jsonb"
 test assign-int4-to-jsonb-column {
     CREATE TABLE t (c jsonb);
     INSERT INTO t VALUES (5);
@@ -2303,9 +2278,6 @@ test assign-int4-to-jsonb-column {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    5
-}
 
 test assign-jsonb-to-int4-column {
     CREATE TABLE t (c int);
