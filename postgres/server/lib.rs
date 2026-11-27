@@ -745,6 +745,8 @@ enum BinaryEncoding {
     Int8,
     Float8,
     Bytea,
+    /// Four bytes, the oid as an unsigned number.
+    Regclass,
 }
 
 impl BinaryEncoding {
@@ -758,6 +760,7 @@ impl BinaryEncoding {
             Type::INT8 => Some(Self::Int8),
             Type::FLOAT8 => Some(Self::Float8),
             Type::BYTEA => Some(Self::Bytea),
+            Type::REGCLASS => Some(Self::Regclass),
             _ => None,
         }
     }
@@ -862,6 +865,7 @@ fn execute_query(
     let text_types: Vec<turso_pg::TextType> = (0..stmt.num_columns())
         .map(|i| turso_pg::TextType::of_column(stmt, i))
         .collect();
+    let connection = stmt.connection().clone();
     let mut encode_failed = false;
 
     let result = stmt.run_with_row_callback(|row| {
@@ -871,7 +875,15 @@ fn execute_query(
                 .get(i)
                 .map(|fi| (fi.datatype().clone(), fi.format()))
                 .unwrap_or((Type::TEXT, FieldFormat::Text));
-            encode_value(&mut encoder, val, &pg_type, format, text_types[i]).inspect_err(|_| {
+            encode_value(
+                &mut encoder,
+                val,
+                &pg_type,
+                format,
+                text_types[i],
+                &connection,
+            )
+            .inspect_err(|_| {
                 encode_failed = true;
             })?;
         }
@@ -1007,7 +1019,8 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
             | BinaryEncoding::Int2
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
-            | BinaryEncoding::Float8,
+            | BinaryEncoding::Float8
+            | BinaryEncoding::Regclass,
         )
         | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
     }
@@ -1103,10 +1116,11 @@ fn encode_value(
     pg_type: &Type,
     format: FieldFormat,
     text_type: turso_pg::TextType,
+    connection: &Arc<turso_core::Connection>,
 ) -> turso_core::Result<()> {
     match format {
-        FieldFormat::Binary => encode_binary(encoder, val, pg_type, text_type),
-        FieldFormat::Text => encode_text(encoder, val, text_type)
+        FieldFormat::Binary => encode_binary(encoder, val, pg_type, text_type, connection),
+        FieldFormat::Text => encode_text(encoder, val, text_type, connection)
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
     }
 }
@@ -1116,8 +1130,9 @@ fn encode_text(
     encoder: &mut DataRowEncoder,
     val: &Value,
     text_type: turso_pg::TextType,
+    connection: &Arc<turso_core::Connection>,
 ) -> PgWireResult<()> {
-    let text = turso_pg::value_text(val, text_type);
+    let text = turso_pg::value_text(val, text_type, connection);
     // pgwire writes a string as it is for Type::TEXT. For an array type it
     // would quote the string, which already is an array literal like {1,2,3}.
     encoder.encode_field_with_type_and_format(
@@ -1137,13 +1152,14 @@ fn encode_binary(
     val: &Value,
     pg_type: &Type,
     text_type: turso_pg::TextType,
+    connection: &Arc<turso_core::Connection>,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, Regclass, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
-        (Text, _) => encode_text(encoder, val, text_type),
+        (Text, _) => encode_text(encoder, val, text_type, connection),
         (_, Value::Null) => encoder.encode_field(&None::<i8>),
         (Bool, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i != 0)),
         (Int2, Value::Numeric(Integer(i))) => match i16::try_from(*i) {
@@ -1158,10 +1174,19 @@ fn encode_binary(
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
-        (Bool | Int2 | Int4 | Int8, Value::Numeric(Float(_)))
+        (Regclass, Value::Numeric(Integer(i))) => match u32::try_from(*i) {
+            Ok(oid) => encoder.encode_field_with_type_and_format(
+                &oid,
+                &Type::OID,
+                FieldFormat::Binary,
+                &FormatOptions::default(),
+            ),
+            Err(_) => return Err(binary_value_not_supported(pg_type)),
+        },
+        (Bool | Int2 | Int4 | Int8 | Regclass, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea | Regclass, Value::Text(_))
+        | (Bool | Int2 | Int4 | Int8 | Float8 | Regclass, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1188,6 +1213,7 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
+        "REGCLASS" => Type::REGCLASS,
         "UUID" => Type::UUID,
         "JSON" => Type::JSON,
         "JSONB" => Type::JSONB,
@@ -1666,6 +1692,13 @@ mod tests {
                 b"\0\0\0\x031.5",
             ),
             ("SELECT true", Type::BOOL, b"\0\0\0\x01\x01", b"\0\0\0\x01t"),
+            // Text format gives the name of the relation, binary the oid.
+            (
+                "SELECT 'pg_class'::regclass",
+                Type::REGCLASS,
+                b"\0\0\0\x04\0\0\x04\xeb",
+                b"\0\0\0\x08pg_class",
+            ),
             // The column's type, not the stored value, picks the encoding.
             (
                 "SELECT count(*) FROM t",
@@ -1700,6 +1733,7 @@ mod tests {
                     fields[0].datatype(),
                     fields[0].format(),
                     turso_pg::TextType::of_column(&stmt, 0),
+                    stmt.connection(),
                 )
                 .unwrap();
                 assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
@@ -2153,6 +2187,7 @@ mod tests {
                     fields[0].datatype(),
                     fields[0].format(),
                     turso_pg::TextType::of_column(&stmt, 0),
+                    stmt.connection(),
                 )
                 .unwrap();
                 let row = encoder.finish().unwrap();
@@ -2276,6 +2311,7 @@ mod tests {
             fields[0].datatype(),
             fields[0].format(),
             turso_pg::TextType::of_column(&stmt, 0),
+            stmt.connection(),
         )
         .unwrap();
         assert_eq!(&encoder.finish().unwrap().data[..], b"\0\0\0\x01t");

@@ -1,4 +1,3 @@
-use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::num::NonZero;
@@ -10,7 +9,7 @@ use crate::catalog::{self, PostgresDialect};
 use crate::error::{
     in_failed_sql_transaction_error, not_supported, sql_parse_error, sqlstate_error,
 };
-use crate::pg_type::type_exists;
+use crate::pg_type::{type_exists, RegClassInput};
 use crate::roles::connection_roles;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
@@ -549,6 +548,7 @@ fn translate_statement<'a>(
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
+    let (sql, parse_result) = resolve_regclass_constants(&pg_conn.conn, sql, parse_result)?;
     let existing_generated = turso_pg_parser::alter_table_add_column_table(&parse_result)
         .and_then(|(schema, table)| {
             relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
@@ -1562,6 +1562,57 @@ fn name_foreign_key_tables<'a>(
     Ok((Cow::Owned(sql), parse_result))
 }
 
+/// `sql` with each regclass constant that the statement stores replaced by
+/// the oid of its relation, as PostgreSQL does when it analyzes the
+/// statement: a view, a default or a check then keeps the relation when it is
+/// renamed, and a name with no relation fails the statement with 42P01.
+fn resolve_regclass_constants<'a>(
+    conn: &Arc<Connection>,
+    sql: Cow<'a, str>,
+    parse_result: turso_pg_parser::ParseResult,
+) -> Result<(Cow<'a, str>, turso_pg_parser::ParseResult)> {
+    let constants = turso_pg_parser::regclass_constants_to_resolve(&parse_result);
+    if constants.is_empty() {
+        return Ok((sql, parse_result));
+    }
+    let created = created_table(conn, &parse_result);
+    let mut sql = sql.into_owned();
+    for constant in constants.iter().rev() {
+        // The table that the statement creates does not exist yet, so a
+        // constant that names it keeps its name.
+        if names_created_table(conn, &constant.text, created.as_ref()) {
+            continue;
+        }
+        let oid = crate::catalog::regclass_oid_of_text(conn, &constant.text)?;
+        sql = turso_pg_parser::replace_string_constant(&sql, constant.location, &oid.to_string())
+            .map_err(sql_parse_error)?;
+    }
+    let parse_result = turso_pg_parser::parse(&sql).map_err(sql_parse_error)?;
+    Ok((Cow::Owned(sql), parse_result))
+}
+
+/// Whether the regclass `text` names `created`, the table that the statement
+/// creates.
+fn names_created_table(
+    conn: &Arc<Connection>,
+    text: &str,
+    created: Option<&(Qualifier, String)>,
+) -> bool {
+    let Some((namespace, table)) = created else {
+        return false;
+    };
+    let Ok(RegClassInput::Name { schema, name }) = crate::pg_type::parse_regclass(text) else {
+        return false;
+    };
+    name == *table
+        && match schema {
+            Some(schema) => conn
+                .qualifier(&schema)
+                .is_some_and(|qualifier| qualifier.target.id == namespace.target.id),
+            None => true,
+        }
+}
+
 /// The schema and name of the table that a CREATE TABLE statement creates.
 fn created_table(
     conn: &Arc<Connection>,
@@ -2360,43 +2411,13 @@ fn is_simple_identifier(name: &str) -> bool {
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {
-    search_path_parser()
-        .parse(value)
-        .into_result()
-        .map_err(|_| {
-            sqlstate_error(
-                SQLSTATE_INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"search_path\"",
-                None,
-            )
-        })
-}
-
-fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra::Err<EmptyErr>> {
-    let whitespace = any().filter(char::is_ascii_whitespace).repeated().ignored();
-    // Parse double-quoted names such as "My, Schema" or "a""b".
-    // Preserve case, commas, and spaces. Turn doubled quotes into one quote.
-    let quoted = just("\"\"")
-        .to('"')
-        .or(none_of('"'))
-        .repeated()
-        .collect::<String>()
-        .delimited_by(just('"'), just('"'));
-    // Parse names such as PUBLIC or $user, up to a comma or ASCII whitespace.
-    // Require at least one character, reject a leading quote, and lowercase ASCII letters.
-    let unquoted = any()
-        .filter(|c: &char| *c != ',' && !c.is_ascii_whitespace())
-        .repeated()
-        .at_least(1)
-        .to_slice()
-        .filter(|name: &&str| !name.starts_with('"'))
-        .map(str::to_ascii_lowercase);
-
-    quoted
-        .or(unquoted)
-        .separated_by(just(',').padded_by(whitespace))
-        .collect::<Vec<_>>()
-        .padded_by(whitespace)
+    turso_pg_parser::split_identifier_string(value, ',').ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "invalid value for parameter \"search_path\"",
+            None,
+        )
+    })
 }
 
 fn create_schema_commands(
@@ -2951,9 +2972,8 @@ fn prepare_copy_columns(
 
 #[cfg(test)]
 mod tests {
-    use super::{open_database_with_io, search_path_parser, PgConnection};
+    use super::{open_database_with_io, PgConnection};
     use crate::PostgresDialect;
-    use chumsky::Parser;
     use std::sync::Arc;
     use turso_core::{
         Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, SessionRole, Value,
@@ -3148,43 +3168,6 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("in no schema"), "{error}");
-    }
-
-    #[test]
-    fn search_path_parser_accepts_identifier_lists() {
-        for (input, expected) in [
-            ("", vec![]),
-            (" \t\n\r\u{c}", vec![]),
-            (" PUBLIC , \"MiXeD\" ", vec!["public", "MiXeD"]),
-            ("\"a,b\", \"a\"\"b\", $USER", vec!["a,b", "a\"b", "$user"]),
-            ("\"\"\"\"", vec!["\""]),
-            ("\"\", public", vec!["", "public"]),
-            ("public\"extra", vec!["public\"extra"]),
-            ("\u{b}PUBLIC\u{a0}", vec!["\u{b}public\u{a0}"]),
-        ] {
-            assert_eq!(
-                search_path_parser().parse(input).into_result().unwrap(),
-                expected,
-                "{input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn search_path_parser_rejects_invalid_identifier_lists() {
-        for input in [
-            ",public",
-            "public,",
-            "public, ",
-            "public,,main",
-            "one two",
-            "\"\"\"",
-            "\"unclosed",
-            "\"a\"b",
-            "\"a\" \"b\"",
-        ] {
-            assert!(search_path_parser().parse(input).has_errors(), "{input:?}");
-        }
     }
 
     fn test_connection() -> super::PgConnection {

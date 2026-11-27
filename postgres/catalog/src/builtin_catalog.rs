@@ -37,6 +37,8 @@ pub trait CatalogTable: 'static {
 pub struct BuiltinCatalog {
     /// The name of the catalog, such as `pg_proc`.
     pub name: &'static str,
+    /// The oid of the catalog, its row in `pg_class`.
+    pub oid: Oid,
     /// The `CREATE TABLE` statement of the catalog, in SQLite syntax. It
     /// gives the columns of the rows of `rows`.
     pub create_sql: &'static str,

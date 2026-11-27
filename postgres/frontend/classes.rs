@@ -469,6 +469,18 @@ impl ClassCatalog {
             .and_then(|oid| self.by_oid.get(oid))
     }
 
+    /// The row of the relation of `namespace` that has the PostgreSQL name
+    /// `name`.
+    pub(crate) fn get_by_relname(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<&RelationClass> {
+        self.oids_by_relname
+            .get(&(namespace, name.to_string()))
+            .and_then(|oid| self.by_oid.get(oid))
+    }
+
     /// Whether a relation of `namespace` has the PostgreSQL name `name`.
     pub(crate) fn name_is_taken(&self, namespace: NamespaceId, name: &str) -> bool {
         self.oids_by_relname

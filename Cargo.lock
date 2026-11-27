@@ -7355,7 +7355,6 @@ version = "0.9.0-pre.6"
 dependencies = [
  "bitflags 2.9.4",
  "chrono",
- "chumsky",
  "hex",
  "parking_lot",
  "rustc-hash 2.1.1",

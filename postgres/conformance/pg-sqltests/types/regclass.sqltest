@@ -1,0 +1,578 @@
+# regclass is the oid of a relation. A cast from text looks the name up the
+# way the search path does, and a cast to text prints the name back.
+
+@database :memory:
+
+setup relations {
+    CREATE TABLE t (id int PRIMARY KEY, label text);
+    CREATE TABLE "Mixed Case" (id int);
+    CREATE SEQUENCE seq;
+    CREATE SCHEMA other;
+    CREATE TABLE other.t (id int);
+    CREATE TABLE other.only_there (id int);
+}
+
+@setup relations
+test regclass-gives-the-oid-of-a-table {
+    SELECT CASE WHEN 't'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 't' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')) THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+}
+
+@setup relations
+test regclass-finds-rows-by-oid {
+    SELECT count(*) FROM pg_attribute WHERE attrelid = 't'::regclass AND attnum > 0;
+}
+expect {
+    2
+}
+
+@setup relations
+test regclass-reads-a-schema-and-a-name {
+    SELECT 'public.t'::regclass::text, 'other.t'::regclass::text;
+}
+expect {
+    t|other.t
+}
+
+@setup relations
+test regclass-folds-unquoted-names-to-lowercase {
+    SELECT 'T'::regclass::text, ' public . T '::regclass::text;
+}
+expect {
+    t|t
+}
+
+@setup relations
+test regclass-keeps-the-case-of-a-quoted-name {
+    SELECT '"Mixed Case"'::regclass::text;
+}
+expect {
+    "Mixed Case"
+}
+
+@setup relations
+test regclass-finds-a-sequence {
+    SELECT 'seq'::regclass::text;
+}
+expect {
+    seq
+}
+
+@setup relations
+test regclass-prints-the-schema-of-a-relation-off-the-search-path {
+    SELECT 'other.only_there'::regclass::text;
+}
+expect {
+    other.only_there
+}
+
+@setup relations
+test regclass-follows-the-search-path {
+    SELECT set_config('search_path', 'other, public', false);
+    SELECT 't'::regclass::text, 'public.t'::regclass::text, 'only_there'::regclass::text;
+}
+expect {
+    other, public
+    t|public.t|only_there
+}
+
+@setup relations
+test regclass-reads-a-catalog-table {
+    SELECT 'pg_class'::regclass::text, 'pg_catalog.pg_class'::regclass::oid;
+}
+expect {
+    pg_class|1259
+}
+
+@setup relations
+test regclass-reads-digits-as-the-oid {
+    SELECT '1259'::regclass::text, '4294967295'::regclass::oid;
+}
+expect {
+    pg_class|4294967295
+}
+
+test regclass-reads-the-catalog-tables-that-pg_dump-asks-for {
+    SELECT 'pg_rewrite'::regclass::oid, 'pg_extension'::regclass::oid, 'pg_default_acl'::regclass::oid, 'pg_trigger'::regclass::oid, 'pg_description'::regclass::oid;
+}
+expect {
+    2618|3079|826|2620|2609
+}
+
+test regclass-prints-an-oid-with-no-relation-as-the-number {
+    SELECT 999999::regclass::text, 0::regclass::text;
+}
+expect {
+    999999|-
+}
+
+@setup relations
+test regclass-compares-as-an-oid {
+    SELECT 't'::regclass = 't'::regclass, 't'::regclass = 'other.t'::regclass;
+}
+expect {
+    t|f
+}
+
+test regclass-orders-as-an-oid {
+    SELECT 'pg_proc'::regclass < 'pg_class'::regclass, 'pg_class'::regclass = 1259::int4, 1259::int8 = 'pg_class'::regclass, 'pg_class'::regclass = 1259::oid;
+}
+expect {
+    t|t|t|t
+}
+
+test regclass-in-lists-and-ranges {
+    SELECT 'pg_class'::regclass IN (1259, 1), 'pg_class'::regclass BETWEEN 1 AND 2000, 'pg_class'::regclass = ANY (ARRAY[1259::oid]);
+}
+expect {
+    t|t|t
+}
+
+test regclass-next-to-a-negative-integer-wraps-like-an-oid {
+    SELECT 4294967295::oid::regclass = -1;
+}
+expect {
+    t
+}
+
+test regclass-reads-a-string-next-to-it-as-an-oid {
+    SELECT 'pg_class'::regclass = 'pg_class';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "pg_class"
+}
+
+test regclass-has-no-arithmetic {
+    SELECT 'pg_class'::regclass + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: regclass
+}
+
+test regclass-has-no-negation {
+    SELECT -'pg_class'::regclass;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: - regclass
+}
+
+test regclass-is-not-compared-with-a-decimal-number {
+    SELECT 'pg_class'::regclass = 1259.0;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: regclass = numeric
+}
+
+test regclass-result-column-prints-the-name {
+    SELECT 'pg_class'::regclass, NULL::regclass;
+}
+expect {
+    pg_class|
+}
+
+@setup relations
+test regclass-result-column-prints-the-schema-off-the-search-path {
+    SELECT 'other.only_there'::regclass, 'public.t'::regclass;
+}
+expect {
+    other.only_there|t
+}
+
+@setup relations
+test regclass-column-prints-the-name {
+    CREATE TABLE uses (id int, r regclass);
+    INSERT INTO uses VALUES (1, 't'), (2, 'other.t'), (3, '"Mixed Case"');
+    SELECT r FROM uses ORDER BY id;
+}
+expect {
+    t
+    other.t
+    "Mixed Case"
+}
+
+@setup relations
+test regclass-casts-to-integers {
+    SELECT 'pg_class'::regclass::int4, 'pg_class'::regclass::int8, 'pg_class'::regclass::oid;
+}
+expect {
+    1259|1259|1259
+}
+
+@setup relations
+test regclass-casts-from-integers {
+    SELECT 1259::int4::regclass::text, 1259::int8::regclass::text, 1259::oid::regclass::text;
+}
+expect {
+    pg_class|pg_class|pg_class
+}
+
+@setup relations
+test regclass-of-a-missing-relation-fails {
+    SELECT 'nosuch'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}
+
+@setup relations
+test regclass-of-a-missing-relation-in-a-schema-fails {
+    SELECT 'other.nosuch'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "other.nosuch" does not exist
+}
+
+@setup relations
+test regclass-of-a-missing-schema-fails {
+    SELECT 'nosuch.t'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch.t" does not exist
+}
+
+@setup relations
+test regclass-refuses-another-case-for-a-quoted-name {
+    SELECT '"mixed case"'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "mixed case" does not exist
+}
+
+test regclass-refuses-hex-digits {
+    SELECT '0x10'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "0x10" does not exist
+}
+
+test regclass-refuses-a-number-above-the-largest-oid {
+    SELECT '4294967296'::regclass;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+test regclass-refuses-empty-text {
+    SELECT ''::regclass;
+}
+@sqlstate 42602
+expect error {
+    invalid name syntax
+}
+
+test regclass-refuses-a-trailing-dot {
+    SELECT 't.'::regclass;
+}
+@sqlstate 42602
+expect error {
+    invalid name syntax
+}
+
+test regclass-refuses-an-unclosed-quote {
+    SELECT '"t'::regclass;
+}
+@sqlstate 42602
+expect error {
+    invalid name syntax
+}
+
+test regclass-refuses-four-names {
+    SELECT 'a.b.c.d'::regclass;
+}
+@sqlstate 42601
+expect error {
+    improper relation name
+}
+
+test regclass-refuses-another-database {
+    SELECT 'db.pg_catalog.pg_class'::regclass;
+}
+@sqlstate 0A000
+expect error {
+    cross-database references are not implemented: "db.pg_catalog.pg_class"
+}
+
+test regclass-refuses-a-cast-to-boolean {
+    SELECT 'pg_class'::regclass::boolean;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type regclass to boolean
+}
+@sqlstate 42846
+expect @tursopg error {
+    cannot cast type regclass to bool
+}
+
+test regclass-refuses-a-cast-from-a-decimal-number {
+    SELECT 1.5::regclass;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type numeric to regclass
+}
+
+@setup relations
+test regclass-column-stores-the-oid {
+    CREATE TABLE uses (r regclass);
+    INSERT INTO uses VALUES ('t'), ('other.t');
+    SELECT r::text FROM uses ORDER BY r::oid;
+}
+expect {
+    t
+    other.t
+}
+
+@setup relations
+test regclass-column-refuses-a-missing-relation {
+    CREATE TABLE uses (r regclass);
+    INSERT INTO uses VALUES ('nosuch');
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}
+
+@setup relations
+test regclass-finds-a-view {
+    CREATE VIEW v AS SELECT id FROM t;
+    SELECT 'v'::regclass::text, (SELECT relkind FROM pg_class WHERE oid = 'v'::regclass);
+}
+expect {
+    v|v
+}
+
+@setup relations
+test regclass-finds-a-catalog-view {
+    SELECT 'pg_tables'::regclass::text, 'pg_catalog.pg_tables'::regclass = (SELECT oid FROM pg_class WHERE relname = 'pg_tables');
+}
+expect {
+    pg_tables|t
+}
+
+@setup relations
+test regclass-in-list-reads-names {
+    SELECT 'pg_class'::regclass IN ('pg_class', 'pg_type'), 't'::regclass IN ('other.t', 'pg_type'), 't'::regclass NOT IN ('t', 'pg_type');
+}
+expect {
+    t|f|f
+}
+
+test regclass-reads-a-dash-as-no-relation {
+    SELECT '-'::regclass::int, '-'::regclass::text;
+}
+expect {
+    0|-
+}
+
+test regclass-folds-only-ascii-letters {
+    CREATE TABLE "é" (a int);
+    SELECT 'É'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-reads-digits-with-spaces-as-a-name {
+    SELECT ' 12 '::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-reads-the-catalog-tables-of-every-database {
+    SELECT 'pg_authid'::regclass::oid, 'pg_enum'::regclass::oid, 'pg_statistic'::regclass::oid;
+}
+expect {
+    1260|3501|2619
+}
+
+test regclass-looks-up-an-empty-quoted-name {
+    SELECT '""'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-looks-up-an-empty-quoted-schema {
+    SELECT '"".t'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-in-a-view-keeps-the-relation-when-it-is-renamed {
+    CREATE TABLE t (a int);
+    CREATE VIEW w AS SELECT 't'::regclass::text AS x;
+    ALTER TABLE t RENAME TO t2;
+    SELECT x FROM w;
+}
+expect {
+    t2
+}
+
+test regclass-in-a-default-keeps-the-relation-when-it-is-renamed {
+    CREATE TABLE t (a int);
+    CREATE TABLE r (c regclass DEFAULT 't');
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO r DEFAULT VALUES;
+    SELECT c::text FROM r;
+}
+expect {
+    t2
+}
+
+test regclass-in-a-check-keeps-the-relation-when-it-is-renamed {
+    CREATE TABLE t (a int);
+    CREATE TABLE r (c regclass, CHECK (c <> 't'::regclass));
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO r VALUES (1259);
+    SELECT c::text FROM r;
+}
+expect {
+    pg_class
+}
+
+test regclass-in-a-default-needs-the-relation {
+    CREATE TABLE r (c regclass DEFAULT 'nope');
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-in-a-view-needs-the-relation {
+    CREATE VIEW w AS SELECT 'nope'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-in-a-domain-keeps-the-relation-when-it-is-renamed {
+    CREATE TABLE h1 (a int);
+    CREATE DOMAIN d AS regclass DEFAULT 'h1'::regclass;
+    CREATE TABLE r (c d);
+    ALTER TABLE h1 RENAME TO h2;
+    INSERT INTO r DEFAULT VALUES;
+    SELECT c::text FROM r;
+}
+expect {
+    h2
+}
+
+test regclass-in-a-domain-needs-the-relation {
+    CREATE DOMAIN d AS regclass CHECK (value <> 'nosuch'::regclass);
+}
+@sqlstate 42P01
+expect error {}
+
+test regclass-default-is-printed-as-its-relation {
+    CREATE TABLE src (a int);
+    CREATE TABLE r (c regclass DEFAULT 'src', e regclass DEFAULT 'src'::regclass);
+    ALTER TABLE src RENAME TO src2;
+    SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'r'::regclass ORDER BY adnum;
+}
+expect {
+    1|'src2'::regclass
+    2|'src2'::regclass
+}
+
+test regclass-in-a-check-is-printed-as-its-relation {
+    CREATE TABLE src (a int);
+    CREATE TABLE r (c regclass, CHECK (c <> 'src'::regclass));
+    SELECT pg_get_constraintdef(oid) LIKE '%''src''%' FROM pg_constraint WHERE conrelid = 'r'::regclass;
+}
+expect {
+    t
+}
+
+test regclass-default-may-name-the-table-it-is-created-in {
+    CREATE TABLE r (c regclass DEFAULT 'r', d int, CHECK (c <> 'r'::regclass OR d IS NULL));
+    INSERT INTO r (d) VALUES (NULL);
+    SELECT c::text FROM r;
+}
+expect {
+    r
+}
+
+test regclass-reads-a-unicode-escape-string-in-a-view {
+    CREATE TABLE src (a int);
+    CREATE VIEW w AS SELECT U&'src'::regclass::text AS x, U&'s!0072c' UESCAPE '!'::regclass::text AS y;
+    ALTER TABLE src RENAME TO src2;
+    SELECT x, y FROM w;
+}
+expect {
+    src2|src2
+}
+
+@setup relations
+test regclass-reads-a-vertical-tab-as-white-space {
+    SELECT E'\vt'::regclass::text;
+}
+expect {
+    t
+}
+
+test regclass-cuts-a-name-to-the-longest-identifier {
+    CREATE TABLE aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (a int);
+    SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::regclass::text;
+}
+expect {
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+}
+
+test regclass-does-not-read-a-no-break-space-as-white-space {
+    SELECT E't9 '::regclass;
+}
+@sqlstate 42P01
+expect error {}
+
+@setup relations
+test regclass-in-an-index-is-printed-as-its-relation {
+    CREATE TABLE p (r regclass);
+    CREATE INDEX pi ON p ((r = 'p'::regclass)) WHERE r <> 't'::regclass;
+    ALTER TABLE t RENAME TO t2;
+    SELECT pg_get_indexdef('pi'::regclass) LIKE '%''p''%' AND pg_get_indexdef('pi'::regclass) LIKE '%t2%';
+}
+expect {
+    t
+}
+
+test regclass-prints-the-schema-of-a-relation-named-like-a-catalog {
+    CREATE TABLE pg_type (x int);
+    SELECT 'public.pg_type'::regclass::text, 'pg_type'::regclass::text;
+}
+expect {
+    public.pg_type|pg_type
+}
+
+test foreign-key-prints-a-relation-named-like-a-catalog-with-its-schema {
+    CREATE TABLE pg_trigger (id int PRIMARY KEY);
+    CREATE TABLE f (x int REFERENCES public.pg_trigger (id));
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'f'::regclass AND contype = 'f';
+}
+expect {
+    FOREIGN KEY (x) REFERENCES public.pg_trigger(id)
+}
+
+test regclass-prints-a-quoted-name-bare-when-the-exact-name-is-found-first {
+    CREATE SCHEMA s1;
+    CREATE TABLE up (a int);
+    CREATE TABLE s1."Up" (a int);
+    SET search_path = public, s1;
+    SELECT '"Up"'::regclass::text, 'up'::regclass::text;
+}
+expect {
+    "Up"|up
+}
+
+test regclass-default-names-a-table-with-the-case-it-is-created-in {
+    CREATE TABLE q (x oid DEFAULT '"Q"'::regclass, y int);
+}
+@sqlstate 42P01
+expect error {}

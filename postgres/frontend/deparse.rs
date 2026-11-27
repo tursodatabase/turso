@@ -13,16 +13,23 @@
 
 use turso_core::ast;
 use turso_core::schema::BTreeTable;
+use turso_core::Connection;
+use turso_core::{walk_expr_mut, WalkControl};
 use turso_pg_parser::quote_identifier;
 use turso_pg_parser::translator::role_keyword;
 
-use crate::catalog::pg_type_oid;
+use crate::catalog::{pg_type_oid, regclass_text};
 use crate::functions::quote_literal;
 
 /// PostgreSQL's text of `condition`, a condition on the columns of `table`,
 /// or None when it has a form this module does not print.
-pub(crate) fn condition_text(condition: &ast::Expr, table: &BTreeTable) -> Option<String> {
-    let printed = Printer { table }.expr(condition)?;
+pub(crate) fn condition_text(
+    conn: &Connection,
+    condition: &ast::Expr,
+    table: &BTreeTable,
+) -> Option<String> {
+    let condition = name_regclass_constants(conn, condition);
+    let printed = Printer { table }.expr(&condition)?;
     Some(printed.typed_text(None))
 }
 
@@ -32,11 +39,22 @@ pub(crate) fn condition_text(condition: &ast::Expr, table: &BTreeTable) -> Optio
 /// cast of the whole expression to the column's type, so `7` stays `7` in a
 /// `bigint` column, but a quoted literal takes the column's type.
 pub(crate) fn default_text(
+    conn: &Connection,
     default: &ast::Expr,
     table: &BTreeTable,
     declared_type: &str,
 ) -> Option<String> {
-    let printed = Printer { table }.expr(default)?;
+    if declared_type.eq_ignore_ascii_case("regclass") {
+        if let ast::Expr::Literal(ast::Literal::String(quoted)) = default {
+            let oid = unquote(quoted)?.parse().ok()?;
+            return Some(format!(
+                "{}::regclass",
+                quote_literal(&regclass_text(conn, oid))
+            ));
+        }
+    }
+    let default = name_regclass_constants(conn, default);
+    let printed = Printer { table }.expr(&default)?;
     if printed.ty != PgType::UnknownLiteral {
         return Some(printed.text);
     }
@@ -213,6 +231,32 @@ fn operands(lhs: &Printed, rhs: &Printed) -> Option<(String, String, PgType)> {
     None
 }
 
+/// `expr` with each regclass constant written as the name of its relation.
+/// A statement stores such a constant as the oid of the relation, which
+/// PostgreSQL prints as the relation name, in the form the search path of the
+/// session finds it by.
+pub(crate) fn name_regclass_constants(conn: &Connection, expr: &ast::Expr) -> ast::Expr {
+    let mut expr = expr.clone();
+    walk_expr_mut(&mut expr, &mut |expr| {
+        if let ast::Expr::Cast {
+            expr: operand,
+            type_name: Some(type_name),
+        } = expr
+        {
+            if type_name.name.eq_ignore_ascii_case("regclass") {
+                if let ast::Expr::Literal(ast::Literal::String(quoted)) = operand.as_mut() {
+                    if let Some(oid) = unquote(quoted).and_then(|text| text.parse().ok()) {
+                        *quoted = format!("'{}'", regclass_text(conn, oid).replace('\'', "''"));
+                    }
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("naming regclass constants does not fail");
+    expr
+}
+
 struct Printer<'a> {
     table: &'a BTreeTable,
 }
@@ -226,6 +270,16 @@ impl Printer<'_> {
             },
             ast::Expr::Id(name) | ast::Expr::Qualified(_, name) => self.column(name),
             ast::Expr::Literal(literal) => literal_text(literal),
+            ast::Expr::Cast {
+                expr,
+                type_name: Some(type_name),
+            } if type_name.name.eq_ignore_ascii_case("regclass") => match expr.as_ref() {
+                ast::Expr::Literal(literal @ ast::Literal::String(_)) => Some(Printed::new(
+                    format!("{}::regclass", literal_text(literal)?.text),
+                    PgType::Other,
+                )),
+                _ => None,
+            },
             ast::Expr::Cast {
                 expr,
                 type_name: Some(type_name),
@@ -701,8 +755,24 @@ mod tests {
         .unwrap()
     }
 
+    fn connection() -> crate::PgConnection {
+        let (io, db) = crate::open_database(
+            ":memory:",
+            None,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap();
+        drop(io);
+        crate::PgConnection::connect(&db).unwrap()
+    }
+
     fn text(stored: &str) -> Option<String> {
-        condition_text(&parse_condition(stored).unwrap(), &table())
+        condition_text(
+            connection().inner(),
+            &parse_condition(stored).unwrap(),
+            &table(),
+        )
     }
 
     /// The pairs are what the engine stores for a condition and what
@@ -790,7 +860,7 @@ mod tests {
         ] {
             let default = parse_condition(stored).unwrap();
             assert_eq!(
-                default_text(&default, &table(), declared_type).as_deref(),
+                default_text(connection().inner(), &default, &table(), declared_type).as_deref(),
                 Some(expected),
                 "{stored}"
             );
@@ -815,7 +885,7 @@ mod tests {
         ] {
             let default = ast::Expr::Literal(ast::Literal::Numeric(stored.to_string()));
             assert_eq!(
-                default_text(&default, &table(), "INT").as_deref(),
+                default_text(connection().inner(), &default, &table(), "INT").as_deref(),
                 Some(expected),
                 "{stored}"
             );
@@ -833,7 +903,7 @@ mod tests {
         ] {
             let default = parse_condition(stored).unwrap();
             assert_eq!(
-                default_text(&default, &table(), declared_type),
+                default_text(connection().inner(), &default, &table(), declared_type),
                 None,
                 "{stored}"
             );

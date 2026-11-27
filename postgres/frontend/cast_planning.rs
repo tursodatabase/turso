@@ -5,9 +5,10 @@
 use crate::casts::{convert, resolve, CastType, CastType::*, Resolution};
 use crate::error::sqlstate_error;
 use crate::functions::format_type;
+use std::sync::Arc;
 use turso_core::ast;
 use turso_core::dialect::{CastContext, CastDecision, CastSource, TypeIdentity, TypeRef};
-use turso_core::{DialectError, LimboError, Register, Result, Value};
+use turso_core::{Connection, DialectError, LimboError, Register, Result, Value};
 use turso_pg_parser::sqlstate::{SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED};
 
 /// Decides a CAST of `operand` to `target` as PostgreSQL does when `CASTS`
@@ -117,7 +118,7 @@ fn conversion_call(operand: &ast::Expr, source: CastType, target: CastType) -> a
 
 /// `pg_cast(value, source, target)`: the value converted from the type named
 /// `source` to the type named `target`.
-pub(crate) fn exec_pg_cast(args: &[Register]) -> Result<Value> {
+pub(crate) fn exec_pg_cast(connection: &Arc<Connection>, args: &[Register]) -> Result<Value> {
     let value = args[0].get_value();
     let (Some(source), Some(target)) = (type_arg(&args[1]), type_arg(&args[2])) else {
         return Err(LimboError::InternalError(
@@ -127,7 +128,7 @@ pub(crate) fn exec_pg_cast(args: &[Register]) -> Result<Value> {
     if matches!(value, Value::Null) {
         return Ok(Value::Null);
     }
-    convert(value, source, target)
+    convert(connection, value, source, target)
 }
 
 fn type_arg(arg: &Register) -> Option<CastType> {
@@ -203,6 +204,7 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
         "bigint" => Int8,
         "boolean" => Bool,
         "oid" => Oid,
+        "regclass" => RegClass,
         "timestamp" => Timestamp,
         "timestamptz" => TimestampTz,
         // FIXME(pg-catalog): numeric is registered only with a type modifier. Without one it is REAL, which `is_lowered_type_name` leaves to the engine. A numeric type that needs no modifier lets every numeric go through CASTS.
@@ -246,7 +248,7 @@ fn named_cast_type(name: &str, place: NamePlace) -> Option<CastType> {
     })
 }
 
-/// FIXME(pg-catalog): These built-in types have no rows in `CASTS`, so the engine decides their casts by `Dialect::text_input_types_refuse_other_kinds` and `check_cast_from_text_input_type` of core, and by the CAST function of the type. A type moves from this list to `CASTS` when its pg_cast rows and their conversions are written: date and time first, then json and jsonb, then inet, cidr and the macaddr types. bytea and the reg types need a registered type first. The list is empty when every built-in type is in pg_type and pg_cast.
+/// FIXME(pg-catalog): These built-in types have no rows in `CASTS`, so the engine decides their casts by `Dialect::text_input_types_refuse_other_kinds` and `check_cast_from_text_input_type` of core, and by the CAST function of the type. A type moves from this list to `CASTS` when its pg_cast rows and their conversions are written: date and time first, then json and jsonb, then inet, cidr and the macaddr types. bytea and the reg types other than regclass need a registered type first. The list is empty when every built-in type is in pg_type and pg_cast.
 /// The built-in types whose casts the engine decides.
 const ENGINE_RULE_TYPES: &[&str] = &[
     "date",
@@ -259,7 +261,6 @@ const ENGINE_RULE_TYPES: &[&str] = &[
     "cidr",
     "macaddr",
     "macaddr8",
-    "regclass",
     "regtype",
     "regproc",
     "regprocedure",

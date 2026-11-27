@@ -28,7 +28,9 @@ use turso_core::{
 use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_pg_parser::quote_identifier;
-use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR, SQLSTATE_UNDEFINED_TABLE,
+};
 
 use crate::error::{sql_parse_error, sqlstate_error};
 
@@ -681,6 +683,7 @@ pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
+        "REGCLASS" => 2205,
         _ => return None,
     };
     Some(oid)
@@ -723,6 +726,104 @@ fn user_tables_with_oids(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>
             (namespace, name, table, oid)
         })
         .collect()
+}
+
+/// The oid of the relation that a regclass input names, as pg_class lists it:
+/// a table, view, index, sequence or catalog. A catalog table that pg_class
+/// does not list has its PostgreSQL oid. Fails with 42P01 when there is no such
+/// relation, as it does for a catalog view that this frontend does not have.
+pub(crate) fn regclass_oid(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<i64> {
+    if schema.is_none_or(|schema| schema == "pg_catalog") {
+        let listed = conn.with_schema(MAIN_DB_ID, |schema| {
+            crate::classes::class_catalog(schema)?
+                .get_by_relname(NamespaceId::ROOT, name)
+                .map(|class| class.oid)
+        });
+        if let Some(oid) = listed {
+            return Ok(oid);
+        }
+        if let Some(oid) = catalog_oid_by_name(name) {
+            return Ok(oid);
+        }
+    }
+    for namespace in crate::session::relation_lookup_namespaces(conn, schema) {
+        if namespace.target.id.is_root() {
+            continue;
+        }
+        let found = conn.with_schema(namespace.database_id(), |schema| {
+            crate::classes::class_catalog(schema)?
+                .get_by_relname(namespace.target.id, name)
+                .map(|class| class.oid)
+        });
+        if let Some(oid) = found {
+            return Ok(oid);
+        }
+    }
+    let written = match schema {
+        Some(schema) => format!("{schema}.{name}"),
+        None => name.to_string(),
+    };
+    Err(sqlstate_error(
+        SQLSTATE_UNDEFINED_TABLE,
+        format!("relation \"{written}\" does not exist"),
+        None,
+    ))
+}
+
+/// The text of the regclass value `oid`: the name of the relation, with its
+/// schema when the relation is not on the search path, or the number when no
+/// relation has that oid. 0 is `-`.
+pub(crate) fn regclass_text(conn: &Connection, oid: i64) -> String {
+    if oid == 0 {
+        return "-".to_string();
+    }
+    let schema = conn.current_schema();
+    let Some(catalog) = crate::classes::class_catalog(&schema) else {
+        return oid.to_string();
+    };
+    let Some(relation) = catalog.get_by_oid(oid) else {
+        return match catalog_name_by_oid(oid) {
+            Some(name) => name.to_string(),
+            None => oid.to_string(),
+        };
+    };
+    if relation.relnamespace.is_root() {
+        return quote_identifier(&relation.relname);
+    }
+    let engine_name = relation.engine_name.as_deref().unwrap_or(&relation.relname);
+    relation_name(conn, &schema, relation.relnamespace, engine_name)
+}
+
+/// The oid that the text of a regclass names: digits are an oid, and anything
+/// else is the name of a relation, which must exist.
+pub(crate) fn regclass_oid_of_text(conn: &Arc<Connection>, text: &str) -> Result<i64> {
+    match crate::pg_type::parse_regclass(text)? {
+        crate::pg_type::RegClassInput::Oid(oid) => Ok(oid),
+        crate::pg_type::RegClassInput::Name { schema, name } => {
+            regclass_oid(conn, schema.as_deref(), &name)
+        }
+    }
+}
+
+/// The oid of the PostgreSQL catalog `name`, from the catalogs of
+/// turso_pg_catalog, for a catalog that pg_class does not list.
+fn catalog_oid_by_name(name: &str) -> Option<i64> {
+    turso_pg_catalog::BUILTIN_CATALOGS
+        .iter()
+        .find(|catalog| catalog.name == name)
+        .map(|catalog| i64::from(catalog.oid))
+}
+
+/// The name of the PostgreSQL catalog with the oid `oid`.
+fn catalog_name_by_oid(oid: i64) -> Option<&'static str> {
+    turso_pg_catalog::BUILTIN_CATALOGS
+        .iter()
+        .find(|catalog| i64::from(catalog.oid) == oid)
+        .map(|catalog| catalog.name)
 }
 
 /// Build a mapping from namespace and table name to OID for all user tables.
@@ -1094,7 +1195,7 @@ impl SnapshotRows for PgAttributeTable {
                 ));
             }
         }
-        for index in catalog_indexes(&schema) {
+        for index in catalog_indexes(conn, &schema) {
             let classes = crate::classes::class_catalog(&schema).expect("indexes have classes");
             let class = classes
                 .get_by_oid(index.table_oid)
@@ -1723,7 +1824,7 @@ impl SnapshotRows for PgPolicyTable {
     /// `pg_get_expr` returns as it is.
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
-        catalog_policies(&schema)
+        catalog_policies(conn, &schema)
             .into_iter()
             .map(|policy| {
                 let roles = policy
@@ -1772,7 +1873,7 @@ impl SnapshotRows for PgPoliciesTable {
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let role_catalog = schema_roles(&schema);
-        catalog_policies(&schema)
+        catalog_policies(conn, &schema)
             .into_iter()
             .map(|policy| {
                 let mut roles: Vec<String> = if policy.roles == [RoleId::PUBLIC] {
@@ -1829,7 +1930,7 @@ struct CatalogPolicy<'a> {
 }
 
 /// The policies of every table, ordered by table oid and then as created.
-fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
+fn catalog_policies<'a>(conn: &Connection, schema: &'a Schema) -> Vec<CatalogPolicy<'a>> {
     let Some(catalog) = crate::classes::class_catalog(schema) else {
         return Vec::new();
     };
@@ -1845,7 +1946,7 @@ fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
         // as CREATE POLICY wrote it, which PostgreSQL also reads.
         let condition_text = |condition: &Option<ast::Expr>, written: &Option<String>| {
             let condition = condition.as_ref()?;
-            crate::deparse::condition_text(condition, &table).or_else(|| written.clone())
+            crate::deparse::condition_text(conn, condition, &table).or_else(|| written.clone())
         };
         for (details, policy) in class.relpolicies.iter() {
             let roles = if policy.roles.contains(&RoleId::PUBLIC) {
@@ -1887,7 +1988,7 @@ impl SnapshotRows for PgIndexesTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        for index in catalog_indexes(&schema) {
+        for index in catalog_indexes(conn, &schema) {
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, index.namespace).to_string()),
                 Value::build_text(index.table_name.clone()),
@@ -2124,7 +2225,7 @@ impl SnapshotRows for PgIndexTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        for index in catalog_indexes(&schema) {
+        for index in catalog_indexes(conn, &schema) {
             let indnatts = index.columns.len() as i64;
             let indkey: String = index
                 .columns
@@ -2224,7 +2325,7 @@ impl SnapshotRows for PgConstraintTable {
 
         let tables = user_tables_sorted(&schema);
         let tbl_oid_map = table_oid_map(&schema);
-        let indexes = catalog_indexes(&schema);
+        let indexes = catalog_indexes(conn, &schema);
         let mut constraint_oid = CONSTRAINT_OID_START;
 
         for (namespace, table_name, table) in &tables {
@@ -2484,7 +2585,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(check_condition_text(&chk.expr, btree)), // conbin
+                    Value::build_text(check_condition_text(conn, &chk.expr, btree)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2545,8 +2646,8 @@ impl SnapshotRows for PgAttrdefTable {
                 };
                 // A default with a form the printer does not know is shown
                 // as the engine's SQL.
-                let adbin = crate::deparse::default_text(&default, btree, &col.ty_str)
-                    .unwrap_or_else(|| render_expr(&default));
+                let adbin = crate::deparse::default_text(conn, &default, btree, &col.ty_str)
+                    .unwrap_or_else(|| render_expr(conn, &default));
                 rows.push(vec![
                     Value::from_i64(attrdef_oid),        // oid
                     Value::from_i64(table_oid),          // adrelid
@@ -4364,7 +4465,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
             if constraint_oid == target_oid {
                 return Some(format!(
                     "CHECK ({})",
-                    check_condition_text(&chk.expr, btree)
+                    check_condition_text(conn, &chk.expr, btree)
                 ));
             }
             constraint_oid += 1;
@@ -4384,19 +4485,19 @@ pub(crate) fn relation_name(
     namespace: NamespaceId,
     name: &str,
 ) -> String {
-    let declared_name = schema
-        .get_btree_table(namespace, name)
-        .map_or_else(|| name.to_string(), |table| table.declared_name.clone());
-    let found = conn
-        .search_order()
-        .into_iter()
-        .filter(|qualifier| qualifier.target.database_id == MAIN_DB_ID)
-        .map(|qualifier| qualifier.target.id)
-        .find(|search_namespace| {
-            crate::classes::class_catalog(schema)
-                .is_some_and(|catalog| catalog.get_by_name(*search_namespace, name).is_some())
-        });
-    if found == Some(namespace) {
+    let class = crate::classes::class_catalog(schema)
+        .and_then(|catalog| catalog.get_by_name(namespace, name));
+    let declared_name = match class {
+        Some(class) => class.relname.clone(),
+        None => schema
+            .get_btree_table(namespace, name)
+            .map_or_else(|| name.to_string(), |table| table.declared_name.clone()),
+    };
+    // The name alone finds this relation when the exact lookup of the name
+    // does, as the cast to regclass does it.
+    if class
+        .is_some_and(|class| visible_relation_oid(conn, schema, &declared_name) == Some(class.oid))
+    {
         return quote_identifier(&declared_name);
     }
     format!(
@@ -4404,6 +4505,40 @@ pub(crate) fn relation_name(
         quote_identifier(schema_name_of(schema, namespace)),
         quote_identifier(&declared_name)
     )
+}
+
+/// The oid of the relation that the name `name`, written without a schema,
+/// finds: a catalog, since pg_catalog is searched first, or else the first
+/// relation of that name in the search path. Names are compared exactly.
+fn visible_relation_oid(conn: &Connection, schema: &Schema, name: &str) -> Option<i64> {
+    let catalog = crate::classes::class_catalog(schema)?;
+    if let Some(class) = catalog.get_by_relname(NamespaceId::ROOT, name) {
+        return Some(class.oid);
+    }
+    if let Some(oid) = catalog_oid_by_name(name) {
+        return Some(oid);
+    }
+    conn.search_order()
+        .into_iter()
+        .filter(|qualifier| qualifier.target.database_id == MAIN_DB_ID)
+        .map(|qualifier| qualifier.target.id)
+        .filter(|namespace| !namespace.is_root())
+        .find_map(|namespace| {
+            catalog
+                .classes()
+                .find(|class| class.relnamespace == namespace && is_named(class, name))
+                .map(|class| class.oid)
+        })
+}
+
+/// Whether the relation of `class` has the name `name`.
+fn is_named(class: &crate::classes::RelationClass, name: &str) -> bool {
+    // FIXME(pg-identifiers): The engine folds the name of a sequence to
+    // lowercase, so pg_class shows `ss` for `CREATE SEQUENCE "Ss"`, and the
+    // name written is not known. A sequence is found by its name in any case.
+    // PostgreSQL compares every name exactly.
+    class.relname == name
+        || (class.relkind == RelationKind::Sequence && class.relname == name.to_ascii_lowercase())
 }
 
 fn constraint_column_list<'a>(
@@ -4426,12 +4561,13 @@ fn constraint_column_list<'a>(
 /// The text of a CHECK condition of `table` as PostgreSQL's `pg_get_expr`
 /// prints it. A condition with a form the printer does not know is shown as
 /// the engine's SQL.
-fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
-    crate::deparse::condition_text(condition, table).unwrap_or_else(|| render_expr(condition))
+fn check_condition_text(conn: &Connection, condition: &ast::Expr, table: &BTreeTable) -> String {
+    crate::deparse::condition_text(conn, condition, table)
+        .unwrap_or_else(|| render_expr(conn, condition))
 }
 
-fn render_expr(expr: &ast::Expr) -> String {
-    let mut expr = expr.clone();
+fn render_expr(conn: &Connection, expr: &ast::Expr) -> String {
+    let mut expr = crate::deparse::name_regclass_constants(conn, expr);
     walk_expr_mut(&mut expr, &mut |expr| {
         // The translator compiles PostgreSQL's binary collations to BINARY.
         if let ast::Expr::Collate(_, collation) = expr {
@@ -4465,7 +4601,7 @@ fn render_expr(expr: &ast::Expr) -> String {
 /// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
 pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    catalog_indexes(&schema)
+    catalog_indexes(conn, &schema)
         .iter()
         .find(|index| index.oid == target_oid)
         .map(|index| index_definition(&schema, index))
@@ -4542,7 +4678,7 @@ struct CatalogIndex {
 
 /// The indexes of the user tables, from their class rows, in the order of
 /// the tables. An index is named as its class row names it.
-fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
+fn catalog_indexes(conn: &Connection, schema: &Schema) -> Vec<CatalogIndex> {
     let Some(classes) = crate::classes::class_catalog(schema) else {
         return Vec::new();
     };
@@ -4609,7 +4745,9 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                                 .expect("index columns have names")
                         },
                         position: column.pos_in_table,
-                        expression: column.expr.as_ref().map(ToString::to_string),
+                        expression: column.expr.as_ref().map(|expr| {
+                            crate::deparse::name_regclass_constants(conn, expr).to_string()
+                        }),
                         order: column.order,
                     })
                     .collect(),
@@ -4618,7 +4756,10 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                 for_constraint: index
                     .name
                     .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX),
-                where_clause: index.where_clause.as_ref().map(ToString::to_string),
+                where_clause: index
+                    .where_clause
+                    .as_ref()
+                    .map(|expr| crate::deparse::name_regclass_constants(conn, expr).to_string()),
             });
         }
     }

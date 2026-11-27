@@ -225,6 +225,7 @@ impl CatalogRow for PgAggregate {
 /// `pg_aggregate` as a built-in catalog, with the rows of [`PG_AGGREGATE`].
 pub const PG_AGGREGATE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_aggregate",
+    oid: 2600,
     create_sql: PgAggregate::CREATE_SQL,
     index_sql: PgAggregate::INDEX_SQL,
     rows: &CatalogRows::new(&PG_AGGREGATE, None, &[0], Some(|row, column| match column { 0 => i64::from(row.aggfnoid), _ => unreachable!("the key has 1 columns") }), 0x34fb32c2),
@@ -281,6 +282,7 @@ impl CatalogRow for PgAm {
 /// `pg_am` as a built-in catalog, with the rows of [`PG_AM`].
 pub const PG_AM_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_am",
+    oid: 2601,
     create_sql: PgAm::CREATE_SQL,
     index_sql: PgAm::INDEX_SQL,
     rows: &CatalogRows::new(&PG_AM, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xc29f9c3b),
@@ -1281,6 +1283,7 @@ impl CatalogRow for PgAmop {
 /// `pg_amop` as a built-in catalog, with the rows of [`PG_AMOP`].
 pub const PG_AMOP_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_amop",
+    oid: 2602,
     create_sql: PgAmop::CREATE_SQL,
     index_sql: PgAmop::INDEX_SQL,
     rows: &CatalogRows::new(&PG_AMOP, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xbc70c4ad),
@@ -2046,6 +2049,7 @@ impl CatalogRow for PgAmproc {
 /// `pg_amproc` as a built-in catalog, with the rows of [`PG_AMPROC`].
 pub const PG_AMPROC_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_amproc",
+    oid: 2603,
     create_sql: PgAmproc::CREATE_SQL,
     index_sql: PgAmproc::INDEX_SQL,
     rows: &CatalogRows::new(&PG_AMPROC, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xf628c125),
@@ -2095,6 +2099,7 @@ impl CatalogRow for PgAttrdef {
 /// `pg_attrdef` as a built-in catalog, with the rows of [`PG_ATTRDEF`].
 pub const PG_ATTRDEF_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_attrdef",
+    oid: 2604,
     create_sql: PgAttrdef::CREATE_SQL,
     index_sql: PgAttrdef::INDEX_SQL,
     rows: &CatalogRows::new(&PG_ATTRDEF, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xa105d3c2),
@@ -2161,6 +2166,7 @@ impl CatalogRow for PgAttribute {
 /// `pg_attribute` as a built-in catalog, with the rows of [`PG_ATTRIBUTE`].
 pub const PG_ATTRIBUTE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_attribute",
+    oid: 1249,
     create_sql: PgAttribute::CREATE_SQL,
     index_sql: PgAttribute::INDEX_SQL,
     rows: &CatalogRows::new(&PG_ATTRIBUTE, None, &[0, 4], Some(|row, column| match column { 0 => i64::from(row.attrelid), 1 => i64::from(row.attnum), _ => unreachable!("the key has 2 columns") }), 0x35da79f9),
@@ -2215,6 +2221,7 @@ impl CatalogRow for PgAuthMembers {
 /// `pg_auth_members` as a built-in catalog, with the rows of [`PG_AUTH_MEMBERS`].
 pub const PG_AUTH_MEMBERS_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_auth_members",
+    oid: 1261,
     create_sql: PgAuthMembers::CREATE_SQL,
     index_sql: PgAuthMembers::INDEX_SQL,
     rows: &CatalogRows::new(&PG_AUTH_MEMBERS, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x3c3bd911),
@@ -2289,6 +2296,7 @@ impl CatalogRow for PgAuthid {
 /// `pg_authid` as a built-in catalog, with the rows of [`PG_AUTHID`].
 pub const PG_AUTHID_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_authid",
+    oid: 1260,
     create_sql: PgAuthid::CREATE_SQL,
     index_sql: PgAuthid::INDEX_SQL,
     rows: &CatalogRows::new(&PG_AUTHID, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x6ae4e522),
@@ -2575,6 +2583,7 @@ impl CatalogRow for PgCast {
 /// `pg_cast` as a built-in catalog, with the rows of [`PG_CAST`].
 pub const PG_CAST_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_cast",
+    oid: 2605,
     create_sql: PgCast::CREATE_SQL,
     index_sql: PgCast::INDEX_SQL,
     rows: &CatalogRows::new(&PG_CAST, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x1b33f10c),
@@ -2655,6 +2664,7 @@ impl CatalogRow for PgClass {
 /// `pg_class` as a built-in catalog, with the rows of [`PG_CLASS`].
 pub const PG_CLASS_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_class",
+    oid: 1259,
     create_sql: PgClass::CREATE_SQL,
     index_sql: PgClass::INDEX_SQL,
     rows: &CatalogRows::new(&PG_CLASS, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x048eed69),
@@ -2719,6 +2729,7 @@ impl CatalogRow for PgCollation {
 /// `pg_collation` as a built-in catalog, with the rows of [`PG_COLLATION`].
 pub const PG_COLLATION_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_collation",
+    oid: 3456,
     create_sql: PgCollation::CREATE_SQL,
     index_sql: PgCollation::INDEX_SQL,
     rows: &CatalogRows::new(&PG_COLLATION, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x2f8dadd8),
@@ -2795,6 +2806,7 @@ impl CatalogRow for PgConstraint {
 /// `pg_constraint` as a built-in catalog, with the rows of [`PG_CONSTRAINT`].
 pub const PG_CONSTRAINT_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_constraint",
+    oid: 2606,
     create_sql: PgConstraint::CREATE_SQL,
     index_sql: PgConstraint::INDEX_SQL,
     rows: &CatalogRows::new(&PG_CONSTRAINT, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xea2835ed),
@@ -2977,6 +2989,7 @@ impl CatalogRow for PgConversion {
 /// `pg_conversion` as a built-in catalog, with the rows of [`PG_CONVERSION`].
 pub const PG_CONVERSION_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_conversion",
+    oid: 2607,
     create_sql: PgConversion::CREATE_SQL,
     index_sql: PgConversion::INDEX_SQL,
     rows: &CatalogRows::new(&PG_CONVERSION, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xe2dc1681),
@@ -3040,6 +3053,7 @@ impl CatalogRow for PgDatabase {
 /// `pg_database` as a built-in catalog, with the rows of [`PG_DATABASE`].
 pub const PG_DATABASE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_database",
+    oid: 1262,
     create_sql: PgDatabase::CREATE_SQL,
     index_sql: PgDatabase::INDEX_SQL,
     rows: &CatalogRows::new(&PG_DATABASE, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x43bea119),
@@ -3083,6 +3097,7 @@ impl CatalogRow for PgDbRoleSetting {
 /// `pg_db_role_setting` as a built-in catalog, with the rows of [`PG_DB_ROLE_SETTING`].
 pub const PG_DB_ROLE_SETTING_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_db_role_setting",
+    oid: 2964,
     create_sql: PgDbRoleSetting::CREATE_SQL,
     index_sql: PgDbRoleSetting::INDEX_SQL,
     rows: &CatalogRows::new(&PG_DB_ROLE_SETTING, None, &[0, 1], Some(|row, column| match column { 0 => i64::from(row.setdatabase), 1 => i64::from(row.setrole), _ => unreachable!("the key has 2 columns") }), 0x85f1b7f2),
@@ -3133,6 +3148,7 @@ impl CatalogRow for PgDefaultAcl {
 /// `pg_default_acl` as a built-in catalog, with the rows of [`PG_DEFAULT_ACL`].
 pub const PG_DEFAULT_ACL_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_default_acl",
+    oid: 826,
     create_sql: PgDefaultAcl::CREATE_SQL,
     index_sql: PgDefaultAcl::INDEX_SQL,
     rows: &CatalogRows::new(&PG_DEFAULT_ACL, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x4119d77d),
@@ -3181,6 +3197,7 @@ impl CatalogRow for PgDepend {
 /// `pg_depend` as a built-in catalog, with the rows of [`PG_DEPEND`].
 pub const PG_DEPEND_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_depend",
+    oid: 2608,
     create_sql: PgDepend::CREATE_SQL,
     index_sql: PgDepend::INDEX_SQL,
     rows: &CatalogRows::new(&PG_DEPEND, None, &[], None, 0x0301618e),
@@ -6900,6 +6917,7 @@ impl CatalogRow for PgDescription {
 /// `pg_description` as a built-in catalog, with the rows of [`PG_DESCRIPTION`].
 pub const PG_DESCRIPTION_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_description",
+    oid: 2609,
     create_sql: PgDescription::CREATE_SQL,
     index_sql: PgDescription::INDEX_SQL,
     rows: &CatalogRows::new(&PG_DESCRIPTION, None, &[0, 1, 2], Some(|row, column| match column { 0 => i64::from(row.objoid), 1 => i64::from(row.classoid), 2 => i64::from(row.objsubid), _ => unreachable!("the key has 3 columns") }), 0x1f947dbb),
@@ -6950,6 +6968,7 @@ impl CatalogRow for PgEnum {
 /// `pg_enum` as a built-in catalog, with the rows of [`PG_ENUM`].
 pub const PG_ENUM_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_enum",
+    oid: 3501,
     create_sql: PgEnum::CREATE_SQL,
     index_sql: PgEnum::INDEX_SQL,
     rows: &CatalogRows::new(&PG_ENUM, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x874f3bfe),
@@ -7002,6 +7021,7 @@ impl CatalogRow for PgEventTrigger {
 /// `pg_event_trigger` as a built-in catalog, with the rows of [`PG_EVENT_TRIGGER`].
 pub const PG_EVENT_TRIGGER_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_event_trigger",
+    oid: 3466,
     create_sql: PgEventTrigger::CREATE_SQL,
     index_sql: PgEventTrigger::INDEX_SQL,
     rows: &CatalogRows::new(&PG_EVENT_TRIGGER, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xbcc20d47),
@@ -7055,6 +7075,7 @@ impl CatalogRow for PgExtension {
 /// `pg_extension` as a built-in catalog, with the rows of [`PG_EXTENSION`].
 pub const PG_EXTENSION_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_extension",
+    oid: 3079,
     create_sql: PgExtension::CREATE_SQL,
     index_sql: PgExtension::INDEX_SQL,
     rows: &CatalogRows::new(&PG_EXTENSION, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x78337abd),
@@ -7109,6 +7130,7 @@ impl CatalogRow for PgForeignDataWrapper {
 /// `pg_foreign_data_wrapper` as a built-in catalog, with the rows of [`PG_FOREIGN_DATA_WRAPPER`].
 pub const PG_FOREIGN_DATA_WRAPPER_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_foreign_data_wrapper",
+    oid: 2328,
     create_sql: PgForeignDataWrapper::CREATE_SQL,
     index_sql: PgForeignDataWrapper::INDEX_SQL,
     rows: &CatalogRows::new(&PG_FOREIGN_DATA_WRAPPER, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x2f63b1db),
@@ -7162,6 +7184,7 @@ impl CatalogRow for PgForeignServer {
 /// `pg_foreign_server` as a built-in catalog, with the rows of [`PG_FOREIGN_SERVER`].
 pub const PG_FOREIGN_SERVER_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_foreign_server",
+    oid: 1417,
     create_sql: PgForeignServer::CREATE_SQL,
     index_sql: PgForeignServer::INDEX_SQL,
     rows: &CatalogRows::new(&PG_FOREIGN_SERVER, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x22825d0a),
@@ -7212,6 +7235,7 @@ impl CatalogRow for PgForeignTable {
 /// `pg_foreign_table` as a built-in catalog, with the rows of [`PG_FOREIGN_TABLE`].
 pub const PG_FOREIGN_TABLE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_foreign_table",
+    oid: 3118,
     create_sql: PgForeignTable::CREATE_SQL,
     index_sql: PgForeignTable::INDEX_SQL,
     rows: &CatalogRows::new(&PG_FOREIGN_TABLE, None, &[0], Some(|row, column| match column { 0 => i64::from(row.ftrelid), _ => unreachable!("the key has 1 columns") }), 0x209e63da),
@@ -7281,6 +7305,7 @@ impl CatalogRow for PgIndex {
 /// `pg_index` as a built-in catalog, with the rows of [`PG_INDEX`].
 pub const PG_INDEX_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_index",
+    oid: 2610,
     create_sql: PgIndex::CREATE_SQL,
     index_sql: PgIndex::INDEX_SQL,
     rows: &CatalogRows::new(&PG_INDEX, None, &[0], Some(|row, column| match column { 0 => i64::from(row.indexrelid), _ => unreachable!("the key has 1 columns") }), 0x60dd3f80),
@@ -7326,6 +7351,7 @@ impl CatalogRow for PgInherits {
 /// `pg_inherits` as a built-in catalog, with the rows of [`PG_INHERITS`].
 pub const PG_INHERITS_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_inherits",
+    oid: 2611,
     create_sql: PgInherits::CREATE_SQL,
     index_sql: PgInherits::INDEX_SQL,
     rows: &CatalogRows::new(&PG_INHERITS, None, &[0, 2], Some(|row, column| match column { 0 => i64::from(row.inhrelid), 1 => i64::from(row.inhseqno), _ => unreachable!("the key has 2 columns") }), 0xf2c1ba77),
@@ -7371,6 +7397,7 @@ impl CatalogRow for PgInitPrivs {
 /// `pg_init_privs` as a built-in catalog, with the rows of [`PG_INIT_PRIVS`].
 pub const PG_INIT_PRIVS_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_init_privs",
+    oid: 3394,
     create_sql: PgInitPrivs::CREATE_SQL,
     index_sql: PgInitPrivs::INDEX_SQL,
     rows: &CatalogRows::new(&PG_INIT_PRIVS, None, &[0, 1, 2], Some(|row, column| match column { 0 => i64::from(row.objoid), 1 => i64::from(row.classoid), 2 => i64::from(row.objsubid), _ => unreachable!("the key has 3 columns") }), 0x8f9d6394),
@@ -7428,6 +7455,7 @@ impl CatalogRow for PgLanguage {
 /// `pg_language` as a built-in catalog, with the rows of [`PG_LANGUAGE`].
 pub const PG_LANGUAGE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_language",
+    oid: 2612,
     create_sql: PgLanguage::CREATE_SQL,
     index_sql: PgLanguage::INDEX_SQL,
     rows: &CatalogRows::new(&PG_LANGUAGE, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xca150d37),
@@ -7471,6 +7499,7 @@ impl CatalogRow for PgLargeobject {
 /// `pg_largeobject` as a built-in catalog, with the rows of [`PG_LARGEOBJECT`].
 pub const PG_LARGEOBJECT_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_largeobject",
+    oid: 2613,
     create_sql: PgLargeobject::CREATE_SQL,
     index_sql: PgLargeobject::INDEX_SQL,
     rows: &CatalogRows::new(&PG_LARGEOBJECT, None, &[0, 1], Some(|row, column| match column { 0 => i64::from(row.loid), 1 => i64::from(row.pageno), _ => unreachable!("the key has 2 columns") }), 0xf8a2859d),
@@ -7519,6 +7548,7 @@ impl CatalogRow for PgLargeobjectMetadata {
 /// `pg_largeobject_metadata` as a built-in catalog, with the rows of [`PG_LARGEOBJECT_METADATA`].
 pub const PG_LARGEOBJECT_METADATA_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_largeobject_metadata",
+    oid: 2995,
     create_sql: PgLargeobjectMetadata::CREATE_SQL,
     index_sql: PgLargeobjectMetadata::INDEX_SQL,
     rows: &CatalogRows::new(&PG_LARGEOBJECT_METADATA, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x16af5813),
@@ -7571,6 +7601,7 @@ impl CatalogRow for PgNamespace {
 /// `pg_namespace` as a built-in catalog, with the rows of [`PG_NAMESPACE`].
 pub const PG_NAMESPACE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_namespace",
+    oid: 2615,
     create_sql: PgNamespace::CREATE_SQL,
     index_sql: PgNamespace::INDEX_SQL,
     rows: &CatalogRows::new(&PG_NAMESPACE, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x4163f0f7),
@@ -7802,6 +7833,7 @@ impl CatalogRow for PgOpclass {
 /// `pg_opclass` as a built-in catalog, with the rows of [`PG_OPCLASS`].
 pub const PG_OPCLASS_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_opclass",
+    oid: 2616,
     create_sql: PgOpclass::CREATE_SQL,
     index_sql: PgOpclass::INDEX_SQL,
     rows: &CatalogRows::new(&PG_OPCLASS, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xa2b590bf),
@@ -8661,6 +8693,7 @@ impl CatalogRow for PgOperator {
 /// `pg_operator` as a built-in catalog, with the rows of [`PG_OPERATOR`].
 pub const PG_OPERATOR_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_operator",
+    oid: 2617,
     create_sql: PgOperator::CREATE_SQL,
     index_sql: PgOperator::INDEX_SQL,
     rows: &CatalogRows::new(&PG_OPERATOR, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x50244ec3),
@@ -8857,6 +8890,7 @@ impl CatalogRow for PgOpfamily {
 /// `pg_opfamily` as a built-in catalog, with the rows of [`PG_OPFAMILY`].
 pub const PG_OPFAMILY_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_opfamily",
+    oid: 2753,
     create_sql: PgOpfamily::CREATE_SQL,
     index_sql: PgOpfamily::INDEX_SQL,
     rows: &CatalogRows::new(&PG_OPFAMILY, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xd5041022),
@@ -8905,6 +8939,7 @@ impl CatalogRow for PgParameterAcl {
 /// `pg_parameter_acl` as a built-in catalog, with the rows of [`PG_PARAMETER_ACL`].
 pub const PG_PARAMETER_ACL_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_parameter_acl",
+    oid: 6243,
     create_sql: PgParameterAcl::CREATE_SQL,
     index_sql: PgParameterAcl::INDEX_SQL,
     rows: &CatalogRows::new(&PG_PARAMETER_ACL, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x2b293729),
@@ -8960,6 +8995,7 @@ impl CatalogRow for PgPartitionedTable {
 /// `pg_partitioned_table` as a built-in catalog, with the rows of [`PG_PARTITIONED_TABLE`].
 pub const PG_PARTITIONED_TABLE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_partitioned_table",
+    oid: 3350,
     create_sql: PgPartitionedTable::CREATE_SQL,
     index_sql: PgPartitionedTable::INDEX_SQL,
     rows: &CatalogRows::new(&PG_PARTITIONED_TABLE, None, &[0], Some(|row, column| match column { 0 => i64::from(row.partrelid), _ => unreachable!("the key has 1 columns") }), 0xffebc6b1),
@@ -9013,6 +9049,7 @@ impl CatalogRow for PgPolicy {
 /// `pg_policy` as a built-in catalog, with the rows of [`PG_POLICY`].
 pub const PG_POLICY_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_policy",
+    oid: 3256,
     create_sql: PgPolicy::CREATE_SQL,
     index_sql: PgPolicy::INDEX_SQL,
     rows: &CatalogRows::new(&PG_POLICY, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xc1a4aa75),
@@ -12485,6 +12522,7 @@ impl CatalogRow for PgProc {
 /// `pg_proc` as a built-in catalog, with the rows of [`PG_PROC`].
 pub const PG_PROC_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_proc",
+    oid: 1255,
     create_sql: PgProc::CREATE_SQL,
     index_sql: PgProc::INDEX_SQL,
     rows: &CatalogRows::new(&PG_PROC, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x133e6212),
@@ -12540,6 +12578,7 @@ impl CatalogRow for PgPublication {
 /// `pg_publication` as a built-in catalog, with the rows of [`PG_PUBLICATION`].
 pub const PG_PUBLICATION_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_publication",
+    oid: 6104,
     create_sql: PgPublication::CREATE_SQL,
     index_sql: PgPublication::INDEX_SQL,
     rows: &CatalogRows::new(&PG_PUBLICATION, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x922071bf),
@@ -12590,6 +12629,7 @@ impl CatalogRow for PgPublicationNamespace {
 /// `pg_publication_namespace` as a built-in catalog, with the rows of [`PG_PUBLICATION_NAMESPACE`].
 pub const PG_PUBLICATION_NAMESPACE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_publication_namespace",
+    oid: 6237,
     create_sql: PgPublicationNamespace::CREATE_SQL,
     index_sql: PgPublicationNamespace::INDEX_SQL,
     rows: &CatalogRows::new(&PG_PUBLICATION_NAMESPACE, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xb31bc6cf),
@@ -12643,6 +12683,7 @@ impl CatalogRow for PgPublicationRel {
 /// `pg_publication_rel` as a built-in catalog, with the rows of [`PG_PUBLICATION_REL`].
 pub const PG_PUBLICATION_REL_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_publication_rel",
+    oid: 6106,
     create_sql: PgPublicationRel::CREATE_SQL,
     index_sql: PgPublicationRel::INDEX_SQL,
     rows: &CatalogRows::new(&PG_PUBLICATION_REL, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x0271c476),
@@ -12704,6 +12745,7 @@ impl CatalogRow for PgRange {
 /// `pg_range` as a built-in catalog, with the rows of [`PG_RANGE`].
 pub const PG_RANGE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_range",
+    oid: 3541,
     create_sql: PgRange::CREATE_SQL,
     index_sql: PgRange::INDEX_SQL,
     rows: &CatalogRows::new(&PG_RANGE, None, &[0], Some(|row, column| match column { 0 => i64::from(row.rngtypid), _ => unreachable!("the key has 1 columns") }), 0x074138da),
@@ -12754,6 +12796,7 @@ impl CatalogRow for PgReplicationOrigin {
 /// `pg_replication_origin` as a built-in catalog, with the rows of [`PG_REPLICATION_ORIGIN`].
 pub const PG_REPLICATION_ORIGIN_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_replication_origin",
+    oid: 6000,
     create_sql: PgReplicationOrigin::CREATE_SQL,
     index_sql: PgReplicationOrigin::INDEX_SQL,
     rows: &CatalogRows::new(&PG_REPLICATION_ORIGIN, None, &[0], Some(|row, column| match column { 0 => i64::from(row.roident), _ => unreachable!("the key has 1 columns") }), 0x9b3a0812),
@@ -12807,6 +12850,7 @@ impl CatalogRow for PgRewrite {
 /// `pg_rewrite` as a built-in catalog, with the rows of [`PG_REWRITE`].
 pub const PG_REWRITE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_rewrite",
+    oid: 2618,
     create_sql: PgRewrite::CREATE_SQL,
     index_sql: PgRewrite::INDEX_SQL,
     rows: &CatalogRows::new(&PG_REWRITE, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x6a9349c7),
@@ -12852,6 +12896,7 @@ impl CatalogRow for PgSeclabel {
 /// `pg_seclabel` as a built-in catalog, with the rows of [`PG_SECLABEL`].
 pub const PG_SECLABEL_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_seclabel",
+    oid: 3596,
     create_sql: PgSeclabel::CREATE_SQL,
     index_sql: PgSeclabel::INDEX_SQL,
     rows: &CatalogRows::new(&PG_SECLABEL, None, &[], None, 0x8e3dfa13),
@@ -12907,6 +12952,7 @@ impl CatalogRow for PgSequence {
 /// `pg_sequence` as a built-in catalog, with the rows of [`PG_SEQUENCE`].
 pub const PG_SEQUENCE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_sequence",
+    oid: 2224,
     create_sql: PgSequence::CREATE_SQL,
     index_sql: PgSequence::INDEX_SQL,
     rows: &CatalogRows::new(&PG_SEQUENCE, None, &[0], Some(|row, column| match column { 0 => i64::from(row.seqrelid), _ => unreachable!("the key has 1 columns") }), 0x6a2a4d2f),
@@ -12955,6 +13001,7 @@ impl CatalogRow for PgShdepend {
 /// `pg_shdepend` as a built-in catalog, with the rows of [`PG_SHDEPEND`].
 pub const PG_SHDEPEND_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_shdepend",
+    oid: 1214,
     create_sql: PgShdepend::CREATE_SQL,
     index_sql: PgShdepend::INDEX_SQL,
     rows: &CatalogRows::new(&PG_SHDEPEND, None, &[], None, 0xd5d04f0d),
@@ -12999,6 +13046,7 @@ impl CatalogRow for PgShdescription {
 /// `pg_shdescription` as a built-in catalog, with the rows of [`PG_SHDESCRIPTION`].
 pub const PG_SHDESCRIPTION_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_shdescription",
+    oid: 2396,
     create_sql: PgShdescription::CREATE_SQL,
     index_sql: PgShdescription::INDEX_SQL,
     rows: &CatalogRows::new(&PG_SHDESCRIPTION, None, &[0, 1], Some(|row, column| match column { 0 => i64::from(row.objoid), 1 => i64::from(row.classoid), _ => unreachable!("the key has 2 columns") }), 0xaf161a3d),
@@ -13043,6 +13091,7 @@ impl CatalogRow for PgShseclabel {
 /// `pg_shseclabel` as a built-in catalog, with the rows of [`PG_SHSECLABEL`].
 pub const PG_SHSECLABEL_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_shseclabel",
+    oid: 3592,
     create_sql: PgShseclabel::CREATE_SQL,
     index_sql: PgShseclabel::INDEX_SQL,
     rows: &CatalogRows::new(&PG_SHSECLABEL, None, &[], None, 0xb0f43fb6),
@@ -13114,6 +13163,7 @@ impl CatalogRow for PgStatistic {
 /// `pg_statistic` as a built-in catalog, with the rows of [`PG_STATISTIC`].
 pub const PG_STATISTIC_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_statistic",
+    oid: 2619,
     create_sql: PgStatistic::CREATE_SQL,
     index_sql: PgStatistic::INDEX_SQL,
     rows: &CatalogRows::new(&PG_STATISTIC, None, &[], None, 0xbcc8d066),
@@ -13169,6 +13219,7 @@ impl CatalogRow for PgStatisticExt {
 /// `pg_statistic_ext` as a built-in catalog, with the rows of [`PG_STATISTIC_EXT`].
 pub const PG_STATISTIC_EXT_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_statistic_ext",
+    oid: 3381,
     create_sql: PgStatisticExt::CREATE_SQL,
     index_sql: PgStatisticExt::INDEX_SQL,
     rows: &CatalogRows::new(&PG_STATISTIC_EXT, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xfde2823c),
@@ -13215,6 +13266,7 @@ impl CatalogRow for PgStatisticExtData {
 /// `pg_statistic_ext_data` as a built-in catalog, with the rows of [`PG_STATISTIC_EXT_DATA`].
 pub const PG_STATISTIC_EXT_DATA_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_statistic_ext_data",
+    oid: 3429,
     create_sql: PgStatisticExtData::CREATE_SQL,
     index_sql: PgStatisticExtData::INDEX_SQL,
     rows: &CatalogRows::new(&PG_STATISTIC_EXT_DATA, None, &[], None, 0x63029ee1),
@@ -13278,6 +13330,7 @@ impl CatalogRow for PgSubscription {
 /// `pg_subscription` as a built-in catalog, with the rows of [`PG_SUBSCRIPTION`].
 pub const PG_SUBSCRIPTION_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_subscription",
+    oid: 6100,
     create_sql: PgSubscription::CREATE_SQL,
     index_sql: PgSubscription::INDEX_SQL,
     rows: &CatalogRows::new(&PG_SUBSCRIPTION, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xa99dc474),
@@ -13322,6 +13375,7 @@ impl CatalogRow for PgSubscriptionRel {
 /// `pg_subscription_rel` as a built-in catalog, with the rows of [`PG_SUBSCRIPTION_REL`].
 pub const PG_SUBSCRIPTION_REL_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_subscription_rel",
+    oid: 6102,
     create_sql: PgSubscriptionRel::CREATE_SQL,
     index_sql: PgSubscriptionRel::INDEX_SQL,
     rows: &CatalogRows::new(&PG_SUBSCRIPTION_REL, None, &[1, 0], Some(|row, column| match column { 0 => i64::from(row.srrelid), 1 => i64::from(row.srsubid), _ => unreachable!("the key has 2 columns") }), 0x853ed20e),
@@ -13374,6 +13428,7 @@ impl CatalogRow for PgTablespace {
 /// `pg_tablespace` as a built-in catalog, with the rows of [`PG_TABLESPACE`].
 pub const PG_TABLESPACE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_tablespace",
+    oid: 1213,
     create_sql: PgTablespace::CREATE_SQL,
     index_sql: PgTablespace::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TABLESPACE, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x7b0fcca8),
@@ -13424,6 +13479,7 @@ impl CatalogRow for PgTransform {
 /// `pg_transform` as a built-in catalog, with the rows of [`PG_TRANSFORM`].
 pub const PG_TRANSFORM_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_transform",
+    oid: 3576,
     create_sql: PgTransform::CREATE_SQL,
     index_sql: PgTransform::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TRANSFORM, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x019256fe),
@@ -13489,6 +13545,7 @@ impl CatalogRow for PgTrigger {
 /// `pg_trigger` as a built-in catalog, with the rows of [`PG_TRIGGER`].
 pub const PG_TRIGGER_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_trigger",
+    oid: 2620,
     create_sql: PgTrigger::CREATE_SQL,
     index_sql: PgTrigger::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TRIGGER, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xe6f15829),
@@ -13540,6 +13597,7 @@ impl CatalogRow for PgTsConfig {
 /// `pg_ts_config` as a built-in catalog, with the rows of [`PG_TS_CONFIG`].
 pub const PG_TS_CONFIG_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_ts_config",
+    oid: 3602,
     create_sql: PgTsConfig::CREATE_SQL,
     index_sql: PgTsConfig::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TS_CONFIG, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x54670829),
@@ -13603,6 +13661,7 @@ impl CatalogRow for PgTsConfigMap {
 /// `pg_ts_config_map` as a built-in catalog, with the rows of [`PG_TS_CONFIG_MAP`].
 pub const PG_TS_CONFIG_MAP_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_ts_config_map",
+    oid: 3603,
     create_sql: PgTsConfigMap::CREATE_SQL,
     index_sql: PgTsConfigMap::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TS_CONFIG_MAP, None, &[0, 1, 2], Some(|row, column| match column { 0 => i64::from(row.mapcfg), 1 => i64::from(row.maptokentype), 2 => i64::from(row.mapseqno), _ => unreachable!("the key has 3 columns") }), 0x07d6d456),
@@ -13655,6 +13714,7 @@ impl CatalogRow for PgTsDict {
 /// `pg_ts_dict` as a built-in catalog, with the rows of [`PG_TS_DICT`].
 pub const PG_TS_DICT_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_ts_dict",
+    oid: 3600,
     create_sql: PgTsDict::CREATE_SQL,
     index_sql: PgTsDict::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TS_DICT, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x2d2a484c),
@@ -13709,6 +13769,7 @@ impl CatalogRow for PgTsParser {
 /// `pg_ts_parser` as a built-in catalog, with the rows of [`PG_TS_PARSER`].
 pub const PG_TS_PARSER_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_ts_parser",
+    oid: 3601,
     create_sql: PgTsParser::CREATE_SQL,
     index_sql: PgTsParser::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TS_PARSER, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xb20b248d),
@@ -13763,6 +13824,7 @@ impl CatalogRow for PgTsTemplate {
 /// `pg_ts_template` as a built-in catalog, with the rows of [`PG_TS_TEMPLATE`].
 pub const PG_TS_TEMPLATE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_ts_template",
+    oid: 3764,
     create_sql: PgTsTemplate::CREATE_SQL,
     index_sql: PgTsTemplate::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TS_TEMPLATE, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x6d4a9c4e),
@@ -14033,6 +14095,7 @@ impl CatalogRow for PgType {
 /// `pg_type` as a built-in catalog, with the rows of [`PG_TYPE`].
 pub const PG_TYPE_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_type",
+    oid: 1247,
     create_sql: PgType::CREATE_SQL,
     index_sql: PgType::INDEX_SQL,
     rows: &CatalogRows::new(&PG_TYPE, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0x842b21b8),
@@ -14082,6 +14145,7 @@ impl CatalogRow for PgUserMapping {
 /// `pg_user_mapping` as a built-in catalog, with the rows of [`PG_USER_MAPPING`].
 pub const PG_USER_MAPPING_CATALOG: BuiltinCatalog = BuiltinCatalog {
     name: "pg_user_mapping",
+    oid: 1418,
     create_sql: PgUserMapping::CREATE_SQL,
     index_sql: PgUserMapping::INDEX_SQL,
     rows: &CatalogRows::new(&PG_USER_MAPPING, Some(|row| row.oid), &[0], Some(|row, column| match column { 0 => i64::from(row.oid), _ => unreachable!("the key has 1 columns") }), 0xd2708538),

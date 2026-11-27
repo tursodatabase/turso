@@ -53,7 +53,7 @@ pub(crate) fn oid_input(text: &str) -> Result<Value> {
     Ok(Value::from_i64(oid))
 }
 
-fn oid_coerce(value: &Value, _params: &[Value]) -> Result<Value> {
+pub(super) fn oid_coerce(value: &Value, _params: &[Value]) -> Result<Value> {
     check_oid_range(value)
 }
 
