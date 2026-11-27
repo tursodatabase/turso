@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    ChainView, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    SortableIndexKey,
+    create_seek_range, ChainView, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey,
+    RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -1237,7 +1237,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.table_iterator = None;
         self.index_iterator = None;
         self.mvcc_range_end.clone_from(&end);
-        fn range<K>(
+        fn range<K: Ord>(
             start: Bound<K>,
             end: Option<K>,
             dir: IterationDirection,
@@ -1245,10 +1245,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             match (end, dir) {
                 (Some(end), IterationDirection::Forwards) => (start, Bound::Included(end)),
                 (Some(end), IterationDirection::Backwards) => (Bound::Included(end), start),
-                (None, _) => match dir {
-                    IterationDirection::Forwards => (start, Bound::Unbounded),
-                    IterationDirection::Backwards => (Bound::Unbounded, start),
-                },
+                (None, _) => create_seek_range(start, dir),
             }
         }
         match &self.mv_cursor_type {

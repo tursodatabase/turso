@@ -6234,18 +6234,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row: &TableRowEntry<'_, A>,
         take_payload: bool,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
-        let versions_arc = row.value();
-        let payload = {
-            let versions = versions_arc.read();
-            if self.btree_covers_chain_for_snapshot(snapshot, row.key().table_id, &versions) {
-                return None;
-            }
-            let occupying = self
-                .find_visible_version(snapshot, &versions)
-                .expect("transaction should exist while its cursor is active")?;
-            take_payload.then(|| occupying.row(row.key()))
-        };
-        Some((row.key().clone(), versions_arc.clone(), payload))
+        let view = self
+            .cursor_view_of_chain(snapshot, row.key(), row.value(), take_payload)
+            .expect("transaction should exist while its cursor is active");
+        match view {
+            ChainView::Visible(payload) => Some((row.key().clone(), row.value().clone(), payload)),
+            ChainView::Hidden | ChainView::BtreeCovers => None,
+        }
     }
 
     /// What a cursor with `snapshot` sees in the MvStore chain `versions` of the row `row_id`.
