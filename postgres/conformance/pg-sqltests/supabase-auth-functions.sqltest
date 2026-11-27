@@ -204,3 +204,83 @@ expect {
     role|s
     uid|s
 }
+
+# A policy calls a function that a user defined, as a Supabase project
+# does with its own helpers.
+test policy-calls-a-function-that-a-user-defined {
+    CREATE FUNCTION current_tenant() RETURNS int LANGUAGE sql STABLE
+        AS $$ SELECT nullif(current_setting('app.tenant', true), '')::int $$;
+    CREATE ROLE tenant_reader;
+    CREATE TABLE tenant_notes (id int PRIMARY KEY, tenant int);
+    INSERT INTO tenant_notes VALUES (1, 1), (2, 2), (3, 1);
+    ALTER TABLE tenant_notes ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_tenant ON tenant_notes USING (tenant = current_tenant());
+    GRANT SELECT ON tenant_notes TO tenant_reader;
+    SET ROLE tenant_reader;
+    SELECT length(set_config('app.tenant', '1', false)) > 0;
+    SELECT id FROM tenant_notes ORDER BY id;
+}
+expect {
+    t
+    1
+    3
+}
+
+# A policy that calls a function that a user defined keeps the call, so a
+# new definition of the function changes what the policy lets through.
+test policy-calls-the-current-definition-of-a-function {
+    CREATE FUNCTION visible_tenant() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+    CREATE ROLE current_definition_reader;
+    CREATE TABLE tenant_notes (id int PRIMARY KEY, tenant int);
+    INSERT INTO tenant_notes VALUES (1, 1), (2, 2);
+    ALTER TABLE tenant_notes ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_tenant ON tenant_notes USING (tenant = visible_tenant());
+    GRANT SELECT ON tenant_notes TO current_definition_reader;
+    CREATE OR REPLACE FUNCTION visible_tenant() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 2 $$;
+    SET ROLE current_definition_reader;
+    SELECT id FROM tenant_notes;
+}
+expect {
+    2
+}
+
+# tursopg prints the condition without the parentheses PostgreSQL puts
+# around an operator.
+@compat-gap "function:pg_get_expr"
+test policy-condition-with-a-function-that-a-user-defined-in-pg-policies {
+    CREATE FUNCTION current_tenant() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+    CREATE TABLE tenant_notes (id int PRIMARY KEY, tenant int);
+    CREATE POLICY own_tenant ON tenant_notes USING (tenant = current_tenant());
+    SELECT qual FROM pg_policies WHERE policyname = 'own_tenant';
+}
+expect {
+    (tenant = current_tenant())
+}
+expect @tursopg {
+    tenant = current_tenant()
+}
+
+# The policies of a Supabase project, with Supabase's own auth.uid() and
+# auth.role(), written both as a call and as a subquery that runs once.
+@setup auth_functions
+test auth-helpers-in-policies {
+    CREATE TABLE notes (id int PRIMARY KEY, owner uuid);
+    INSERT INTO notes VALUES
+        (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'),
+        (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_select ON notes FOR SELECT
+        USING (owner = auth.uid() AND auth.role() = 'authenticated');
+    CREATE POLICY own_update ON notes FOR UPDATE USING (owner = (SELECT auth.uid()));
+    CREATE ROLE authenticated;
+    GRANT SELECT, UPDATE ON notes TO authenticated;
+    SET ROLE authenticated;
+    SELECT length(set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","role":"authenticated"}', false)) > 0;
+    SELECT id FROM notes;
+    UPDATE notes SET id = id + 10 RETURNING id;
+}
+expect {
+    t
+    1
+    11
+}

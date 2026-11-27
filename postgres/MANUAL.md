@@ -158,6 +158,10 @@ NULL` constraint.
 
 Policies cannot use subqueries with `FROM`, parameters, aggregate or window
 functions, or generated columns that are computed when they are read. A
+policy can call a function made with `CREATE FUNCTION` whose body has no
+subquery (see `CREATE FUNCTION`). The policy keeps the call, so `CREATE OR
+REPLACE FUNCTION` changes what the policy lets through, as in PostgreSQL,
+and `DROP FUNCTION` fails while a policy calls the function. A
 column that a policy uses cannot be renamed, dropped or changed, unlike in
 PostgreSQL, which renames it in the policy too. Renaming the table keeps its
 policies, and dropping the table drops them.
@@ -298,10 +302,11 @@ SQLSTATE `0A000`:
 - A function with the name and number of parameters of a function that
   tursopg has built in, such as `hex(x)` or `abs(a, b)`, in any schema.
 - A call of a function in an index expression, in the `WHERE` clause of a
-  partial index, in a generated column, in a policy, or in the `CHECK` or
-  `DEFAULT` of a domain. A policy that calls a built-in function, such as
-  `auth.uid()`, before a function of that name is created fails when a
-  statement uses it.
+  partial index, in a generated column, or in the `CHECK` or `DEFAULT` of a
+  domain.
+- A call of a function whose body has a subquery in a policy. `CREATE
+  POLICY` fails, and a statement that uses the policy fails when the
+  function is replaced by one with a subquery.
 - A call of a function whose body has a subquery in a column default or a
   `CHECK` constraint. The table is not created, and a statement that
   computes the default or checks the constraint fails when the function is

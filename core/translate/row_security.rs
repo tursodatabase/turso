@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use crate::ast;
+use crate::translate::catalog::AggregateClauses;
 
 use crate::{
     bail_parse_error,
@@ -481,12 +482,10 @@ fn bind_policy_expr(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<ast::Expr> {
-    // CREATE POLICY refuses a call that the dialect expands, but a function
-    // created later can take the name of a function that a stored policy
-    // calls. Its body is not checked as a policy, so it is refused here.
-    resolver
-        .catalog
-        .check_no_expanded_function_calls(expr, "a policy")?;
+    // The policy stores the call, not the body, and the function can have
+    // been replaced since CREATE POLICY, or created with the name of a
+    // built-in function that the policy calls.
+    check_policy_calls(expr, resolver)?;
     let mut policy_table = table.clone();
     policy_table.identifier = normalize_ident(&btree.declared_name);
     policy_table.has_alias = false;
@@ -800,12 +799,7 @@ fn prepare_policy_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     let table_name = normalize_ident(&table.declared_name);
-    // The checks below are of the condition as it is stored. The expression
-    // that the dialect compiles in place of a call is not checked, and it
-    // can have a subquery.
-    resolver
-        .catalog
-        .check_no_expanded_function_calls(expr, "a policy")?;
+    check_policy_calls(expr, resolver)?;
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
         match expr {
             ast::Expr::Subquery(select) => {
@@ -842,13 +836,55 @@ fn prepare_policy_expr(
             ast::Expr::Variable(_) => {
                 bail_parse_error!("there is no parameter $1")
             }
-            ast::Expr::FunctionCall { name, args, .. } => {
-                check_policy_function(name.as_str(), args.len(), resolver)?;
+            ast::Expr::FunctionCall { .. } => {
+                let clauses = AggregateClauses::of(expr);
+                let ast::Expr::FunctionCall { name, args, .. } = &*expr else {
+                    unreachable!("the arm matches a function call");
+                };
+                // check_policy_calls checked a function that the dialect
+                // expands. The policy keeps the call: a statement that
+                // applies the policy expands it with the function's
+                // definition at that time, as in PostgreSQL.
+                let expands = resolver
+                    .catalog
+                    .expand_function_call(name.as_str(), args, clauses)?
+                    .is_some();
+                if !expands {
+                    check_policy_function(name.as_str(), args.len(), resolver)?;
+                }
             }
             ast::Expr::FunctionCallStar { name, .. } => {
                 check_policy_function(name.as_str(), 0, resolver)?;
             }
             _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// Checks each call in policy condition `expr`, also in its `(SELECT
+/// <expr>)`, that the dialect expands into an expression: the expression is
+/// computed for each row as the condition is, so it may not have a subquery.
+/// A subquery could read the table again, which PostgreSQL reports as
+/// infinite recursion, and the engine compiles the condition without
+/// planning subqueries.
+fn check_policy_calls(expr: &ast::Expr, resolver: &Resolver) -> Result<()> {
+    crate::util::walk_expr_with_subqueries(expr, &mut |expr: &ast::Expr| {
+        if let ast::Expr::FunctionCall { name, args, .. } = expr {
+            let clauses = AggregateClauses::of(expr);
+            let expansion = resolver
+                .catalog
+                .expand_function_call(name.as_str(), args, clauses)?;
+            if expansion
+                .as_ref()
+                .is_some_and(crate::translate::insert::expr_contains_subquery)
+            {
+                return Err(LimboError::NotSupported(format!(
+                    "a call of function {}, whose body has a subquery, is not supported in a policy",
+                    name.as_str()
+                )));
+            }
         }
         Ok(WalkControl::Continue)
     })?;

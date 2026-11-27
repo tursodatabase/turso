@@ -1869,7 +1869,6 @@ expect @tursopg {
     8
 }
 
-@compat-gap "syntax:create-policy"
 test policy-that-calls-a-sql-function {
     CREATE TABLE docs (id int PRIMARY KEY, owner int);
     CREATE FUNCTION me() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 2 $$;
@@ -1880,14 +1879,67 @@ test policy-that-calls-a-sql-function {
 expect {
     p
 }
+
+# The body of a function that a policy calls is computed for each row, and
+# tursopg compiles a policy without planning subqueries.
+@compat-gap "syntax:create-policy"
+test policy-that-calls-a-sql-function-whose-body-has-a-subquery {
+    CREATE TABLE owners (id int);
+    INSERT INTO owners VALUES (2);
+    CREATE FUNCTION me() RETURNS int LANGUAGE sql STABLE AS $$ SELECT (SELECT max(id) FROM owners) $$;
+    CREATE TABLE docs (id int PRIMARY KEY, owner int);
+    ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY p ON docs USING (owner = me());
+    SELECT polname FROM pg_policy;
+}
+expect {
+    p
+}
 @sqlstate 0A000
 expect @tursopg error {
-    function public.me is not supported in a policy
+    a call of function public.me, whose body has a subquery, is not supported in a policy
+}
+
+# A policy keeps its call, so replacing the function changes the policy, also
+# when the policy calls the function in a subquery.
+@compat-gap "syntax:create-policy"
+test policy-whose-function-gets-a-body-with-a-subquery {
+    CREATE TABLE owners (id int);
+    INSERT INTO owners VALUES (2);
+    CREATE FUNCTION me() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 2 $$;
+    CREATE TABLE docs (id int PRIMARY KEY, owner int);
+    INSERT INTO docs VALUES (1, 1), (2, 2);
+    ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY p ON docs USING (owner = (SELECT me()));
+    CREATE ROLE replaced_function_reader;
+    GRANT SELECT ON docs, owners TO replaced_function_reader;
+    CREATE OR REPLACE FUNCTION me() RETURNS int LANGUAGE sql STABLE AS $$ SELECT (SELECT max(id) FROM owners) $$;
+    SET ROLE replaced_function_reader;
+    SELECT id FROM docs;
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function public.me, whose body has a subquery, is not supported in a policy
+}
+
+test drop-function-that-a-policy-calls-errors {
+    CREATE TABLE docs (id int PRIMARY KEY, owner int);
+    CREATE FUNCTION me() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 2 $$;
+    CREATE POLICY p ON docs USING (owner = me());
+    DROP FUNCTION me();
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop function me\(\) because other objects depend on it
 }
 
 # CREATE POLICY accepts auth.uid() while it is tursopg's built-in function.
-# A function created later with that name is not compiled into the policy:
-# its body could read the policy's table again.
+# A function created later with that name is compiled into the policy, and
+# its body may not have a subquery, which could read the policy's table
+# again.
 @skip-if postgres "PostgreSQL has no built-in auth.uid()"
 test policy-whose-built-in-function-a-sql-function-replaces-errors {
     CREATE TABLE p (a uuid);
@@ -1903,7 +1955,7 @@ test policy-whose-built-in-function-a-sql-function-replaces-errors {
 }
 @sqlstate 0A000
 expect error {
-    function auth.uid is not supported in a policy
+    a call of function auth.uid, whose body has a subquery, is not supported in a policy
 }
 
 # tursopg compiles a call as the body with the arguments in place of the
