@@ -1552,6 +1552,10 @@ pub struct TursoStatement {
 impl Drop for TursoStatement {
     fn drop(&mut self) {
         self.stmts.lock().unwrap().remove(&self.stmt_id);
+        let statement = self.handle.lock().unwrap().take();
+        if let Some(statement) = statement {
+            self.concurrent_guard.drop_statement(statement);
+        }
     }
 }
 
@@ -2302,6 +2306,49 @@ mod tests {
             assert_eq!(stmt.execute(None).unwrap().rows_changed, 1);
             stmt.finalize(None).unwrap();
         }
+    }
+
+    #[test]
+    pub fn test_db_statement_drop_defers_to_connection_guard() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        assert!(!db.open().unwrap().is_io());
+        let conn = db.connect().unwrap();
+        conn.prepare_single("CREATE TABLE t (x)")
+            .unwrap()
+            .execute(None)
+            .unwrap();
+        let mut stmt = conn
+            .prepare_single("INSERT INTO t VALUES (1), (2) RETURNING x")
+            .unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert!(conn.connection.is_in_write_tx());
+
+        // Another thread that uses the connection holds the guard during its call. It can
+        // wait for the dropping thread, for example for the Python GIL, so drop must not wait.
+        let token = conn.concurrent_guard.try_use().unwrap();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(stmt);
+            dropped_tx.send(()).unwrap();
+        });
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("drop waited for the connection guard");
+        // The reset that ends the write transaction must not run during the other call.
+        assert!(conn.connection.is_in_write_tx());
+
+        drop(token);
+        assert!(!conn.connection.is_in_write_tx());
     }
 
     #[test]
