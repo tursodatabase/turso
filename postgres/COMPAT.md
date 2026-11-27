@@ -42,6 +42,11 @@ a "... is not supported" error rather than running with different semantics.
 The few remaining cases that are accepted without their full meaning are
 called out as "silently ignored" in the notes of the tables below.
 
+ATTACH and DETACH are statements of the SQLite frontend. PostgreSQL has no
+such statements: its schemas are in one database. A PostgreSQL connection
+rejects them with SQLSTATE 0A000, in SQL and in the connection API, also when
+the experimental attach option is on.
+
 ## Core SQL baseline
 
 Basics not enumerated by the official feature matrix.
