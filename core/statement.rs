@@ -324,7 +324,11 @@ impl Statement {
                 format: EqpFormat::Json,
             } => (EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(), 0),
         };
-        let state = vdbe::ProgramState::new(max_registers, cursor_count);
+        let state = vdbe::ProgramState::new_with_nan_policy(
+            max_registers,
+            cursor_count,
+            connection.nan_policy(),
+        );
         let alloc = connection.db.allocators.statement.clone();
         let state =
             crate::with_statement_allocation_site!(ProgramState, DynBox::try_new_in(state, alloc))?;
