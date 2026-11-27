@@ -1,4 +1,3 @@
-use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::num::NonZero;
@@ -2360,43 +2359,13 @@ fn is_simple_identifier(name: &str) -> bool {
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {
-    search_path_parser()
-        .parse(value)
-        .into_result()
-        .map_err(|_| {
-            sqlstate_error(
-                SQLSTATE_INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"search_path\"",
-                None,
-            )
-        })
-}
-
-fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra::Err<EmptyErr>> {
-    let whitespace = any().filter(char::is_ascii_whitespace).repeated().ignored();
-    // Parse double-quoted names such as "My, Schema" or "a""b".
-    // Preserve case, commas, and spaces. Turn doubled quotes into one quote.
-    let quoted = just("\"\"")
-        .to('"')
-        .or(none_of('"'))
-        .repeated()
-        .collect::<String>()
-        .delimited_by(just('"'), just('"'));
-    // Parse names such as PUBLIC or $user, up to a comma or ASCII whitespace.
-    // Require at least one character, reject a leading quote, and lowercase ASCII letters.
-    let unquoted = any()
-        .filter(|c: &char| *c != ',' && !c.is_ascii_whitespace())
-        .repeated()
-        .at_least(1)
-        .to_slice()
-        .filter(|name: &&str| !name.starts_with('"'))
-        .map(str::to_ascii_lowercase);
-
-    quoted
-        .or(unquoted)
-        .separated_by(just(',').padded_by(whitespace))
-        .collect::<Vec<_>>()
-        .padded_by(whitespace)
+    turso_pg_parser::split_identifier_string(value, ',').ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "invalid value for parameter \"search_path\"",
+            None,
+        )
+    })
 }
 
 fn create_schema_commands(
@@ -2951,9 +2920,8 @@ fn prepare_copy_columns(
 
 #[cfg(test)]
 mod tests {
-    use super::{open_database_with_io, search_path_parser, PgConnection};
+    use super::{open_database_with_io, PgConnection};
     use crate::PostgresDialect;
-    use chumsky::Parser;
     use std::sync::Arc;
     use turso_core::{
         Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, SessionRole, Value,
@@ -3148,43 +3116,6 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("in no schema"), "{error}");
-    }
-
-    #[test]
-    fn search_path_parser_accepts_identifier_lists() {
-        for (input, expected) in [
-            ("", vec![]),
-            (" \t\n\r\u{c}", vec![]),
-            (" PUBLIC , \"MiXeD\" ", vec!["public", "MiXeD"]),
-            ("\"a,b\", \"a\"\"b\", $USER", vec!["a,b", "a\"b", "$user"]),
-            ("\"\"\"\"", vec!["\""]),
-            ("\"\", public", vec!["", "public"]),
-            ("public\"extra", vec!["public\"extra"]),
-            ("\u{b}PUBLIC\u{a0}", vec!["\u{b}public\u{a0}"]),
-        ] {
-            assert_eq!(
-                search_path_parser().parse(input).into_result().unwrap(),
-                expected,
-                "{input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn search_path_parser_rejects_invalid_identifier_lists() {
-        for input in [
-            ",public",
-            "public,",
-            "public, ",
-            "public,,main",
-            "one two",
-            "\"\"\"",
-            "\"unclosed",
-            "\"a\"b",
-            "\"a\" \"b\"",
-        ] {
-            assert!(search_path_parser().parse(input).has_errors(), "{input:?}");
-        }
     }
 
     fn test_connection() -> super::PgConnection {

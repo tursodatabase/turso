@@ -13,7 +13,6 @@ path = "lib.rs"
 [dependencies]
 bitflags = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
-chumsky = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
 rustc-hash = "2.0"

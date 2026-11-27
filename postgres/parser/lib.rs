@@ -3,6 +3,7 @@ pub mod copy;
 mod create_function;
 pub mod datetime_unit;
 pub mod functions;
+mod identifier_list;
 mod names;
 mod policy_condition;
 use pg_query::NodeEnum;
@@ -151,6 +152,7 @@ impl FunctionTypeUse {
     }
 }
 
+pub use identifier_list::split_identifier_string;
 pub use type_name::{parse_type_name, WrittenTypeName};
 
 /// Parse a PostgreSQL SQL statement using pg_query
