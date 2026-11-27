@@ -629,6 +629,76 @@ fn dropped_waiter_after_log_tx_still_commits() {
     );
 }
 
+#[test]
+fn dropped_waiter_and_leader_after_log_tx_do_not_resurrect_after_restart() {
+    let mut db = restart_after_dropping_group_commit(true);
+    let conn = db.connect();
+    assert!(get_rows(&conn, "SELECT pk FROM t ORDER BY pk").is_empty());
+    conn.execute("INSERT INTO t VALUES (3, 1)").unwrap();
+    drop(conn);
+
+    db.restart();
+    assert_eq!(
+        get_rows(&db.connect(), "SELECT pk FROM t ORDER BY pk"),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
+#[test]
+fn dropped_leader_then_dropped_retry_waiter_does_not_resurrect_after_restart() {
+    let db = restart_after_dropping_group_commit(false);
+    assert!(get_rows(&db.connect(), "SELECT pk FROM t ORDER BY pk").is_empty());
+}
+
+fn restart_after_dropping_group_commit(drop_waiter_first: bool) -> MvccTestDbNoConn {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    setup.close().unwrap();
+    drop(setup);
+
+    let leader = db.connect();
+    let waiter = db.connect();
+    leader.execute("BEGIN CONCURRENT").unwrap();
+    waiter.execute("BEGIN CONCURRENT").unwrap();
+    leader.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    waiter.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+    leader.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogicalLogWriteIssued.point(),
+    ])));
+
+    let store = db.get_mvcc_store();
+    assert!(store.lock_commits_for_testing());
+    let mut waiter_commit = waiter.prepare("COMMIT").unwrap();
+    let mut leader_commit = leader.prepare("COMMIT").unwrap();
+    // The waiter enqueues first so the leader writes its frame before its own.
+    assert!(matches!(waiter_commit.step().unwrap(), StepResult::IO));
+    assert_eq!(store.waiting_commit_count_for_testing(), 1);
+    assert!(matches!(leader_commit.step().unwrap(), StepResult::IO));
+    assert_eq!(store.waiting_commit_count_for_testing(), 2);
+    store.unlock_commits_for_testing();
+    assert!(matches!(
+        step_until_yield_or_done(&mut leader_commit),
+        StepResult::Yield
+    ));
+    assert!(store.last_group_commit_size() >= 2);
+
+    if drop_waiter_first {
+        drop(waiter_commit);
+        drop(leader_commit);
+    } else {
+        drop(leader_commit);
+        drop(waiter_commit);
+    }
+    assert!(get_rows(&db.connect(), "SELECT pk FROM t ORDER BY pk").is_empty());
+    drop((leader, waiter, store));
+    db.restart();
+    db
+}
+
 fn step_until_done(stmt: &mut Statement) {
     for _ in 0..10_000 {
         match stmt.step().unwrap() {

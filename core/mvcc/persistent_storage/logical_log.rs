@@ -612,6 +612,10 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
+    /// Completion for the deferred write, so abort can drain it before truncating.
+    pending_write_completion: Option<Completion>,
+    /// Deferred commit timestamp staged until `advance_offset_after_success`.
+    pending_max_appended_commit_ts: Option<u64>,
     /// A header write or truncate whose result has not been looked at yet; see
     /// `publish_finished_header_change`.
     pending_header_change: Option<PendingHeaderChange>,
@@ -647,6 +651,8 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
+            pending_write_completion: None,
+            pending_max_appended_commit_ts: None,
             pending_header_change: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
@@ -702,7 +708,6 @@ impl LogicalLog {
         self.finish_pending_header_change();
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
-        self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
         debug_assert!(
@@ -907,8 +912,11 @@ impl LogicalLog {
         if advance_offset_immediately {
             self.offset += buffer_len as u64;
             self.running_crc = crc;
+            self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         } else {
             self.pending_running_crc = Some(crc);
+            self.pending_write_completion = Some(c.clone());
+            self.pending_max_appended_commit_ts = Some(commit_ts);
         }
         Ok((c, buffer_len as u64))
     }
@@ -982,15 +990,34 @@ impl LogicalLog {
             .pending_running_crc
             .take()
             .expect("advance_offset_after_success called without pending deferred write");
+        self.pending_write_completion = None;
+        if let Some(commit_ts) = self.pending_max_appended_commit_ts.take() {
+            self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
+        }
     }
 
-    /// Discard the pending running CRC staged by a deferred write whose
-    /// two-phase commit aborted before the offset advanced.
-    ///
-    /// This must be called on the abort path so no later write chains its
-    /// running CRC from a value staged for a write that never confirmed.
-    pub fn discard_pending_write(&mut self) {
+    /// Clear the deferred write state, drain the write, and truncate and sync
+    /// back to the confirmed offset so recovery cannot replay the aborted frame.
+    pub fn discard_pending_write(&mut self) -> Result<()> {
         self.pending_running_crc = None;
+        self.pending_max_appended_commit_ts = None;
+        let Some(c) = &self.pending_write_completion else {
+            return Ok(());
+        };
+        // Even a failed write may leave bytes behind, but it must finish
+        // before truncation so it cannot extend the file again.
+        self.io.drain_completions(std::slice::from_ref(c))?;
+        let completion = Completion::new_trunc(|result| {
+            if let Err(err) = result {
+                tracing::error!("logical_log_discard_truncate failed: {}", err);
+            }
+        });
+        let c = self.file.truncate(self.offset, completion)?;
+        self.io.wait_for_completion(c)?;
+        let c = self.sync(FileSyncType::Fsync)?;
+        self.io.wait_for_completion(c)?;
+        self.pending_write_completion = None;
+        Ok(())
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
@@ -1134,6 +1161,8 @@ impl LogicalLog {
         // new salt once that write succeeded.
         self.offset = 0;
         self.pending_running_crc = None;
+        self.pending_write_completion = None;
+        self.pending_max_appended_commit_ts = None;
         self.running_crc = derive_initial_crc(header.salt);
         header.salt = self.io.generate_random_number() as u64;
 
@@ -1186,6 +1215,8 @@ impl LogicalLog {
         if empties_log {
             self.offset = 0;
             self.pending_running_crc = None;
+            self.pending_write_completion = None;
+            self.pending_max_appended_commit_ts = None;
             self.max_appended_commit_ts = 0;
         }
         if self.offset == 0 {
