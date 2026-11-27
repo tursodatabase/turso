@@ -80,8 +80,9 @@ fn normalized_first_key(values: &[ValueRef<'_>], key_info: &[KeyInfo]) -> (u64, 
                 Numeric::Integer(i) => (*i as f64, i.unsigned_abs() < (1u64 << 49)),
                 Numeric::Float(f) => (f64::from(*f), false),
             };
-            let f = if f == 0.0 { 0.0 } else { f }; // collapse -0.0 with +0.0
-            let bits = f.to_bits();
+            // Equality treats all NaNs alike. Their sign and payload must not
+            // change the prefix or bypass a secondary-column comparison.
+            let bits = crate::Double::new(f).canonical_bits();
             let monotone = if bits >> 63 == 1 {
                 !bits
             } else {
@@ -1693,5 +1694,41 @@ mod tests {
                 ValueRef::Null,
             ],
         );
+    }
+
+    #[test]
+    fn nan_representations_have_one_sort_prefix() {
+        for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+            let keys = [KeyInfo {
+                sort_order,
+                collation: CollationSeq::BINARY,
+                nulls_order: None,
+            }; 2];
+            let canonical = [ValueRef::from_f64(f64::NAN), ValueRef::from_i64(1)];
+            let expected = normalized_first_key(&canonical, &keys);
+            assert!(!expected.1, "NaNs must fall back to the secondary column");
+            for bits in [
+                0x7ff8_0000_0000_0000u64,
+                0xfff8_0000_0000_0001,
+                0x7ff0_0000_0000_0001,
+                0x7fff_ffff_ffff_ffff,
+            ] {
+                let values = [
+                    ValueRef::from_f64(f64::from_bits(bits)),
+                    ValueRef::from_i64(2),
+                ];
+                assert_eq!(normalized_first_key(&values, &keys), expected);
+            }
+            let infinity = [ValueRef::from_f64(f64::INFINITY), ValueRef::from_i64(1)];
+            let cmp = expected.0.cmp(&normalized_first_key(&infinity, &keys).0);
+            assert_eq!(
+                cmp,
+                if sort_order == SortOrder::Asc {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            );
+        }
     }
 }
