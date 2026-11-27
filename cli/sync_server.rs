@@ -1582,7 +1582,7 @@ fn validate_db_name(name: &str) -> bool {
 
 fn db_path_for(base: &Path, name: &str) -> PathBuf {
     // Extensionless like sqld's layout: the files appear as data, data-wal,
-    // data-shm (and data.db-log under MVCC) inside the database's directory.
+    // data-shm (and data-log under MVCC) inside the database's directory.
     base.join(name).join("data")
 }
 

@@ -261,6 +261,8 @@ public class TursoSqliteDatabaseCreator(
             return;
 
         File.Delete(fullPath + "-log");
+        // Older versions named the log after the file name without its last extension.
+        File.Delete(Path.ChangeExtension(fullPath, ".db-log"));
         File.Delete(fullPath + "-wal-revert");
         File.Delete(fullPath + "-info");
         File.Delete(fullPath + "-changes");
