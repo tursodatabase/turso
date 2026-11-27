@@ -17,7 +17,7 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::schema::type_def_uses_type;
+use crate::translate::schema::{check_column_type, type_def_uses_type};
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::StrictType;
@@ -4245,6 +4245,9 @@ impl Schema {
         if !type_sqls.is_empty() {
             self.load_type_definitions(dialect, type_sqls, syms)?;
         }
+        if self.custom_types_enabled {
+            self.check_strict_column_types()?;
+        }
         if !self.namespace_names_loaded && !view_info.is_empty() {
             // A view body names tables by their namespace, so the views wait
             // for the names of the namespaces. No index is on a view: CREATE
@@ -4298,6 +4301,35 @@ impl Schema {
                     btree.name,
                     column.name.as_deref().unwrap_or_default()
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a schema with a STRICT column whose custom type has arguments
+    /// CREATE TABLE refuses, such as `varchar` without its length. It runs
+    /// once the types are loaded, because a column's type may be one that
+    /// CREATE TYPE made.
+    ///
+    /// A column whose type this schema does not know is left out: CREATE
+    /// TABLE checks a table of a temp or attached database against the types
+    /// of main, so its type may be one that only main has. Tables that are not
+    /// STRICT are left out too: the table of a materialized view is not
+    /// STRICT, and copies the domain and array types of the columns it selects.
+    fn check_strict_column_types(&self) -> Result<()> {
+        for btree in self
+            .all_tables()
+            .filter_map(|table| table.btree())
+            .filter(|btree| btree.is_strict)
+        {
+            for column in btree
+                .columns()
+                .iter()
+                .filter(|column| self.get_type_def_unchecked(&column.ty_str).is_some())
+            {
+                check_column_type(column, &btree.name, true, self).map_err(|e| {
+                    LimboError::Corrupt(format!("malformed database schema ({}) - {e}", btree.name))
+                })?;
             }
         }
         Ok(())

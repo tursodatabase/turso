@@ -121,7 +121,7 @@ CREATE TABLE users (
 
 The first parameter is always the input `value`. Additional parameters are the arguments provided in the column type declaration, in order.
 
-A column of a STRICT table gives one argument for each additional parameter. A type without additional parameters takes no arguments: `CREATE TABLE t(a uuid(3)) STRICT` fails with `type "uuid" requires 0 parameter(s), got 1`.
+A column of a STRICT table gives one argument for each additional parameter. A type without additional parameters takes no arguments: `CREATE TABLE t(a uuid(3)) STRICT` fails with `type "uuid" requires 0 parameter(s), got 1`. A database whose schema has such a column, for example `varchar` without its length, fails to open with `malformed database schema (t) - type "varchar" requires 1 parameter(s), got 0`.
 
 ### COERCE
 
