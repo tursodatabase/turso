@@ -4,7 +4,6 @@ use std::hash::{Hash, Hasher};
 
 use crate::numeric::Numeric;
 use crate::types::{Value, ValueRef};
-use crate::vdbe::hash_table::normalized_f64_bits;
 
 /// Default number of expected items for bloom filter sizing.
 /// This is used when the expected count is not known ahead of time.
@@ -175,7 +174,7 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
 /// numeric comparison semantics (e.g. 10 == 10.0, -0.0 == 0.0).
 fn hash_numeric<H: Hasher>(hasher: &mut H, f: f64) {
     const NUMERIC_TAG: u8 = 2;
-    let bits = normalized_f64_bits(f);
+    let bits = crate::Double::new(f).canonical_bits();
     NUMERIC_TAG.hash(hasher);
     bits.hash(hasher);
 }
@@ -184,6 +183,20 @@ fn hash_numeric<H: Hasher>(hasher: &mut H, f: f64) {
 mod bloomtests {
     use super::*;
     use crate::types::Text;
+
+    #[test]
+    fn nan_representations_have_no_bloom_false_negatives() {
+        let mut filter = BloomFilter::new();
+        filter.insert_value(&Value::from_f64(f64::NAN));
+        for bits in [
+            0x7ff8_0000_0000_0000u64,
+            0xfff8_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+            0x7fff_ffff_ffff_ffff,
+        ] {
+            assert!(filter.contains_value(&Value::from_f64(f64::from_bits(bits))));
+        }
+    }
 
     #[test]
     fn test_bloom_filter_i64() {
