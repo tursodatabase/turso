@@ -2475,10 +2475,6 @@ test now-plus-an-integer-errors {
 expect error {
     operator does not exist: timestamp with time zone \+ integer
 }
-@sqlstate 42883
-expect @tursopg error {
-    operator does not exist: timestamptz \+ integer
-}
 
 test numeric-column-plus-round-and-mod-of-exact-numbers-is-exact {
     -- round() and mod() of exact numbers give exact numbers, so the sums keep

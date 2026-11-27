@@ -21,8 +21,6 @@ mod options;
 mod pg_type;
 mod policies;
 mod procs;
-// FIXME(pg-catalog): The operator half of the resolver has no caller until operators use it.
-#[cfg_attr(not(test), allow(dead_code))]
 mod resolve;
 mod resolve_catalog;
 mod roles;

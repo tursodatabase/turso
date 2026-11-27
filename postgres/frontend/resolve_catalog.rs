@@ -8,8 +8,9 @@ use crate::procs::{Proc, PROCS};
 use crate::resolve::{
     CastMethod, CastRow, Catalog, OperatorRow, ProcRow, RangeRow, TypeKind, TypeRow,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::LazyLock;
+use turso_core::dialect::CastContext;
 
 /// `pg_type`, `pg_cast`, `pg_proc` and `pg_operator` of the frontend.
 pub(crate) struct FrontendCatalog;
@@ -17,6 +18,11 @@ pub(crate) struct FrontendCatalog;
 impl FrontendCatalog {
     pub(crate) fn has_function(name: &str) -> bool {
         TABLES.procs.contains_key(name)
+    }
+
+    /// Whether a row of `pg_operator` takes the type `oid`, or a type that it casts to implicitly.
+    pub(crate) fn has_operators(oid: i64) -> bool {
+        TABLES.types_with_operators.contains(&oid)
     }
 
     /// The array type over the type `element`.
@@ -98,6 +104,7 @@ struct Tables {
     casts: FxHashMap<(i64, i64), CastRow>,
     procs: FxHashMap<&'static str, Vec<&'static Proc>>,
     operators: FxHashMap<&'static str, Vec<OperatorRow>>,
+    types_with_operators: FxHashSet<i64>,
 }
 
 struct Type {
@@ -159,6 +166,15 @@ static TABLES: LazyLock<Tables> = LazyLock::new(|| {
                 function: operator.oid,
             });
     }
+    let mut types_with_operators: FxHashSet<i64> = OPERATORS
+        .iter()
+        .flat_map(|operator| [operator.left, operator.right])
+        .collect();
+    for cast in PG_CASTS {
+        if cast.context == CastContext::Implicit && types_with_operators.contains(&cast.target) {
+            types_with_operators.insert(cast.source);
+        }
+    }
     Tables {
         types: all_types
             .iter()
@@ -191,6 +207,7 @@ static TABLES: LazyLock<Tables> = LazyLock::new(|| {
             .collect(),
         procs,
         operators,
+        types_with_operators,
     }
 });
 

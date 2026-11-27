@@ -71,7 +71,7 @@ fn resolve(name: &str, arguments: &[OperandType]) -> Result<FunctionChoice> {
 const READ_AS_TEXT_BY_THE_FUNCTION: &[&str] = &["INTEGER", "REAL", "BLOB"];
 
 /// The type core gives a value of the type `oid`, `None` for a pseudo-type.
-fn cast_type(oid: i64) -> Option<ast::Type> {
+pub(crate) fn cast_type(oid: i64) -> Option<ast::Type> {
     let (name, is_array) = FrontendCatalog::type_name(oid)?;
     Some(ast::Type {
         name: cast_type_name(name, is_array),
@@ -118,7 +118,7 @@ fn argument_type(name: &str, index: usize, argument: &OperandType) -> Result<Opt
 
 /// The PostgreSQL type that an engine type is read as: the type it most often
 /// stands for.
-fn engine_type_oid(ty: EngineType) -> i64 {
+pub(crate) fn engine_type_oid(ty: EngineType) -> i64 {
     match ty {
         EngineType::Integer => 23,
         EngineType::Real => 701,
@@ -128,7 +128,7 @@ fn engine_type_oid(ty: EngineType) -> i64 {
     }
 }
 
-fn resolve_error(error: ResolveError) -> LimboError {
+pub(crate) fn resolve_error(error: ResolveError) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
         code: error.sqlstate(),
         message: error.message().to_string(),

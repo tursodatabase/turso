@@ -1026,7 +1026,7 @@ test jsonb-set-operators {
 expect {
     {"a": 2}|{"a": 1, "b": 2}|{"b": 2}
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # B-123: jsonb_typeof / jsonb_array_length
@@ -1220,8 +1220,9 @@ test jsonb-removes-a-key {
 expect {
     {"b": 2}
 }
-expect @tursopg {
-    0
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: text - unknown
 }
 
 # B-130: 16 nested scalar subqueries

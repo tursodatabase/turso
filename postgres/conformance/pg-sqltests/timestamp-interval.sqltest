@@ -137,7 +137,7 @@ expect {
 }
 @sqlstate 42883
 expect @tursopg error {
-    operator does not exist: timestamptz - timestamptz
+    operator does not exist: timestamp with time zone - timestamp with time zone
 }
 
 @compat-gap "type:interval"

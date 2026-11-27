@@ -1084,6 +1084,8 @@ pub(crate) fn is_preferred_type(
     }
 }
 
+// FIXME(pg-catalog): Only a test calls this, until a call that needs binary coercion is resolved.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_binary_coercible(
     catalog: &dyn Catalog,
     srctype: i64,

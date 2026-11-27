@@ -149,6 +149,8 @@ pub(crate) fn get_type_category_preferred(
     Ok((typtup.category, typtup.is_preferred))
 }
 
+// FIXME(pg-catalog): Only a test calls this, until a call that needs binary coercion is resolved.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn type_is_array(catalog: &dyn Catalog, typid: i64) -> bool {
     get_element_type(catalog, typid) != INVALID_OID
 }

@@ -17,6 +17,9 @@ pub(crate) use catalog::{
 };
 pub(crate) use error::ResolveError;
 
+use catalog::UNKNOWNOID;
+use turso_core::dialect::CastContext;
+
 /// The type of one argument of a call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArgType {
@@ -112,4 +115,24 @@ pub(crate) fn resolve_operator(
         Ok(Err(error)) => Resolution::Error(error),
         Err(reason) => Resolution::Unsupported(reason),
     }
+}
+
+/// The type that PostgreSQL gives the values of an IN list (`select_common_type`), or `None` when two of them are of different categories.
+pub(crate) fn common_type(catalog: &dyn Catalog, types: &[ArgType]) -> Result<Option<i64>, Reason> {
+    let oids: Vec<i64> = types
+        .iter()
+        .map(|ty| match ty {
+            ArgType::Known(oid) => *oid,
+            ArgType::Unknown => UNKNOWNOID,
+        })
+        .collect();
+    Ok(match coerce::select_common_type(catalog, &oids)? {
+        coerce::CommonType::Type(oid) => Some(oid),
+        coerce::CommonType::CannotBeMatched(..) => None,
+    })
+}
+
+/// Whether a value of the type `from` is converted to the type `to` without being asked.
+pub(crate) fn casts_implicitly(catalog: &dyn Catalog, from: i64, to: i64) -> Result<bool, Reason> {
+    coerce::can_coerce_type(catalog, &[from], &[to], CastContext::Implicit)
 }

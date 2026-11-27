@@ -355,7 +355,7 @@ test now-minus-untyped-literal {
 }
 @sqlstate 22007
 expect error {}
-@sqlstate 42883
+@sqlstate 42P18
 expect @tursopg error {}
 
 @compat-gap "operator:timestamptz - timestamptz"

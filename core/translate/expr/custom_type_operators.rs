@@ -154,7 +154,7 @@ fn read_as_chosen_types(
     };
     let choose_pair = |slots: &[usize]| {
         dialect.choose_operator(operator.name, &|| {
-            operand_types(slots, OperandType::Unnamed)
+            operand_types(slots, OperandType::Untyped)
         })
     };
     if operator
