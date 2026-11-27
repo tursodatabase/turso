@@ -752,6 +752,19 @@ test cast-json-to-int4 {
 @sqlstate 42846
 expect error {}
 
+# PostgreSQL has no cast from json to integer.
+test json-to-int-cast {
+    SELECT '1'::json::int;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type json to integer
+}
+@sqlstate 42846
+expect @tursopg error {
+    cannot cast type json to int4
+}
+
 test cast-int4-to-json {
     SELECT 5::json;
 }

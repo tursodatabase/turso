@@ -424,19 +424,6 @@ expect @tursopg {
     1
 }
 
-# PostgreSQL has no cast from json to integer.
-test json-to-int-cast {
-    SELECT '1'::json::int;
-}
-@sqlstate 42846
-expect error {
-    cannot cast type json to integer
-}
-@sqlstate 42846
-expect @tursopg error {
-    cannot cast type json to int4
-}
-
 test numeric-with-a-scale-cast-to-an-integer {
     CREATE TABLE n (y numeric(10,2));
     INSERT INTO n VALUES (3), (2.5), (-2.5), (2.49);
