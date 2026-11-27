@@ -4879,14 +4879,15 @@ impl Schema {
         let mut parent_collations: Vec<CollationSeq> =
             Vec::try_with_capacity_ext(parent_cols.len())?;
         let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
+        let mut parent_is_rowid: Vec<bool> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
-            let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
+            let (p, collation, parent_affinity, is_rowid) = match parent_tbl.get_column(pc) {
                 Some((i, column)) if column.is_rowid_alias() => {
-                    (i, CollationSeq::BINARY, column.affinity())
+                    (i, CollationSeq::BINARY, column.affinity(), true)
                 }
-                Some((i, column)) => (i, column.collation(), column.affinity()),
+                Some((i, column)) => (i, column.collation(), column.affinity(), false),
                 None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
-                    (0, CollationSeq::BINARY, Affinity::Integer)
+                    (0, CollationSeq::BINARY, Affinity::Integer, true)
                 }
                 None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
@@ -4902,21 +4903,14 @@ impl Schema {
             parent_collations
                 .push_within_capacity(collation)
                 .expect("parent FK collation vector was preallocated to parent_cols.len()");
+            parent_is_rowid
+                .push_within_capacity(is_rowid)
+                .expect("parent FK rowid flag vector was preallocated to parent_cols.len()");
         }
 
         // A single-column parent key is the rowid when it names rowid/_rowid_/oid
         // or points at an INTEGER PRIMARY KEY rowid alias.
-        let parent_uses_rowid = parent_cols.len() == 1 && {
-            let pc = parent_cols[0].as_str();
-            ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r))
-                || parent_tbl.columns.iter().any(|col| {
-                    col.is_rowid_alias()
-                        && col
-                            .name
-                            .as_deref()
-                            .is_some_and(|n| n.eq_ignore_ascii_case(pc))
-                })
-        };
+        let parent_uses_rowid = parent_cols.len() == 1 && parent_is_rowid[0];
 
         let parent_unique_index = if parent_uses_rowid {
             None
@@ -4953,6 +4947,7 @@ impl Schema {
             parent_pos: parent_pos.into_boxed_slice(),
             parent_collations: parent_collations.into_boxed_slice(),
             key_affinities: key_affinities.into_boxed_slice(),
+            parent_is_rowid: parent_is_rowid.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
@@ -8171,6 +8166,10 @@ pub struct ResolvedFkRef {
     /// The affinity applied when a child key is compared with a parent key,
     /// as SQLite compares `parent_col = child_col`.
     pub key_affinities: BoxedSlice<Affinity>,
+    /// For each parent key column, whether it is the rowid or an INTEGER
+    /// PRIMARY KEY rowid alias. As in SQLite, a reference to such a column
+    /// in a foreign-key action has INTEGER affinity, also in a composite key.
+    pub parent_is_rowid: BoxedSlice<bool>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,

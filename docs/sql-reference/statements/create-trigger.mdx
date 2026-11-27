@@ -86,6 +86,10 @@ OLD.status
 
 The optional `WHEN` clause filters which rows cause the trigger body to execute. The expression can reference `NEW` and `OLD` columns.
 
+As in SQLite with recursive triggers disabled, a trigger does not fire for a row that its own body, or a trigger its body fires, inserts, updates or deletes. Its `WHEN` clause is not evaluated for that row.
+
+Outside a subquery, a column in the `WHEN` clause must be qualified with `NEW` or `OLD`. An unqualified name, such as `status` instead of `NEW.status`, is an error (`no such column: status`) when the trigger fires.
+
 ```sql
 -- Only fire when the status column actually changes
 CREATE TRIGGER log_status_change

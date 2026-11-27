@@ -9,112 +9,25 @@ use crate::turso_assert;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
-    sync::{Arc, OnceLock, Weak},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    sync::Arc,
+    translate::{
+        collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS, trigger_exec::SubprogramKey,
+    },
     vdbe::{
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, ConstraintInfo, Insn, Subprogram},
-        BranchOffset, PreparedProgram,
+        BranchOffset,
     },
     Connection, LimboError, Result,
 };
-use std::{cell::RefCell, num::NonZero, num::NonZeroUsize, rc::Rc};
-
-/// Tracks foreign-key action programs that are currently being compiled.
-///
-/// This is needed when generated foreign-key action SQL reaches the same
-/// foreign-key action again before the first copy has finished compiling.
-///
-/// Example: in `t(id PRIMARY KEY, parent REFERENCES t(id) ON DELETE CASCADE)`,
-/// deleting row `1` runs an action that deletes row `2`. Deleting row `2` must
-/// run the same action again to delete row `3`. While compiling that action,
-/// this stack lets the nested delete emit a call back to the action program
-/// already being built.
-///
-/// A two-table cycle needs the same mechanism: table `a` cascades to `b`, and
-/// `b` cascades back to `a`.
-#[derive(Clone, Default)]
-pub(super) struct FkActionCompileStack(Rc<RefCell<Vec<FkActionCompileStackEntry>>>);
-
-/// One foreign-key action program that is currently being compiled.
-struct FkActionCompileStackEntry {
-    /// The foreign key whose action program is being compiled.
-    foreign_key: Arc<ForeignKey>,
-    /// Whether the action started from a parent delete or a parent key update.
-    parent_change: FkActionParentChange,
-    /// The place where the finished action program will be stored.
-    ///
-    /// Recursive calls emitted during compilation hold a clone of this slot.
-    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
-}
-
-impl FkActionCompileStack {
-    /// Find the unfinished action program for this foreign key and parent row change.
-    ///
-    /// Returning `Some` means the compiler is re-entering the same FK action.
-    /// The caller should emit a recursive call to that in-progress program
-    /// instead of compiling another copy of the action.
-    fn find(
-        &self,
-        foreign_key: &Arc<ForeignKey>,
-        parent_change: FkActionParentChange,
-    ) -> Option<Arc<OnceLock<Weak<PreparedProgram>>>> {
-        self.0
-            .borrow()
-            .iter()
-            .find(|entry| {
-                entry.parent_change == parent_change && Arc::ptr_eq(&entry.foreign_key, foreign_key)
-            })
-            .map(|entry| entry.slot.clone())
-    }
-
-    /// Remember that a foreign-key action program is being compiled.
-    ///
-    /// The returned guard removes the entry from the stack when compilation
-    /// ends, including when compilation returns an error.
-    fn push(
-        &self,
-        foreign_key: Arc<ForeignKey>,
-        parent_change: FkActionParentChange,
-    ) -> FkActionCompileStackGuard {
-        let slot = Arc::new(OnceLock::new());
-        self.0.borrow_mut().push(FkActionCompileStackEntry {
-            foreign_key,
-            parent_change,
-            slot: slot.clone(),
-        });
-        FkActionCompileStackGuard {
-            stack: self.clone(),
-            slot,
-        }
-    }
-}
-
-/// Removes a foreign-key action program from the compile stack when compilation ends.
-struct FkActionCompileStackGuard {
-    stack: FkActionCompileStack,
-    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
-}
-
-impl Drop for FkActionCompileStackGuard {
-    fn drop(&mut self) {
-        let ended = self
-            .stack
-            .0
-            .borrow_mut()
-            .pop()
-            .expect("foreign-key action compilation stack underflow");
-        debug_assert!(Arc::ptr_eq(&ended.slot, &self.slot));
-    }
-}
+use std::{num::NonZero, num::NonZeroUsize};
 
 /// The parent-row change that started a foreign-key action.
 ///
-/// Delete and update actions are different generated programs. A recursive
-/// delete action must call the in-progress delete action, not an update action
-/// for the same foreign key.
+/// Delete and update actions are different generated programs, so a delete
+/// action must not call the update action of the same foreign key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FkActionParentChange {
+pub(super) enum FkActionParentChange {
     /// The parent row was deleted.
     Delete,
     /// The parent key was updated.
@@ -1699,7 +1612,7 @@ impl FkActionContext {
     /// Return which generated action program this context runs.
     ///
     /// Delete actions only have old parent key values. Update actions have old
-    /// and new parent key values. The recursive compile stack uses this to keep
+    /// and new parent key values. `SubprogramKey::FkAction` uses this to keep
     /// delete and update action programs separate for the same foreign key.
     fn parent_change(&self) -> FkActionParentChange {
         if self.new_key_registers.is_some() {
@@ -1836,13 +1749,12 @@ const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts::new(2, 32, 4)
 /// Compile and emit a foreign-key action as a subprogram.
 ///
 /// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT,
-/// and CASCADE UPDATE. The recursive case is handled before compiling a new
-/// subprogram: if the same foreign-key action is already being compiled, this
-/// emits a call to that in-progress program instead of compiling forever.
+/// and CASCADE UPDATE. The statement compiles each action once and calls it
+/// from every place it fires (see `CompiledSubprograms`).
 ///
-/// This is required for self-referential cascades and foreign-key cycles. In
-/// both cases, the generated action SQL can fire the same action again before
-/// the first action program has finished compiling.
+/// An action can fire itself again: in self-referential cascades and in
+/// foreign-key cycles, the generated action SQL reaches the same action before
+/// its program has finished compiling. That call goes to the pending program.
 fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -1852,15 +1764,18 @@ fn emit_fk_action_subprogram(
     foreign_key: Arc<ForeignKey>,
     description: &'static str,
 ) -> Result<()> {
-    let parent_change = ctx.parent_change();
-    let compile_stack = resolver.fk_action_compile_stack.clone();
+    let key = SubprogramKey::FkAction {
+        foreign_key,
+        parent_change: ctx.parent_change(),
+    };
+    let subprograms = resolver.compiled_subprograms.clone();
 
-    let subprogram = if let Some(slot) = compile_stack.find(&foreign_key, parent_change) {
+    let subprogram = if let Some((subprogram, _)) = subprograms.find(&key) {
         assert!(
-            program.flags.is_subprogram(),
-            "recursive foreign-key action calls must be emitted from a foreign-key action subprogram"
+            !matches!(subprogram, Subprogram::Pending(_)) || program.flags.is_subprogram(),
+            "recursive foreign-key action calls must be emitted from a subprogram"
         );
-        Subprogram::Pending(slot)
+        subprogram
     } else {
         let Some(depth) = program.nested_subprogram_depth() else {
             return Ok(());
@@ -1875,7 +1790,7 @@ fn emit_fk_action_subprogram(
         subprogram_builder
             .flags
             .set_writes_stored_values(ctx.new_key_is_stored);
-        let entry = compile_stack.push(foreign_key, parent_change);
+        let pending = subprograms.start(key, None);
         subprogram_builder.prologue();
         // Foreign-key actions see every row and need no privileges, as in
         // PostgreSQL, so a cascading delete also removes the rows that
@@ -1891,12 +1806,7 @@ fn emit_fk_action_subprogram(
         })?;
         subprogram_builder.epilogue(resolver.schema());
         let built = subprogram_builder.build(connection, true, description)?;
-        let prepared = built.prepared().clone();
-        entry
-            .slot
-            .set(Arc::downgrade(&prepared))
-            .expect("foreign-key action subprogram should be set exactly once");
-        Subprogram::PreparedProgram(prepared)
+        pending.finish(built.prepared().clone())
     };
 
     // Foreign-key action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
@@ -1929,21 +1839,15 @@ fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedNam
 /// Generate a DELETE statement AST for CASCADE DELETE:
 /// DELETE FROM child_table WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
 fn generate_cascade_delete_stmt(
-    child_table: &str,
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
     ast::Stmt::Delete {
         with: None,
-        tbl_name: qualified_table_name(child_table, db_name),
+        tbl_name: qualified_table_name(&fk_ref.child_table.name, db_name),
         indexed: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
-        ))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(fk_ref, ctx))),
         returning: vec![],
         truncate: false,
     }
@@ -1952,14 +1856,14 @@ fn generate_cascade_delete_stmt(
 /// Generate an UPDATE statement AST for SET NULL:
 /// UPDATE child_table SET fk_col1 = NULL, fk_col2 = NULL ... WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
 fn generate_set_null_stmt(
-    child_table: &str,
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause: fk_col1 = NULL, fk_col2 = NULL ...
-    let sets: Vec<ast::Set> = child_cols
+    let sets: Vec<ast::Set> = fk_ref
+        .fk
+        .child_columns
         .iter()
         .map(|col| ast::Set {
             col_names: vec![Name::from_string(col)],
@@ -1969,15 +1873,11 @@ fn generate_set_null_stmt(
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: qualified_table_name(child_table, db_name),
+        tbl_name: qualified_table_name(&fk_ref.child_table.name, db_name),
         indexed: None,
         sets,
         from: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
-        ))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(fk_ref, ctx))),
         returning: vec![],
     })
 }
@@ -1985,17 +1885,18 @@ fn generate_set_null_stmt(
 /// Generate an UPDATE statement AST for SET DEFAULT:
 /// UPDATE child_table SET fk_col1 = default1, fk_col2 = default2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
 fn generate_set_default_stmt(
-    child_table: &BTreeTable,
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause: if no default is defined for a column, we use NULL
-    let sets: Vec<ast::Set> = child_cols
+    let sets: Vec<ast::Set> = fk_ref
+        .fk
+        .child_columns
         .iter()
         .map(|col| {
-            let default_expr = child_table
+            let default_expr = fk_ref
+                .child_table
                 .get_column(col)
                 .and_then(|(_, c)| c.default.as_ref())
                 .map(|d| (**d).clone())
@@ -2010,15 +1911,11 @@ fn generate_set_default_stmt(
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: qualified_table_name(&child_table.name, db_name),
+        tbl_name: qualified_table_name(&fk_ref.child_table.name, db_name),
         indexed: None,
         sets,
         from: None,
-        where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
-        ))),
+        where_clause: Some(Box::new(build_fk_match_where_clause(fk_ref, ctx))),
         returning: vec![],
     })
 }
@@ -2026,14 +1923,14 @@ fn generate_set_default_stmt(
 /// Generate an UPDATE statement AST for CASCADE UPDATE:
 /// UPDATE child_table SET fk_col1 = ?new1, fk_col2 = ?new2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
 fn generate_cascade_update_stmt(
-    child_table: &str,
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause
-    let sets: Vec<ast::Set> = child_cols
+    let sets: Vec<ast::Set> = fk_ref
+        .fk
+        .child_columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -2052,11 +1949,11 @@ fn generate_cascade_update_stmt(
         })
         .collect();
 
-    let where_clause = build_fk_match_where_clause(child_cols, parent_collations, ctx);
+    let where_clause = build_fk_match_where_clause(fk_ref, ctx);
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: qualified_table_name(child_table, db_name),
+        tbl_name: qualified_table_name(&fk_ref.child_table.name, db_name),
         indexed: None,
         sets,
         from: None,
@@ -2070,15 +1967,12 @@ fn generate_cascade_update_stmt(
 ///
 /// As in SQLite's `fkActionTrigger`, the parent key value is the left operand
 /// and has the parent column's collation, so the comparison uses it.
-fn build_fk_match_where_clause(
-    child_cols: &[String],
-    parent_collations: &[CollationSeq],
-    ctx: &FkSubprogramContext,
-) -> Expr {
-    turso_assert!(child_cols.len() == parent_collations.len());
+fn build_fk_match_where_clause(fk_ref: &ResolvedFkRef, ctx: &FkSubprogramContext) -> Expr {
+    let child_cols = &fk_ref.fk.child_columns;
+    turso_assert!(child_cols.len() == fk_ref.parent_collations.len());
     let mut conditions: Vec<Expr> = Vec::with_capacity(child_cols.len());
 
-    for (i, (col, collation)) in child_cols.iter().zip(parent_collations).enumerate() {
+    for (i, (col, collation)) in child_cols.iter().zip(&fk_ref.parent_collations).enumerate() {
         let param_idx = ctx.old_param_index(i);
         let parent_key = ast::Variable::for_column(
             u32::try_from(param_idx.get())
@@ -2087,6 +1981,8 @@ fn build_fk_match_where_clause(
                 .expect("fk parameter index must fit into NonZeroU32"),
             None,
             Some(&collation.name()),
+            // As in SQLite, a rowid parent key column has INTEGER affinity.
+            fk_ref.parent_is_rowid[i],
         );
         let cond = Expr::Binary(
             Box::new(Expr::Variable(parent_key)),
@@ -2133,13 +2029,7 @@ fn fire_fk_cascade_delete(
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_cascade_delete_stmt(
-        &fk_ref.child_table.name,
-        child_cols,
-        &fk_ref.parent_collations,
-        &subprog_ctx,
-        db_name.as_deref(),
-    );
+    let stmt = generate_cascade_delete_stmt(fk_ref, &subprog_ctx, db_name.as_deref());
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -2164,13 +2054,7 @@ fn fire_fk_set_null(
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_set_null_stmt(
-        &fk_ref.child_table.name,
-        child_cols,
-        &fk_ref.parent_collations,
-        &subprog_ctx,
-        db_name.as_deref(),
-    );
+    let stmt = generate_set_null_stmt(fk_ref, &subprog_ctx, db_name.as_deref());
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -2195,13 +2079,7 @@ fn fire_fk_set_default(
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_set_default_stmt(
-        &fk_ref.child_table,
-        child_cols,
-        &fk_ref.parent_collations,
-        &subprog_ctx,
-        db_name.as_deref(),
-    );
+    let stmt = generate_set_default_stmt(fk_ref, &subprog_ctx, db_name.as_deref());
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -2227,13 +2105,7 @@ fn fire_fk_cascade_update(
     let child_cols = &fk_ref.fk.child_columns;
     // CASCADE UPDATE needs new params for the SET clause
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);
-    let stmt = generate_cascade_update_stmt(
-        &fk_ref.child_table.name,
-        child_cols,
-        &fk_ref.parent_collations,
-        &subprog_ctx,
-        db_name.as_deref(),
-    );
+    let stmt = generate_cascade_update_stmt(fk_ref, &subprog_ctx, db_name.as_deref());
     emit_fk_action_subprogram(
         program,
         resolver,

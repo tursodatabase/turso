@@ -33,8 +33,8 @@ use crate::schema::{
 };
 use crate::security::roles::RoleId;
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
-use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
+use crate::translate::trigger_exec::CompiledSubprograms;
 use crate::vdbe::{
     affinity::Affinity,
     builder::{
@@ -174,13 +174,9 @@ pub struct Resolver<'a> {
     pub(crate) automatic_index: bool,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
-    /// Foreign-key action programs currently being compiled by this resolver.
-    ///
-    /// This is shared with forked resolvers because `translate_inner` can fork
-    /// the resolver while compiling generated foreign-key action SQL. Without
-    /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
-    /// that its own action program is already being built.
-    pub(super) fk_action_compile_stack: FkActionCompileStack,
+    /// Trigger and foreign-key action subprograms compiled so far for this
+    /// statement, shared with forked resolvers.
+    pub(super) compiled_subprograms: CompiledSubprograms,
     /// Number of queries that the planner plans one inside the other: subqueries,
     /// the bodies of CTEs and views, and the subquery of each window. Forks
     /// share it, because they plan parts of the same statement.
@@ -223,21 +219,6 @@ impl RegisterColumn {
         Self {
             affinity: column.comparison_affinity(),
             ..Self::table_column(column, is_strict, schema)
-        }
-    }
-
-    /// NEW.x or OLD.x in a trigger. It has the collation and type of column x
-    /// but, as in SQLite, no affinity unless x is the rowid alias.
-    /// See https://www.sqlite.org/forum/forumpost/819f2d6627
-    pub fn trigger_row_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
-        Self {
-            affinity: if column.is_rowid_alias() {
-                Affinity::Integer
-            } else {
-                Affinity::None
-            },
-            collation: crate::translate::collate::column_collation(column),
-            column_type: column_type(column, is_strict, schema),
         }
     }
 
@@ -445,7 +426,7 @@ impl<'a> Resolver<'a> {
             automatic_index: true,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
-            fk_action_compile_stack: FkActionCompileStack::default(),
+            compiled_subprograms: CompiledSubprograms::default(),
             query_nesting_depth: Rc::default(),
             role_is_not_superuser: false,
             row_security_role,
@@ -484,7 +465,7 @@ impl<'a> Resolver<'a> {
             automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
-            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            compiled_subprograms: self.compiled_subprograms.clone(),
             query_nesting_depth: self.query_nesting_depth.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
             row_security_role: self.row_security_role,
@@ -505,7 +486,7 @@ impl<'a> Resolver<'a> {
             automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
-            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            compiled_subprograms: self.compiled_subprograms.clone(),
             query_nesting_depth: self.query_nesting_depth.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
             row_security_role: self.row_security_role,

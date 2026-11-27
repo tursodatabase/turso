@@ -5398,3 +5398,39 @@ test fk-update-child-without-parent-fails {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+# The parent key of an FK action is a rowid, so as in SQLite it has INTEGER
+# affinity and matches a child key stored as the text '1'. In a composite key
+# only the rowid column gets INTEGER affinity.
+test fk-actions-with-rowid-parent-match-text-child-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c_del(pid REFERENCES p(id) ON DELETE CASCADE);
+    CREATE TABLE c_null(pid REFERENCES p(id) ON DELETE SET NULL);
+    CREATE TABLE c_upd(pid REFERENCES p ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1), (2);
+    INSERT INTO c_del VALUES('1');
+    INSERT INTO c_null VALUES('1');
+    INSERT INTO c_upd VALUES('2');
+    UPDATE p SET id = 3 WHERE id = 2;
+    DELETE FROM p WHERE id = 1;
+    SELECT count(*) FROM c_del;
+    SELECT quote(pid) FROM c_null;
+    SELECT quote(pid) FROM c_upd;
+    CREATE TABLE p2(id INTEGER PRIMARY KEY, k INT, UNIQUE(id, k), UNIQUE(k, id));
+    CREATE TABLE c2_del(a, b, FOREIGN KEY(a, b) REFERENCES p2(id, k) ON DELETE CASCADE);
+    CREATE TABLE c2_null(a, b, FOREIGN KEY(a, b) REFERENCES p2(k, id) ON DELETE SET NULL);
+    INSERT INTO p2 VALUES(1, 1);
+    INSERT INTO c2_del VALUES('1', 1);
+    INSERT INTO c2_null VALUES(1, '1');
+    DELETE FROM p2;
+    SELECT count(*) FROM c2_del;
+    SELECT quote(a), quote(b) FROM c2_null;
+}
+expect {
+    0
+    NULL
+    3
+    0
+    NULL|NULL
+}

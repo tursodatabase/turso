@@ -1,0 +1,33 @@
+@database :memory:
+
+# A trigger that is already running does not fire again, and its WHEN clause
+# is not evaluated for that firing. Here the WHEN clause would fail for the
+# row the trigger inserts. Turso used to evaluate it before skipping the
+# firing, so the INSERT failed.
+test when-clause-of-trigger-that-fires-itself-is-not-evaluated {
+    CREATE TABLE t(a, b);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN json(new.b) IS NOT NULL BEGIN INSERT INTO t VALUES(new.a + 1, 'notjson'); END;
+    INSERT INTO t VALUES(1, '{}');
+    SELECT * FROM t;
+}
+expect {
+    1|{}
+    2|notjson
+}
+
+# The same through another table's trigger: tr_t fires tr_u, which inserts
+# into t again.
+test when-clause-of-trigger-fired-again-through-another-trigger-is-not-evaluated {
+    CREATE TABLE t(a);
+    CREATE TABLE u(a);
+    CREATE TRIGGER tr_t BEFORE INSERT ON t WHEN abs(new.a) >= 0 BEGIN INSERT INTO u VALUES(new.a); END;
+    CREATE TRIGGER tr_u AFTER INSERT ON u BEGIN INSERT INTO t VALUES(-9223372036854775808); END;
+    INSERT INTO t VALUES(1);
+    SELECT a FROM t ORDER BY a;
+    SELECT a FROM u;
+}
+expect {
+    -9223372036854775808
+    1
+    1
+}

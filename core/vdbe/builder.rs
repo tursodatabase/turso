@@ -2132,9 +2132,6 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc_when_reentered, "Once")?;
                 }
-                Insn::ResetOnce { region_end, .. } => {
-                    resolve(region_end, "ResetOnce")?;
-                }
                 Insn::Prev { pc_if_prev, .. } => {
                     resolve(pc_if_prev, "Prev")?;
                 }
