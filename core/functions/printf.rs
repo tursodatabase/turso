@@ -2007,7 +2007,7 @@ mod tests {
 
     #[test]
     fn test_nan_handling() {
-        // Value::from_f64(NaN) returns Value::Null (NonNan rejects NaN),
+        // Value::from_f64(NaN) returns Value::Null (Double rejects NaN),
         // so NaN is treated as NULL which coerces to 0.0 for float formats.
         // The NaN-specific formatting code (NaN/null output) is defense-in-depth
         // that can't be triggered through the Value system.

@@ -21,7 +21,7 @@ use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
-use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert, Double};
 pub mod affinity;
 pub mod array;
 pub mod bloom_filter;
@@ -602,7 +602,7 @@ impl Register {
     /// Set the value of the register to a floating point,
     /// reusing Register::Value(Value::Numeric(Numeric::Float(_))) if possible.
     #[inline(always)]
-    pub fn set_float(&mut self, val: NonNan) {
+    pub fn set_float(&mut self, val: Double) {
         match self {
             Register::Value(Value::Numeric(Numeric::Float(existing))) => {
                 *existing = val;
@@ -4630,7 +4630,7 @@ pub(crate) fn decode_serial_type_into_register(
             let val = f64::from_be_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
             ]);
-            if let Some(nn) = NonNan::new(val) {
+            if let Some(nn) = Double::non_nan(val) {
                 dest.set_float(nn);
             } else {
                 dest.set_null();

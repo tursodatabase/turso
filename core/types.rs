@@ -8,7 +8,7 @@ use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
-use crate::numeric::nonnan::NonNan;
+use crate::numeric::double::Double;
 use crate::numeric::Numeric;
 use crate::numeric::{format_float, IntegerText};
 use crate::pseudo::PseudoCursor;
@@ -805,7 +805,7 @@ impl<V: AsValueRef> AsValueRef for &V {
 
 impl Value {
     pub const fn from_f64(f: f64) -> Self {
-        match NonNan::new(f) {
+        match Double::non_nan(f) {
             Some(nn) => Self::Numeric(Numeric::Float(nn)),
             None => Self::Null,
         }
@@ -1379,7 +1379,7 @@ impl std::ops::AddAssign<f64> for Value {
     fn add_assign(&mut self, rhs: f64) {
         let sum = (|| {
             let lhs_num = Numeric::from_value(&self)?;
-            let rhs_num = NonNan::new(rhs).map(Numeric::Float)?;
+            let rhs_num = Double::non_nan(rhs).map(Numeric::Float)?;
             lhs_num.checked_add(rhs_num)
         })();
 
@@ -2529,7 +2529,7 @@ impl<'a> Clone for ValueIterator<'a> {
 
 impl<'a> ValueRef<'a> {
     pub fn from_f64(f: f64) -> Self {
-        match NonNan::new(f) {
+        match Double::non_nan(f) {
             Some(nn) => Self::Numeric(Numeric::Float(nn)),
             None => Self::Null,
         }
@@ -5261,16 +5261,16 @@ mod tests {
     /// via partial_cmp returned None. The .unwrap() in Ord::cmp and
     /// the single-value compare would then panic.
     ///
-    /// Now Numeric::Float wraps NonNan, which rejects NaN at construction time.
+    /// Now Numeric::Float wraps Double, which rejects NaN at construction time.
     /// This makes it impossible to represent NaN in a ValueRef, so partial_cmp
     /// is total and can never return None for any representable value.
     #[test]
     fn test_valueref_partial_cmp_no_panic_on_nan() {
-        use crate::numeric::nonnan::NonNan;
+        use crate::numeric::double::Double;
 
-        // NonNan::new rejects NaN — this is the type-level guarantee that
+        // Double::non_nan rejects NaN — this is the type-level guarantee that
         // prevents the old panic. No ValueRef::Float(NAN) can be constructed.
-        assert!(NonNan::new(f64::NAN).is_none());
+        assert!(Double::non_nan(f64::NAN).is_none());
 
         // from_f64(NAN) falls back to Null instead of storing a NaN float.
         assert_eq!(ValueRef::from_f64(f64::NAN), ValueRef::Null);
