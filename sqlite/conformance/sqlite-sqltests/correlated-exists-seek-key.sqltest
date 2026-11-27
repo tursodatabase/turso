@@ -43,6 +43,10 @@ test correlated-exists-seek-key-fuzzer {
 expect {
     587003.667536799|-718444.0
 }
+# JS Number omits .0 for whole numbers
+expect @js {
+    587003.667536799|-718444
+}
 
 setup rows {
     CREATE TABLE p (a INTEGER PRIMARY KEY, b TEXT NOT NULL);
