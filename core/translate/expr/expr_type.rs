@@ -1426,7 +1426,7 @@ fn has_declared_result_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &Typ
 /// Whether every value of column `column` of `table` has a declared type: the
 /// table declares its column types, or it is a subquery in FROM whose column
 /// has a declared type.
-fn column_has_declared_type(table: &Table, column: usize, env: &TypeEnv) -> bool {
+pub(super) fn column_has_declared_type(table: &Table, column: usize, env: &TypeEnv) -> bool {
     match table {
         Table::FromClauseSubquery(subquery) => env.resolver().is_some_and(|resolver| {
             query_column_has_declared_type(&subquery.plan, column, resolver)
