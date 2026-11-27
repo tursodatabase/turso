@@ -1624,6 +1624,9 @@ impl BuildSharedWal {
                     self.phase = BuildSharedWalPhase::AwaitHeader(c);
                 }
                 BuildSharedWalPhase::AwaitHeader(c) => {
+                    if let Some(err) = c.get_error() {
+                        return Err(err.into());
+                    }
                     if !c.succeeded() {
                         io_yield_one!(c);
                     }
@@ -1651,6 +1654,9 @@ impl BuildSharedWal {
                     };
                 }
                 BuildSharedWalPhase::AwaitChunk { completion, offset } => {
+                    if let Some(err) = completion.get_error() {
+                        return Err(err.into());
+                    }
                     if !completion.succeeded() {
                         io_yield_one!(completion);
                     }
@@ -1742,8 +1748,7 @@ impl StreamingWalReader {
         let reader = self.clone();
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let _reader = reader.clone();
-            _reader.handle_header_read(res);
-            None
+            _reader.handle_header_read(res)
         });
         let c = Completion::new_read(header_buf, completion);
         self.file.pread(0, c)
@@ -1777,22 +1782,31 @@ impl StreamingWalReader {
         let completion: Box<ReadComplete> = Box::new(move |res| {
             tracing::debug!("WAL chunk read complete");
             let reader = me.clone();
-            reader.handle_chunk_read(res);
-            None
+            reader.handle_chunk_read(offset, res)
         });
         let c = Completion::new_read(buf, completion);
         let guard = self.file.pread(offset, c)?;
         Ok((read_size, guard))
     }
 
-    fn handle_header_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_header_read(
+        self: Arc<Self>,
+        res: Result<(Arc<Buffer>, i32), CompletionError>,
+    ) -> Option<CompletionError> {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
-            return;
+            return None;
         };
+        // The file is at least as long as the header, so a read that returns
+        // fewer bytes does not mean that the WAL has no header. If recovery
+        // treated it that way, the committed frames would not be visible and
+        // the next write would overwrite them.
         if bytes_read != WAL_HEADER_SIZE as i32 {
-            self.finalize_loading();
-            return;
+            return Some(CompletionError::ShortReadWalFrame {
+                offset: 0,
+                expected: WAL_HEADER_SIZE,
+                actual: bytes_read as usize,
+            });
         }
 
         let (page_sz, c1, c2, use_native, ok) = {
@@ -1836,7 +1850,7 @@ impl StreamingWalReader {
         if PageSize::new(page_sz).is_none() || !ok {
             *self.header.lock() = WalHeader::default();
             self.finalize_loading();
-            return;
+            return None;
         }
         {
             let mut st = self.state.write();
@@ -1849,14 +1863,28 @@ impl StreamingWalReader {
         self.off_atomic
             .store(WAL_HEADER_SIZE as u64, Ordering::Release);
         self.page_atomic.store(page_sz as u64, Ordering::Release);
+        None
     }
 
-    fn handle_chunk_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_chunk_read(
+        self: Arc<Self>,
+        offset: u64,
+        res: Result<(Arc<Buffer>, i32), CompletionError>,
+    ) -> Option<CompletionError> {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
-            return;
+            return None;
         };
-        let buf_slice = &buf.as_slice()[..bytes_read as usize];
+        // The requested bytes are all inside the file, so a read that returns
+        // fewer bytes does not show where the valid frames end.
+        if bytes_read as usize != buf.len() {
+            return Some(CompletionError::ShortReadWalFrame {
+                offset,
+                expected: buf.len(),
+                actual: bytes_read as usize,
+            });
+        }
+        let buf_slice = buf.as_slice();
         // Snapshot salts/endianness once to avoid per-frame header locks
         let (header_copy, use_native) = {
             let st = self.state.read();
@@ -1870,6 +1898,7 @@ impl StreamingWalReader {
         if consumed < buf_slice.len() || self.off_atomic.load(Ordering::Acquire) >= self.file_size {
             self.finalize_loading();
         }
+        None
     }
 
     // Processes frames from a buffer, returns bytes processed
