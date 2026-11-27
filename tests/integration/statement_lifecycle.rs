@@ -2489,7 +2489,7 @@ unsafe extern "C" fn keepalive_finalize(
 }
 
 fn register_keepalive_aggregate(conn: &Arc<Connection>) {
-    conn.syms.write().functions.insert(
+    conn.syms.write().insert_function(
         "keepalive_agg".to_string(),
         Arc::new(
             turso_core::function::ExternalFunc::new_aggregate(
