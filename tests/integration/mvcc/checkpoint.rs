@@ -6514,3 +6514,96 @@ fn checkpoint_with_queued_log_truncate_resets_log_offset() {
         vec![vec![Value::from_i64(1), Value::build_text("a")]]
     );
 }
+
+/// With the passive checkpoint flag on, an explicit TRUNCATE that finds another checkpoint
+/// in progress must return Busy. Before, it did no work and returned `0|0|0`, which is also
+/// the result of a TRUNCATE that empties the logical log.
+#[test]
+fn truncate_returns_busy_while_another_checkpoint_runs() {
+    let (db, other) = run_while_auto_checkpoint_paused("PRAGMA wal_checkpoint(TRUNCATE)");
+
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        db.get_mvcc_store().get_logical_log_file().size().unwrap(),
+        0
+    );
+}
+
+/// An explicit PASSIVE checkpoint must also return Busy. Only the commit auto-checkpoint
+/// does no work when another checkpoint is in progress.
+#[test]
+fn explicit_passive_returns_busy_while_another_checkpoint_runs() {
+    let (db, other) = run_while_auto_checkpoint_paused("PRAGMA wal_checkpoint(PASSIVE)");
+
+    let rows = get_rows(&other, "PRAGMA wal_checkpoint(PASSIVE)");
+    assert_eq!(rows[0][0].as_int(), Some(0), "busy column: {rows:?}");
+    assert_eq!(
+        db.get_mvcc_store().get_logical_log_file().size().unwrap(),
+        0
+    );
+}
+
+/// `PRAGMA journal_mode = wal` runs a TRUNCATE checkpoint before it leaves MVCC. Before,
+/// the contended checkpoint did no work, the mode changed with the row still only in the
+/// logical log, and the paused INSERT then panicked.
+#[test]
+fn journal_mode_wal_returns_busy_while_another_checkpoint_runs() {
+    let (_db, other) = run_while_auto_checkpoint_paused("PRAGMA journal_mode = 'wal'");
+
+    let rows = get_rows(&other, "PRAGMA journal_mode");
+    assert_eq!(rows[0][0].to_string(), "mvcc");
+    let rows = get_rows(&other, "PRAGMA journal_mode = 'wal'");
+    assert_eq!(rows[0][0].to_string(), "wal");
+    let rows = get_rows(&other, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1, "row lost after journal_mode = wal: {rows:?}");
+}
+
+/// Commits a row on one connection and stops the commit's auto-checkpoint after it sets
+/// `checkpoint_in_progress`. Runs `sql` on a second connection and checks that it returns
+/// Busy. Then lets the auto-checkpoint finish and checks that the row is there. Returns the
+/// database and the second connection.
+fn run_while_auto_checkpoint_paused(sql: &str) -> (MvccTestDbNoConn, Arc<Connection>) {
+    use turso_core::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeCollectTableRows.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut insert = conn.prepare("INSERT INTO t VALUES (1, 'x')").unwrap();
+    let pager_io = conn.get_pager().io.clone();
+    while !injector.is_empty() {
+        match insert.step().unwrap() {
+            StepResult::IO => pager_io.step().unwrap(),
+            StepResult::Yield => {}
+            other => panic!("INSERT finished before its auto-checkpoint stopped: {other:?}"),
+        }
+    }
+
+    let other = db.connect();
+    let result = other
+        .prepare(sql)
+        .and_then(|mut stmt| stmt.run_collect_rows());
+    // `journal_mode = wal` drops the MV store when it succeeds.
+    let log_size = db
+        .get_db()
+        .get_mv_store()
+        .as_ref()
+        .map(|store| store.get_logical_log_file().size().unwrap());
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "contended `{sql}` must return Busy, got {result:?}, logical log size {log_size:?}"
+    );
+
+    drive_statement_to_done(&mut insert, &pager_io);
+    conn.set_yield_injector(None);
+    drop(insert);
+
+    let rows = get_rows(&other, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1, "row lost: {rows:?}");
+    (db, other)
+}
