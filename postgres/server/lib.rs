@@ -492,6 +492,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = &self.conn;
         let query = &portal.statement.statement;
         if has_no_statements(query)? {
+            check_parameter_count(portal, 0)?;
             return Ok(Response::EmptyQuery);
         }
 
@@ -977,6 +978,7 @@ fn bind_portal_parameters(
         portal.parameter_len(),
         "parameter",
     )?;
+    check_parameter_count(portal, stmt.parameters_count())?;
     for (i, (bytes, binary)) in portal.parameters.iter().zip(binary).enumerate() {
         let declared = portal.statement.parameter_types.get(i);
         let value = match bytes {
@@ -1002,6 +1004,28 @@ fn bind_portal_parameters(
         let _ = stmt.bind_at(idx, value);
     }
     Ok(())
+}
+
+/// Refuses a Bind whose number of values is not the number of parameters of
+/// the statement, as PostgreSQL does. As in PostgreSQL, the statement has
+/// one parameter for each type that Parse declared, or up to its highest $N
+/// if that is more. `query_parameters` is the highest $N in the query.
+fn check_parameter_count(portal: &Portal<String>, query_parameters: usize) -> PgWireResult<()> {
+    let required = query_parameters.max(portal.statement.parameter_types.len());
+    let supplied = portal.parameter_len();
+    if supplied == required {
+        return Ok(());
+    }
+    let name = match portal.statement.id.as_str() {
+        DEFAULT_NAME => "",
+        name => name,
+    };
+    Err(wire_error(
+        SQLSTATE_PROTOCOL_VIOLATION,
+        format!(
+            "bind message supplies {supplied} parameters, but prepared statement \"{name}\" requires {required}"
+        ),
+    ))
 }
 
 /// FIXME(pg-catalog): This refuses a binary parameter of unknown type because Turso cannot work out its type from the query. A typed expression tree replaces this refusal.
@@ -1929,6 +1953,103 @@ mod tests {
         let events = client.simple_query("COMMIT").unwrap();
         assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "COMMIT"));
         assert_row_count(&mut client, "q", "1");
+    }
+
+    /// PostgreSQL 16 refuses each of these with 08P01 and the same message.
+    #[test]
+    fn a_bind_with_the_wrong_number_of_values_is_refused() {
+        let (mut client, _conn) = copy_test_client();
+        // Query, types declared in Parse, values in Bind, and the number of
+        // parameters of the statement.
+        for (sql, types, values, required) in [
+            ("SELECT 1", 0, 1, 0),
+            ("SELECT $1 AS v", 0, 0, 1),
+            ("SELECT $1 AS v", 0, 2, 1),
+            ("SELECT $1::int + $2::int", 0, 1, 2),
+            ("SELECT $1::int + $2::int", 0, 3, 2),
+            ("SELECT $2::int", 2, 1, 2),
+            ("SELECT 1", 1, 0, 1),
+            ("SELECT $1::int", 3, 1, 3),
+            ("", 0, 1, 0),
+        ] {
+            let events = parse_bind_execute(&mut client, sql, types, values);
+            let [BackendEvent::Other(b'1'), BackendEvent::Other(b'2'), .., BackendEvent::ErrorResponse(fields), BackendEvent::ReadyForQuery(b'I')] =
+                &events[..]
+            else {
+                panic!("{sql:?} with {values} values: {events:?}");
+            };
+            assert_eq!(fields[&b'C'], SQLSTATE_PROTOCOL_VIOLATION);
+            assert_eq!(
+                fields[&b'M'],
+                format!("bind message supplies {values} parameters, but prepared statement \"\" requires {required}")
+            );
+        }
+    }
+
+    /// The statement has one parameter for each declared type, or up to its
+    /// highest $N if that is more, as in PostgreSQL.
+    #[test]
+    fn a_bind_with_one_value_for_each_parameter_runs() {
+        let (mut client, _conn) = copy_test_client();
+        for (sql, types, values, row) in [
+            ("SELECT $1::int + $2::int AS v", 0, 2, "3"),
+            ("SELECT $2::int AS v", 2, 2, "2"),
+            ("SELECT 1 AS v", 1, 1, "1"),
+            ("SELECT $1::int AS v", 3, 3, "1"),
+        ] {
+            let events = parse_bind_execute(&mut client, sql, types, values);
+            assert_eq!(
+                data_rows(&events),
+                [[Some(row.to_owned())]],
+                "{sql:?}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bind_with_the_wrong_number_of_values_aborts_the_transaction_block() {
+        let (mut client, _conn) = copy_test_client();
+        client.simple_query("CREATE TABLE b (i int)").unwrap();
+        client.simple_query("BEGIN").unwrap();
+        client.simple_query("INSERT INTO b VALUES (1)").unwrap();
+        let events = parse_bind_execute(&mut client, "INSERT INTO b VALUES ($1)", 0, 2);
+        assert!(
+            matches!(events.last(), Some(BackendEvent::ReadyForQuery(b'E'))),
+            "{events:?}"
+        );
+        let events = client.simple_query("COMMIT").unwrap();
+        assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "ROLLBACK"));
+        assert_row_count(&mut client, "b", "0");
+    }
+
+    /// Sends Parse of `sql` with `types` parameters of type int4, Bind with
+    /// `values` text values 1, 2, 3 and so on, Execute and Sync, and returns
+    /// the events up to ReadyForQuery.
+    fn parse_bind_execute(
+        client: &mut PgConn,
+        sql: &str,
+        types: u16,
+        values: u16,
+    ) -> Vec<BackendEvent> {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&types.to_be_bytes());
+        for _ in 0..types {
+            parse.extend_from_slice(&Type::INT4.oid().to_be_bytes());
+        }
+        client.write_message(b'P', &parse).unwrap();
+        let mut bind = vec![0, 0, 0, 0];
+        bind.extend_from_slice(&values.to_be_bytes());
+        for value in 1..=values {
+            let text = value.to_string();
+            bind.extend_from_slice(&(text.len() as i32).to_be_bytes());
+            bind.extend_from_slice(text.as_bytes());
+        }
+        bind.extend_from_slice(&[0, 0]);
+        client.write_message(b'B', &bind).unwrap();
+        client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+        sync_and_read(client)
     }
 
     const THREE_TIMES: &str = "SELECT now(), statement_timestamp(), clock_timestamp()";
