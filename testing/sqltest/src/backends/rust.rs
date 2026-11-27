@@ -44,6 +44,9 @@ pub struct RustBackend {
     default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
     /// Enable MVCC mode
     mvcc: bool,
+    /// Open every new database as `:model:`: all trees are in the in-memory model of the
+    /// cursor contract (debug builds only).
+    model: bool,
 }
 
 impl RustBackend {
@@ -51,6 +54,7 @@ impl RustBackend {
         Self {
             default_db_resolver: None,
             mvcc: false,
+            model: false,
         }
     }
 
@@ -63,6 +67,12 @@ impl RustBackend {
     /// Enable MVCC mode (experimental journal mode)
     pub fn with_mvcc(mut self, mvcc: bool) -> Self {
         self.mvcc = mvcc;
+        self
+    }
+
+    /// Open every new database as `:model:`
+    pub fn with_model(mut self, model: bool) -> Self {
+        self.model = model;
         self
     }
 }
@@ -105,6 +115,15 @@ impl SqlBackend for RustBackend {
         config: &DatabaseConfig,
     ) -> Result<Box<dyn DatabaseInstance>, BackendError> {
         let (db_path, temp_file) = match &config.location {
+            // A `:model:` database cannot be in a file, and has no pre-built content.
+            DatabaseLocation::Memory | DatabaseLocation::TempFile if self.model => {
+                (":model:".to_string(), None)
+            }
+            _ if self.model => {
+                return Err(BackendError::Unsupported(
+                    "unsupported in model storage: pre-built database file".to_string(),
+                ));
+            }
             DatabaseLocation::Memory => (":memory:".to_string(), None),
             DatabaseLocation::TempFile => {
                 let temp = NamedTempFile::new()

@@ -605,6 +605,15 @@ async fn run_single<B: SqlBackend, R: Runnable>(
         // Create database instance
         let mut db = match backend.create_database(&options.db_config).await {
             Ok(db) => db,
+            Err(BackendError::Unsupported(reason)) => {
+                return TestResult {
+                    name: test.name().to_string(),
+                    file: options.file_path,
+                    database: options.db_config,
+                    outcome: TestOutcome::Skipped { reason },
+                    duration: start.elapsed(),
+                };
+            }
             Err(e) => {
                 return TestResult {
                     name: test.name().to_string(),
