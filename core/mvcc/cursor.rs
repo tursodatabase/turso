@@ -1428,6 +1428,34 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
         Ok(())
     }
+
+    /// Initialize MVCC iterator for backward iteration from the last visible row, and set the
+    /// MVCC peek to that row (used by last(), and when prev() is called without last())
+    fn init_mvcc_iterator_backward(&mut self) -> Result<()> {
+        let last_key = match &self.mv_cursor_type {
+            MvccCursorType::Table => self.db.get_last_table_rowid(
+                self.table_id,
+                &mut self.table_iterator,
+                self.tx_id,
+                cursor_work(&self.work),
+            ),
+            MvccCursorType::Index(_) => self.db.get_last_index_rowid(
+                self.table_id,
+                self.tx_id,
+                &mut self.index_iterator,
+                cursor_work(&self.work),
+            )?,
+        };
+        tracing::trace!("init_mvcc_iterator_backward: mvcc_key: {:?}", last_key);
+        self.dual_peek.mvcc_peek = match last_key {
+            Some(key) => CursorPeek::Row {
+                key,
+                versions: None,
+            },
+            None => CursorPeek::Exhausted,
+        };
+        Ok(())
+    }
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCursor<Clock, A> {
@@ -1472,42 +1500,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.invalidate_record();
         self.current_pos = CursorPosition::End;
 
-        // Initialize MVCC iterator to last position
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => match self.db.get_last_table_rowid(
-                self.table_id,
-                &mut self.table_iterator,
-                self.tx_id,
-                cursor_work(&self.work),
-            ) {
-                Some(k) => {
-                    tracing::trace!("last: mvcc_key: {:?}", k);
-                    self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
-                    };
-                }
-                None => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-            MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
-                self.table_id,
-                self.tx_id,
-                &mut self.index_iterator,
-                cursor_work(&self.work),
-            )? {
-                Some(k) => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
-                    };
-                }
-                None => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-        };
+        self.init_mvcc_iterator_backward()?;
 
         self.refresh_current_position(IterationDirection::Backwards);
         self.invalidate_record();
