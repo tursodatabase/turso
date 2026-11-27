@@ -30,6 +30,12 @@ setup like_index_table {
     CREATE INDEX users_age ON users (age) WHERE name LIKE 'J%';
 }
 
+setup bytea_index_table {
+    CREATE TABLE bx (id int PRIMARY KEY, b bytea);
+    INSERT INTO bx VALUES (1, '\\x01'), (2, '\\x02ff'), (3, '\\x03');
+    CREATE INDEX bx_b ON bx (b);
+}
+
 setup dml_items {
     CREATE TABLE items (id int primary key, value int);
     INSERT INTO items VALUES (1, 10);
@@ -77,6 +83,37 @@ test explain-scans-when-the-like-predicate-differs {
 }
 expect {
     1|0|0|SCAN users
+}
+
+@setup bytea_index_table
+test explain-uses-the-index-of-a-bytea-column-for-a-bare-literal {
+    EXPLAIN SELECT id FROM bx WHERE b = '\\x02ff';
+    SELECT id FROM bx WHERE b = '\\x02ff';
+}
+expect {
+    1|0|0|SEARCH bx USING COVERING INDEX bx_b (b=?)
+    2
+}
+
+@setup bytea_index_table
+test explain-uses-the-index-of-a-bytea-column-for-a-cast-to-bytea {
+    EXPLAIN SELECT id FROM bx WHERE b = '\\x02ff'::bytea;
+    SELECT id FROM bx WHERE b = '\\x02ff'::bytea;
+}
+expect {
+    1|0|0|SEARCH bx USING COVERING INDEX bx_b (b=?)
+    2
+}
+
+@setup bytea_index_table
+test explain-uses-the-index-of-a-bytea-column-for-a-range {
+    EXPLAIN SELECT id FROM bx WHERE b > '\\x02';
+    SELECT id FROM bx WHERE b > '\\x02' ORDER BY id;
+}
+expect {
+    1|0|0|SEARCH bx USING COVERING INDEX bx_b (b>?)
+    2
+    3
 }
 
 @setup dml_items
