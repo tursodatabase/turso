@@ -260,10 +260,12 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        // random() is a native function (see functions.rs) because it returns
-        // a double, not SQLite's integer. Skipping the builtin lets that one
-        // be found.
-        if name.eq_ignore_ascii_case("random") {
+        // A native function (see functions.rs) that has the name of a builtin
+        // replaces it, because the builtin has SQLite's behavior: random()
+        // returns a double, not SQLite's integer, and chr() takes one argument
+        // and returns NULL for NULL. Returning None lets the engine find the
+        // native function instead.
+        if native_function_names().contains(&name.to_ascii_lowercase()) {
             return Ok(None);
         }
         turso_core::dialect::resolve_builtin_function(name, arg_count)
@@ -521,6 +523,20 @@ impl Dialect for PostgresDialect {
     fn json_contains_function(&self) -> Option<&'static str> {
         Some("jsonb_contains")
     }
+}
+
+/// The lowercase names of the native functions that `register_native_extensions`
+/// registers.
+fn native_function_names() -> &'static HashSet<String> {
+    static NAMES: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(|| {
+        OpenOptions::new(Arc::new(PostgresDialect))
+            .native_extensions
+            .functions
+            .iter()
+            .map(|function| function.name.clone())
+            .collect()
+    });
+    &NAMES
 }
 
 /// `concat_ws(separator, ...)` with PostgreSQL's rule: every argument that is
