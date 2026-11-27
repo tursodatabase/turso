@@ -86,8 +86,8 @@ impl IdxGaps {
     /// scan, MVCC ends the scan.
     pub const FM1_NEXT_AFTER_FOUND_MISS: IdxGaps = IdxGaps(1 << 15);
     /// PW2: WAL and ephemeral: after an `IdxInsert` of the cursor and a write by another
-    /// cursor, the cursor is not on the new entry: a read gives NULL, `Prev` returns the new
-    /// entry again.
+    /// cursor, the cursor is not on the new entry: a read gives NULL or another entry, `Prev`
+    /// returns the new entry again.
     pub const PW2_READ_AFTER_INSERT_AND_PEER_WRITE: IdxGaps = IdxGaps(1 << 16);
     /// G3: WAL and ephemeral: a cursor with the null-row flag and a write by another cursor
     /// since its last move reads the real entry instead of NULL.

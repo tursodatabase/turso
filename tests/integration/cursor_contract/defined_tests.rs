@@ -37,12 +37,24 @@ const INDEX_CONFIGS: [(DbKind, Layout); 4] = [
 const TABLE_ROWS: &[(i64, i64)] = &[(10, 100), (20, 200), (30, 300)];
 
 /// Runs `check` for every config and panics with the list of the configs that disagree.
+/// A program that the model calls illegal is a mistake in the test, not a bug of an engine.
 fn on_every_config(configs: &[(DbKind, Layout)], check: impl Fn(DbKind, Layout)) {
-    let failed: Vec<String> = configs
-        .iter()
-        .filter(|(kind, layout)| catch_unwind(AssertUnwindSafe(|| check(*kind, *layout))).is_err())
-        .map(|(kind, layout)| format!("{kind:?}/{layout:?}"))
-        .collect();
+    let mut failed = Vec::new();
+    for (kind, layout) in configs {
+        let Err(payload) = catch_unwind(AssertUnwindSafe(|| check(*kind, *layout))) else {
+            continue;
+        };
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            !message.contains("the model says op"),
+            "the model refuses the program: {message}"
+        );
+        failed.push(format!("{kind:?}/{layout:?}"));
+    }
     assert!(
         failed.is_empty(),
         "disagree with the model: {}",
@@ -52,8 +64,13 @@ fn on_every_config(configs: &[(DbKind, Layout)], check: impl Fn(DbKind, Layout))
 
 #[track_caller]
 fn agrees_table(ncur: usize, ops: &[Op]) {
+    agrees_table_rows(TABLE_ROWS, ncur, ops);
+}
+
+#[track_caller]
+fn agrees_table_rows(rows: &[(i64, i64)], ncur: usize, ops: &[Op]) {
     on_every_config(&TABLE_CONFIGS, |kind, layout| {
-        model::assert_agrees(kind, layout, TABLE_ROWS, ncur, ops)
+        model::assert_agrees(kind, layout, rows, ncur, ops)
     });
 }
 
@@ -221,7 +238,7 @@ fn idx_read_after_peer_insert() {
     );
 }
 
-/// PW2: WAL is not on its new entry after the peer write and reads NULL.
+/// PW2: WAL is not on its new entry after the peer write: it reads `(1, 10, 1)`.
 #[test]
 fn known_bug_pw2_idx_read_after_own_insert_and_peer_insert() {
     known_bug(
@@ -333,14 +350,19 @@ fn known_bug_fm1_idx_next_after_found_miss() {
     );
 }
 
-/// FM1: MVCC ends the scan.
+/// FM1: WAL skips `(2, 30, 4)` and reads `(3, NULL, 5)`; MVCC ends the scan.
 #[test]
 fn known_bug_fm1_idx_next_after_no_conflict_miss() {
     known_bug(
         "FM1",
-        "disagree with the model: Mvcc/AllInMemory Mvcc/Checkpointed",
+        "disagree with the model: Wal/AllInMemory Wal/Checkpointed Mvcc/AllInMemory Mvcc/Checkpointed",
         || {
-            agrees_index(1, &[IOp::NoConflict(0, vec![v(2), v(20)]), IOp::Next(0)]);
+            let ops = [
+                IOp::NoConflict(0, vec![v(2), v(20)]),
+                IOp::Next(0),
+                IOp::Observe(0),
+            ];
+            agrees_index(1, &ops);
         },
     );
 }
@@ -360,23 +382,44 @@ fn known_bug_fm1_next_after_found_miss_skips_an_entry() {
     );
 }
 
-/// PD1: WAL: `Prev` from the gap of an own `Delete`, after a peer insert, panics. The model
-/// ends the scan: there is no row before the deleted rowid 10.
+/// PD1: WAL and ephemeral: `Prev` from the gap of an own `Delete`, after a peer insert, goes
+/// wrong. With rows 8 and 20: both rows are deleted, the peer inserts 16, and `Prev` panics
+/// (`self.current_page >= 0`); the model ends the scan.
 #[test]
 fn known_bug_pd1_prev_from_gap_after_peer_insert() {
     known_bug(
         "PD1",
-        "disagree with the model: Wal/AllInMemory Wal/Checkpointed",
+        "disagree with the model: Wal/AllInMemory Wal/Checkpointed Ephemeral/AllInMemory",
         || {
             let ops = [
-                Op::SeekRowid(0, 30),
+                Op::SeekGT(0, 19),
                 Op::Delete(0),
                 Op::Last(1),
-                Op::Prev(1),
-                Op::Prev(1),
                 Op::Delete(1),
                 insert(0, 16),
                 Op::Prev(1),
+            ];
+            agrees_table_rows(&[(8, 53), (20, 250)], 2, &ops);
+        },
+    );
+}
+
+/// PD1: with rows 10, 20, 30: cursor 1 deletes 20, the peer inserts 16, and `Prev` of cursor 1
+/// gives 10, not 16. MVCC gives 16.
+#[test]
+fn known_bug_pd1_prev_from_gap_skips_peer_insert() {
+    known_bug(
+        "PD1",
+        "disagree with the model: Wal/AllInMemory Wal/Checkpointed Ephemeral/AllInMemory",
+        || {
+            let ops = [
+                Op::SeekGT(0, 25),
+                Op::Delete(0),
+                Op::Last(1),
+                Op::Delete(1),
+                insert(0, 16),
+                Op::Prev(1),
+                Op::RowId(1),
             ];
             agrees_table(2, &ops);
         },

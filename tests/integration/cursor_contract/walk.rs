@@ -61,8 +61,8 @@ impl KnownGaps {
     /// G3: WAL and ephemeral: a cursor with the null-row flag and a write by another cursor
     /// since its last move reads the real row instead of NULL.
     pub const G3: KnownGaps = KnownGaps(1 << 9);
-    /// PD1: WAL: `Next` or `Prev` from the gap of an own `Delete`, after a write by another
-    /// cursor, panics (`self.current_page >= 0`).
+    /// PD1: WAL and ephemeral: `Next` or `Prev` from the gap of an own `Delete`, after a write
+    /// by another cursor, skips the new row or panics (`self.current_page >= 0`).
     pub const PD1: KnownGaps = KnownGaps(1 << 10);
 
     pub const NONE: KnownGaps = KnownGaps(0);
