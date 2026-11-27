@@ -2902,6 +2902,79 @@ mod tests {
         assert_eq!(remote_rows[1][2], Value::Text("from-local".to_string()));
     }
 
+    /// A push whose batch fails on one row must not commit the other rows or the
+    /// client's last change id on the remote, so a retried push fails again and the
+    /// changes stay queued.
+    #[tokio::test]
+    pub async fn test_sync_push_failed_row_is_not_committed_partially() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let cases = [
+            (
+                "CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL, deleted_at_ms INTEGER) STRICT;
+                 CREATE UNIQUE INDEX tags_live_name ON tags(name) WHERE deleted_at_ms IS NULL;
+                 CREATE TABLE sentinels (id TEXT PRIMARY KEY) STRICT;",
+                vec!["INSERT INTO tags VALUES ('tag-{X}', 'same name', NULL)"],
+            ),
+            (
+                "CREATE TABLE owners (id TEXT PRIMARY KEY) STRICT;
+                 CREATE TABLE names (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id), name TEXT NOT NULL, is_primary INTEGER NOT NULL, deleted_at_ms INTEGER) STRICT;
+                 CREATE UNIQUE INDEX names_one_primary ON names(owner_id) WHERE is_primary = 1 AND deleted_at_ms IS NULL;
+                 CREATE TABLE sentinels (id TEXT PRIMARY KEY) STRICT;
+                 INSERT INTO owners VALUES ('owner-1');
+                 INSERT INTO names VALUES ('name-0', 'owner-1', 'original', 1, NULL);",
+                vec![
+                    "UPDATE names SET is_primary = 0 WHERE owner_id = 'owner-1' AND is_primary = 1",
+                    "INSERT INTO names VALUES ('name-{X}', 'owner-1', 'new {X}', 1, NULL)",
+                ],
+            ),
+        ];
+        for (schema, statements) in cases {
+            let server = TursoServer::new().await.unwrap();
+            for sql in schema.split(';').filter(|sql| !sql.trim().is_empty()) {
+                server.db_sql(sql).await.unwrap();
+            }
+            let mut replicas = Vec::new();
+            for side in ["A", "B"] {
+                let db = crate::sync::Builder::new_remote(":memory:")
+                    .with_remote_url(server.db_url())
+                    .build()
+                    .await
+                    .unwrap();
+                let conn = db.connect().await.unwrap();
+                conn.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+                for sql in &statements {
+                    conn.execute(&sql.replace("{X}", side), ()).await.unwrap();
+                }
+                conn.execute(
+                    &format!("INSERT INTO sentinels VALUES ('sentinel-{side}')"),
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute("COMMIT", ()).await.unwrap();
+                replicas.push(db);
+            }
+            let (a, b) = (&replicas[0], &replicas[1]);
+            a.push().await.unwrap();
+
+            let pending = b.stats().await.unwrap().cdc_operations;
+            assert!(pending > 0);
+            for _ in 0..2 {
+                let err = b.push().await.unwrap_err();
+                assert!(
+                    err.to_string().contains("UNIQUE constraint failed"),
+                    "{err}"
+                );
+                assert_eq!(b.stats().await.unwrap().cdc_operations, pending);
+            }
+            let sentinels = server
+                .db_sql("SELECT id FROM sentinels ORDER BY id")
+                .await
+                .unwrap();
+            assert_eq!(sentinels, vec![vec![Value::Text("sentinel-A".to_string())]]);
+        }
+    }
+
     /// Read-only consumer: pull + checkpoint loop with concurrent readers must
     /// not panic with `frame_count must be not less than frame_watermark` when
     /// a checkpoint backfills every frame and the next write tx restarts the

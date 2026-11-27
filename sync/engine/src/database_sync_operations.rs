@@ -30,8 +30,8 @@ use crate::{
     errors::Error,
     io_operations::IoOperations,
     server_proto::{
-        self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
-        PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
+        self, Batch, BatchCond, BatchCondList, BatchStep, BatchStreamReq, PageData,
+        PageUpdatesEncodingReq, PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
         PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     sync_cipher::ChangeKind,
@@ -3157,24 +3157,13 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             want_rows: Some(false),
             replication_index: None,
         },
-        condition: Some(BatchCond::Not {
-            cond: Box::new(BatchCond::IsAutocommit {}),
-        }),
+        // set for all steps at once below, when the batch is complete
+        condition: None,
     };
 
     let mut add_column_step_indices = std::collections::HashSet::new();
     let mut sql_over_http_requests = vec![
-        BatchStep {
-            stmt: Stmt {
-                sql: Some("BEGIN IMMEDIATE".to_string()),
-                sql_id: None,
-                args: Vec::new(),
-                named_args: Vec::new(),
-                want_rows: Some(false),
-                replication_index: None,
-            },
-            condition: None,
-        },
+        step("BEGIN IMMEDIATE".to_string(), Vec::new()),
         step(TURSO_SYNC_CREATE_TABLE.to_string(), Vec::new()),
     ];
 
@@ -3340,6 +3329,47 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
         ));
     }
     sql_over_http_requests.push(step("COMMIT".to_string(), Vec::new()));
+
+    // A failed statement does not end the remote transaction. So each step runs only
+    // if the step before it succeeded: otherwise the remote would apply the other rows
+    // of the batch, record the client's last change id and commit, and the next push
+    // would skip the failed rows. An ALTER TABLE ADD COLUMN error is ignored, so the
+    // step after it also runs on that error, but only inside the transaction.
+    for (i, request) in sql_over_http_requests.iter_mut().enumerate().skip(1) {
+        let prev = (i - 1) as u32;
+        request.condition = Some(if add_column_step_indices.contains(&(i - 1)) {
+            BatchCond::And(BatchCondList {
+                conds: vec![
+                    BatchCond::Not {
+                        cond: Box::new(BatchCond::IsAutocommit {}),
+                    },
+                    BatchCond::Or(BatchCondList {
+                        conds: vec![
+                            BatchCond::Ok { step: prev },
+                            BatchCond::Error { step: prev },
+                        ],
+                    }),
+                ],
+            })
+        } else {
+            BatchCond::Ok { step: prev }
+        });
+    }
+    // Roll back when BEGIN succeeded but COMMIT did not, so that the remote does not
+    // keep the transaction open. If no transaction is open any more, ROLLBACK fails,
+    // and the push reports that error instead of success.
+    let commit_step = (sql_over_http_requests.len() - 1) as u32;
+    sql_over_http_requests.push(BatchStep {
+        condition: Some(BatchCond::And(BatchCondList {
+            conds: vec![
+                BatchCond::Ok { step: 0 },
+                BatchCond::Not {
+                    cond: Box::new(BatchCond::Ok { step: commit_step }),
+                },
+            ],
+        })),
+        ..step("ROLLBACK".to_string(), Vec::new())
+    });
 
     tracing::debug!("hrana request: {:?}", sql_over_http_requests);
     let replay_hrana_request = server_proto::PipelineReqBody {
