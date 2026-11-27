@@ -1944,3 +1944,37 @@ fn test_unique_index_probes_in_key_order_do_not_seek_again() {
         "`{sql}`: each probe seeks again: {small:?} -> {large:?}"
     );
 }
+
+/// When every row of a table is hidden, the first rowid allocation in a process reads the
+/// last row (there is none) and then steps forward. The step must not walk all the hidden
+/// rows again from the other end.
+#[test]
+fn test_first_rowid_allocation_reads_hidden_rows_once() {
+    for n in [N, 4 * N] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+            run(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, a)");
+            run(
+                &conn,
+                &format!("INSERT INTO t SELECT value, value FROM generate_series(1, {n})"),
+            );
+            run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+            run(&conn, "DELETE FROM t");
+        }
+        // A new process allocates the first rowid of the table from the table itself.
+        db.restart();
+        let conn = db.connect();
+        let (_, work) = run_measured(&conn, "INSERT INTO t(a) VALUES ('n1')", &[]);
+        let n = n as u64;
+        assert!(
+            work.btree_rows_examined >= n,
+            "the deleted rows are not hidden B-tree rows: {work:?}"
+        );
+        assert!(
+            work.btree_rows_examined <= n + 1 && work.mvcc_entries_examined <= n + 1,
+            "the allocation reads the hidden rows more than once: {work:?}"
+        );
+    }
+}

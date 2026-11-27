@@ -926,6 +926,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     CursorPosition::BeforeFirst if dir == IterationDirection::Backwards => {
                         return Ok(IOResult::Done(()));
                     }
+                    CursorPosition::BeforeFirst | CursorPosition::End
+                        if matches!(self.heads, Heads::NextFromEdge(walk_dir) if walk_dir != dir)
+                            && self.mvcc_rows_epoch() == self.mvcc_peek_epoch =>
+                    {
+                        // The walk from the other edge found no visible row, and nothing
+                        // changed since. NewRowid relies on this when all rows are hidden: it
+                        // reads the last row, finds none, and then steps forward.
+                        self.current_pos = match dir {
+                            IterationDirection::Forwards => CursorPosition::End,
+                            IterationDirection::Backwards => CursorPosition::BeforeFirst,
+                        };
+                        return Ok(IOResult::Done(()));
+                    }
                     CursorPosition::Loaded { .. }
                         if matches!(self.heads, Heads::NextFromEdge(walk_dir) if walk_dir != dir)
                             && self.mvcc_rows_epoch() == self.mvcc_peek_epoch =>
