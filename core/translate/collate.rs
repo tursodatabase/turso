@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use crate::{
     function::ExternalCollation,
     function::ResultType,
-    schema::{Schema, TypeDef},
+    schema::{Column, Schema, TypeDef},
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         catalog::CatalogContext,
@@ -1345,6 +1345,130 @@ fn expr_collation_if_any(
     }
 }
 
+/// Finds the table column that an expression refers to: an `Expr::Column`, or
+/// a column name where expressions are matched by name, as for index
+/// expressions. None when it is not known.
+pub(crate) type ColumnLookup<'a> = dyn Fn(&Expr) -> Option<&'a Column> + 'a;
+
+/// Whether `lhs = rhs` and `rhs = lhs` compare with the same collation by the
+/// rules of [comparison_collation]. They need not: without COLLATE operators
+/// the left column decides, so for `x TEXT` and `y TEXT COLLATE NOCASE`,
+/// `x = y` is false and `y = x` is true when x is 'a' and y is 'A'.
+///
+/// `column` finds the columns of column operands. The answer is false when a
+/// collation that could decide it is not known here: a column that `column`
+/// does not find or a register.
+pub(crate) fn swapped_comparison_keeps_collation(
+    lhs: &Expr,
+    rhs: &Expr,
+    column: &ColumnLookup<'_>,
+) -> bool {
+    // A row value comparison compares its elements pair by pair, and each pair
+    // has its own collation, as in SQLite. So the swap keeps the collation only
+    // when it keeps the collation of every pair. When only one operand is a
+    // row value (the other is a subquery, for example), the pairs are not
+    // known here.
+    match (row_value_elements(lhs), row_value_elements(rhs)) {
+        (Some(lhs), Some(rhs)) => {
+            return lhs.len() == rhs.len()
+                && lhs
+                    .iter()
+                    .zip(rhs)
+                    .all(|(lhs, rhs)| swapped_comparison_keeps_collation(lhs, rhs, column));
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    let lhs_has_collate = has_collate_operator(lhs);
+    if lhs_has_collate != has_collate_operator(rhs) {
+        // The operand with the COLLATE operator decides in both orders.
+        return true;
+    }
+    match (
+        operand_collation(lhs, column),
+        operand_collation(rhs, column),
+    ) {
+        // Without COLLATE operators, an operand without a collation lets the
+        // other operand decide in both orders.
+        (OperandCollation::None, _) | (_, OperandCollation::None) if !lhs_has_collate => true,
+        (OperandCollation::Column(lhs), OperandCollation::Column(rhs)) => lhs == rhs,
+        (OperandCollation::Named(lhs), OperandCollation::Named(rhs)) => {
+            crate::util::normalize_ident(lhs) == crate::util::normalize_ident(rhs)
+        }
+        _ => false,
+    }
+}
+
+/// The elements of a row value such as `(a, b)`, also inside more
+/// parentheses. None when `expr` is not a row value.
+fn row_value_elements(expr: &Expr) -> Option<&[Box<Expr>]> {
+    match expr {
+        Expr::Parenthesized(exprs) if exprs.len() > 1 => Some(exprs),
+        Expr::Parenthesized(exprs) => exprs.first().and_then(|expr| row_value_elements(expr)),
+        _ => None,
+    }
+}
+
+/// The collation of a comparison operand, as far as
+/// [swapped_comparison_keeps_collation] can know it.
+enum OperandCollation<'a> {
+    /// The operand has no collation.
+    None,
+    /// The collation of a table column.
+    Column(TextCollation),
+    /// The collation that a COLLATE operator or a bound parameter names.
+    Named(&'a str),
+    /// The operand has a collation that is not known here.
+    Unknown,
+}
+
+/// The collation of `expr`, found the way [expr_collation_if_any] finds it.
+fn operand_collation<'e>(expr: &'e Expr, column: &ColumnLookup<'_>) -> OperandCollation<'e> {
+    match expr {
+        // Expression indexes are matched with column names in place of
+        // `Expr::Column`.
+        Expr::Column { .. } | Expr::Id(_) | Expr::Qualified(..) | Expr::DoublyQualified(..) => {
+            match column(expr) {
+                Some(column) => column_collation(column)
+                    .map_or(OperandCollation::None, OperandCollation::Column),
+                None => OperandCollation::Unknown,
+            }
+        }
+        Expr::RowId { .. } => OperandCollation::None,
+        Expr::Variable(variable) => variable
+            .col_collation
+            .as_deref()
+            .map_or(OperandCollation::None, OperandCollation::Named),
+        Expr::Register { .. } => OperandCollation::Unknown,
+        Expr::MergedColumn(columns) => {
+            let first_column = columns
+                .first()
+                .expect("a merged column must have at least two source columns");
+            operand_collation(first_column, column)
+        }
+        Expr::Cast { expr, .. } | Expr::Unary(UnaryOperator::Positive, expr) => {
+            operand_collation(expr, column)
+        }
+        Expr::Parenthesized(exprs) => {
+            let first = exprs.first().expect("parentheses must hold an expression");
+            operand_collation(first, column)
+        }
+        Expr::Collate(_, name) => OperandCollation::Named(name.as_str()),
+        _ => {
+            let mut operand_with_collate = None;
+            for_each_operand(expr, &mut |operand| {
+                if operand_with_collate.is_none() && has_collate_operator(operand) {
+                    operand_with_collate = Some(operand);
+                }
+            });
+            match operand_with_collate {
+                Some(operand) => operand_collation(operand, column),
+                None => OperandCollation::None,
+            }
+        }
+    }
+}
+
 /// A column has its declared collation, BINARY when it declares none. A rowid
 /// alias (INTEGER PRIMARY KEY) is the rowid and has none, as in SQLite.
 pub(crate) fn column_collation(column: &crate::schema::Column) -> Option<TextCollation> {
@@ -1353,7 +1477,7 @@ pub(crate) fn column_collation(column: &crate::schema::Column) -> Option<TextCol
 
 /// Whether the expression contains a COLLATE operator outside of a subquery
 /// (SQLite's `EP_Collate` flag).
-fn has_collate_operator(expr: &Expr) -> bool {
+pub(crate) fn has_collate_operator(expr: &Expr) -> bool {
     if matches!(expr, Expr::Collate(..)) {
         return true;
     }

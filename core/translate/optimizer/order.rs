@@ -19,7 +19,7 @@ use crate::{
         },
         planner::{table_mask_from_expr, TableMask},
     },
-    util::exprs_are_equivalent,
+    util::{exprs_are_equivalent, exprs_are_equivalent_with_columns},
 };
 
 use super::{access_method::AccessMethod, cost::index_access_is_unique_point_lookup, join::JoinN};
@@ -822,7 +822,8 @@ fn target_matches_order_column(
         (ColumnTarget::Column(col_no), _) => idx_col.pos_in_table == *col_no,
         (ColumnTarget::Expr(expr), Some(idx_expr)) => {
             let target_expr = unsafe { &**expr };
-            if exprs_are_equivalent(target_expr, idx_expr) {
+            let column = |expr: &ast::Expr| table_ref.column_named_by(expr);
+            if exprs_are_equivalent_with_columns(target_expr, idx_expr, &column) {
                 return true;
             }
             // Expression indexes are compared against the normalized form that
@@ -831,7 +832,7 @@ fn target_matches_order_column(
             // final comparison.
             let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
             let normalized = normalize_expr_for_index_matching(target_expr, table_ref, &refs);
-            exprs_are_equivalent(&normalized, idx_expr)
+            exprs_are_equivalent_with_columns(&normalized, idx_expr, &column)
         }
         _ => false,
     }

@@ -24,7 +24,7 @@ use crate::{
     },
     types::KeyInfo,
     types::SeekOp,
-    util::exprs_are_equivalent,
+    util::{exprs_are_equivalent, exprs_are_equivalent_with_columns},
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
@@ -3790,15 +3790,16 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
+            let column = |expr: &ast::Expr| self.column_named_by(expr);
             let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
+                exprs_are_equivalent_with_columns(idx_where_clause, &usage.normalized_expr, &column)
             } else {
                 false
             };
 
             let index_key_covers_columns = !usage.may_be_null_row
                 && index
-                    .expression_to_index_pos(&usage.normalized_expr)
+                    .expression_to_index_pos(&usage.normalized_expr, &column)
                     .is_some();
             if index_key_covers_columns || matches_where_clause {
                 any_covered = true;
@@ -3823,6 +3824,22 @@ impl JoinedTable {
             if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
                 required_columns.clear(col_idx);
             }
+        }
+    }
+
+    /// The column of this table that `expr` refers to: an `Expr::Column` of
+    /// this table, or a column name, as in the expressions that are matched
+    /// with index expressions.
+    pub(crate) fn column_named_by(&self, expr: &ast::Expr) -> Option<&Column> {
+        match expr {
+            ast::Expr::Column { table, column, .. } if *table == self.internal_id => {
+                self.table.get_column_at(*column)
+            }
+            ast::Expr::Id(name) => self
+                .table
+                .get_column_by_name(name.as_str())
+                .map(|(_, column)| column),
+            _ => None,
         }
     }
 

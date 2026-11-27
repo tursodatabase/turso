@@ -19,7 +19,8 @@ pub fn selected_expression_index<'a>(
     let table = table_references.find_joined_table_by_internal_id(table_id)?;
     let index = table.op.index()?;
     let normalized = normalize_expr_for_index_matching(expr, table, table_references);
-    let expression_position = index.expression_to_index_pos(&normalized)?;
+    let expression_position =
+        index.expression_to_index_pos(&normalized, &|expr| table.column_named_by(expr))?;
     Some((table, index, expression_position))
 }
 

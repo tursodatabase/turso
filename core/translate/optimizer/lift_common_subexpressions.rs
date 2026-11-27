@@ -4,9 +4,9 @@ use crate::{turso_assert, turso_assert_greater_than};
 use crate::{
     translate::{
         expr::{unwrap_parens, unwrap_parens_owned},
-        plan::WhereTerm,
+        plan::{TableReferences, WhereTerm},
     },
-    util::exprs_are_equivalent,
+    util::{exprs_are_equivalent, exprs_are_equivalent_with_columns},
     Result,
 };
 
@@ -19,8 +19,17 @@ use super::AvailableIndexes;
 /// The original `OR` remains because the new filters also accept `(1, 1)`.
 pub(crate) fn rewrite_or_terms(
     where_clause: &mut Vec<WhereTerm>,
+    table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
 ) -> Result<()> {
+    // Lets `x = y` in one branch match `y = x` in another when the columns x
+    // and y have the same collation.
+    let column = |expr: &Expr| match expr {
+        Expr::Column { table, column, .. } => table_references
+            .find_table_by_internal_id(*table)
+            .and_then(|(_, table)| table.get_column_at(*column)),
+        _ => None,
+    };
     let mut term_index = 0;
     while term_index < where_clause.len() {
         if !matches!(
@@ -69,7 +78,7 @@ pub(crate) fn rewrite_or_terms(
             common_terms.retain(|common_expr| {
                 branch
                     .iter()
-                    .any(|expr| exprs_are_equivalent(common_expr, expr))
+                    .any(|expr| exprs_are_equivalent_with_columns(common_expr, expr, &column))
             });
         }
 
@@ -420,7 +429,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         // Should now have 3 terms:
         // 1. (x = 1) OR (y = 1)
@@ -522,7 +535,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         // Should now have 2 terms:
         // 1. (x = 1) OR (y = 1) OR (z = 1)
@@ -589,7 +606,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         // Should remain unchanged since no common terms
         let nonconsumed_terms = where_clause
@@ -655,7 +676,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -706,7 +731,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         // Should remain unchanged
         let nonconsumed_terms = where_clause
@@ -755,7 +784,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -784,7 +817,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         assert_eq!(where_clause.len(), 1);
         assert_eq!(where_clause[0].expr, or_expr);
@@ -810,7 +847,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         assert_eq!(where_clause.len(), 3);
         assert_eq!(where_clause[0].expr, or_expr);
@@ -845,7 +886,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         assert_eq!(where_clause.len(), 2);
         assert!(!where_clause
@@ -870,7 +915,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         assert_eq!(where_clause.len(), 2);
         assert_eq!(where_clause[1].origin, where_clause[0].origin);
@@ -890,7 +939,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         assert_eq!(where_clause.len(), 2);
         assert_eq!(where_clause[1].origin, where_clause[0].origin);
@@ -920,7 +973,11 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &TableReferences::new_empty(),
+            &AvailableIndexes::default(),
+        )?;
 
         assert_eq!(where_clause.len(), 1);
         Ok(())
