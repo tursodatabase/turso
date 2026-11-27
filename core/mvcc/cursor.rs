@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions, SortableIndexKey,
-    create_seek_range,
+    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
+    SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -15,12 +15,12 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp, SeekResult, Value,
-    ValueRef, compare_immutable,
+    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
+    SeekResult, Value, ValueRef,
 };
+use crate::vdbe::metrics::{cursor_work, new_cursor_work_handle, CursorWorkHandle, CursorWorkRef};
 use crate::vdbe::Register;
-use crate::vdbe::metrics::{CursorWorkHandle, CursorWorkRef, cursor_work, new_cursor_work_handle};
-use crate::{Completion, Connection, LimboError, Pager, Result, return_if_io};
+use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -81,6 +81,9 @@ enum AdvanceBtreeState {
 /// operations we can use the same enum for both.
 enum RewindState {
     Advance,
+    /// The B-tree side has moved. Move it again if a savepoint rollback ran
+    /// during the move, then take the MVCC peek.
+    Finish,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -636,6 +639,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// type, read before the MVCC peek was taken.
     /// See [`Self::reseek_mvcc_if_rows_changed`].
     mvcc_peek_epoch: u64,
+    /// [`MvStore::rollback_to_epoch`] read when the B-tree peek was last
+    /// checked. See [`Self::reposition_btree_if_rows_restored`].
+    btree_peek_epoch: u64,
     /// The work counters of the statement that opened the cursor.
     /// See [`crate::vdbe::metrics::CursorWork`].
     work: CursorWorkHandle,
@@ -683,6 +689,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         } else {
             db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
         };
+        let btree_peek_epoch = db.rollback_to_epoch();
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
@@ -709,6 +716,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
+            btree_peek_epoch,
             work: new_cursor_work_handle(),
         })
     }
@@ -1021,6 +1029,63 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         Ok(true)
     }
 
+    /// Moves the B-tree side again, from the current position, if a savepoint
+    /// rollback ran since the B-tree peek was last checked. To reach its peek,
+    /// the B-tree side skipped the rows that MVCC versions hid, possibly before
+    /// a stop for I/O or in an earlier step. The rollback can undo a delete or
+    /// an update of this cursor's own transaction and make such a row visible
+    /// again.
+    fn reposition_btree_if_rows_restored(&mut self, dir: IterationDirection) -> IOResultOr<()> {
+        loop {
+            // The B-tree peek stays uninitialized until the move is done. A
+            // move can stop for I/O before it records any state of its own,
+            // for example in the first seek or rewind of the B-tree cursor.
+            if !self.dual_peek.btree_uninitialized() {
+                if !self.rows_restored_since_btree_peek() {
+                    return Ok(IOResult::Done(()));
+                }
+                self.dual_peek.btree_peek = CursorPeek::Uninitialized;
+            }
+            match (&self.current_pos, dir) {
+                (CursorPosition::BeforeFirst, IterationDirection::Forwards) => {
+                    return_if_io!(self.advance_btree_forward());
+                }
+                (CursorPosition::End, IterationDirection::Backwards) => {
+                    return_if_io!(self.advance_btree_backward());
+                }
+                (CursorPosition::Loaded { row_id, .. }, _) => {
+                    let current_key = row_id.row_id.clone();
+                    let seek_key = match &current_key {
+                        RowKey::Int(rowid) => SeekKey::TableRowId(*rowid),
+                        RowKey::Record(record) => SeekKey::IndexKey(record.key.clone()),
+                    };
+                    let op = match dir {
+                        IterationDirection::Forwards => SeekOp::GT,
+                        IterationDirection::Backwards => SeekOp::LT,
+                    };
+                    return_if_io!(self.seek_btree_and_set_peek(seek_key, op));
+                }
+                (pos, dir) => {
+                    panic!("B-tree side moved {dir:?} from the end of the scan: {pos:?}");
+                }
+            }
+        }
+    }
+
+    /// Whether a savepoint rollback ran since the B-tree peek was last
+    /// checked. If one ran, the B-tree side must move again: this resets what
+    /// the B-tree side keeps of its last move.
+    fn rows_restored_since_btree_peek(&mut self) -> bool {
+        let epoch = self.db.rollback_to_epoch();
+        if epoch == self.btree_peek_epoch {
+            return false;
+        }
+        self.btree_peek_epoch = epoch;
+        // The forward scan is monotonic, and the B-tree side can move back.
+        self.index_shadow_scan.reset();
+        true
+    }
+
     fn mvcc_rows_epoch(&self) -> u64 {
         match self.mv_cursor_type {
             MvccCursorType::Table => self.db.table_rows_epoch(),
@@ -1302,6 +1367,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
         self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+        self.btree_peek_epoch = self.db.rollback_to_epoch();
         self.eq_seek_row = None;
         // The forward scan is monotonic; a reposition invalidates it.
         self.index_shadow_scan.reset();
@@ -1446,26 +1512,24 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
+            self.current_pos = CursorPosition::End;
             self.state
                 .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
         }
 
-        turso_assert!(
-            matches!(
+        match self.state {
+            Some(MvccLazyCursorState::Rewind(RewindState::Advance)) => {
+                // Initialize btree cursor to last position
+                return_if_io!(self.advance_btree_backward());
                 self.state
-                    .as_ref()
-                    .expect("rewind state is not initialized"),
-                MvccLazyCursorState::Rewind(RewindState::Advance)
-            ),
-            "invalid last state",
-            { "state": format!("{:?}", self.state) }
-        );
-
-        // Initialize btree cursor to last position
-        return_if_io!(self.advance_btree_backward());
+                    .replace(MvccLazyCursorState::Rewind(RewindState::Finish));
+            }
+            Some(MvccLazyCursorState::Rewind(RewindState::Finish)) => {}
+            _ => panic!("invalid last state: {:?}", self.state),
+        }
+        return_if_io!(self.reposition_btree_if_rows_restored(IterationDirection::Backwards));
 
         self.invalidate_record();
-        self.current_pos = CursorPosition::End;
 
         // Initialize MVCC iterator to last position
         match &self.mv_cursor_type {
@@ -1539,13 +1603,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccLazyCursorState::Next(NextState::AdvanceUnitialized)
         ) {
             return_if_io!(self.advance_btree_forward());
-            // Initialize MVCC iterator and get first peek, after the B-tree
-            // advance, for the reason given at the end of this function.
             self.mvcc_peek_epoch = self.mvcc_rows_epoch();
             self.init_mvcc_iterator_forward()?;
-            self.advance_mvcc_iterator();
+            // The first MVCC peek is taken below, with the merge.
             self.state
-                .replace(MvccLazyCursorState::Next(NextState::CheckNeedsAdvance));
+                .replace(MvccLazyCursorState::Next(NextState::Advance {
+                    mvcc: true,
+                    btree: false,
+                }));
         }
 
         if matches!(
@@ -1599,9 +1664,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         };
         if btree {
             return_if_io!(self.advance_btree_forward());
+            self.state
+                .replace(MvccLazyCursorState::Next(NextState::Advance {
+                    mvcc,
+                    btree: false,
+                }));
         }
+        return_if_io!(self.reposition_btree_if_rows_restored(IterationDirection::Forwards));
         // The MVCC side moves after the B-tree side, in the same call as the
-        // merge of the two peeks. The B-tree advance can stop for I/O, and
+        // merge of the two peeks. The B-tree side can stop for I/O, and
         // during the stop this connection can change MVCC rows, for example
         // with ROLLBACK TO. An MVCC peek taken before the stop can be a row
         // that is gone.
@@ -1698,7 +1769,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         };
         if btree {
             return_if_io!(self.advance_btree_backward());
+            self.state
+                .replace(MvccLazyCursorState::Prev(PrevState::Advance {
+                    mvcc,
+                    btree: false,
+                }));
         }
+        return_if_io!(self.reposition_btree_if_rows_restored(IterationDirection::Backwards));
         // The MVCC side moves after the B-tree side, as in next().
         let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Backwards)?;
         if mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
@@ -1854,6 +1931,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::PickWinner, direction)) => {
+                    // The B-tree seek skipped the rows that MVCC versions hid. If it
+                    // stopped for I/O, a savepoint rollback during the stop can make
+                    // one of these rows visible again.
+                    if self.rows_restored_since_btree_peek() {
+                        self.dual_peek.btree_peek = CursorPeek::Uninitialized;
+                        self.state
+                            .replace(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction));
+                        continue;
+                    }
                     // The MVCC seek runs after the B-tree seek, in the same call as
                     // the merge of the two peeks. The B-tree seek can stop for I/O,
                     // and during the stop the connection can change MVCC rows, for
@@ -2373,25 +2459,24 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
+            self.current_pos = CursorPosition::BeforeFirst;
             self.state
                 .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
         }
 
-        turso_assert!(
-            matches!(
+        match self.state {
+            Some(MvccLazyCursorState::Rewind(RewindState::Advance)) => {
+                // First run btree_cursor rewind so that we don't need a explicit state machine.
+                return_if_io!(self.advance_btree_forward());
                 self.state
-                    .as_ref()
-                    .expect("rewind state is not initialized"),
-                MvccLazyCursorState::Rewind(RewindState::Advance)
-            ),
-            "invalid rewind state",
-            { "state": format!("{:?}", self.state) }
-        );
-        // First run btree_cursor rewind so that we don't need a explicit state machine.
-        return_if_io!(self.advance_btree_forward());
+                    .replace(MvccLazyCursorState::Rewind(RewindState::Finish));
+            }
+            Some(MvccLazyCursorState::Rewind(RewindState::Finish)) => {}
+            _ => panic!("invalid rewind state: {:?}", self.state),
+        }
+        return_if_io!(self.reposition_btree_if_rows_restored(IterationDirection::Forwards));
 
         self.invalidate_record();
-        self.current_pos = CursorPosition::BeforeFirst;
 
         // Initialize MVCC iterators for rewind operation; in practice there is only one of these
         // depending on the cursor type, so we should at some point refactor the iterator thing to be

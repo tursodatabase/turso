@@ -10,6 +10,7 @@ use super::checkpoint::{
 };
 use super::test_db::MvccTestDbNoConn;
 use super::transactions::{generate_simple_string_row, get_record_value, write_synthetic_row};
+use crate::queued_io::QueuedIo;
 use crate::unreliable_io::UnreliableIo;
 use rand::Rng;
 use rand::SeedableRng;
@@ -73,7 +74,8 @@ use turso_core::StatementStatusCounter;
 use turso_core::TransactionMode;
 use turso_core::ValueRef;
 use turso_core::{
-    CheckpointMode, ConnectOpts, Connection, LimboError, SessionRole, StepResult, Value,
+    CheckpointMode, ConnectOpts, Connection, LimboError, OpenOptions, SessionRole, StepResult,
+    Value,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -7023,6 +7025,337 @@ fn test_scan_stopped_inside_step_follows_rollback_to() {
             }
         }
         assert_eq!(ids, expected, "{scan_sql} {point:?}");
+    }
+}
+
+/// Yields at the `hit`-th time a cursor reaches `point`, and never again.
+#[derive(Debug)]
+struct YieldAtHit {
+    point: YieldPoint,
+    hits_left: AtomicU64,
+}
+
+impl YieldAtHit {
+    fn new(point: CursorYieldPoint, hit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            point: point.point(),
+            hits_left: AtomicU64::new(hit),
+        })
+    }
+}
+
+impl YieldInjector for YieldAtHit {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        point == self.point && self.hits_left.fetch_sub(1, Ordering::Relaxed) == 1
+    }
+}
+
+/// A scan must return a B-tree row whose delete or update a `ROLLBACK TO`
+/// undoes, when the scan skipped the row as hidden before the rollback but has
+/// not returned a row past it. The rollback runs on the same connection, during
+/// a stop of the scan inside a step at the `hit`-th `point`, or between two
+/// steps when `stop` is `None`. Rows 10, 30 and 50 are in the B-tree, and the
+/// transaction inserts row 20 before `SAVEPOINT s`.
+#[test]
+fn test_scan_returns_btree_row_that_rollback_to_restores() {
+    use CursorYieldPoint::*;
+    for (scan_sql, write, rows_before_write, rows_before_stop, stop, expected) in [
+        // The step after row 10 skips 30 and moves to 50, then stops.
+        (
+            "SELECT id FROM t NOT INDEXED",
+            "DELETE FROM t WHERE id = 30",
+            0,
+            1,
+            Some((AdvanceBtreeForwardProgress, 3)),
+            vec![10, 20, 30, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            "DELETE FROM t WHERE id = 30",
+            0,
+            1,
+            Some((AdvanceBtreeForwardProgress, 3)),
+            vec![10, 20, 30, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            "UPDATE t SET k = 2 WHERE id = 30",
+            0,
+            1,
+            Some((AdvanceBtreeForwardProgress, 3)),
+            vec![10, 20, 30, 50],
+        ),
+        (
+            "SELECT id FROM t NOT INDEXED ORDER BY id DESC",
+            "DELETE FROM t WHERE id = 30",
+            0,
+            1,
+            Some((AdvanceBtreeBackwardProgress, 3)),
+            vec![50, 30, 20, 10],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1 ORDER BY id DESC",
+            "UPDATE t SET k = 2 WHERE id = 30",
+            0,
+            1,
+            Some((AdvanceBtreeBackwardProgress, 3)),
+            vec![50, 30, 20, 10],
+        ),
+        // The seek of the first step skips 30 and moves to 50, then stops.
+        (
+            "SELECT id FROM t NOT INDEXED WHERE id > 20",
+            "DELETE FROM t WHERE id = 30",
+            0,
+            0,
+            Some((SeekBtreeProgress, 2)),
+            vec![30, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            "DELETE FROM t WHERE id = 10",
+            0,
+            0,
+            Some((SeekBtreeProgress, 2)),
+            vec![10, 20, 30, 50],
+        ),
+        // The rewind or last of the first step skips the first row, then stops.
+        (
+            "SELECT id FROM t NOT INDEXED",
+            "DELETE FROM t WHERE id = 10",
+            0,
+            0,
+            Some((AdvanceBtreeForwardProgress, 2)),
+            vec![10, 20, 30, 50],
+        ),
+        (
+            "SELECT id FROM t NOT INDEXED ORDER BY id DESC",
+            "DELETE FROM t WHERE id = 50",
+            0,
+            0,
+            Some((AdvanceBtreeBackwardProgress, 2)),
+            vec![50, 30, 20, 10],
+        ),
+        // Row 30 is deleted after the scan returns 20. The next step finds
+        // that its B-tree peek, 30, is hidden, then stops before it moves on.
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            "DELETE FROM t WHERE id = 30",
+            2,
+            2,
+            Some((NextBtreeAdvance, 1)),
+            vec![10, 20, 30, 50],
+        ),
+        // The step that returns 20 skips the deleted row after it. The
+        // rollback runs before the next step.
+        (
+            "SELECT id FROM t NOT INDEXED",
+            "DELETE FROM t WHERE id = 30",
+            0,
+            2,
+            None,
+            vec![10, 20, 30, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1 ORDER BY id DESC",
+            "DELETE FROM t WHERE id = 10",
+            0,
+            3,
+            None,
+            vec![50, 30, 20, 10],
+        ),
+    ] {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_k ON t(k)").unwrap();
+        conn.execute("INSERT INTO t VALUES (10,1),(30,1),(50,1)")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (20,1)").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+
+        let mut scan = conn.prepare(scan_sql).unwrap();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut written = false;
+        let mut rolled_back = false;
+        loop {
+            if !written && ids.len() == rows_before_write {
+                conn.execute(write).unwrap();
+                written = true;
+            }
+            if !rolled_back && ids.len() == rows_before_stop {
+                if let Some((point, hit)) = stop {
+                    conn.set_yield_injector(Some(YieldAtHit::new(point, hit)));
+                    let result = scan.step().unwrap();
+                    conn.set_yield_injector(None);
+                    assert!(
+                        matches!(result, StepResult::Yield),
+                        "{scan_sql} {write} {stop:?}: {result:?}"
+                    );
+                }
+                conn.execute("ROLLBACK TO s").unwrap();
+                rolled_back = true;
+            }
+            match scan.step().unwrap() {
+                StepResult::Row => ids.push(scan.row().unwrap().get::<i64>(0).unwrap()),
+                StepResult::IO => scan.get_pager().io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        assert!(rolled_back, "{scan_sql} {write} {stop:?}");
+        assert_eq!(ids, expected, "{scan_sql} {write} {stop:?}");
+    }
+}
+
+/// When a scan moves its B-tree side again after a `ROLLBACK TO`, that move
+/// can also skip a hidden row and stop for I/O. A second `ROLLBACK TO` during
+/// this stop must make the scan move its B-tree side once more.
+#[test]
+fn test_scan_follows_rollback_to_during_btree_reposition() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (10,1),(30,1),(50,1)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (20,1)").unwrap();
+    conn.execute("SAVEPOINT a").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 30").unwrap();
+    conn.execute("SAVEPOINT b").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 50").unwrap();
+
+    let mut scan = conn.prepare("SELECT id FROM t NOT INDEXED").unwrap();
+    let mut ids: Vec<i64> = Vec::new();
+    let mut rolled_back = false;
+    loop {
+        if !rolled_back && ids == [10, 20] {
+            rolled_back = true;
+            // The step that returned 20 skipped 30 and 50. This rollback
+            // restores 50.
+            conn.execute("ROLLBACK TO b").unwrap();
+            // The next step seeks the B-tree side past 20. The seek skips 30,
+            // which is still hidden, then stops.
+            conn.set_yield_injector(Some(YieldAtHit::new(
+                CursorYieldPoint::SeekBtreeProgress,
+                2,
+            )));
+            let result = scan.step().unwrap();
+            conn.set_yield_injector(None);
+            assert!(matches!(result, StepResult::Yield), "{result:?}");
+            // This rollback restores 30.
+            conn.execute("ROLLBACK TO a").unwrap();
+        }
+        match scan.step().unwrap() {
+            StepResult::Row => ids.push(scan.row().unwrap().get::<i64>(0).unwrap()),
+            StepResult::IO => scan.get_pager().io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    assert_eq!(ids, vec![10, 20, 30, 50]);
+}
+
+/// When a scan moves its B-tree side again after a `ROLLBACK TO`, the seek of
+/// that move can stop for I/O. The next step must finish the seek and not use
+/// a B-tree side that has no position. Each B-tree leaf holds few rows, and the
+/// transaction deletes rows 11 to 49. The scan returns 10, then stops while it
+/// skips the deleted rows. During the stop, a `ROLLBACK TO` undoes a write to
+/// another table, and the leaves that the scan skipped leave the page cache.
+/// The seek past row 10 then reads them again.
+#[test]
+fn test_scan_finishes_btree_reposition_that_stops_for_io() {
+    use CursorYieldPoint::*;
+    for (scan_sql, point, expected) in [
+        (
+            "SELECT id FROM t NOT INDEXED WHERE k = 1",
+            AdvanceBtreeForwardProgress,
+            vec![10, 50],
+        ),
+        (
+            "SELECT id FROM t NOT INDEXED WHERE k = 1 ORDER BY id DESC",
+            AdvanceBtreeBackwardProgress,
+            vec![50, 10],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1",
+            AdvanceBtreeForwardProgress,
+            vec![10, 50],
+        ),
+        (
+            "SELECT id FROM t INDEXED BY t_k WHERE k = 1 ORDER BY pad DESC",
+            AdvanceBtreeBackwardProgress,
+            vec![50, 10],
+        ),
+    ] {
+        // `QueuedIo` completes a read only in `io.step()`, so a read of a page
+        // that is not in the page cache stops the step.
+        let io = Arc::new(QueuedIo::new());
+        let db = Database::open(
+            io.clone(),
+            "scan-reposition-io.db",
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, pad TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_k ON t(k, pad)").unwrap();
+        conn.execute("CREATE TABLE u(x)").unwrap();
+        conn.execute(
+            "INSERT INTO t SELECT value, 1, printf('%.3000d', value) \
+             FROM generate_series(10, 50)",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM t WHERE id BETWEEN 11 AND 49")
+            .unwrap();
+
+        let mut scan = conn.prepare(scan_sql).unwrap();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut stopped = false;
+        loop {
+            if !stopped && ids.len() == 1 {
+                stopped = true;
+                conn.set_yield_injector(Some(YieldAtHit::new(point, 20)));
+                let result = loop {
+                    match scan.step().unwrap() {
+                        StepResult::IO => io.step().unwrap(),
+                        result => break result,
+                    }
+                };
+                conn.set_yield_injector(None);
+                assert!(
+                    matches!(result, StepResult::Yield),
+                    "{scan_sql}: {result:?}"
+                );
+                conn.execute("SAVEPOINT s").unwrap();
+                conn.execute("INSERT INTO u VALUES (1)").unwrap();
+                conn.execute("ROLLBACK TO s").unwrap();
+                conn.get_pager().test_evict_all_unpinned_clean();
+            }
+            match scan.step().unwrap() {
+                StepResult::Row => ids.push(scan.row().unwrap().get::<i64>(0).unwrap()),
+                StepResult::IO => io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        assert_eq!(ids, expected, "{scan_sql}");
     }
 }
 
