@@ -215,6 +215,8 @@ forms; the first schema of `search_path` that exists), `current_schemas(boolean)
 `obj_description()`/`col_description()` read `pg_description`; `obj_description()`
 knows the catalogs `pg_class` and `pg_namespace` and returns NULL for any other.
 A call of either in a column DEFAULT, a CHECK constraint or an index, or with an aggregate or window function in an argument, is rejected with 0A000.
+`pg_table_is_visible(oid)` checks the current search path and name shadowing,
+including the implicit position of `pg_catalog`, and returns NULL for an unknown OID.
 DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,

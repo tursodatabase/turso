@@ -2799,3 +2799,64 @@ expect {
     dep_base|n
     dep_other|n
 }
+
+test pg-table-is-visible-missing-oid {
+    SELECT pg_table_is_visible(0), pg_table_is_visible(NULL);
+}
+expect {
+    |
+}
+
+test pg-table-is-visible-search-path {
+    CREATE SCHEMA visible_first;
+    CREATE SCHEMA visible_second;
+    CREATE TABLE visible_first.same_name (x int);
+    CREATE VIEW visible_second.same_name AS SELECT 1 AS x;
+    CREATE VIEW visible_second.other_name AS SELECT 2 AS x;
+    SET search_path = missing_schema, visible_first, visible_second;
+    SELECT n.nspname, c.relname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('visible_first', 'visible_second')
+    ORDER BY 1, 2;
+    SET search_path = visible_second;
+    SELECT n.nspname, c.relname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('visible_first', 'visible_second')
+    ORDER BY 1, 2;
+}
+expect {
+    visible_first|same_name|t
+    visible_second|other_name|t
+    visible_second|same_name|f
+    visible_first|same_name|f
+    visible_second|other_name|t
+    visible_second|same_name|t
+}
+
+test pg-table-is-visible-catalog-search-path {
+    CREATE VIEW public.pg_class AS SELECT 1 AS x;
+    SELECT n.nspname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'pg_class' ORDER BY 1;
+    SET search_path = public, pg_catalog;
+    SELECT n.nspname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'pg_class' ORDER BY 1;
+    SET search_path = '';
+    SELECT n.nspname, pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'pg_class' ORDER BY 1;
+}
+expect {
+    pg_catalog|t
+    public|f
+    pg_catalog|f
+    public|t
+    pg_catalog|t
+    public|f
+}
