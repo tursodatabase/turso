@@ -746,7 +746,7 @@ pub(crate) fn regclass_oid(
         if let Some(oid) = listed {
             return Ok(oid);
         }
-        if let Some(&(_, oid)) = CATALOG_TABLE_OIDS.iter().find(|(table, _)| *table == name) {
+        if let Some(oid) = catalog_oid_by_name(name) {
             return Ok(oid);
         }
     }
@@ -786,11 +786,8 @@ pub(crate) fn regclass_text(conn: &Connection, oid: i64) -> String {
         return oid.to_string();
     };
     let Some(relation) = catalog.get_by_oid(oid) else {
-        return match CATALOG_TABLE_OIDS
-            .iter()
-            .find(|(_, table_oid)| *table_oid == oid)
-        {
-            Some(&(name, _)) => name.to_string(),
+        return match catalog_name_by_oid(oid) {
+            Some(name) => name.to_string(),
             None => oid.to_string(),
         };
     };
@@ -802,9 +799,7 @@ pub(crate) fn regclass_text(conn: &Connection, oid: i64) -> String {
     let hides_catalog = catalog
         .get_by_relname(NamespaceId::ROOT, &relation.relname)
         .is_some()
-        || CATALOG_TABLE_OIDS
-            .iter()
-            .any(|(name, _)| *name == relation.relname);
+        || catalog_oid_by_name(&relation.relname).is_some();
     if hides_catalog {
         return format!(
             "{}.{}",
@@ -827,58 +822,22 @@ pub(crate) fn regclass_oid_of_text(conn: &Arc<Connection>, text: &str) -> Result
     }
 }
 
-/// FIXME(pg-catalog): These oids were copied by hand from the pg_class of
-/// PostgreSQL 18. When pg_class lists these catalogs, its rows replace them.
-/// The catalog tables that this frontend does not implement, with the oid
-/// that PostgreSQL gives each. The implemented ones have their oid in
-/// `BUILTIN_CATALOGS`, which pg_class lists.
-const CATALOG_TABLE_OIDS: &[(&str, i64)] = &[
-    ("pg_aggregate", 2600),
-    ("pg_amop", 2602),
-    ("pg_amproc", 2603),
-    ("pg_authid", 1260),
-    ("pg_collation", 3456),
-    ("pg_conversion", 2607),
-    ("pg_db_role_setting", 2964),
-    ("pg_default_acl", 826),
-    ("pg_enum", 3501),
-    ("pg_event_trigger", 3466),
-    ("pg_extension", 3079),
-    ("pg_foreign_data_wrapper", 2328),
-    ("pg_foreign_server", 1417),
-    ("pg_foreign_table", 3118),
-    ("pg_inherits", 2611),
-    ("pg_init_privs", 3394),
-    ("pg_largeobject", 2613),
-    ("pg_largeobject_metadata", 2995),
-    ("pg_opclass", 2616),
-    ("pg_opfamily", 2753),
-    ("pg_parameter_acl", 6243),
-    ("pg_partitioned_table", 3350),
-    ("pg_publication", 6104),
-    ("pg_publication_namespace", 6237),
-    ("pg_publication_rel", 6106),
-    ("pg_range", 3541),
-    ("pg_replication_origin", 6000),
-    ("pg_seclabel", 3596),
-    ("pg_shdepend", 1214),
-    ("pg_shdescription", 2396),
-    ("pg_shseclabel", 3592),
-    ("pg_statistic", 2619),
-    ("pg_statistic_ext", 3381),
-    ("pg_statistic_ext_data", 3429),
-    ("pg_subscription", 6100),
-    ("pg_subscription_rel", 6102),
-    ("pg_tablespace", 1213),
-    ("pg_transform", 3576),
-    ("pg_trigger", 2620),
-    ("pg_ts_config", 3602),
-    ("pg_ts_config_map", 3603),
-    ("pg_ts_dict", 3600),
-    ("pg_ts_parser", 3601),
-    ("pg_ts_template", 3764),
-    ("pg_user_mapping", 1418),
-];
+/// The oid of the PostgreSQL catalog `name`, from the catalogs of
+/// turso_pg_catalog, for a catalog that pg_class does not list.
+fn catalog_oid_by_name(name: &str) -> Option<i64> {
+    turso_pg_catalog::BUILTIN_CATALOGS
+        .iter()
+        .find(|catalog| catalog.name == name)
+        .map(|catalog| i64::from(catalog.oid))
+}
+
+/// The name of the PostgreSQL catalog with the oid `oid`.
+fn catalog_name_by_oid(oid: i64) -> Option<&'static str> {
+    turso_pg_catalog::BUILTIN_CATALOGS
+        .iter()
+        .find(|catalog| i64::from(catalog.oid) == oid)
+        .map(|catalog| catalog.name)
+}
 
 /// Build a mapping from namespace and table name to OID for all user tables.
 fn table_oid_map(schema: &Schema) -> HashMap<(NamespaceId, String), i64> {
@@ -4812,18 +4771,6 @@ mod tests {
     use tempfile::tempdir;
     use turso_core::{ConnectOpts, SessionRole};
     use turso_sqlite::SqliteDialect;
-
-    #[test]
-    fn catalog_table_oids_leave_out_the_implemented_catalogs() {
-        for (name, oid) in CATALOG_TABLE_OIDS {
-            assert!(
-                BUILTIN_CATALOGS
-                    .iter()
-                    .all(|&(builtin_oid, builtin, _, _)| builtin != *name && builtin_oid != *oid),
-                "{name} is implemented: its oid comes from BUILTIN_CATALOGS"
-            );
-        }
-    }
 
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.
