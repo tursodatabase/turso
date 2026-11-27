@@ -24,6 +24,12 @@ setup date_index_table {
     CREATE INDEX dx_d ON dx (d);
 }
 
+setup like_index_table {
+    CREATE TABLE users (id int PRIMARY KEY, age int, name text);
+    INSERT INTO users VALUES (1, 3, 'John'), (2, 3, 'Mary'), (3, 4, 'Jane');
+    CREATE INDEX users_age ON users (age) WHERE name LIKE 'J%';
+}
+
 setup dml_items {
     CREATE TABLE items (id int primary key, value int);
     INSERT INTO items VALUES (1, 10);
@@ -55,6 +61,22 @@ test explain-uses-the-index-of-a-date-column-for-a-cast-to-date {
 expect {
     1|0|0|SEARCH dx USING COVERING INDEX dx_d (d=?)
     2
+}
+
+@setup like_index_table
+test explain-uses-a-partial-index-with-a-like-predicate {
+    EXPLAIN SELECT id FROM users WHERE age = 3 AND name LIKE 'J%';
+}
+expect {
+    1|0|0|SEARCH users USING COVERING INDEX users_age (age=?)
+}
+
+@setup like_index_table
+test explain-scans-when-the-like-predicate-differs {
+    EXPLAIN SELECT id FROM users WHERE age = 3 AND name LIKE 'K%';
+}
+expect {
+    1|0|0|SCAN users
 }
 
 @setup dml_items

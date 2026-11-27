@@ -1516,21 +1516,22 @@ expect {
 }
 
 @setup like_strings
-@skip-if postgres "Turso can only index LIKE with a string-literal pattern, which it turns into GLOB"
-test like-with-computed-pattern-in-index-errors {
-    CREATE INDEX t_like_computed ON t (id) WHERE s LIKE 'a' || '%';
+test like-with-computed-pattern-in-index {
+    CREATE INDEX t_like_computed ON t (id) WHERE s LIKE 'Ab' || '%';
+    SELECT id FROM t WHERE s LIKE 'Ab' || '%' ORDER BY id;
 }
-expect error {
-    CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern
+expect {
+    2
 }
 
 @setup like_strings
-@skip-if postgres "Turso can only index LIKE with a string-literal pattern, which it turns into GLOB"
+@skip-if postgres "Turso does not support LIKE with ESCAPE in an index"
 test like-with-escape-clause-in-index-errors {
     CREATE INDEX t_like_escape ON t (id) WHERE s LIKE 'a#_c' ESCAPE '#';
 }
+@sqlstate 0A000
 expect error {
-    CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern
+    CREATE INDEX does not support LIKE with ESCAPE
 }
 
 test ilike-pattern-ending-with-escape-errors {

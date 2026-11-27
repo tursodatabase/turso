@@ -781,7 +781,7 @@ expect {
     799
 }
 expect @tursopg {
-    231
+    233
 }
 
 # pg_proc of tursopg does not have the functions of PostgreSQL under their

@@ -4742,42 +4742,25 @@ impl PostgreSQLTranslator {
         };
         let lhs = fold_case(self.translate_operand(lexpr)?);
 
-        // A literal pattern becomes GLOB, a core operator that also works in
-        // index expressions, where frontend functions such as textlike() cannot.
-        if let Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
-            val: Some(pg_query::protobuf::a_const::Val::Sval(pattern)),
-            ..
-        })) = &rexpr.node
+        // The dialect chooses the function that runs `~~` for the types of the
+        // operands: SQLite's own LIKE ignores case and has no default escape
+        // character.
+        let rhs = self.translate_operand(rexpr)?;
+        if self.translating_index.get()
+            && matches!(&rhs, ast::Expr::FunctionCall { name, .. } if name.as_str().eq_ignore_ascii_case("like_escape"))
         {
-            if let Some(glob) = like_pattern_to_glob(&pattern.sval) {
-                return Ok(ast::Expr::Like {
-                    lhs: Box::new(lhs),
-                    not,
-                    op: ast::LikeOperator::Glob,
-                    rhs: Box::new(fold_case(ast::Expr::Literal(ast::Literal::String(
-                        format!("'{}'", glob.replace('\'', "''")),
-                    )))),
-                    escape: None,
-                });
-            }
-        }
-
-        if self.translating_index.get() {
-            return Err(ParseError::sqlstate(SQLSTATE_FEATURE_NOT_SUPPORTED,
-                "CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern that does not use ESCAPE or end with the escape character".to_string(),
+            return Err(ParseError::sqlstate(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "CREATE INDEX does not support LIKE with ESCAPE".to_string(),
             ));
         }
-
-        // SQLite's LIKE ignores case and has no default escape character, so
-        // other PostgreSQL LIKE patterns run through the frontend's textlike() function.
-        let call = function_call(
-            "textlike",
-            vec![lhs, fold_case(self.translate_operand(rexpr)?)],
-        );
-        Ok(if not {
-            ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(call))
-        } else {
-            call
+        let rhs = fold_case(rhs);
+        Ok(ast::Expr::Like {
+            lhs: Box::new(lhs),
+            not,
+            op: ast::LikeOperator::Like,
+            rhs: Box::new(rhs),
+            escape: None,
         })
     }
 
@@ -10606,43 +10589,6 @@ fn exact_name(name: impl Into<String>) -> ast::Name {
     ast::Name::exact(name.into())
 }
 
-/// SQLite's default SQLITE_MAX_LIKE_PATTERN_LENGTH, which core enforces on
-/// GLOB patterns.
-const SQLITE_MAX_LIKE_PATTERN_LENGTH: usize = 50000;
-
-/// PostgreSQL's LIKE is case-sensitive like GLOB. `%` and `_` become `*` and
-/// `?`, and a character escaped with `\` or special to GLOB is matched literally.
-/// Returns None when GLOB cannot express the pattern: it ends with the escape
-/// character, which is an error only once matching reaches it, or it grows past
-/// SQLite's pattern length limit because each literal `*`, `?` and `[` takes
-/// three bytes in GLOB.
-fn like_pattern_to_glob(pattern: &str) -> Option<String> {
-    let mut glob = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        let literal = match c {
-            '%' => {
-                glob.push('*');
-                continue;
-            }
-            '_' => {
-                glob.push('?');
-                continue;
-            }
-            '\\' => chars.next()?,
-            c => c,
-        };
-        if matches!(literal, '*' | '?' | '[') {
-            glob.push('[');
-            glob.push(literal);
-            glob.push(']');
-        } else {
-            glob.push(literal);
-        }
-    }
-    (glob.len() <= SQLITE_MAX_LIKE_PATTERN_LENGTH).then_some(glob)
-}
-
 /// The pattern and ESCAPE string of a SIMILAR TO, when both are string
 /// literals. pg_query passes them as the arguments of
 /// similar_to_escape(pattern[, escape]); without ESCAPE, `\` is the escape.
@@ -11974,15 +11920,15 @@ mod tests {
         let ast::Expr::Like {
             lhs,
             not: false,
-            op: ast::LikeOperator::Glob,
+            op: ast::LikeOperator::Like,
             rhs,
             escape: None,
         } = &where_expr
         else {
-            panic!("Expected GLOB expression but got: {where_expr:?}");
+            panic!("Expected LIKE expression but got: {where_expr:?}");
         };
         assert!(matches!(**lhs, ast::Expr::Id(_)));
-        assert!(matches!(&**rhs, ast::Expr::Literal(ast::Literal::String(p)) if p == "'John*'"));
+        assert!(matches!(&**rhs, ast::Expr::Literal(ast::Literal::String(p)) if p == "'John%'"));
     }
 
     #[test]
@@ -11990,39 +11936,130 @@ mod tests {
         let where_expr = where_clause_of("SELECT * FROM users WHERE name NOT LIKE 'sqlite\\_%'");
         let ast::Expr::Like {
             not: true,
-            op: ast::LikeOperator::Glob,
+            op: ast::LikeOperator::Like,
             rhs,
             ..
         } = &where_expr
         else {
-            panic!("Expected NOT GLOB expression but got: {where_expr:?}");
+            panic!("Expected NOT LIKE expression but got: {where_expr:?}");
         };
-        assert!(matches!(&**rhs, ast::Expr::Literal(ast::Literal::String(p)) if p == "'sqlite_*'"));
+        assert!(
+            matches!(&**rhs, ast::Expr::Literal(ast::Literal::String(p)) if p == "'sqlite\\_%'")
+        );
     }
 
     #[test]
     fn test_like_with_column_pattern_translation() {
         let where_expr = where_clause_of("SELECT * FROM users WHERE name NOT LIKE pattern");
-        let ast::Expr::Unary(ast::UnaryOperator::Not, inner) = &where_expr else {
-            panic!("Expected NOT textlike() but got: {where_expr:?}");
+        let ast::Expr::Like {
+            not: true,
+            op: ast::LikeOperator::Like,
+            rhs,
+            ..
+        } = &where_expr
+        else {
+            panic!("Expected NOT LIKE expression but got: {where_expr:?}");
         };
+        assert!(matches!(**rhs, ast::Expr::Id(_)));
+    }
+
+    fn without_parentheses(expr: &ast::Expr) -> &ast::Expr {
+        match expr {
+            ast::Expr::Parenthesized(inner) if inner.len() == 1 => without_parentheses(&inner[0]),
+            other => other,
+        }
+    }
+
+    fn index_where_clause_of(sql: &str) -> Result<ast::Expr, ParseError> {
+        let translator = PostgreSQLTranslator::new();
+        let parsed = crate::parse(sql).unwrap();
+        let ast::Stmt::CreateIndex { where_clause, .. } = translator.translate(&parsed)? else {
+            panic!("Expected CreateIndex statement");
+        };
+        Ok(*where_clause.expect("Expected a predicate"))
+    }
+
+    #[test]
+    fn test_like_in_an_index_is_the_node_of_a_query() {
+        let in_index = index_where_clause_of(
+            "CREATE INDEX i ON users (id) WHERE name LIKE 'John%' AND name NOT LIKE 'a\\_b'",
+        )
+        .unwrap();
+        let in_query = where_clause_of(
+            "SELECT * FROM users WHERE name LIKE 'John%' AND name NOT LIKE 'a\\_b'",
+        );
+        let (
+            ast::Expr::Binary(left, ast::Operator::And, right),
+            ast::Expr::Binary(q_left, _, q_right),
+        ) = (&in_index, &in_query)
+        else {
+            panic!("Expected AND but got: {in_index:?} and {in_query:?}");
+        };
+        assert!(matches!(
+            without_parentheses(left),
+            ast::Expr::Like {
+                not: false,
+                op: ast::LikeOperator::Like,
+                ..
+            }
+        ));
+        assert!(matches!(
+            without_parentheses(right),
+            ast::Expr::Like {
+                not: true,
+                op: ast::LikeOperator::Like,
+                ..
+            }
+        ));
+        assert_eq!(without_parentheses(left), without_parentheses(q_left));
+        assert_eq!(without_parentheses(right), without_parentheses(q_right));
+    }
+
+    #[test]
+    fn test_like_in_an_index_takes_a_computed_pattern() {
+        let where_expr =
+            index_where_clause_of("CREATE INDEX i ON users (id) WHERE name LIKE 'a' || '%'")
+                .unwrap();
+        assert!(matches!(
+            without_parentheses(&where_expr),
+            ast::Expr::Like {
+                op: ast::LikeOperator::Like,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_like_in_an_index_with_escape_is_refused() {
+        let error =
+            index_where_clause_of("CREATE INDEX i ON users (id) WHERE name LIKE 'a#_c' ESCAPE '#'")
+                .unwrap_err();
         assert!(
-            matches!(&**inner, ast::Expr::FunctionCall { name, .. } if name.as_str() == "textlike"),
-            "Expected textlike() call but got: {inner:?}"
+            error
+                .to_string()
+                .contains("CREATE INDEX does not support LIKE with ESCAPE"),
+            "{error}"
         );
     }
 
     #[test]
-    fn test_like_pattern_too_long_for_glob_uses_textlike() {
-        let sql = format!(
-            "SELECT * FROM users WHERE name LIKE '{}'",
-            "*".repeat(16667)
-        );
-        let where_expr = where_clause_of(&sql);
-        assert!(
-            matches!(&where_expr, ast::Expr::FunctionCall { name, .. } if name.as_str() == "textlike"),
-            "Expected textlike() call but got: {where_expr:?}"
-        );
+    fn test_ilike_translation_folds_case_of_both_sides() {
+        let where_expr = where_clause_of("SELECT * FROM users WHERE name ILIKE 'John%'");
+        let ast::Expr::Like {
+            lhs,
+            op: ast::LikeOperator::Like,
+            rhs,
+            ..
+        } = &where_expr
+        else {
+            panic!("Expected LIKE expression but got: {where_expr:?}");
+        };
+        for side in [lhs, rhs] {
+            assert!(
+                matches!(&**side, ast::Expr::FunctionCall { name, .. } if name.as_str() == "lower"),
+                "Expected lower() call but got: {side:?}"
+            );
+        }
     }
 
     #[test]

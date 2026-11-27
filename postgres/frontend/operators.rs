@@ -47,7 +47,13 @@ pub(crate) struct Operator {
 ///    string literal is read as bytea. A comparison runs in the engine, and
 ///    `||` runs the function of the row (`byteacat`).
 /// 6. Otherwise the engine runs its own operator.
+///
+/// `~~` is LIKE, and always has a function of the frontend that runs it: see
+/// `choose_like`.
 pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<OperatorChoice> {
+    if op == "~~" {
+        return choose_like(operands);
+    }
     let Some(types) = checked_operand_types(operands) else {
         return Ok(OperatorChoice::LeftToTheEngine);
     };
@@ -111,6 +117,43 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     }))
 }
 
+/// The choice of `~~`, which is `LIKE`. The engine's own LIKE ignores case and
+/// has no default escape character, so a function of the frontend runs every
+/// LIKE: `bytealike` when an operand is bytea, and `textlike` for the others.
+/// The operand types are checked when they are all known.
+fn choose_like(operands: &[OperandType]) -> Result<OperatorChoice> {
+    if let Some(types) = checked_operand_types(operands) {
+        if has_bytea(&types) {
+            if let Some(choice) = bytea_operator_choice("~~", &types) {
+                return choice;
+            }
+        } else {
+            let oids: Vec<Option<i64>> = types
+                .iter()
+                .map(|ty| ty.as_ref().map(|ty| ty.oid))
+                .collect();
+            check_operator("~~", &oids)?;
+        }
+    }
+    let row = OPERATORS
+        .iter()
+        .find(|row| row.name == "~~" && row.left == TEXT && row.right == TEXT)
+        .expect("OPERATORS has the row of ~~ for text");
+    Ok(OperatorChoice::Chosen(ChosenOperator {
+        id: row.oid,
+        operands: vec![],
+        cast_operands: vec![],
+        function: Some(OperatorFunction {
+            name: "textlike".to_string(),
+            result: ast::Type {
+                name: "boolean".to_string(),
+                size: None,
+                array_dimensions: 0,
+            },
+        }),
+    }))
+}
+
 fn has_bytea(types: &[Option<Checked>]) -> bool {
     types.iter().flatten().any(|ty| ty.oid == BYTEA)
 }
@@ -170,10 +213,20 @@ fn bytea_row_choice(row: &Operator) -> OperatorChoice {
         size: None,
         array_dimensions: 0,
     };
+    let boolean = ast::Type {
+        name: "boolean".to_string(),
+        size: None,
+        array_dimensions: 0,
+    };
     // FIXME(pg-catalog): This hand-codes the oprcode of the rows of bytea that need a function of the frontend. The comparisons run in the engine, which compares blobs as `byteaeq` and its kin do. The function a row names, once pg_proc has the functions of every row, replaces this.
-    let function = (row.name == "||").then(|| OperatorFunction {
-        name: "byteacat".to_string(),
-        result: bytea.clone(),
+    let function = match row.name {
+        "||" => Some(("byteacat", &bytea)),
+        "~~" => Some(("bytealike", &boolean)),
+        _ => None,
+    }
+    .map(|(name, result)| OperatorFunction {
+        name: name.to_string(),
+        result: result.clone(),
     });
     OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
@@ -929,6 +982,8 @@ pub(crate) const OPERATORS: &[Operator] = operators![
     (1133, ">", FLOAT8, FLOAT4, BOOL, 1122, 1134, false, false),
     (1134, "<=", FLOAT8, FLOAT4, BOOL, 1125, 1133, false, false),
     (1135, ">=", FLOAT8, FLOAT4, BOOL, 1124, 1132, false, false),
+    (1209, "~~", TEXT, TEXT, BOOL, 0, 1210, false, false),
+    (1210, "!~~", TEXT, TEXT, BOOL, 0, 1209, false, false),
     (1228, "~*", TEXT, TEXT, BOOL, 0, 1229, false, false),
     (1229, "!~*", TEXT, TEXT, BOOL, 0, 1228, false, false),
     (1320, "=", TIMESTAMPTZ, TIMESTAMPTZ, BOOL, 1320, 1321, true, true),
