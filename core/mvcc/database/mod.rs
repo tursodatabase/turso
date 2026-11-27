@@ -4645,6 +4645,9 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// checkpoint's full sweep.
     gc_last_lwm: AtomicU64,
     experimental_mvcc_passive_checkpoint: bool,
+    /// The path of the logical log file. `None` when a custom durable storage
+    /// writes the log.
+    logical_log_path: Option<std::path::PathBuf>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -4775,7 +4778,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             gc_in_progress: AtomicBool::new(false),
             gc_last_lwm: AtomicU64::new(u64::MAX),
             experimental_mvcc_passive_checkpoint,
+            logical_log_path: None,
         })
+    }
+
+    /// Sets the path of the logical log file that the storage of this store writes.
+    pub(crate) fn with_logical_log_path(mut self, path: std::path::PathBuf) -> Self {
+        self.logical_log_path = Some(path);
+        self
+    }
+
+    /// Returns the path of the logical log file, or `None` when a custom
+    /// durable storage writes the log.
+    pub fn logical_log_path(&self) -> Option<&std::path::Path> {
+        self.logical_log_path.as_deref()
     }
 
     /// Get the table ID from the root page, resolving against the current (live) mapping.

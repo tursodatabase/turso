@@ -872,7 +872,7 @@ impl TursoSyncServer {
         db: &DbHandle,
         req: &PullUpdatesReqProtoBody,
     ) -> Result<HttpResponse> {
-        let log_path = match logical_log_path(&db.path) {
+        let default_log_path = match logical_log_path(&db.path) {
             Ok(path) => path,
             Err(_) if is_in_memory_db_path(&db.path) => {
                 info!(
@@ -882,9 +882,16 @@ impl TursoSyncServer {
             }
             Err(err) => return Err(err),
         };
-        let (db_size, fallback_revision, legacy_current_revision, log) = {
+        let (db_size, fallback_revision, legacy_current_revision, log_path, log) = {
             let conn = db.conn.lock().expect("database connection lock poisoned");
             let wal_state = conn.wal_state()?;
+            // A database that an older version opened in MVCC mode can use a
+            // log with the old name, so read the file that core writes.
+            let log_path = conn
+                .mv_store()
+                .as_ref()
+                .and_then(|mv_store| mv_store.logical_log_path().map(Path::to_path_buf))
+                .unwrap_or(default_log_path);
             // The log is read under the connection lock so that no commit or
             // checkpoint changes it between the snapshot and the read.
             let log = std::fs::read(&log_path).map(|mut log| {
@@ -904,6 +911,7 @@ impl TursoSyncServer {
                 current_snapshot_db_size_pages(&conn, wal_state.max_frame)?,
                 format!("page:{}", wal_state.max_frame),
                 wal_state.max_frame.to_string(),
+                log_path,
                 log,
             )
         };

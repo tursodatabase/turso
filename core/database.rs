@@ -2370,6 +2370,9 @@ impl Database {
                     // In WAL mode, a logical log is always unexpected.
                     // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
                     // recovery and is reconciled in MvStore::bootstrap().
+                    // Only the new log name is checked: a database leaves MVCC mode only after a
+                    // checkpoint has emptied its log, so a log with the old name that has data
+                    // belongs to another database file.
                     if !open_mv_store
                         && journal_mode::file_has_data(&journal_mode::logical_log_path(&self.path))
                     {
@@ -2547,9 +2550,10 @@ impl Database {
                     if open_mv_store {
                         let canonical_path = self.get_database_canonical_path();
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
+                        let log_path = journal_mode::find_logical_log_path(&canonical_path)?;
                         let mv_store = journal_mode::open_mv_store(
                             self.io.clone(),
-                            &journal_mode::logical_log_path(&canonical_path),
+                            &log_path,
                             self.open_flags,
                             self.durable_storage.clone(),
                             enc_ctx,
@@ -2631,7 +2635,12 @@ impl Database {
         if let Some(context) = encryption_context.as_ref() {
             self.validate_external_restore_wal(&new_shared_wal.read(), context)?;
         }
-        let log_path = journal_mode::logical_log_path(&self.path);
+        let log_path = if self.mvcc_enabled() {
+            journal_mode::find_logical_log_path(&self.path)?
+        } else {
+            // A database that is not in MVCC mode has no log with the old name.
+            journal_mode::logical_log_path(&self.path)
+        };
         let new_mv_store = if self.mvcc_enabled() || journal_mode::file_has_data(&log_path) {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
