@@ -810,6 +810,33 @@ impl<'a> Resolver<'a> {
         self.catalog.resolve_queried_table(qualified_name)
     }
 
+    /// The overlay that a statement reads where it names `table_name` of
+    /// `namespace` (see [`crate::OpenOptions::table_overlay`]). None when
+    /// the statement is a statement of the engine, which reads and writes
+    /// the stored table, or when the name is not that of a stored table with
+    /// an overlay.
+    pub(crate) fn table_overlay(
+        &self,
+        namespace: NamespaceRef,
+        table_name: &str,
+    ) -> Option<Arc<crate::vtab::VirtualTable>> {
+        if self.origin.is_engine()
+            || namespace.database_id != crate::MAIN_DB_ID
+            || !namespace.id.is_root()
+        {
+            return None;
+        }
+        let overlay = self
+            .catalog
+            .symbol_table
+            .table_overlays
+            .get(&normalize_ident(table_name))?;
+        self.with_schema(namespace.database_id, |schema| {
+            schema.get_btree_table(namespace.id, table_name)
+        })?;
+        Some(overlay.clone())
+    }
+
     pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<NamespaceRef> {
         self.catalog.resolve_existing_table_named(table_name)
     }

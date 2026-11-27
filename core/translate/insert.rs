@@ -90,6 +90,9 @@ fn validate(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
+    if resolver.table_overlay(namespace, table_name).is_some() {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
     // Check if this table has any incompatible dependent views
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name

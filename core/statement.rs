@@ -89,7 +89,9 @@ pub enum StatementStatusCounter {
 
 impl StatementOrigin {
     /// Whether the engine made the statement: a helper statement, a read of
-    /// the engine's own metadata or a schema write of the engine.
+    /// the engine's own metadata or a schema write of the engine. Such a
+    /// statement is SQLite text, and it reads and writes the stored table
+    /// of a table with an overlay.
     pub(crate) const fn is_engine(self) -> bool {
         matches!(
             self,

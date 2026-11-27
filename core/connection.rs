@@ -5148,6 +5148,10 @@ pub struct SymbolTable {
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
+    /// The overlay of each stored table of the root namespace of the main
+    /// database that has one, by the normalized name of the table. See
+    /// [`crate::OpenOptions::table_overlay`].
+    pub table_overlays: HashMap<String, Arc<VirtualTable>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -5189,6 +5193,7 @@ impl SymbolTable {
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
             index_methods: HashMap::default(),
+            table_overlays: HashMap::default(),
         }
     }
     pub fn resolve_function(
@@ -5228,6 +5233,9 @@ impl SymbolTable {
         }
         for (name, module) in &other.index_methods {
             self.index_methods.insert(name.clone(), module.clone());
+        }
+        for (name, overlay) in &other.table_overlays {
+            self.table_overlays.insert(name.clone(), overlay.clone());
         }
     }
 }
