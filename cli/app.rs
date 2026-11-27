@@ -5,7 +5,7 @@ use crate::{
         Command, CommandParser,
     },
     config::Config,
-    dot_command::tokenize_dot_command,
+    dot_command::{tokenize_dot_command, tokenize_dot_command_spans},
     helper::LimboHelper,
     input::{
         get_io, get_writer, open_flags, ApplyWriter, DbLocation, NoopProgress, OutputMode,
@@ -2437,9 +2437,12 @@ pub(crate) fn database_name_without_query(name: &str) -> &str {
 /// the same statement, because a key can be on a later line than `hexkey`.
 fn line_without_keys(input: &str, line_start: usize) -> String {
     let mut keys = Vec::new();
+    // A URI can be outside of a string, for example on a dot command line
+    // that the user typed after an unfinished statement.
+    uri_key_ranges(input, 0, &mut keys);
     // Limbo::consume finds a dot command in the same way.
     if input.trim_start().starts_with('.') {
-        uri_key_ranges(input, 0, &mut keys);
+        dot_command_key_ranges(input, &mut keys);
     } else {
         sql_key_ranges(input, &mut keys);
     }
@@ -2458,10 +2461,29 @@ fn line_without_keys(input: &str, line_start: usize) -> String {
     line
 }
 
+/// Adds to `keys` the byte range of each argument of the dot command
+/// `line` that has a `hexkey` URI parameter only after its quotes are
+/// removed, such as `"c.db?hex"key=ab12`. The raw text does not show where
+/// the key is in such an argument, so all of the argument is a key.
+fn dot_command_key_ranges(line: &str, keys: &mut Vec<std::ops::Range<usize>>) {
+    let (args, _) = tokenize_dot_command_spans(line);
+    for (arg, span) in args {
+        let raw = &line[span.clone()];
+        let quoted_whole = ['\'', '"']
+            .iter()
+            .any(|&q| raw.strip_prefix(q).and_then(|r| r.strip_suffix(q)) == Some(&arg));
+        let mut arg_keys = Vec::new();
+        uri_key_ranges(&arg, 0, &mut arg_keys);
+        if raw != arg && !quoted_whole && !arg_keys.is_empty() {
+            keys.push(span);
+        }
+    }
+}
+
 /// Adds to `keys` the byte ranges of the encryption keys in the SQL text
 /// `sql`: the values of `PRAGMA hexkey`, the `KEY` of `ATTACH`, and the
-/// `hexkey` parameters of the URIs in tokens. `sql` can end inside a
-/// statement or a string.
+/// file name of `ATTACH` if it is more than one token. `sql` can end
+/// inside a statement or a string.
 fn sql_key_ranges(sql: &str, keys: &mut Vec<std::ops::Range<usize>>) {
     use turso_parser::{lexer::Lexer, token::TokenType};
     enum State {
@@ -2524,7 +2546,6 @@ fn sql_key_ranges(sql: &str, keys: &mut Vec<std::ops::Range<usize>>) {
             }
         };
         let text = &sql[start..end];
-        uri_key_ranges(text, start, keys);
         if token_type == TokenType::TK_NONE {
             // Spaces and comments.
             continue;
@@ -2996,6 +3017,16 @@ mod tests {
                 ".clone 'file:d.db?cipher=aegis256&hexkey=ab12#x'",
                 0,
                 ".clone 'file:d.db?cipher=aegis256&hexkey=***#x'",
+            ),
+            (
+                ".open \"/p/e.db?cipher=aegis256&hex\"key=ab12 x",
+                0,
+                ".open *** x",
+            ),
+            (
+                "SELECT 1\n.open c.db?cipher=aegis256&hexkey=ab12",
+                9,
+                ".open c.db?cipher=aegis256&hexkey=***",
             ),
             ("PRAGMA hexkey =\n'ab12';", 16, "***;"),
             ("PRAGMA hexkey = 'ab\n12';", 20, "***;"),

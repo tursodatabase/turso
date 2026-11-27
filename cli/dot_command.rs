@@ -1,32 +1,40 @@
 pub(crate) fn tokenize_dot_command(line: &str) -> (Vec<String>, Option<char>) {
+    let (args, quote) = tokenize_dot_command_spans(line);
+    (args.into_iter().map(|(arg, _)| arg).collect(), quote)
+}
+
+/// Splits `line` as `tokenize_dot_command` does, and also returns for each
+/// argument the byte range of `line` that it comes from, quotes included.
+pub(crate) fn tokenize_dot_command_spans(
+    line: &str,
+) -> (Vec<(String, std::ops::Range<usize>)>, Option<char>) {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut quote = None;
-    let mut token_started = false;
+    let mut token_start = None;
 
-    for ch in line.chars() {
+    for (pos, ch) in line.char_indices() {
         match quote {
             Some(delimiter) if ch == delimiter => quote = None,
             Some(_) => current.push(ch),
             None if ch.is_whitespace() => {
-                if token_started {
-                    args.push(std::mem::take(&mut current));
-                    token_started = false;
+                if let Some(start) = token_start.take() {
+                    args.push((std::mem::take(&mut current), start..pos));
                 }
             }
-            None if matches!(ch, '\'' | '"') && !token_started => {
+            None if matches!(ch, '\'' | '"') && token_start.is_none() => {
                 quote = Some(ch);
-                token_started = true;
+                token_start = Some(pos);
             }
             None => {
                 current.push(ch);
-                token_started = true;
+                token_start.get_or_insert(pos);
             }
         }
     }
 
-    if token_started {
-        args.push(current);
+    if let Some(start) = token_start {
+        args.push((current, start..line.len()));
     }
 
     (args, quote)
