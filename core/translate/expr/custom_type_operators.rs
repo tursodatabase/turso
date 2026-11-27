@@ -55,8 +55,31 @@ pub(crate) fn read_literal_operands(
     if resolver.schema().type_registry.is_empty() {
         return Ok(());
     }
+    // FIXME(registered-types): A typed expression tree gives each expression
+    // its type from the types of what it contains, in one run from the leaves
+    // up, and this loop goes away.
+    for _ in 0..MAX_DEPTH_OF_CASTS {
+        if !read_literal_operands_once(expr, tables, resolver)? {
+            return Ok(());
+        }
+    }
+    Err(crate::LimboError::InternalError(
+        "the operands of an expression are still being cast after the most levels it can have"
+            .to_string(),
+    ))
+}
+
+const MAX_DEPTH_OF_CASTS: usize = 64;
+
+/// One walk of [read_literal_operands]. Whether it cast an operand.
+fn read_literal_operands_once(
+    expr: &mut ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
     let context = ExprContext::new(tables, resolver);
     let dialect = resolver.catalog.dialect.as_ref();
+    let mut cast_any = false;
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
         let (mut operands, uses) = operator_uses(expr);
         let mut types = vec![None; operands.len()];
@@ -71,15 +94,12 @@ pub(crate) fn read_literal_operands(
             let Some(ty) = ty else {
                 continue;
             };
-            let literal = std::mem::replace(*operand, ast::Expr::Literal(ast::Literal::Null));
-            **operand = ast::Expr::Cast {
-                expr: Box::new(literal),
-                type_name: Some(ty),
-            };
+            cast_any = true;
+            wrap_in_cast(operand, ty);
         }
         Ok(WalkControl::Continue)
     })?;
-    Ok(())
+    Ok(cast_any)
 }
 
 /// Fails when the dialect's `=` of `lhs IN (SELECT rhs ...)` still casts an operand.
@@ -455,10 +475,21 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
             (operands, uses)
         }
         ast::Expr::FunctionCall { name, args, .. }
-            if name.as_str().eq_ignore_ascii_case("nullif") && args.len() == 2 =>
+            if (name.as_str().eq_ignore_ascii_case("nullif") && args.len() == 2)
+                || (name.as_str().eq_ignore_ascii_case("coalesce") && args.len() > 1) =>
         {
+            let is_nullif = name.as_str().eq_ignore_ascii_case("nullif");
+            let count = args.len();
             let operands = args.iter_mut().map(|arg| arg.as_mut()).collect();
-            (operands, first_with_each("=", 1..2))
+            if is_nullif {
+                return (operands, first_with_each("=", 1..2));
+            }
+            let uses = vec![OperatorUse {
+                name: "=",
+                operands: (0..count).collect(),
+                kind: UseKind::ListValues,
+            }];
+            (operands, uses)
         }
         // The comparison with the values of a subquery is asked when the
         // subquery is planned: see `in_subquery_collation`.
