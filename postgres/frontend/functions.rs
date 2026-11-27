@@ -2486,17 +2486,6 @@ fn hand_written_input_error(
             }
             None
         }
-        "uuid" => {
-            let hex: String = trimmed.chars().filter(|c| *c != '-').collect();
-            if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                Some((
-                    format!("invalid input syntax for type uuid: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            } else {
-                None
-            }
-        }
         "date" => check_temporal_input(input, "date"),
         "timestamp" => check_temporal_input(input, "timestamp"),
         "timestamptz" => check_temporal_input(input, "timestamptz"),

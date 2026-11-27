@@ -1,8 +1,7 @@
-use crate::error::sqlstate_error;
 use crate::functions::{invalid_json, pg_scalar_function, unsupported_unicode_escape, Uuid};
+use crate::pg_type::canonical_uuid;
 use turso_core::native_ext::FunctionArity;
 use turso_core::{Connection, OpenOptions, Result};
-use turso_pg_parser::sqlstate::SQLSTATE_INVALID_TEXT_REPRESENTATION;
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     options
@@ -42,18 +41,6 @@ fn claim(conn: &Connection, setting_name: &str, claim_name: &str) -> Result<Opti
         Some(serde_json::Value::String(value)) => Some(value.clone()),
         Some(value) => Some(value.to_string()),
     })
-}
-
-fn canonical_uuid(text: &str) -> Result<String> {
-    uuid::Uuid::parse_str(text)
-        .map(|uuid| uuid.hyphenated().to_string())
-        .map_err(|_| {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!("invalid input syntax for type uuid: \"{text}\""),
-                None,
-            )
-        })
 }
 
 fn jwt(conn: &Connection) -> Result<Option<String>> {

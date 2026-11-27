@@ -83,6 +83,14 @@ fn uuid_decode(value: &Value, _params: &[Value]) -> Result<Value> {
     })
 }
 
+/// The canonical text of the uuid that `text` is, as `uuid_out` writes the
+/// value that `uuid_in` reads.
+pub(crate) fn canonical_uuid(text: &str) -> Result<String> {
+    string_to_uuid(text)
+        .map(|bytes| uuid_to_string(&bytes))
+        .ok_or_else(|| invalid_uuid(text))
+}
+
 fn invalid_uuid(text: &str) -> turso_core::LimboError {
     sqlstate_error(
         SQLSTATE_INVALID_TEXT_REPRESENTATION,
