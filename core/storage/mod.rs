@@ -20,8 +20,6 @@ pub(crate) mod checksum;
 pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
-#[cfg(debug_assertions)]
-pub mod model;
 #[cfg(feature = "aristo-instr")]
 pub mod page_cache;
 #[cfg(not(feature = "aristo-instr"))]
@@ -34,6 +32,8 @@ pub(crate) mod pager;
 pub(crate) mod shared_wal_coordination;
 #[allow(dead_code)]
 pub(super) mod slot_bitmap;
+#[cfg(debug_assertions)]
+pub mod spec_model;
 pub mod sqlite3_ondisk;
 mod state_machines;
 pub(crate) mod subjournal;

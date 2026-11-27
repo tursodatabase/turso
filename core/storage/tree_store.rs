@@ -68,26 +68,27 @@ pub trait TreeStore: Send + Sync {
     fn check_feature(&self, feature: &str) -> Result<()>;
 }
 
-/// The path of a database whose trees are all in the in-memory model of the cursor contract
-/// (`storage::model`). It is like `:memory:`, and exists only in debug builds.
-pub const MODEL_PATH: &str = ":model:";
+/// The path of a database whose trees are all in the in-memory spec-model of the cursor contract
+/// (`storage::spec_model`). It is like `:memory:`, and exists only in debug builds.
+pub const SPEC_MODEL_PATH: &str = ":spec-model:";
 
-/// The tree storage for a database at `path`: the model storage for [`MODEL_PATH`], else none.
+/// The tree storage for a database at `path`: the spec-model storage for
+/// [`SPEC_MODEL_PATH`], else none.
 /// This is the only place that picks a storage.
 pub fn tree_storage_for_path(path: &str) -> Result<Option<Arc<dyn TreeStorage>>> {
-    if path != MODEL_PATH {
+    if path != SPEC_MODEL_PATH {
         return Ok(None);
     }
     #[cfg(debug_assertions)]
     {
         Ok(Some(Arc::new(
-            crate::storage::model::ModelStorage::default(),
+            crate::storage::spec_model::SpecModelStorage::default(),
         )))
     }
     #[cfg(not(debug_assertions))]
     {
         Err(crate::LimboError::InvalidArgument(
-            "the :model: database exists only in debug builds".to_string(),
+            "the :spec-model: database exists only in debug builds".to_string(),
         ))
     }
 }

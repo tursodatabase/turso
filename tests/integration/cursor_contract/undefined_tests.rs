@@ -9,10 +9,11 @@
 //! test is a `known_bug_*` test, because no engine refuses yet. When an engine does, the
 //! test fails with "does not fail any more": remove the wrapper.
 //!
-//! The `:model:` engine (`DbKind::Model`) is not in the `known_bug` part: it must refuse
-//! every sequence. A case marked `model_gap` is one that the model engine cannot see, because
-//! it infers the ops from the calls of the VDBE on `CursorTrait`. The test then requires that
-//! the model engine does not refuse it, so that a better inference shows up.
+//! The `:spec-model:` engine (`DbKind::SpecModel`) is not in the `known_bug` part: it must
+//! refuse every sequence. A case marked `spec_model_gap` is one that the spec-model engine
+//! cannot see, because it infers the ops from the calls of the VDBE on `CursorTrait`. The test
+//! then requires that the spec-model engine does not refuse it, so that a better inference
+//! shows up.
 //!
 //! A release build may still do anything. The tests exist only in debug builds.
 
@@ -97,25 +98,25 @@ fn index_run(
     }
 }
 
-/// The error of the `:model:` engine for the table program, if any.
-fn model_table_error(rows: &[(i64, i64)], ncursors: usize, ops: &[Op]) -> Option<String> {
-    run(DbKind::Model, Layout::AllInMemory, rows, ncursors, ops).err()
+/// The error of the `:spec-model:` engine for the table program, if any.
+fn spec_model_table_error(rows: &[(i64, i64)], ncursors: usize, ops: &[Op]) -> Option<String> {
+    run(DbKind::SpecModel, Layout::AllInMemory, rows, ncursors, ops).err()
 }
 
-/// The error of the `:model:` engine for the index program, if any.
-fn model_index_error(idef: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) -> Option<String> {
-    let cfg = index_run(idef, rows, nidx, DbKind::Model, Layout::AllInMemory);
+/// The error of the `:spec-model:` engine for the index program, if any.
+fn spec_model_index_error(idef: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) -> Option<String> {
+    let cfg = index_run(idef, rows, nidx, DbKind::SpecModel, Layout::AllInMemory);
     run_index(&cfg, ops).error
 }
 
-/// Requires that the `:model:` engine does not refuse a program of a `model_gap` case.
+/// Requires that the `:spec-model:` engine does not refuse a program of a `spec_model_gap` case.
 #[track_caller]
-fn model_misses(error: Option<String>, why: &str) {
+fn spec_model_misses(error: Option<String>, why: &str) {
     if let Some(e) = &error {
         assert!(
             !e.starts_with("panic: unsupported"),
-            "the model engine refuses this program now, so it is not a gap any more \
-             ({why}): remove `model_gap` from the case. {e}"
+            "the spec-model engine refuses this program now, so it is not a gap any more \
+             ({why}): remove `spec_model_gap` from the case. {e}"
         );
     }
 }
@@ -164,8 +165,8 @@ fn rejects_index(idef: IdxDef, rows: &[Row], nidx: usize, ops: &[IOp]) {
     }
 }
 
-/// A table program whose last op is Undefined. `$id` is the rule of SPEC 2d. The `:model:`
-/// engine must refuse it, unless the case gives a `model_gap` reason.
+/// A table program whose last op is Undefined. `$id` is the rule of SPEC 2d. The
+/// `:spec-model:` engine must refuse it, unless the case gives a `spec_model_gap` reason.
 macro_rules! table_case {
     ($name:ident, $id:literal, $ncur:expr, [$($op:expr),+ $(,)?]) => {
         #[test]
@@ -173,18 +174,18 @@ macro_rules! table_case {
             let ops = [$($op),+];
             assert_table_illegal(TABLE_ROWS, $ncur, &ops);
             judge(
-                "Model",
+                "SpecModel",
                 &format!("{:?}", ops.last().unwrap()),
-                model_table_error(TABLE_ROWS, $ncur, &ops).as_deref(),
+                spec_model_table_error(TABLE_ROWS, $ncur, &ops).as_deref(),
             );
             known_bug($id, EXPECTED, || rejects_table(TABLE_ROWS, $ncur, &ops));
         }
     };
-    ($name:ident, $id:literal, $ncur:expr, [$($op:expr),+ $(,)?], model_gap: $why:literal) => {
+    ($name:ident, $id:literal, $ncur:expr, [$($op:expr),+ $(,)?], spec_model_gap: $why:literal) => {
         #[test]
         fn $name() {
             let ops = [$($op),+];
-            model_misses(model_table_error(TABLE_ROWS, $ncur, &ops), $why);
+            spec_model_misses(spec_model_table_error(TABLE_ROWS, $ncur, &ops), $why);
             known_bug($id, EXPECTED, || rejects_table(TABLE_ROWS, $ncur, &ops));
         }
     };
@@ -199,19 +200,19 @@ macro_rules! index_case {
             let rows = $rows;
             assert_index_illegal($idef, &rows, $ncur, &ops);
             judge(
-                "Model",
+                "SpecModel",
                 &format!("{:?}", ops.last().unwrap()),
-                model_index_error($idef, &rows, $ncur, &ops).as_deref(),
+                spec_model_index_error($idef, &rows, $ncur, &ops).as_deref(),
             );
             known_bug($id, EXPECTED, || rejects_index($idef, &rows, $ncur, &ops));
         }
     };
-    ($name:ident, $id:literal, $idef:expr, $rows:expr, $ncur:expr, [$($op:expr),+ $(,)?], model_gap: $why:literal) => {
+    ($name:ident, $id:literal, $idef:expr, $rows:expr, $ncur:expr, [$($op:expr),+ $(,)?], spec_model_gap: $why:literal) => {
         #[test]
         fn $name() {
             let ops = [$($op),+];
             let rows = $rows;
-            model_misses(model_index_error($idef, &rows, $ncur, &ops), $why);
+            spec_model_misses(spec_model_index_error($idef, &rows, $ncur, &ops), $why);
             known_bug($id, EXPECTED, || rejects_index($idef, &rows, $ncur, &ops));
         }
     };
@@ -360,7 +361,7 @@ index_case!(
     index_rows(),
     1,
     [IOp::Rewind(0), del(0, 1, 10, 1), IOp::Next(0)],
-    model_gap: "IdxDelete calls an eq-only seek and Delete; Delete leaves a direction"
+    spec_model_gap: "IdxDelete calls an eq-only seek and Delete; Delete leaves a direction"
 );
 
 // ---------------------------------------------------------------------------------------
@@ -372,7 +373,7 @@ table_case!(
     "U3",
     1,
     [Op::NullRow(0), insert(0, 25, true)],
-    model_gap: "an insert that seeks makes the calls of a seek opcode and an insert, and that seek is legal after NullRow"
+    spec_model_gap: "an insert that seeks makes the calls of a seek opcode and an insert, and that seek is legal after NullRow"
 );
 table_case!(
     known_bug_u3_delete_after_null_row,
@@ -399,7 +400,7 @@ index_case!(
     index_rows(),
     1,
     [IOp::NullRow(0), add(0, 7, 7, 70, false)],
-    model_gap: "an insert that seeks makes the calls of a seek opcode and an insert, and that seek is legal after NullRow"
+    spec_model_gap: "an insert that seeks makes the calls of a seek opcode and an insert, and that seek is legal after NullRow"
 );
 index_case!(
     known_bug_u3_idx_delete_after_null_row,
@@ -552,7 +553,7 @@ index_case!(
     index_rows(),
     1,
     [del(0, 9, 9, 99)],
-    model_gap: "the VDBE returns Corrupt after the seek misses and calls no delete"
+    spec_model_gap: "the VDBE returns Corrupt after the seek misses and calls no delete"
 );
 index_case!(
     known_bug_u7_idx_delete_of_equal_but_not_identical_key,
@@ -566,7 +567,7 @@ index_case!(
         b: v(1),
         rowid: 1,
     }],
-    model_gap: "the VDBE returns Corrupt after the seek misses and calls no delete"
+    spec_model_gap: "the VDBE returns Corrupt after the seek misses and calls no delete"
 );
 
 // ---------------------------------------------------------------------------------------
@@ -662,7 +663,7 @@ index_case!(
     index_rows(),
     1,
     [IOp::NoConflict(0, vec![Val::Null]), IOp::Observe(0)],
-    model_gap: "NoConflict with a NULL makes no call on the cursor"
+    spec_model_gap: "NoConflict with a NULL makes no call on the cursor"
 );
 
 // ---------------------------------------------------------------------------------------

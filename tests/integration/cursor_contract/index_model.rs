@@ -1,9 +1,9 @@
 //! Reference model of index cursors (SPEC 2b) with the sort order and the collation of the index
 //! columns (SPEC 2c, `IdxDef`).
 //!
-//! The rules are in `turso_core::storage::model::spec`, the step function that the model
-//! storage of the VDBE runs too. `istep` maps the index ops onto it. This file keeps the
-//! index as a sorted list of keys with the compare of SPEC 2c (`cmp_prefix` and so on). The
+//! The rules are in `turso_core::storage::spec_model::spec`, the step function that the
+//! spec-model storage of the VDBE runs too. `istep` maps the index ops onto it. This file keeps
+//! the index as a sorted list of keys with the compare of SPEC 2c (`cmp_prefix` and so on). The
 //! unit tests at the end are examples with hand-checked expected values.
 //!
 //! The model is the oracle of the index random walk (`index_walk.rs`). `istep` returns `None`
@@ -15,7 +15,7 @@ use super::model::Spec;
 use super::program::ReadMode;
 use super::{DbKind, Layout};
 use std::cmp::Ordering;
-use turso_core::storage::model::spec::{self, Tree, Write};
+use turso_core::storage::spec_model::spec::{self, Tree, Write};
 use turso_core::types::SeekOp;
 
 // ---------------------------------------------------------------------------------------
@@ -234,7 +234,7 @@ pub fn irun(st: &IState, p: &[IAction]) -> Option<(IState, Vec<IMObs>)> {
 }
 
 /// One action. `None` means the action is illegal in this state. The rules are in
-/// `turso_core::storage::model::spec`; this function maps the op onto it.
+/// `turso_core::storage::spec_model::spec`; this function maps the op onto it.
 pub fn istep(st: &IState, a: &IAction) -> Option<(IState, IMObs)> {
     let c = st.icurs.get(a.iacur)?;
     let (d, s) = (st.idef, &st.irows);

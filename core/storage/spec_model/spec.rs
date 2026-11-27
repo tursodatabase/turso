@@ -4,7 +4,7 @@
 //! tree, or the rule of SPEC section 2d that makes the op illegal. `after_peer_write` gives
 //! the shape of every other cursor of the tree after that write. Neither changes its inputs.
 //! They know the tree only through the `Tree` trait, so the same code runs with any key type
-//! and compare function: the model storage of the VDBE and the test models use it.
+//! and compare function: the spec-model storage of the VDBE and the test models use it.
 //!
 //! The ops are opcode-level: one op is one VDBE opcode, also when the opcode makes several
 //! cursor calls (an `IdxInsert` seeks, may read, then inserts).

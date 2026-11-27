@@ -76,7 +76,7 @@ const CONFIGS: [(DbKind, Layout); 6] = [
     (DbKind::Mvcc, Layout::AllInMemory),
     (DbKind::Mvcc, Layout::Checkpointed),
     (DbKind::Ephemeral, Layout::AllInMemory),
-    (DbKind::Model, Layout::AllInMemory),
+    (DbKind::SpecModel, Layout::AllInMemory),
 ];
 
 /// The read modes that agree everywhere, as long as the program does not read a cursor that
@@ -160,13 +160,13 @@ fn check(rows: &[Row], opts: Opts, ops: &Ops, expected: &[IObs]) {
     assert_eq!(ops.len(), expected.len(), "one observation per op");
     let mut failures = Vec::new();
     for (label, outcome) in run_all(rows, opts, ops) {
-        // Some scenarios pin what the engines do for an undefined sequence. The `:model:`
+        // Some scenarios pin what the engines do for an undefined sequence. The `:spec-model:`
         // engine refuses such a program, and that is its correct result.
         let refused = outcome
             .error
             .as_deref()
             .is_some_and(|e| e.starts_with("panic: unsupported"));
-        if label.starts_with("Model/")
+        if label.starts_with("SpecModel/")
             && refused
             && !is_legal(rows, opts.nidx, false, IdxDef::default(), ops)
         {
@@ -1035,7 +1035,7 @@ fn clear_empties_the_index_in_wal_and_errors_in_mvcc() {
             let got = run_index(&cfg, &ops);
             let label = format!("{kind:?}/{layout:?}/{mode:?}: {got:?}");
             match kind {
-                DbKind::Wal | DbKind::Model => assert_eq!(
+                DbKind::Wal | DbKind::SpecModel => assert_eq!(
                     got,
                     Outcome {
                         obs: vec![n(), n(), e(6, NULL, 5), n(), n(), n(), r(0), j()],

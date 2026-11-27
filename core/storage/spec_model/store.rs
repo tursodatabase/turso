@@ -1,4 +1,4 @@
-//! The tree storage of a `:model:` database: every tree is a model tree in memory.
+//! The tree storage of a `:spec-model:` database: every tree is a spec-model tree in memory.
 //!
 //! A version of the database is an immutable map from root page to tree. The connections share
 //! the committed version. A read transaction keeps the version it started with. A write
@@ -6,7 +6,7 @@
 //! Commit publishes the copy. A savepoint keeps a copy of the map, and a rollback to it puts
 //! the copy back. The real pager still decides who may write, so two writers never meet here.
 
-use super::cursor::{ModelCursor, SharedTree};
+use super::cursor::{SharedTree, SpecModelCursor};
 use crate::storage::btree::CursorTrait;
 use crate::storage::pager::Pager;
 use crate::storage::tree_store::{SavedTrees, TreeKind, TreeStorage, TreeStore};
@@ -18,13 +18,13 @@ use std::collections::BTreeMap;
 /// One version of all trees of the database.
 type Trees = BTreeMap<i64, Arc<SharedTree>>;
 
-/// The model storage of one database.
+/// The spec-model storage of one database.
 #[derive(Default)]
-pub struct ModelStorage {
+pub struct SpecModelStorage {
     committed: Arc<Mutex<Arc<Trees>>>,
 }
 
-impl TreeStorage for ModelStorage {
+impl TreeStorage for SpecModelStorage {
     fn connect(&self) -> Arc<dyn TreeStore> {
         Arc::new(ConnStore {
             trees: Arc::new(ConnTrees {
@@ -108,7 +108,7 @@ struct ConnStore {
 }
 
 fn unsupported(feature: &str) -> LimboError {
-    LimboError::InternalError(format!("unsupported in model storage: {feature}"))
+    LimboError::InternalError(format!("unsupported in spec-model storage: {feature}"))
 }
 
 fn index_info(kind: &TreeKind<'_>) -> Result<Option<Arc<IndexInfo>>> {
@@ -128,7 +128,7 @@ impl TreeStore for ConnStore {
         kind: TreeKind<'_>,
     ) -> Result<Box<dyn CursorTrait>> {
         let info = index_info(&kind)?;
-        Ok(Box::new(ModelCursor::on_tree(
+        Ok(Box::new(SpecModelCursor::on_tree(
             pager,
             self.trees.clone(),
             root,
@@ -142,7 +142,7 @@ impl TreeStore for ConnStore {
         kind: TreeKind<'_>,
     ) -> Result<Box<dyn CursorTrait>> {
         let info = index_info(&kind)?;
-        Ok(Box::new(ModelCursor::ephemeral(pager, info)))
+        Ok(Box::new(SpecModelCursor::ephemeral(pager, info)))
     }
 
     fn create_tree(&self, root: i64) {
@@ -209,7 +209,7 @@ impl TreeStore for ConnStore {
     fn restore(&self, saved: &SavedTrees) {
         let trees = saved
             .downcast_ref::<Option<Trees>>()
-            .expect("a model savepoint holds model trees");
+            .expect("a spec-model savepoint holds spec-model trees");
         self.trees.tx.lock().write.clone_from(trees);
     }
 

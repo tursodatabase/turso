@@ -1,4 +1,4 @@
-//! `ModelCursor`: a `CursorTrait` implementation that keeps the tree in memory and runs each
+//! `SpecModelCursor`: a `CursorTrait` implementation that keeps the tree in memory and runs each
 //! opcode through the spec layer (`spec.rs`). It does no I/O.
 //!
 //! The VDBE calls the cursor at a finer grain than the contract, and some opcodes make the
@@ -131,7 +131,7 @@ impl SharedTree {
             }
             (Rows::Table(map), Write::Clear) => map.clear(),
             (Rows::Index(_, rows), Write::Clear) => rows.clear(),
-            (_, w) => unreachable!("model: write {w:?} does not fit the tree"),
+            (_, w) => unreachable!("spec-model: write {w:?} does not fit the tree"),
         }
     }
 }
@@ -177,7 +177,7 @@ static NEXT_ROOT: AtomicI64 = AtomicI64::new(1 << 40);
 /// How many ops a panic message lists.
 const RECENT: usize = 12;
 
-pub struct ModelCursor {
+pub struct SpecModelCursor {
     tree: TreeRef,
     info: Option<Arc<IndexInfo>>,
     root: i64,
@@ -205,7 +205,7 @@ pub struct ModelCursor {
     alt_dirs: Vec<Dir>,
 }
 
-impl ModelCursor {
+impl SpecModelCursor {
     /// A cursor on a new ephemeral tree.
     pub fn ephemeral(pager: Arc<Pager>, info: Option<Arc<IndexInfo>>) -> Self {
         stats::tree_opened(info.is_some());
@@ -363,7 +363,7 @@ impl ModelCursor {
                 .iter()
                 .find(|s| cmp(info, s, k, Ordering::Equal).is_eq())
                 .cloned(),
-            _ => unreachable!("model: key and tree differ"),
+            _ => unreachable!("spec-model: key and tree differ"),
         })
     }
 
@@ -420,7 +420,7 @@ impl ModelCursor {
             Key::Record(_) if !self.has_rowid() => None,
             Key::Record(rec) => match rec.last_value() {
                 Some(Ok(ValueRef::Numeric(Numeric::Integer(r)))) => Some(r),
-                other => panic!("model: an index entry ends with {other:?}, not a rowid"),
+                other => panic!("spec-model: an index entry ends with {other:?}, not a rowid"),
             },
         }
     }
@@ -434,22 +434,24 @@ fn cmp(
     key: &ImmutableRecord,
     tb: Ordering,
 ) -> Ordering {
-    let values = key.get_values().expect("model: a key record is readable");
+    let values = key
+        .get_values()
+        .expect("spec-model: a key record is readable");
     compare_record(stored.get_payload(), values.iter(), info, tb)
-        .expect("model: a stored record is readable")
+        .expect("spec-model: a stored record is readable")
 }
 
 fn record_of(key: &Key) -> &ImmutableRecord {
     match key {
         Key::Record(r) => r,
-        Key::Rowid(_) => unreachable!("model: a rowid key on an index"),
+        Key::Rowid(_) => unreachable!("spec-model: a rowid key on an index"),
     }
 }
 
 fn rowid_of(key: &Key) -> i64 {
     match key {
         Key::Rowid(r) => *r,
-        Key::Record(_) => unreachable!("model: a record key on a table"),
+        Key::Record(_) => unreachable!("spec-model: a record key on a table"),
     }
 }
 
@@ -579,10 +581,10 @@ impl Tree for Rows {
 }
 
 fn copy_record(payload: &[u8]) -> ImmutableRecord {
-    ImmutableRecord::copy_payload(payload, RecordBuf::alloc()).expect("model: out of memory")
+    ImmutableRecord::copy_payload(payload, RecordBuf::alloc()).expect("spec-model: out of memory")
 }
 
-impl CursorTrait for ModelCursor {
+impl CursorTrait for SpecModelCursor {
     fn last(&mut self) -> IOResultOr<()> {
         self.finish_new_rowid();
         self.run(Op::Last, None);
@@ -718,7 +720,7 @@ impl CursorTrait for ModelCursor {
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         let Value::Numeric(Numeric::Integer(r)) = key else {
-            panic!("model: a table key is not an integer: {key:?}");
+            panic!("spec-model: a table key is not an integer: {key:?}");
         };
         let hit = self.seek_key(Key::Rowid(*r), SeekOp::GE { eq_only: true });
         Ok(IOResult::Done(hit == SeekResult::Found))
@@ -733,7 +735,7 @@ impl CursorTrait for ModelCursor {
 
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
         panic!(
-            "unsupported in model storage: Destroy through a cursor (root {})",
+            "unsupported in spec-model storage: Destroy through a cursor (root {})",
             self.root
         )
     }
@@ -768,7 +770,7 @@ impl CursorTrait for ModelCursor {
 
     fn set_has_record(&mut self, _has_record: bool) {
         panic!(
-            "unsupported in model storage: set_has_record (root {})",
+            "unsupported in spec-model storage: set_has_record (root {})",
             self.root
         )
     }

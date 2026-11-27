@@ -1,8 +1,8 @@
 //! Reference model of table cursors (SPEC section 2).
 //!
-//! The rules are in `turso_core::storage::model::spec`, the step function that the model
-//! storage of the VDBE runs too. This file maps the table ops of the harness onto it, keeps
-//! the table as a sorted list of `(rowid, value)`, and says what an op may observe.
+//! The rules are in `turso_core::storage::spec_model::spec`, the step function that the
+//! spec-model storage of the VDBE runs too. This file maps the table ops of the harness onto
+//! it, keeps the table as a sorted list of `(rowid, value)`, and says what an op may observe.
 //!
 //! The model is the oracle of the random walk tester. It decides which ops are legal
 //! (`step` returns `None` for an illegal op) and what an op may observe. A value that the
@@ -10,7 +10,7 @@
 
 use super::program::{Obs, Op};
 use super::{run as run_engine, DbKind, Layout};
-use turso_core::storage::model::spec::{self, Tree, Write};
+use turso_core::storage::spec_model::spec::{self, Tree, Write};
 use turso_core::types::SeekOp;
 
 // ---------------------------------------------------------------------------------------

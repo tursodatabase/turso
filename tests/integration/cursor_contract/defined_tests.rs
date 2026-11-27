@@ -23,7 +23,7 @@ const TABLE_CONFIGS: [(DbKind, Layout); 6] = [
     (DbKind::Mvcc, Layout::AllInMemory),
     (DbKind::Mvcc, Layout::Checkpointed),
     (DbKind::Ephemeral, Layout::AllInMemory),
-    (DbKind::Model, Layout::AllInMemory),
+    (DbKind::SpecModel, Layout::AllInMemory),
 ];
 
 /// The ephemeral engine has no index `OpenDup` (O1), so index programs with two cursors do
@@ -33,7 +33,7 @@ const INDEX_CONFIGS: [(DbKind, Layout); 5] = [
     (DbKind::Wal, Layout::Checkpointed),
     (DbKind::Mvcc, Layout::AllInMemory),
     (DbKind::Mvcc, Layout::Checkpointed),
-    (DbKind::Model, Layout::AllInMemory),
+    (DbKind::SpecModel, Layout::AllInMemory),
 ];
 
 const TABLE_ROWS: &[(i64, i64)] = &[(10, 100), (20, 200), (30, 300)];

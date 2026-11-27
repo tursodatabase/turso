@@ -21,9 +21,9 @@ use std::collections::HashSet;
 /// The keys of the walk are in `0..=KEY_MAX`.
 const KEY_MAX: i64 = 26;
 const MAX_OPS: usize = 25;
-/// The `:model:` engine runs in every scope: it is fast, and it must agree with the model on
-/// every legal program.
-const MODEL: (DbKind, Layout) = (DbKind::Model, Layout::AllInMemory);
+/// The `:spec-model:` engine runs in every scope: it is fast, and it must agree with the test
+/// model on every legal program.
+const SPEC_MODEL: (DbKind, Layout) = (DbKind::SpecModel, Layout::AllInMemory);
 const CONFIGS: [(DbKind, Layout); 4] = [
     (DbKind::Wal, Layout::AllInMemory),
     (DbKind::Wal, Layout::Checkpointed),
@@ -158,7 +158,7 @@ fn random_scope(rng: &mut ChaCha8Rng) -> Vec<(DbKind, Layout)> {
         5 => CONFIGS[2..].to_vec(),
         _ => vec![CONFIGS[rng.random_range(0..4)]],
     };
-    scope.push(MODEL);
+    scope.push(SPEC_MODEL);
     scope
 }
 

@@ -1,19 +1,19 @@
-//! Model storage: an in-memory implementation of the cursor contract
+//! Spec-model storage: an in-memory implementation of the cursor contract
 //! (`tests/integration/cursor_contract/SPEC.md`). It is the spec in code, an oracle for SQL
 //! results, and a checker that panics with `unsupported: U<n>: ...` on an Undefined sequence.
 //!
-//! It exists only in debug builds. A database opened at the path `:model:` keeps all its
-//! trees here (`ModelStorage`, through the `TreeStorage` seam of `storage::tree_store`).
+//! It exists only in debug builds. A database opened at the path `:spec-model:` keeps all its
+//! trees here (`SpecModelStorage`, through the `TreeStorage` seam of `storage::tree_store`).
 
 mod cursor;
 pub mod spec;
 mod store;
 
-pub use cursor::ModelCursor;
-pub use store::ModelStorage;
+pub use cursor::SpecModelCursor;
+pub use store::SpecModelStorage;
 
-/// Counters that show how much of the model a run used. A process that opened a model tree
-/// prints them to stderr when it exits.
+/// Counters that show how much of the spec-model a run used. A process that opened a
+/// spec-model tree prints them to stderr when it exits.
 mod stats {
     use crate::sync::{LazyLock, Mutex};
     use std::collections::BTreeMap;
@@ -53,7 +53,7 @@ mod stats {
             .map(|(name, n)| format!("{name}={n}"))
             .collect();
         format!(
-            "model storage: {} ephemeral table trees, {} ephemeral index trees, {} cursors on \
+            "spec-model storage: {} ephemeral table trees, {} ephemeral index trees, {} cursors on \
              database trees, {} OpenDup cursors; steps: {}",
             TABLES.load(Ordering::Relaxed),
             INDEXES.load(Ordering::Relaxed),

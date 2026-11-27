@@ -31,11 +31,11 @@ pub enum DbKind {
     /// An ephemeral b-tree (`OpenEphemeral`, `OpenAutoindex`): no MVCC and no schema. The
     /// program writes the setup rows itself. `Layout` has no meaning for it.
     Ephemeral,
-    /// A `:model:` database: every tree, the schema tree too, is a tree of the in-memory
-    /// model of the contract (`core/storage/model`). It refuses a program that the contract
-    /// calls illegal with a panic that starts with `unsupported:`. `Layout` has no meaning
-    /// for it.
-    Model,
+    /// A `:spec-model:` database: every tree, the schema tree too, is a tree of the in-memory
+    /// spec-model of the contract (`core/storage/spec_model`). It refuses a program that the
+    /// contract calls illegal with a panic that starts with `unsupported:`. `Layout` has no
+    /// meaning for it.
+    SpecModel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,7 +97,7 @@ fn open_database(
     let db = match kind {
         DbKind::Wal | DbKind::Ephemeral => TempDatabase::new_empty(),
         DbKind::Mvcc => TempDatabase::new_with_mvcc("cursor_contract.db"),
-        DbKind::Model => TempDatabase::new_model(),
+        DbKind::SpecModel => TempDatabase::new_spec_model(),
     };
     let conn = db.connect_limbo();
     let sql = |text: &str| conn.execute(text).map_err(|e| format!("{text}: {e}"));
@@ -251,14 +251,15 @@ mod tests {
         Obs { jumped, rowid, col }
     }
 
-    /// Every engine and layout. Layout has no meaning for the ephemeral and model engines, so they run once.
+    /// Every engine and layout. Layout has no meaning for the ephemeral and spec-model
+    /// engines, so they run once.
     const CONFIGS: [(DbKind, Layout); 6] = [
         (DbKind::Wal, Layout::AllInMemory),
         (DbKind::Wal, Layout::Checkpointed),
         (DbKind::Mvcc, Layout::AllInMemory),
         (DbKind::Mvcc, Layout::Checkpointed),
         (DbKind::Ephemeral, Layout::AllInMemory),
-        (DbKind::Model, Layout::AllInMemory),
+        (DbKind::SpecModel, Layout::AllInMemory),
     ];
 
     /// Runs the program on every engine, layout and read mode and asserts that they all give
@@ -281,7 +282,7 @@ mod tests {
             for mode in modes {
                 let mode = *mode;
                 let got = run_mode(kind, layout, rows, ncursors, ops, mode);
-                if kind == DbKind::Model && refused_illegal(rows, ncursors, ops, &got) {
+                if kind == DbKind::SpecModel && refused_illegal(rows, ncursors, ops, &got) {
                     continue;
                 }
                 assert_eq!(
@@ -290,13 +291,13 @@ mod tests {
                     "{kind:?} / {layout:?} / {mode:?} differs for {ops:?}"
                 );
             }
-            // The model must agree with the engine on every hand-written scenario.
+            // The test model must agree with the engine on every hand-written scenario.
             model::assert_agrees_prefix(kind, layout, rows, ncursors, ops);
         }
     }
 
     /// Some hand-written scenarios pin what the engines do for an undefined sequence (for
-    /// example `Prev` after `SeekRowid`). The `:model:` engine refuses such a program, and
+    /// example `Prev` after `SeekRowid`). The `:spec-model:` engine refuses such a program, and
     /// that is its correct result.
     fn refused_illegal(
         rows: &[(i64, i64)],

@@ -356,7 +356,7 @@ pub fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:")
         || path.starts_with("file::memory:")
         || path.is_empty()
-        || path == crate::storage::tree_store::MODEL_PATH
+        || path == crate::storage::tree_store::SPEC_MODEL_PATH
 }
 
 /// Creates a read completion for database header reads that checks for short reads.
@@ -806,7 +806,7 @@ pub struct Database<
 > {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
     /// Where the trees live when they are not B-trees in the database pages
-    /// (`storage::tree_store`). `Some` only for a `:model:` database.
+    /// (`storage::tree_store`). `Some` only for a `:spec-model:` database.
     pub(crate) tree_storage: Option<Arc<dyn crate::storage::tree_store::TreeStorage>>,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
