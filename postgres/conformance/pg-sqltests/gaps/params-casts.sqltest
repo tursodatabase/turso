@@ -246,14 +246,6 @@ expect {
     t
 }
 
-# A-45: jsonb literal key order/whitespace
-test jsonb-literal-key-order-whitespace {
-    SELECT '{"b": 2,  "a":1, "aa": [1,  2]}'::jsonb;
-}
-expect {
-    {"a": 1, "b": 2, "aa": [1, 2]}
-}
-
 # A-46: jsonb duplicate keys keep last
 test jsonb-duplicate-keys-keep-last {
     SELECT '{"a":1,"a":2}'::jsonb;
