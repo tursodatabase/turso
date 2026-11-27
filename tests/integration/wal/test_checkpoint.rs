@@ -515,9 +515,11 @@ fn test_wal_restart_blocks_readers() {
     // now that we have some frames to checkpoint, try again
     conn2.get_pager().begin_read_tx().unwrap();
     let p = conn1.get_pager();
-    let w = p.wal().unwrap();
+    // The WAL is restarted only after the checkpoint synced the database
+    // file, by the pager, so the pager checkpoint is the one that finds the
+    // reader.
     loop {
-        match w.checkpoint(&p, CheckpointMode::Restart, SyncMode::Full) {
+        match p.checkpoint(CheckpointMode::Restart, SyncMode::Full, true) {
             Ok(IOResult::IO(io)) => {
                 io.wait(db.io.as_ref()).unwrap();
             }
@@ -529,6 +531,7 @@ fn test_wal_restart_blocks_readers() {
                     matches!(*e, LimboError::Busy),
                     "should return busy if we have readers"
                 );
+                p.cleanup_after_checkpoint_failure();
                 break;
             }
         }

@@ -12,6 +12,7 @@
 
 use super::test_db::MvccTestDbNoConn;
 use crate::common::{ExecRows, SyncCountingIo, TempDatabase};
+use crate::unreliable_io::UnreliableIo;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6513,4 +6514,116 @@ fn checkpoint_with_queued_log_truncate_resets_log_offset() {
         get_rows(&conn, "SELECT id, v FROM t"),
         vec![vec![Value::from_i64(1), Value::build_text("a")]]
     );
+}
+
+/// A Truncate or Restart checkpoint whose fsync of the database file fails must keep the WAL
+/// frames it copied until a later fsync of the database file succeeds. The failed fsync drops
+/// the copied pages, so the retried checkpoint has to copy the frames again. If it truncates
+/// the logical log and the WAL without that, the committed rows exist nowhere on disk.
+#[test]
+fn checkpoint_retried_after_failed_db_fsync_keeps_committed_rows() {
+    for mode in ["TRUNCATE", "RESTART"] {
+        let db_path = format!("mvcc-ckpt-failed-db-fsync-{mode}.db");
+        let io = Arc::new(UnreliableIo::new());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            &db_path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        // The tests go on after the failed fsync, which needs the retry policy.
+        conn.execute("PRAGMA data_sync_retry = 1").unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+        let expected = vec![
+            vec![Value::from_i64(1), Value::build_text("a")],
+            vec![Value::from_i64(2), Value::build_text("b")],
+            vec![Value::from_i64(3), Value::build_text("c")],
+        ];
+
+        io.fail_next_sync(&db_path);
+        assert!(
+            conn.execute(format!("PRAGMA wal_checkpoint({mode})"))
+                .is_err(),
+            "{mode}: the checkpoint must report the failed fsync of the database file"
+        );
+        conn.execute(format!("PRAGMA wal_checkpoint({mode})"))
+            .unwrap();
+        assert_eq!(get_rows(&conn, "SELECT id, v FROM t ORDER BY id"), expected);
+
+        let (_dir, recovered) = io.crash_process_and_recover(&db_path).unwrap();
+        assert_eq!(
+            get_rows(&recovered, "SELECT id, v FROM t ORDER BY id"),
+            expected,
+            "{mode}: rows lost after a process crash"
+        );
+        assert_integrity_ok(&recovered);
+        let (_dir, recovered) = io.crash_now_and_recover(&db_path).unwrap();
+        assert_eq!(
+            get_rows(&recovered, "SELECT id, v FROM t ORDER BY id"),
+            expected,
+            "{mode}: rows lost after a power loss"
+        );
+    }
+}
+
+/// `PRAGMA journal_mode = 'wal'` on an MVCC database runs a Truncate checkpoint first. When the
+/// fsync of the database file in that checkpoint fails, the retried switch has to copy the WAL
+/// frames into the database file again before it truncates the WAL and the logical log.
+#[test]
+fn switch_to_wal_retried_after_failed_db_fsync_keeps_committed_rows() {
+    let db_path = "mvcc-switch-to-wal-failed-db-fsync.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    // The tests go on after the failed fsync, which needs the retry policy.
+    conn.execute("PRAGMA data_sync_retry = 1").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    let expected = vec![
+        vec![Value::from_i64(1), Value::build_text("a")],
+        vec![Value::from_i64(2), Value::build_text("b")],
+        vec![Value::from_i64(3), Value::build_text("c")],
+    ];
+
+    io.fail_next_sync(db_path);
+    assert!(
+        conn.execute("PRAGMA journal_mode = 'wal'").is_err(),
+        "the switch must report the failed fsync of the database file"
+    );
+    conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let (_dir, recovered) = io.crash_process_and_recover(db_path).unwrap();
+    assert_eq!(
+        get_rows(&recovered, "SELECT id, v FROM t ORDER BY id"),
+        expected
+    );
+    assert_integrity_ok(&recovered);
 }

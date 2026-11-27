@@ -1314,6 +1314,10 @@ enum CheckpointPhase {
         clear_page_cache: bool,
         max_frame: u64,
     },
+    /// Restart the WAL (RESTART and TRUNCATE checkpoint modes only).
+    /// This must happen AFTER SyncDbFile: until the database file is synced, the WAL
+    /// frames are the only durable copy of the backfilled pages.
+    RestartLog { clear_page_cache: bool },
     /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
     /// This must happen AFTER SyncDbFile to ensure data durability.
     TruncateWalFile { clear_page_cache: bool },
@@ -5204,8 +5208,8 @@ impl Pager {
                 },
             };
         }
-        if matches!(mode, CheckpointMode::Truncate { .. }) {
-            CheckpointPhase::TruncateWalFile { clear_page_cache }
+        if mode.should_restart_log() {
+            CheckpointPhase::RestartLog { clear_page_cache }
         } else {
             CheckpointPhase::Finalize { clear_page_cache }
         }
@@ -5302,7 +5306,11 @@ impl Pager {
                     } else if res.wal_checkpoint_backfilled == 0
                         || sync_mode == crate::SyncMode::Off
                     {
-                        state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                        state.phase = if mode.should_restart_log() {
+                            CheckpointPhase::RestartLog { clear_page_cache }
+                        } else {
+                            CheckpointPhase::Finalize { clear_page_cache }
+                        };
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                     }
@@ -5327,10 +5335,10 @@ impl Pager {
                     if should_skip_truncate_db_file {
                         let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
-                            // Skip DB sync, proceed to WAL truncation
-                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
+                            // Skip DB sync, proceed to the WAL restart and truncation
+                            state.phase = CheckpointPhase::RestartLog { clear_page_cache };
                         } else {
-                            // Sync DB first, then SyncDbFile will transition to TruncateWalFile
+                            // Sync DB first, then SyncDbFile will transition to RestartLog
                             state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                         }
                         continue;
@@ -5368,10 +5376,10 @@ impl Pager {
                         // No DB truncation needed (or unsupported size pre-check), move to next phase.
                         let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
-                            // Skip DB sync, proceed to WAL truncation
-                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
+                            // Skip DB sync, proceed to the WAL restart and truncation
+                            state.phase = CheckpointPhase::RestartLog { clear_page_cache };
                         } else {
-                            // Sync DB first, then SyncDbFile will transition to TruncateWalFile
+                            // Sync DB first, then SyncDbFile will transition to RestartLog
                             state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                         }
                         continue;
@@ -5564,6 +5572,19 @@ impl Pager {
                     };
                     self.checkpoint_state.write().phase = next_phase;
                     continue;
+                }
+                CheckpointPhase::RestartLog { clear_page_cache } => {
+                    let truncate = {
+                        let state = self.checkpoint_state.read();
+                        let result = state.result.as_ref().expect("result should be set");
+                        wal.restart_log_after_checkpoint(result)?;
+                        matches!(state.mode, Some(CheckpointMode::Truncate { .. }))
+                    };
+                    self.checkpoint_state.write().phase = if truncate {
+                        CheckpointPhase::TruncateWalFile { clear_page_cache }
+                    } else {
+                        CheckpointPhase::Finalize { clear_page_cache }
+                    };
                 }
                 CheckpointPhase::TruncateWalFile { clear_page_cache } => {
                     // Truncate WAL file after DB is safely synced - this ensures data durability.

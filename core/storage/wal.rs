@@ -761,6 +761,9 @@ pub trait Wal: Debug + Send + Sync {
     /// `sync_mode` controls the WAL durability barrier: unless it is
     /// [SyncMode::Off], the WAL is fsynced before any frame is backfilled so
     /// that a crash mid-backfill can always be healed by WAL recovery.
+    /// A RESTART or TRUNCATE checkpoint leaves the log as it is: the caller
+    /// syncs the database file and then calls
+    /// [Wal::restart_log_after_checkpoint] with the returned result.
     fn checkpoint(
         &self,
         pager: &Pager,
@@ -817,6 +820,16 @@ pub trait Wal: Debug + Send + Sync {
     /// Currently this is only used for MVCC as it takes care of write conflicts on its own.
     /// This should't be used with regular WAL mode.
     fn update_max_frame(&self);
+
+    /// Restart the log after a RESTART or TRUNCATE checkpoint that copied every frame into
+    /// the database file, so that the next writer writes from the start of the WAL.
+    /// `result` is that checkpoint's result and still holds its locks.
+    ///
+    /// Call it only after the database file was synced (or under synchronous=OFF). Until
+    /// then the WAL frames are the only durable copy of the copied pages: when the sync
+    /// fails, the OS may drop those pages, and a retried checkpoint must find the frames
+    /// in the WAL to copy them again.
+    fn restart_log_after_checkpoint(&self, result: &CheckpointResult) -> Result<()>;
 
     /// Truncate WAL file to zero and sync it. This is called AFTER the DB file has been
     /// synced during TRUNCATE checkpoint mode, ensuring data durability.
@@ -4838,6 +4851,27 @@ impl Wal for WalFile {
         self.max_frame.store(new_max_frame, Ordering::Release);
     }
 
+    fn restart_log_after_checkpoint(&self, result: &CheckpointResult) -> Result<()> {
+        turso_assert!(
+            matches!(result.maybe_guard, Some(CheckpointLocks::Writer { .. })),
+            "We must hold writer and checkpoint locks to restart the log",
+            { "checkpoint_guard": result.maybe_guard }
+        );
+        turso_assert!(
+            result.everything_backfilled(),
+            "the log can be restarted only after every frame was backfilled",
+            {
+                "wal_max_frame": result.wal_max_frame,
+                "wal_total_backfilled": result.wal_total_backfilled
+            }
+        );
+        self.restart_log()?;
+        // Frame numbers start again at 1, so a page cached from a frame of the
+        // old log must not match a frame with the same number in the new one.
+        self.increment_checkpoint_epoch();
+        Ok(())
+    }
+
     fn truncate_wal(
         &self,
         result: &mut CheckpointResult,
@@ -5234,15 +5268,17 @@ impl WalFile {
                         return Err(LimboError::Busy.into());
                     }
                     if mode.should_restart_log() {
-                        turso_assert!(
-                            matches!(
-                                *self.checkpoint_guard.read(),
-                                Some(CheckpointLocks::Writer { .. })
-                            ),
-                            "We must hold writer and checkpoint locks to restart the log",
-                            { "checkpoint_guard": *self.checkpoint_guard.read() }
-                        );
-                        self.restart_log()?;
+                        // The log is not restarted here. The pages just copied
+                        // are not durable in the database file until the caller
+                        // syncs it, and if that sync fails the OS may drop them;
+                        // a retried checkpoint must then find the frames in the
+                        // WAL to copy them again. The caller restarts the log
+                        // with `restart_log_after_checkpoint` once the sync
+                        // succeeded. Until then this connection reads every page
+                        // from the database file, which now holds all frames up
+                        // to `wal_max_frame`, as it would after the restart.
+                        self.max_frame.store(wal_max_frame, Ordering::Release);
+                        self.min_frame.store(wal_max_frame + 1, Ordering::Release);
                     }
                     ongoing_chkpt.state = CheckpointState::Finalize {
                         checkpoint_result: Some(checkpoint_result),
@@ -5255,9 +5291,6 @@ impl WalFile {
                     // This ensures data durability: if a crash occurs after WAL truncation
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
-                    if mode.should_restart_log() {
-                        Self::unlock_after_restart(&self.coordination, None);
-                    }
                     let mut checkpoint_result = {
                         let mut oc = self.ongoing_checkpoint.write();
                         let CheckpointState::Finalize {
@@ -5279,12 +5312,15 @@ impl WalFile {
                     // b. the max frame > 0 (we have something to truncate)
                     if checkpoint_result.should_truncate()
                         || checkpoint_result.wal_checkpoint_backfilled > 0
+                        || mode.should_restart_log()
                     {
                         // Backfilled frames are not globally durable until
                         // the pager syncs the DB file and publishes
                         // nbackfills. Keep the checkpoint guard through that
                         // tail so another writer cannot restart the WAL
-                        // generation underneath a pending publish.
+                        // generation underneath a pending publish. RESTART
+                        // and TRUNCATE restart the log in that tail, which
+                        // needs the writer lock.
                         checkpoint_result.maybe_guard = self.checkpoint_guard.write().take();
                     } else {
                         let _ = self.checkpoint_guard.write().take();
@@ -5391,10 +5427,13 @@ impl WalFile {
         result
     }
 
+    /// Restart the log so that the next writer writes from the start of the WAL.
+    /// Fails with `Busy`, and changes nothing, when a reader still uses the WAL.
     fn restart_log(&self) -> Result<()> {
         tracing::debug!("restart_log");
         let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
         self.apply_restart_snapshot(snapshot);
+        self.coordination.end_restart();
         Ok(())
     }
 
@@ -5446,18 +5485,6 @@ impl WalFile {
         self.min_frame.store(0, Ordering::Release);
         self.checkpoint_seq
             .store(snapshot.checkpoint_seq, Ordering::Release);
-    }
-
-    // unlock shared read locks taken by RESTART/TRUNCATE checkpoint modes
-    fn unlock_after_restart(coordination: &Arc<dyn WalCoordination>, e: Option<&LimboError>) {
-        coordination.end_restart();
-        if let Some(e) = e {
-            mark_unlikely();
-            tracing::debug!(
-                "Failed to restart WAL header: {:?}, releasing read locks",
-                e
-            );
-        }
     }
 
     fn acquire_proper_checkpoint_guard(
