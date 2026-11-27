@@ -3035,7 +3035,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
         conn.close().unwrap();
     }
 
-    let log_path = std::path::Path::new(&db_path_str).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(&db_path_str);
     overwrite_file_with_junk(&log_path, LOG_HDR_SIZE / 2, 0xAB);
     {
         let io = Arc::new(PlatformIO::new().unwrap());
@@ -3081,7 +3081,7 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
     }
     db.close();
 
-    let log_path = std::path::Path::new(&db_path).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(&db_path);
     std::fs::remove_file(&log_path).unwrap();
 
     let io = Arc::new(PlatformIO::new().unwrap());
@@ -3270,7 +3270,7 @@ fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path().to_string();
     let wal_path = wal_path_for_db(&db_path);
-    let log_path = std::path::Path::new(&db_path).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(&db_path);
 
     {
         let conn = db.connect();
@@ -8857,7 +8857,7 @@ fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
 fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
-    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(db.path());
 
     {
         let conn = db.connect();
@@ -9716,7 +9716,7 @@ fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
     conn.execute("INSERT INTO secret_items VALUES (1, 'secret-alpha')")
         .unwrap();
 
-    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(db.path());
     let log_bytes = std::fs::read(log_path).unwrap();
     assert!(!bytes_contain(&log_bytes, b"secret_items"));
     assert!(!bytes_contain(&log_bytes, b"secret-alpha"));
@@ -11244,7 +11244,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
     }
 
     // Step 3: re-open with the busy-on-log_tx storage wrapper.
-    let log_path = path.with_extension("db-log");
+    let log_path = turso_core::logical_log_path(&path);
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let log_file = io
         .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
@@ -11513,7 +11513,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         conn.close().unwrap();
     }
 
-    let log_path = path.with_extension("db-log");
+    let log_path = turso_core::logical_log_path(&path);
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let log_file = io
         .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
@@ -12925,7 +12925,7 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
 }
 
 fn overwrite_log_header_byte(path: &str, offset: u64, value: u8) {
-    let log_path = std::path::Path::new(path).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(path);
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -13533,7 +13533,7 @@ fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
 
     // --- Verify the raw log file is encrypted (no plaintext leakage) ---
     {
-        let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+        let log_path = turso_core::logical_log_path(db.path());
         let log_bytes = std::fs::read(&log_path).expect("MVCC log file should exist");
         assert!(
             log_bytes.len() > 56,
@@ -13597,7 +13597,7 @@ fn test_encrypted_recovery_large_payload_multi_chunk() {
             .unwrap();
     }
 
-    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(db.path());
     assert!(log_path.exists(), "db-log should exist before restart");
     assert_log_payloads_decrypt(&log_path, hex_key, turso_core::CipherMode::Aes256Gcm);
 
@@ -13619,7 +13619,7 @@ fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let large_value = "z".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
-    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(db.path());
 
     {
         let conn = db.connect();
@@ -13680,7 +13680,7 @@ fn test_encrypted_recovery_checkpoint_then_more_writes() {
         conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
     }
 
-    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(db.path());
     assert!(log_path.exists(), "db-log file should exist before restart");
     assert_log_payloads_decrypt(&log_path, hex_key, turso_core::CipherMode::Aes256Gcm);
 
@@ -13701,7 +13701,7 @@ fn test_encrypted_recovery_checkpoint_then_more_writes() {
 fn test_encrypted_recovery_multiple_restart_cycles() {
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
-    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(db.path());
 
     // Cycle 1: create table + insert
     {
@@ -13739,7 +13739,7 @@ fn test_encrypted_recovery_multiple_restart_cycles() {
 fn test_encrypted_recovery_corrupted_ciphertext() {
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
-    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    let log_path = turso_core::logical_log_path(db.path());
 
     // Write two transactions: checkpoint the first, leave the second only in the log.
     {

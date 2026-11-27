@@ -216,8 +216,7 @@ fn create_main_db_wal_path(main_db_path: &str) -> String {
     format!("{main_db_path}-wal")
 }
 fn create_main_db_log_path(main_db_path: &str) -> String {
-    std::path::Path::new(main_db_path)
-        .with_extension("db-log")
+    turso_core::logical_log_path(main_db_path)
         .to_string_lossy()
         .to_string()
 }
@@ -3611,7 +3610,7 @@ mod tests {
                 "replica.sqlite-wal-revert",
                 "replica.sqlite-info",
                 "replica.sqlite-changes",
-                "replica.db-log",
+                "replica.sqlite-log",
                 "replica.sqlite-replace-base-apply",
                 "replica.sqlite-replace-base-apply-main-db.backup",
                 "replica.sqlite-replace-base-apply-main-wal.backup",

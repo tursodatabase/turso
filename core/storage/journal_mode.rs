@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use std::path::{Path, PathBuf};
 
 use crate::storage::sqlite3_ondisk::Version;
 use crate::{alloc::DynAllocator, mvcc, LimboError, MvStore, OpenFlags, Result, IO};
@@ -56,15 +57,11 @@ impl From<Version> for JournalMode {
     }
 }
 
-pub fn logical_log_exists(db_path: impl AsRef<std::path::Path>) -> bool {
-    let db_path = db_path.as_ref();
-    let log_path = db_path.with_extension("db-log");
-    std::path::Path::exists(log_path.as_path()) && log_path.as_path().metadata().unwrap().len() > 0
-}
-
+/// Opens the MVCC store whose logical log is at `log_path`. A custom
+/// `durable_storage` replaces the log file, and then `log_path` is not used.
 pub fn open_mv_store(
     io: Arc<dyn IO>,
-    db_path: impl AsRef<std::path::Path>,
+    log_path: &Path,
     flags: OpenFlags,
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
@@ -86,8 +83,6 @@ pub fn open_mv_store(
         if let Some(storage) = durable_storage {
             storage
         } else {
-            let db_path = db_path.as_ref();
-            let log_path = db_path.with_extension("db-log");
             let string_path = log_path
                 .as_os_str()
                 .to_str()
@@ -106,4 +101,22 @@ pub fn open_mv_store(
         allocator,
         experimental_mvcc_passive_checkpoint,
     )?))
+}
+
+/// Returns the path of the MVCC logical log of the database at `db_path`: the
+/// full file name followed by `-log`, as for the `-wal` file. For `app.db`,
+/// the log is `app.db-log`.
+pub fn logical_log_path(db_path: impl AsRef<Path>) -> PathBuf {
+    sidecar_path(db_path.as_ref(), "-log")
+}
+
+/// Returns true if `path` is a file of one byte or more.
+pub fn file_has_data(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0)
+}
+
+fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
 }

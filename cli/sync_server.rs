@@ -1368,7 +1368,7 @@ impl MvccLogSnapshot {
 }
 
 fn logical_log_path(db_path: &str) -> Result<PathBuf> {
-    Ok(db_file_path(db_path)?.with_extension("db-log"))
+    Ok(turso_core::logical_log_path(db_file_path(db_path)?))
 }
 
 fn is_in_memory_db_path(db_path: &str) -> bool {
@@ -2645,7 +2645,7 @@ mod tests {
         let log1 = logical_log_path(&db1.to_string_lossy()).unwrap();
         let log2 = logical_log_path(&db2.to_string_lossy()).unwrap();
         assert_ne!(log1, log2, "databases must not share a logical log");
-        assert_eq!(log1, Path::new("/tmp/dbs/db1/data.db-log"));
+        assert_eq!(log1, Path::new("/tmp/dbs/db1/data-log"));
     }
 
     const TEST_MAX_OPEN: usize = 4;

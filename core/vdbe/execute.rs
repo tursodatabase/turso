@@ -19643,7 +19643,7 @@ fn op_journal_mode_inner(
                     let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                     let mv_store = journal_mode::open_mv_store(
                         pager.io.clone(),
-                        &db_path,
+                        &journal_mode::logical_log_path(&db_path),
                         connection.db.open_flags,
                         connection.db.durable_storage.clone(),
                         enc_ctx,

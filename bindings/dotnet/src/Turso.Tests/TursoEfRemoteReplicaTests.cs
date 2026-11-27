@@ -411,7 +411,7 @@ public sealed class TursoEfRemoteReplicaTests
             replicaPath + "-journal",
             replicaPath + "-wal",
             replicaPath + "-shm",
-            Path.ChangeExtension(replicaPath, ".db-log"),
+            replicaPath + "-log",
             replicaPath + "-wal-revert",
             replicaPath + "-info",
             replicaPath + "-changes",

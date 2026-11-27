@@ -260,7 +260,7 @@ public class TursoSqliteDatabaseCreator(
         if (!includeReplicaSidecars)
             return;
 
-        File.Delete(Path.ChangeExtension(fullPath, ".db-log"));
+        File.Delete(fullPath + "-log");
         File.Delete(fullPath + "-wal-revert");
         File.Delete(fullPath + "-info");
         File.Delete(fullPath + "-changes");

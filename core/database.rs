@@ -515,13 +515,12 @@ enum HeaderValidationState {
     },
     /// Pager created; (re-entrant) header reads + validation. Holds the owned
     /// `Pager` because `set_wal` needs `&mut Pager`; it is `Arc`-wrapped only
-    /// once validation completes. `is_readonly`/`log_exists` are captured in
-    /// `Start` (before the autovacuum check may force ReadOnly) so re-entry
-    /// observes the original values.
+    /// once validation completes. `is_readonly` is captured in `Start`
+    /// (before the autovacuum check may force ReadOnly) so re-entry observes
+    /// the original value.
     Validate {
         pager: Box<Pager>,
         is_readonly: bool,
-        log_exists: bool,
     },
     /// A modified header (e.g. Legacy→WAL conversion) must be written to disk
     /// before the WAL is attached. `completion` is the in-flight write.
@@ -2197,23 +2196,15 @@ impl Database {
                     // `is_readonly` across the `_init` yields is stable.
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
-                    let log_exists =
-                        journal_mode::logical_log_exists(std::path::Path::new(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
                     turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
                     *st = HeaderValidationState::Validate {
                         pager: Box::new(pager),
                         is_readonly,
-                        log_exists,
                     };
                 }
-                HeaderValidationState::Validate {
-                    pager,
-                    is_readonly,
-                    log_exists,
-                } => {
+                HeaderValidationState::Validate { pager, is_readonly } => {
                     let is_readonly = *is_readonly;
-                    let log_exists = *log_exists;
 
                     // Re-entrant reads: both `with_header` and `from_pager`
                     // resume via their own state machines, and the autovacuum
@@ -2379,7 +2370,9 @@ impl Database {
                     // In WAL mode, a logical log is always unexpected.
                     // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
                     // recovery and is reconciled in MvStore::bootstrap().
-                    if !open_mv_store && log_exists {
+                    if !open_mv_store
+                        && journal_mode::file_has_data(&journal_mode::logical_log_path(&self.path))
+                    {
                         return Err(LimboError::Corrupt(format!(
                             "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
                             self.path
@@ -2556,7 +2549,7 @@ impl Database {
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                         let mv_store = journal_mode::open_mv_store(
                             self.io.clone(),
-                            &canonical_path,
+                            &journal_mode::logical_log_path(&canonical_path),
                             self.open_flags,
                             self.durable_storage.clone(),
                             enc_ctx,
@@ -2638,12 +2631,11 @@ impl Database {
         if let Some(context) = encryption_context.as_ref() {
             self.validate_external_restore_wal(&new_shared_wal.read(), context)?;
         }
-        let new_mv_store = if self.mvcc_enabled()
-            || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
-        {
+        let log_path = journal_mode::logical_log_path(&self.path);
+        let new_mv_store = if self.mvcc_enabled() || journal_mode::file_has_data(&log_path) {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
-                &self.path,
+                &log_path,
                 self.open_flags,
                 self.durable_storage.clone(),
                 encryption_context.clone(),
