@@ -3,8 +3,8 @@
 use super::oid::{oid_coerce, oid_input};
 use crate::error::sqlstate_error;
 use turso_core::ast;
-use turso_core::types::{Conversion, StorageClass, Type};
-use turso_core::{Numeric, Result, Value};
+use turso_core::types::{Conversion, StorageClass, TextInput, Type};
+use turso_core::{LimboError, Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_NAME, SQLSTATE_SYNTAX_ERROR,
 };
@@ -29,6 +29,10 @@ impl Type for RegClass {
         "integer"
     }
 
+    fn input(&self) -> Option<TextInput> {
+        Some(regclass_input)
+    }
+
     fn coerce(&self) -> Option<Conversion> {
         Some(Conversion::Function(oid_coerce))
     }
@@ -36,6 +40,18 @@ impl Type for RegClass {
     fn reads_as(&self) -> Option<StorageClass> {
         Some(StorageClass::Integer)
     }
+}
+
+/// The oid of the relation that `text` names, as the input function of
+/// regclass reads it. It looks the relation up, so it needs a connection.
+fn regclass_input(
+    connection: Option<&std::sync::Arc<turso_core::Connection>>,
+    text: &str,
+) -> Result<Value> {
+    let connection = connection.ok_or_else(|| {
+        LimboError::InternalError("the input of regclass needs a connection".to_string())
+    })?;
+    crate::catalog::regclass_oid_of_text(connection, text).map(Value::from_i64)
 }
 
 /// What the text of a regclass says.

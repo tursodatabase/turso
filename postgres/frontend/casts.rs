@@ -8,7 +8,7 @@
 //! Nothing here reads a statement: `resolve` and `convert` take the types as
 //! `CastType`. cast_planning.rs finds the `CastType` of an expression.
 
-use crate::catalog::{regclass_oid_of_text, regclass_text};
+use crate::catalog::regclass_text;
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text};
 use crate::pg_type::{check_oid_range, type_input};
@@ -254,24 +254,14 @@ pub(crate) fn convert(
     if target.is_float() {
         return to_float(value, source, target);
     }
-    if target == Oid {
+    if target == Oid || target == RegClass {
         return to_oid(value, source);
-    }
-    if target == RegClass {
-        return to_regclass(connection, value, source);
     }
     match target {
         Text => to_text(connection, value, source),
         Bool => to_bool(value),
         _ => Ok(value.clone()),
     }
-}
-
-fn to_regclass(connection: &Arc<Connection>, value: &Value, source: CastType) -> Result<Value> {
-    let Value::Text(text) = value else {
-        return to_oid(value, source);
-    };
-    regclass_oid_of_text(connection, text.as_str()).map(Value::from_i64)
 }
 
 fn to_oid(value: &Value, source: CastType) -> Result<Value> {
