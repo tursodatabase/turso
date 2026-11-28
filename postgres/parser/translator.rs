@@ -1791,6 +1791,25 @@ impl PostgreSQLTranslator {
                 }
             }
             Some(Node::String(s)) => ast::QualifiedName::single(exact_name(s.sval.clone())),
+            // PostgreSQL never drops the element type here: DROP TYPE on
+            // `t[]` fails because `t` requires its array type, and DROP DOMAIN
+            // on it fails because an array type is not a domain. Turso has no
+            // array types for user-defined types to report these errors on.
+            Some(Node::TypeName(tn)) if !tn.array_bounds.is_empty() => {
+                return Err(ParseError::not_supported(format!(
+                    "DROP {} on an array type",
+                    drop_object_type_name(remove_type)
+                )));
+            }
+            // PostgreSQL looks the type up first and then refuses the modifier
+            // with 42601, so a missing type still gets 42704, or is skipped
+            // with IF EXISTS. The parser cannot tell if the type exists.
+            Some(Node::TypeName(tn)) if !tn.typmods.is_empty() => {
+                return Err(ParseError::not_supported(format!(
+                    "DROP {} with a type modifier",
+                    drop_object_type_name(remove_type)
+                )));
+            }
             Some(Node::TypeName(tn)) => ast::QualifiedName::single(exact_name(object_name(
                 &tn.names,
                 is_default_schema,

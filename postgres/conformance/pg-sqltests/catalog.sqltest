@@ -151,6 +151,19 @@ expect {
     catalog_posint|d|23|2200
 }
 
+# A domain is a type, so DROP TYPE drops it.
+test catalog-drop-type-drops-a-domain {
+    CREATE DOMAIN catalog_dropped AS int CHECK (VALUE > 0);
+    DROP TYPE catalog_dropped;
+    SELECT count(*) FROM pg_type WHERE typname = 'catalog_dropped';
+    CREATE DOMAIN catalog_dropped AS int;
+    SELECT count(*) FROM pg_type WHERE typname = 'catalog_dropped';
+}
+expect {
+    0
+    1
+}
+
 test catalog-pg-attribute-enum-and-domain-columns {
     CREATE TYPE catalog_color AS ENUM ('red', 'blue');
     CREATE DOMAIN catalog_age AS integer;

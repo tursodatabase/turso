@@ -58,6 +58,8 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
         | LimboError::InvalidArgument(..)
         | LimboError::ParseError(..)
         | LimboError::DependentObjects(..)
+        | LimboError::UndefinedObject { .. }
+        | LimboError::WrongObjectType(_)
         | LimboError::TxError(..)
         | LimboError::TransactionAlreadyActive
         | LimboError::NoActiveTransaction { .. }

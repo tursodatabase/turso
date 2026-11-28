@@ -1202,3 +1202,100 @@ expect {
 }
 @sqlstate 42P01
 expect @tursopg error {}
+
+# DROP TYPE and DROP DOMAIN on an array type never drop its element type.
+# Turso has no array types for user-defined types, so it refuses them.
+@compat-gap "syntax:drop-type"
+test drop-type-on-the-array-of-a-domain {
+    CREATE DOMAIN gap_dn AS int;
+    DROP TYPE gap_dn[];
+}
+@sqlstate 2BP01
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-type"
+test drop-type-if-exists-on-the-array-of-a-domain {
+    CREATE DOMAIN gap_dn AS int;
+    DROP TYPE IF EXISTS gap_dn[][];
+}
+@sqlstate 2BP01
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-type"
+test drop-type-on-the-array-of-an-enum {
+    CREATE TYPE gap_e AS ENUM ('a');
+    DROP TYPE gap_e[3];
+}
+@sqlstate 2BP01
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-type"
+test drop-type-if-exists-on-the-array-of-a-missing-type {
+    DROP TYPE IF EXISTS gap_missing[];
+    SELECT 1;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-domain"
+test drop-domain-on-the-array-of-a-domain {
+    CREATE DOMAIN gap_dn AS int;
+    DROP DOMAIN gap_dn[];
+}
+@sqlstate 42809
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# PostgreSQL refuses a type modifier in DROP TYPE and DROP DOMAIN only after
+# it finds the type, so a missing type is skipped with IF EXISTS. Turso
+# refuses the modifier before it looks the type up.
+@compat-gap "syntax:drop-type"
+test drop-type-with-a-modifier-on-a-domain {
+    CREATE DOMAIN gap_dn AS int;
+    DROP TYPE gap_dn(5);
+}
+@sqlstate 42601
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-type"
+test drop-type-with-a-modifier-on-an-enum {
+    CREATE TYPE gap_e AS ENUM ('a');
+    DROP TYPE gap_e(1);
+}
+@sqlstate 42601
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-type"
+test drop-type-if-exists-with-a-modifier-on-a-missing-type {
+    DROP TYPE IF EXISTS gap_missing(5);
+    SELECT 1;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:drop-domain"
+test drop-domain-with-a-modifier-on-a-domain {
+    CREATE DOMAIN gap_dn AS int;
+    DROP DOMAIN gap_dn(3);
+}
+@sqlstate 42601
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}

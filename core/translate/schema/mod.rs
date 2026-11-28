@@ -3128,18 +3128,29 @@ pub fn translate_drop_type(
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!("no such {kind}: {normalized_name}");
+        return Err(LimboError::UndefinedObject {
+            kind,
+            name: normalized_name,
+        });
     }
 
     let type_def = type_def.unwrap();
 
     // Validate that DROP TYPE targets a type and DROP DOMAIN targets a domain
-    let target_is_domain = type_def.is_domain;
-    if is_domain_drop && !target_is_domain {
-        bail_parse_error!("{normalized_name} is a type, not a domain. Use DROP TYPE instead");
-    }
-    if !is_domain_drop && target_is_domain {
-        bail_parse_error!("{normalized_name} is a domain, not a type. Use DROP DOMAIN instead");
+    let target_kind = if type_def.is_domain { "domain" } else { "type" };
+    let kind_refused = if is_domain_drop {
+        !type_def.is_domain
+    } else {
+        type_def.is_domain && !resolver.catalog.dialect.drop_type_drops_domains()
+    };
+    if kind_refused {
+        return Err(LimboError::WrongObjectType(Box::new(
+            crate::error::WrongObjectType {
+                name: normalized_name,
+                kind: target_kind,
+                expected: kind,
+            },
+        )));
     }
 
     // Check if built-in type

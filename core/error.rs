@@ -84,6 +84,17 @@ pub struct DependentObjects {
     pub dependents: Vec<String>,
 }
 
+/// A DROP of one kind of object that named an object of another kind.
+#[derive(Debug, Clone)]
+pub struct WrongObjectType {
+    /// The name of the object.
+    pub name: String,
+    /// The kind of the object, such as `type`.
+    pub kind: &'static str,
+    /// The kind of object that the DROP expects, such as `domain`.
+    pub expected: &'static str,
+}
+
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
@@ -235,6 +246,14 @@ pub enum LimboError {
     Dialect(Box<DialectError>),
     #[error("cannot drop {} because other objects depend on it: {}", .0.dropped, .0.dependents.join(", "))]
     DependentObjects(Box<DependentObjects>),
+    /// A statement named an object that does not exist. `kind` is the kind
+    /// of object the statement expects, such as `type` or `domain`.
+    #[error("no such {kind}: {name}")]
+    UndefinedObject { kind: &'static str, name: String },
+    /// A DROP of one kind of object, such as `domain`, named an object of
+    /// another kind, such as `type`.
+    #[error("{} is a {}, not a {}. Use DROP {} instead", .0.name, .0.kind, .0.expected, .0.kind.to_ascii_uppercase())]
+    WrongObjectType(Box<WrongObjectType>),
 }
 
 impl LimboError {

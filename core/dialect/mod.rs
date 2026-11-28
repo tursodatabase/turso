@@ -596,6 +596,15 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `DROP TYPE` drops a domain.
+    ///
+    /// PostgreSQL treats a domain as a type, so `DROP TYPE` drops it, and
+    /// only `DROP DOMAIN` checks the kind of its target. Turso's SQLite
+    /// frontend refuses `DROP TYPE` on a domain and asks for `DROP DOMAIN`.
+    fn drop_type_drops_domains(&self) -> bool {
+        false
+    }
+
     /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
     /// in its indexed terms.
     ///

@@ -399,6 +399,7 @@ test domain-drop-type-on-domain-error {
     DROP TYPE my_domain;
 }
 expect error {
+    my_domain is a domain, not a type. Use DROP DOMAIN instead
 }
 
 @requires custom_types "uses CREATE DOMAIN"
@@ -407,6 +408,7 @@ test domain-drop-domain-on-type-error {
     DROP DOMAIN my_type;
 }
 expect error {
+    my_type is a type, not a domain. Use DROP TYPE instead
 }
 
 

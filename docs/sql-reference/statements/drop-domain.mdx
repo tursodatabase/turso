@@ -59,6 +59,8 @@ DROP TYPE my_domain;
 -- Error: 'my_domain' is a domain, not a type. Use DROP DOMAIN instead
 ```
 
+The PostgreSQL frontend follows PostgreSQL, where a domain is a type: DROP TYPE drops a domain. DROP DOMAIN on a type that is not a domain is still an error.
+
 ## Examples
 
 ### Drop a Domain
