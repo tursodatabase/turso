@@ -811,6 +811,18 @@ impl Value {
         }
     }
 
+    pub fn is_nan(&self) -> bool {
+        matches!(self, Self::Numeric(Numeric::Float(f)) if f.is_nan())
+    }
+
+    /// Makes a NaN into NULL when NaN is not a value in this binary.
+    #[inline]
+    pub(crate) fn apply_nan_rule(&mut self) {
+        if self.is_nan() && !crate::dialect::linked::nan_is_a_value() {
+            *self = Value::Null;
+        }
+    }
+
     pub const fn from_i64(i: i64) -> Self {
         Self::Numeric(Numeric::Integer(i))
     }
