@@ -1130,10 +1130,19 @@ fn op_comparison_slow(
     // converted values are only compared, and the registers keep their values:
     // other instructions read them too, such as the other uses of a constant,
     // or the record of a row that a CHECK constraint compares a column of.
-    let (new_lhs, new_rhs) = (
-        affinity.convert_for_compare(lhs_value),
-        affinity.convert_for_compare(rhs_value),
-    );
+    // Like SQLite's OP_Eq, TEXT affinity turns a number into text only when
+    // the other side is text, so two numbers are still compared as numbers.
+    let skip_conversion = affinity == Affinity::Text
+        && !matches!(lhs_value, Value::Text(_))
+        && !matches!(rhs_value, Value::Text(_));
+    let (new_lhs, new_rhs) = if skip_conversion {
+        (None, None)
+    } else {
+        (
+            affinity.convert_for_compare(lhs_value),
+            affinity.convert_for_compare(rhs_value),
+        )
+    };
 
     let lhs_for_compare = new_lhs
         .as_ref()

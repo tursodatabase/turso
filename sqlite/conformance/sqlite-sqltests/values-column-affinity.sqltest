@@ -1,0 +1,355 @@
+@database :memory:
+
+# A column of a VALUES list gets its affinity from its expressions, like a
+# SELECT column does, so a CAST to TEXT or a subquery that reads a TEXT column
+# makes the text be compared as text. SQLite turns a multi-row VALUES list
+# into a UNION ALL of its rows when a row is not constant or the row before it
+# has an affinity; other rows are read by a co-routine, whose column has no
+# affinity. A derived table combines the affinities of all those parts. A
+# scalar or IN subquery uses the last part.
+
+setup tables {
+    CREATE TABLE tt(x TEXT);
+    INSERT INTO tt VALUES ('20');
+    CREATE TABLE ti(n INTEGER);
+    INSERT INTO ti VALUES (20);
+}
+
+test derived-table-cast-to-text {
+    SELECT column1 = 20 FROM (VALUES (CAST('20' AS TEXT)));
+}
+expect {
+    1
+}
+
+@setup tables
+test derived-table-subquery-reads-text-column {
+    SELECT column1 = 20 FROM (VALUES ((SELECT x FROM tt)));
+}
+expect {
+    1
+}
+
+test derived-table-plain-text-has-no-affinity {
+    SELECT column1 = 20 FROM (VALUES ('20'));
+}
+expect {
+    0
+}
+
+test derived-table-second-column {
+    SELECT column2 = 20 FROM (VALUES (1, CAST('20' AS TEXT)));
+}
+expect {
+    1
+}
+
+test derived-table-integer-column-converts-text {
+    SELECT column1 = '20' FROM (VALUES (CAST(20 AS INTEGER)));
+}
+expect {
+    1
+}
+
+test cte-cast-to-text {
+    WITH c(v) AS (VALUES (CAST('20' AS TEXT))) SELECT v = 20 FROM c;
+}
+expect {
+    1
+}
+
+test materialized-cte-cast-to-text {
+    WITH c(v) AS MATERIALIZED (VALUES (CAST('20' AS TEXT))) SELECT v = 20 FROM c;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test view-cast-to-text {
+    CREATE VIEW v1 AS VALUES (CAST('20' AS TEXT));
+    SELECT column1 = 20 FROM v1;
+}
+expect {
+    1
+}
+
+test first-row-text-then-text {
+    SELECT column1 = 20 FROM (VALUES (CAST('20' AS TEXT)), ('x'));
+}
+expect {
+    1
+    0
+}
+
+test first-row-text-then-integer-has-no-affinity {
+    SELECT column1 = 20 FROM (VALUES (CAST('20' AS TEXT)), (5));
+}
+expect {
+    0
+    0
+}
+
+test first-row-integer-then-text-has-no-affinity {
+    SELECT column1 = '20' FROM (VALUES (CAST(20 AS INTEGER)), ('a'));
+}
+expect {
+    0
+    0
+}
+
+test each-column-combines-its-own-rows {
+    SELECT column1 = 20, column2 = 20
+    FROM (VALUES (CAST('20' AS TEXT), '20'), ('20', CAST('20' AS TEXT)));
+}
+expect {
+    1|1
+    1|1
+}
+
+test every-row-cast-to-text {
+    SELECT column1 = 20 FROM (VALUES (CAST('20' AS TEXT)), (CAST('20' AS TEXT))) LIMIT 1;
+}
+expect {
+    1
+}
+
+test later-rows-read-by-co-routine-have-no-affinity {
+    SELECT column1 = 20 FROM (VALUES (CAST('20' AS TEXT)), ('a'), ('b'));
+}
+expect {
+    0
+    0
+    0
+}
+
+test text-rows-after-two-cast-rows {
+    SELECT column1 = 20 FROM (VALUES (CAST('20' AS TEXT)), (CAST('20' AS TEXT)), ('a'));
+}
+expect {
+    1
+    1
+    0
+}
+
+test cast-only-in-a-later-constant-row-is-ignored {
+    SELECT column1 = 20 FROM (VALUES ('x'), (CAST('20' AS TEXT)));
+}
+expect {
+    0
+    0
+}
+
+test null-first-row-then-cast {
+    SELECT column1 = 20 FROM (VALUES (NULL), (CAST('20' AS TEXT)), (3));
+}
+expect {
+
+    0
+    0
+}
+
+@setup tables
+test later-subquery-row-gives-its-affinity {
+    SELECT column1 = 20 FROM (VALUES ('x'), ((SELECT x FROM tt)));
+}
+expect {
+    0
+    1
+}
+
+@setup tables
+test later-subquery-row-gives-integer-affinity {
+    SELECT column1 = '20' FROM (VALUES (5), ((SELECT n FROM ti)));
+}
+expect {
+    0
+    1
+}
+
+@setup tables
+test subquery-row-after-co-routine-rows {
+    SELECT column1 = 20 FROM (VALUES ('x'), ('y'), ((SELECT x FROM tt)));
+}
+expect {
+    0
+    0
+    0
+}
+
+@setup tables
+test cast-row-after-subquery-row {
+    SELECT column1 = 20 FROM (VALUES ('a'), ((SELECT x FROM tt)), (CAST('20' AS TEXT)));
+}
+expect {
+    0
+    1
+    1
+}
+
+@setup tables
+test every-row-is-a-subquery {
+    SELECT column1 = 20 FROM (VALUES ((SELECT x FROM tt)), ((SELECT x FROM tt)));
+}
+expect {
+    1
+    1
+}
+
+test values-as-first-select-of-a-compound {
+    SELECT column1 = 20 FROM (VALUES (CAST('20' AS TEXT)) UNION ALL SELECT 'y');
+}
+expect {
+    1
+    0
+}
+
+@setup tables
+test in-subquery-reads-derived-table {
+    SELECT 20 IN (SELECT column1 FROM (VALUES (CAST('20' AS TEXT)))),
+           (SELECT count(*) FROM ti WHERE n IN (SELECT column1 FROM (VALUES (CAST('20' AS TEXT)))));
+}
+expect {
+    1|1
+}
+
+@setup tables
+test join-on-derived-table {
+    SELECT ti.n FROM ti JOIN (VALUES (CAST('20' AS TEXT))) v ON v.column1 = ti.n;
+}
+expect {
+    20
+}
+
+test scalar-subquery-single-row {
+    SELECT (VALUES (CAST('20' AS TEXT))) = 20;
+}
+expect {
+    1
+}
+
+test scalar-subquery-uses-the-last-row {
+    SELECT (VALUES (CAST('20' AS TEXT)), ('x')) = 20,
+           (VALUES (CAST('20' AS TEXT)), (CAST('21' AS TEXT))) = 20,
+           (VALUES (CAST('20' AS TEXT)), (5)) = 20;
+}
+expect {
+    0|1|0
+}
+
+test scalar-subquery-co-routine-rows-have-no-affinity {
+    SELECT (VALUES ('20'), (CAST('21' AS TEXT))) = 20,
+           (VALUES (CAST('20' AS TEXT)), ('a'), ('b')) = 20;
+}
+expect {
+    0|0
+}
+
+test in-values-single-row {
+    SELECT 20 IN (VALUES (CAST('20' AS TEXT)));
+}
+expect {
+    1
+}
+
+test in-values-uses-the-last-row {
+    SELECT 20 IN (VALUES (CAST('20' AS TEXT)), ('x')),
+           20 IN (VALUES ('x'), ('y'), (CAST('20' AS TEXT))),
+           20 IN (VALUES (CAST('21' AS TEXT)), (CAST('20' AS TEXT)));
+}
+expect {
+    0|0|1
+}
+
+@cross-check-integrity
+test create-table-as-select-from-values {
+    CREATE TABLE c1 AS SELECT * FROM (VALUES (CAST('20' AS TEXT)));
+    SELECT sql FROM sqlite_schema WHERE name = 'c1';
+}
+expect {
+    CREATE TABLE c1(column1 TEXT)
+}
+
+@cross-check-integrity
+test create-table-as-values {
+    CREATE TABLE c2 AS VALUES (CAST('20' AS TEXT), 5);
+    SELECT sql FROM sqlite_schema WHERE name = 'c2';
+    SELECT column1 = 20 FROM c2;
+}
+expect {
+    CREATE TABLE c2(column1 TEXT,column2)
+    1
+}
+
+# When a column is numeric and its first SELECT is a CAST, SQLite gives it the
+# FLEXNUM affinity: it is declared NUM, and the values keep their types. quote()
+# shows a REAL as 1.0 on every backend.
+@cross-check-integrity
+test create-table-as-values-real-cast-then-integer {
+    CREATE TABLE c AS VALUES (CAST(1 AS REAL)), (2);
+    SELECT sql FROM sqlite_schema WHERE name = 'c';
+    SELECT quote(column1), typeof(column1) FROM c;
+}
+expect {
+    CREATE TABLE c(column1 NUM)
+    1.0|real
+    2|integer
+}
+
+test compound-real-cast-then-integer-compares-as-number {
+    SELECT x = '2' FROM (SELECT CAST(1 AS REAL) AS x UNION ALL SELECT 2);
+}
+expect {
+    0
+    1
+}
+
+# A join over these columns builds an automatic index on them. Its keys must
+# keep the values' types: REALs stay REAL, and an integer from VALUES stays an
+# integer.
+setup join_table {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (2), (1.5), (1);
+}
+
+@setup join_table
+@cross-check-integrity
+test join-on-compound-of-real-casts-keeps-reals {
+    SELECT quote(v.v) FROM (SELECT CAST(1.5 AS REAL) v UNION ALL SELECT CAST(2 AS REAL)) v
+    JOIN t ON t.x = v.v ORDER BY 1;
+}
+expect {
+    1.5
+    2.0
+}
+
+@setup join_table
+@cross-check-integrity
+test join-on-values-of-real-casts-keeps-reals {
+    SELECT quote(v.column1) FROM (VALUES (CAST(1.5 AS REAL)), (CAST(2 AS REAL))) v
+    JOIN t ON t.x = v.column1 ORDER BY 1;
+}
+expect {
+    1.5
+    2.0
+}
+
+@setup join_table
+@cross-check-integrity
+test join-on-values-real-cast-then-integer-keeps-each-type {
+    SELECT quote(v.column1) FROM (VALUES (CAST(1 AS REAL)), (2)) v
+    JOIN t ON t.x = v.column1 ORDER BY 1;
+}
+expect {
+    1.0
+    2
+}
+
+# TEXT affinity turns a number into text only when the other side is text.
+test scalar-subquery-with-text-affinity-compares-two-numbers-as-numbers {
+    SELECT (VALUES (CAST(20 AS REAL)), (CAST('a' AS TEXT))) = 20,
+           (VALUES (CAST(20 AS REAL)), (CAST('a' AS TEXT))) = '20.0';
+}
+expect {
+    1|1
+}

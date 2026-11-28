@@ -955,15 +955,31 @@ fn get_subquery_parser<'a>(
                 let reg_start = program.alloc_registers(reg_count);
 
                 // Like SQLite, a compound takes the affinity of its last SELECT.
-                let columns: Vec<_> = plan
-                    .select_result_columns()
-                    .iter()
+                let affinities = match &plan {
+                    Plan::Select(select_plan)
+                    | Plan::CompoundSelect {
+                        right_most: select_plan,
+                        ..
+                    } => select_plan.subquery_column_affinities(
+                        &ExprContext::new(Some(&select_plan.table_references), resolver),
+                        resolver,
+                    ),
+                    _ => plan
+                        .select_result_columns()
+                        .iter()
+                        .map(|result_col| {
+                            get_expr_affinity(
+                                &result_col.expr,
+                                &ExprContext::new(Some(plan.select_table_references()), resolver),
+                            )
+                        })
+                        .collect(),
+                };
+                let columns: Vec<_> = affinities
+                    .into_iter()
                     .enumerate()
-                    .map(|(i, result_col)| RowValueSubqueryColumn {
-                        affinity: get_expr_affinity(
-                            &result_col.expr,
-                            &ExprContext::new(Some(plan.select_table_references()), resolver),
-                        ),
+                    .map(|(i, affinity)| RowValueSubqueryColumn {
+                        affinity,
                         expr_type: query_column_type(&plan, i, resolver),
                     })
                     .collect();
@@ -1157,20 +1173,28 @@ fn get_subquery_parser<'a>(
                 // "x IN (SELECT y ...)" compares x and y like "x = y" does, so
                 // the ephemeral index uses the collation of that comparison
                 // for its NotFound/Found probes.
+                let rhs_context = ExprContext::new(Some(table_references), resolver);
+                let rhs_affinities = match &plan {
+                    Plan::Select(select) => {
+                        select.subquery_column_affinities(&rhs_context, resolver)
+                    }
+                    Plan::CompoundSelect { right_most, .. } => {
+                        right_most.subquery_column_affinities(&rhs_context, resolver)
+                    }
+                    _ => result_columns
+                        .iter()
+                        .map(|rc| get_expr_affinity(&rc.expr, &rhs_context))
+                        .collect(),
+                };
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
                 let mut lhs_exprs = Vec::with_capacity(lhs_column_count);
-                for (i, lhs_expr) in lhs_columns.enumerate() {
+                for (lhs_expr, &rhs_affinity) in lhs_columns.zip(&rhs_affinities) {
                     let lhs_affinity = get_expr_affinity(
                         lhs_expr,
                         &ExprContext::new(Some(referenced_tables), resolver),
                     );
                     affinity_chars.push(
-                        comparison_affinity(
-                            &result_columns[i].expr,
-                            lhs_affinity,
-                            &ExprContext::new(Some(table_references), resolver),
-                        )
-                        .aff_mask(),
+                        comparison_affinity(rhs_affinity, lhs_affinity, &rhs_context).aff_mask(),
                     );
                     lhs_exprs.push(lhs_expr);
                 }
