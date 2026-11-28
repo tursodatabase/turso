@@ -1311,7 +1311,7 @@ impl Value {
     }
 
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Concat)]
-    pub fn exec_concat(&self, rhs: &Value) -> Result<Value> {
+    pub fn exec_concat(&self, rhs: &Value, blobs_concat_to_blob: bool) -> Result<Value> {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
             if lhs.len() + rhs.len() > Self::MAX_BLOB_LENGTH as usize {
                 return Err(LimboError::TooBig);
@@ -1322,7 +1322,15 @@ impl Value {
                 )?;
             blob.extend_from_slice(lhs);
             blob.extend_from_slice(rhs);
-            return Ok(Value::Blob(blob));
+            if blobs_concat_to_blob {
+                return Ok(Value::Blob(blob));
+            }
+            // SQLite's `||` always gives TEXT. Text must be valid UTF-8 here, so
+            // bytes that are not stay a BLOB, which keeps them unchanged.
+            return Ok(match crate::types::validate_utf8(&blob) {
+                Some(text) => Value::build_text(text.to_owned()),
+                None => Value::Blob(blob),
+            });
         }
 
         // Two TEXT operands, the usual case, need no conversion.
@@ -1341,8 +1349,8 @@ impl Value {
 
     /// The TEXT result of `self || rhs`, written into `dest`, which keeps its
     /// buffer when the buffer is large enough. Returns false, and leaves
-    /// `dest` as it was, when the result is not TEXT: two BLOBs give a BLOB,
-    /// and a NULL operand gives NULL.
+    /// `dest` as it was, for two BLOBs, which [Self::exec_concat] joins, and
+    /// for a NULL operand, which gives NULL.
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Concat)]
     pub fn exec_concat_into(&self, rhs: &Value, dest: &mut Text) -> Result<bool> {
         let mut lhs_integer = None;
@@ -1356,8 +1364,8 @@ impl Value {
         Ok(true)
     }
 
-    /// The operands of `self || rhs` as text, or `None` when the result is
-    /// not TEXT: two BLOBs give a BLOB, and a NULL operand gives NULL. The
+    /// The operands of `self || rhs` as text, or `None` for two BLOBs, whose
+    /// bytes [Self::exec_concat] joins, and for a NULL operand. The
     /// text of an integer operand goes into `lhs_integer` or `rhs_integer`.
     /// [Self::exec_concat] and [Self::exec_concat_into] get their operands
     /// from this function, so the rules for the operands of `||` are here.
@@ -2219,7 +2227,7 @@ mod tests {
         let lhs = blob(&[1, 2]);
         let rhs = blob(&[3, 4]);
 
-        assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+        assert_eq!(lhs.exec_concat(&rhs, true).unwrap(), blob(&[1, 2, 3, 4]));
     }
 
     #[test]
@@ -2295,11 +2303,10 @@ mod tests {
             for rhs in &values {
                 let expected = match (lhs, rhs) {
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
-                    (Value::Blob(l), Value::Blob(r)) => blob(&[&l[..], &r[..]].concat()),
                     _ => Value::build_text(format!("{lhs}{rhs}")),
                 };
                 assert_eq!(
-                    lhs.exec_concat(rhs).unwrap(),
+                    lhs.exec_concat(rhs, false).unwrap(),
                     expected,
                     "{lhs:?} || {rhs:?}"
                 );
