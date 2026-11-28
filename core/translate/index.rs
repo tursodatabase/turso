@@ -1472,6 +1472,16 @@ pub fn translate_drop_index(
                     .to_string(),
             ));
         }
+        // An index method drops its own backing indexes in a nested
+        // statement. Dropping one by hand leaves the method without its data.
+        if !connection.is_nested_stmt()
+            && idx.is_backing_btree_index()
+            && resolver.with_schema(database_id, |s| {
+                s.backing_btree_has_owner(namespace.id, idx)
+            })
+        {
+            bail_parse_error!("Cannot drop internal index {}", idx.name);
+        }
     }
 
     let cmd_context = CmdContext::new(connection, resolver, database_id);

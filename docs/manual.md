@@ -1053,6 +1053,33 @@ OPTIMIZE INDEX;
 
 Run optimization after bulk inserts or when query performance degrades.
 
+### Going Back to SQLite
+
+SQLite cannot open a database that has an FTS index. Every statement fails, including `SELECT 1`:
+
+```
+malformed database schema (__turso_internal_fts_dir_docs_fts_key) - near "USING": syntax error
+```
+
+An FTS index keeps its data in an internal table and index, such as `__turso_internal_fts_dir_docs_fts` and `__turso_internal_fts_dir_docs_fts_key`. The schema entry of that index uses `USING backing_btree`, which SQLite cannot parse, so SQLite refuses the whole file.
+
+To make the database readable by SQLite again, use Turso to drop each FTS index, then checkpoint the WAL:
+
+```sql
+-- List the indexes to drop
+SELECT name FROM sqlite_schema
+WHERE type = 'index' AND sql LIKE '% USING %'
+  AND sql NOT LIKE '% USING backing_btree %';
+
+-- Drop each index that the query returns
+DROP INDEX docs_fts;
+
+-- Copy the changes from the WAL into the database file
+PRAGMA wal_checkpoint(TRUNCATE);
+```
+
+`DROP INDEX` also removes the internal table and index. The rows of the indexed table do not change. After these steps, SQLite reads the file, and `PRAGMA integrity_check` returns `ok`. To search the data in Turso again, create the FTS index again.
+
 ### Example: Building a Search Feature
 
 ```sql

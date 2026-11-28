@@ -1163,6 +1163,8 @@ Turso implements FTS using Tantivy instead of SQLite's FTS3/FTS4/FTS5.
 | SQLite FTS3/FTS4/FTS5 | ❌ No | Use Turso FTS instead |
 | snippet() | ❌ No | |
 
+SQLite cannot open a database that has an FTS index, because the schema entries of the FTS index use `USING`. To go back to SQLite, run `DROP INDEX` in Turso for each FTS index, then `PRAGMA wal_checkpoint(TRUNCATE)`. The [manual](docs/manual.md#going-back-to-sqlite) gives the steps.
+
 ### CSV
 
 The CSV extension provides RFC 4180 compliant CSV file reading.

@@ -1134,3 +1134,38 @@ test fts-distinct-on-score-keeps-one-row-per-score {
 expect {
     1
 }
+
+@backend cli
+test fts-drop-internal-index-is-refused {
+    CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);
+    CREATE INDEX docs_fts ON docs USING fts (body);
+    DROP INDEX __turso_internal_fts_dir_docs_fts_key;
+}
+expect error {
+    Cannot drop internal index __turso_internal_fts_dir_docs_fts_key
+}
+
+@backend cli
+test fts-drop-internal-index-if-exists-is-refused {
+    CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);
+    CREATE INDEX docs_fts ON docs USING fts (body);
+    DROP INDEX IF EXISTS __turso_internal_fts_dir_docs_fts_key;
+}
+expect error {
+    Cannot drop internal index __turso_internal_fts_dir_docs_fts_key
+}
+
+@backend cli
+test fts-drop-index-removes-internal-objects {
+    CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);
+    CREATE INDEX docs_fts ON docs USING fts (body);
+    INSERT INTO docs VALUES (1, 'kiwi venture'), (2, 'other text');
+    DROP INDEX docs_fts;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_fts%';
+    SELECT id, body FROM docs ORDER BY id;
+}
+expect {
+    0
+    1|kiwi venture
+    2|other text
+}

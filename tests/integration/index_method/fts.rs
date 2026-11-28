@@ -178,3 +178,60 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
         "accepted invalid weights: {accepted:?}"
     );
 }
+
+/// Older versions let `DROP INDEX` remove the `_key` index of an FTS index by hand. Dropping the
+/// FTS index or its table must still work on such a file, and must leave a file that SQLite reads.
+#[test]
+fn fts_drop_works_when_the_backing_index_is_missing() {
+    for drop_sql in ["DROP INDEX docs_fts", "DROP TABLE docs"] {
+        let db = crate::common::TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::default().with_index_method(true))
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (1, 'kiwi venture')")
+            .unwrap();
+        // A nested statement may drop an internal index, as older versions let any statement do.
+        conn.start_nested();
+        let stmt = conn.prepare("DROP INDEX __turso_internal_fts_dir_docs_fts_key");
+        conn.end_nested();
+        stmt.unwrap().run_ignore_rows().unwrap();
+
+        conn.execute(drop_sql).unwrap();
+        assert_eq!(
+            collected(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name <> 'docs'"
+            ),
+            vec![vec![Value::from_i64(0)]],
+            "{drop_sql}"
+        );
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        crate::common::rusqlite_integrity_check(&db.path).unwrap();
+    }
+}
+
+/// Only an index that an index method owns is internal: an ordinary index whose name has the
+/// internal prefix, created by SQLite, can be dropped.
+#[test]
+fn drop_index_with_internal_prefix_not_owned_by_an_index_method() {
+    let path = crate::common::TempDatabase::new_empty().path;
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE t(a); CREATE INDEX __turso_internal_x ON t(a); \
+             CREATE INDEX __TURSO_INTERNAL_y ON t(a);",
+        )
+        .unwrap();
+    let db = crate::common::TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    conn.execute("DROP INDEX __turso_internal_x").unwrap();
+    conn.execute("DROP INDEX __TURSO_INTERNAL_y").unwrap();
+    assert_eq!(
+        collected(&conn, "SELECT name FROM sqlite_schema"),
+        vec![vec![Value::from_text("t".to_string())]]
+    );
+}
