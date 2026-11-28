@@ -52,6 +52,7 @@ mod stats;
 mod stmt_journal;
 mod stmt_readonly;
 mod storage;
+mod subscription;
 mod suspended_statement_checkpoint;
 mod table_overlay;
 #[cfg(all(feature = "fs", not(target_family = "wasm")))]

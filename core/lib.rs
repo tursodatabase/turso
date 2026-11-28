@@ -65,6 +65,9 @@ pub mod function;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod functions;
 mod incremental;
+mod subscription;
+pub use subscription::{ChangeBatch, ChangeFilter, ChangeSubscription, ChangedKeys};
+
 mod incremental_blob;
 pub use incremental_blob::Blob;
 mod info;

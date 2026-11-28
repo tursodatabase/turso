@@ -578,3 +578,33 @@ fn a_namespace_is_created_and_dropped_after_another_connection_changes_the_schem
     conn.drop_namespace("shop").unwrap();
     assert_eq!(other.qualifier("shop"), None);
 }
+
+#[turso_macros::test]
+fn subscription_separates_namespaces(db: TempDatabase) {
+    use turso_core::{ChangeBatch, ChangeFilter, ChangedKeys};
+    let conn = db.connect_limbo();
+    conn.create_namespace("app").unwrap();
+    conn.execute("CREATE TABLE public.t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let all = conn.db.subscribe_changes(ChangeFilter::All);
+    let app = conn.db.subscribe_changes(ChangeFilter::Table {
+        table: "app.t".into(),
+    });
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO public.t VALUES(1)").unwrap();
+    conn.execute("INSERT INTO app.t VALUES(2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let keys = |n| ChangedKeys::Keys([vec![Value::from_i64(n)]].into());
+    assert_eq!(
+        all.try_recv(),
+        Some(ChangeBatch::Tables(
+            [("public.t".into(), keys(1)), ("app.t".into(), keys(2))].into()
+        ))
+    );
+    assert_eq!(
+        app.try_recv(),
+        Some(ChangeBatch::Tables([("app.t".into(), keys(2))].into()))
+    );
+}

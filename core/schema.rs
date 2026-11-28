@@ -1111,9 +1111,11 @@ pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
-    RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| table_name.to_lowercase().starts_with(prefix))
+    RESERVED_TABLE_PREFIXES.iter().any(|prefix| {
+        table_name
+            .get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    })
 }
 
 /// Whether a relation of kind `kind` named `name` is the user's, as against
@@ -6577,7 +6579,10 @@ impl BTreeTable {
             })
     }
 
-    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<TextCollation> {
+    pub(crate) fn primary_key_constraint_collation(
+        &self,
+        column_name: &str,
+    ) -> Option<TextCollation> {
         self.unique_sets
             .iter()
             .find(|unique_set| unique_set.is_primary_key)

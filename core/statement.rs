@@ -876,6 +876,7 @@ impl Statement {
                         .n_active_writes
                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     debug_assert_eq!(prev, 1, "writer count mismatch before statement restart");
+                    self.connection.pending_changes.end_statement(true);
                 }
                 self.state.stop_counting_as_reader(&self.connection);
                 self.state.reset(None, None);
@@ -1848,6 +1849,8 @@ impl Statement {
                 previous == 1,
                 "resetting a writer with {previous} active writer(s)"
             );
+            // Storage rollback already discarded any changes it reverted.
+            self.connection.pending_changes.end_statement(false);
             self.state.is_active_write = false;
         }
         if self.counted_as_active_root && !preserve_active_root_count {

@@ -1070,6 +1070,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     state: AtomicTransactionState,
     /// The transaction ID.
     tx_id: u64,
+    subscription_notification: Mutex<Option<crate::subscription::CommitNotification>>,
     /// The transaction begin timestamp.
     begin_ts: u64,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
@@ -1135,6 +1136,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             read_mark,
             schema_generation_at_begin,
             portable_logical_changes,
+            subscription_notification: Mutex::new(None),
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -6930,9 +6932,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 "committed writer must be visible in finalized_tx_states before leaving txs",
                 { "tx_id": tx_id }
             );
+            let notification = if matches!(tx.state.load(), TransactionState::Committed(_)) {
+                tx.subscription_notification.lock().take()
+            } else {
+                None
+            };
             self.txs.remove(&tx_id);
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
+            }
+            if let Some(notification) = notification {
+                notification.publish();
             }
             return;
         }
@@ -7046,6 +7056,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) {
         conn.set_mv_tx_for_db(db_id, None);
         self.remove_tx(tx_id);
+        if db_id == crate::MAIN_DB_ID {
+            conn.pending_changes.finish(Some(tx_id), None);
+        }
     }
 
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
@@ -7187,6 +7200,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.commit_coordinator.clone(),
             self.global_header.clone(),
         )?);
+        if db_id == crate::MAIN_DB_ID {
+            if let Some(notification) = connection
+                .pending_changes
+                .for_mvcc_commit(tx_id, &connection.db.subscriptions)
+            {
+                let tx = self.txs.get(&tx_id).expect("committing transaction exists");
+                *tx.value().subscription_notification.lock() = Some(notification);
+            }
+        }
         let state_machine = StateMachine::new(state);
         Ok(state_machine)
     }
@@ -7228,6 +7250,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
         if let Some(connection) = connection {
+            if db == crate::MAIN_DB_ID {
+                connection.pending_changes.finish(Some(tx_id), None);
+            }
             connection.set_mv_tx_for_db(db, None);
         }
         let dirty_stamp = match tx.state.load() {
@@ -7386,6 +7411,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         match tx_state {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
                 if self.commit_coordinator.abandon_if_issued(tx_id) {
+                    if db_id == crate::MAIN_DB_ID {
+                        connection.pending_changes.finish(Some(tx_id), None);
+                    }
                     if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
                         connection.set_mv_tx_for_db(db_id, None);
                     }

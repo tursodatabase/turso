@@ -886,6 +886,7 @@ impl ActiveOpStateSlot {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
             route: None,
             deleted_record: None,
+            subscription_key: None,
         }
     );
     active_state_accessor!(
@@ -934,6 +935,7 @@ impl ActiveOpStateSlot {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             route: None,
             old_record: None,
+            old_subscription_key: None,
             is_noop_update: false,
         }
     );
@@ -1246,6 +1248,8 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    subscription_cursor: Option<(usize, Option<usize>)>,
+    subscription_capture: crate::subscription::Capture,
     /// Whether this statement has passed a `Transaction` instruction and is
     /// counted in `Connection::n_active_read_statements`.
     pub(crate) is_active_read: bool,
@@ -1367,6 +1371,8 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            subscription_cursor: None,
+            subscription_capture: Default::default(),
             is_active_read: false,
             is_active_destroy: false,
             tx_read_only_at_start: false,
@@ -1479,6 +1485,8 @@ impl ProgramState {
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
         self.cursor_databases.fill(None);
+        self.subscription_cursor = None;
+        self.subscription_capture = Default::default();
         for (cursor, context) in self
             .cursors
             .iter_mut()
@@ -1964,6 +1972,10 @@ impl ProgramState {
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
+        if ends_write_statement && end_statement == EndStatement::ReleaseSavepoint {
+            connection.pending_changes.end_statement(false);
+        }
+        let mut main_rolled_back = false;
         let result = match end_statement {
             EndStatement::ReleaseSavepoint => {
                 if let Some(mv_store) = connection.mv_store().as_ref() {
@@ -1996,8 +2008,9 @@ impl ProgramState {
                 let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
                     let mut err = None;
                     if let Some(tx_id) = connection.get_mv_tx_id() {
-                        if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
-                            err = Some(e);
+                        match mv_store.rollback_first_savepoint(tx_id) {
+                            Ok(rolled_back) => main_rolled_back = rolled_back,
+                            Err(e) => err = Some(e),
                         }
                     }
                     connection.for_each_attached_mv_tx(|db_id, tx_id| {
@@ -2019,7 +2032,8 @@ impl ProgramState {
                     err
                 } else if self.uses_subjournal {
                     match pager.rollback_to_newest_savepoint() {
-                        Ok(_) => {
+                        Ok(rolled_back) => {
+                            main_rolled_back = rolled_back;
                             let mut err = None;
                             for p in &attached_pagers {
                                 if let Err(e) = p.rollback_to_newest_savepoint() {
@@ -2058,6 +2072,9 @@ impl ProgramState {
                 }
             }
         };
+        if ends_write_statement && end_statement == EndStatement::RollbackSavepoint {
+            connection.pending_changes.end_statement(main_rolled_back);
+        }
         if self.uses_subjournal {
             pager.stop_use_subjournal();
             self.uses_subjournal = false;
@@ -4890,6 +4907,7 @@ mod tests {
             sub_state: OpInsertSubState::Seek,
             route: None,
             old_record: None,
+            old_subscription_key: None,
             is_noop_update: false,
         };
         state.seek_state = OpSeekState::MoveLast;

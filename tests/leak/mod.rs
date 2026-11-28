@@ -21,12 +21,14 @@ use turso_sqlite::SqliteDialect;
 
 struct CountingAllocator;
 
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
             LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
         ptr
@@ -35,6 +37,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc_zeroed(layout);
         if !ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
             LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
         ptr
@@ -48,6 +51,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = System.realloc(ptr, layout, new_size);
         if !new_ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
             LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
             LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         }
@@ -205,4 +209,96 @@ fn database_lifecycle_does_not_leak_mvcc() {
 #[serial_test::serial]
 fn database_lifecycle_does_not_leak_wal() {
     assert_no_per_database_leak(false);
+}
+
+#[test]
+#[serial_test::serial]
+fn updating_one_row_does_not_copy_pending_subscription_keys() {
+    let db = Database::open_file(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    for i in 0..16 {
+        conn.execute(format!("CREATE TABLE t{i}(k TEXT PRIMARY KEY, x INTEGER)"))
+            .unwrap();
+        conn.execute(format!("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<128) INSERT INTO t{i} SELECT printf('%0800d',i),0 FROM n")).unwrap();
+    }
+    let _sub = db.subscribe_changes(turso_core::ChangeFilter::All);
+    let mut update = conn.prepare("UPDATE t0 SET x=x+1 WHERE rowid=1").unwrap();
+    let mut measure = || {
+        update.reset().unwrap();
+        let before = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        update.run_ignore_rows().unwrap();
+        ALLOCATED_BYTES.load(Ordering::Relaxed) - before
+    };
+    conn.execute("BEGIN").unwrap();
+    let baseline = measure();
+    for i in 0..16 {
+        conn.execute(format!("UPDATE t{i} SET x=x+1")).unwrap();
+    }
+    let populated = measure();
+    eprintln!("one update allocated {baseline} bytes with an empty batch and {populated} with 2048 pending keys");
+    assert!(
+        populated < baseline + 65536,
+        "additional allocation: {} bytes",
+        populated.saturating_sub(baseline)
+    );
+    conn.execute("SAVEPOINT nested").unwrap();
+    let saved = measure();
+    assert!(
+        saved < baseline + 65536,
+        "update after SAVEPOINT allocated {saved} bytes"
+    );
+    conn.execute("ROLLBACK TO nested").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+#[serial_test::serial]
+fn bulk_update_stops_copying_keys_after_a_table_invalidation() {
+    let db = Database::open_file(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, x INTEGER)")
+        .unwrap();
+    conn.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1200) INSERT INTO t SELECT printf('%0800d',i),0 FROM n").unwrap();
+    let mut update = conn.prepare("UPDATE t SET x=1-x").unwrap();
+    let mut measure = || {
+        conn.execute("BEGIN").unwrap();
+        update.reset().unwrap();
+        let before = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        update.run_ignore_rows().unwrap();
+        let bytes = ALLOCATED_BYTES.load(Ordering::Relaxed) - before;
+        // Exclude commit and auto-checkpoint allocations from row capture.
+        conn.execute("COMMIT").unwrap();
+        bytes
+    };
+    measure();
+    let idle = measure();
+    let sub = db.subscribe_changes(turso_core::ChangeFilter::All);
+    let watched = measure();
+    let extra = watched.saturating_sub(idle);
+    eprintln!("capturing a 1200-row update allocated {extra} extra bytes");
+    // The bounded batch needs at most 129 old and new 800-byte keys.
+    assert!(
+        extra < 512 * 1024,
+        "capturing the batch allocated {extra} extra bytes"
+    );
+    assert_eq!(
+        sub.try_recv(),
+        Some(turso_core::ChangeBatch::Tables(
+            [("t".into(), turso_core::ChangedKeys::All)].into()
+        ))
+    );
 }

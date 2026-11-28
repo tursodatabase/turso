@@ -3612,6 +3612,11 @@ impl Pager {
                         connection.db.update_schema_if_newer(schema);
                     }
 
+                    if update_transaction_state {
+                        connection
+                            .pending_changes
+                            .finish(None, Some(&connection.db.subscriptions));
+                    }
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
                         complete_commit();
                         self.clear_savepoints()?;
@@ -3642,6 +3647,7 @@ impl Pager {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;
         };
+        connection.pending_changes.finish(None, None);
         let (is_write, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
             _ => (false, false),
@@ -5016,6 +5022,10 @@ impl Pager {
         wal.read_frame_raw(frame_no, frame)
     }
 
+    pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        self.wal_insert_frame_with_hook(frame_no, frame, |_| {})
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     #[aristo::intent(
         "The cached page is updated only from a frame past the end of the WAL, because a frame already in the WAL can be older than the cached page.",
@@ -5027,7 +5037,12 @@ impl Pager {
         verify = "full",
         id = "wal_insert_frame_marks_cached_page_with_frame_number"
     )]
-    pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+    pub(crate) fn wal_insert_frame_with_hook(
+        &self,
+        frame_no: u64,
+        frame: &[u8],
+        on_append: impl FnOnce(&WalFrameInfo),
+    ) -> Result<WalFrameInfo> {
         turso_assert!(
             self.is_authenticated(),
             "WAL frame insertion requires an authenticated pager"
@@ -5090,6 +5105,33 @@ impl Pager {
             raw_page,
             self.get_sync_type(),
         )?;
+        let result = self.update_cache_from_wal_frame(
+            frame_no,
+            frame_is_new,
+            wal.checkpoint_epoch(),
+            &header,
+            raw_page,
+        );
+        let info = WalFrameInfo {
+            page_no: header.page_number,
+            db_size: header.db_size,
+        };
+        // The append succeeded even if updating the local cache failed.
+        if frame_is_new {
+            on_append(&info);
+        }
+        result?;
+        Ok(info)
+    }
+
+    fn update_cache_from_wal_frame(
+        &self,
+        frame_no: u64,
+        frame_is_new: bool,
+        checkpoint_epoch: u32,
+        header: &crate::storage::sqlite3_ondisk::WalFrameHeader,
+        raw_page: &[u8],
+    ) -> Result<()> {
         let cached_page = if frame_is_new {
             self.cache_get(header.page_number as usize)?
         } else {
@@ -5102,7 +5144,7 @@ impl Pager {
                 page.get().id() == header.page_number as usize,
                 "page has unexpected id"
             );
-            page.set_wal_tag(frame_no, wal.checkpoint_epoch());
+            page.set_wal_tag(frame_no, checkpoint_epoch);
         }
         if header.page_number == 1 {
             let db_size = self.io.block(|| {
@@ -5133,10 +5175,7 @@ impl Pager {
             }
             dirty_pages.clear();
         }
-        Ok(WalFrameInfo {
-            page_no: header.page_number,
-            db_size: header.db_size,
-        })
+        Ok(())
     }
 
     pub fn is_checkpointing(&self) -> bool {

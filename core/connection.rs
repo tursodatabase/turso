@@ -497,6 +497,7 @@ pub struct Connection {
 
     /// Ordered row changes captured once per connection transaction, with
     /// consumer indexes for materialized-view maintenance.
+    pub(crate) pending_changes: crate::subscription::PendingChanges,
     pub(crate) transaction_changes: crate::incremental::view::TransactionChanges,
     /// Prepared IVM bytecode keyed by schema epoch and physical view layout.
     pub(crate) maintenance_program_cache:
@@ -2098,7 +2099,17 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        self.pager.load().wal_insert_frame(frame_no, frame)
+        self.pager
+            .load()
+            .wal_insert_frame_with_hook(frame_no, frame, |info| {
+                // Imported pages can replace dirty SQL pages without describing their row keys.
+                if info.is_commit_frame() {
+                    self.pending_changes.finish(None, None);
+                    self.db.subscriptions.refresh();
+                } else {
+                    self.pending_changes.record_refresh(self);
+                }
+            })
     }
 
     /// Start WAL session by initiating read+write transaction for this connection
@@ -2141,7 +2152,9 @@ impl Connection {
                 ));
             };
 
+            let mut committed = false;
             let commit_err = if force_commit {
+                let previous_commit = wal.get_max_frame_in_wal();
                 pager
                     .io
                     .block(|| {
@@ -2152,6 +2165,8 @@ impl Connection {
                             self.get_data_sync_retry(),
                         ));
                         pager.commit_wal_end();
+                        // With no dirty SQL pages, the pager can finish without a commit frame.
+                        committed = wal.get_max_frame_in_wal() > previous_commit;
                         Ok(IOResult::Done(()))
                     })
                     .err()
@@ -2184,6 +2199,8 @@ impl Connection {
             }
             wal.end_write_tx();
             wal.end_read_tx();
+            self.pending_changes
+                .finish(None, committed.then_some(&self.db.subscriptions));
             if let Some(err) = commit_err {
                 return Err(err);
             }
@@ -4792,7 +4809,9 @@ impl Connection {
     }
 
     pub(crate) fn push_named_savepoint(&self, frame: NamedSavepointFrame) {
-        self.named_savepoints.write().push(frame);
+        let mut frames = self.named_savepoints.write();
+        self.pending_changes.open_savepoint();
+        frames.push(frame);
     }
 
     /// Snapshot the in-memory schemas (main, temp, attached) for a
@@ -4830,6 +4849,7 @@ impl Connection {
         if savepoints[target_idx].starts_transaction && target_idx == 0 {
             return SavepointResult::Commit;
         }
+        self.pending_changes.release_savepoints(target_idx);
         savepoints.truncate(target_idx);
         SavepointResult::Release
     }
@@ -4840,6 +4860,7 @@ impl Connection {
             .iter()
             .rposition(|savepoint| savepoint.name == name)?;
         let frame = &savepoints[target_idx];
+        self.pending_changes.rollback_to_savepoint(target_idx);
         let info = RollbackFrameInfo {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
@@ -4853,7 +4874,11 @@ impl Connection {
     }
 
     pub(crate) fn clear_named_savepoints(&self) {
-        self.named_savepoints.write().clear();
+        let mut frames = self.named_savepoints.write();
+        if !frames.is_empty() {
+            self.pending_changes.release_savepoints(0);
+            frames.clear();
+        }
     }
 
     /// Park a statement's index-method cursor on the connection until the

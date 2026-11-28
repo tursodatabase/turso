@@ -3610,10 +3610,10 @@ pub fn op_blob_len(
 /// Write a blob's bytes into a column's value at an offset, in place — the VDBE
 /// backing for sqlite3_blob_write.
 pub fn op_blob_write(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _connection: &Arc<Connection>,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
@@ -3644,6 +3644,8 @@ pub fn op_blob_write(
         }
         Err(err) => return Err(err),
     }
+    subscription_table(program, state, connection, *cursor);
+    state.subscription_capture.record(connection, None);
     state.registers[*dest].set_value(Value::Numeric(Numeric::Integer(1)));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5335,6 +5337,11 @@ pub fn op_transaction_inner(
                             connection.transaction_changes.is_empty(),
                             "write statement started with view changes left by an earlier statement"
                         );
+                        if state.has_stmt_transaction {
+                            connection
+                                .pending_changes
+                                .begin_statement(connection.get_mv_tx_id());
+                        }
                         state.is_active_write = true;
                         state.tx_read_only_at_start = connection.is_tx_read_only();
                         if is_main_db {
@@ -12036,6 +12043,8 @@ pub struct OpInsertState {
     /// list on every sub-state transition.
     pub(crate) route: Option<ChangeLogRoute>,
     pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
+    // An overwrite with an unknown old key invalidates the whole table.
+    pub(crate) old_subscription_key: Option<Option<std::vec::Vec<Value>>>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
@@ -12247,6 +12256,67 @@ fn check_db_write_allowed(
     Err(Box::new(LimboError::ReadOnly))
 }
 
+/// Only persistent user-table cursors in main participate. Prepared statements
+/// consult the registry at execution time, including trigger subprograms.
+fn subscription_table<'a>(
+    program: &'a Program,
+    state: &mut ProgramState,
+    connection: &Connection,
+    id: usize,
+) -> Option<&'a crate::schema::BTreeTable> {
+    let db = state.cursor_databases[id];
+    if state.subscription_cursor != Some((id, db)) {
+        state.subscription_cursor = Some((id, db));
+        state.subscription_capture = match &program.cursor_ref[id].1 {
+            CursorType::BTreeTable(table)
+                if db == Some(MAIN_DB_ID)
+                    && !program.prepared().explain.ephemeral_cursors.contains(&id) =>
+            {
+                connection.subscription_route(table)
+            }
+            _ => crate::subscription::Capture::Ignore,
+        };
+    }
+    if state.subscription_capture.wants_keys() {
+        let CursorType::BTreeTable(table) = &program.cursor_ref[id].1 else {
+            unreachable!()
+        };
+        Some(table)
+    } else {
+        None
+    }
+}
+
+/// An UPDATE can overwrite a row in place. Capture its previous logical key
+/// before the write, then publish both keys only if the insert succeeds.
+fn overwritten_subscription_key(
+    program: &Program,
+    state: &mut ProgramState,
+    connection: &Connection,
+    cursor_id: usize,
+    key_reg: usize,
+) -> IOResultOr<Option<Option<std::vec::Vec<Value>>>> {
+    let Some(table) = subscription_table(program, state, connection, cursor_id) else {
+        return Ok(IOResult::Done(None));
+    };
+    if !table.has_rowid
+        || table.primary_key_columns.is_empty()
+        || table.get_rowid_alias_column().is_some()
+    {
+        return Ok(IOResult::Done(None));
+    }
+    let insert_key = state.registers[key_reg].get_value().as_int();
+    let cursor = state.get_cursor(cursor_id).as_btree_mut();
+    let rowid = crate::return_if_io!(cursor.rowid());
+    if rowid != insert_key || rowid.is_none() {
+        return Ok(IOResult::Done(None));
+    }
+    let record = crate::return_if_io!(cursor.record());
+    Ok(IOResult::Done(record.map(|record| {
+        crate::subscription::primary_key(table, rowid, Some(record))
+    })))
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -12433,6 +12503,18 @@ pub fn op_insert(
                         }
                     }
                 }
+                if !state.active_op_state.insert().is_noop_update
+                    && flag.has(InsertFlags::SKIP_LAST_ROWID)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                {
+                    let key = return_if_io!(
+                        state,
+                        overwritten_subscription_key(
+                            program, state, connection, *cursor_id, *key_reg
+                        )
+                    );
+                    state.active_op_state.insert().old_subscription_key = key;
+                }
                 state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
                 continue;
             }
@@ -12466,6 +12548,23 @@ pub fn op_insert(
                             cursor.insert(&BTreeKey::new_index_key(record.as_record_ref()))
                         );
                     }
+                    let key = subscription_table(program, state, connection, *cursor_id).and_then(
+                        |table| {
+                            let rowid = table
+                                .has_rowid
+                                .then(|| state.registers[*key_reg].get_value().as_int())
+                                .flatten();
+                            let record = match &state.registers[*record_reg] {
+                                Register::Record(record) => Some(record),
+                                _ => None,
+                            };
+                            crate::subscription::primary_key(table, rowid, record)
+                        },
+                    );
+                    if let Some(old) = state.active_op_state.insert().old_subscription_key.take() {
+                        state.subscription_capture.record(connection, old);
+                    }
+                    state.subscription_capture.record(connection, key);
                     state.record_rows_written(1);
                 }
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
@@ -12709,6 +12808,7 @@ pub struct OpDeleteState {
     /// list on every sub-state transition.
     pub(crate) route: Option<ChangeLogRoute>,
     pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
+    pub(crate) subscription_key: Option<std::vec::Vec<Value>>,
 }
 
 #[derive(Clone, Copy)]
@@ -12744,6 +12844,19 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
+                if let Some(table) = subscription_table(program, state, connection, *cursor_id) {
+                    let cursor = state.get_cursor(*cursor_id).as_btree_mut();
+                    let rowid = return_if_io!(state, cursor.rowid());
+                    let record = if table.primary_key_columns.is_empty()
+                        || table.get_rowid_alias_column().is_some()
+                    {
+                        None
+                    } else {
+                        return_if_io!(state, cursor.record())
+                    };
+                    let key = crate::subscription::primary_key(table, rowid, record);
+                    state.active_op_state.delete().subscription_key = key;
+                }
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, connection, *cursor_id)?
                 } else {
@@ -12792,6 +12905,8 @@ pub fn op_delete(
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(state, cursor.delete());
                 }
+                let key = state.active_op_state.delete().subscription_key.take();
+                state.subscription_capture.record(connection, key);
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
                 let has_change_log_subscribers = state
@@ -14292,6 +14407,21 @@ fn op_clear_btree_inner(
                                 "ClearBtree: removed row count {removed_entries} does not fit in i64"
                             ))
                         })?;
+                        if removed_entries > 0 && *db == MAIN_DB_ID {
+                            let table = connection
+                                .schema
+                                .read()
+                                .all_tables()
+                                .filter_map(|t| t.btree())
+                                .find(|t| t.root_page == *root);
+                            if let Some(table) = table {
+                                connection
+                                    .subscription_route(&table)
+                                    .record(connection, None);
+                            } else {
+                                connection.pending_changes.record_refresh(connection);
+                            }
+                        }
                         state.record_statement_changes(changes);
                         state.record_rows_written(removed_entries);
                     }
@@ -16052,6 +16182,9 @@ pub fn op_set_cookie(
         IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
     }
 
+    if *db == MAIN_DB_ID && matches!(cookie, Cookie::SchemaVersion) {
+        connection.pending_changes.record_refresh(connection);
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

@@ -836,6 +836,7 @@ pub struct Database<
     /// address, this can never repeat within a process, so detach/reattach
     /// and close/reopen produce distinguishable values.
     pub(crate) incarnation: u64,
+    pub(crate) subscriptions: std::sync::Arc<crate::subscription::ChangeRegistry>,
 
     pager_state: Arc<SharedPagerState>,
     /// Key of this database's entry in `DATABASE_MANAGER`, set once the
@@ -993,6 +994,7 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            subscriptions: Default::default(),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a
                 // shuttle test execution, and a shuttle-tracked atomic that
@@ -3076,6 +3078,7 @@ impl Database {
             failure_injector: RwLock::new(None),
             #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
+            pending_changes: Default::default(),
             transaction_changes: TransactionChanges::with_io(self.io.clone()),
             maintenance_program_cache:
                 crate::incremental::vdbe_maintenance::MaintenanceProgramCache::new(),
