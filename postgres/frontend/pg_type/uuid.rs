@@ -91,6 +91,17 @@ pub(crate) fn canonical_uuid(text: &str) -> Result<String> {
         .ok_or_else(|| invalid_uuid(text))
 }
 
+/// The text of a version 4 uuid made from random bits, as `gen_random_uuid`
+/// gives it.
+pub(crate) fn random_uuid_text(high: i64, low: i64) -> String {
+    let mut bytes = [0u8; UUID_LEN];
+    bytes[..8].copy_from_slice(&high.to_be_bytes());
+    bytes[8..].copy_from_slice(&low.to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    uuid_to_string(&bytes)
+}
+
 fn invalid_uuid(text: &str) -> turso_core::LimboError {
     sqlstate_error(
         SQLSTATE_INVALID_TEXT_REPRESENTATION,
@@ -216,6 +227,20 @@ mod tests {
         assert_eq!(stored, Value::from_slice(&BYTES).unwrap());
         let error = uuid_input("nope").unwrap_err().to_string();
         assert!(error.contains("invalid input syntax for type uuid: \"nope\""));
+    }
+
+    #[test]
+    fn random_uuid_has_version_4_and_the_rfc_variant() {
+        for (high, low) in [
+            (0, 0),
+            (-1, -1),
+            (0x0123_4567_89ab_cdef, 0x0fed_cba9_8765_4321),
+        ] {
+            let text = random_uuid_text(high, low);
+            let bytes = string_to_uuid(&text).unwrap();
+            assert_eq!(bytes[6] >> 4, 4, "{text}");
+            assert_eq!(bytes[8] >> 6, 0b10, "{text}");
+        }
     }
 
     #[test]

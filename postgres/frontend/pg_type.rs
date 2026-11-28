@@ -14,7 +14,7 @@ pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
 pub(crate) use oid::{check_oid_range, oid_input};
 pub(crate) use regclass::{parse_regclass, RegClassInput};
-pub(crate) use uuid::canonical_uuid;
+pub(crate) use uuid::{canonical_uuid, random_uuid_text};
 
 use crate::error::sqlstate_error;
 use crate::session::relation_lookup_namespaces;

@@ -479,6 +479,13 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
+        "gen_random_uuid"(FunctionArity::Exact(0), false) => {
+            let io = &connection.get_pager().io;
+            Uuid(crate::pg_type::random_uuid_text(
+                io.generate_random_number(),
+                io.generate_random_number(),
+            ))
+        },
         // The time the transaction started, or the statement outside a
         // transaction.
         "now" | "transaction_timestamp"(FunctionArity::Exact(0), false) => {
