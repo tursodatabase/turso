@@ -117,7 +117,7 @@ SELECT matrix[2][1] FROM m;
 
 ### Slice Operator [start:end]
 
-Extract a sub-array using half-open range `[start, end)`.
+Extract a sub-array by subscripts. Both ends are included, and an end outside the array is clamped to it. The result starts at 1, whatever the lower bound of the array.
 
 ```sql
 array_expr[start:end]
@@ -127,8 +127,8 @@ array_expr[start:end]
 CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
 INSERT INTO t VALUES (1, ARRAY['a','b','c','d']);
 
-SELECT tags[1:3] FROM t;
--- ["b","c"]
+SELECT tags[2:3] FROM t;
+-- {b,c}
 ```
 
 ---
@@ -340,7 +340,7 @@ SELECT array_contains('[1, 2, 3]', 5);
 
 ### array_position
 
-Returns the zero-based index of the first occurrence of an element.
+Returns the subscript of the first occurrence of an element.
 
 ```sql
 array_position(array, element)
@@ -351,22 +351,22 @@ array_position(array, element)
 | `array` | BLOB/TEXT | The array to search |
 | `element` | any | The element to find |
 
-**Returns:** INTEGER -- the zero-based index, or NULL if not found.
+**Returns:** INTEGER -- the subscript, or NULL if not found.
 
 ```sql
-SELECT array_position('[10, 20, 30]', 20);
+SELECT array_position(ARRAY[10, 20, 30], 20);
+-- 2
+
+SELECT array_position(ARRAY[10, 20, 30], 10);
 -- 1
 
-SELECT array_position('[10, 20, 30]', 10);
--- 0
-
-SELECT array_position('[10, 20, 30]', 99);
+SELECT array_position(ARRAY[10, 20, 30], 99);
 -- NULL
 ```
 
 ### array_slice
 
-Extracts a sub-array by index range.
+Extracts a sub-array by subscript range.
 
 ```sql
 array_slice(array, start, end)
@@ -375,17 +375,17 @@ array_slice(array, start, end)
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `array` | BLOB/TEXT | The source array |
-| `start` | INTEGER | Start index (zero-based, inclusive). NULL means 0 |
-| `end` | INTEGER | End index (exclusive) |
+| `start` | INTEGER | Start subscript (inclusive). NULL means the start of the array |
+| `end` | INTEGER | End subscript (inclusive) |
 
-**Returns:** BLOB -- a new array containing elements from `start` to `end - 1`.
+**Returns:** BLOB -- a new array, starting at 1, with the elements from subscript `start` to subscript `end`.
 
 ```sql
-SELECT array_slice('[1, 2, 3, 4]', 1, 3);
--- [2,3]
+SELECT array_slice(ARRAY[1, 2, 3, 4], 2, 3);
+-- {2,3}
 
-SELECT array_slice('[1, 2, 3, 4]', NULL, 2);
--- [1,2]
+SELECT array_slice(ARRAY[1, 2, 3, 4], NULL, 2);
+-- {1,2}
 ```
 
 ### array_to_string

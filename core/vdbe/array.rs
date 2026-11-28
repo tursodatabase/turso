@@ -18,10 +18,15 @@ pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
 /// Handles record blobs, JSON text input, and NULL (empty array).
 /// Returns None if the value cannot be interpreted as an array.
 pub fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
+    array_from_any(arr).map(|array| array.elements)
+}
+
+/// [array_values_from_any] with the lower bound of the array.
+pub(crate) fn array_from_any(arr: &Value) -> Option<ArrayValue> {
     match arr {
-        Value::Blob(blob) => array_values_from_blob(blob).ok(),
-        Value::Text(text) => parse_text_array(text.as_str()),
-        Value::Null => Some(Vec::new()),
+        Value::Blob(blob) => ArrayValue::decode(blob).ok(),
+        Value::Text(text) => parse_text_array_value(text.as_str()),
+        Value::Null => Some(ArrayValue::new(Vec::new())),
         _ => None,
     }
 }
@@ -414,32 +419,32 @@ pub(crate) fn exec_array_position(arr: &Value, target: &Value) -> Value {
     }
     if let Value::Blob(blob) = arr {
         return array_find_streaming(blob, |vref| vref == *target)
-            .map(|i| Value::from_i64(i as i64 + 1)) // 1-based (PG convention)
+            .map(Value::from_i64)
             .unwrap_or(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(array) = array_from_any(arr) else {
         return Value::Null;
     };
-    for (i, elem) in elements.iter().enumerate() {
+    for (i, elem) in array.elements.iter().enumerate() {
         if elem == target {
-            return Value::from_i64(i as i64 + 1); // 1-based (PG convention)
+            return Value::from_i64(i64::from(array.lower_bound) + i as i64);
         }
     }
     Value::Null
 }
 
 /// Stream through a record-format blob, calling `predicate` on each element.
-/// Returns Some(index) for the first element where the predicate returns true,
-/// or None if no match or on error.
+/// Returns Some(subscript) for the first element where the predicate returns
+/// true, or None if no match or on error.
 fn array_find_streaming(
     blob: &[u8],
     predicate: impl Fn(crate::ValueRef<'_>) -> bool,
-) -> Option<usize> {
+) -> Option<i64> {
     let view = ArrayView::parse(blob).ok()?;
     for (i, vref) in view.elements().enumerate() {
         let vref = vref.ok()?;
         if predicate(vref) {
-            return Some(i);
+            return Some(i64::from(view.lower_bound()) + i as i64);
         }
     }
     None
@@ -449,21 +454,23 @@ pub(crate) fn exec_array_slice(arr: &Value, start: &Value, end: &Value) -> Resul
     if matches!(arr, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(array) = array_from_any(arr) else {
         return Ok(Value::Null);
     };
-    // PG convention: 1-based inclusive bounds
-    let start_idx = match start {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
+    let lower_bound = i64::from(array.lower_bound);
+    let start = match start {
+        Value::Numeric(Numeric::Integer(subscript)) => subscript.saturating_sub(lower_bound),
         _ => 0,
     };
-    let end_idx = match end {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => *i as usize, // inclusive → exclusive
+    let end = match end {
+        Value::Numeric(Numeric::Integer(subscript)) => {
+            subscript.saturating_sub(lower_bound).saturating_add(1)
+        }
         _ => 0,
     };
-    let end = end_idx.min(elements.len());
-    let start = start_idx.min(end);
-    encode_array(DEFAULT_LOWER_BOUND, &elements[start..end])
+    let end = end.clamp(0, array.elements.len() as i64) as usize;
+    let start = (start.max(0) as usize).min(end);
+    encode_array(DEFAULT_LOWER_BOUND, &array.elements[start..end])
 }
 
 /// Split a string into an array using a delimiter.
@@ -905,6 +912,53 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn ints(lower_bound: i32, values: &[i64]) -> Value {
+        encode_array(
+            lower_bound,
+            values
+                .iter()
+                .map(|v| Value::from_i64(*v))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn slice_counts_from_the_lower_bound() {
+        let array = ints(0, &[10, 20, 30]);
+        for (start, end, expected) in [
+            (0, 1, vec![10, 20]),
+            (1, 2, vec![20, 30]),
+            (0, 5, vec![10, 20, 30]),
+            (-4, 1, vec![10, 20]),
+            (2, 2, vec![30]),
+            (3, 4, vec![]),
+            (1, 0, vec![]),
+        ] {
+            let slice =
+                exec_array_slice(&array, &Value::from_i64(start), &Value::from_i64(end)).unwrap();
+            assert_eq!(slice, ints(1, &expected), "[{start}:{end}]");
+        }
+    }
+
+    #[test]
+    fn position_is_a_subscript() {
+        let array = ints(0, &[10, 20, 30]);
+        for (target, expected) in [(10, Some(0)), (20, Some(1)), (30, Some(2)), (99, None)] {
+            let position = exec_array_position(&array, &Value::from_i64(target));
+            assert_eq!(position, expected.map_or(Value::Null, Value::from_i64));
+        }
+    }
+
+    #[test]
+    fn position_in_a_text_array_with_a_lower_bound_is_a_subscript() {
+        let array = Value::build_text("[5:6]={10,20}");
+        assert_eq!(
+            exec_array_position(&array, &Value::from_i64(20)),
+            Value::from_i64(6)
+        );
     }
 
     #[test]
