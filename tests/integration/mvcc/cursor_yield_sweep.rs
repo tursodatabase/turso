@@ -1209,7 +1209,10 @@ fn test_seek_sees_own_write_after_gc_unlinked_its_chain() {
             &[(55, 50), (60, 60), (70, 70), (80, 80), (90, 90), (100, 100)],
         ),
     ];
-    for point in [CursorYieldPoint::SeekStart, CursorYieldPoint::SeekBtreeProgress] {
+    for point in [
+        CursorYieldPoint::SeekStart,
+        CursorYieldPoint::SeekBtreeProgress,
+    ] {
         for (sql, write, expected) in cases {
             let db = MvccTestDbNoConn::new_with_random_db();
             let conn = db.connect();

@@ -12,6 +12,7 @@ use crate::mvcc::database::{
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
@@ -23,7 +24,6 @@ use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::fmt::Debug;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
