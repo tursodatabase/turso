@@ -8,9 +8,12 @@
 //! The input is split into fields as PostgreSQL's `ParseDateTime` does and the
 //! fields are read as its `DecodeDateTime` does, for a subset of its forms.
 //! Values whose text would not sort in time order are rejected: BC, years past
-//! 9999, years not written with 4 digits and `infinity`.
+//! 9999, years not written with 4 digits and `infinity`. `epoch` is read as
+//! 1970-01-01 00:00:00 UTC.
 
 use crate::types::Value;
+use crate::util::trim_ascii_whitespace;
+use crate::vdbe::affinity::is_space;
 use crate::{LimboError, Result};
 use chrono::{Datelike, Duration, Month, NaiveDate, NaiveDateTime, Timelike};
 
@@ -110,7 +113,7 @@ fn split_fields(input: &str) -> Option<Vec<Field<'_>>> {
     while i < bytes.len() {
         let start = i;
         let c = bytes[i];
-        if c.is_ascii_whitespace() || c == b',' {
+        if is_space(c) || c == b',' {
             i += 1;
         } else if c.is_ascii_digit() {
             i = skip(i, &|c| c.is_ascii_digit());
@@ -173,12 +176,27 @@ struct Fields {
 
 impl Fields {
     fn read(input: &str, ty: TemporalType) -> Result<Self> {
-        match input.trim().to_ascii_lowercase().as_str() {
+        // PostgreSQL skips only the ASCII spaces that C's isspace() accepts, so a
+        // special word with a no-break space around it is not that word.
+        let word = trim_ascii_whitespace(input);
+        match word.to_ascii_lowercase().as_str() {
             "allballs" if ty == TemporalType::Time => {
                 return Ok(Self {
                     time: Some(0),
                     ..Self::default()
                 })
+            }
+            "epoch" if ty != TemporalType::Time => {
+                // PostgreSQL reads `epoch` as 1970-01-01 00:00:00 UTC. Unlike
+                // `infinity` it is an ordinary instant, so its stored text sorts
+                // in time order with the others.
+                let text = match ty {
+                    TemporalType::Date => "1970-01-01",
+                    TemporalType::Timestamp => "1970-01-01 00:00:00",
+                    TemporalType::Timestamptz => "1970-01-01 00:00:00+00",
+                    TemporalType::Time => unreachable!("the guard excludes time"),
+                };
+                return Self::read(text, ty);
             }
             word @ ("infinity" | "-infinity" | "epoch" | "now" | "today" | "tomorrow"
             | "yesterday" | "allballs") => {

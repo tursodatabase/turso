@@ -204,6 +204,30 @@ expect {
 @sqlstate 22007
 expect @tursopg error {}
 
+# A-38: special value epoch
+test special-value-epoch {
+    SELECT 'epoch'::timestamptz, 'epoch'::timestamp, 'epoch'::date;
+}
+expect {
+    1970-01-01 00:00:00+00|1970-01-01 00:00:00|1970-01-01
+}
+
+# PostgreSQL skips a vertical tab like any other ASCII space.
+test date-with-vertical-tab {
+    SELECT E'\x0b2024-01-01'::date, E'\x0bepoch'::date;
+}
+expect {
+    2024-01-01|1970-01-01
+}
+
+# PostgreSQL skips only ASCII spaces around a special word; the first
+# character here is U+00A0 NO-BREAK SPACE.
+test special-value-epoch-with-no-break-space {
+    SELECT ' epoch'::date;
+}
+@sqlstate 22007
+expect error {}
+
 # A-39: invalid date (Feb 30)
 test invalid-date-feb-30 {
     SELECT '2026-02-30'::date;

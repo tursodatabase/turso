@@ -512,3 +512,45 @@ expect {
 expect @tursopg {
     {"a\nb"}|t
 }
+
+# json_object(key, value) with two arguments is a SQLite function. PostgreSQL
+# has no such function and errors. tursopg runs SQLite's function and writes the
+# timestamptz in its stored form, without the T and the offset.
+@compat-gap "function:json_object"
+test json-object-two-arguments-of-timestamptz {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00.123456+00');
+    SELECT json_object('ts', ts) FROM t;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    {"ts":"2026-10-08 12:00:00.123456"}
+}
+
+# json_group_array is a SQLite aggregate. PostgreSQL has no such function and
+# errors. tursopg runs SQLite's aggregate and writes the timestamptz in its
+# stored form.
+@compat-gap "function:json_group_array"
+test json-group-array-of-timestamptz {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00.123456+00');
+    SELECT json_group_array(ts) FROM t;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    ["2026-10-08 12:00:00.123456"]
+}
+
+# json_object(keys text[], values text[]) is PostgreSQL's json_object.
+# tursopg runs SQLite's json_object, which refuses an array as a key.
+@compat-gap "function:json_object"
+test json-object-of-key-and-value-arrays {
+    SELECT json_object(ARRAY['ts'], ARRAY['2026-10-08 12:00:00+00']);
+}
+expect {
+    {"ts" : "2026-10-08 12:00:00+00"}
+}
+@sqlstate 42000
+expect @tursopg error {}
