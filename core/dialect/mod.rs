@@ -653,6 +653,32 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The error for an `ALTER TABLE ... DROP COLUMN` that the engine refuses
+    /// before it emits any code, for the reason `refusal` gives. `table` and
+    /// `column` are spelled as SQLite's message for that reason spells them.
+    /// The default gives SQLite's message for each reason. PostgreSQL drops such a column,
+    /// with the constraints and indexes on it, which the engine cannot do, so
+    /// a dialect can say it is not supported.
+    fn drop_column_refused(
+        &self,
+        table: &str,
+        column: &str,
+        refusal: DropColumnRefusal,
+    ) -> LimboError {
+        LimboError::ParseError(match refusal {
+            DropColumnRefusal::PrimaryKey => {
+                format!("cannot drop PRIMARY KEY column: \"{column}\"")
+            }
+            DropColumnRefusal::Unique => format!("cannot drop UNIQUE column: \"{column}\""),
+            DropColumnRefusal::OnlyColumn => {
+                format!("cannot drop column \"{column}\": no other columns exist")
+            }
+            DropColumnRefusal::InTableUnique => {
+                format!("error in table {table} after drop column: no such column: {column}")
+            }
+        })
+    }
+
     /// Appends a blob element of an array to the array's text, as in
     /// `{"X'6162'"}`.
     ///
@@ -763,6 +789,21 @@ pub fn undefined_operator_message(op: &str, operand_types: &[String]) -> String 
         [left, right] => format!("operator does not exist: {left} {op} {right}"),
         _ => unreachable!("an operator has one or two operands"),
     }
+}
+
+/// Why `ALTER TABLE ... DROP COLUMN` refuses a column, in the order SQLite's
+/// `sqlite3AlterDropColumn` checks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropColumnRefusal {
+    /// The column is a PRIMARY KEY column or part of one.
+    PrimaryKey,
+    /// The column has a UNIQUE constraint of its own.
+    Unique,
+    /// The column is the table's only column.
+    OnlyColumn,
+    /// The column is named in a table-level UNIQUE constraint. SQLite finds
+    /// this only when it rewrites the table's CREATE statement without it.
+    InTableUnique,
 }
 
 /// What a dialect decided for an operator.

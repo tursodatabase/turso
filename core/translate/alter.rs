@@ -1,15 +1,16 @@
 use crate::alloc::TursoIteratorExt;
 use crate::ast::{self, TableInternalId};
 use crate::dialect::{
-    AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, DropColumn, NewOwner,
-    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
+    AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, DropColumn, DropColumnRefusal,
+    NewOwner, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView,
+    TempTriggerOfRenamedTable,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
 use crate::translate::row_security;
 use crate::types::StrictType;
-use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
+use crate::{turso_assert_eq, SymbolTable};
 
 use super::{
     index::emit_refill_index,
@@ -717,15 +718,8 @@ pub fn translate_alter_table(
                 column_name,
             )?;
 
-            // Tables always have at least one column.
-            turso_assert_ne!(btree.columns().len(), 0);
-
-            if btree.columns().len() == 1 {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": no other columns exist"
-                )));
-            }
-
+            // The column must exist before the other DROP COLUMN checks, as in
+            // SQLite: a PostgreSQL table can have no columns at all.
             let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
                 LimboError::ParseError(format!("no such column: \"{column_name}\""))
             })?;
@@ -741,25 +735,40 @@ pub fn translate_alter_table(
             // The column is used in the expression of a generated column.
             // The column appears in a trigger or view.
 
-            if column.primary_key() {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": PRIMARY KEY"
-                )));
-            }
-
-            if column.unique()
-                || btree.unique_sets.iter().any(|set| {
-                    set.columns
-                        .iter()
-                        .any(|c| c.name == normalize_ident(column_name))
-                })
-            {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": UNIQUE"
-                )));
-            }
-
+            // In SQLite's order (sqlite3AlterDropColumn): a PRIMARY KEY column, then a column
+            // with its own UNIQUE, then the only column. A column named only in a table-level
+            // UNIQUE is not flagged, so SQLite finds it after the count, when it rewrites the
+            // table's CREATE statement.
+            // SQLite's message for a table-level UNIQUE names the table as it was created and
+            // the column as the constraint spells it.
             let col_normalized = normalize_ident(column_name);
+            let in_table_unique = btree
+                .unique_sets
+                .iter()
+                .flat_map(|set| &set.columns)
+                .find(|key| normalize_ident(&key.name) == col_normalized);
+            let (table, column, refusal) = if column.primary_key() {
+                (table_name, column_name, Some(DropColumnRefusal::PrimaryKey))
+            } else if column.unique() {
+                (table_name, column_name, Some(DropColumnRefusal::Unique))
+            } else if btree.columns().len() == 1 {
+                (table_name, column_name, Some(DropColumnRefusal::OnlyColumn))
+            } else if let Some(key) = in_table_unique {
+                (
+                    btree.declared_name.as_str(),
+                    key.name.as_str(),
+                    Some(DropColumnRefusal::InTableUnique),
+                )
+            } else {
+                (table_name, column_name, None)
+            };
+            if let Some(refusal) = refusal {
+                return Err(resolver
+                    .catalog
+                    .dialect
+                    .drop_column_refused(table, column, refusal));
+            }
+
             for index in table_indexes.iter() {
                 // Referenced in regular index
                 let maybe_indexed_col = index
