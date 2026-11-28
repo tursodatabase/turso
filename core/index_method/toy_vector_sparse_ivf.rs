@@ -538,6 +538,12 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         .into());
                     };
                     let sum = vector.as_f32_sparse().values.iter().sum::<f32>() as f64;
+                    if sum.is_nan() {
+                        return Err(LimboError::InvalidArgument(
+                            "sparse vector index: the sum of the components is NaN".to_string(),
+                        )
+                        .into());
+                    }
                     self.insert_state = VectorSparseInvertedIndexInsertState::Prepare {
                         vector: Some(vector),
                         sum,

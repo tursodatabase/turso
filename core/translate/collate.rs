@@ -27,7 +27,6 @@ use crate::{
     },
     type_ordering::TypeOrdering,
     types::ValueRef,
-    vdbe::hash_table::normalized_f64_bits,
     LimboError, Numeric, Result,
 };
 
@@ -209,7 +208,7 @@ impl CollationSeq {
                 let f = i as f64;
                 if (f as i64) == i && f.is_finite() {
                     hasher.write_u8(FLOAT_HASH);
-                    hasher.write(&normalized_f64_bits(f).to_le_bytes());
+                    hasher.write(&crate::Double::new(f).canonical_bits().to_le_bytes());
                 } else {
                     // The REAL would lose precision, so no REAL can equal this integer.
                     hasher.write_u8(INT_HASH);
@@ -218,7 +217,7 @@ impl CollationSeq {
             }
             ValueRef::Numeric(Numeric::Float(f)) => {
                 hasher.write_u8(FLOAT_HASH);
-                hasher.write(&normalized_f64_bits(f64::from(f)).to_le_bytes());
+                hasher.write(&f.canonical_bits().to_le_bytes());
             }
             ValueRef::Text(text) => {
                 hasher.write_u8(TEXT_HASH);

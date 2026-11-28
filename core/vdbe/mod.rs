@@ -17,11 +17,13 @@
 //!
 //! <https://www.sqlite.org/opcode.html>
 
+pub(crate) mod registers;
+
 use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
-use crate::types::{Extendable, Text, ValueBlob};
-use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
+use crate::types::{Extendable, NanPolicy, Text, ValueBlob};
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert, Double};
 pub mod affinity;
 pub mod array;
 pub mod bloom_filter;
@@ -602,7 +604,7 @@ impl Register {
     /// Set the value of the register to a floating point,
     /// reusing Register::Value(Value::Numeric(Numeric::Float(_))) if possible.
     #[inline(always)]
-    pub fn set_float(&mut self, val: NonNan) {
+    pub fn set_float(&mut self, val: Double) {
         match self {
             Register::Value(Value::Numeric(Numeric::Float(existing))) => {
                 *existing = val;
@@ -1119,7 +1121,7 @@ pub struct ProgramState {
     pub(crate) index_method_finalize_subprogram: usize,
     pub(crate) index_methods_finalized: bool,
     cursor_seqs: Vec<i64>,
-    registers: Box<[Register]>,
+    registers: registers::Registers,
     /// Trace state: register snapshot for diffing.
     pre_op_registers: Option<Box<[String]>>,
     pub(crate) result_row: Option<Row>,
@@ -1304,14 +1306,20 @@ unsafe impl Sync for ProgramState {}
 crate::assert::assert_send_sync!(ProgramState);
 
 impl ProgramState {
+    #[cfg(test)]
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
+        Self::new_with_nan_policy(max_registers, max_cursors, NanPolicy::Null)
+    }
+
+    pub(crate) fn new_with_nan_policy(
+        max_registers: usize,
+        max_cursors: usize,
+        nan_policy: NanPolicy,
+    ) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_databases = vec![None; max_cursors];
         let cursor_seqs = vec![0i64; max_cursors];
-        let registers = (0..max_registers)
-            .map(|_| Register::Value(Value::Null))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let registers = registers::Registers::new(max_registers, nan_policy);
         Self {
             check_countdown: 1,
             countdown_synced: 1,
@@ -1388,7 +1396,7 @@ impl ProgramState {
     }
 
     pub fn set_register(&mut self, idx: usize, value: Register) {
-        self.registers[idx] = value;
+        *self.registers.write(idx) = value;
     }
 
     pub fn get_register(&self, idx: usize) -> &Register {
@@ -1423,7 +1431,8 @@ impl ProgramState {
         matches!(self.execution_state, ProgramExecutionState::Interrupting)
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
+    pub fn bind_at(&mut self, index: NonZero<usize>, mut value: Value) -> Result<()> {
+        self.registers.nan_policy().normalize(&mut value);
         let i = index.get() - 1;
         if i >= self.parameters.len() {
             self.parameters.resize(i + 1, Value::Null);
@@ -1471,11 +1480,8 @@ impl ProgramState {
         }
         self.result_row = None;
         if let Some(max_registers) = max_registers {
-            // into_vec and into_boxed_slice do not allocate
-            let mut registers = std::mem::take(&mut self.registers).into_vec();
-            // As we are dropping whatever is in the result row, we can be sure that no one is referencing values from `*const Register` inside `Row`.
-            registers.resize_with(max_registers, || Register::Value(Value::Null));
-            self.registers = registers.into_boxed_slice();
+            // The previous result row was cleared, so its pointers are no longer used.
+            self.registers.resize(max_registers);
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
         self.cursor_databases.fill(None);
@@ -1508,12 +1514,7 @@ impl ProgramState {
         self.index_method_finalize_subprogram_keys = None;
         self.index_method_finalize_subprogram = 0;
         self.index_methods_finalized = false;
-        for r in self.registers.iter_mut() {
-            match r {
-                Register::Value(v) => *v = Value::Null,
-                _ => r.set_null(),
-            }
-        }
+        self.registers.clear(..);
         self.last_compare = None;
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
@@ -2540,14 +2541,14 @@ impl Program {
         }
         let (opcode, p1, p2, p3, p4, p5, comment) = row;
 
-        state.registers[0].set_int(state.pc as i64);
-        state.registers[1].set_value(Value::from_text(opcode));
-        state.registers[2].set_int(p1);
-        state.registers[3].set_int(p2);
-        state.registers[4].set_int(p3);
-        state.registers[5].set_value(p4);
-        state.registers[6].set_int(p5);
-        state.registers[7].set_value(Value::from_text(comment));
+        state.registers.set_int(0, state.pc as i64);
+        state.registers.set_value(1, Value::from_text(opcode));
+        state.registers.set_int(2, p1);
+        state.registers.set_int(3, p2);
+        state.registers.set_int(4, p3);
+        state.registers.set_value(5, p4);
+        state.registers.set_int(6, p5);
+        state.registers.set_value(7, Value::from_text(comment));
         state.result_row = Some(Row {
             values: &state.registers[0] as *const Register,
             count: EXPLAIN_COLUMNS.len(),
@@ -2594,11 +2595,13 @@ impl Program {
                 continue;
             };
 
-            state.registers[0].set_int(*p1 as i64);
-            state.registers[1] =
+            state.registers.set_int(0, *p1 as i64);
+            *state.registers.write(1) =
                 Register::Value(Value::from_i64(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
-            state.registers[2].set_int(0);
-            state.registers[3].set_value(Value::from_text(detail.to_string()));
+            state.registers.set_int(2, 0);
+            state
+                .registers
+                .set_value(3, Value::from_text(detail.to_string()));
             state.result_row = Some(Row {
                 values: &state.registers[0] as *const Register,
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
@@ -2637,9 +2640,10 @@ impl Program {
         if state.pc != 0 {
             return Ok(StepResult::Done);
         }
-        state.registers[0].set_value(Value::from_text(crate::translate::eqp::program_plan_json(
-            self,
-        )));
+        state.registers.set_value(
+            0,
+            Value::from_text(crate::translate::eqp::program_plan_json(self)),
+        );
         state.result_row = Some(Row {
             values: &state.registers[0] as *const Register,
             count: EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(),
@@ -3771,7 +3775,7 @@ impl Program {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
         }
         state.extension_state = crate::native_ext::ExtensionState::None;
-        crate::native_ext::abort_aggregates(&mut state.registers);
+        crate::native_ext::abort_aggregates(&mut state.registers.write(..));
         state.explicit_checkpoint_guard = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
@@ -4313,22 +4317,6 @@ fn add_to_change_count(count: &AtomicI64, amount: i64) {
     );
 }
 
-/// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
-pub(crate) fn split_registers(
-    registers: &mut [Register],
-    src: usize,
-    dst: usize,
-) -> (&Register, &mut Register) {
-    debug_assert_ne!(src, dst, "split_registers: src and dst must differ");
-    if src < dst {
-        let (left, right) = registers.split_at_mut(dst);
-        (&left[src], &mut right[0])
-    } else {
-        let (left, right) = registers.split_at_mut(src);
-        (&right[0], &mut left[dst])
-    }
-}
-
 pub fn registers_to_ref_values<'a>(
     registers: &'a [Register],
 ) -> impl ExactSizeIterator<Item = ValueRef<'a>> + Clone {
@@ -4645,13 +4633,11 @@ pub(crate) fn decode_serial_type_into_register(
             if unlikely(data.len() < 8) {
                 return Err(LimboError::Corrupt("Invalid 8-byte float".into()));
             }
-            let val = f64::from_be_bytes([
+            match crate::Double::from_record_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ]);
-            if let Some(nn) = NonNan::new(val) {
-                dest.set_float(nn);
-            } else {
-                dest.set_null();
+            ]) {
+                Some(real) => dest.set_float(real),
+                None => dest.set_null(),
             }
             *data = &data[8..];
         }
@@ -5021,8 +5007,8 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Write some data to registers
-                state.registers[0].set_int(42);
-                state.registers[1].set_text(Text::new("test".to_string()));
+                state.registers.set_int(0, 42);
+                state.registers.set_text(1, Text::new("test".to_string()));
 
                 // Send state to another thread
                 let handle = thread::spawn(move || {
@@ -5038,7 +5024,7 @@ mod shuttle_tests {
                     }
 
                     // Modify in new thread
-                    state.registers[2].set_int(100);
+                    state.registers.set_int(2, 100);
                     state
                 });
 
@@ -5061,9 +5047,9 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Set up registers with test data
-                state.registers[0].set_int(1);
-                state.registers[1].set_int(2);
-                state.registers[2].set_int(3);
+                state.registers.set_int(0, 1);
+                state.registers.set_int(1, 2);
+                state.registers.set_int(2, 3);
 
                 // Create a result_row pointing to registers
                 state.result_row = Some(Row {
@@ -5105,8 +5091,8 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Set up registers
-                state.registers[0].set_int(42);
-                state.registers[1].set_int(43);
+                state.registers.set_int(0, 42);
+                state.registers.set_int(1, 43);
 
                 // Create result_row
                 state.result_row = Some(Row {
@@ -5157,7 +5143,7 @@ mod shuttle_tests {
 
                 // Set up registers with distinct values
                 for i in 0..5 {
-                    state.registers[i].set_int(i as i64 * 10);
+                    state.registers.set_int(i, i as i64 * 10);
                 }
 
                 state.result_row = Some(Row {
@@ -5199,7 +5185,7 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0].set_int(100);
+                state.registers.set_int(0, 100);
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
                     count: 1,
@@ -5230,7 +5216,7 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0].set_int(1);
+                state.registers.set_int(0, 1);
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
                     count: 1,
@@ -5240,7 +5226,7 @@ mod shuttle_tests {
                 let _ = state.result_row.take();
 
                 // Now safe to modify registers
-                state.registers[0].set_int(999);
+                state.registers.set_int(0, 999);
 
                 // Create new row pointing to modified registers
                 state.result_row = Some(Row {
@@ -5265,14 +5251,14 @@ mod shuttle_tests {
         shuttle::check_random(
             || {
                 let mut state = create_test_state(10, 2);
-                state.registers[0].set_int(0);
+                state.registers.set_int(0, 0);
 
                 // Thread 1: increment
                 let h1 = thread::spawn(move || {
                     if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
                         &state.registers[0]
                     {
-                        state.registers[0].set_int(v + 1);
+                        state.registers.set_int(0, v + 1);
                     }
                     state
                 });
@@ -5284,7 +5270,7 @@ mod shuttle_tests {
                     if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
                         &state.registers[0]
                     {
-                        state.registers[0].set_int(v + 1);
+                        state.registers.set_int(0, v + 1);
                     }
                     state
                 });
@@ -5296,7 +5282,7 @@ mod shuttle_tests {
                     if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
                         &state.registers[0]
                     {
-                        state.registers[0].set_int(v + 1);
+                        state.registers.set_int(0, v + 1);
                     }
                     state
                 });
@@ -5323,7 +5309,7 @@ mod shuttle_tests {
 
                 // Initialize with test data
                 for i in 0..5 {
-                    state.registers[i].set_int(i as i64);
+                    state.registers.set_int(i, i as i64);
                 }
 
                 let state = Arc::new(state);
@@ -5361,9 +5347,9 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0].set_int(10);
-                state.registers[1].set_int(20);
-                state.registers[2].set_int(30);
+                state.registers.set_int(0, 10);
+                state.registers.set_int(1, 20);
+                state.registers.set_int(2, 30);
 
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
@@ -5408,7 +5394,7 @@ mod shuttle_tests {
 
                 // Fill registers with identifiable data
                 for i in 0..20 {
-                    state.registers[i].set_int(i as i64 * 100);
+                    state.registers.set_int(i, i as i64 * 100);
                 }
 
                 state.result_row = Some(Row {

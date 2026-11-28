@@ -2268,3 +2268,134 @@ fn the_catalog_gets_a_new_schema_and_a_dropped_schema() {
         ["create schema app", "drop schema app"]
     );
 }
+
+struct DialectThatKeepsNan;
+
+impl Dialect for DialectThatKeepsNan {
+    fn name(&self) -> &'static str {
+        "nan-test"
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse(sql)
+    }
+
+    fn parse_internal(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> Result<turso_core::ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
+        SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn nan_is_a_value(&self) -> bool {
+        true
+    }
+}
+
+fn first_column(conn: &Arc<Connection>, sql: &str) -> Vec<Value> {
+    conn.prepare(sql)
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|mut row| row.remove(0))
+        .collect()
+}
+
+#[test]
+fn a_dialect_that_keeps_nan_stores_it_and_reads_it_back() {
+    const NAN: &str = "(9e999 - 9e999)";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stored-nan.db");
+    for reopen in [false, true] {
+        let db = crate::common::TempDatabase::builder()
+            .with_db_path(&path)
+            .with_dialect(Arc::new(DialectThatKeepsNan))
+            .build();
+        let conn = db.connect_limbo();
+        if !reopen {
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x REAL)")
+                .unwrap();
+            conn.execute("CREATE UNIQUE INDEX t_x ON t(x)").unwrap();
+            conn.execute(format!(
+                "INSERT INTO t VALUES (1, {NAN}), (2, 1.5), (3, 9e999)"
+            ))
+            .unwrap();
+        }
+        let [nan_row, number, infinity] = [1, 2, 3].map(Value::from_i64);
+        assert_eq!(
+            first_column(&conn, "SELECT id FROM t ORDER BY x DESC"),
+            [nan_row.clone(), infinity, number]
+        );
+        assert_eq!(
+            first_column(&conn, &format!("SELECT id FROM t WHERE x = {NAN}")),
+            [nan_row.clone()]
+        );
+        assert_eq!(
+            first_column(&conn, "SELECT id FROM t INDEXED BY t_x WHERE x > 9e999"),
+            [nan_row]
+        );
+        assert!(first_column(&conn, "SELECT id FROM t WHERE x IS NULL").is_empty());
+        assert!(first_column(&conn, "SELECT x FROM t WHERE id = 1")[0].is_nan());
+        assert!(conn
+            .execute(format!("INSERT INTO t VALUES (4, -{NAN})"))
+            .is_err());
+        assert_eq!(
+            first_column(&conn, "PRAGMA integrity_check"),
+            [Value::build_text("ok")]
+        );
+        if reopen {
+            conn.execute(format!("DELETE FROM t WHERE x = {NAN}"))
+                .unwrap();
+            assert_eq!(
+                first_column(&conn, "SELECT count(*) FROM t"),
+                [Value::from_i64(2)]
+            );
+        }
+    }
+}
+
+#[test]
+fn a_dialect_that_keeps_nan_sorts_and_groups_all_nans_alike() {
+    let db = crate::common::TempDatabase::builder()
+        .with_dialect(Arc::new(DialectThatKeepsNan))
+        .build();
+    let conn = db.connect_limbo();
+    let nans = [
+        f64::NAN,
+        f64::from_bits(0xfff8_0000_0000_0001),
+        f64::from_bits(0x7ff0_0000_0000_0001),
+    ];
+    for sql in [
+        "SELECT v FROM (SELECT ?1 AS v UNION ALL SELECT ?2 UNION ALL SELECT ?3 UNION ALL SELECT 9e999) ORDER BY v",
+        "SELECT ?1 AS v UNION SELECT ?2 UNION SELECT ?3 UNION SELECT 9e999 ORDER BY v",
+        "SELECT DISTINCT v FROM (SELECT ?1 AS v UNION ALL SELECT ?2 UNION ALL SELECT ?3 UNION ALL SELECT 9e999) ORDER BY v",
+        "SELECT v FROM (SELECT ?1 AS v UNION ALL SELECT ?2 UNION ALL SELECT ?3 UNION ALL SELECT 9e999) GROUP BY v ORDER BY v",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        for (index, nan) in nans.into_iter().enumerate() {
+            stmt.bind_at(
+                std::num::NonZeroUsize::new(index + 1).unwrap(),
+                Value::from_f64(nan),
+            )
+            .unwrap();
+        }
+        let rows = stmt.run_collect_rows().unwrap();
+        let all_rows = sql.contains("UNION ALL") && !sql.contains("DISTINCT") && !sql.contains("GROUP BY");
+        assert_eq!(rows.len(), if all_rows { 4 } else { 2 }, "{sql}: {rows:?}");
+        assert_eq!(rows[0][0], Value::from_f64(f64::INFINITY), "{sql}");
+        assert!(rows[1..].iter().all(|row| row[0].is_nan()), "{sql}: {rows:?}");
+    }
+}

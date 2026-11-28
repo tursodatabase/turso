@@ -8,7 +8,7 @@ use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
-use crate::numeric::nonnan::NonNan;
+use crate::numeric::double::Double;
 use crate::numeric::Numeric;
 use crate::numeric::{format_float, IntegerText};
 use crate::pseudo::PseudoCursor;
@@ -803,12 +803,38 @@ impl<V: AsValueRef> AsValueRef for &V {
     }
 }
 
-impl Value {
-    pub const fn from_f64(f: f64) -> Self {
-        match NonNan::new(f) {
-            Some(nn) => Self::Numeric(Numeric::Float(nn)),
-            None => Self::Null,
+/// What a SQL dialect does with a floating-point NaN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NanPolicy {
+    Null,
+    Preserve,
+}
+
+impl NanPolicy {
+    pub(crate) fn for_dialect(dialect: &dyn crate::Dialect) -> Self {
+        if dialect.nan_is_a_value() {
+            Self::Preserve
+        } else {
+            Self::Null
         }
+    }
+
+    #[inline]
+    pub(crate) fn normalize(self, value: &mut Value) {
+        if self == Self::Null && value.is_nan() {
+            *value = Value::Null;
+        }
+    }
+}
+
+impl Value {
+    /// Constructs a REAL without applying SQL dialect rules.
+    pub const fn from_f64(f: f64) -> Self {
+        Self::Numeric(Numeric::Float(Double::new(f)))
+    }
+
+    pub fn is_nan(&self) -> bool {
+        matches!(self, Self::Numeric(Numeric::Float(f)) if f.is_nan())
     }
 
     pub const fn from_i64(i: i64) -> Self {
@@ -927,10 +953,7 @@ impl Value {
                     _ => unreachable!(),
                 }
             }
-            Value::Numeric(Numeric::Float(f)) => {
-                let fval: f64 = (*f).into();
-                out.extend_from_slice(&fval.to_be_bytes());
-            }
+            Value::Numeric(Numeric::Float(f)) => out.extend_from_slice(&f.to_record_bytes()),
             Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
@@ -1379,7 +1402,7 @@ impl std::ops::AddAssign<f64> for Value {
     fn add_assign(&mut self, rhs: f64) {
         let sum = (|| {
             let lhs_num = Numeric::from_value(&self)?;
-            let rhs_num = NonNan::new(rhs).map(Numeric::Float)?;
+            let rhs_num = Double::non_nan(rhs).map(Numeric::Float)?;
             lhs_num.checked_add(rhs_num)
         })();
 
@@ -1592,10 +1615,7 @@ mod immutable_record {
                 SerialTypeKind::I64 => out.extend_from_slice(&i.to_be_bytes()),
                 other => panic!("Serial type is not an integer: {other:?}"),
             },
-            ValueRef::Numeric(Numeric::Float(f)) => {
-                let fval: f64 = f.into();
-                out.extend_from_slice(&fval.to_be_bytes());
-            }
+            ValueRef::Numeric(Numeric::Float(f)) => out.extend_from_slice(&f.to_record_bytes()),
             ValueRef::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             ValueRef::Blob(b) => out.extend_from_slice(b),
         }
@@ -2528,9 +2548,15 @@ impl<'a> Clone for ValueIterator<'a> {
 }
 
 impl<'a> ValueRef<'a> {
-    pub fn from_f64(f: f64) -> Self {
-        match NonNan::new(f) {
-            Some(nn) => Self::Numeric(Numeric::Float(nn)),
+    /// Constructs a REAL without applying SQL dialect rules.
+    pub const fn from_f64(f: f64) -> Self {
+        Self::Numeric(Numeric::Float(Double::new(f)))
+    }
+
+    /// Reads the 8 bytes of a REAL in a record.
+    pub const fn from_record_real(bytes: [u8; 8]) -> Self {
+        match Double::from_record_bytes(bytes) {
+            Some(real) => Self::Numeric(Numeric::Float(real)),
             None => Self::Null,
         }
     }
@@ -3621,9 +3647,7 @@ impl Record {
                         }
                     }
                 }
-                Value::Numeric(Numeric::Float(f)) => {
-                    buf.extend_from_slice(&f64::from(*f).to_be_bytes())
-                }
+                Value::Numeric(Numeric::Float(f)) => buf.extend_from_slice(&f.to_record_bytes()),
                 Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };
@@ -5169,6 +5193,31 @@ mod tests {
     }
 
     #[test]
+    fn a_nan_in_a_record_is_read_back_as_a_nan() {
+        let values = [Value::from_f64(-f64::NAN), Value::from_f64(1.5)];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        assert!(!record.contains_null().unwrap());
+        let read = record.get_values_owned().unwrap();
+        assert!(read[0].is_nan());
+        assert_eq!(read[1], Value::from_f64(1.5));
+
+        let mut serialized = std::vec::Vec::new();
+        Record::new(vec![Value::from_f64(-f64::NAN), Value::from_f64(1.5)])
+            .serialize(&mut serialized);
+        assert_eq!(serialized, record.get_payload());
+    }
+
+    #[test]
+    fn nan_bits_that_no_record_writer_makes_are_read_as_null() {
+        for bits in [0x7ff8_0000_0000_0000u64, 0xfff8_0000_0000_0001] {
+            let mut payload = vec![2, 7];
+            payload.extend_from_slice(&bits.to_be_bytes());
+            let record = ImmutableRecordRef::from_bin_record(&payload);
+            assert_eq!(record.get_values_owned().unwrap(), vec![Value::Null]);
+        }
+    }
+
+    #[test]
     fn test_serialize_text() {
         let text = "hello";
         let record = Record::new(vec![Value::Text(Text::new(text))]);
@@ -5261,19 +5310,17 @@ mod tests {
     /// via partial_cmp returned None. The .unwrap() in Ord::cmp and
     /// the single-value compare would then panic.
     ///
-    /// Now Numeric::Float wraps NonNan, which rejects NaN at construction time.
-    /// This makes it impossible to represent NaN in a ValueRef, so partial_cmp
-    /// is total and can never return None for any representable value.
+    /// Now Numeric::Float wraps Double, whose order is total even for NaN, so
+    /// partial_cmp can never return None, including for a value made from NaN.
     #[test]
     fn test_valueref_partial_cmp_no_panic_on_nan() {
-        use crate::numeric::nonnan::NonNan;
+        use crate::numeric::double::Double;
 
-        // NonNan::new rejects NaN — this is the type-level guarantee that
-        // prevents the old panic. No ValueRef::Float(NAN) can be constructed.
-        assert!(NonNan::new(f64::NAN).is_none());
+        assert!(Double::non_nan(f64::NAN).is_none());
 
-        // from_f64(NAN) falls back to Null instead of storing a NaN float.
-        assert_eq!(ValueRef::from_f64(f64::NAN), ValueRef::Null);
+        assert!(
+            matches!(ValueRef::from_f64(f64::NAN), ValueRef::Numeric(Numeric::Float(f)) if f.is_nan())
+        );
 
         // Exercise every representable float edge case through partial_cmp,
         // Ord::cmp, and CollationSeq::compare — none of these can panic now.
@@ -5292,7 +5339,7 @@ mod tests {
             ValueRef::from_f64(f64::MIN_POSITIVE),
             ValueRef::from_f64(f64::INFINITY),
             ValueRef::from_f64(f64::NEG_INFINITY),
-            ValueRef::from_f64(f64::NAN), // becomes Null
+            ValueRef::from_f64(f64::NAN),
             ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
             ValueRef::Text(TextRef::new("", TextSubtype::Text)),
             ValueRef::Blob(&[1, 2, 3]),

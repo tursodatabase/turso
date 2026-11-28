@@ -4020,6 +4020,11 @@ impl Database {
         self.with_schema_mut(|schema| schema.register_internal_vtab(table))
     }
 
+    /// Whether a REAL can be NaN in this database, from its dialect.
+    pub(crate) fn nan_policy(&self) -> crate::types::NanPolicy {
+        crate::types::NanPolicy::for_dialect(self.dialect.as_ref())
+    }
+
     /// The SQL dialect this database was opened with.
     pub fn dialect(&self) -> Arc<dyn Dialect> {
         self.dialect.clone()
