@@ -89,7 +89,7 @@ impl NativeExtensions {
                 .insert(function.name.clone(), function.clone());
         }
         for (name, module) in &self.modules {
-            syms.vtab_modules.insert(name.clone(), module.clone());
+            syms.insert_vtab_module(name.clone(), module.clone());
             if module.module_kind == VTabKind::TableValuedFunction {
                 db.register_virtual_table(crate::vtab::VirtualTable::function(
                     db.dialect().as_ref(),

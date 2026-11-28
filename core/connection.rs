@@ -5218,6 +5218,17 @@ impl SymbolTable {
             .map(|external| external.collation)
     }
 
+    /// Resolves a virtual table module by ASCII case-insensitive name,
+    /// matching SQLite's module lookup rules.
+    pub fn resolve_vtab_module(&self, name: &str) -> Option<&Arc<crate::ext::VTabImpl>> {
+        self.vtab_modules.get(name).or_else(|| {
+            self.vtab_modules
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+        })
+    }
+
     pub fn extend(&mut self, other: &SymbolTable) {
         for (name, func) in &other.functions {
             self.functions.insert(name.clone(), func.clone());
@@ -5229,7 +5240,7 @@ impl SymbolTable {
             self.vtabs.insert(name.clone(), vtab.clone());
         }
         for (name, module) in &other.vtab_modules {
-            self.vtab_modules.insert(name.clone(), module.clone());
+            self.insert_vtab_module(name.clone(), module.clone());
         }
         for (name, module) in &other.index_methods {
             self.index_methods.insert(name.clone(), module.clone());
@@ -5237,6 +5248,20 @@ impl SymbolTable {
         for (name, overlay) in &other.table_overlays {
             self.table_overlays.insert(name.clone(), overlay.clone());
         }
+    }
+
+    /// Registers a virtual table module, replacing any existing entry whose
+    /// name matches ASCII case-insensitively.
+    pub fn insert_vtab_module(&mut self, name: String, module: Arc<crate::ext::VTabImpl>) {
+        if let Some(existing_key) = self
+            .vtab_modules
+            .keys()
+            .find(|k| *k != &name && k.eq_ignore_ascii_case(&name))
+            .cloned()
+        {
+            self.vtab_modules.remove(&existing_key);
+        }
+        self.vtab_modules.insert(name, module);
     }
 }
 
