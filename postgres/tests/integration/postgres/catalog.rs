@@ -268,6 +268,46 @@ fn test_alter_table_preserves_catalog_names_after_reopen(db: TempDatabase) {
     );
 }
 
+#[test]
+fn pg_attribute_keeps_the_type_modifier_of_a_negative_scale_after_alter_table_and_reopen() {
+    let db = TempDatabase::builder().build();
+    {
+        let conn = db.connect_postgres();
+        conn.execute("CREATE TABLE rewritten (c numeric(6,-3), v varchar(4))")
+            .unwrap();
+        conn.execute("ALTER TABLE rewritten ADD COLUMN x int")
+            .unwrap();
+    }
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    let mut stmt = conn
+        .prepare(
+            "SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute \
+             WHERE attrelid = 'rewritten'::regclass AND attnum > 0 ORDER BY attnum",
+        )
+        .unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![
+            vec![
+                Value::build_text("c"),
+                Value::from_i64(395265),
+                Value::build_text("numeric(6,-3)")
+            ],
+            vec![
+                Value::build_text("v"),
+                Value::from_i64(8),
+                Value::build_text("character varying(4)")
+            ],
+            vec![
+                Value::build_text("x"),
+                Value::from_i64(-1),
+                Value::build_text("integer")
+            ],
+        ]
+    );
+}
+
 /// Opening a database and reading its schema again go through the same
 /// steps, so the catalogs must report the same objects after both.
 #[test]

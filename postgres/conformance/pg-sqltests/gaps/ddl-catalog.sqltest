@@ -363,7 +363,6 @@ expect {
 }
 
 # E-30: format_type with typmod
-@compat-gap "function:format_type"
 test format-type-with-typmod {
     CREATE TABLE t (n numeric(10,2), v varchar(5), ts timestamptz, j jsonb, u uuid, a text[]);
     SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attnum > 0 ORDER BY attnum;
@@ -371,14 +370,6 @@ test format-type-with-typmod {
 expect {
     n|numeric(10,2)
     v|character varying(5)
-    ts|timestamp with time zone
-    j|jsonb
-    u|uuid
-    a|text[]
-}
-expect @tursopg {
-    n|numeric
-    v|character varying
     ts|timestamp with time zone
     j|jsonb
     u|uuid

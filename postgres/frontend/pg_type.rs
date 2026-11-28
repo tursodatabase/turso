@@ -73,7 +73,7 @@ impl FormatName {
             FormatName::Length(name) => name.to_string(),
             FormatName::Numeric if typmod > 4 => {
                 let precision = ((typmod - 4) >> 16) & 0xffff;
-                let scale = (typmod - 4) & 0xffff;
+                let scale = (((typmod - 4) & 0x7ff) ^ 0x400) - 0x400;
                 format!("numeric({precision},{scale})")
             }
             FormatName::Numeric => "numeric".to_string(),

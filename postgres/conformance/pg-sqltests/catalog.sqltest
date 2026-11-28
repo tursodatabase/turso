@@ -3036,3 +3036,19 @@ expect {
     c|3807|1|jsonb[]
     d|23|0|integer
 }
+
+test pg-attribute-typmod-of-varchar-and-numeric-columns {
+    CREATE TABLE typmods (n numeric(10,2), p numeric(7), v varchar(5), a varchar(3)[], t text, d numeric(5,-2));
+    SELECT a.attname, a.atttypmod, format_type(a.atttypid, a.atttypmod)
+    FROM pg_attribute a
+    WHERE a.attrelid = 'typmods'::regclass AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    n|655366|numeric(10,2)
+    p|458756|numeric(7,0)
+    v|9|character varying(5)
+    a|7|character varying(3)[]
+    t|-1|text
+    d|329730|numeric(5,-2)
+}
