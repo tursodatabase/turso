@@ -251,9 +251,9 @@ impl Type for IntegerType {
 
     fn input(&self) -> Option<TextInput> {
         Some(match self {
-            IntegerType::Int2 => |text| IntegerType::Int2.parse(text).map(Value::from_i64),
-            IntegerType::Int4 => |text| IntegerType::Int4.parse(text).map(Value::from_i64),
-            IntegerType::Int8 => |text| IntegerType::Int8.parse(text).map(Value::from_i64),
+            IntegerType::Int2 => |_, text| IntegerType::Int2.parse(text).map(Value::from_i64),
+            IntegerType::Int4 => |_, text| IntegerType::Int4.parse(text).map(Value::from_i64),
+            IntegerType::Int8 => |_, text| IntegerType::Int8.parse(text).map(Value::from_i64),
         })
     }
 

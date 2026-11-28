@@ -28,7 +28,7 @@ impl Type for Oid {
     }
 
     fn input(&self) -> Option<TextInput> {
-        Some(oid_input)
+        Some(|_, text| oid_input(text))
     }
 
     fn coerce(&self) -> Option<Conversion> {

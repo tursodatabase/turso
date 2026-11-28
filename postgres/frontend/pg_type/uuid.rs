@@ -31,7 +31,7 @@ impl Type for Uuid {
     }
 
     fn input(&self) -> Option<TextInput> {
-        Some(uuid_input)
+        Some(|_, text| uuid_input(text))
     }
 
     fn encode(&self) -> Option<Conversion> {

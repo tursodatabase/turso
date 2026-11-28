@@ -246,7 +246,7 @@ pub(crate) fn convert(
     if let (Value::Text(text), CastType::Text, Some(read)) =
         (value, source, type_input(target.oid()))
     {
-        return read(text.as_str());
+        return read(Some(connection), text.as_str());
     }
     if target.is_integer() {
         return to_integer(value, source, target);
@@ -296,7 +296,7 @@ fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value
         // when it looks like one. As text it is not an integer.
         (Value::Numeric(Numeric::Float(f)), CastType::Text) => {
             let read = type_input(target.oid()).expect("an integer type has an INPUT");
-            return read(&format!("{:?}", f64::from(*f)));
+            return read(None, &format!("{:?}", f64::from(*f)));
         }
         (Value::Numeric(Numeric::Float(f)), CastType::Numeric) => {
             float_to_i64(f64::from(*f).round(), target)?

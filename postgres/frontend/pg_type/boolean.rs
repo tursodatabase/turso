@@ -34,7 +34,7 @@ impl Type for Boolean {
     }
 
     fn input(&self) -> Option<TextInput> {
-        Some(bool_input)
+        Some(|_, text| bool_input(text))
     }
 
     fn encode(&self) -> Option<Conversion> {

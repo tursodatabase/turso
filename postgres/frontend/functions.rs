@@ -2414,7 +2414,7 @@ pub(crate) fn validate_pg_input(
         return Err(not_supported());
     }
     if let Some(read) = type_input(oid) {
-        return Ok(input_error_of(read(input)));
+        return Ok(input_error_of(read(Some(conn), input)));
     }
     let modifier = ty
         .modifiers
@@ -2424,13 +2424,15 @@ pub(crate) fn validate_pg_input(
 }
 
 /// What is wrong with `text` as input of the built-in type whose pg_type row
-/// is named `typname`, for a caller that already holds the type.
+/// is named `typname`, for a caller that already holds the type. The caller
+/// has no connection, so only a type that does not look at the database is
+/// read by its INPUT.
 pub(crate) fn built_in_input_error(typname: &str, text: &str) -> Option<InputError> {
     let read = built_in_type_named(typname)
         .filter(|(_, _, dimensions_of_name)| *dimensions_of_name == 0)
         .and_then(|(oid, _, _)| type_input(oid));
     match read {
-        Some(read) => input_error_of(read(text)),
+        Some(read) => input_error_of(read(None, text)),
         None => hand_written_input_error(typname, None, text).flatten(),
     }
 }
