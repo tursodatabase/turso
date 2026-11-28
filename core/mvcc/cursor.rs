@@ -23,6 +23,7 @@ use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::fmt::Debug;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
@@ -582,8 +583,12 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     index_shadow_scan: IndexShadowScan<A>,
     /// [`MvStore::table_rows_epoch`] or [`MvStore::index_rows_epoch`], by cursor
     /// type, read before the MVCC peek was taken.
-    /// See [`Self::step`].
+    /// See [`Self::mvcc_head_is_stale`].
     mvcc_peek_epoch: u64,
+    /// The write counter of the cursor's transaction. See [`Self::mvcc_head_is_stale`].
+    tx_writes: Arc<AtomicU64>,
+    /// The value of `tx_writes` before the MVCC peek was taken.
+    mvcc_peek_tx_writes: u64,
     /// The work counters of the statement that opened the cursor.
     /// See [`crate::vdbe::metrics::CursorWork`].
     work: CursorWorkHandle,
@@ -619,6 +624,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
         // root_page -> table_id reverse lookup snapshot-consistent. See `retired_rootpages`.
         let snapshot = db.read_snapshot(tx_id)?;
+        let tx_writes = db.tx_writes(tx_id)?;
         let table_id = if connection.experimental_mvcc_passive_checkpoint_enabled() {
             // Under PASSIVE checkpointing a transaction can capture a schema cookie older than
             // the drop committed within its own snapshot (the drop publishes its cookie after
@@ -658,6 +664,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             mvcc_range_end: None,
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
+            tx_writes,
+            mvcc_peek_tx_writes: 0,
             work: new_cursor_work_handle(),
         })
     }
@@ -906,6 +914,32 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
+    /// Records the state of the MvStore before the MvStore head is positioned.
+    fn note_mvcc_head_positioned(&mut self) {
+        self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+        self.mvcc_peek_tx_writes = self.tx_writes.load(AtomicOrdering::SeqCst);
+    }
+
+    /// Whether the MvStore head can be stale: a write of the cursor's own transaction came
+    /// after the head was positioned. Such a write can add a key between the current row
+    /// and the head, or change the chain that the head holds, and the MvStore iterator
+    /// sees neither. Writes of other transactions are not visible to this transaction, so
+    /// they do not make the head stale. A head that each foreign write made stale would
+    /// examine the same hidden entries again after each page read.
+    fn mvcc_head_is_stale(&mut self) -> bool {
+        let epoch = self.mvcc_rows_epoch();
+        if epoch == self.mvcc_peek_epoch {
+            // Each write of the own transaction also changes the epoch. The epoch is one
+            // atomic load, so it is checked first.
+            return false;
+        }
+        if self.tx_writes.load(AtomicOrdering::SeqCst) != self.mvcc_peek_tx_writes {
+            return true;
+        }
+        self.mvcc_peek_epoch = epoch;
+        false
+    }
+
     /// Moves the cursor one row in `dir`. This is the body of `next` and `prev`.
     fn step(&mut self, dir: IterationDirection) -> IOResultOr<()> {
         match &self.state {
@@ -919,6 +953,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             Some(state) => panic!("invalid state for a step: {state:?}"),
             None => {
                 self.drop_eq_bound_unless_kept();
+                let head_is_current = !self.mvcc_head_is_stale();
                 match &self.current_pos {
                     CursorPosition::End if dir == IterationDirection::Forwards => {
                         return Ok(IOResult::Done(()));
@@ -928,7 +963,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     }
                     CursorPosition::BeforeFirst | CursorPosition::End
                         if matches!(self.heads, Heads::NextFromEdge(walk_dir) if walk_dir != dir)
-                            && self.mvcc_rows_epoch() == self.mvcc_peek_epoch =>
+                            && head_is_current =>
                     {
                         // The walk from the other edge found no visible row, and nothing
                         // changed since. NewRowid relies on this when all rows are hidden: it
@@ -941,7 +976,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     }
                     CursorPosition::Loaded { .. }
                         if matches!(self.heads, Heads::NextFromEdge(walk_dir) if walk_dir != dir)
-                            && self.mvcc_rows_epoch() == self.mvcc_peek_epoch =>
+                            && head_is_current =>
                     {
                         // The walk to this row started at the edge in `dir` and found every
                         // entry before this row hidden. Nothing changed since, so no row is
@@ -972,9 +1007,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 inject_io_yield!(self, CursorYieldPoint::NextStart);
             }
         }
-        if self.mvcc_rows_epoch() != self.mvcc_peek_epoch {
-            // A write of this cursor's own transaction can add a key between the current row
-            // and the MvStore head, or remove the head, and the MvStore iterator sees neither.
+        if self.mvcc_head_is_stale() {
             // The write can come before the step, or while the step waits on IO.
             match &self.current_pos {
                 CursorPosition::Loaded { row_id, .. } => {
@@ -1055,7 +1088,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             self.set_null_flag(false);
             self.start_at_edge(dir)?;
             self.state = Some(MvccLazyCursorState::Walk(dir));
-        } else if self.mvcc_rows_epoch() != self.mvcc_peek_epoch {
+        } else if self.mvcc_head_is_stale() {
             // A write of this cursor's own transaction while the walk waited on IO can add
             // an MvStore version of a row that the MvStore iterator already passed. The walk
             // returned no row yet, so it can start the MvStore at the edge again.
@@ -1268,7 +1301,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         dir: IterationDirection,
         end: Option<RowKey>,
     ) -> Result<()> {
-        self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+        self.note_mvcc_head_positioned();
         self.table_iterator = None;
         self.index_iterator = None;
         self.mvcc_range_end.clone_from(&end);
@@ -1552,7 +1585,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         if !walk_ended
             || self.eq_bound.is_none()
             || self.heads != Heads::Next(dir)
-            || self.mvcc_rows_epoch() != self.mvcc_peek_epoch
+            || self.mvcc_head_is_stale()
             || !matches!(self.dual_peek.btree_peek, CursorPeek::Raw { .. })
             || !seek_key_names_one_row(seek_key, &self.mv_cursor_type)?
         {
@@ -1581,6 +1614,28 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         Ok(true)
     }
 
+    /// Positions the MvStore head at the first entry that `seek_key` and `op` select, and
+    /// sets the bound of an equality seek.
+    fn position_mvcc_head_at_seek_key(&mut self, seek_key: &SeekKey<'_>, op: SeekOp) -> Result<()> {
+        let key = self.seek_row_key(seek_key)?;
+        let mut end = None;
+        if op.eq_only() {
+            // An equality seek returns only rows with this key, so the walk stops at the
+            // first entry past it in each source.
+            self.eq_bound = Some(EqBound {
+                key: key.clone(),
+                one_row: seek_key_names_one_row(seek_key, &self.mv_cursor_type)?,
+                kept: false,
+            });
+            end = Some(key.clone());
+        }
+        let start = match op {
+            SeekOp::GE { .. } | SeekOp::LE { .. } => Bound::Included(key),
+            SeekOp::GT | SeekOp::LT => Bound::Excluded(key),
+        };
+        self.position_mvcc_head(start, op.iteration_direction(), end)
+    }
+
     /// Reset dual peek state (called on rewind/last/seek)
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
@@ -1588,7 +1643,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.index_iterator = None;
         self.heads = Heads::Detached;
         self.eq_bound = None;
-        self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+        self.note_mvcc_head_positioned();
         self.eq_seek_row = None;
         // The forward scan is monotonic; a reposition invalidates it.
         self.index_shadow_scan.reset();
@@ -1754,23 +1809,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     self.set_null_flag(false);
 
                     let direction = op.iteration_direction();
-                    let key = self.seek_row_key(&seek_key)?;
-                    let mut end = None;
-                    if op.eq_only() {
-                        // An equality seek returns only rows with this key, so the walk
-                        // stops at the first entry past it in each source.
-                        self.eq_bound = Some(EqBound {
-                            key: key.clone(),
-                            one_row: seek_key_names_one_row(&seek_key, &self.mv_cursor_type)?,
-                            kept: false,
-                        });
-                        end = Some(key.clone());
-                    }
-                    let start = match op {
-                        SeekOp::GE { .. } | SeekOp::LE { .. } => Bound::Included(key),
-                        SeekOp::GT | SeekOp::LT => Bound::Excluded(key),
-                    };
-                    self.position_mvcc_head(start, direction, end)?;
+                    self.position_mvcc_head_at_seek_key(&seek_key, op)?;
                     self.state = Some(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction));
                     inject_io_yield!(self, CursorYieldPoint::SeekStart);
                 }

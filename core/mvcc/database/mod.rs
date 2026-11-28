@@ -1126,6 +1126,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// The portable logical-change setting of the connection when this transaction
     /// began.
     portable_logical_changes: bool,
+    /// Incremented after each write of this transaction to a version chain, and after
+    /// each undo of such writes at `ROLLBACK TO`. Cursors compare it to find out whether
+    /// their MvStore head can be stale. Writes of other transactions do not change it,
+    /// because this transaction does not see them.
+    writes: Arc<AtomicU64>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1154,6 +1159,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
+            writes: Arc::new(AtomicU64::new(0)),
             created_table_ids: Mutex::new(Vec::new()),
         }
     }
@@ -1333,7 +1339,13 @@ impl<A: RowVersionAllocator> Transaction<A> {
     }
 
     /// Record a version that was created during the current savepoint.
+    /// See [`Self::writes`].
+    fn note_write(&self) {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn record_created_table_version(&self, rowid: RowID, version_id: u64) {
+        self.note_write();
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
             tracing::debug!(
                 "record_created_table_version(tx_id={}, table_id={}, row_id={}, version_id={})",
@@ -1352,6 +1364,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         key: (MVTableId, Arc<SortableIndexKey>),
         version_id: u64,
     ) {
+        self.note_write();
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
             tracing::debug!(
                 "record_created_index_version(tx_id={}, table_id={}, version_id={})",
@@ -1365,6 +1378,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
 
     /// Record a version that was deleted during the current savepoint.
     fn record_deleted_table_version(&self, rowid: RowID, version_id: u64) {
+        self.note_write();
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
             tracing::debug!(
                 "record_deleted_table_version(tx_id={}, table_id={}, row_id={}, version_id={})",
@@ -1383,6 +1397,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         key: (MVTableId, Arc<SortableIndexKey>),
         version_id: u64,
     ) {
+        self.note_write();
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
             tracing::debug!(
                 "record_deleted_index_version(tx_id={}, table_id={}, version_id={})",
@@ -7623,6 +7638,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .txs
             .get(&tx_id)
             .unwrap_or_else(|| panic!("Transaction {tx_id} not found while restoring savepoint"));
+        if undoes_table_versions || undoes_index_versions {
+            tx.value().note_write();
+        }
         let tx = tx.value();
         Self::remove_rolled_back_chains_from_write_set(tx, write_set_len_at_begin);
         *tx.header.write() = header;
@@ -8896,6 +8914,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
         #[cfg(shuttle)]
         crate::thread::yield_now();
+    }
+
+    /// The write counter of transaction `tx_id`. See [`Transaction::writes`].
+    pub(crate) fn tx_writes(&self, tx_id: TxID) -> Result<Arc<AtomicU64>> {
+        self.txs
+            .get(&tx_id)
+            .map(|tx| tx.value().writes.clone())
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))
     }
 
     /// Current epoch of table version changes; see the field docs.

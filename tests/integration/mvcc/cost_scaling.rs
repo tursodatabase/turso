@@ -53,7 +53,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::num::NonZero;
 use std::sync::Arc;
-use turso_core::{Connection, CursorWork, Value};
+use turso_core::mvcc::cursor::CursorYieldPoint;
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
+use turso_core::{Connection, CursorWork, StepResult, Value};
 
 /// The size of the state at the smaller run. The larger run uses `4 * N`.
 const N: usize = 200;
@@ -1977,4 +1980,120 @@ fn test_first_rowid_allocation_reads_hidden_rows_once() {
             "the allocation reads the hidden rows more than once: {work:?}"
         );
     }
+}
+
+/// Yields at each step of the B-tree head, as a page read that misses the page cache does.
+#[derive(Debug)]
+struct YieldAtBtreeSteps;
+
+impl YieldInjector for YieldAtBtreeSteps {
+    fn should_yield(&self, _instance: u64, _key: u64, point: YieldPoint) -> bool {
+        point == CursorYieldPoint::AdvanceBtreeForwardProgress.point()
+            || point == CursorYieldPoint::AdvanceBtreeBackwardProgress.point()
+    }
+}
+
+/// Runs `sql` on `conn`, and makes `writer` commit an insert into table `other` at each
+/// yield. Returns the rows, the cursor work and the number of yields.
+fn run_with_writer_at_yields(
+    conn: &Arc<Connection>,
+    writer: &Arc<Connection>,
+    sql: &str,
+) -> (Vec<Vec<Value>>, CursorWork, usize) {
+    conn.set_yield_injector(Some(Arc::new(YieldAtBtreeSteps)));
+    let mut stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("prepare `{sql}` failed: {e}"));
+    let (mut rows, mut yields) = (Vec::new(), 0);
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO => stmt._io().step().unwrap(),
+            StepResult::Yield => {
+                yields += 1;
+                run(writer, "INSERT INTO other(v) VALUES (0)");
+            }
+            StepResult::Row => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
+            StepResult::Done => break,
+            other => panic!("`{sql}`: unexpected {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+    let work = stmt.metrics().cursor_work;
+    (rows, work, yields)
+}
+
+/// A write of another transaction while a walk waits on IO must not start the walk of the
+/// MvStore again. The other transaction's writes are not visible to the walk. When each
+/// write started the walk again, a scan over hidden rows examined the hidden entries again
+/// after each page read, and its work grew with the square of the hidden rows.
+#[test]
+fn test_foreign_writes_at_page_reads_do_not_restart_the_walk() {
+    let build = |n: usize| {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+        run(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, k INT)");
+        run(&conn, "CREATE INDEX t_k ON t(k)");
+        run(&conn, "CREATE TABLE other(id INTEGER PRIMARY KEY, v INT)");
+        run(&conn, "CREATE INDEX other_v ON other(v)");
+        run(
+            &conn,
+            &format!("INSERT INTO t SELECT value, value FROM generate_series(1, {n})"),
+        );
+        run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        run(&conn, &format!("DELETE FROM t WHERE id < {n}"));
+        (db, conn)
+    };
+    for sql in [
+        "SELECT id FROM t",
+        "SELECT id FROM t ORDER BY id DESC",
+        "SELECT k FROM t INDEXED BY t_k ORDER BY k",
+    ] {
+        let works = [N, 4 * N].map(|n| {
+            let (db, conn) = build(n);
+            let writer = db.connect();
+            let (rows, work, yields) = run_with_writer_at_yields(&conn, &writer, sql);
+            assert_eq!(rows, vec![vec![int(n as i64)]], "`{sql}`");
+            assert!(yields >= n, "`{sql}`: the walk yielded {yields} times");
+            work
+        });
+        let wrong = violations(Class::Linear, &works[0], &works[1]);
+        assert!(
+            wrong.is_empty(),
+            "`{sql}`: foreign writes restart the walk: {wrong:?}"
+        );
+    }
+}
+
+/// The first rowid allocation over a table whose rows are all hidden must read them once,
+/// also when another transaction writes while the allocation waits on IO.
+#[test]
+fn test_first_rowid_allocation_with_foreign_writes_reads_hidden_rows_once() {
+    let n = 4 * N;
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+        run(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, a)");
+        run(&conn, "CREATE TABLE other(id INTEGER PRIMARY KEY, v INT)");
+        run(
+            &conn,
+            &format!("INSERT INTO t SELECT value, value FROM generate_series(1, {n})"),
+        );
+        run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        run(&conn, "DELETE FROM t");
+    }
+    db.restart();
+    let conn = db.connect();
+    let writer = db.connect();
+    run(&conn, "BEGIN CONCURRENT");
+    let (_, work, yields) =
+        run_with_writer_at_yields(&conn, &writer, "INSERT INTO t(a) VALUES ('n1')");
+    run(&conn, "COMMIT");
+    let n = n as u64;
+    assert!(yields > 0, "the allocation did not yield");
+    assert!(
+        work.btree_rows_examined <= n + 1 && work.mvcc_entries_examined <= n + 1,
+        "the allocation reads the hidden rows more than once: {work:?}"
+    );
 }
