@@ -8,8 +8,8 @@ use crate::{
     translate::{
         collate::{comparison_collation, in_list_collation, CollationSeq},
         expr::{
-            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
-            WalkControl,
+            as_binary_components, expr_contains_function_that_changes_within_statement,
+            get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -115,6 +115,11 @@ pub struct Constraint {
     /// of `x = y`. None for terms that are not collating comparisons (LIKE,
     /// MATCH and other virtual-table operators).
     pub collation: Option<CollationSeq>,
+    /// Whether the constraining expression calls a function, such as `random()`,
+    /// that can return a different value each time it runs within one statement.
+    /// A term the loop evaluates for each row then compares the column with a
+    /// different value in each row.
+    pub constraining_expr_changes_within_statement: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -905,6 +910,9 @@ pub fn table_constraints_from_where_clause(
             // on the opposite side of the constrained column.
             let null_matching =
                 |constraining_expr: &ast::Expr| is_op && !is_non_null_literal(constraining_expr);
+            let changes_within_statement = |constraining_expr: &ast::Expr| {
+                expr_contains_function_that_changes_within_statement(constraining_expr, resolver)
+            };
             // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
             match lhs {
                 ast::Expr::Column { table, column, .. } => {
@@ -933,6 +941,9 @@ pub fn table_constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(rhs),
                             collation: cmp_collation,
+                            constraining_expr_changes_within_statement: changes_within_statement(
+                                rhs,
+                            )?,
                         });
                     }
                 }
@@ -966,6 +977,9 @@ pub fn table_constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(rhs),
                             collation: cmp_collation,
+                            constraining_expr_changes_within_statement: changes_within_statement(
+                                rhs,
+                            )?,
                         });
                     }
                 }
@@ -1008,6 +1022,7 @@ pub fn table_constraints_from_where_clause(
                         comparison_affinity: cmp_aff,
                         null_matching: null_matching(rhs),
                         collation: cmp_collation,
+                        constraining_expr_changes_within_statement: changes_within_statement(rhs)?,
                     });
                 }
                 _ => {}
@@ -1039,6 +1054,9 @@ pub fn table_constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(lhs),
                             collation: cmp_collation,
+                            constraining_expr_changes_within_statement: changes_within_statement(
+                                lhs,
+                            )?,
                         });
                     }
                 }
@@ -1072,6 +1090,9 @@ pub fn table_constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(lhs),
                             collation: cmp_collation,
+                            constraining_expr_changes_within_statement: changes_within_statement(
+                                lhs,
+                            )?,
                         });
                     }
                 }
@@ -1114,6 +1135,7 @@ pub fn table_constraints_from_where_clause(
                         comparison_affinity: cmp_aff,
                         null_matching: null_matching(lhs),
                         collation: cmp_collation,
+                        constraining_expr_changes_within_statement: changes_within_statement(lhs)?,
                     });
                 }
                 _ => {}
@@ -1129,12 +1151,15 @@ pub fn table_constraints_from_where_clause(
         if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
             let estimated_values = rhs.len() as f64;
             let mut rhs_mask = TableMask::default();
+            let mut rhs_changes_within_statement = false;
             for rhs_expr in rhs.iter() {
                 rhs_mask.union_with(&table_mask_from_expr(
                     rhs_expr,
                     table_references,
                     subqueries,
                 )?)?;
+                rhs_changes_within_statement |=
+                    expr_contains_function_that_changes_within_statement(rhs_expr, resolver)?;
             }
             let table_stats = schema.analyze_stats.table_stats(
                 table_reference.namespace.id,
@@ -1181,6 +1206,7 @@ pub fn table_constraints_from_where_clause(
                         comparison_affinity: cmp_aff,
                         null_matching: false,
                         collation: cmp_collation,
+                        constraining_expr_changes_within_statement: rhs_changes_within_statement,
                     });
                 }
                 ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1201,6 +1227,7 @@ pub fn table_constraints_from_where_clause(
                         comparison_affinity: cmp_aff,
                         null_matching: false,
                         collation: cmp_collation,
+                        constraining_expr_changes_within_statement: rhs_changes_within_statement,
                     });
                 }
                 _ => {}
@@ -1284,6 +1311,7 @@ pub fn table_constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: false,
                             collation: cmp_collation,
+                            constraining_expr_changes_within_statement: false,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1304,6 +1332,7 @@ pub fn table_constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: false,
                             collation: cmp_collation,
+                            constraining_expr_changes_within_statement: false,
                         });
                     }
                     _ => {}
@@ -2393,6 +2422,8 @@ pub(crate) fn analyze_binary_term_for_index(
 
     let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
         .unwrap_or_else(|_| TableMask::default());
+    let changes_within_statement =
+        expr_contains_function_that_changes_within_statement(constraining_expr, resolver).ok()?;
 
     // Cannot use index seek if the constraining expression references the same table
     // being scanned, since the expression value varies per row and cannot be evaluated
@@ -2427,6 +2458,7 @@ pub(crate) fn analyze_binary_term_for_index(
         comparison_affinity: Some(affinity),
         null_matching,
         collation: Some(comparison_collation),
+        constraining_expr_changes_within_statement: changes_within_statement,
     };
 
     Some(AnalyzedTerm {
