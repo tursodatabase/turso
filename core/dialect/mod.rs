@@ -567,11 +567,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// FIXME(pg-catalog): This hand-codes prorettype of the pg_proc entries mod(smallint, smallint), mod(integer, integer) and mod(bigint, bigint), which return their argument type. A lookup in a pg_proc table replaces this.
-    /// Whether `mod` of two integers returns an integer.
+    /// FIXME(pg-catalog): This hand-codes the pg_operator entry `numeric % numeric` (numeric_mod) and the pg_proc entries mod(numeric, numeric), mod(smallint, smallint), mod(integer, integer) and mod(bigint, bigint) for every REAL operand, because Turso gives decimal literals and plain `numeric` columns the REAL type. PostgreSQL has no `%` and no mod() for double precision. An expression tree that carries PostgreSQL types replaces this: it picks numeric_mod for numeric operands and rejects double precision.
+    /// Whether `%` and `mod()` compute the exact remainder of PostgreSQL's
+    /// numeric type, with the sign of the dividend.
     ///
-    /// PostgreSQL returns an integer. SQLite always returns a REAL.
-    fn mod_of_integers_is_integer(&self) -> bool {
+    /// PostgreSQL gives `7.5 % 2 = 1.5`, and an integer for two integers.
+    /// SQLite's `%` casts both operands to integers first and gives 1.0.
+    /// SQLite's `mod()` uses the C function fmod() and always returns a REAL.
+    fn exact_remainder(&self) -> bool {
         false
     }
 

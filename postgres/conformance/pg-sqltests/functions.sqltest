@@ -2134,6 +2134,37 @@ expect {
     1.5|-1.5
 }
 
+test remainder-of-fractions-keeps-the-fraction {
+    SELECT 7.5 % 2, 0.5 % 3.5, 7.5::numeric % 2, -7.5 % 2, 7.5 % -2, 7 % 2.5, 7 % 2, -7 % 2;
+}
+expect {
+    1.5|0.5|1.5|-1.5|1.5|2.0|1|-1
+}
+
+test remainder-of-fractions-is-exact {
+    SELECT 9007199254740993 % 2.5, -9007199254740993 % 2.5, 0.1 % 0.03,
+        mod(9007199254740993, 2.5), mod(-9007199254740993, 2.5), mod(0.1, 0.03);
+}
+expect {
+    0.5|-0.5|0.01|0.5|-0.5|0.01
+}
+
+test remainder-of-numeric-column-keeps-the-fraction {
+    CREATE TABLE amounts (a numeric);
+    INSERT INTO amounts VALUES (7.5), (-0.5);
+    SELECT a % 2 FROM amounts ORDER BY a;
+}
+expect {
+    -0.5
+    1.5
+}
+
+test remainder-of-fraction-by-zero {
+    SELECT 7.5 % 0;
+}
+@sqlstate 22012
+expect error {}
+
 test mod-with-null-is-null {
     SELECT coalesce(mod(NULL, 0)::text, '<null>'), coalesce(mod(1, NULL)::text, '<null>');
 }
