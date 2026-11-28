@@ -30,8 +30,8 @@ use crate::{
     errors::Error,
     io_operations::IoOperations,
     server_proto::{
-        self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
-        PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
+        self, Batch, BatchCond, BatchCondList, BatchStep, BatchStreamReq, PageData,
+        PageUpdatesEncodingReq, PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
         PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     sync_cipher::ChangeKind,
@@ -3339,7 +3339,32 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             ],
         ));
     }
-    sql_over_http_requests.push(step("COMMIT".to_string(), Vec::new()));
+    // A failed statement does not end the remote transaction. So commit only if every
+    // step succeeded, except an ALTER TABLE ADD COLUMN step whose error is ignored, and
+    // roll back otherwise: else the remote would apply the other rows of the batch,
+    // record the client's last change id, and the next push would skip the failed rows.
+    let commit_step = sql_over_http_requests.len() as u32;
+    let all_ok = (0..sql_over_http_requests.len())
+        .filter(|i| !add_column_step_indices.contains(i))
+        .map(|i| BatchCond::Ok { step: i as u32 })
+        .collect();
+    sql_over_http_requests.push(BatchStep {
+        condition: Some(BatchCond::And(BatchCondList { conds: all_ok })),
+        ..step("COMMIT".to_string(), Vec::new())
+    });
+    // If no transaction is open any more, ROLLBACK fails, and the push reports that
+    // error instead of success.
+    sql_over_http_requests.push(BatchStep {
+        condition: Some(BatchCond::And(BatchCondList {
+            conds: vec![
+                BatchCond::Ok { step: 0 },
+                BatchCond::Not {
+                    cond: Box::new(BatchCond::Ok { step: commit_step }),
+                },
+            ],
+        })),
+        ..step("ROLLBACK".to_string(), Vec::new())
+    });
 
     tracing::debug!("hrana request: {:?}", sql_over_http_requests);
     let replay_hrana_request = server_proto::PipelineReqBody {
