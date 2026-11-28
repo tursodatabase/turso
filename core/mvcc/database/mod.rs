@@ -409,6 +409,51 @@ impl Ord for SortableIndexKey {
     }
 }
 
+/// An index key that a loop compares with many keys of the same index. A cursor that passes
+/// many MvStore entries compares each of them with one B-tree key.
+///
+/// [`SortableIndexKey::compare`] reads the first integer and the metadata of the key that
+/// comes first for each comparison. The probe reads them once, so that each comparison reads
+/// only the first integer and the number of columns of the other key.
+pub(crate) struct IndexKeyProbe<'k> {
+    key: &'k SortableIndexKey,
+    /// The first integer of `key` and the sort order of its first column, when
+    /// [`SortableIndexKey::compare_first_integers`] can use them for `key`.
+    first_integer: Option<(i64, SortOrder)>,
+}
+
+impl<'k> IndexKeyProbe<'k> {
+    pub(crate) fn new(key: &'k SortableIndexKey) -> Self {
+        let first_integer = SortableIndexKey::first_integer(key.key.get_payload())
+            .zip(key.metadata.key_info.first())
+            .filter(|(_, key_info)| {
+                key.metadata.num_cols != 0 && matches!(key_info.collation, CollationSeq::Text(_))
+            })
+            .map(|(value, key_info)| (value, key_info.sort_order));
+        Self { key, first_integer }
+    }
+
+    /// The order of the key relative to `other`. This is the result of `key.cmp(other)`.
+    #[inline(always)]
+    pub(crate) fn cmp(&self, other: &SortableIndexKey) -> std::cmp::Ordering {
+        // This is SortableIndexKey::compare_first_integers with the values of `key` read
+        // before.
+        if let Some((lhs, sort_order)) = self.first_integer {
+            if let Some(rhs) = SortableIndexKey::first_integer(other.key.get_payload()) {
+                if other.metadata.num_cols != 0 && lhs != rhs {
+                    return match sort_order {
+                        SortOrder::Asc => lhs.cmp(&rhs),
+                        SortOrder::Desc => lhs.cmp(&rhs).reverse(),
+                    };
+                }
+            }
+        }
+        self.key
+            .compare_columns(other)
+            .expect("Failed to compare IndexKeys")
+    }
+}
+
 /// What a cursor sees in one MvStore chain. See [`MvStore::cursor_view_of_chain`].
 pub(crate) enum ChainView {
     /// A version is visible. It holds a copy of the row when the caller asked for one.
@@ -6263,7 +6308,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         take_payload: bool,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
         let view = self
-            .cursor_view_of_chain(snapshot, row.key(), row.value(), take_payload)
+            .cursor_view_of_chain(
+                snapshot,
+                row.key().table_id,
+                &row.key().row_id,
+                row.value(),
+                take_payload,
+            )
             .expect("transaction should exist while its cursor is active");
         match view {
             ChainView::Visible(payload) => Some((row.key().clone(), row.value().clone(), payload)),
@@ -6271,26 +6322,48 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// What a cursor with `snapshot` sees in the MvStore chain `versions` of the row `row_id`.
-    /// For a table row, `take_payload` copies the visible version under the chain lock,
-    /// because passive GC can empty the chain before the cursor reads the row.
+    /// What a cursor with `snapshot` sees in the MvStore chain `versions` of the row `key` of
+    /// `table_id`. For a table row, `take_payload` copies the visible version under the chain
+    /// lock, because passive GC can empty the chain before the cursor reads the row.
+    ///
+    /// It takes the key by reference, and makes a `RowID` only for a copy of the row: a
+    /// cursor calls it for each MvStore entry that it passes.
     pub(crate) fn cursor_view_of_chain(
         &self,
         snapshot: MvccReadSnapshot,
-        row_id: &RowID,
+        table_id: MVTableId,
+        key: &RowKey,
         versions: &RowVersions<A>,
         take_payload: bool,
     ) -> Result<ChainView> {
         let versions = versions.read();
-        if matches!(row_id.row_id, RowKey::Int(_))
-            && self.btree_covers_chain_for_snapshot(snapshot, row_id.table_id, &versions)
+        if matches!(key, RowKey::Int(_))
+            && self.btree_covers_chain_for_snapshot(snapshot, table_id, &versions)
         {
             return Ok(ChainView::BtreeCovers);
         }
         Ok(match self.find_visible_version(snapshot, &versions)? {
-            Some(version) => ChainView::Visible(take_payload.then(|| version.row(row_id))),
+            Some(version) => ChainView::Visible(take_payload.then(|| {
+                version.row(&RowID {
+                    table_id,
+                    row_id: key.clone(),
+                })
+            })),
             None => ChainView::Hidden,
         })
+    }
+
+    /// Whether a cursor with `snapshot` sees a version in the MvStore chain `versions` of an
+    /// index row. This is [`Self::cursor_view_of_chain`] for an index key without a copy of
+    /// the row: `Visible` gives true, and `Hidden` gives false. It takes no key, so that a
+    /// cursor that passes many index entries does not make a `RowKey` for each of them.
+    pub(crate) fn index_chain_has_visible_version(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &RowVersions<A>,
+    ) -> Result<bool> {
+        let versions = versions.read();
+        Ok(self.find_visible_version(snapshot, &versions)?.is_some())
     }
 
     fn find_next_visible_table_row<'a, I>(

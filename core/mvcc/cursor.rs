@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, ChainView, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey,
-    RowVersions, SortableIndexKey,
+    create_seek_range, ChainView, IndexKeyProbe, MVTableId, MvStore, MvccReadSnapshot, Row, RowID,
+    RowKey, RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -248,6 +248,28 @@ struct EqBound {
     /// Whether the bound also limits the steps after the seek. See
     /// [`MvccLazyCursor::keep_eq_bound`].
     kept: bool,
+}
+
+/// The key of an MvStore entry, borrowed from the entry. The walk compares it with the keys
+/// of its heads without a copy of the key.
+#[derive(Clone, Copy)]
+enum EntryKey<'k> {
+    /// The key of a table row.
+    Row(&'k RowKey),
+    /// The key of an index row.
+    Index(&'k SortableIndexKey),
+}
+
+impl EntryKey<'_> {
+    /// Compares the key with `other` as `RowKey::cmp` compares the `RowKey` of the entry.
+    fn cmp(self, other: &RowKey) -> Ordering {
+        match (self, other) {
+            (EntryKey::Row(key), other) => key.cmp(other),
+            (EntryKey::Index(key), RowKey::Record(other)) => key.cmp(other.as_ref()),
+            // RowKey orders Int before Record.
+            (EntryKey::Index(_), RowKey::Int(_)) => Ordering::Greater,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1136,23 +1158,26 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             if !btree_past_bound {
                 return_if_io!(self.step_btree_head(dir));
             }
-            let mvcc_key = self.walkable_key(&self.dual_peek.mvcc_peek).cloned();
-            let btree_key = self.walkable_key(&self.dual_peek.btree_peek).cloned();
-            let order = match (&mvcc_key, &btree_key) {
-                (None, None) => {
-                    self.current_pos = match dir {
-                        IterationDirection::Forwards => CursorPosition::End,
-                        IterationDirection::Backwards => CursorPosition::BeforeFirst,
-                    };
-                    self.heads = Heads::Next(dir);
-                    return Ok(IOResult::Done(()));
+            let order = {
+                let mvcc_key = self.walkable_key(&self.dual_peek.mvcc_peek);
+                let btree_key = self.walkable_key(&self.dual_peek.btree_peek);
+                match (mvcc_key, btree_key) {
+                    (None, None) => None,
+                    (Some(_), None) => Some(Ordering::Less),
+                    (None, Some(_)) => Some(Ordering::Greater),
+                    (Some(mvcc_key), Some(btree_key)) => Some(match dir {
+                        IterationDirection::Forwards => mvcc_key.cmp(btree_key),
+                        IterationDirection::Backwards => btree_key.cmp(mvcc_key),
+                    }),
                 }
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(mvcc_key), Some(btree_key)) => match dir {
-                    IterationDirection::Forwards => mvcc_key.cmp(btree_key),
-                    IterationDirection::Backwards => btree_key.cmp(mvcc_key),
-                },
+            };
+            let Some(order) = order else {
+                self.current_pos = match dir {
+                    IterationDirection::Forwards => CursorPosition::End,
+                    IterationDirection::Backwards => CursorPosition::BeforeFirst,
+                };
+                self.heads = Heads::Next(dir);
+                return Ok(IOResult::Done(()));
             };
             // A tie checks a B-tree row that has an MvStore chain. That needs the
             // transaction, so a read after the transaction ended stops here.
@@ -1167,23 +1192,23 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             };
             match chain {
                 Some(ChainView::Visible(row)) => {
-                    if row.is_some() {
-                        self.eq_seek_row = row;
-                    }
-                    let versions = self.dual_peek.mvcc_peek.versions();
-                    let key = mvcc_key.expect("the MvStore head comes first");
-                    self.land(key, false, versions, dir);
+                    self.land_on_mvcc_head(row, dir);
                     return Ok(IOResult::Done(()));
                 }
                 Some(ChainView::BtreeCovers) if order.is_eq() => {
-                    let key = btree_key.expect("the heads tie");
+                    let key = self.btree_head_key();
                     self.land(key, true, None, dir);
                     return Ok(IOResult::Done(()));
                 }
                 // Only the MvStore has this key, and no version of it is visible.
-                Some(_) if order.is_lt() => self.dual_peek.mvcc_peek = CursorPeek::Stale,
+                Some(_) if order.is_lt() => {
+                    if let Some(row) = self.skip_hidden_mvcc_entries(dir)? {
+                        self.land_on_mvcc_head(row, dir);
+                        return Ok(IOResult::Done(()));
+                    }
+                }
                 _ => {
-                    let key = btree_key.expect("the B-tree head comes first or ties");
+                    let key = self.btree_head_key();
                     let valid = if order.is_eq() {
                         self.tied_btree_head_is_valid()?
                     } else {
@@ -1206,11 +1231,173 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
+    /// Steps the MvStore head past the hidden entries that come before the B-tree head, in
+    /// one loop over the MvStore iterator. The walk calls it when the MvStore head comes
+    /// first and is hidden. It stops at the first entry that the walk must not skip: an
+    /// entry past the bound of an equality seek, an entry that does not come before the
+    /// B-tree head, or a visible entry. That entry becomes the MvStore head. When the
+    /// iterator ends, the head ends as in [`Self::step_mvcc_head`].
+    ///
+    /// For each entry, the loop does the same checks and counts the same work as a turn of
+    /// the walk. But a turn of the walk clones the keys of both heads, makes a head for the
+    /// entry and drops the head before it. When many hidden entries come before the next
+    /// visible row, that work costs more than the check of the entries. So the loop reads
+    /// each entry in the iterator and makes a head only for the entry where it stops. The
+    /// B-tree head does not move while the MvStore head steps, so the loop does not step it.
+    ///
+    /// Returns the copy of the row when the entry where it stops is visible and comes
+    /// first. The walk then lands on the MvStore head.
+    fn skip_hidden_mvcc_entries(&mut self, dir: IterationDirection) -> Result<Option<Option<Row>>> {
+        let take_payload = self.take_eq_payload();
+        let Self {
+            db,
+            dual_peek,
+            eq_bound,
+            table_iterator,
+            index_iterator,
+            mv_cursor_type,
+            mvcc_range_end,
+            work,
+            snapshot,
+            table_id,
+            ..
+        } = self;
+        let (snapshot, table_id, work) = (*snapshot, *table_id, cursor_work(work));
+        let eq_bound = eq_bound.as_ref();
+        let btree_key = Self::key_under_bound(&dual_peek.btree_peek, eq_bound);
+        // The loop compares each index entry with the same B-tree key. The comparison costs
+        // as much as the visibility check of the entry, so the probe reads the B-tree key
+        // only once.
+        let btree_probe = match btree_key {
+            Some(RowKey::Record(key)) => Some(IndexKeyProbe::new(key)),
+            _ => None,
+        };
+        // The order of the B-tree head relative to an entry that comes before it.
+        let btree_after = match dir {
+            IterationDirection::Forwards => Ordering::Greater,
+            IterationDirection::Backwards => Ordering::Less,
+        };
+        // Whether the walk checks the chain of the entry `key` before the B-tree head. This
+        // is the order that a turn of the walk computes for the heads. The loop compares
+        // the B-tree key with the entry in both directions. `Ord` makes that the reverse of
+        // the comparison of the entry with the B-tree key, which a forward turn does.
+        let comes_first = |key: EntryKey<'_>| {
+            if eq_bound.is_some_and(|bound| !key.cmp(&bound.key).is_eq()) {
+                return false;
+            }
+            let Some(btree_key) = btree_key else {
+                return true;
+            };
+            let btree_order = match (key, &btree_probe) {
+                (EntryKey::Index(key), Some(probe)) => probe.cmp(key),
+                _ => key.cmp(btree_key).reverse(),
+            };
+            btree_order == btree_after
+        };
+        // The entry where the loop stops, and the copy of its row if it is visible.
+        let mut stop = None;
+        match mv_cursor_type {
+            MvccCursorType::Table => {
+                let iter = table_iterator
+                    .as_mut()
+                    .expect("the MvStore iterator is positioned");
+                for entry in iter {
+                    let RowID {
+                        table_id: entry_table_id,
+                        row_id: key,
+                    } = entry.key();
+                    // All tables share one map, so an entry of another table ends this one.
+                    if *entry_table_id != table_id {
+                        break;
+                    }
+                    let row = if comes_first(EntryKey::Row(key)) {
+                        work.visibility_check();
+                        match db.cursor_view_of_chain(
+                            snapshot,
+                            table_id,
+                            key,
+                            entry.value(),
+                            take_payload,
+                        )? {
+                            ChainView::Visible(row) => Some(row),
+                            ChainView::Hidden | ChainView::BtreeCovers => continue,
+                        }
+                    } else {
+                        None
+                    };
+                    stop = Some((key.clone(), entry.value().clone(), row));
+                    break;
+                }
+            }
+            MvccCursorType::Index(_) => {
+                turso_assert!(!take_payload, "an index cursor takes no copy of a row");
+                let iter = index_iterator
+                    .as_mut()
+                    .expect("the MvStore iterator is positioned");
+                for entry in iter {
+                    let key = entry.key();
+                    let row = if comes_first(EntryKey::Index(key)) {
+                        work.visibility_check();
+                        if !db.index_chain_has_visible_version(snapshot, entry.value())? {
+                            continue;
+                        }
+                        Some(None)
+                    } else {
+                        None
+                    };
+                    stop = Some((RowKey::Record(key.clone()), entry.value().clone(), row));
+                    break;
+                }
+            }
+        }
+        let Some((key, versions, row)) = stop else {
+            dual_peek.mvcc_peek = match mvcc_range_end {
+                Some(key) => CursorPeek::SeekPast(key.clone()),
+                None => CursorPeek::Exhausted,
+            };
+            return Ok(None);
+        };
+        dual_peek.mvcc_peek = CursorPeek::Raw {
+            key,
+            versions: Some(versions),
+        };
+        Ok(row)
+    }
+
+    /// Lands on the MvStore head. `row` is the copy of the row from the view of its chain.
+    fn land_on_mvcc_head(&mut self, row: Option<Row>, dir: IterationDirection) {
+        if row.is_some() {
+            self.eq_seek_row = row;
+        }
+        let CursorPeek::Raw { key, versions } = &self.dual_peek.mvcc_peek else {
+            unreachable!("the MvStore head holds an entry");
+        };
+        let (key, versions) = (key.clone(), versions.clone());
+        self.land(key, false, versions, dir);
+    }
+
+    /// The key of the B-tree head.
+    fn btree_head_key(&self) -> RowKey {
+        self.dual_peek
+            .btree_peek
+            .raw_key()
+            .cloned()
+            .expect("the B-tree head holds an entry")
+    }
+
     /// The key of a head that the walk can return: a head past the bound of an equality
     /// seek ends its source for the walk.
     fn walkable_key<'p>(&self, peek: &'p CursorPeek<A>) -> Option<&'p RowKey> {
+        Self::key_under_bound(peek, self.eq_bound.as_ref())
+    }
+
+    /// See [`Self::walkable_key`].
+    fn key_under_bound<'p>(
+        peek: &'p CursorPeek<A>,
+        eq_bound: Option<&EqBound>,
+    ) -> Option<&'p RowKey> {
         let key = peek.raw_key()?;
-        match &self.eq_bound {
+        match eq_bound {
             // For an index, the bound can be a prefix of the key. The comparison of
             // SortableIndexKey compares only the columns that both keys have.
             Some(bound) if !key.cmp(&bound.key).is_eq() => None,
@@ -1228,12 +1415,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             unreachable!("the MvStore head holds an entry");
         };
         cursor_work(&self.work).visibility_check();
-        let row_id = RowID {
-            table_id: self.table_id,
-            row_id: key.clone(),
-        };
-        self.db
-            .cursor_view_of_chain(self.snapshot, &row_id, versions, self.take_eq_payload())
+        self.db.cursor_view_of_chain(
+            self.snapshot,
+            self.table_id,
+            key,
+            versions,
+            self.take_eq_payload(),
+        )
     }
 
     /// Whether the walk copies the visible version of a table row into `eq_seek_row`: only
