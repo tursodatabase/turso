@@ -6472,6 +6472,7 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get_page();
+        buffer.as_mut_slice().fill(0);
         let inner = page.get();
         inner.set_buffer(Arc::new(buffer));
         page.set_loaded();
@@ -6913,6 +6914,27 @@ mod tests {
             *pager.cacheflush_state.read(),
             CacheFlushState::Init
         ));
+    }
+
+    #[test]
+    fn allocate_new_page_zeros_buffer() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let pool = BufferPool::begin_init(&io, 65536);
+        // Allocate and poison a page to dirty a pool slot
+        {
+            let page = super::allocate_new_page(2, &pool);
+            let inner = page.get();
+            let buf = inner.as_ptr();
+            buf.fill(0xAB);
+        }
+        // Allocate a new page and verify it is completely zeroed
+        let page = super::allocate_new_page(3, &pool);
+        let inner = page.get();
+        let buf = inner.as_ptr();
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "allocated new page buffer must be zeroed"
+        );
     }
 
     #[test]
