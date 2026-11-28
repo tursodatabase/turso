@@ -1,8 +1,9 @@
 use crate::alloc::TursoIteratorExt;
 use crate::ast::{self, TableInternalId};
 use crate::dialect::{
-    AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, DropColumn, NewOwner,
-    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
+    AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, DropColumn, DropColumnRefusal,
+    NewOwner, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView,
+    TempTriggerOfRenamedTable,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
@@ -738,37 +739,34 @@ pub fn translate_alter_table(
             // with its own UNIQUE, then the only column. A column named only in a table-level
             // UNIQUE is not flagged, so SQLite finds it after the count, when it rewrites the
             // table's CREATE statement.
-            if column.primary_key() {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop PRIMARY KEY column: \"{column_name}\""
-                )));
-            }
-
-            if column.unique() {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop UNIQUE column: \"{column_name}\""
-                )));
-            }
-
-            if btree.columns().len() == 1 {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": no other columns exist"
-                )));
-            }
-
             // SQLite's message for a table-level UNIQUE names the table as it was created and
             // the column as the constraint spells it.
             let col_normalized = normalize_ident(column_name);
-            if let Some(key) = btree
+            let in_table_unique = btree
                 .unique_sets
                 .iter()
                 .flat_map(|set| &set.columns)
-                .find(|key| normalize_ident(&key.name) == col_normalized)
-            {
-                return Err(LimboError::ParseError(format!(
-                    "error in table {} after drop column: no such column: {}",
-                    btree.declared_name, key.name
-                )));
+                .find(|key| normalize_ident(&key.name) == col_normalized);
+            let (table, column, refusal) = if column.primary_key() {
+                (table_name, column_name, Some(DropColumnRefusal::PrimaryKey))
+            } else if column.unique() {
+                (table_name, column_name, Some(DropColumnRefusal::Unique))
+            } else if btree.columns().len() == 1 {
+                (table_name, column_name, Some(DropColumnRefusal::OnlyColumn))
+            } else if let Some(key) = in_table_unique {
+                (
+                    btree.declared_name.as_str(),
+                    key.name.as_str(),
+                    Some(DropColumnRefusal::InTableUnique),
+                )
+            } else {
+                (table_name, column_name, None)
+            };
+            if let Some(refusal) = refusal {
+                return Err(resolver
+                    .catalog
+                    .dialect
+                    .drop_column_refused(table, column, refusal));
             }
 
             for index in table_indexes.iter() {

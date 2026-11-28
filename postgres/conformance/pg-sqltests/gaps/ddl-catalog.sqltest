@@ -1202,3 +1202,73 @@ expect {
 }
 @sqlstate 42P01
 expect @tursopg error {}
+
+# PostgreSQL drops a table's only column and keeps the table with no columns,
+# and drops a PRIMARY KEY or UNIQUE column with its constraint and index. The
+# engine refuses each of them, so tursopg says it is not supported.
+
+# E-115: DROP COLUMN of a table's only column
+@compat-gap "syntax:alter-table"
+test drop-column-the-only-column {
+    CREATE TABLE t_only_column (a int);
+    ALTER TABLE t_only_column DROP a;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-116: DROP COLUMN of a table's only column, a PRIMARY KEY
+@compat-gap "syntax:alter-table"
+test drop-column-the-only-primary-key-column {
+    CREATE TABLE t_only_pk (a int PRIMARY KEY);
+    ALTER TABLE t_only_pk DROP a;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-117: DROP COLUMN of a PRIMARY KEY column
+@compat-gap "syntax:alter-table"
+test drop-column-a-primary-key-column {
+    CREATE TABLE t_pk_column (a int PRIMARY KEY, b int);
+    ALTER TABLE t_pk_column DROP a;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-118: DROP COLUMN of a UNIQUE column
+@compat-gap "syntax:alter-table"
+test drop-column-a-unique-column {
+    CREATE TABLE t_unique_column (a int UNIQUE, b int);
+    ALTER TABLE t_unique_column DROP a;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-119: DROP COLUMN of a column in a table UNIQUE
+@compat-gap "syntax:alter-table"
+test drop-column-a-column-in-a-table-unique {
+    CREATE TABLE t_table_unique (a int, b int, UNIQUE (a, b));
+    ALTER TABLE t_table_unique DROP a;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-120: DROP COLUMN of a mixed case column in a table UNIQUE
+@compat-gap "syntax:alter-table"
+test drop-column-a-mixed-case-column-in-a-table-unique {
+    CREATE TABLE t_mixed_case ("A" int, b int, UNIQUE ("A", b));
+    ALTER TABLE t_mixed_case DROP "A";
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}

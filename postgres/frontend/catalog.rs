@@ -11,7 +11,7 @@ use turso_core::schema::RelationKind;
 use turso_core::{
     dialect::{
         call_builtin_scalar, identity_table_sql_marker, split_identity_table_sql_marker,
-        ScalarFuncContext, SortTermMatching, POSTGRES_TABLE_SQL_PREFIX,
+        DropColumnRefusal, ScalarFuncContext, SortTermMatching, POSTGRES_TABLE_SQL_PREFIX,
     },
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
@@ -514,6 +514,35 @@ impl Dialect for PostgresDialect {
                 None,
             ),
         })
+    }
+
+    /// PostgreSQL drops each column that SQLite refuses, with the constraints and
+    /// indexes on it; the engine cannot, so each refusal is reported as not supported.
+    fn drop_column_refused(
+        &self,
+        _table: &str,
+        column: &str,
+        refusal: DropColumnRefusal,
+    ) -> LimboError {
+        let what = match refusal {
+            // FIXME(pg-depend): PostgreSQL drops a PRIMARY KEY or UNIQUE constraint, and its
+            // index, with a column it covers, as pg_depend records. The engine refuses to drop a
+            // column that such a constraint covers. An engine that drops the constraint with the
+            // column replaces the PRIMARY KEY and UNIQUE arms.
+            DropColumnRefusal::PrimaryKey => "dropping a PRIMARY KEY column",
+            DropColumnRefusal::Unique | DropColumnRefusal::InTableUnique => {
+                "dropping a column with a UNIQUE constraint"
+            }
+            // FIXME(pg-empty-tables): PostgreSQL drops a table's only column and keeps the table
+            // with no columns. The engine refuses to drop the last column. An engine that can
+            // drop a table's last column replaces this arm.
+            DropColumnRefusal::OnlyColumn => "dropping the only column of a table",
+        };
+        crate::error::sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("{what} is not supported (column \"{column}\")"),
+            None,
+        )
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {
