@@ -4502,6 +4502,13 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// their next MVCC row again on a mismatch, like index cursors do with
     /// [`Self::index_rows_epoch`].
     table_rows_epoch: AtomicU64,
+    /// Bumped whenever a savepoint rollback (`ROLLBACK TO`, or the rollback of
+    /// a failed statement) undoes table or index versions. The undo of a delete
+    /// or an update can make a B-tree row visible again, to the transaction
+    /// that rolled back. `MvccLazyCursor` compares it before it uses its
+    /// B-tree peek, to find out whether a B-tree row that it skipped as hidden
+    /// can be visible now.
+    rollback_to_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
@@ -4738,6 +4745,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
             table_rows_epoch: AtomicU64::new(0),
+            rollback_to_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
@@ -7720,6 +7728,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if undoes_index_versions {
             self.bump_index_rows_epoch();
         }
+        if undoes_table_versions || undoes_index_versions {
+            self.rollback_to_epoch.fetch_add(1, Ordering::SeqCst);
+        }
 
         let tx = self
             .txs
@@ -9008,6 +9019,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// A table version was inserted, deleted or rolled back; see field docs.
     fn bump_table_rows_epoch(&self) {
         self.table_rows_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current epoch of savepoint rollbacks; see the field docs.
+    pub(crate) fn rollback_to_epoch(&self) -> u64 {
+        self.rollback_to_epoch.load(Ordering::SeqCst)
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]
