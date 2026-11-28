@@ -1813,6 +1813,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     self.state = Some(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction));
                     inject_io_yield!(self, CursorYieldPoint::SeekStart);
                 }
+                Some(MvccLazyCursorState::Seek(_, _)) if self.mvcc_head_is_stale() => {
+                    // A write of the own transaction came while the seek waited. The seek
+                    // returned no row yet, so it can start the MvStore head again. The
+                    // B-tree head stays: the transaction does not write to the B-tree.
+                    self.position_mvcc_head_at_seek_key(&seek_key, op)?;
+                }
                 Some(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction)) => {
                     if op.eq_only()
                         && self.eq_bound.as_ref().is_some_and(|bound| bound.one_row)

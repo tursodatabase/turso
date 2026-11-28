@@ -1162,3 +1162,100 @@ fn cursor_yield_sweep_reaches_every_point() {
         .collect();
     assert!(missing.is_empty(), "no operation reaches {missing:?}");
 }
+
+/// Yields one time, at the first occurrence of a point.
+#[derive(Debug)]
+struct YieldOnceAt(YieldPoint, AtomicBool);
+
+impl YieldInjector for YieldOnceAt {
+    fn should_yield(&self, _instance: u64, _key: u64, point: YieldPoint) -> bool {
+        point == self.0 && !self.1.swap(true, Ordering::SeqCst)
+    }
+}
+
+/// A seek yields after it positioned its MvStore head on a chain. GC then unlinks that
+/// chain, and the transaction of the seek writes the row with another statement, which
+/// makes a new chain. The seek must see the write. When the seek kept its head, it decided
+/// the B-tree row from the old chain: it returned a row that the transaction deleted, and a
+/// moved index row two times.
+#[test]
+fn test_seek_sees_own_write_after_gc_unlinked_its_chain() {
+    /// A query, the write at the yield, and the rows that the query must return.
+    type Case = (&'static str, &'static str, &'static [(i64, i64)]);
+    let cases: &[Case] = &[
+        (
+            "SELECT v, id FROM t INDEXED BY tv WHERE v >= 45 ORDER BY v",
+            "DELETE FROM t WHERE id = 50",
+            &[(60, 60), (70, 70), (80, 80), (90, 90), (100, 100)],
+        ),
+        (
+            "SELECT v, id FROM t INDEXED BY tv WHERE v = 50",
+            "DELETE FROM t WHERE id = 50",
+            &[],
+        ),
+        (
+            "SELECT id, v FROM t WHERE id >= 45",
+            "DELETE FROM t WHERE id = 50",
+            &[(60, 60), (70, 70), (80, 80), (90, 90), (100, 100)],
+        ),
+        (
+            "SELECT id, v FROM t WHERE id = 50",
+            "DELETE FROM t WHERE id = 50",
+            &[],
+        ),
+        (
+            "SELECT v, id FROM t INDEXED BY tv WHERE v >= 45 ORDER BY v",
+            "UPDATE t SET v = 55 WHERE id = 50",
+            &[(55, 50), (60, 60), (70, 70), (80, 80), (90, 90), (100, 100)],
+        ),
+    ];
+    for point in [CursorYieldPoint::SeekStart, CursorYieldPoint::SeekBtreeProgress] {
+        for (sql, write, expected) in cases {
+            let db = MvccTestDbNoConn::new_with_random_db();
+            let conn = db.connect();
+            for setup in [
+                "PRAGMA mvcc_checkpoint_threshold = -1",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)",
+                "CREATE INDEX tv ON t(v)",
+                "INSERT INTO t SELECT value * 10, value * 10 FROM generate_series(1, 10)",
+                "PRAGMA wal_checkpoint(TRUNCATE)",
+            ] {
+                conn.execute(setup).unwrap();
+            }
+            // A rolled-back delete leaves chains of row 50 that hold only an aborted
+            // version, so GC can unlink them.
+            let other = db.connect();
+            other.execute("BEGIN CONCURRENT").unwrap();
+            other.execute("DELETE FROM t WHERE id = 50").unwrap();
+            other.execute("ROLLBACK").unwrap();
+
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            conn.set_yield_injector(Some(Arc::new(YieldOnceAt(
+                point.point(),
+                AtomicBool::new(false),
+            ))));
+            let mut stmt = conn.prepare(sql).unwrap();
+            let (mut rows, mut yields) = (Vec::new(), 0);
+            loop {
+                match stmt.step().unwrap() {
+                    StepResult::IO => stmt._io().step().unwrap(),
+                    StepResult::Yield => {
+                        yields += 1;
+                        db.get_mvcc_store().gc_incremental(usize::MAX);
+                        conn.execute(write).unwrap();
+                    }
+                    StepResult::Row => {
+                        let row = stmt.row().unwrap();
+                        let (a, b) = (row.get_value(0), row.get_value(1));
+                        rows.push((a.as_int().unwrap(), b.as_int().unwrap()));
+                    }
+                    StepResult::Done => break,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            conn.set_yield_injector(None);
+            assert_eq!(yields, 1, "{point:?} `{sql}`");
+            assert_eq!(&rows, expected, "{point:?} `{sql}` after `{write}`");
+        }
+    }
+}
