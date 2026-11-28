@@ -1,6 +1,9 @@
 use std::{
     fmt,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Mutex,
+    },
 };
 
 use crate::rsapi::TursoError;
@@ -71,6 +74,10 @@ impl<T: AsRef<str>> From<T> for IoBackend {
 /// simple helper which return MISUSE error in case of concurrent access to some operation
 struct ConcurrentGuard {
     in_use: AtomicU32,
+    /// Statements that were dropped while another call held the guard. Dropping a
+    /// stepped statement resets it, and the reset can roll back the transaction of the
+    /// connection, so the holder of the guard drops them when it releases the guard.
+    deferred_drops: Mutex<Vec<turso_core::Statement>>,
 }
 
 struct ConcurrentGuardToken<'a> {
@@ -81,6 +88,7 @@ impl ConcurrentGuard {
     pub fn new() -> Self {
         Self {
             in_use: AtomicU32::new(0),
+            deferred_drops: Mutex::new(Vec::new()),
         }
     }
     pub fn try_use(&self) -> Result<ConcurrentGuardToken<'_>, TursoError> {
@@ -93,14 +101,30 @@ impl ConcurrentGuard {
         };
         Ok(ConcurrentGuardToken { guard: self })
     }
+    /// Drop the statement now if the guard is free, or else when the call that holds
+    /// the guard releases it. This does not wait, because the holder can need something
+    /// that the dropping thread holds, for example the Python GIL.
+    pub fn drop_statement(&self, statement: turso_core::Statement) {
+        self.deferred_drops.lock().unwrap().push(statement);
+        // If the guard is free, its token drops the statement. If another call holds
+        // the guard, that call sees the statement when it releases the guard.
+        let _ = self.try_use();
+    }
 }
 
 impl<'a> Drop for ConcurrentGuardToken<'a> {
     fn drop(&mut self) {
+        let deferred = std::mem::take(&mut *self.guard.deferred_drops.lock().unwrap());
+        drop(deferred);
         let before = self.guard.in_use.swap(0, Ordering::SeqCst);
         assert!(
             before == 1,
             "invalid db state: guard wasn't in use while token is active"
         );
+        // A statement added after the take above is dropped by the next holder of the
+        // guard. Take the guard here, in case no other call takes it.
+        if !self.guard.deferred_drops.lock().unwrap().is_empty() {
+            let _ = self.guard.try_use();
+        }
     }
 }
