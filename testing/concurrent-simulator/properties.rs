@@ -359,6 +359,65 @@ impl Property for FtsResultComparisonProperty {
     }
 }
 
+/// Check that the access paths of [`Operation::CompareScans`] return the same rows, and
+/// that a write of [`Operation::WriteScanSim`] returns each row ID at most once.
+pub struct ScanConsistencyProperty;
+
+impl Property for ScanConsistencyProperty {
+    fn finish_op(
+        &mut self,
+        step: usize,
+        fiber_id: usize,
+        _txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        if !matches!(
+            op,
+            Operation::CompareScans { .. } | Operation::WriteScanSim { .. }
+        ) {
+            return Ok(());
+        }
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(err @ (LimboError::ParseError(_) | LimboError::InvalidArgument(_))) => {
+                bail!("step {step} fiber {fiber_id}: the scan_sim query was rejected: {err}")
+            }
+            // The driver handles failed operations. There are no rows to examine.
+            Err(_) => return Ok(()),
+        };
+        match op {
+            Operation::CompareScans { lo, hi } => {
+                let Some(row) = rows.first() else {
+                    bail!("step {step} fiber {fiber_id}: the scan comparison returned no row");
+                };
+                // The first values summarize the rows in the key range. The last two give
+                // the smallest and largest key.
+                let (range, edges) = row.split_at(row.len() - 2);
+                if range.iter().any(|value| value != &range[0]) || edges[0] != edges[1] {
+                    bail!(
+                        "step {step} fiber {fiber_id}: the access paths of scan_sim disagree \
+                         for k in {lo}..={hi}: {row:?}"
+                    );
+                }
+            }
+            Operation::WriteScanSim { sql } => {
+                let mut ids = HashSet::new();
+                for row in rows {
+                    let id = row.first().and_then(Value::as_int);
+                    if !ids.insert(id) {
+                        bail!("step {step} fiber {fiber_id}: {sql:?} returned row ID {id:?} twice");
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// Check if an integrity_check result is informational (not actual corruption).
 /// In MVCC mode, "Page N: never used" is expected for allocated but unused pages.
 fn is_integrity_check_informational(text: &str) -> bool {

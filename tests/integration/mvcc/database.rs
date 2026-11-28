@@ -4676,10 +4676,10 @@ fn test_commit_without_tx() {
     );
 }
 
-/// Any ddl specially CREATE INDEX must cause SchemaUpdated errors on ongoing INSERTS because
-/// we shouldn't commit an insert without inserting rows to this new index that is being created.
-/// Here we test that case by injecting in the middle of CREATE INDEX's commit and then doing a
-/// regular concurrent insert that will not take into account new index.
+/// A CREATE INDEX that yields in its commit at `LogRecordPrepared` has an end timestamp, but
+/// it did not publish the new schema yet. An INSERT of a concurrent transaction then must not
+/// commit a row that the new index misses. The INSERT gets Busy, and after CREATE INDEX ends,
+/// the index holds every row.
 #[test]
 fn test_insert_in_middle_commit_of_create_index_returns_err() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -4696,10 +4696,6 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
     let conn_a = db.connect();
     let conn_b = db.connect();
 
-    // T1 (conn_a): CREATE INDEX, yielding at `LogRecordPrepared` — the
-    // point in the commit pipeline where `end_ts` has been assigned and the
-    // log record is built, but the global header and
-    // `last_committed_schema_change_ts` haven't been published yet.
     conn_a.set_yield_injector(Some(FixedYieldInjector::new([
         CommitYieldPoint::LogRecordPrepared.point(),
     ])));
@@ -4720,36 +4716,24 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
         "CREATE INDEX should yield at CommitYieldPoint::LogRecordPrepared"
     );
 
-    // T2 (conn_b): start a new tx now — its begin_ts will be > T1's end_ts,
-    // but the global schema view still doesn't know about the new index `i`.
-    // The INSERT compiles its bytecode against the stale schema and emits
-    // IdxInsert ops only for the indexes the stale schema knows about.
     conn_b.execute("BEGIN CONCURRENT").unwrap();
-    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let insert = conn_b.execute("INSERT INTO t VALUES (2, 20)");
+    assert!(
+        matches!(insert, Err(LimboError::Busy)),
+        "an INSERT during the commit of CREATE INDEX returned {insert:?}"
+    );
+    conn_b.execute("ROLLBACK").unwrap();
 
-    // T1 finishes finalizing the CREATE INDEX. After this point, the global
-    // header carries the new schema_cookie and `last_committed_schema_change_ts`
-    // is bumped to T1's `end_ts`.
     create_idx.run_ignore_rows().unwrap();
     drop(create_idx);
-
-    // T2 commits. The schema-conflict check at `CommitState::Initial` compares
-    // `last_committed_schema_change_ts (= T1.end_ts) > tx_b.begin_ts (> T1.end_ts)`
-    // which is FALSE — so no conflict is raised and T2 commits cleanly, even
-    // though its writes never touched the new index.
-
-    let commit_result = conn_b.execute("COMMIT");
-
-    assert!(
-        matches!(
-            commit_result,
-            Err(LimboError::SchemaConflict | LimboError::SchemaUpdated)
-        ),
-        "BUG: tx_b's COMMIT returned {commit_result:?} but should have been \
-         aborted with SchemaConflict/SchemaUpdated. tx_b began with a stale \
-         schema (missing index `i`), so its INSERT silently skipped writing \
-         to that index. Allowing the commit leaves `i` permanently short the \
-         row tx_b wrote."
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert_eq!(
+        get_rows(&conn_a, "PRAGMA integrity_check"),
+        vec![vec![Value::from_text("ok".to_string())]]
+    );
+    assert_eq!(
+        get_rows(&conn_a, "SELECT c FROM t INDEXED BY i ORDER BY c"),
+        vec![vec![Value::from_i64(10)], vec![Value::from_i64(20)]]
     );
 }
 
@@ -13954,4 +13938,172 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
         objects.iter().any(|object| object.name == "items"),
         "DML-only portable frame should resolve user table after cross-connection checkpoint"
     );
+}
+
+/// The uniqueness check of `PRAGMA integrity_check` looks up each index entry (`Found`) and
+/// steps to the next entry (`Next`). Here the next entry of (-6, 13, 250) is (-4, 14, 17) in
+/// the MvStore, and the B-tree holds (-2, 1, 314). The step ended the bounded MvStore range
+/// of the lookup, and the cursor compared the heads before it positioned the MvStore again.
+/// So it skipped (-4, 14, 17) and returned (-2, 1, 314) twice: once after each lookup, which
+/// the check reported as a non-unique entry.
+#[test]
+fn integrity_check_steps_to_mvstore_entry_after_index_lookup() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER, u INTEGER)",
+        "CREATE UNIQUE INDEX t_u ON t(u)",
+        "INSERT INTO t VALUES (313, 'v1', -8, 1)",
+        "INSERT OR REPLACE INTO t(v, k, u) VALUES ('v3', -2, 1)",
+        "CREATE UNIQUE INDEX t_ku ON t(k, u)",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        "INSERT INTO t VALUES (250, 'v13', -6, 13)",
+        "INSERT INTO t VALUES (17, 'v14', -4, 14)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::from_text("ok".to_string())]]
+    );
+}
+
+/// Yields once at `point`, the first time the point comes after `armed` is set.
+#[derive(Debug)]
+struct YieldOnceAt {
+    point: YieldPoint,
+    armed: AtomicBool,
+}
+
+impl YieldInjector for YieldOnceAt {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        point == self.point && self.armed.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Runs `scan` in a transaction over checkpointed rows 1..=20. After `rows_before_yield`
+/// rows, the scan yields at `point`, and at the yield the same transaction runs `write`.
+/// Returns the column `id_column` of each row of the scan.
+fn scan_with_own_write_at_step_yield(
+    rows_before_yield: usize,
+    point: YieldPoint,
+    mvcc_tail: &str,
+    write: &str,
+    scan: &str,
+    id_column: usize,
+) -> Vec<i64> {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v INT, w INT)",
+        "CREATE INDEX tv ON t(v)",
+        "INSERT INTO t SELECT value, value, 0 FROM generate_series(1, 20)",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        mvcc_tail,
+        "BEGIN",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let injector = Arc::new(YieldOnceAt {
+        point,
+        armed: AtomicBool::new(rows_before_yield == 0),
+    });
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut ids = Vec::new();
+    let mut stmt = conn.prepare(scan).unwrap();
+    let mut write = Some(write);
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO => stmt._io().step().unwrap(),
+            StepResult::Yield => conn.execute(write.take().unwrap()).unwrap(),
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                ids.push(row.get_value(id_column).as_int().unwrap());
+                injector
+                    .armed
+                    .store(ids.len() == rows_before_yield, Ordering::SeqCst);
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    assert!(write.is_none(), "the scan did not yield at {point:?}");
+    drop(stmt);
+    conn.set_yield_injector(None);
+    conn.execute("ROLLBACK").unwrap();
+    ids
+}
+
+/// A step checked whether the MvStore changed only before its `NextStart` yield. A write of
+/// the same transaction at that yield gave row 2 a new MvStore version after the MvStore
+/// head (row 20). After the yield, the B-tree head found row 2 shadowed, and the MvStore
+/// iterator had already passed it, so the scan skipped row 2.
+#[test]
+fn step_sees_own_write_made_at_yield() {
+    let point = CursorYieldPoint::NextStart.point();
+    let tail = "UPDATE t SET w = 5 WHERE id = 20";
+    let ids = scan_with_own_write_at_step_yield(
+        1,
+        point,
+        tail,
+        "UPDATE t SET w = 7 WHERE id = 2",
+        "SELECT id FROM t",
+        0,
+    );
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+    let ids = scan_with_own_write_at_step_yield(
+        1,
+        point,
+        "UPDATE t SET w = 5 WHERE id = 1",
+        "UPDATE t SET w = 7 WHERE id = 19",
+        "SELECT id FROM t ORDER BY id DESC",
+        0,
+    );
+    assert_eq!(ids, (1..=20).rev().collect::<Vec<_>>());
+    // The update rewrites the index entry of row 2 with the same key.
+    let ids = scan_with_own_write_at_step_yield(
+        1,
+        point,
+        "UPDATE t SET v = 20 WHERE id = 20",
+        "UPDATE t SET v = 2 WHERE id = 2",
+        "SELECT v, id FROM t INDEXED BY tv WHERE v > 0 ORDER BY v",
+        1,
+    );
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+    // The same write while the step waits for the B-tree.
+    let ids = scan_with_own_write_at_step_yield(
+        1,
+        CursorYieldPoint::AdvanceBtreeForwardProgress.point(),
+        tail,
+        "UPDATE t SET w = 7 WHERE id = 2",
+        "SELECT id FROM t",
+        0,
+    );
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+}
+
+/// The walk of `rewind` or `last` to the first row did not check whether the MvStore
+/// changed while it waited for the B-tree. A write of the same transaction at that yield
+/// gave the first B-tree row a new MvStore version, which the MvStore iterator had already
+/// passed, so the scan skipped the first row.
+#[test]
+fn edge_walk_sees_own_write_made_at_yield() {
+    let ids = scan_with_own_write_at_step_yield(
+        0,
+        CursorYieldPoint::AdvanceBtreeForwardProgress.point(),
+        "UPDATE t SET w = 5 WHERE id = 20",
+        "UPDATE t SET w = 7 WHERE id = 1",
+        "SELECT id FROM t",
+        0,
+    );
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+    let ids = scan_with_own_write_at_step_yield(
+        0,
+        CursorYieldPoint::AdvanceBtreeBackwardProgress.point(),
+        "UPDATE t SET w = 5 WHERE id = 1",
+        "UPDATE t SET w = 7 WHERE id = 20",
+        "SELECT id FROM t ORDER BY id DESC",
+        0,
+    );
+    assert_eq!(ids, (1..=20).rev().collect::<Vec<_>>());
 }

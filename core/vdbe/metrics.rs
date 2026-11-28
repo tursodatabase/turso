@@ -25,6 +25,9 @@ pub struct CursorWork {
     /// Visibility decisions: whether an MvStore entry is visible, or whether MVCC shadows
     /// a B-tree row. A check can include one MvStore point lookup.
     pub visibility_checks: u64,
+    /// MvStore point lookups: a search of the skiplist for one key, to find the chain of
+    /// a B-tree row. A seek that walks hidden B-tree rows can do one for each row.
+    pub mvcc_point_lookups: u64,
 }
 
 impl CursorWork {
@@ -38,6 +41,9 @@ impl CursorWork {
         self.mvcc_seeks = self.mvcc_seeks.wrapping_add(other.mvcc_seeks);
         self.btree_seeks = self.btree_seeks.wrapping_add(other.btree_seeks);
         self.visibility_checks = self.visibility_checks.wrapping_add(other.visibility_checks);
+        self.mvcc_point_lookups = self
+            .mvcc_point_lookups
+            .wrapping_add(other.mvcc_point_lookups);
     }
 
     /// The raw entries of both sources that cursors looked at.
@@ -73,6 +79,8 @@ pub struct CursorWorkCounters {
     btree_seeks: AtomicU64,
     #[cfg(debug_assertions)]
     visibility_checks: AtomicU64,
+    #[cfg(debug_assertions)]
+    mvcc_point_lookups: AtomicU64,
 }
 
 /// The handle to the [`CursorWorkCounters`] of a statement that the statement and its
@@ -189,6 +197,12 @@ impl<'a> CursorWorkRef<'a> {
         Self::bump(&self.counters.visibility_checks);
     }
 
+    #[inline(always)]
+    pub(crate) fn mvcc_point_lookup(self) {
+        #[cfg(debug_assertions)]
+        Self::bump(&self.counters.mvcc_point_lookups);
+    }
+
     /// The counts. All zero in release builds.
     pub(crate) fn get(self) -> CursorWork {
         #[cfg(debug_assertions)]
@@ -200,6 +214,7 @@ impl<'a> CursorWorkRef<'a> {
                 mvcc_seeks: c.mvcc_seeks.load(Ordering::Relaxed),
                 btree_seeks: c.btree_seeks.load(Ordering::Relaxed),
                 visibility_checks: c.visibility_checks.load(Ordering::Relaxed),
+                mvcc_point_lookups: c.mvcc_point_lookups.load(Ordering::Relaxed),
             }
         }
         #[cfg(not(debug_assertions))]
@@ -220,6 +235,7 @@ impl<'a> CursorWorkRef<'a> {
             &self.counters.mvcc_seeks,
             &self.counters.btree_seeks,
             &self.counters.visibility_checks,
+            &self.counters.mvcc_point_lookups,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -468,6 +484,11 @@ impl fmt::Display for StatementMetrics {
                 f,
                 "    Visibility checks:{}",
                 self.cursor_work.visibility_checks
+            )?;
+            writeln!(
+                f,
+                "    MvStore lookups:  {}",
+                self.cursor_work.mvcc_point_lookups
             )?;
         }
         Ok(())

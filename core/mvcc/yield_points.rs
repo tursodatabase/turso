@@ -7,6 +7,9 @@ use crate::LimboError;
 pub struct YieldPoint {
     pub ordinal: u8,
     pub point_count: u8,
+    /// The type of the yield point family. Two families can have the same number of
+    /// points, so a point of one family must not match a point of another.
+    pub family: &'static str,
 }
 
 /// External hook consulted at safe state machine boundaries to decide whether to synthesize a yield.

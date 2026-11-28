@@ -39,7 +39,9 @@
 //! [`PULL_CELLS`]. A cell that
 //! is known to fail with the current cursor is listed in [`KNOWN_SUPER_LINEAR`]. The test
 //! fails if such a cell starts to pass, so the list stays correct, and a fix removes the
-//! cells that it fixes from the list.
+//! cells that it fixes from the list. A cell whose work is linear in the hidden entries by
+//! design is listed in [`HIDDEN_AT_EDGE`] and checked as [`Class::Linear`].
+
 //!
 //! Run with `MVCC_COST_REPORT=1` and `--nocapture` to print the counts of each cell.
 
@@ -47,10 +49,14 @@ use super::test_db::MvccTestDbNoConn;
 use rand::seq::SliceRandom;
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::num::NonZero;
 use std::sync::Arc;
-use turso_core::{Connection, CursorWork, Value};
+use turso_core::mvcc::cursor::CursorYieldPoint;
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
+use turso_core::{Connection, CursorWork, StepResult, Value};
 
 /// The size of the state at the smaller run. The larger run uses `4 * N`.
 const N: usize = 200;
@@ -77,13 +83,14 @@ impl Class {
 }
 
 /// The counters of [`CursorWork`] with their names.
-fn counters(work: &CursorWork) -> [(&'static str, u64); 5] {
+fn counters(work: &CursorWork) -> [(&'static str, u64); 6] {
     [
         ("mvcc_entries", work.mvcc_entries_examined),
         ("btree_rows", work.btree_rows_examined),
         ("mvcc_seeks", work.mvcc_seeks),
         ("btree_seeks", work.btree_seeks),
         ("visibility_checks", work.visibility_checks),
+        ("mvcc_point_lookups", work.mvcc_point_lookups),
     ]
 }
 
@@ -1341,382 +1348,232 @@ fn pull_cell_name(table: PullTable, change: PullChange, order: Order, prior: Pri
 /// another cell fail must not be merged. So each fix of the cursor shows what it fixes, and
 /// no fix can bring back a cost that an earlier fix removed. The names are the text of
 /// [`query_cell_name`], [`replay_cell_name`] and [`pull_cell_name`].
-const KNOWN_SUPER_LINEAR: &[(&str, &[&str])] = &[
+const KNOWN_SUPER_LINEAR: &[(&str, &[&str])] = &[];
+
+/// Cells whose work is linear in the hidden entries of the state, by design. To find the
+/// first visible entry from one end of a table or index (max(), min(), ORDER BY .. LIMIT
+/// 1, and the first rowid allocation of a table, which reads the largest visible rowid), a
+/// cursor must step over all the hidden entries at that end. No cursor can skip them
+/// without a visibility check:
+///
+/// - Uncommitted rows and rows committed after the snapshot are hidden only from this
+///   snapshot. They end when the other transaction ends or the snapshot ends.
+/// - Deleted rows (Tombstones, DeletedMvRows, the old keys of UpdatedIndexKeys) stay until
+///   a checkpoint or GC removes them.
+///
+/// These cells use [`Class::Linear`]. A cell that grows within its own class must be
+/// removed from this list.
+const HIDDEN_AT_EDGE: &[&str] = &[
+    "Tombstones/Before/probes-in-Btree/MinRowid",
+    "Tombstones/Before/probes-in-Btree/MinIndex",
+    "Tombstones/Before/probes-in-Btree/LimitIndexAsc",
+    "Tombstones/Before/probes-in-MvStore/MinRowid",
+    "Tombstones/Before/probes-in-MvStore/MinIndex",
+    "Tombstones/Before/probes-in-MvStore/LimitIndexAsc",
+    "Tombstones/After/probes-in-Btree/MaxRowid",
+    "Tombstones/After/probes-in-Btree/MaxIndex",
+    "Tombstones/After/probes-in-Btree/LimitRowidDesc",
+    "Tombstones/After/probes-in-Btree/LimitIndexDesc",
+    "Tombstones/After/probes-in-MvStore/MaxRowid",
+    "Tombstones/After/probes-in-MvStore/MaxIndex",
+    "Tombstones/After/probes-in-MvStore/LimitRowidDesc",
+    "Tombstones/After/probes-in-MvStore/LimitIndexDesc",
+    "Tombstones/Around/probes-in-Btree/MaxRowid",
+    "Tombstones/Around/probes-in-Btree/MinRowid",
+    "Tombstones/Around/probes-in-Btree/MaxIndex",
+    "Tombstones/Around/probes-in-Btree/MinIndex",
+    "Tombstones/Around/probes-in-Btree/LimitRowidDesc",
+    "Tombstones/Around/probes-in-Btree/LimitIndexAsc",
+    "Tombstones/Around/probes-in-Btree/LimitIndexDesc",
+    "Tombstones/Around/probes-in-MvStore/MaxRowid",
+    "Tombstones/Around/probes-in-MvStore/MinRowid",
+    "Tombstones/Around/probes-in-MvStore/MaxIndex",
+    "Tombstones/Around/probes-in-MvStore/MinIndex",
+    "Tombstones/Around/probes-in-MvStore/LimitRowidDesc",
+    "Tombstones/Around/probes-in-MvStore/LimitIndexAsc",
+    "Tombstones/Around/probes-in-MvStore/LimitIndexDesc",
+    "DeletedMvRows/Before/probes-in-Btree/MinRowid",
+    "DeletedMvRows/Before/probes-in-Btree/MinIndex",
+    "DeletedMvRows/Before/probes-in-Btree/LimitIndexAsc",
+    "DeletedMvRows/Before/probes-in-MvStore/MinRowid",
+    "DeletedMvRows/Before/probes-in-MvStore/MinIndex",
+    "DeletedMvRows/Before/probes-in-MvStore/LimitIndexAsc",
+    "DeletedMvRows/After/probes-in-Btree/MaxRowid",
+    "DeletedMvRows/After/probes-in-Btree/MaxIndex",
+    "DeletedMvRows/After/probes-in-Btree/LimitRowidDesc",
+    "DeletedMvRows/After/probes-in-Btree/LimitIndexDesc",
+    "DeletedMvRows/After/probes-in-MvStore/MaxRowid",
+    "DeletedMvRows/After/probes-in-MvStore/MaxIndex",
+    "DeletedMvRows/After/probes-in-MvStore/LimitRowidDesc",
+    "DeletedMvRows/After/probes-in-MvStore/LimitIndexDesc",
+    "DeletedMvRows/Around/probes-in-Btree/MaxRowid",
+    "DeletedMvRows/Around/probes-in-Btree/MinRowid",
+    "DeletedMvRows/Around/probes-in-Btree/MaxIndex",
+    "DeletedMvRows/Around/probes-in-Btree/MinIndex",
+    "DeletedMvRows/Around/probes-in-Btree/LimitRowidDesc",
+    "DeletedMvRows/Around/probes-in-Btree/LimitIndexAsc",
+    "DeletedMvRows/Around/probes-in-Btree/LimitIndexDesc",
+    "DeletedMvRows/Around/probes-in-MvStore/MaxRowid",
+    "DeletedMvRows/Around/probes-in-MvStore/MinRowid",
+    "DeletedMvRows/Around/probes-in-MvStore/MaxIndex",
+    "DeletedMvRows/Around/probes-in-MvStore/MinIndex",
+    "DeletedMvRows/Around/probes-in-MvStore/LimitRowidDesc",
+    "DeletedMvRows/Around/probes-in-MvStore/LimitIndexAsc",
+    "DeletedMvRows/Around/probes-in-MvStore/LimitIndexDesc",
+    "UpdatedIndexKeys/Before/probes-in-Btree/MinIndex",
+    "UpdatedIndexKeys/Before/probes-in-Btree/LimitIndexAsc",
+    "UpdatedIndexKeys/Before/probes-in-MvStore/MinIndex",
+    "UpdatedIndexKeys/Before/probes-in-MvStore/LimitIndexAsc",
+    "UpdatedIndexKeys/Around/probes-in-Btree/MinIndex",
+    "UpdatedIndexKeys/Around/probes-in-Btree/LimitIndexAsc",
+    "UpdatedIndexKeys/Around/probes-in-MvStore/MinIndex",
+    "UpdatedIndexKeys/Around/probes-in-MvStore/LimitIndexAsc",
+    "Uncommitted/Before/probes-in-Btree/MinRowid",
+    "Uncommitted/Before/probes-in-Btree/MinIndex",
+    "Uncommitted/Before/probes-in-Btree/LimitIndexAsc",
+    "Uncommitted/Before/probes-in-MvStore/MinRowid",
+    "Uncommitted/Before/probes-in-MvStore/MinIndex",
+    "Uncommitted/Before/probes-in-MvStore/LimitIndexAsc",
+    "Uncommitted/After/probes-in-Btree/MaxRowid",
+    "Uncommitted/After/probes-in-Btree/MaxIndex",
+    "Uncommitted/After/probes-in-Btree/LimitRowidDesc",
+    "Uncommitted/After/probes-in-Btree/LimitIndexDesc",
+    "Uncommitted/After/probes-in-MvStore/MaxRowid",
+    "Uncommitted/After/probes-in-MvStore/MaxIndex",
+    "Uncommitted/After/probes-in-MvStore/LimitRowidDesc",
+    "Uncommitted/After/probes-in-MvStore/LimitIndexDesc",
+    "Uncommitted/Around/probes-in-Btree/MaxRowid",
+    "Uncommitted/Around/probes-in-Btree/MinRowid",
+    "Uncommitted/Around/probes-in-Btree/MaxIndex",
+    "Uncommitted/Around/probes-in-Btree/MinIndex",
+    "Uncommitted/Around/probes-in-Btree/LimitRowidDesc",
+    "Uncommitted/Around/probes-in-Btree/LimitIndexAsc",
+    "Uncommitted/Around/probes-in-Btree/LimitIndexDesc",
+    "Uncommitted/Around/probes-in-MvStore/MaxRowid",
+    "Uncommitted/Around/probes-in-MvStore/MinRowid",
+    "Uncommitted/Around/probes-in-MvStore/MaxIndex",
+    "Uncommitted/Around/probes-in-MvStore/MinIndex",
+    "Uncommitted/Around/probes-in-MvStore/LimitRowidDesc",
+    "Uncommitted/Around/probes-in-MvStore/LimitIndexAsc",
+    "Uncommitted/Around/probes-in-MvStore/LimitIndexDesc",
+    "CommittedAfterSnapshot/Before/probes-in-Btree/MinRowid",
+    "CommittedAfterSnapshot/Before/probes-in-Btree/MinIndex",
+    "CommittedAfterSnapshot/Before/probes-in-Btree/LimitIndexAsc",
+    "CommittedAfterSnapshot/Before/probes-in-MvStore/MinRowid",
+    "CommittedAfterSnapshot/Before/probes-in-MvStore/MinIndex",
+    "CommittedAfterSnapshot/Before/probes-in-MvStore/LimitIndexAsc",
+    "CommittedAfterSnapshot/After/probes-in-Btree/MaxRowid",
+    "CommittedAfterSnapshot/After/probes-in-Btree/MaxIndex",
+    "CommittedAfterSnapshot/After/probes-in-Btree/LimitRowidDesc",
+    "CommittedAfterSnapshot/After/probes-in-Btree/LimitIndexDesc",
+    "CommittedAfterSnapshot/After/probes-in-MvStore/MaxRowid",
+    "CommittedAfterSnapshot/After/probes-in-MvStore/MaxIndex",
+    "CommittedAfterSnapshot/After/probes-in-MvStore/LimitRowidDesc",
+    "CommittedAfterSnapshot/After/probes-in-MvStore/LimitIndexDesc",
+    "CommittedAfterSnapshot/Around/probes-in-Btree/MaxRowid",
+    "CommittedAfterSnapshot/Around/probes-in-Btree/MinRowid",
+    "CommittedAfterSnapshot/Around/probes-in-Btree/MaxIndex",
+    "CommittedAfterSnapshot/Around/probes-in-Btree/MinIndex",
+    "CommittedAfterSnapshot/Around/probes-in-Btree/LimitRowidDesc",
+    "CommittedAfterSnapshot/Around/probes-in-Btree/LimitIndexAsc",
+    "CommittedAfterSnapshot/Around/probes-in-Btree/LimitIndexDesc",
+    "CommittedAfterSnapshot/Around/probes-in-MvStore/MaxRowid",
+    "CommittedAfterSnapshot/Around/probes-in-MvStore/MinRowid",
+    "CommittedAfterSnapshot/Around/probes-in-MvStore/MaxIndex",
+    "CommittedAfterSnapshot/Around/probes-in-MvStore/MinIndex",
+    "CommittedAfterSnapshot/Around/probes-in-MvStore/LimitRowidDesc",
+    "CommittedAfterSnapshot/Around/probes-in-MvStore/LimitIndexAsc",
+    "CommittedAfterSnapshot/Around/probes-in-MvStore/LimitIndexDesc",
+    "Tombstones/After/probes-in-Btree/InsertAutoRowid",
+    "Tombstones/After/probes-in-MvStore/InsertAutoRowid",
+    "Tombstones/Around/probes-in-Btree/InsertAutoRowid",
+    "Tombstones/Around/probes-in-MvStore/InsertAutoRowid",
+    "DeletedMvRows/After/probes-in-Btree/InsertAutoRowid",
+    "DeletedMvRows/After/probes-in-MvStore/InsertAutoRowid",
+    "DeletedMvRows/Around/probes-in-Btree/InsertAutoRowid",
+    "DeletedMvRows/Around/probes-in-MvStore/InsertAutoRowid",
+    "Uncommitted/After/probes-in-Btree/InsertAutoRowid",
+    "Uncommitted/After/probes-in-MvStore/InsertAutoRowid",
+    "Uncommitted/Around/probes-in-Btree/InsertAutoRowid",
+    "Uncommitted/Around/probes-in-MvStore/InsertAutoRowid",
+    "CommittedAfterSnapshot/After/probes-in-Btree/InsertAutoRowid",
+    "CommittedAfterSnapshot/After/probes-in-MvStore/InsertAutoRowid",
+    "CommittedAfterSnapshot/Around/probes-in-Btree/InsertAutoRowid",
+    "CommittedAfterSnapshot/Around/probes-in-MvStore/InsertAutoRowid",
+];
+
+/// The work of each query, replay change and pull change, summed over all its cells at
+/// size N, in the order of [`counters`]. A change to the cursor must not raise a total above
+/// its ceiling: the growth classes do not see a cost that grows by a constant factor, such
+/// as one more seek for each probe. When a change lowers a total, the ceiling can stay. Run
+/// with `MVCC_COST_REPORT=1` to print the current totals. The ceilings cover the first five
+/// counters. Main did not count MvStore point lookups, so they have only a growth class.
+const WORK_CEILINGS: &[(&str, [u64; 5])] = &[
+    ("CountAll", [12025, 4314, 72, 42, 13428]),
+    ("DeleteThroughIndex", [4695, 0, 4704, 0, 4032]),
+    ("EqualityLoop", [1392, 1104, 1008, 672, 2016]),
+    ("FullIndexScanAsc", [12025, 4314, 72, 42, 13428]),
+    ("FullIndexScanDesc", [9114, 4314, 42, 42, 13428]),
+    ("FullScanAsc", [7914, 4314, 42, 42, 11028]),
+    ("FullScanDesc", [7914, 4314, 42, 42, 11028]),
+    ("InsertAutoRowid", [2442, 629, 4074, 4074, 3042]),
+    ("InsertUnique", [0, 0, 4704, 4704, 672]),
+    ("IntegrityCheck", [87891, 37704, 20752, 8076, 110453]),
+    ("JoinNonUnique", [903, 1680, 1050, 714, 2016]),
+    ("JoinRowid", [375, 1008, 714, 378, 1344]),
+    ("JoinUnique", [711, 1680, 1386, 714, 2016]),
+    ("LimitIndexAsc", [4247, 1228, 67, 42, 4242]),
+    ("LimitIndexDesc", [2435, 629, 42, 42, 3042]),
+    ("LimitRowidDesc", [2435, 629, 42, 42, 3042]),
+    ("MaxIndex", [2435, 629, 42, 42, 3042]),
+    ("MaxRowid", [2435, 629, 42, 42, 3042]),
+    ("MinIndex", [4247, 1228, 67, 42, 4242]),
+    ("MinRowid", [2435, 629, 42, 42, 3042]),
+    ("PointDescIndex", [864, 1008, 1008, 672, 1344]),
+    ("PointNocase", [864, 1008, 1008, 672, 1344]),
+    ("PointNonUnique", [864, 1008, 1008, 672, 1344]),
+    ("PointNullPrefix", [864, 1008, 1008, 672, 1344]),
+    ("PointRowid", [336, 336, 672, 336, 672]),
+    ("PointUnique", [672, 1008, 1344, 672, 1344]),
+    ("RangeDescIndexAsc", [705, 699, 42, 42, 1386]),
+    ("RangeDescIndexDesc", [717, 699, 63, 42, 1386]),
+    ("RangeIndexAsc", [717, 699, 63, 42, 1386]),
+    ("RangeIndexDesc", [705, 699, 42, 42, 1386]),
+    ("RangeRowidAsc", [705, 699, 42, 42, 1386]),
+    ("RangeRowidDesc", [705, 699, 42, 42, 1386]),
+    ("UpdateIndexKey", [3351, 0, 4704, 1344, 2688]),
+    ("UpdateThroughIndex", [672, 1008, 1344, 672, 1344]),
+    ("pull/FullRowUpsert", [13935, 14000, 19200, 16800, 38735]),
+    ("pull/RecordedPull", [13949, 13752, 19248, 15240, 29299]),
+    ("pull/UpdateChangedColumns", [3200, 1600, 3600, 2800, 4800]),
+    ("replay/Delete", [5577, 7200, 7200, 6000, 12189]),
     (
-        "A step of the cursor finds the next visible row of each source on its own. It \
-         walks all the hidden entries after the current key in one source, even when the \
-         other source has the next row close by. A range read walks them after its last \
-         row, and an equality loop or an index write walks them at each probe. The merge \
-         walk of PR #12556 fixes all these cells.",
-        &[
-            "Tombstones/Before/probes-in-Btree/RangeRowidDesc",
-            "Tombstones/Before/probes-in-Btree/RangeIndexDesc",
-            "Tombstones/Before/probes-in-Btree/RangeDescIndexDesc",
-            "Tombstones/Before/probes-in-Btree/MaxRowid",
-            "Tombstones/Before/probes-in-Btree/MaxIndex",
-            "Tombstones/Before/probes-in-Btree/LimitRowidDesc",
-            "Tombstones/Before/probes-in-Btree/LimitIndexDesc",
-            "Tombstones/Before/probes-in-MvStore/RangeRowidDesc",
-            "Tombstones/Before/probes-in-MvStore/RangeIndexDesc",
-            "Tombstones/Before/probes-in-MvStore/RangeDescIndexDesc",
-            "Tombstones/Before/probes-in-MvStore/MaxRowid",
-            "Tombstones/Before/probes-in-MvStore/MaxIndex",
-            "Tombstones/Before/probes-in-MvStore/LimitRowidDesc",
-            "Tombstones/Before/probes-in-MvStore/LimitIndexDesc",
-            "Tombstones/Before/probes-in-MvStore/InsertAutoRowid",
-            "Tombstones/After/probes-in-Btree/EqualityLoop",
-            "Tombstones/After/probes-in-Btree/RangeRowidAsc",
-            "Tombstones/After/probes-in-Btree/RangeIndexAsc",
-            "Tombstones/After/probes-in-Btree/RangeDescIndexAsc",
-            "Tombstones/After/probes-in-Btree/MinRowid",
-            "Tombstones/After/probes-in-Btree/MinIndex",
-            "Tombstones/After/probes-in-Btree/LimitIndexAsc",
-            "Tombstones/After/probes-in-Btree/UpdateIndexKey",
-            "Tombstones/After/probes-in-Btree/DeleteThroughIndex",
-            "Tombstones/After/probes-in-MvStore/EqualityLoop",
-            "Tombstones/After/probes-in-MvStore/RangeRowidAsc",
-            "Tombstones/After/probes-in-MvStore/RangeIndexAsc",
-            "Tombstones/After/probes-in-MvStore/RangeDescIndexAsc",
-            "Tombstones/After/probes-in-MvStore/MinRowid",
-            "Tombstones/After/probes-in-MvStore/MinIndex",
-            "Tombstones/After/probes-in-MvStore/LimitIndexAsc",
-            "Tombstones/Around/probes-in-Btree/EqualityLoop",
-            "Tombstones/Around/probes-in-Btree/RangeRowidAsc",
-            "Tombstones/Around/probes-in-Btree/RangeRowidDesc",
-            "Tombstones/Around/probes-in-Btree/RangeIndexAsc",
-            "Tombstones/Around/probes-in-Btree/RangeIndexDesc",
-            "Tombstones/Around/probes-in-Btree/RangeDescIndexAsc",
-            "Tombstones/Around/probes-in-Btree/RangeDescIndexDesc",
-            "Tombstones/Around/probes-in-Btree/UpdateIndexKey",
-            "Tombstones/Around/probes-in-Btree/DeleteThroughIndex",
-            "Tombstones/Around/probes-in-MvStore/EqualityLoop",
-            "Tombstones/Around/probes-in-MvStore/RangeRowidAsc",
-            "Tombstones/Around/probes-in-MvStore/RangeRowidDesc",
-            "Tombstones/Around/probes-in-MvStore/RangeIndexAsc",
-            "Tombstones/Around/probes-in-MvStore/RangeIndexDesc",
-            "Tombstones/Around/probes-in-MvStore/RangeDescIndexAsc",
-            "Tombstones/Around/probes-in-MvStore/RangeDescIndexDesc",
-            "DeletedMvRows/Before/probes-in-Btree/RangeRowidDesc",
-            "DeletedMvRows/Before/probes-in-Btree/RangeIndexDesc",
-            "DeletedMvRows/Before/probes-in-Btree/RangeDescIndexDesc",
-            "DeletedMvRows/Before/probes-in-Btree/MaxRowid",
-            "DeletedMvRows/Before/probes-in-Btree/MaxIndex",
-            "DeletedMvRows/Before/probes-in-Btree/LimitRowidDesc",
-            "DeletedMvRows/Before/probes-in-Btree/LimitIndexDesc",
-            "DeletedMvRows/After/probes-in-Btree/EqualityLoop",
-            "DeletedMvRows/After/probes-in-Btree/RangeRowidAsc",
-            "DeletedMvRows/After/probes-in-Btree/RangeIndexAsc",
-            "DeletedMvRows/After/probes-in-Btree/RangeDescIndexAsc",
-            "DeletedMvRows/After/probes-in-Btree/MinRowid",
-            "DeletedMvRows/After/probes-in-Btree/MinIndex",
-            "DeletedMvRows/After/probes-in-Btree/LimitIndexAsc",
-            "DeletedMvRows/After/probes-in-Btree/UpdateIndexKey",
-            "DeletedMvRows/After/probes-in-Btree/DeleteThroughIndex",
-            "DeletedMvRows/Around/probes-in-Btree/EqualityLoop",
-            "DeletedMvRows/Around/probes-in-Btree/RangeRowidAsc",
-            "DeletedMvRows/Around/probes-in-Btree/RangeRowidDesc",
-            "DeletedMvRows/Around/probes-in-Btree/RangeIndexAsc",
-            "DeletedMvRows/Around/probes-in-Btree/RangeIndexDesc",
-            "DeletedMvRows/Around/probes-in-Btree/RangeDescIndexAsc",
-            "DeletedMvRows/Around/probes-in-Btree/RangeDescIndexDesc",
-            "DeletedMvRows/Around/probes-in-Btree/UpdateIndexKey",
-            "DeletedMvRows/Around/probes-in-Btree/DeleteThroughIndex",
-            "UpdatedIndexKeys/Before/probes-in-Btree/MinRowid",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/RangeRowidDesc",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/RangeIndexDesc",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/RangeDescIndexDesc",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/MaxRowid",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/MinRowid",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/MaxIndex",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/LimitRowidDesc",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/LimitIndexDesc",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/InsertAutoRowid",
-            "UpdatedIndexKeys/After/probes-in-Btree/EqualityLoop",
-            "UpdatedIndexKeys/After/probes-in-Btree/RangeIndexAsc",
-            "UpdatedIndexKeys/After/probes-in-Btree/RangeDescIndexAsc",
-            "UpdatedIndexKeys/After/probes-in-Btree/MaxRowid",
-            "UpdatedIndexKeys/After/probes-in-Btree/MaxIndex",
-            "UpdatedIndexKeys/After/probes-in-Btree/MinIndex",
-            "UpdatedIndexKeys/After/probes-in-Btree/LimitRowidDesc",
-            "UpdatedIndexKeys/After/probes-in-Btree/LimitIndexAsc",
-            "UpdatedIndexKeys/After/probes-in-Btree/LimitIndexDesc",
-            "UpdatedIndexKeys/After/probes-in-Btree/UpdateIndexKey",
-            "UpdatedIndexKeys/After/probes-in-Btree/DeleteThroughIndex",
-            "UpdatedIndexKeys/After/probes-in-Btree/InsertAutoRowid",
-            "UpdatedIndexKeys/After/probes-in-MvStore/EqualityLoop",
-            "UpdatedIndexKeys/After/probes-in-MvStore/RangeRowidAsc",
-            "UpdatedIndexKeys/After/probes-in-MvStore/RangeIndexAsc",
-            "UpdatedIndexKeys/After/probes-in-MvStore/RangeDescIndexAsc",
-            "UpdatedIndexKeys/After/probes-in-MvStore/MaxRowid",
-            "UpdatedIndexKeys/After/probes-in-MvStore/MinRowid",
-            "UpdatedIndexKeys/After/probes-in-MvStore/MaxIndex",
-            "UpdatedIndexKeys/After/probes-in-MvStore/MinIndex",
-            "UpdatedIndexKeys/After/probes-in-MvStore/LimitRowidDesc",
-            "UpdatedIndexKeys/After/probes-in-MvStore/LimitIndexAsc",
-            "UpdatedIndexKeys/After/probes-in-MvStore/LimitIndexDesc",
-            "UpdatedIndexKeys/After/probes-in-MvStore/InsertAutoRowid",
-            "UpdatedIndexKeys/Around/probes-in-Btree/EqualityLoop",
-            "UpdatedIndexKeys/Around/probes-in-Btree/RangeIndexAsc",
-            "UpdatedIndexKeys/Around/probes-in-Btree/RangeDescIndexAsc",
-            "UpdatedIndexKeys/Around/probes-in-Btree/MaxRowid",
-            "UpdatedIndexKeys/Around/probes-in-Btree/MinRowid",
-            "UpdatedIndexKeys/Around/probes-in-Btree/MaxIndex",
-            "UpdatedIndexKeys/Around/probes-in-Btree/LimitRowidDesc",
-            "UpdatedIndexKeys/Around/probes-in-Btree/LimitIndexDesc",
-            "UpdatedIndexKeys/Around/probes-in-Btree/UpdateIndexKey",
-            "UpdatedIndexKeys/Around/probes-in-Btree/DeleteThroughIndex",
-            "UpdatedIndexKeys/Around/probes-in-Btree/InsertAutoRowid",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/EqualityLoop",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/RangeRowidAsc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/RangeRowidDesc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/RangeIndexAsc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/RangeIndexDesc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/RangeDescIndexAsc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/RangeDescIndexDesc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/MaxRowid",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/MinRowid",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/MaxIndex",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/LimitRowidDesc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/LimitIndexDesc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/InsertAutoRowid",
-            "Uncommitted/Before/probes-in-Btree/RangeRowidDesc",
-            "Uncommitted/Before/probes-in-Btree/RangeIndexDesc",
-            "Uncommitted/Before/probes-in-Btree/RangeDescIndexDesc",
-            "Uncommitted/Before/probes-in-Btree/MaxRowid",
-            "Uncommitted/Before/probes-in-Btree/MaxIndex",
-            "Uncommitted/Before/probes-in-Btree/LimitRowidDesc",
-            "Uncommitted/Before/probes-in-Btree/LimitIndexDesc",
-            "Uncommitted/After/probes-in-Btree/EqualityLoop",
-            "Uncommitted/After/probes-in-Btree/RangeRowidAsc",
-            "Uncommitted/After/probes-in-Btree/RangeIndexAsc",
-            "Uncommitted/After/probes-in-Btree/RangeDescIndexAsc",
-            "Uncommitted/After/probes-in-Btree/MinRowid",
-            "Uncommitted/After/probes-in-Btree/MinIndex",
-            "Uncommitted/After/probes-in-Btree/LimitIndexAsc",
-            "Uncommitted/After/probes-in-Btree/UpdateIndexKey",
-            "Uncommitted/After/probes-in-Btree/DeleteThroughIndex",
-            "Uncommitted/Around/probes-in-Btree/EqualityLoop",
-            "Uncommitted/Around/probes-in-Btree/RangeRowidAsc",
-            "Uncommitted/Around/probes-in-Btree/RangeRowidDesc",
-            "Uncommitted/Around/probes-in-Btree/RangeIndexAsc",
-            "Uncommitted/Around/probes-in-Btree/RangeIndexDesc",
-            "Uncommitted/Around/probes-in-Btree/RangeDescIndexAsc",
-            "Uncommitted/Around/probes-in-Btree/RangeDescIndexDesc",
-            "Uncommitted/Around/probes-in-Btree/UpdateIndexKey",
-            "Uncommitted/Around/probes-in-Btree/DeleteThroughIndex",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/RangeRowidDesc",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/RangeIndexDesc",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/RangeDescIndexDesc",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/MaxRowid",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/MaxIndex",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/LimitRowidDesc",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/LimitIndexDesc",
-            "CommittedAfterSnapshot/After/probes-in-Btree/EqualityLoop",
-            "CommittedAfterSnapshot/After/probes-in-Btree/RangeRowidAsc",
-            "CommittedAfterSnapshot/After/probes-in-Btree/RangeIndexAsc",
-            "CommittedAfterSnapshot/After/probes-in-Btree/RangeDescIndexAsc",
-            "CommittedAfterSnapshot/After/probes-in-Btree/MinRowid",
-            "CommittedAfterSnapshot/After/probes-in-Btree/MinIndex",
-            "CommittedAfterSnapshot/After/probes-in-Btree/LimitIndexAsc",
-            "CommittedAfterSnapshot/After/probes-in-Btree/UpdateIndexKey",
-            "CommittedAfterSnapshot/After/probes-in-Btree/DeleteThroughIndex",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/EqualityLoop",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/RangeRowidAsc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/RangeRowidDesc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/RangeIndexAsc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/RangeIndexDesc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/RangeDescIndexAsc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/RangeDescIndexDesc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/UpdateIndexKey",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/DeleteThroughIndex",
-            "replay/CompositePk/NonUnique/Delete/Random",
-            "replay/CompositePk/NonUnique/DeleteThenInsert/Random",
-            "replay/CompositePk/NonUnique/UpdateSameIndexValue/KeyOrder",
-            "replay/CompositePk/NonUnique/UpdateSameIndexValue/Random",
-            "replay/CompositePk/Unique/Delete/Random",
-            "replay/CompositePk/Unique/DeleteThenInsert/Random",
-            "replay/CompositePk/Unique/UpdateSameIndexValue/KeyOrder",
-            "replay/CompositePk/Unique/UpdateSameIndexValue/Random",
-            "replay/CompositePk/NullableUnique/Delete/Random",
-            "replay/CompositePk/NullableUnique/DeleteThenInsert/Random",
-            "replay/CompositePk/NullableUnique/UpdateSameIndexValue/KeyOrder",
-            "replay/CompositePk/NullableUnique/UpdateSameIndexValue/Random",
-        ],
+        "replay/DeleteThenInsert",
+        [12645, 10788, 14388, 11988, 23247],
     ),
+    ("replay/InsertOrReplace", [10881, 6206, 13188, 13188, 22093]),
+    ("replay/UpdateIndexed", [3688, 7612, 10788, 9588, 10512]),
     (
-        "An exact (GE eq_only) seek on a full index key, as IdxInsert does, finds no \
-         visible MvStore entry and finds a B-tree entry at the key that MVCC hides. The \
-         cursor then steps the B-tree past the key until it finds a visible entry: for an \
-         index key it does not stop at the end of the key (only exact rowid seeks do). A \
-         replay that deletes and inserts the same index key does this at each change, and \
-         walks all the hidden B-tree entries after the key: the entries of the rows that \
-         it deleted before (DeleteThenInsert), or the entries of the rows that an earlier \
-         pull rewrote and no checkpoint moved to the B-tree yet (pull prior-Committed, in \
-         the four indexes whose values do not change). A real sync pull replays updates \
-         as all the deletes, then all the inserts (RecordedPull), so it does this in all \
-         the indexes at each change.",
-        &[
-            "replay/Rowid/NonUnique/DeleteThenInsert/KeyOrder",
-            "replay/Rowid/Unique/DeleteThenInsert/KeyOrder",
-            "replay/Rowid/NullableUnique/DeleteThenInsert/KeyOrder",
-            "replay/CompositePk/NonUnique/DeleteThenInsert/KeyOrder",
-            "replay/CompositePk/Unique/DeleteThenInsert/KeyOrder",
-            "replay/CompositePk/NullableUnique/DeleteThenInsert/KeyOrder",
-            "pull/Indexed/FullRowUpsert/KeyOrder/prior-Committed",
-            "pull/Indexed/RecordedPull/KeyOrder/prior-None",
-            "pull/Indexed/RecordedPull/KeyOrder/prior-Committed",
-            "pull/Indexed/RecordedPull/KeyOrder/prior-Checkpointed",
-            "pull/IndexedGenerated/RecordedPull/KeyOrder/prior-None",
-        ],
+        "replay/UpdateSameIndexValue",
+        [14547, 9600, 9600, 8400, 23544],
     ),
+    ("replay/UpdateUnindexed", [378, 4800, 3600, 3600, 3978]),
+    ("replay/Upsert", [13188, 7612, 11988, 11988, 29612]),
     (
-        "To find the first visible entry from one end of a table or index (max(), min(), \
-         ORDER BY .. LIMIT 1, and the first rowid allocation of a statement, which reads \
-         the largest rowid), the cursor steps over all the hidden entries at that end. A \
-         change to the merge of the two sources does not remove this cost: a checkpoint or \
-         garbage collection removes tombstones and deleted rows, and the end of the other \
-         transaction removes its rows. For example, a queue table that deletes its oldest \
-         rows and reads min() pays it at each read until a checkpoint.",
-        &[
-            "Tombstones/Before/probes-in-Btree/MinRowid",
-            "Tombstones/Before/probes-in-Btree/MinIndex",
-            "Tombstones/Before/probes-in-Btree/LimitIndexAsc",
-            "Tombstones/Before/probes-in-MvStore/MinRowid",
-            "Tombstones/Before/probes-in-MvStore/MinIndex",
-            "Tombstones/Before/probes-in-MvStore/LimitIndexAsc",
-            "Tombstones/After/probes-in-Btree/MaxRowid",
-            "Tombstones/After/probes-in-Btree/MaxIndex",
-            "Tombstones/After/probes-in-Btree/LimitRowidDesc",
-            "Tombstones/After/probes-in-Btree/LimitIndexDesc",
-            "Tombstones/After/probes-in-Btree/InsertAutoRowid",
-            "Tombstones/After/probes-in-MvStore/MaxRowid",
-            "Tombstones/After/probes-in-MvStore/MaxIndex",
-            "Tombstones/After/probes-in-MvStore/LimitRowidDesc",
-            "Tombstones/After/probes-in-MvStore/LimitIndexDesc",
-            "Tombstones/After/probes-in-MvStore/InsertAutoRowid",
-            "Tombstones/Around/probes-in-Btree/MaxRowid",
-            "Tombstones/Around/probes-in-Btree/MinRowid",
-            "Tombstones/Around/probes-in-Btree/MaxIndex",
-            "Tombstones/Around/probes-in-Btree/MinIndex",
-            "Tombstones/Around/probes-in-Btree/LimitRowidDesc",
-            "Tombstones/Around/probes-in-Btree/LimitIndexAsc",
-            "Tombstones/Around/probes-in-Btree/LimitIndexDesc",
-            "Tombstones/Around/probes-in-Btree/InsertAutoRowid",
-            "Tombstones/Around/probes-in-MvStore/MaxRowid",
-            "Tombstones/Around/probes-in-MvStore/MinRowid",
-            "Tombstones/Around/probes-in-MvStore/MaxIndex",
-            "Tombstones/Around/probes-in-MvStore/MinIndex",
-            "Tombstones/Around/probes-in-MvStore/LimitRowidDesc",
-            "Tombstones/Around/probes-in-MvStore/LimitIndexAsc",
-            "Tombstones/Around/probes-in-MvStore/LimitIndexDesc",
-            "Tombstones/Around/probes-in-MvStore/InsertAutoRowid",
-            "DeletedMvRows/Before/probes-in-Btree/MinRowid",
-            "DeletedMvRows/Before/probes-in-Btree/MinIndex",
-            "DeletedMvRows/Before/probes-in-Btree/LimitIndexAsc",
-            "DeletedMvRows/Before/probes-in-MvStore/MinRowid",
-            "DeletedMvRows/Before/probes-in-MvStore/MinIndex",
-            "DeletedMvRows/Before/probes-in-MvStore/LimitIndexAsc",
-            "DeletedMvRows/After/probes-in-Btree/MaxRowid",
-            "DeletedMvRows/After/probes-in-Btree/MaxIndex",
-            "DeletedMvRows/After/probes-in-Btree/LimitRowidDesc",
-            "DeletedMvRows/After/probes-in-Btree/LimitIndexDesc",
-            "DeletedMvRows/After/probes-in-Btree/InsertAutoRowid",
-            "DeletedMvRows/After/probes-in-MvStore/MaxRowid",
-            "DeletedMvRows/After/probes-in-MvStore/MaxIndex",
-            "DeletedMvRows/After/probes-in-MvStore/LimitRowidDesc",
-            "DeletedMvRows/After/probes-in-MvStore/LimitIndexDesc",
-            "DeletedMvRows/After/probes-in-MvStore/InsertAutoRowid",
-            "DeletedMvRows/Around/probes-in-Btree/MaxRowid",
-            "DeletedMvRows/Around/probes-in-Btree/MinRowid",
-            "DeletedMvRows/Around/probes-in-Btree/MaxIndex",
-            "DeletedMvRows/Around/probes-in-Btree/MinIndex",
-            "DeletedMvRows/Around/probes-in-Btree/LimitRowidDesc",
-            "DeletedMvRows/Around/probes-in-Btree/LimitIndexAsc",
-            "DeletedMvRows/Around/probes-in-Btree/LimitIndexDesc",
-            "DeletedMvRows/Around/probes-in-Btree/InsertAutoRowid",
-            "DeletedMvRows/Around/probes-in-MvStore/MaxRowid",
-            "DeletedMvRows/Around/probes-in-MvStore/MinRowid",
-            "DeletedMvRows/Around/probes-in-MvStore/MaxIndex",
-            "DeletedMvRows/Around/probes-in-MvStore/MinIndex",
-            "DeletedMvRows/Around/probes-in-MvStore/LimitRowidDesc",
-            "DeletedMvRows/Around/probes-in-MvStore/LimitIndexAsc",
-            "DeletedMvRows/Around/probes-in-MvStore/LimitIndexDesc",
-            "DeletedMvRows/Around/probes-in-MvStore/InsertAutoRowid",
-            "UpdatedIndexKeys/Before/probes-in-Btree/MinIndex",
-            "UpdatedIndexKeys/Before/probes-in-Btree/LimitIndexAsc",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/MinIndex",
-            "UpdatedIndexKeys/Before/probes-in-MvStore/LimitIndexAsc",
-            "UpdatedIndexKeys/Around/probes-in-Btree/MinIndex",
-            "UpdatedIndexKeys/Around/probes-in-Btree/LimitIndexAsc",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/MinIndex",
-            "UpdatedIndexKeys/Around/probes-in-MvStore/LimitIndexAsc",
-            "Uncommitted/Before/probes-in-Btree/MinRowid",
-            "Uncommitted/Before/probes-in-Btree/MinIndex",
-            "Uncommitted/Before/probes-in-Btree/LimitIndexAsc",
-            "Uncommitted/Before/probes-in-MvStore/MinRowid",
-            "Uncommitted/Before/probes-in-MvStore/MinIndex",
-            "Uncommitted/Before/probes-in-MvStore/LimitIndexAsc",
-            "Uncommitted/After/probes-in-Btree/MaxRowid",
-            "Uncommitted/After/probes-in-Btree/MaxIndex",
-            "Uncommitted/After/probes-in-Btree/LimitRowidDesc",
-            "Uncommitted/After/probes-in-Btree/LimitIndexDesc",
-            "Uncommitted/After/probes-in-Btree/InsertAutoRowid",
-            "Uncommitted/After/probes-in-MvStore/MaxRowid",
-            "Uncommitted/After/probes-in-MvStore/MaxIndex",
-            "Uncommitted/After/probes-in-MvStore/LimitRowidDesc",
-            "Uncommitted/After/probes-in-MvStore/LimitIndexDesc",
-            "Uncommitted/After/probes-in-MvStore/InsertAutoRowid",
-            "Uncommitted/Around/probes-in-Btree/MaxRowid",
-            "Uncommitted/Around/probes-in-Btree/MinRowid",
-            "Uncommitted/Around/probes-in-Btree/MaxIndex",
-            "Uncommitted/Around/probes-in-Btree/MinIndex",
-            "Uncommitted/Around/probes-in-Btree/LimitRowidDesc",
-            "Uncommitted/Around/probes-in-Btree/LimitIndexAsc",
-            "Uncommitted/Around/probes-in-Btree/LimitIndexDesc",
-            "Uncommitted/Around/probes-in-Btree/InsertAutoRowid",
-            "Uncommitted/Around/probes-in-MvStore/MaxRowid",
-            "Uncommitted/Around/probes-in-MvStore/MinRowid",
-            "Uncommitted/Around/probes-in-MvStore/MaxIndex",
-            "Uncommitted/Around/probes-in-MvStore/MinIndex",
-            "Uncommitted/Around/probes-in-MvStore/LimitRowidDesc",
-            "Uncommitted/Around/probes-in-MvStore/LimitIndexAsc",
-            "Uncommitted/Around/probes-in-MvStore/LimitIndexDesc",
-            "Uncommitted/Around/probes-in-MvStore/InsertAutoRowid",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/MinRowid",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/MinIndex",
-            "CommittedAfterSnapshot/Before/probes-in-Btree/LimitIndexAsc",
-            "CommittedAfterSnapshot/Before/probes-in-MvStore/MinRowid",
-            "CommittedAfterSnapshot/Before/probes-in-MvStore/MinIndex",
-            "CommittedAfterSnapshot/Before/probes-in-MvStore/LimitIndexAsc",
-            "CommittedAfterSnapshot/After/probes-in-Btree/MaxRowid",
-            "CommittedAfterSnapshot/After/probes-in-Btree/MaxIndex",
-            "CommittedAfterSnapshot/After/probes-in-Btree/LimitRowidDesc",
-            "CommittedAfterSnapshot/After/probes-in-Btree/LimitIndexDesc",
-            "CommittedAfterSnapshot/After/probes-in-Btree/InsertAutoRowid",
-            "CommittedAfterSnapshot/After/probes-in-MvStore/MaxRowid",
-            "CommittedAfterSnapshot/After/probes-in-MvStore/MaxIndex",
-            "CommittedAfterSnapshot/After/probes-in-MvStore/LimitRowidDesc",
-            "CommittedAfterSnapshot/After/probes-in-MvStore/LimitIndexDesc",
-            "CommittedAfterSnapshot/After/probes-in-MvStore/InsertAutoRowid",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/MaxRowid",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/MinRowid",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/MaxIndex",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/MinIndex",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/LimitRowidDesc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/LimitIndexAsc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/LimitIndexDesc",
-            "CommittedAfterSnapshot/Around/probes-in-Btree/InsertAutoRowid",
-            "CommittedAfterSnapshot/Around/probes-in-MvStore/MaxRowid",
-            "CommittedAfterSnapshot/Around/probes-in-MvStore/MinRowid",
-            "CommittedAfterSnapshot/Around/probes-in-MvStore/MaxIndex",
-            "CommittedAfterSnapshot/Around/probes-in-MvStore/MinIndex",
-            "CommittedAfterSnapshot/Around/probes-in-MvStore/LimitRowidDesc",
-            "CommittedAfterSnapshot/Around/probes-in-MvStore/LimitIndexAsc",
-            "CommittedAfterSnapshot/Around/probes-in-MvStore/LimitIndexDesc",
-            "CommittedAfterSnapshot/Around/probes-in-MvStore/InsertAutoRowid",
-        ],
+        "replay/UpsertSameIndexValue",
+        [12594, 9600, 10800, 10800, 33588],
     ),
 ];
+
+/// The [`WORK_CEILINGS`] entry of a cell: its query, replay change or pull change.
+fn ceiling_group(name: &str) -> String {
+    let parts = name.split('/').collect::<Vec<_>>();
+    match parts[0] {
+        "replay" => format!("replay/{}", parts[3]),
+        "pull" => format!("pull/{}", parts[2]),
+        _ => parts[parts.len() - 1].to_string(),
+    }
+}
 
 fn known_reason(name: &str) -> Option<&'static str> {
     KNOWN_SUPER_LINEAR
@@ -1752,7 +1609,19 @@ fn check_cell(
     large: &CursorWork,
     failures: &mut Vec<String>,
     report: &mut String,
+    totals: &mut BTreeMap<String, CursorWork>,
 ) {
+    totals.entry(ceiling_group(name)).or_default().merge(small);
+    let class = if HIDDEN_AT_EDGE.contains(&name) {
+        if violations(class, small, large).is_empty() {
+            failures.push(format!(
+                "{name}: listed in HIDDEN_AT_EDGE but grows within {class:?}; remove it"
+            ));
+        }
+        Class::Linear
+    } else {
+        class
+    };
     let bad = violations(class, small, large);
     let known = known_reason(name);
     let status = match (bad.is_empty(), known) {
@@ -1790,13 +1659,34 @@ fn check_cell(
 }
 
 /// Prints the report if `MVCC_COST_REPORT` is set, and fails with the failures.
-fn finish(report: &str, failures: &[String]) {
+fn finish(report: &str, failures: &[String], totals: &BTreeMap<String, CursorWork>) {
     if std::env::var_os("MVCC_COST_REPORT").is_some() {
         eprintln!("{report}");
     }
+    let mut failures = failures.to_vec();
+    let mut table = String::new();
+    for (group, work) in totals {
+        let counts = counters(work).map(|(_, count)| count);
+        let _ = writeln!(table, "    (\"{group}\", {counts:?}),");
+        match WORK_CEILINGS.iter().find(|(name, _)| name == group) {
+            Some((_, ceiling)) => {
+                for ((name, count), max) in counters(work).into_iter().zip(ceiling) {
+                    if count > *max {
+                        failures.push(format!(
+                            "{group}: {name} is {count} in total, above its ceiling {max}"
+                        ));
+                    }
+                }
+            }
+            None => failures.push(format!("{group}: no entry in WORK_CEILINGS")),
+        }
+    }
+    if std::env::var_os("MVCC_COST_REPORT").is_some() || !failures.is_empty() {
+        eprintln!("Current totals for WORK_CEILINGS:\n{table}");
+    }
     assert!(
         failures.is_empty(),
-        "{} cells do not match the table:\n{}",
+        "{} checks failed:\n{}",
         failures.len(),
         failures.join("\n")
     );
@@ -1806,6 +1696,7 @@ fn finish(report: &str, failures: &[String]) {
 fn test_mvcc_query_cost_scaling() {
     let mut failures = Vec::new();
     let mut report = String::new();
+    let mut totals = BTreeMap::new();
     for shape in SHAPES {
         for placement in PLACEMENTS {
             for source in PROBE_SOURCES {
@@ -1820,18 +1711,43 @@ fn test_mvcc_query_cost_scaling() {
                         &large[i],
                         &mut failures,
                         &mut report,
+                        &mut totals,
                     );
+                    if source == ProbeSource::MvStore && READS_ONE_MVSTORE_ROW.contains(&query) {
+                        for work in [&small[i], &large[i]] {
+                            // A join may rewind its outer table once.
+                            if work.btree_seeks > 1 {
+                                failures.push(format!(
+                                    "{name}: seeks the B-tree {} times, but the MvStore holds \
+                                     the only row of each probe",
+                                    work.btree_seeks
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    finish(&report, &failures);
+    finish(&report, &failures, &totals);
 }
+
+/// Queries whose probes each match at most one row (a rowid or a UNIQUE key). When the
+/// MvStore holds a visible row with that key, the B-tree cannot hold another visible match,
+/// so the probe must not seek the B-tree. The `Next` of a UNIQUE index loop does not seek it
+/// either: the loop keeps the bound of its seek.
+const READS_ONE_MVSTORE_ROW: [Query; 4] = [
+    Query::PointRowid,
+    Query::PointUnique,
+    Query::JoinRowid,
+    Query::JoinUnique,
+];
 
 #[test]
 fn test_mvcc_replay_cost_scaling() {
     let mut failures = Vec::new();
     let mut report = String::new();
+    let mut totals = BTreeMap::new();
     for table in REPLAY_TABLES {
         for index in SECONDARY_INDEXES {
             let measure = |n: usize| {
@@ -1857,19 +1773,21 @@ fn test_mvcc_replay_cost_scaling() {
                         &large[i],
                         &mut failures,
                         &mut report,
+                        &mut totals,
                     );
                     i += 1;
                 }
             }
         }
     }
-    finish(&report, &failures);
+    finish(&report, &failures, &totals);
 }
 
 #[test]
 fn test_mvcc_pull_cost_scaling() {
     let mut failures = Vec::new();
     let mut report = String::new();
+    let mut totals = BTreeMap::new();
     for table in [PullTable::Indexed, PullTable::IndexedGenerated] {
         let cells = PULL_CELLS
             .iter()
@@ -1894,10 +1812,11 @@ fn test_mvcc_pull_cost_scaling() {
                 &large[i],
                 &mut failures,
                 &mut report,
+                &mut totals,
             );
         }
     }
-    finish(&report, &failures);
+    finish(&report, &failures, &totals);
 }
 
 /// The counters count each MvStore iterator once when it is made and each entry that it
@@ -1927,4 +1846,254 @@ fn test_cursor_work_counts_mvstore_iterators_exactly() {
             "`{sql}`: {work:?}"
         );
     }
+}
+
+/// Runs `sql` at state size N and 4N with `build`, and returns the work of each run.
+fn work_at_n_and_4n(
+    build: impl Fn(usize) -> (MvccTestDbNoConn, Arc<Connection>),
+    sql: &str,
+) -> (CursorWork, CursorWork) {
+    let mut works = [N, 4 * N].map(|n| {
+        let (_db, conn) = build(n);
+        run_measured(&conn, sql, &[]).1
+    });
+    let large = std::mem::take(&mut works[1]);
+    let small = std::mem::take(&mut works[0]);
+    (small, large)
+}
+
+/// An index seek that walks B-tree entries whose MvStore chains hide them must decide each
+/// one from the chain that the MvStore head holds. A skiplist lookup for each entry made a
+/// job queue query (`WHERE status = 'pending'` after the jobs moved to 'done') 4.5 times
+/// slower than main.
+#[test]
+fn test_index_seek_over_hidden_btree_entries_does_no_point_lookups() {
+    let moved_keys = |n: usize| {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+        run(
+            &conn,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, k INT, v TEXT)",
+        );
+        run(&conn, "CREATE INDEX t_k ON t(k)");
+        run(
+            &conn,
+            &format!("INSERT INTO t SELECT value, 7, 'a' FROM generate_series(1, {n})"),
+        );
+        run(
+            &conn,
+            &format!(
+                "INSERT INTO t SELECT value + {n}, value % 50 + 100, 'b' \
+                 FROM generate_series(1, 100)"
+            ),
+        );
+        run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        run(&conn, &format!("UPDATE t SET k = 8 WHERE id < {n}"));
+        (db, conn)
+    };
+    let deleted_rows = |n: usize| {
+        let (db, conn) = moved_keys(n);
+        run(&conn, &format!("DELETE FROM t WHERE id <= {n}"));
+        (db, conn)
+    };
+    let eq_seek = "SELECT count(*) FROM t INDEXED BY t_k WHERE k = 7";
+    let range_seek = "SELECT k FROM t INDEXED BY t_k WHERE k > 0 ORDER BY k LIMIT 1";
+    for (sql, (small, large)) in [
+        (eq_seek, work_at_n_and_4n(moved_keys, eq_seek)),
+        (range_seek, work_at_n_and_4n(deleted_rows, range_seek)),
+    ] {
+        assert!(
+            Class::Constant.allows(small.mvcc_point_lookups, large.mvcc_point_lookups),
+            "`{sql}`: MvStore point lookups grow with the hidden entries: {small:?} -> {large:?}"
+        );
+    }
+}
+
+/// A loop that probes a UNIQUE index in key order finds each row on the B-tree head that
+/// the `Next` of the probe before it left. A seek of both sources for each probe made a
+/// join on a UNIQUE column 2 times slower than main.
+#[test]
+fn test_unique_index_probes_in_key_order_do_not_seek_again() {
+    let build = |n: usize| {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+        run(
+            &conn,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, v TEXT)",
+        );
+        run(&conn, "CREATE TABLE p(id INTEGER PRIMARY KEY, x INT)");
+        run(
+            &conn,
+            &format!("INSERT INTO t SELECT value, value, 'b' FROM generate_series(1, {n})"),
+        );
+        run(
+            &conn,
+            &format!("INSERT INTO p SELECT value, value FROM generate_series(1, {n})"),
+        );
+        run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        (db, conn)
+    };
+    let sql = "SELECT count(*), count(t.u) FROM p LEFT JOIN t ON t.u = p.x";
+    for n in [N, 4 * N] {
+        let (_db, conn) = build(n);
+        let (rows, _) = run_measured(&conn, sql, &[]);
+        assert_eq!(rows, vec![vec![int(n as i64), int(n as i64)]]);
+    }
+    let (small, large) = work_at_n_and_4n(build, sql);
+    assert!(
+        Class::Constant.allows(small.seeks(), large.seeks()),
+        "`{sql}`: each probe seeks again: {small:?} -> {large:?}"
+    );
+}
+
+/// When every row of a table is hidden, the first rowid allocation in a process reads the
+/// last row (there is none) and then steps forward. The step must not walk all the hidden
+/// rows again from the other end.
+#[test]
+fn test_first_rowid_allocation_reads_hidden_rows_once() {
+    for n in [N, 4 * N] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+            run(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, a)");
+            run(
+                &conn,
+                &format!("INSERT INTO t SELECT value, value FROM generate_series(1, {n})"),
+            );
+            run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+            run(&conn, "DELETE FROM t");
+        }
+        // A new process allocates the first rowid of the table from the table itself.
+        db.restart();
+        let conn = db.connect();
+        let (_, work) = run_measured(&conn, "INSERT INTO t(a) VALUES ('n1')", &[]);
+        let n = n as u64;
+        assert!(
+            work.btree_rows_examined >= n,
+            "the deleted rows are not hidden B-tree rows: {work:?}"
+        );
+        assert!(
+            work.btree_rows_examined <= n + 1 && work.mvcc_entries_examined <= n + 1,
+            "the allocation reads the hidden rows more than once: {work:?}"
+        );
+    }
+}
+
+/// Yields at each step of the B-tree head, as a page read that misses the page cache does.
+#[derive(Debug)]
+struct YieldAtBtreeSteps;
+
+impl YieldInjector for YieldAtBtreeSteps {
+    fn should_yield(&self, _instance: u64, _key: u64, point: YieldPoint) -> bool {
+        point == CursorYieldPoint::AdvanceBtreeForwardProgress.point()
+            || point == CursorYieldPoint::AdvanceBtreeBackwardProgress.point()
+    }
+}
+
+/// Runs `sql` on `conn`, and makes `writer` commit an insert into table `other` at each
+/// yield. Returns the rows, the cursor work and the number of yields.
+fn run_with_writer_at_yields(
+    conn: &Arc<Connection>,
+    writer: &Arc<Connection>,
+    sql: &str,
+) -> (Vec<Vec<Value>>, CursorWork, usize) {
+    conn.set_yield_injector(Some(Arc::new(YieldAtBtreeSteps)));
+    let mut stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("prepare `{sql}` failed: {e}"));
+    let (mut rows, mut yields) = (Vec::new(), 0);
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO => stmt._io().step().unwrap(),
+            StepResult::Yield => {
+                yields += 1;
+                run(writer, "INSERT INTO other(v) VALUES (0)");
+            }
+            StepResult::Row => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
+            StepResult::Done => break,
+            other => panic!("`{sql}`: unexpected {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+    let work = stmt.metrics().cursor_work;
+    (rows, work, yields)
+}
+
+/// A write of another transaction while a walk waits on IO must not start the walk of the
+/// MvStore again. The other transaction's writes are not visible to the walk. When each
+/// write started the walk again, a scan over hidden rows examined the hidden entries again
+/// after each page read, and its work grew with the square of the hidden rows.
+#[test]
+fn test_foreign_writes_at_page_reads_do_not_restart_the_walk() {
+    let build = |n: usize| {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+        run(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, k INT)");
+        run(&conn, "CREATE INDEX t_k ON t(k)");
+        run(&conn, "CREATE TABLE other(id INTEGER PRIMARY KEY, v INT)");
+        run(&conn, "CREATE INDEX other_v ON other(v)");
+        run(
+            &conn,
+            &format!("INSERT INTO t SELECT value, value FROM generate_series(1, {n})"),
+        );
+        run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        run(&conn, &format!("DELETE FROM t WHERE id < {n}"));
+        (db, conn)
+    };
+    for sql in [
+        "SELECT id FROM t",
+        "SELECT id FROM t ORDER BY id DESC",
+        "SELECT k FROM t INDEXED BY t_k ORDER BY k",
+    ] {
+        let works = [N, 4 * N].map(|n| {
+            let (db, conn) = build(n);
+            let writer = db.connect();
+            let (rows, work, yields) = run_with_writer_at_yields(&conn, &writer, sql);
+            assert_eq!(rows, vec![vec![int(n as i64)]], "`{sql}`");
+            assert!(yields >= n, "`{sql}`: the walk yielded {yields} times");
+            work
+        });
+        let wrong = violations(Class::Linear, &works[0], &works[1]);
+        assert!(
+            wrong.is_empty(),
+            "`{sql}`: foreign writes restart the walk: {wrong:?}"
+        );
+    }
+}
+
+/// The first rowid allocation over a table whose rows are all hidden must read them once,
+/// also when another transaction writes while the allocation waits on IO.
+#[test]
+fn test_first_rowid_allocation_with_foreign_writes_reads_hidden_rows_once() {
+    let n = 4 * N;
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        run(&conn, "PRAGMA mvcc_checkpoint_threshold = -1");
+        run(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, a)");
+        run(&conn, "CREATE TABLE other(id INTEGER PRIMARY KEY, v INT)");
+        run(
+            &conn,
+            &format!("INSERT INTO t SELECT value, value FROM generate_series(1, {n})"),
+        );
+        run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        run(&conn, "DELETE FROM t");
+    }
+    db.restart();
+    let conn = db.connect();
+    let writer = db.connect();
+    run(&conn, "BEGIN CONCURRENT");
+    let (_, work, yields) =
+        run_with_writer_at_yields(&conn, &writer, "INSERT INTO t(a) VALUES ('n1')");
+    run(&conn, "COMMIT");
+    let n = n as u64;
+    assert!(yields > 0, "the allocation did not yield");
+    assert!(
+        work.btree_rows_examined <= n + 1 && work.mvcc_entries_examined <= n + 1,
+        "the allocation reads the hidden rows more than once: {work:?}"
+    );
 }

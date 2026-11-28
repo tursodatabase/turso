@@ -463,6 +463,13 @@ fn run_inprocess(args: &Args, seed: u64, swarm: Option<&SwarmConfig>) -> anyhow:
         );
     }
 
+    if whopper.stats.scan_checks > 0 {
+        println!(
+            "\n{} scan_sim access path comparisons",
+            whopper.stats.scan_checks
+        );
+    }
+
     if args.elle.is_some() {
         println!("\nElle history exported to: {}", args.elle_output);
     }
@@ -595,6 +602,8 @@ fn build_workloads_and_properties(args: &Args, swarm: Option<&SwarmConfig>) -> B
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
             (10, Box::new(IntegrityCheckWorkload)),
+            (15, Box::new(ScanSimWriteWorkload)),
+            (8, Box::new(ScanSimCompareWorkload)),
         ];
         let w = match swarm {
             Some(swarm) => {
@@ -620,10 +629,12 @@ fn build_workloads_and_properties(args: &Args, swarm: Option<&SwarmConfig>) -> B
             Box::new(FtsResultComparisonProperty),
             Box::new(SnapshotStabilityProperty::new()),
             Box::new(RolledBackInsertsNotVisible::new()),
+            Box::new(ScanConsistencyProperty),
         ];
 
         let mut extra_schema = fts_sim_schema();
         extra_schema.extend(upsert_sim_schema());
+        extra_schema.extend(scan_sim_schema());
         (w, p, extra_schema, vec![])
     }
 }

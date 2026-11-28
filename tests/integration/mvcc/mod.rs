@@ -3,6 +3,7 @@ mod concurrent_inserts;
 // The cursor work counters exist in debug builds only.
 #[cfg(debug_assertions)]
 mod cost_scaling;
+mod cursor_yield_sweep;
 mod database;
 mod group_commit;
 mod hermitage;

@@ -1009,6 +1009,109 @@ impl Workload for UpsertRowidWorkload {
     }
 }
 
+pub const SCAN_SIM_TABLE: &str = "scan_sim";
+pub const SCAN_SIM_INDEX: &str = "scan_sim_k";
+
+/// A row of `SCAN_SIM_TABLE` with ID `id` has `u = id + SCAN_SIM_UNIQUE_OFFSET`. So the
+/// UNIQUE index on `u` names one row for each ID, and an INSERT OR REPLACE never deletes a
+/// row with a different ID through it.
+pub const SCAN_SIM_UNIQUE_OFFSET: i64 = 1_000_000;
+
+/// A small range of IDs and keys makes connections change the same rows and index entries.
+const SCAN_SIM_MAX_ID: i64 = 300;
+const SCAN_SIM_MAX_KEY: i64 = 40;
+
+pub fn scan_sim_schema() -> Vec<(String, String)> {
+    vec![
+        (
+            SCAN_SIM_TABLE.to_string(),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {SCAN_SIM_TABLE} \
+                 (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, u INTEGER UNIQUE)"
+            ),
+        ),
+        (
+            SCAN_SIM_INDEX.to_string(),
+            format!("CREATE INDEX IF NOT EXISTS {SCAN_SIM_INDEX} ON {SCAN_SIM_TABLE}(k)"),
+        ),
+    ]
+}
+
+fn scan_sim_key_range(rng: &mut ChaCha8Rng) -> (i64, i64) {
+    let lo = rng.random_range(-1..SCAN_SIM_MAX_KEY);
+    let hi = lo + rng.random_range(0..=SCAN_SIM_MAX_KEY / 2);
+    (lo, hi)
+}
+
+/// Write rows of `SCAN_SIM_TABLE`. Some writes read the table or its index in the same
+/// statement: an UPDATE that changes the index key that it scans, an UPDATE with a
+/// subquery that reads the rows that the statement writes, and a DELETE of a key range.
+pub struct ScanSimWriteWorkload;
+
+impl Workload for ScanSimWriteWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let (lo, hi) = scan_sim_key_range(rng);
+        let operation = match rng.random_range(0..10) {
+            0..=4 => {
+                let id = rng.random_range(0..SCAN_SIM_MAX_ID);
+                let k = if rng.random_bool(0.05) {
+                    "NULL".to_string()
+                } else {
+                    rng.random_range(0..SCAN_SIM_MAX_KEY).to_string()
+                };
+                let v = rng.random_range(0..1000);
+                let u = id + SCAN_SIM_UNIQUE_OFFSET;
+                Operation::Execute {
+                    sql: format!(
+                        "INSERT OR REPLACE INTO {SCAN_SIM_TABLE} VALUES ({id}, {k}, {v}, {u})"
+                    ),
+                }
+            }
+            5..=6 => {
+                let delta = *[-3, -1, 1, 2].choose(rng).expect("deltas are not empty");
+                Operation::WriteScanSim {
+                    sql: format!(
+                        "UPDATE {SCAN_SIM_TABLE} SET k = k + {delta} \
+                         WHERE k BETWEEN {lo} AND {hi} RETURNING id"
+                    ),
+                }
+            }
+            7..=8 => {
+                let first = rng.random_range(0..SCAN_SIM_MAX_ID);
+                let last = first + rng.random_range(0..SCAN_SIM_MAX_ID / 4);
+                Operation::WriteScanSim {
+                    sql: format!(
+                        "UPDATE {SCAN_SIM_TABLE} SET v = \
+                         (SELECT count(*) FROM {SCAN_SIM_TABLE} AS b WHERE b.k = {SCAN_SIM_TABLE}.k) \
+                         WHERE id BETWEEN {first} AND {last} RETURNING id"
+                    ),
+                }
+            }
+            _ => Operation::WriteScanSim {
+                sql: format!(
+                    "DELETE FROM {SCAN_SIM_TABLE} WHERE k BETWEEN {lo} AND {lo} + 1 RETURNING id"
+                ),
+            },
+        };
+        Some(operation)
+    }
+}
+
+/// Compare the rows of `SCAN_SIM_TABLE` that several access paths return, using
+/// [`Operation::CompareScans`].
+pub struct ScanSimCompareWorkload;
+
+impl Workload for ScanSimCompareWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let (lo, hi) = scan_sim_key_range(rng);
+        Some(Operation::CompareScans { lo, hi })
+    }
+
+    fn checks_results(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
