@@ -1,5 +1,4 @@
 use crate::sync::Arc;
-use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::iter;
 
@@ -16,9 +15,8 @@ use crate::translate::expr::{
 };
 use crate::translate::expr_context::ExprContext;
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, ordered_ephemeral_key_columns, partial_index,
-    partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
-    RangeConstraintRef,
+    automatic_index_key, convert_to_vtab_constraint, partial_index, partial_index_predicate_terms,
+    BinaryExprSide, Constraint, ConstraintOperator, RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -38,9 +36,7 @@ use crate::{
 };
 
 use super::{
-    constraints::{
-        usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
-    },
+    constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost::{
         estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
         estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, estimate_sort_cpu_cost,
@@ -836,7 +832,8 @@ pub fn find_best_access_method_for_join_order<'a>(
             rhs_table,
             subquery,
             rhs_constraints,
-            join_order,
+            lhs_mask,
+            join_order.last().unwrap().original_idx,
             planning_context,
             ready_where,
             schema,
@@ -850,12 +847,12 @@ pub fn find_best_access_method_for_join_order<'a>(
                 &[],
                 &[],
                 input_cardinality,
-                RowCountEstimate::HardcodedFallback(1.0),
+                base_row_count,
                 false,
                 params,
                 None,
             ),
-            estimated_rows_per_outer_row: 1.0,
+            estimated_rows_per_outer_row: *base_row_count,
             consumed_where_terms: Default::default(),
             params: AccessMethodParams::RecursiveCteInput,
         })),
@@ -993,7 +990,7 @@ fn find_best_access_method_for_btree<'a>(
         && !keeps_right_rows
         && allow_automatic_index
     {
-        let constraint_refs = usable_constraints_for_lhs_mask(
+        let (_, constraint_refs) = automatic_index_key(
             &rhs_constraints.constraints,
             &rhs_constraints.temporary_index_terms,
             lhs_mask,
@@ -1866,7 +1863,8 @@ fn find_best_access_method_for_subquery(
     rhs_table: &JoinedTable,
     subquery: &FromClauseSubquery,
     rhs_constraints: &TableConstraints,
-    join_order: &[JoinOrderMember],
+    lhs_mask: &TableMask,
+    rhs_table_idx: usize,
     planning_context: JoinPlanningContext<'_>,
     ready_where: &[(usize, usize)],
     schema: &Schema,
@@ -1874,7 +1872,6 @@ fn find_best_access_method_for_subquery(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
-    use super::constraints::ConstraintRef;
     let maybe_order_target = planning_context.maybe_order_target;
 
     let coroutine_scan_cost = estimate_cost_for_scan_or_seek(
@@ -2012,8 +2009,14 @@ fn find_best_access_method_for_subquery(
         }));
     }
 
-    let usable_constraints: Vec<&Constraint> = usable.iter().map(|(_, c)| *c).collect();
-    let key_col_positions = ordered_ephemeral_key_columns(&usable_constraints);
+    let usable_terms: SmallVec<[usize; 4]> =
+        usable.iter().map(|(term_index, _)| *term_index).collect();
+    let (key_col_positions, usable_constraint_refs) = automatic_index_key(
+        &rhs_constraints.constraints,
+        &usable_terms,
+        lhs_mask,
+        rhs_table_idx,
+    );
     if key_col_positions.is_empty() {
         return Ok(Some(AccessMethod {
             cost: scan_cost,
@@ -2024,38 +2027,6 @@ fn find_best_access_method_for_subquery(
             },
         }));
     }
-
-    let key_col_pos_to_index_pos: HashMap<usize, usize> = key_col_positions
-        .iter()
-        .enumerate()
-        .map(|(index_col_pos, table_col_pos)| (*table_col_pos, index_col_pos))
-        .collect();
-
-    // Map each usable constraint to a ConstraintRef
-    let mut temp_constraint_refs: Vec<ConstraintRef> = usable
-        .iter()
-        .map(|(orig_idx, c)| {
-            let table_col_pos = c.table_col_pos.expect("table_col_pos was Some above");
-            let index_col_pos = *key_col_pos_to_index_pos
-                .get(&table_col_pos)
-                .expect("table_col_pos must exist in key_col_positions");
-            ConstraintRef {
-                constraint_vec_pos: *orig_idx,
-                index_col_pos,
-                sort_order: SortOrder::Asc,
-                nulls_order: ast::NullsOrder::First,
-            }
-        })
-        .collect();
-
-    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
-
-    // Filter to only constraints that can be used given the current join order
-    let usable_constraint_refs = usable_constraints_for_join_order(
-        &rhs_constraints.constraints,
-        &temp_constraint_refs,
-        join_order,
-    )?;
 
     let has_search_constraints = !usable_constraint_refs.is_empty();
     if !has_search_constraints {
@@ -2140,7 +2111,7 @@ fn find_best_access_method_for_subquery(
         )?,
         params: AccessMethodParams::MaterializedSubquery {
             index: ephemeral_index,
-            constraint_refs: usable_constraint_refs,
+            constraint_refs: usable_constraint_refs.into_vec(),
             iter_dir,
         },
     };

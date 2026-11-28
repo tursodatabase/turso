@@ -3557,12 +3557,14 @@ fn apply_table_access_plan(
                     turso_assert!(index.is_none(), "a new temporary index must not exist yet");
                     let prior_tables: TableMask =
                         best_table_numbers.iter().take(i).copied().try_collect()?;
-                    *constraint_refs = constraints::usable_constraints_for_lhs_mask(
-                        &constraints_per_table[table_idx].constraints,
-                        &constraints_per_table[table_idx].temporary_index_terms,
+                    let table_constraints = &constraints_per_table[table_idx];
+                    *constraint_refs = constraints::automatic_index_key(
+                        &table_constraints.constraints,
+                        &table_constraints.temporary_index_terms,
                         &prior_tables,
                         table_idx,
                     )
+                    .1
                     .into_vec();
                     turso_assert!(
                         !constraint_refs.is_empty(),

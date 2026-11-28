@@ -1,0 +1,25 @@
+---
+source: recursive-cte.sqltest
+expression: |-
+  WITH RECURSIVE under(n) AS (
+          VALUES('n1')
+          UNION ALL
+          SELECT org.name FROM org JOIN under ON org.boss = under.n
+      )
+      SELECT count(*) FROM under;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - org
+  - org.boss
+  - under
+  setup_blocks:
+  - org-tree
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN under
+   |--SETUP
+   `--RECURSIVE STEP
+      |--SCAN under
+      `--SEARCH org USING COVERING INDEX ephemeral_org_t2 (boss=?)
