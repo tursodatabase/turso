@@ -490,3 +490,167 @@ fn assert_pulls_keep_values(create_table: &str, transaction: &[&str]) -> Result<
     }
     Ok(())
 }
+
+/// `tag` is a generated column that uses another generated column,
+/// `surname_norm`.
+const MUGGLES_IN_LONDON: &[&str] = &[
+    r#"CREATE TABLE "muggles-in-london" (
+        id TEXT PRIMARY KEY,
+        surname TEXT,
+        surname_norm TEXT AS (CAST (surname AS TEXT)),
+        tag TEXT AS (LOWER (surname_norm))
+    )"#,
+    r#"INSERT INTO "muggles-in-london" (id, surname) VALUES ('a', 'Smith')"#,
+];
+
+/// Changes the expression of `surname_norm`. `tag` uses `surname_norm`, so
+/// `tag` is dropped first and added again at the end with the same
+/// expression.
+const REDEFINE_SURNAME_NORM: &[&str] = &[
+    r#"ALTER TABLE "muggles-in-london" DROP COLUMN tag"#,
+    r#"ALTER TABLE "muggles-in-london" DROP COLUMN surname_norm"#,
+    r#"ALTER TABLE "muggles-in-london" ADD COLUMN surname_norm TEXT AS (UPPER (surname))"#,
+    r#"ALTER TABLE "muggles-in-london" ADD COLUMN tag TEXT AS (LOWER (surname_norm))"#,
+];
+
+#[test]
+fn redefine_generated_column_used_by_another_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(MUGGLES_IN_LONDON)?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(REDEFINE_SURNAME_NORM)?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+/// `house` has two generated columns, `house_key` and `house_len`. `motto` is
+/// a generated column that uses `house_key`.
+const MUGGLES_WITH_HOUSE: &[&str] = &[
+    r#"CREATE TABLE "muggles-in-london" (
+        id TEXT PRIMARY KEY,
+        house TEXT,
+        house_key TEXT AS (lower(house)),
+        house_len INT AS (length(house)),
+        wand TEXT,
+        wand_key TEXT AS (lower(wand)),
+        motto TEXT AS (house_key || '!')
+    )"#,
+    r#"INSERT INTO "muggles-in-london" (id, house, wand) VALUES ('a', 'Gryffindor', 'Holly')"#,
+];
+
+/// Drops `house` and its generated columns. `motto` uses `house_key`, so
+/// `motto` is dropped first. Then `motto` is added again at the end with an
+/// expression that uses `wand_key`.
+const DROP_HOUSE_AND_REDEFINE_MOTTO: &[&str] = &[
+    r#"ALTER TABLE "muggles-in-london" DROP COLUMN motto"#,
+    r#"ALTER TABLE "muggles-in-london" DROP COLUMN house_key"#,
+    r#"ALTER TABLE "muggles-in-london" DROP COLUMN house_len"#,
+    r#"ALTER TABLE "muggles-in-london" DROP COLUMN house"#,
+    r#"ALTER TABLE "muggles-in-london" ADD COLUMN motto TEXT AS (wand_key || '!')"#,
+];
+
+#[test]
+fn drop_column_with_generated_columns_and_redefine_their_user_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(MUGGLES_WITH_HOUSE)?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(DROP_HOUSE_AND_REDEFINE_MOTTO)?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+
+    // A pull matches the values of a remote row to the columns by position.
+    // This insert shows that the replica kept the column order of the server.
+    remote.execute_transaction(&[
+        r#"INSERT INTO "muggles-in-london" (id, wand) VALUES ('b', 'Elder')"#,
+    ])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+/// Changes the expression of `house_key`. `motto` uses `house_key`, and
+/// `motto_len` uses `motto`, so the remote drops both first and adds them
+/// again at the end with the same expressions.
+#[test]
+fn redefine_generated_column_used_through_another_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(&[
+        r#"CREATE TABLE "muggles-in-london" (
+            id TEXT PRIMARY KEY,
+            house TEXT,
+            house_key TEXT AS (lower(house)),
+            motto TEXT AS (house_key || '!'),
+            motto_len INT AS (length(motto))
+        )"#,
+        r#"INSERT INTO "muggles-in-london" (id, house) VALUES ('a', 'Gryffindor')"#,
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        r#"ALTER TABLE "muggles-in-london" DROP COLUMN motto_len"#,
+        r#"ALTER TABLE "muggles-in-london" DROP COLUMN motto"#,
+        r#"ALTER TABLE "muggles-in-london" DROP COLUMN house_key"#,
+        r#"ALTER TABLE "muggles-in-london" ADD COLUMN house_key TEXT AS (upper(house))"#,
+        r#"ALTER TABLE "muggles-in-london" ADD COLUMN motto TEXT AS (house_key || '!')"#,
+        r#"ALTER TABLE "muggles-in-london" ADD COLUMN motto_len INT AS (length(motto))"#,
+    ])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+/// The remote drops a column and the generated column that uses it. The
+/// generated column comes before that column in the table, so the replica
+/// must drop the columns in another order than from the last to the first.
+#[test]
+fn drop_column_and_generated_column_declared_before_it() -> Result<()> {
+    let remote = Remote::new(&[
+        r#"CREATE TABLE "muggles-in-london" (
+            id TEXT PRIMARY KEY,
+            house_key TEXT AS (lower(house)),
+            house TEXT,
+            wand TEXT
+        )"#,
+        r#"INSERT INTO "muggles-in-london" (id, house, wand) VALUES ('a', 'Gryffindor', 'Holly')"#,
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        r#"ALTER TABLE "muggles-in-london" DROP COLUMN house_key"#,
+        r#"ALTER TABLE "muggles-in-london" DROP COLUMN house"#,
+    ])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+/// The remote drops a generated column and one of the columns that it uses.
+/// It renames the other column, and it adds the generated column again on the
+/// renamed column.
+#[test]
+fn drop_and_rename_columns_of_generated_column_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(&[
+        r#"CREATE TABLE "muggles-in-london" (
+            id TEXT PRIMARY KEY,
+            house TEXT,
+            wand TEXT,
+            motto TEXT AS (house || wand)
+        )"#,
+        r#"INSERT INTO "muggles-in-london" (id, house, wand) VALUES ('a', 'Gryffindor', 'Holly')"#,
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&[
+        r#"ALTER TABLE "muggles-in-london" DROP COLUMN motto"#,
+        r#"ALTER TABLE "muggles-in-london" DROP COLUMN house"#,
+        r#"ALTER TABLE "muggles-in-london" RENAME COLUMN wand TO wand_wood"#,
+        r#"ALTER TABLE "muggles-in-london" ADD COLUMN motto TEXT AS (upper(wand_wood))"#,
+    ])?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
