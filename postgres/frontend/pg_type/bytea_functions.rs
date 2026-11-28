@@ -6,11 +6,12 @@ use super::IntegerType;
 use crate::error::sqlstate_error;
 use crate::functions::{like_matches, pg_scalar_function, Boolean};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarReturn};
+use turso_core::types::{value_blob_from_slice, ValueBlob};
 use turso_core::{OpenOptions, Register, Result, Value};
 use turso_pg_parser::sqlstate::{SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE};
 
 /// A bytea value. Returning one gives the function the type `bytea`.
-pub(crate) struct Bytea(pub(crate) Vec<u8>);
+pub(crate) struct Bytea(pub(crate) ValueBlob);
 
 impl ScalarReturn for Bytea {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("bytea"));
@@ -26,7 +27,11 @@ pub(crate) fn register_bytea_functions(options: OpenOptions) -> OpenOptions {
             "byteacat",
             FunctionArity::Exact(2),
             true,
-            |_, args| Ok(byteas(args)?.map(|(left, right)| Bytea(byteacat(left, right)))),
+            |_, args| {
+                byteas(args)?
+                    .map(|(left, right)| Ok(Bytea(value_blob_from_slice(&byteacat(left, right))?)))
+                    .transpose()
+            },
         ))
         .extension_function(pg_scalar_function(
             "bytealike",
@@ -79,10 +84,10 @@ pub(crate) fn bytealike(text: &[u8], pattern: &[u8]) -> Result<bool> {
 
 /// PostgreSQL's cast from an integer of type `from` to bytea (`int2_bytea`,
 /// `int4_bytea` and `int8_bytea`): its bytes, most significant first.
-pub(crate) fn int_to_bytea(value: i64, from: IntegerType) -> Value {
+pub(crate) fn int_to_bytea(value: i64, from: IntegerType) -> Result<Value> {
     let bytes = value.to_be_bytes();
     let width = usize::from(from.digits());
-    Value::from_blob(bytes[bytes.len() - width..].to_vec())
+    Ok(Value::from_slice(&bytes[bytes.len() - width..])?)
 }
 
 /// PostgreSQL's cast from bytea to an integer of type `target` (`bytea_int2`,
@@ -180,12 +185,13 @@ mod tests {
 
     #[test]
     fn an_integer_casts_to_its_bytes() {
-        assert_eq!(int_to_bytea(1, Int2), Value::from_blob(vec![0, 1]));
-        assert_eq!(int_to_bytea(-1, Int2), Value::from_blob(vec![0xff, 0xff]));
-        assert_eq!(int_to_bytea(258, Int4), Value::from_blob(vec![0, 0, 1, 2]));
+        let bytes = |bytes: &[u8]| Value::from_slice(bytes).unwrap();
+        assert_eq!(int_to_bytea(1, Int2).unwrap(), bytes(&[0, 1]));
+        assert_eq!(int_to_bytea(-1, Int2).unwrap(), bytes(&[0xff, 0xff]));
+        assert_eq!(int_to_bytea(258, Int4).unwrap(), bytes(&[0, 0, 1, 2]));
         assert_eq!(
-            int_to_bytea(-2, Int8),
-            Value::from_blob(vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe])
+            int_to_bytea(-2, Int8).unwrap(),
+            bytes(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe])
         );
     }
 

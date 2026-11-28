@@ -328,7 +328,7 @@ fn from_bytea(value: &Value, target: IntegerType) -> Result<Value> {
 
 fn to_bytea(value: &Value, source: IntegerType) -> Result<Value> {
     match value {
-        Value::Numeric(Numeric::Integer(number)) => Ok(int_to_bytea(*number, source)),
+        Value::Numeric(Numeric::Integer(number)) => int_to_bytea(*number, source),
         other => Ok(other.clone()),
     }
 }
