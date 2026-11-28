@@ -177,6 +177,9 @@ fn first_marked_byte<const QUOTE_AND_BACKSLASH: bool, const BOUNDED: bool>(
     table: &[bool; 256],
 ) -> usize {
     debug_assert!(limit <= rest.len());
+    // The bytes after the SSE2 steps, and all bytes on other targets, are
+    // tested only with `table`, so it must mark the bytes the SSE2 steps test.
+    debug_assert!(!QUOTE_AND_BACKSLASH || (table[quote as usize] && table[b'\\' as usize]));
     #[cfg(target_arch = "x86_64")]
     let start = {
         use std::arch::x86_64::{
