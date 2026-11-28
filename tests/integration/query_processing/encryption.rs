@@ -2694,6 +2694,33 @@ fn cached_open_with_different_io_uses_only_the_verifier() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// A connect to a cached encrypted database must read the database header
+/// before its pager takes the WAL read lock for page 1, as a connect to a
+/// plaintext database does. A host can suspend the connect in its first read.
+/// When the connect holds no WAL read lock there, a checkpoint that runs during
+/// the suspension does not find a reader.
+#[test]
+fn cached_encrypted_connect_reads_the_header_before_the_page_1_read_lock() -> anyhow::Result<()> {
+    let database = ReadLockDatabase::new("header-before-read-lock")?;
+    let opts = ConnectOpts::new(turso_core::SessionRole::Superuser)
+        .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?));
+    let mut state = turso_core::ConnectAsyncState::new();
+    let IOResult::IO(mut pending) = database.db.connect_async(opts.clone(), &mut state)? else {
+        panic!("a connect to a cached encrypted database must wait for a read");
+    };
+    database.assert_truncate_checkpoint_succeeds("while a connect waits for its first read");
+    let reader = loop {
+        pending.wait(database.io.as_ref())?;
+        match database.db.connect_async(opts.clone(), &mut state)? {
+            IOResult::Done(reader) => break reader,
+            IOResult::IO(next) => pending = next,
+        }
+    };
+    let rows: Vec<(String,)> = reader.exec_rows("SELECT value FROM secrets");
+    assert_eq!(rows, [("protected value".into(),)]);
+    Ok(())
+}
+
 #[test]
 fn connect_async_yields_and_cancellation_releases_read_transactions() -> anyhow::Result<()> {
     for wrong in [false, true] {
