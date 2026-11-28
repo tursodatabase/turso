@@ -1,0 +1,15 @@
+@database :memory:
+
+test excluded-named-rowid-alias-and-non-alias {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE, n INT DEFAULT 0);
+    INSERT INTO t VALUES (1, 'a', 0), (2, 'b', 0);
+    INSERT INTO t VALUES (3, 'b', 0) ON CONFLICT(v)
+        DO UPDATE SET n=excluded.id WHERE excluded.id=3;
+    SELECT n FROM t WHERE id=2;
+    INSERT INTO t(id,v,n) VALUES (4, 'b', 77) ON CONFLICT(v) DO UPDATE SET n=excluded.n;
+    SELECT n FROM t WHERE id=2;
+}
+expect {
+    3
+    77
+}

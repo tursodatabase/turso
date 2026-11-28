@@ -1,0 +1,58 @@
+@database :memory:
+
+test excluded-rowid-alias-set-and-where {
+    CREATE TABLE t (id int PRIMARY KEY, v text UNIQUE, n int DEFAULT 0);
+    INSERT INTO t VALUES (1, 'a', 0), (2, 'b', 0);
+    INSERT INTO t VALUES (3, 'b', 0) ON CONFLICT (v)
+        DO UPDATE SET n = excluded.id WHERE excluded.id = 3;
+    SELECT id, v, n FROM t ORDER BY id;
+}
+expect {
+    1|a|0
+    2|b|3
+}
+
+test excluded-rowid-alias-set {
+    CREATE TABLE t (id int PRIMARY KEY, v text UNIQUE, n int DEFAULT 0);
+    INSERT INTO t VALUES (1, 'a', 0), (2, 'b', 0);
+    INSERT INTO t VALUES (3, 'b', 0) ON CONFLICT (v) DO UPDATE SET n = excluded.id;
+    SELECT id, v, n FROM t ORDER BY id;
+}
+expect {
+    1|a|0
+    2|b|3
+}
+
+test excluded-non-alias-control {
+    CREATE TABLE t (id int PRIMARY KEY, v text UNIQUE, n int DEFAULT 0);
+    INSERT INTO t VALUES (1, 'a', 0);
+    INSERT INTO t VALUES (2, 'a', 7) ON CONFLICT (v)
+        DO UPDATE SET n = excluded.n;
+    SELECT id, v, n FROM t;
+}
+expect {
+    1|a|7
+}
+
+test excluded-non-alias-numeric-control {
+    CREATE TABLE t (id int PRIMARY KEY, v text UNIQUE, n numeric(10,2));
+    INSERT INTO t VALUES (1, 'a', 1.25);
+    INSERT INTO t VALUES (2, 'a', 2.75) ON CONFLICT (v) DO UPDATE SET n=excluded.n;
+    SELECT id, n FROM t;
+}
+expect {
+    1|2.75
+}
+
+test excluded-generated-and-explicit-rowid {
+    CREATE TABLE t (id serial PRIMARY KEY, v text UNIQUE, n int DEFAULT 0);
+    INSERT INTO t(v) VALUES ('a');
+    INSERT INTO t(v) VALUES ('a') ON CONFLICT (v) DO UPDATE SET n=excluded.id;
+    SELECT id, v, n FROM t;
+    INSERT INTO t(id,v) VALUES (20,'a') ON CONFLICT (v) DO UPDATE SET n=excluded.id;
+    SELECT id, v, n FROM t;
+}
+expect {
+    1|a|2
+    1|a|20
+}
