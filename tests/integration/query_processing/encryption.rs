@@ -2531,6 +2531,41 @@ fn test_missing_key_refusals_leave_no_read_lock() -> anyhow::Result<()> {
     Ok(())
 }
 
+// A connection to an encrypted database whose page size is already known checks
+// its key without IO, then takes the WAL read lock to read page 1. A host that
+// runs other work while a connection waits for IO (turso-server runs a TRUNCATE
+// checkpoint there) must not find that lock held during the connection's first
+// wait, which is how connections to unencrypted databases behave.
+#[test]
+fn test_cached_encrypted_connection_first_wait_holds_no_read_lock() -> anyhow::Result<()> {
+    for mvcc in [false, true] {
+        let database = ReadLockDatabase::new(&format!("cached-connection-first-wait-{mvcc}"))?;
+        if mvcc {
+            database.owner.execute("PRAGMA journal_mode = 'mvcc'")?;
+        }
+        database.assert_truncate_checkpoint_succeeds("before the connection");
+        let opts = ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?));
+        let mut state = turso_core::ConnectAsyncState::new();
+        let IOResult::IO(pending) = database.db.connect_async(opts.clone(), &mut state)? else {
+            panic!("the connection must wait for a read");
+        };
+        database.assert_truncate_checkpoint_succeeds(&format!(
+            "while the connection waited for its first read (mvcc={mvcc})"
+        ));
+        pending.wait(database.io.as_ref())?;
+        let connection = loop {
+            match database.db.connect_async(opts.clone(), &mut state)? {
+                IOResult::Done(connection) => break connection,
+                IOResult::IO(pending) => pending.wait(database.io.as_ref())?,
+            }
+        };
+        let rows: Vec<(String,)> = connection.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("protected value".into(),)]);
+    }
+    Ok(())
+}
+
 /// An encrypted WAL database (AEGIS-256, KEY_A) with one row, kept open
 /// through a valid connection.
 struct ReadLockDatabase {
@@ -2581,14 +2616,15 @@ impl ReadLockDatabase {
     }
 
     /// No other connection may hold a read lock: the checkpoint must not be
-    /// busy and must leave an empty WAL.
+    /// busy and must leave an empty WAL. An MVCC checkpoint reports a held
+    /// lock as an error instead of a busy row.
     fn assert_truncate_checkpoint_succeeds(&self, when: &str) {
         let rows = self
             .owner
             .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap()
             .run_collect_rows()
-            .unwrap();
+            .unwrap_or_else(|err| panic!("TRUNCATE checkpoint failed {when}: {err:?}"));
         let busy = rows[0][0].to_string();
         assert_eq!(busy, "0", "TRUNCATE checkpoint was busy {when}: {rows:?}");
         let wal = self

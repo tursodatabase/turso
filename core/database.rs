@@ -3726,7 +3726,21 @@ impl Database {
                         if let Some(page_size) =
                             self.pager_state.page_size().filter(|_| use_cached_header)
                         {
+                            // A wrong key fails here, before any IO. The check has no side
+                            // effects, so it runs again harmlessly when the header read below
+                            // yields and this function is called again.
                             let mut context = self.pager_state.verify_encryption_key(key)?;
+                            // The key check needs no IO, but read the header anyway, as an
+                            // unencrypted connect does and as every connect did before the
+                            // cached check existed. `_init_nonblock` takes the WAL read lock for
+                            // page 1 right after this returns. Without this read, the connect's
+                            // first IO wait happens while it holds that lock, so an embedder
+                            // that runs other work during IO waits, such as a TRUNCATE
+                            // checkpoint, finds a reader on the WAL far more often. The header
+                            // bytes are not used.
+                            if self.initialized() {
+                                let _ = return_if_io!(self.read_db_header_buf(hdr_st));
+                            }
                             context.set_page_size(page_size);
                             let mut io_ctx = IOContext::default();
                             io_ctx.set_encryption(context);
