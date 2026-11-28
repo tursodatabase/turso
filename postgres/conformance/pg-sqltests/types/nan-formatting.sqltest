@@ -1,0 +1,62 @@
+@database :memory:
+
+test nan-float-text-casts {
+    SELECT ('Infinity'::float8 - 'Infinity'::float8)::text,
+           ('Infinity'::float8 - 'Infinity'::float8)::varchar,
+           lpad(('Infinity'::float8 - 'Infinity'::float8)::text, 5, 'x');
+}
+expect {
+    NaN|NaN|xxNaN
+}
+
+test nan-float-json-array {
+    SELECT array_to_json(ARRAY['Infinity'::float8 - 'Infinity'::float8]);
+}
+expect {
+    ["NaN"]
+}
+
+test stored-nan-float-text-casts {
+    CREATE TABLE t(x REAL);
+    INSERT INTO t VALUES ('Infinity'::float8 - 'Infinity'::float8);
+    SELECT x::text, x::varchar, array_to_json(ARRAY[x]) FROM t;
+    SELECT string_agg(x::text, ',') FROM t;
+}
+expect {
+    NaN|NaN|["NaN"]
+    NaN
+}
+
+test cast-nan-to-float8 {
+    SELECT 'NaN'::float8;
+}
+expect {
+    NaN
+}
+
+test cast-nan-text-to-float8 {
+    SELECT 'NaN'::text::float8;
+}
+expect {
+    NaN
+}
+
+test cast-nan-to-float4 {
+    SELECT 'nan'::real;
+}
+expect {
+    NaN
+}
+
+test cast-a-nan-float8-to-real {
+    SELECT ('Infinity'::float8 - 'Infinity'::float8)::real::text;
+}
+expect {
+    NaN
+}
+
+test cast-a-nan-float8-to-integer {
+    SELECT ('Infinity'::float8 - 'Infinity'::float8)::int4;
+}
+@sqlstate 22003
+expect error {}

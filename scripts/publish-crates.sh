@@ -6,6 +6,7 @@ cargo publish -p turso_ast
 cargo publish -p turso_parser
 cargo publish -p turso_pg_parser
 cargo publish -p turso_core
+cargo publish -p turso_dialect_definitions
 cargo publish -p turso_sqlite
 cargo publish -p turso_sdk_kit_macros
 cargo publish -p turso_sdk_kit

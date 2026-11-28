@@ -26,6 +26,15 @@ SELECT typeof('hello');    -- 'text'
 SELECT typeof(x'CAFE');    -- 'blob'
 ```
 
+A floating-point NaN is `NULL`. This applies to results
+from arithmetic, functions, and extensions, and to NaN bits in a database REAL
+field. Table reads and index lookups use the same rule. Positive and negative
+infinity remain REAL values.
+
+Turso reserves one NaN bit pattern, `0x7ff800545552534f`, and never writes it
+to a REAL field. If a REAL field holds these bits, a read of the field fails
+with a database corruption error.
+
 ## Type Affinity
 
 When a column is declared with a type name, Turso assigns a **type affinity** to that column. Type affinity is a recommendation for how to store values, not a strict constraint (unless using STRICT tables). Turso uses the same affinity rules as SQLite.

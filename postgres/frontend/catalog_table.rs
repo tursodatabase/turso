@@ -35,11 +35,11 @@ use turso_core::{
     Completion, Connection, IOResult, LimboError, NamespaceId, Numeric, OpenOptions, Result,
     Statement, StepResult, Value,
 };
+use turso_dialect_definitions::SqliteDialect;
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
 use turso_pg_catalog::{BuiltinRows, CatalogTable, PgDescription};
-use turso_sqlite::SqliteDialect;
 
 /// Each catalog that the frontend serves from its built-in rows and its
 /// stored table.

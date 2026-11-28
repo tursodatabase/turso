@@ -2007,22 +2007,14 @@ mod tests {
 
     #[test]
     fn test_nan_handling() {
-        // Value::from_f64(NaN) returns Value::Null (NonNan rejects NaN),
-        // so NaN is treated as NULL which coerces to 0.0 for float formats.
-        // The NaN-specific formatting code (NaN/null output) is defense-in-depth
-        // that can't be triggered through the Value system.
-        assert_eq!(
-            exec_printf(&[text("%f"), float(f64::NAN)]).unwrap(),
-            *text("0.000000").get_value()
-        );
-        assert_eq!(
-            exec_printf(&[text("%e"), float(f64::NAN)]).unwrap(),
-            *text("0.000000e+00").get_value()
-        );
-        assert_eq!(
-            exec_printf(&[text("%g"), float(f64::NAN)]).unwrap(),
-            *text("0").get_value()
-        );
+        // The formatter handles a raw numeric NaN. SQLite normalizes SQL inputs
+        // before this function runs; float-special-values.sqltest checks that.
+        for format in ["%f", "%e", "%g"] {
+            assert_eq!(
+                exec_printf(&[text(format), float(f64::NAN)]).unwrap(),
+                *text("NaN").get_value()
+            );
+        }
     }
 
     #[test]
