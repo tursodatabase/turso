@@ -688,6 +688,17 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(OperatorChoice::LeftToTheEngine)
     }
 
+    /// Called when a string literal that nothing read is compared with a value
+    /// of a registered type that is stored as a blob and converts no operand.
+    /// The engine compares the literal as written, which is text, and a blob
+    /// is never equal to text, so the comparison is false for every row. A
+    /// dialect may refuse it. A string literal in a statement is read by
+    /// [Dialect::choose_operator] before this, so this is reached only for an
+    /// expression that is compiled without that step.
+    fn check_string_literal_comparison(&self, _type_name: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Chooses the `=` of `x IN (a, b, ...)` for the values that read no
     /// column, when the dialect picks one type for `x` and all of them at
     /// once. `operands` gives the types of `x` and then of each value, and is

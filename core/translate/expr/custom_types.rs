@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::ResolvedType;
+use crate::schema::{ResolvedType, TypeDefKind};
 use crate::types::{Conversion, StorageClass, StrictType};
 
 /// FIXME(pg-catalog): This types literals by the rules of SQLite: TRUE and FALSE are integer and 1.5 is real, where PostgreSQL types them boolean and numeric. The type decides whether an operator of a custom type encodes the literal to that type. A typed expression tree that gives literals the types of the dialect replaces this.
@@ -423,9 +423,45 @@ pub(crate) fn untyped_operand_type(
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<Option<ResolvedType>> {
-    read_untyped_operand_as(operand, resolver.schema(), || {
-        Ok(type_of(other, &TypeEnv::new(referenced_tables, resolver)))
-    })
+    let mut other_type = None;
+    let resolved = read_untyped_operand_as(operand, resolver.schema(), || {
+        let ty = type_of(other, &TypeEnv::new(referenced_tables, resolver));
+        other_type = Some(ty.clone());
+        Ok(ty)
+    })?;
+    if let (None, Some(ExprType::Custom { type_def, .. })) = (&resolved, other_type) {
+        check_string_literal_against_blob_type(operand, &type_def, resolver)?;
+    }
+    Ok(resolved)
+}
+
+/// Asks the dialect whether a string literal may be compared as written with
+/// a value of `type_def`, when the type is stored as a blob: the comparison is
+/// false for every row. A parameter is not asked: one that has a declared type
+/// is bound as a value of that type, and the dialect guesses the type of one
+/// that has none.
+fn check_string_literal_against_blob_type(
+    operand: &ast::Expr,
+    type_def: &TypeDef,
+    resolver: &Resolver,
+) -> Result<()> {
+    let stored_as_blob = matches!(
+        &type_def.kind,
+        TypeDefKind::Custom { kinds: Some(kinds), .. } if kinds.stored == BuiltinType::Blob
+    );
+    if stored_as_blob
+        && type_def.ordering().is_none()
+        && matches!(
+            unwrap_parens(operand)?,
+            ast::Expr::Literal(ast::Literal::String(_))
+        )
+    {
+        resolver
+            .catalog
+            .dialect
+            .check_string_literal_comparison(&type_def.name)?;
+    }
+    Ok(())
 }
 
 /// The type a string literal or parameter compared with a value of
