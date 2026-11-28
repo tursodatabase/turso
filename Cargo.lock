@@ -6148,7 +6148,6 @@ dependencies = [
  "async-trait",
  "chumsky",
  "clap",
- "fake",
  "futures",
  "glob",
  "indicatif",
@@ -6160,7 +6159,6 @@ dependencies = [
  "pretty_assertions",
  "query-result-oracle",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
  "regex",
  "rusqlite",
  "serde",
@@ -6170,11 +6168,41 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
+ "turso_ast",
+ "turso_parser",
+ "turso_pg_client",
+]
+
+[[package]]
+name = "sqltest-pg"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "sqltest",
+ "tempfile",
+ "tokio",
+ "turso_core",
+ "turso_pg",
+]
+
+[[package]]
+name = "sqltest-sqlite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "fake",
+ "owo-colors 4.2.3",
+ "pretty_assertions",
+ "query-result-oracle",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "sqltest",
+ "tempfile",
+ "tokio",
  "turso",
  "turso_ast",
  "turso_parser",
- "turso_pg",
- "turso_pg_client",
 ]
 
 [[package]]
@@ -7478,14 +7506,11 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "turso",
- "turso-dbhash",
  "turso_core",
  "turso_ext",
  "turso_macros",
  "turso_pg",
  "turso_pg_catalog",
- "turso_sdk_kit",
  "twox-hash",
  "zerocopy",
 ]

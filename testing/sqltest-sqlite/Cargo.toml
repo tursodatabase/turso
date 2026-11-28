@@ -1,0 +1,34 @@
+[package]
+name = "sqltest-sqlite"
+version = "0.1.0"
+edition = "2024"
+description = "SQL test runner for the SQLite frontend of Turso"
+license = "MIT"
+repository = "https://github.com/tursodatabase/turso"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sqltest"
+path = "src/main.rs"
+
+[dependencies]
+sqltest = { path = "../sqltest" }
+anyhow = { workspace = true }
+async-trait = "0.1"
+fake = { version = "4.4", features = ["derive", "rand_core"] }
+owo-colors = "4.2.3"
+query-result-oracle = { path = "../query-result-oracle" }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+# `test_helper` exposes test-only SQL functions (e.g. test_nondet_counter)
+# that the sqltests use to observe planner behavior.
+turso = { workspace = true, features = ["test_helper"] }
+turso_ast = { workspace = true }
+turso_parser = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
