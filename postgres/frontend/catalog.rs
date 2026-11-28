@@ -1,5 +1,5 @@
 use crate::functions::validate_pg_input;
-use crate::pg_type::{built_in_type, BuiltInType, BUILT_IN_TYPES};
+use crate::pg_type::{built_in_type, type_modifier_input, BuiltInType, BUILT_IN_TYPES};
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
@@ -2134,7 +2134,7 @@ impl SnapshotRows for PgTypeTable {
                 Value::Null,                      // typoutput
                 Value::Null,                      // typreceive
                 Value::Null,                      // typsend
-                Value::Null,                      // typmodin
+                Value::build_text("-"),           // typmodin
                 Value::Null,                      // typmodout
                 Value::Null,                      // typanalyze
                 Value::build_text("i"),           // typalign
@@ -2180,38 +2180,38 @@ fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
     vec![
-        Value::from_i64(t.oid),                       // oid
-        Value::build_text(t.name.clone()),            // typname
-        Value::from_i64(11),                          // typnamespace (pg_catalog)
-        Value::from_i64(10),                          // typowner
-        Value::from_i64(t.typlen),                    // typlen
-        Value::from_i64(i64::from(t.typbyval)),       // typbyval
-        Value::build_text("b"),                       // typtype
-        Value::build_text(t.typcategory),             // typcategory
-        Value::from_i64(i64::from(t.typispreferred)), // typispreferred
-        Value::from_i64(1),                           // typisdefined
-        Value::build_text(t.typdelim),                // typdelim
-        Value::from_i64(0),                           // typrelid
-        Value::Null,                                  // typsubscript
-        Value::from_i64(t.typelem),                   // typelem
-        Value::from_i64(t.typarray),                  // typarray
-        Value::Null,                                  // typinput
-        Value::Null,                                  // typoutput
-        Value::Null,                                  // typreceive
-        Value::Null,                                  // typsend
-        Value::Null,                                  // typmodin
-        Value::Null,                                  // typmodout
-        Value::Null,                                  // typanalyze
-        Value::build_text(t.typalign),                // typalign
-        Value::build_text(t.typstorage),              // typstorage
-        Value::from_i64(0),                           // typnotnull
-        Value::from_i64(0),                           // typbasetype
-        Value::from_i64(-1),                          // typtypmod
-        Value::from_i64(0),                           // typndims
-        Value::from_i64(0),                           // typcollation
-        Value::Null,                                  // typdefaultbin
-        Value::Null,                                  // typdefault
-        Value::Null,                                  // typacl
+        Value::from_i64(t.oid),                                       // oid
+        Value::build_text(t.name.clone()),                            // typname
+        Value::from_i64(11),                                          // typnamespace (pg_catalog)
+        Value::from_i64(10),                                          // typowner
+        Value::from_i64(t.typlen),                                    // typlen
+        Value::from_i64(i64::from(t.typbyval)),                       // typbyval
+        Value::build_text("b"),                                       // typtype
+        Value::build_text(t.typcategory),                             // typcategory
+        Value::from_i64(i64::from(t.typispreferred)),                 // typispreferred
+        Value::from_i64(1),                                           // typisdefined
+        Value::build_text(t.typdelim),                                // typdelim
+        Value::from_i64(0),                                           // typrelid
+        Value::Null,                                                  // typsubscript
+        Value::from_i64(t.typelem),                                   // typelem
+        Value::from_i64(t.typarray),                                  // typarray
+        Value::Null,                                                  // typinput
+        Value::Null,                                                  // typoutput
+        Value::Null,                                                  // typreceive
+        Value::Null,                                                  // typsend
+        Value::build_text(type_modifier_input(t.oid).unwrap_or("-")), // typmodin
+        Value::Null,                                                  // typmodout
+        Value::Null,                                                  // typanalyze
+        Value::build_text(t.typalign),                                // typalign
+        Value::build_text(t.typstorage),                              // typstorage
+        Value::from_i64(0),                                           // typnotnull
+        Value::from_i64(0),                                           // typbasetype
+        Value::from_i64(-1),                                          // typtypmod
+        Value::from_i64(0),                                           // typndims
+        Value::from_i64(0),                                           // typcollation
+        Value::Null,                                                  // typdefaultbin
+        Value::Null,                                                  // typdefault
+        Value::Null,                                                  // typacl
     ]
 }
 

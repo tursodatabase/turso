@@ -460,6 +460,61 @@ expect {
     t|t|t|t|t|t|t|t|f
 }
 
+test pg-input-type-name-takes-a-modifier-where-the-type-has-typmodin {
+    SELECT pg_input_is_valid('1', 'numeric(3)'), pg_input_is_valid('1', 'varchar(3)'), pg_input_is_valid('1', 'bpchar(3)');
+}
+expect {
+    t|t|t
+}
+
+test pg-input-type-name-refuses-a-modifier-on-a-type-that-takes-none {
+    SELECT pg_input_is_valid('1', 'int4(3)');
+}
+@sqlstate 42601
+expect error {
+    type modifier is not allowed for type "int4"
+}
+
+test pg-input-type-name-refuses-a-modifier-on-text {
+    SELECT pg_input_is_valid('x', 'text(3)');
+}
+@sqlstate 42601
+expect error {
+    type modifier is not allowed for type "text"
+}
+
+test pg-input-type-name-refuses-a-modifier-and-names-the-schema {
+    SELECT pg_input_is_valid('1', 'pg_catalog.int4(3)');
+}
+@sqlstate 42601
+expect error {
+    type modifier is not allowed for type "pg_catalog.int4"
+}
+
+test pg-input-type-name-refuses-a-modifier-on-a-spelling-of-the-grammar {
+    SELECT pg_input_is_valid('1', 'integer(3)');
+}
+@sqlstate 42601
+expect error {
+    syntax error at or near
+}
+@sqlstate 42601
+expect @tursopg error {
+    invalid type name "integer\(3\)"
+}
+
+test pg-type-typmodin-names-the-function-that-reads-a-modifier {
+    SELECT typname, typmodin FROM pg_type WHERE typname IN ('int4', 'varchar', '_varchar', 'numeric', 'timestamptz', 'text') ORDER BY typname;
+}
+expect {
+    _varchar|varchartypmodin
+    int4|-
+    numeric|numerictypmodin
+    text|-
+    timestamptz|timestamptztypmodin
+    varchar|varchartypmodin
+}
+
 test pg-input-type-name-null-is-null {
     SELECT pg_input_is_valid('1', NULL) IS NULL;
 }

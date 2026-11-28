@@ -22,7 +22,9 @@ use std::sync::Arc;
 use turso_core::schema::{RelationKind, SchemaBuilder};
 use turso_core::types::{TextInput, Type};
 use turso_core::{Connection, Result};
-use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_UNDEFINED_OBJECT};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_OBJECT,
+};
 use turso_pg_parser::WrittenTypeName;
 
 /// A row of `pg_type` for a built-in type that is not an array, and how
@@ -204,12 +206,31 @@ pub(crate) fn lookup_type_name(conn: &Arc<Connection>, text: &str) -> Result<Nam
             None,
         ));
     };
+    let takes_modifiers = match kind {
+        NamedTypeKind::BuiltIn { oid, .. } => type_modifier_input(oid).is_some(),
+        NamedTypeKind::Custom | NamedTypeKind::RowOfRelation => false,
+    };
+    if !written.modifiers.is_empty() && !takes_modifiers {
+        return Err(sqlstate_error(
+            SQLSTATE_SYNTAX_ERROR,
+            format!("type modifier is not allowed for type \"{written_name}\""),
+            None,
+        ));
+    }
     Ok(NamedType {
         written_name,
         modifiers: written.modifiers,
         array_dimensions,
         kind,
     })
+}
+
+/// `typmodin` of the pg_type row `oid` in PostgreSQL 18: the name of the
+/// function that reads the modifiers written after the name of the type, such
+/// as the 10 of `varchar(10)`. None for a type that takes no modifier.
+pub(crate) fn type_modifier_input(oid: i64) -> Option<&'static str> {
+    let row = turso_pg_catalog::PgType::by_oid(u32::try_from(oid).ok()?)?;
+    turso_pg_catalog::PgProc::by_oid(row.typmodin).map(|function| function.proname)
 }
 
 /// Whether `typname` is a type of `pg_catalog` in PostgreSQL that tursopg
