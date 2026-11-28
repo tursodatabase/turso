@@ -576,6 +576,10 @@ pub struct Connection {
     /// How many of `n_active_read_statements` free a b-tree
     /// (`PreparedProgram::destroys_btree`), as DROP TABLE and DROP INDEX do.
     pub(crate) n_active_destroy_statements: AtomicI32,
+    /// How many MVCC commit state machines of this connection exist, from
+    /// `CommitStateMachine::new` until they are dropped. While it is above 0,
+    /// only the statement stepping the commit may step (see `Statement::_step`).
+    pub(crate) n_active_mvcc_commits: AtomicI32,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -2261,10 +2265,18 @@ impl Connection {
         }
     }
 
-    /// Close a connection and checkpoint.
+    /// Close a connection and checkpoint. Fails with `StatementsInProgress`
+    /// while an MVCC commit of this connection is in progress.
     pub fn close(&self) -> Result<()> {
         if self.is_closed() {
             return Ok(());
+        }
+        // Rolling back a transaction whose commit has built its log record
+        // would remove its rows in memory while recovery still replays them.
+        if self.n_active_mvcc_commits.load(Ordering::SeqCst) > 0 {
+            return Err(LimboError::StatementsInProgress(
+                "cannot close a connection while a commit is in progress",
+            ));
         }
         self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();

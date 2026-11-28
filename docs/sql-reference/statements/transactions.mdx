@@ -66,6 +66,10 @@ UPDATE accounts SET balance = balance - 100 WHERE name = 'Alice';
 END;
 ```
 
+<Info>
+In MVCC mode a commit can return to the caller before it finishes, for example while it waits for I/O. Until the transaction is committed, every other statement on the same connection returns `SQLITE_BUSY`, including a statement that started before the commit. Other connections are not affected.
+</Info>
+
 ## ROLLBACK
 
 The ROLLBACK statement aborts the current transaction and reverts all changes made since BEGIN. The database is left in the state it was in before the transaction started.

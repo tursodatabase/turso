@@ -1770,6 +1770,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitStateMachine<C
 impl<Clock: LogicalClock, A: ConcurrentAllocator> Drop for CommitStateMachine<Clock, A> {
     fn drop(&mut self) {
         self.cleanup_unfinished_commit();
+        // `new` counted this commit in `n_active_mvcc_commits`. The count
+        // stays up while the auto-checkpoint runs: the checkpoint runs on
+        // this connection and its pager, which a statement run then would use
+        // too, and the COMMIT may still have to commit the transactions of
+        // attached databases, which such a statement would join or roll back.
+        let previous = self
+            .connection
+            .n_active_mvcc_commits
+            .fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(previous > 0, "n_active_mvcc_commits went below 0");
     }
 }
 
@@ -1851,6 +1861,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let tx_entry = mvcc_store.txs.get(&tx_id).map(|entry| unsafe {
             std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry)
         });
+        connection
+            .n_active_mvcc_commits
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             state,
             is_finalized: false,

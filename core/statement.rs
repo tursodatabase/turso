@@ -585,6 +585,21 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        // An MVCC commit that yielded has taken its transaction out of the
+        // `Active` state and may have built its log record. Another statement
+        // of this connection that read, wrote, rolled back or ended that
+        // transaction now would change rows the commit is publishing, so it
+        // must wait until the commit has removed the transaction. Checked on
+        // every step, since a statement started before the commit can be
+        // stepped again too.
+        if self.connection.n_active_mvcc_commits.load(Ordering::SeqCst) > 0
+            && self.origin.is_top_level()
+            && !self.state.has_active_mvcc_commit()
+        {
+            return Err(LimboError::StatementsInProgress(
+                "cannot run a statement while a commit is in progress",
+            ));
+        }
         self.stepped = true;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
