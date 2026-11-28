@@ -1,5 +1,6 @@
 //! PostgreSQL's boolean type.
 
+use super::{FormatName, RegisteredType};
 use crate::error::sqlstate_error;
 use crate::functions::parse_pg_bool;
 use turso_core::ast;
@@ -110,4 +111,10 @@ fn bool_cast(value: &Value, _params: &[Value]) -> Result<Value> {
 /// the boolean of core reads it.
 fn bool_decode(value: &Value, _params: &[Value]) -> Result<Value> {
     Ok(Value::from_i64(i64::from(value.exec_if(false, false))))
+}
+
+impl RegisteredType for Boolean {
+    fn format_name(&self) -> FormatName {
+        FormatName::Plain("boolean")
+    }
 }

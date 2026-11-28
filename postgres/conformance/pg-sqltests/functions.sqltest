@@ -1371,6 +1371,34 @@ expect {
     character varying(50)
 }
 
+test format-type-of-an-oid-that-is-not-a-type {
+    SELECT format_type(0, NULL), format_type(99999, NULL);
+}
+expect {
+    -|???
+}
+
+test format-type-names-the-types-that-tursopg-has-no-row-for {
+    SELECT format_type(18, -1), format_type(19, -1), format_type(1083, -1), format_type(1186, -1), format_type(2278, -1);
+}
+expect {
+    "char"|name|time without time zone|interval|void
+}
+
+test format-type-prints-the-array-of-a-type {
+    SELECT format_type(1000, -1), format_type(1007, -1), format_type(1009, -1), format_type(1016, -1), format_type(1231, -1);
+}
+expect {
+    boolean[]|integer[]|text[]|bigint[]|numeric[]
+}
+
+test format-type-prints-the-modifier-of-a-type {
+    SELECT format_type(1043, 9), format_type(1043, -1), format_type(1042, 7), format_type(1700, 655366), format_type(1700, -1);
+}
+expect {
+    character varying(5)|character varying|character(3)|numeric(10,2)|numeric
+}
+
 test pg-type-is-visible {
     SELECT CASE WHEN pg_type_is_visible(23) THEN 1 ELSE 0 END;
 }

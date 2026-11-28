@@ -1,6 +1,7 @@
 //! PostgreSQL's regclass type: the oid of a relation.
 
 use super::oid::{oid_coerce, oid_input};
+use super::{FormatName, RegisteredType};
 use crate::error::sqlstate_error;
 use turso_core::ast;
 use turso_core::types::{Conversion, StorageClass, TextInput, Type};
@@ -113,5 +114,11 @@ fn split_name(text: &str) -> Result<Vec<String>> {
             "invalid name syntax",
             None,
         )),
+    }
+}
+
+impl RegisteredType for RegClass {
+    fn format_name(&self) -> FormatName {
+        FormatName::Plain("regclass")
     }
 }

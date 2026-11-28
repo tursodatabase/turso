@@ -2073,6 +2073,18 @@ pub(crate) fn pg_type_name(oid: i64) -> Option<&'static str> {
     built_in_type(oid).map(|info| info.name)
 }
 
+/// The name of the type made by CREATE TYPE or CREATE DOMAIN that has the oid
+/// `oid`, quoted where it needs it. The oid of such a type is the one that its
+/// pg_type row has.
+pub(crate) fn custom_type_name(conn: &Connection, oid: i64) -> Option<String> {
+    let schema = conn.current_schema();
+    schema
+        .type_registry
+        .values()
+        .find(|ty| !ty.is_builtin && user_type_oid(&ty.name) == oid)
+        .map(|ty| quote_identifier(&ty.name))
+}
+
 /// The `typcategory` of the built-in type with this oid.
 pub(crate) fn pg_type_category(oid: i64) -> Option<&'static str> {
     built_in_type(oid).map(|info| info.category)

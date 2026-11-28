@@ -310,7 +310,6 @@ expect {
 }
 
 # E-25: enum column atttypid/format_type
-@compat-gap "function:format_type"
 test enum-column-atttypid-format-type {
     CREATE TYPE mood AS ENUM ('happy', 'sad');
     CREATE TABLE t (m mood);
@@ -318,9 +317,6 @@ test enum-column-atttypid-format-type {
 }
 expect {
     mood
-}
-expect @tursopg {
-    unknown
 }
 
 # E-26: domain in pg_type typtype d
@@ -333,7 +329,6 @@ expect {
 }
 
 # E-27: domain column format_type
-@compat-gap "function:format_type"
 test domain-column-format-type {
     CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
     CREATE TABLE t (n posint);
@@ -341,9 +336,6 @@ test domain-column-format-type {
 }
 expect {
     posint
-}
-expect @tursopg {
-    unknown
 }
 
 # E-28: serial column default in pg_attrdef

@@ -407,7 +407,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             exec_jsonb_exists_keys(args[0].get_value(), args[1].get_value(), true)?
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
-            .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
+            .map(|type_oid| format_type_in(connection, type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
         "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -2212,56 +2212,25 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
-/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It lists the types that `format_type` prints in another form than their `typname`, such as integer for int4. The others print their `typname` from the pg_type table, which is not what PostgreSQL does for every one: it prints `time with time zone` for timetz. It prints character for bpchar with typemod -1, where PostgreSQL prints bpchar. A rule in pg_type for how `format_type` prints each type replaces this.
-/// The name of a type as `format_type` prints it.
-pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
-    match type_oid {
-        16 => "boolean".to_string(),
-        18 => "\"char\"".to_string(),
-        20 => "bigint".to_string(),
-        21 => "smallint".to_string(),
-        23 => "integer".to_string(),
-        700 => "real".to_string(),
-        701 => "double precision".to_string(),
-        1000 => "boolean[]".to_string(),
-        1007 => "integer[]".to_string(),
-        1009 => "text[]".to_string(),
-        1022 => "double precision[]".to_string(),
-        1042 => {
-            if typemod > 4 {
-                format!("character({})", typemod - 4)
-            } else {
-                "character".to_string()
-            }
+/// The name of a type as `format_type` prints it, where the connection also
+/// knows the types made by CREATE TYPE and CREATE DOMAIN.
+fn format_type_in(connection: &Connection, type_oid: i64, typemod: i64) -> String {
+    if crate::pg_type::type_format_name(type_oid, typemod).is_none() {
+        if let Some(name) = crate::catalog::custom_type_name(connection, type_oid) {
+            return name;
         }
-        1043 => {
-            if typemod > 4 {
-                format!("character varying({})", typemod - 4)
-            } else {
-                "character varying".to_string()
-            }
-        }
-        1083 => "time without time zone".to_string(),
-        1114 => "timestamp without time zone".to_string(),
-        1184 => "timestamp with time zone".to_string(),
-        1700 => {
-            if typemod > 4 {
-                let precision = ((typemod - 4) >> 16) & 0xffff;
-                let scale = (typemod - 4) & 0xffff;
-                format!("numeric({precision},{scale})")
-            } else {
-                "numeric".to_string()
-            }
-        }
-        // These have no row in the pg_type table yet.
-        19 => "name".to_string(),
-        1186 => "interval".to_string(),
-        2206 => "regtype".to_string(),
-        2278 => "void".to_string(),
-        _ => crate::catalog::pg_type_name(type_oid)
-            .unwrap_or("unknown")
-            .to_string(),
     }
+    format_type(type_oid, typemod)
+}
+
+/// FIXME(pg-catalog): The name of each type comes from the type that tursopg registers, or from its row in `BUILT_IN_TYPES`, because pg_type does not say how `format_type` prints a type. A rule in pg_type for that replaces both.
+/// The name of a type as `format_type` prints it: `-` for the oid 0 and `???`
+/// for an oid that no type of tursopg has.
+pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
+    if type_oid == 0 {
+        return "-".to_string();
+    }
+    crate::pg_type::type_format_name(type_oid, typemod).unwrap_or_else(|| "???".to_string())
 }
 
 /// Simplified to_char: formats a number with the given format pattern.

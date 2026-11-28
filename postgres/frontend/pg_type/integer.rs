@@ -1,6 +1,7 @@
 //! PostgreSQL's integer types: smallint (int2), integer (int4) and bigint
 //! (int8).
 
+use super::{FormatName, RegisteredType};
 use crate::error::sqlstate_error;
 use turso_core::ast;
 use turso_core::schema::{
@@ -322,6 +323,16 @@ fn int4_cast(value: &Value, _params: &[Value]) -> Result<Value> {
 
 fn int8_cast(value: &Value, _params: &[Value]) -> Result<Value> {
     IntegerType::Int8.cast(value)
+}
+
+impl RegisteredType for IntegerType {
+    fn format_name(&self) -> FormatName {
+        FormatName::Plain(match self {
+            IntegerType::Int2 => "smallint",
+            IntegerType::Int4 => "integer",
+            IntegerType::Int8 => "bigint",
+        })
+    }
 }
 
 #[cfg(test)]
