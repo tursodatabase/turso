@@ -1684,6 +1684,30 @@ impl ProgramState {
             || (connection.get_auto_commit() && attached_txn_open())
     }
 
+    /// Whether the statement is in the part of a commit that can no longer be undone: the
+    /// commit's data is written, or another connection can write it.
+    pub(crate) fn is_finishing_commit(&self, connection: &Connection) -> bool {
+        match &self.commit_state {
+            CommitState::Ready => false,
+            // `Pager::commit_tx` clears the transaction state when the WAL commit is durable
+            // and only its auto-checkpoint is left.
+            CommitState::Committing => {
+                matches!(connection.get_tx_state(), TransactionState::None)
+            }
+            CommitState::CommittingMvcc { state_machine } => !state_machine.inner().can_roll_back(),
+            // The main database has committed.
+            CommitState::CommittingAttached | CommitState::CommittingAttachedMvcc { .. } => true,
+        }
+    }
+
+    /// Makes the statement's MVCC commit of the main database finish without its
+    /// auto-checkpoint. The commits of attached databases are not changed.
+    pub(crate) fn skip_commit_checkpoint(&mut self) {
+        if let CommitState::CommittingMvcc { state_machine } = &mut self.commit_state {
+            state_machine.inner_mut().skip_auto_checkpoint();
+        }
+    }
+
     /// The MvStore this statement runs against: the same answer as
     /// `Connection::mv_store`, but a full ArcSwap load (thread-local debt
     /// slot, ~50 instructions) only when the slot changed since the last

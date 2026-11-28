@@ -1755,6 +1755,8 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     wrote_logical_log: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    /// Set by `skip_auto_checkpoint`: the commit finishes without its auto-checkpoint.
+    skip_auto_checkpoint: bool,
     _phantom: PhantomData<Clock>,
 }
 
@@ -1869,6 +1871,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             group_batch: None,
             wrote_logical_log: false,
             sync_mode,
+            skip_auto_checkpoint: false,
             _phantom: PhantomData,
         })
     }
@@ -1939,6 +1942,41 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         if let CommitState::AwaitGroupCommit { ticket, .. } = self.state {
             let _ = self.commit_coordinator.drop_pending(ticket);
         }
+    }
+
+    /// Whether the commit can still be undone: no other connection can write its logical-log
+    /// record, and no write of it has been issued. Once the record is queued for group commit, a
+    /// leader can write it at any time, and dropping the statement then finishes the commit. The
+    /// record is queued only by a step of this commit, so a commit that is not stepped again stays
+    /// in a state that dropping it rolls back.
+    pub(crate) fn can_roll_back(&self) -> bool {
+        match self.state {
+            CommitState::Initial
+            | CommitState::Commit { .. }
+            | CommitState::WaitForDependencies { .. }
+            | CommitState::BuildLogRecord(_)
+            | CommitState::MarkDirtyKeys { .. }
+            | CommitState::BeginCommitLogicalLog { .. } => !self.is_finalized,
+            CommitState::AwaitGroupCommit { .. }
+            | CommitState::UpgradeLogicalLogHeader { .. }
+            | CommitState::WriteLogicalLog { .. }
+            | CommitState::FinishLogicalLogWrite { .. }
+            | CommitState::MarkLogRecordWritten { .. }
+            | CommitState::SyncLogicalLog { .. }
+            | CommitState::SyncGroupPrefix { .. }
+            | CommitState::GroupPrefixSynced { .. }
+            | CommitState::EndCommitLogicalLog { .. }
+            | CommitState::CommitEnd { .. }
+            | CommitState::RewriteLiveVersions(_)
+            | CommitState::FinalizeCommit { .. }
+            | CommitState::Checkpoint { .. } => false,
+        }
+    }
+
+    /// Makes the commit finish without its auto-checkpoint. A checkpoint that has started is
+    /// abandoned at the next step, as when the commit is dropped.
+    pub(crate) fn skip_auto_checkpoint(&mut self) {
+        self.skip_auto_checkpoint = true;
     }
 
     fn cleanup_unfinished_commit(&mut self) {
@@ -3774,7 +3812,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-                if appended_to_log && mvcc_store.storage.should_checkpoint() {
+                if appended_to_log
+                    && !self.skip_auto_checkpoint
+                    && mvcc_store.storage.should_checkpoint()
+                {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
                             upper_bound_inclusive: None,
@@ -3810,6 +3851,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
+            }
+            CommitState::Checkpoint { .. } if self.skip_auto_checkpoint => {
+                self.cleanup_mvcc_checkpoint_state();
+                self.finalize(mvcc_store)?;
+                return Ok(TransitionResult::Done(()));
             }
             CommitState::Checkpoint { state_machine } => {
                 let step_result = {
