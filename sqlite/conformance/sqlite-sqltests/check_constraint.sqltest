@@ -808,6 +808,55 @@ test check_constraint_cast_expression_violation {
 expect error {
 }
 
+# A CAST to a name that is no type is read by the affinity of the name.
+@cross-check-integrity
+test check_constraint_cast_to_a_name_that_is_no_type {
+    CREATE TABLE t (
+        a TEXT CHECK (CAST(a AS int4) > 0),
+        b TEXT CHECK (CAST(b AS float8) > 0.5),
+        c TEXT CHECK (CAST(c AS real) > 0.5),
+        d TEXT CHECK (CAST(d AS foo) > 0)
+    );
+    INSERT INTO t VALUES ('5', '1.5', '1.5', '7');
+    SELECT a, b, c, d FROM t;
+}
+expect {
+    5|1.5|1.5|7
+}
+
+@cross-check-integrity
+test check_constraint_cast_to_a_name_that_is_no_type_violation {
+    CREATE TABLE t (a TEXT CHECK (CAST(a AS int4) > 0));
+    INSERT INTO t VALUES ('-5');
+}
+expect error {
+}
+
+@cross-check-integrity
+@requires strict "uses STRICT tables"
+test check_constraint_cast_to_a_name_that_is_no_type_strict {
+    CREATE TABLE t (
+        a TEXT CHECK (CAST(a AS int4) > 0),
+        b TEXT CHECK (CAST(b AS float8) > 0.5),
+        c TEXT CHECK (CAST(c AS real) > 0.5),
+        d TEXT CHECK (CAST(d AS foo) > 0)
+    ) STRICT;
+    INSERT INTO t VALUES ('5', '1.5', '1.5', '7');
+    SELECT a, b, c, d FROM t;
+}
+expect {
+    5|1.5|1.5|7
+}
+
+@cross-check-integrity
+@requires strict "uses STRICT tables"
+test check_constraint_cast_to_a_name_that_is_no_type_strict_violation {
+    CREATE TABLE t (a TEXT CHECK (CAST(a AS int4) > 0), d TEXT CHECK (CAST(d AS foo) > 0)) STRICT;
+    INSERT INTO t VALUES ('5', '-7');
+}
+expect error {
+}
+
 # ON CONFLICT clauses with CHECK constraints
 @cross-check-integrity
 test check_constraint_on_conflict_ignore {
