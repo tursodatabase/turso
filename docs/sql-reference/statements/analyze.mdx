@@ -70,6 +70,9 @@ SELECT * FROM sqlite_stat1;
 -- orders  | idx_product   | 1000 10
 ```
 
+The `tbl` and `idx` columns have the names with the case that the `CREATE` statements gave
+them.
+
 The `stat` column contains space-separated integers. The first integer is the total number of rows in the table. Subsequent integers estimate the average number of rows that share the same value for the leftmost N columns of the index.
 
 ## See Also

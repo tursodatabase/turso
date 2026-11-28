@@ -159,3 +159,71 @@ expect {
     Child|Parent|1
     Child|parent|2
 }
+
+# The row of an AUTOINCREMENT table in sqlite_sequence has the table name as
+# CREATE TABLE wrote it, as the row in sqlite_schema has it.
+test sqlite-sequence-keeps-name-case {
+    CREATE TABLE "MixedCase" (a INTEGER PRIMARY KEY AUTOINCREMENT, b);
+    INSERT INTO mixedcase (b) VALUES (1), (2), (3);
+    DELETE FROM MIXEDCASE;
+    INSERT INTO mixedcase (b) VALUES (4);
+    SELECT m.name, s.seq FROM sqlite_schema m JOIN sqlite_sequence s ON s.name = m.name;
+    ALTER TABLE mixedcase RENAME TO "NewName";
+    INSERT INTO newname (b) VALUES (5);
+    SELECT a FROM newname ORDER BY a;
+    SELECT * FROM sqlite_sequence;
+    DROP TABLE NEWNAME;
+    SELECT count(*) FROM sqlite_sequence;
+}
+expect {
+    MixedCase|4
+    4
+    5
+    NewName|5
+    0
+}
+
+# The rows of sqlite_stat1 have the names of tables and indexes as the CREATE
+# statements wrote them, as the rows in sqlite_schema have them. A second
+# ANALYZE replaces the rows.
+test sqlite-stat1-keeps-name-case {
+    CREATE TABLE "MixedCase" (a INTEGER PRIMARY KEY, b);
+    CREATE INDEX "MyIdx" ON mixedcase (b);
+    CREATE TABLE "NoIndex" (a);
+    INSERT INTO mixedcase VALUES (1, 1), (2, 2);
+    INSERT INTO noindex VALUES (1);
+    ANALYZE;
+    SELECT m.name, s.stat FROM sqlite_schema m JOIN sqlite_stat1 s ON s.idx = m.name;
+    INSERT INTO mixedcase VALUES (3, 3);
+    ANALYZE mixedcase;
+    ANALYZE MYIDX;
+    SELECT * FROM sqlite_stat1 ORDER BY tbl;
+}
+expect {
+    MyIdx|2 1
+    MixedCase|MyIdx|3 1
+    NoIndex||1
+}
+
+# A row of sqlite_sequence or sqlite_stat1 whose name differs in case from
+# the name that CREATE wrote is not a row of the table. ALTER TABLE RENAME
+# and ANALYZE leave it.
+test sqlite-sequence-and-stat1-keep-rows-of-other-case {
+    CREATE TABLE "MixedCase" (a INTEGER PRIMARY KEY AUTOINCREMENT, b);
+    CREATE INDEX "MyIdx" ON mixedcase (b);
+    INSERT INTO mixedcase (b) VALUES (1);
+    INSERT INTO sqlite_sequence VALUES ('MIXEDCASE', 500);
+    ANALYZE;
+    INSERT INTO sqlite_stat1 VALUES ('MIXEDCASE', 'MYIDX', '9 9');
+    INSERT INTO mixedcase (b) VALUES (2);
+    ANALYZE mixedcase;
+    SELECT * FROM sqlite_stat1 ORDER BY tbl;
+    ALTER TABLE mixedcase RENAME TO "NewName";
+    SELECT * FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    MIXEDCASE|MYIDX|9 9
+    MixedCase|MyIdx|2 1
+    MIXEDCASE|500
+    NewName|2
+}

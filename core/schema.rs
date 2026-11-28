@@ -1899,6 +1899,15 @@ impl Schema {
         self.namespace(namespace).broken_views.contains(name)
     }
 
+    /// The name of a B-tree table as the CREATE TABLE statement wrote it,
+    /// with the prefix of its namespace. `row_name` is the normalized form
+    /// of that name. None when the schema has no such table.
+    pub fn declared_table_row_name(&self, row_name: &str) -> Option<String> {
+        let (namespace, name) = self.demangle_name(row_name);
+        let table = self.get_btree_table(namespace, name)?;
+        Some(mangle_name(namespace, &table.declared_name))
+    }
+
     pub fn remove_broken_view(&mut self, namespace: NamespaceId, name: &str) -> bool {
         self.namespace_mut(namespace).broken_views.remove(name)
     }

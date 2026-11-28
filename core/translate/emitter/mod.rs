@@ -43,7 +43,7 @@ use crate::vdbe::{
     builder::{
         CursorKey, CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder, SelfTableContext,
     },
-    insn::{to_u32, ConstraintInfo, InsertFlags, Insn},
+    insn::{to_u32, CmpInsFlags, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{
@@ -1983,6 +1983,35 @@ pub fn emit_cdc_explicit_commit_insns(
 /// Initialize the limit/offset counters and registers.
 /// In case of compound SELECTs, the limit counter is initialized only once,
 /// hence [LimitCtx::initialize_counter] being false in those cases.
+/// Emits a jump to `target_pc` when the text in `name_reg` is `spelling`.
+/// Emits nothing when `spelling` is the same as `other_spelling`, which the
+/// caller compares.
+///
+/// A row of `sqlite_sequence` or `sqlite_stat1` names a table or an index
+/// in one of two spellings: the name as the CREATE statement wrote it, which
+/// SQLite and Turso write, or the normalized name, which older Turso
+/// versions wrote. A row with a third spelling names no object, as in SQLite.
+pub(crate) fn emit_jump_if_other_spelling(
+    program: &mut ProgramBuilder,
+    name_reg: usize,
+    spelling: &str,
+    other_spelling: &str,
+    target_pc: BranchOffset,
+) {
+    if spelling == other_spelling {
+        return;
+    }
+    let spelling_reg = program.emit_string8_new_reg(spelling.to_string());
+    program.mark_last_insn_constant();
+    program.emit_insn(Insn::Eq {
+        lhs: name_reg,
+        rhs: spelling_reg,
+        target_pc,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+}
+
 pub(crate) fn init_limit(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,

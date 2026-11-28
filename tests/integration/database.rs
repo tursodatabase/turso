@@ -448,6 +448,113 @@ fn sqlite_rows(path: &std::path::Path, query: &str) -> Vec<String> {
     .collect()
 }
 
+/// SQLite keeps the case that CREATE gave a table name in sqlite_sequence,
+/// and the case of table and index names in sqlite_stat1. Turso must find
+/// these rows and write the names in the same case, so that SQLite finds the
+/// rows that Turso wrote.
+#[test]
+fn test_sequence_and_stat_rows_of_sqlite_file_with_mixed_case_names() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("mixed_case_sequence.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            r#"CREATE TABLE "MixedCase"(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+               CREATE INDEX "MyIdx" ON mixedcase(y);
+               INSERT INTO mixedcase(y) VALUES (1), (2), (3);
+               DELETE FROM mixedcase WHERE x = 3;
+               ANALYZE;"#,
+        )
+        .unwrap();
+    drop(sqlite);
+
+    {
+        let db = crate::common::TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO mixedcase(y) VALUES (4)").unwrap();
+        conn.execute("ANALYZE").unwrap();
+        conn.execute(r#"ALTER TABLE mixedcase RENAME TO "NewName""#)
+            .unwrap();
+        conn.execute("INSERT INTO newname(y) VALUES (5)").unwrap();
+        conn.execute(r#"CREATE TABLE "Other"(x INTEGER PRIMARY KEY AUTOINCREMENT, y)"#)
+            .unwrap();
+        conn.execute("INSERT INTO other(y) VALUES (1), (2)")
+            .unwrap();
+        conn.execute("DELETE FROM other").unwrap();
+    }
+
+    assert_eq!(
+        sqlite_rows(&path, "SELECT x FROM newname ORDER BY x"),
+        vec!["1", "2", "4", "5"]
+    );
+    assert_eq!(
+        sqlite_rows(&path, "SELECT name, seq FROM sqlite_sequence ORDER BY name"),
+        vec!["NewName|5", "Other|2"]
+    );
+    assert_eq!(
+        sqlite_rows(&path, "SELECT tbl, idx, stat FROM sqlite_stat1"),
+        vec!["MixedCase|MyIdx|3 1"]
+    );
+
+    // SQLite finds the sqlite_sequence row that Turso wrote.
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch("INSERT INTO other(y) VALUES (3)")
+        .unwrap();
+    drop(sqlite);
+    assert_eq!(sqlite_rows(&path, "SELECT x FROM other"), vec!["3"]);
+    assert_eq!(
+        sqlite_rows(&path, "SELECT name, seq FROM sqlite_sequence ORDER BY name"),
+        vec!["NewName|5", "Other|3"]
+    );
+    assert_eq!(sqlite_integrity_check(&path), "ok");
+}
+
+/// Older Turso versions wrote lowercase names in sqlite_sequence and in
+/// sqlite_stat1, as in sqlite_schema. Turso must find these rows and must
+/// not add rows for the same table in another case. ANALYZE replaces the
+/// rows and writes the names as the CREATE statements wrote them.
+#[test]
+fn test_sequence_and_stat_rows_of_file_with_lowercase_names() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("lowercase_sequence.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            r#"CREATE TABLE "MixedCase"(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+               CREATE INDEX "MyIdx" ON "MixedCase"(y);
+               INSERT INTO "MixedCase"(y) VALUES (1), (2), (3);
+               DELETE FROM "MixedCase" WHERE x = 3;
+               ANALYZE;
+               PRAGMA writable_schema = ON;
+               UPDATE sqlite_schema SET name = lower(name), tbl_name = lower(tbl_name);
+               UPDATE sqlite_sequence SET name = lower(name);
+               UPDATE sqlite_stat1 SET tbl = lower(tbl), idx = lower(idx);"#,
+        )
+        .unwrap();
+    drop(sqlite);
+
+    {
+        let db = crate::common::TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO mixedcase(y) VALUES (4)").unwrap();
+        conn.execute("ANALYZE").unwrap();
+    }
+
+    assert_eq!(
+        sqlite_rows(&path, "SELECT x FROM mixedcase ORDER BY x"),
+        vec!["1", "2", "4"]
+    );
+    assert_eq!(
+        sqlite_rows(&path, "SELECT name, seq FROM sqlite_sequence"),
+        vec!["mixedcase|4"]
+    );
+    assert_eq!(
+        sqlite_rows(&path, "SELECT tbl, idx, stat FROM sqlite_stat1"),
+        vec!["MixedCase|MyIdx|3 1"]
+    );
+}
+
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
