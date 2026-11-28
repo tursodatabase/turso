@@ -246,14 +246,23 @@ impl DatabaseTape {
         if self.disable_auto_checkpoint {
             conn.wal_auto_actions_disable();
         }
+        Ok(self.iterate_changes_on(conn, opts))
+    }
 
+    /// Like [Self::iterate_changes], but reads with `conn`, inside the transaction that `conn`
+    /// is in.
+    pub(crate) fn iterate_changes_on(
+        &self,
+        conn: Arc<turso_core::Connection>,
+        opts: DatabaseChangesIteratorOpts,
+    ) -> DatabaseChangesIterator {
         let cdc_version = self
             .cdc_version
             .read()
             .unwrap()
             .expect("tape must be connected before iterate changes");
 
-        Ok(DatabaseChangesIterator {
+        DatabaseChangesIterator {
             conn,
             cdc_table: self.cdc_table.clone(),
             cdc_version,
@@ -265,7 +274,7 @@ impl DatabaseTape {
             batch_size: opts.batch_size,
             ignore_schema_changes: opts.ignore_schema_changes,
             max_change_id_exclusive: opts.max_change_id_exclusive,
-        })
+        }
     }
     fn connect_options(&self) -> ConnectOpts {
         ConnectOpts::new(SessionRole::Superuser).with_encryption_key(self.encryption_key.clone())

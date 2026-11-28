@@ -185,9 +185,15 @@ impl InProcessServer {
             .page_pulls
             .as_ref()
             .map(|pulls| pulls.fetch_add(1, Ordering::Relaxed) + 1);
-        if let Some(pull) = pull {
+        if let (Some(pull), false) = (pull, self.remote.mvcc) {
             let database = self.remote.checkpoint_and_read_database_file()?;
             self.pages(&self.remote, database, revision_at(pull), false)
+        } else if pull.is_some_and(|pull| pull % 2 == 0) {
+            // How the sync server answers a logical pull it cannot serve from the log. The
+            // client then pulls the log from the revision it was given.
+            let database = self.remote.checkpoint_and_read_database_file()?;
+            let log_end = self.remote.read_logical_log()?.len();
+            self.pages(&self.remote, database, revision_at(log_end), true)
         } else if request.client_revision.is_empty() || self.force_page_updates {
             self.page_bootstrap(false)
         } else if self.replace_once.swap(false, Ordering::SeqCst) {

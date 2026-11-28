@@ -1,7 +1,7 @@
-//! What reads on other connections return while pulls and checkpoints run on a WAL database.
-//! Pulls run without the SDK's SyncBusyGate, as they do in the SDK on a WAL database. The SDK
-//! takes the gate for every checkpoint, so each checkpoint here waits for the other connections'
-//! statements to finish and blocks new ones until it ends (`SyncBusyGate` below).
+//! What reads on other connections return while pulls and checkpoints run. Pulls run without the
+//! SDK's SyncBusyGate unless a test says so. The SDK takes the gate for every checkpoint, so each
+//! checkpoint here waits for the other connections' statements to finish and blocks new ones until
+//! it ends (`SyncBusyGate` below).
 //!
 //! Rows are only ever inserted, locally and on the remote:
 //! - a read outside a transaction must contain every row an earlier such read saw;
@@ -34,6 +34,20 @@ const PAUSE: Duration = Duration::from_millis(1);
 const LOCAL_ROWS: usize = 500;
 
 #[test]
+fn readers_during_logical_pull() -> Result<()> {
+    let remote = remote()?;
+    let replica = remote.bootstrap_replica()?;
+    run(&remote, &replica, false, false)
+}
+
+#[test]
+fn readers_during_logical_pull_and_checkpoint() -> Result<()> {
+    let remote = remote()?;
+    let replica = remote.bootstrap_replica()?;
+    run(&remote, &replica, true, false)
+}
+
+#[test]
 fn readers_during_wal_page_pull() -> Result<()> {
     wal_page_pull(false)
 }
@@ -43,8 +57,31 @@ fn readers_during_wal_page_pull_and_checkpoint() -> Result<()> {
     wal_page_pull(true)
 }
 
+/// A page apply to an MVCC database commits the remote pages and replays local changes in a
+/// later commit, so the SDK holds its SyncBusyGate while it runs
+/// (`DatabaseSyncEngine::apply_needs_sync_busy_gate`).
+#[test]
+fn readers_with_sync_busy_gate_during_mvcc_page_pull() -> Result<()> {
+    page_pull(remote()?, "mvcc", false, true)
+}
+
+#[test]
+#[ignore = "without the SyncBusyGate, every pull succeeds but no remote row is in the table after it, or a plain INSERT keeps failing with SchemaUpdated"]
+fn readers_during_mvcc_page_pull() -> Result<()> {
+    page_pull(remote()?, "mvcc", false, false)
+}
+
 fn wal_page_pull(checkpoint: bool) -> Result<()> {
     let remote = Remote::new_wal(&[TABLE])?;
+    page_pull(remote, "wal", checkpoint, false)
+}
+
+fn page_pull(
+    remote: Arc<Remote>,
+    journal_mode: &str,
+    checkpoint: bool,
+    gate_pulls: bool,
+) -> Result<()> {
     let dir = Arc::new(tempfile::tempdir()?);
     let replica = Replica::open(
         &dir,
@@ -57,16 +94,22 @@ fn wal_page_pull(checkpoint: bool) -> Result<()> {
         .prepare("PRAGMA journal_mode")?
         .run_collect_rows()?;
     match &mode[0][0] {
-        Value::Text(mode) => assert_eq!(mode.as_str(), "wal"),
+        Value::Text(mode) => assert_eq!(mode.as_str(), journal_mode),
         other => panic!("unexpected journal mode {other:?}"),
     }
-    run(&remote, &replica, checkpoint)
+    run(&remote, &replica, checkpoint, gate_pulls)
 }
 
+// No index: every pull replays all unpushed local rows, and replaying them into an MVCC index
+// gets slower with each row (tursodatabase/turso#11871).
 const TABLE: &str = "CREATE TABLE t(x TEXT)";
 
+fn remote() -> Result<Arc<Remote>> {
+    Remote::new(&[TABLE])
+}
+
 /// This test's replacement for the SDK's SyncBusyGate. Statements on the other connections hold
-/// it for reading; a checkpoint holds it for writing.
+/// it for reading; a checkpoint, and a pull when the test gates pulls, holds it for writing.
 type SyncBusyGate = Arc<RwLock<()>>;
 
 #[derive(Default)]
@@ -95,7 +138,7 @@ impl Flags {
     }
 }
 
-fn run(remote: &Remote, replica: &Replica, checkpoint: bool) -> Result<()> {
+fn run(remote: &Remote, replica: &Replica, checkpoint: bool, gate_pulls: bool) -> Result<()> {
     let flags = Arc::new(Flags::default());
     let sync_busy_gate = SyncBusyGate::default();
     let writer = spawn_writer(replica.connect()?, flags.clone(), sync_busy_gate.clone());
@@ -108,7 +151,10 @@ fn run(remote: &Remote, replica: &Replica, checkpoint: bool) -> Result<()> {
     for round in 0..ROUNDS {
         remote.execute_transaction(&[&format!("INSERT INTO t VALUES ('remote-{round}')")])?;
         flags
-            .run_pull_or_checkpoint(|| replica.pull())
+            .run_pull_or_checkpoint(|| {
+                let _sync_busy_gate = gate_pulls.then(|| sync_busy_gate.write().unwrap());
+                replica.pull()
+            })
             .map_err(|e| step_error("pull", round, e))?;
         if checkpoint {
             // Waiting for the gate is outside the flag: nothing else runs while the checkpoint does.
@@ -147,14 +193,16 @@ fn run(remote: &Remote, replica: &Replica, checkpoint: bool) -> Result<()> {
         "{report}"
     );
     assert!(autocommit.reads > 0 && in_txn.reads > 0, "{report}");
-    // Each client must have finished work while a pull or checkpoint was running,
-    // or the test did not check what happens during one.
-    assert!(
-        writer.during_pull_or_checkpoint > 0
-            && autocommit.during_pull_or_checkpoint > 0
-            && in_txn.during_pull_or_checkpoint > 0,
-        "{report}"
-    );
+    if !gate_pulls {
+        // Each client must have finished work while a pull or checkpoint was running,
+        // or the test did not check what happens during one.
+        assert!(
+            writer.during_pull_or_checkpoint > 0
+                && autocommit.during_pull_or_checkpoint > 0
+                && in_txn.during_pull_or_checkpoint > 0,
+            "{report}"
+        );
+    }
     Ok(())
 }
 

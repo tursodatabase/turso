@@ -99,8 +99,9 @@ pub struct DatabaseSyncEngineOpts {
     pub logical_mvcc_pull: Option<bool>,
     /// How long the sync engine waits for a lock held by another connection (for example the
     /// app's write transaction) before it fails with `Busy`. Applies to the engine's own
-    /// connections and to starting WAL transactions. Pulls on MVCC databases, logical and
-    /// replace-base pulls, and checkpoints do not wait: they need the SDK's sync busy gate (see `apply_needs_sync_busy_gate`).
+    /// connections and to starting WAL transactions. Page pulls on MVCC databases, replace-base
+    /// pulls and checkpoints do not wait: they need the SDK's sync busy gate (see
+    /// `apply_needs_sync_busy_gate`).
     /// [`DEFAULT_SYNC_BUSY_TIMEOUT`] is a reasonable value.
     pub busy_timeout: std::time::Duration,
 }
@@ -2207,28 +2208,26 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     /// runs (the SDK's `SyncBusyGate`). Checkpoints always need the gate, whatever this
     /// returns.
     ///
-    /// The answer follows the stream being applied, not only the local journal mode: a pull can
-    /// return a logical or a replace-base stream for a WAL database.
+    /// A logical apply reads the local changes after BEGIN IMMEDIATE, so a commit by another
+    /// connection cannot slip in between, and it needs no gate. A page apply to a WAL database
+    /// applies the remote pages and replays the local changes in one commit. A page apply to an
+    /// MVCC database commits the remote pages first and replays the local changes in a later
+    /// commit, and so does a replace-base apply to any database. A statement that runs between
+    /// the two commits reads the database without the local changes.
     pub fn apply_needs_sync_busy_gate(&self, changes: &DbChangesStatus) -> bool {
         !changes.is_empty() && self.stream_needs_sync_busy_gate(changes.stream_kind)
     }
 
     /// The rule behind `apply_needs_sync_busy_gate` and `pull_busy_timeout`.
-    ///
-    /// Every pull on an MVCC database needs the gate. A logical apply reads the local changes
-    /// before it begins its write transaction, so a change committed in between is missing
-    /// after the pull. A replace-base apply commits the remote pages first and replays the
-    /// local changes in a later commit, so a statement that runs between the two commits reads
-    /// the database without the local changes. These two stream kinds have those problems on a
-    /// WAL database too. Other pulls on a WAL database apply the remote pages and replay the
-    /// local changes in one commit, so other connections run during them.
     fn stream_needs_sync_busy_gate(&self, stream_kind: DbChangesStreamKind) -> bool {
         // No wildcard arm: a new stream kind must state whether its apply code needs the gate.
-        let stream_needs_gate = match stream_kind {
-            DbChangesStreamKind::Logical | DbChangesStreamKind::ReplaceBasePages => true,
-            DbChangesStreamKind::LegacyPages | DbChangesStreamKind::Pages => false,
-        };
-        self.main_tape.mvcc_enabled() || stream_needs_gate
+        match stream_kind {
+            DbChangesStreamKind::ReplaceBasePages => true,
+            DbChangesStreamKind::LegacyPages | DbChangesStreamKind::Pages => {
+                self.main_tape.mvcc_enabled()
+            }
+            DbChangesStreamKind::Logical => false,
+        }
     }
 
     /// Sync all new changes from remote DB and apply them locally
@@ -2317,33 +2316,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<BTreeMap<u64, String>> {
         tracing::info!("apply_logical_mvcc_changes(path={})", self.main_db_path);
 
-        let conn = self.connect_for_pull(DbChangesStreamKind::Logical)?;
-        let had_cdc_table = has_table(coro, &conn, "turso_cdc").await?;
-        let (local_pull_gen, local_last_change_id) =
-            read_last_change_id(coro, &conn, &self.client_unique_id).await?;
-        let mut precollected_local_changes = Vec::new();
-        if had_cdc_table {
-            let iterate_opts = DatabaseChangesIteratorOpts {
-                first_change_id: None,
-                mode: DatabaseChangesIteratorMode::Apply,
-                ignore_schema_changes: false,
-                ..Default::default()
-            };
-            let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
-            while let Some(operation) = iterator.next(coro).await? {
-                match operation {
-                    DatabaseTapeOperation::RowChange(change) => {
-                        precollected_local_changes.push(change)
-                    }
-                    DatabaseTapeOperation::Commit => continue,
-                    DatabaseTapeOperation::StmtReplay(_)
-                    | DatabaseTapeOperation::SchemaReplay(_) => {
-                        panic!("changes iterator must not use replay-only operations")
-                    }
-                }
-            }
-        }
-
+        let conn = connect_untracked(&self.main_tape)?;
+        // Read the local changes and the last synced change id after BEGIN IMMEDIATE, so no
+        // other connection can commit between reading them and committing the apply.
         begin_immediate(coro, &conn).await?;
         let mut logical_table_names_by_stable_id =
             self.meta().logical_table_names_by_stable_id.clone();
@@ -2354,6 +2329,32 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             },
         );
         let apply_result = async {
+            let had_cdc_table = has_table(coro, &conn, "turso_cdc").await?;
+            let (local_pull_gen, local_last_change_id) =
+                read_last_change_id(coro, &conn, &self.client_unique_id).await?;
+            let mut precollected_local_changes = Vec::new();
+            if had_cdc_table {
+                let iterate_opts = DatabaseChangesIteratorOpts {
+                    first_change_id: None,
+                    mode: DatabaseChangesIteratorMode::Apply,
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut iterator = self.main_tape.iterate_changes_on(conn.clone(), iterate_opts);
+                while let Some(operation) = iterator.next(coro).await? {
+                    match operation {
+                        DatabaseTapeOperation::RowChange(change) => {
+                            precollected_local_changes.push(change)
+                        }
+                        DatabaseTapeOperation::Commit => continue,
+                        DatabaseTapeOperation::StmtReplay(_)
+                        | DatabaseTapeOperation::SchemaReplay(_) => {
+                            panic!("changes iterator must not use replay-only operations")
+                        }
+                    }
+                }
+            }
+
             let remote_apply_stats =
                 apply_logical_transactions_staging_without_commit(
                     coro,

@@ -186,6 +186,69 @@ fn execute(conn: &TursoConnection, io: &MemoryYieldIO, sql: &str) {
     }
 }
 
+/// The app holds a write transaction on the same thread that drives a logical MVCC pull. While
+/// the pull waits for the app's lock, each `resume()` returns at once, so the app can insert a
+/// row and commit. The pull then finishes, and the row is still there and still waiting to be
+/// pushed. (A pull that read the local changes before it began its transaction would replay
+/// only the changes from before the app's commit, and the app's row would be gone.)
+#[test]
+fn logical_pull_waits_for_the_app_and_keeps_the_apps_commit() {
+    let remote =
+        Remote::new(&["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('first')"]).unwrap();
+    let server = InProcessServer::new(remote.clone());
+    let io = Arc::new(MemoryYieldIO::new());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local.db").to_str().unwrap().to_string();
+    let sync = open(&path, io.clone(), Some(true));
+
+    run(&sync, &server, &io, &sync.create());
+    let conn = connect(&sync, &server, &io);
+    execute(&conn, &io, "BEGIN IMMEDIATE");
+
+    remote
+        .execute_transaction(&["INSERT INTO t VALUES ('second')"])
+        .unwrap();
+    let wait = sync.wait_changes();
+    run(&sync, &server, &io, &wait);
+    let TursoAsyncOperationResult::Changes { changes } = wait.take_result().unwrap() else {
+        panic!("wait_changes returned no changes");
+    };
+    let apply = sync.apply_changes(changes);
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(200) {
+        let resume_started = std::time::Instant::now();
+        // Blocking here for the pull's busy timeout (5 s) would also block the app's COMMIT.
+        assert_eq!(
+            run_once(&sync, &server, &io, &apply),
+            TursoStatusCode::Io,
+            "the pull finished while the app held its write transaction"
+        );
+        assert!(
+            resume_started.elapsed() < std::time::Duration::from_secs(1),
+            "resume() blocked for {:?}",
+            resume_started.elapsed()
+        );
+    }
+
+    execute(&conn, &io, "INSERT INTO t VALUES ('app')");
+    execute(&conn, &io, "COMMIT");
+    run(&sync, &server, &io, &apply);
+    assert_eq!(
+        read(&conn, &io),
+        Ok(vec![
+            "app".to_string(),
+            "first".to_string(),
+            "second".to_string()
+        ])
+    );
+
+    assert_eq!(
+        pending_cdc_operations(&sync, &server, &io),
+        1,
+        "the app's row must be waiting to be pushed"
+    );
+}
+
 fn open(
     path: &str,
     io: Arc<MemoryYieldIO>,
@@ -367,63 +430,6 @@ fn pull_commits_the_change_id_together_with_the_pages() {
     );
 }
 
-/// A logical MVCC pull runs behind the SDK's SyncBusyGate, which fails the app's COMMIT, so it
-/// must not wait for the app's transaction. It fails with Busy at once, and the next pull, after
-/// the app commits, applies the remote change and keeps the app's row waiting to be pushed.
-#[test]
-fn logical_pull_fails_at_once_while_the_app_holds_a_transaction() {
-    let remote =
-        Remote::new(&["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('first')"]).unwrap();
-    let server = InProcessServer::new(remote.clone());
-    let io = Arc::new(MemoryYieldIO::new());
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("local.db").to_str().unwrap().to_string();
-    let sync = open(&path, io.clone(), Some(true));
-
-    run(&sync, &server, &io, &sync.create());
-    let conn = connect(&sync, &server, &io);
-    execute(&conn, &io, "BEGIN IMMEDIATE");
-    execute(&conn, &io, "INSERT INTO t VALUES ('app')");
-
-    remote
-        .execute_transaction(&["INSERT INTO t VALUES ('second')"])
-        .unwrap();
-    let started = std::time::Instant::now();
-    let apply = pull_changes(&sync, &server, &io);
-    let mut result = Ok(TursoStatusCode::Io);
-    while result == Ok(TursoStatusCode::Io) {
-        result = try_run_once(&sync, &server, &io, &apply);
-    }
-    let error = result.expect_err("the pull must fail while the app holds its transaction");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "the pull waited {:?} for the app: {error}",
-        started.elapsed()
-    );
-    assert!(
-        error.to_lowercase().contains("busy") || error.contains("locked"),
-        "unexpected error: {error}"
-    );
-
-    execute(&conn, &io, "COMMIT");
-    let apply = pull_changes(&sync, &server, &io);
-    run(&sync, &server, &io, &apply);
-    assert_eq!(
-        read(&conn, &io),
-        Ok(vec![
-            "app".to_string(),
-            "first".to_string(),
-            "second".to_string()
-        ])
-    );
-
-    assert_eq!(
-        pending_cdc_operations(&sync, &server, &io),
-        1,
-        "the app's row must be waiting to be pushed"
-    );
-}
-
 /// Number of local changes that are waiting to be pushed.
 fn pending_cdc_operations(
     sync: &TursoDatabaseSync<Vec<u8>>,
@@ -438,20 +444,6 @@ fn pending_cdc_operations(
     stats.cdc_operations
 }
 
-/// Runs `wait_changes` and returns the `apply_changes` operation for what it found.
-fn pull_changes(
-    sync: &TursoDatabaseSync<Vec<u8>>,
-    server: &InProcessServer,
-    io: &MemoryYieldIO,
-) -> Box<TursoDatabaseAsyncOperation> {
-    let wait = sync.wait_changes();
-    run(sync, server, io, &wait);
-    let TursoAsyncOperationResult::Changes { changes } = wait.take_result().unwrap() else {
-        panic!("wait_changes returned no changes");
-    };
-    sync.apply_changes(changes)
-}
-
 fn last_synced_change_id(conn: &TursoConnection, io: &MemoryYieldIO) -> i64 {
     query_integer(conn, io, "SELECT change_id FROM turso_sync_last_change_id")
 }
@@ -463,76 +455,6 @@ fn query_integer(conn: &TursoConnection, io: &MemoryYieldIO, sql: &str) -> i64 {
         match stmt.step(None).unwrap() {
             TursoStatusCode::Row => match stmt.row_value(0).unwrap() {
                 Value::Numeric(turso_core::Numeric::Integer(value)) => result = Some(value),
-                other => panic!("unexpected value {other:?}"),
-            },
-            TursoStatusCode::Io => io.step().unwrap(),
-            TursoStatusCode::Done => {
-                return result.unwrap_or_else(|| panic!("{sql} returned no row"))
-            }
-        }
-    }
-}
-
-/// A replica bootstrapped in WAL mode and reopened with `logical_mvcc_pull: Some(true)` pulls
-/// logical streams without converting its database to MVCC. The apply still needs the
-/// SDK's SyncBusyGate: it reads the local changes and then commits, and an app commit in between
-/// would count as synced and never be pushed. So the app's write during the apply must fail with
-/// "database is locked".
-#[test]
-fn logical_pull_on_a_wal_database_rejects_app_writes() {
-    // The remote is in MVCC mode, but the bootstrap base is an empty WAL database, so the
-    // replica starts in WAL mode. A fresh bootstrap with logical pulls would convert it to
-    // MVCC, so it is bootstrapped without them and reopened with them.
-    let remote =
-        Remote::new(&["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('first')"]).unwrap();
-    let bootstrap_base = Remote::new_wal(&[]).unwrap();
-    let server = InProcessServer::with_bootstrap_base(remote.clone(), bootstrap_base);
-    let io = Arc::new(MemoryYieldIO::new());
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("local.db").to_str().unwrap().to_string();
-    let sync = open(&path, io.clone(), None);
-    run(&sync, &server, &io, &sync.create());
-    drop(sync);
-    let sync = open(&path, io.clone(), Some(true));
-    run(&sync, &server, &io, &sync.create());
-    let conn = connect(&sync, &server, &io);
-    let apply = pull_changes(&sync, &server, &io);
-    run(&sync, &server, &io, &apply);
-    assert_eq!(read(&conn, &io), Ok(vec!["first".to_string()]));
-    assert_eq!(
-        query_text(&conn, &io, "PRAGMA journal_mode"),
-        "wal",
-        "the local database must stay in WAL mode"
-    );
-
-    remote
-        .execute_transaction(&["INSERT INTO t VALUES ('second')"])
-        .unwrap();
-    let apply = pull_changes(&sync, &server, &io);
-
-    let mut rejected_writes = 0;
-    while run_once(&sync, &server, &io, &apply) == TursoStatusCode::Io {
-        let error = try_execute(&conn, &io, "INSERT INTO t VALUES ('during pull')")
-            .expect_err("an app write during the logical apply must fail");
-        assert!(error.contains("database is locked"), "{error}");
-        rejected_writes += 1;
-    }
-    assert!(rejected_writes > 0);
-    assert_eq!(
-        read(&conn, &io),
-        Ok(vec!["first".to_string(), "second".to_string()])
-    );
-    // The gate is open again.
-    execute(&conn, &io, "INSERT INTO t VALUES ('after')");
-}
-
-fn query_text(conn: &TursoConnection, io: &MemoryYieldIO, sql: &str) -> String {
-    let mut stmt = conn.prepare_single(sql).unwrap();
-    let mut result = None;
-    loop {
-        match stmt.step(None).unwrap() {
-            TursoStatusCode::Row => match stmt.row_value(0).unwrap() {
-                Value::Text(text) => result = Some(text.as_str().to_string()),
                 other => panic!("unexpected value {other:?}"),
             },
             TursoStatusCode::Io => io.step().unwrap(),
