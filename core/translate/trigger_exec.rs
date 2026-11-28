@@ -253,6 +253,9 @@ fn rewrite_upsert_exprs_for_subprogram(
             }
         }
         if let Some(ref mut idx) = u.index {
+            for target in idx.targets.iter_mut() {
+                rewrite_trigger_expr_for_subprogram(&mut target.expr, ctx)?;
+            }
             if let Some(ref mut wc) = idx.where_clause {
                 rewrite_trigger_expr_for_subprogram(wc, ctx)?;
             }

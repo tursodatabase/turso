@@ -1600,3 +1600,521 @@ test upsert-excluded-reads-the-generated-rowid {
 expect {
     1|10|b22
 }
+
+# A conflict target matches a UNIQUE index when each index column matches a
+# term, and two index columns can match the same term. A term that names the
+# INTEGER PRIMARY KEY column names the rowid, so it matches no index column.
+# The differential fuzzer found the first case in MVCC mode
+# (seed 18176556712755275848, profile writes).
+setup upsert_target_dup {
+    CREATE TABLE t(b INTEGER PRIMARY KEY, n INTEGER, c TEXT);
+    INSERT INTO t VALUES (-1, 5, 'old');
+}
+
+@setup upsert_target_dup
+@cross-check-integrity
+test upsert-target-matches-index-with-a-column-twice {
+    CREATE UNIQUE INDEX i1 ON t(n, n);
+    CREATE UNIQUE INDEX i2 ON t(n, b);
+    INSERT INTO t(n, b) VALUES (5, 1) ON CONFLICT (n, b) DO UPDATE SET c = 'new';
+    SELECT * FROM t;
+}
+expect {
+    -1|5|new
+}
+
+@setup upsert_target_dup
+@cross-check-integrity
+test upsert-target-matches-only-index-with-a-column-twice {
+    CREATE UNIQUE INDEX i1 ON t(n, n);
+    INSERT INTO t(n, b) VALUES (5, 1) ON CONFLICT (n, b) DO UPDATE SET c = 'new';
+    SELECT * FROM t;
+}
+expect {
+    -1|5|new
+}
+
+@setup upsert_target_dup
+test upsert-target-integer-primary-key-matches-no-index-column {
+    CREATE UNIQUE INDEX i2 ON t(n, b);
+    INSERT INTO t(n, b) VALUES (5, 1) ON CONFLICT (n, b) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@setup upsert_target_dup
+test upsert-target-rowid-matches-no-index-column {
+    CREATE UNIQUE INDEX i2 ON t(n, b);
+    INSERT INTO t(n, b) VALUES (5, 1) ON CONFLICT (n, rowid) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@setup upsert_target_dup
+@cross-check-integrity
+test upsert-target-integer-primary-key-in-index-expression {
+    CREATE UNIQUE INDEX i2 ON t(n, b + 0);
+    INSERT INTO t(n, b) VALUES (5, -1) ON CONFLICT (n, b + 0) DO UPDATE SET c = 'new';
+    SELECT * FROM t;
+}
+expect {
+    -1|5|new
+}
+
+@setup upsert_target_dup
+@cross-check-integrity
+test upsert-target-rowid-in-term-matches-integer-primary-key-in-index-expression {
+    CREATE UNIQUE INDEX i2 ON t(n, b + 0);
+    INSERT INTO t(n, b) VALUES (5, -1) ON CONFLICT (n, rowid + 0) DO UPDATE SET c = 'new';
+    SELECT * FROM t;
+}
+expect {
+    -1|5|new
+}
+
+@setup upsert_target_dup
+@cross-check-integrity
+test upsert-target-rowid-in-where-matches-integer-primary-key-in-index-where {
+    CREATE UNIQUE INDEX i2 ON t(n) WHERE b < 0;
+    INSERT INTO t(n, b) VALUES (5, -2) ON CONFLICT (n) WHERE rowid < 0 DO UPDATE SET c = 'new';
+    SELECT * FROM t;
+}
+expect {
+    -1|5|new
+}
+
+@setup upsert_target_dup
+@cross-check-integrity
+test upsert-target-rowid-names-integer-primary-key {
+    INSERT INTO t(n, b) VALUES (6, -1) ON CONFLICT (rowid) DO UPDATE SET c = 'new';
+    INSERT INTO t(n, b) VALUES (7, -1) ON CONFLICT (_rowid_) DO UPDATE SET c = c || '2';
+    SELECT * FROM t;
+}
+expect {
+    -1|5|new2
+}
+
+@setup upsert_target_dup
+test upsert-target-integer-primary-key-with-collate-matches-nothing {
+    INSERT INTO t(n, b) VALUES (5, -1) ON CONFLICT (b COLLATE nocase) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@cross-check-integrity
+test upsert-target-rowid-of-table-without-integer-primary-key {
+    CREATE TABLE r(a UNIQUE, c);
+    INSERT INTO r(rowid, a, c) VALUES (1, 5, 'old');
+    INSERT INTO r(rowid, a) VALUES (1, 6) ON CONFLICT (rowid) DO UPDATE SET c = 'new';
+    INSERT INTO r(a) VALUES (7) ON CONFLICT (rowid) DO UPDATE SET c = 'never';
+    SELECT rowid, a, c FROM r;
+}
+expect {
+    1|5|new
+    2|7|
+}
+
+test upsert-target-rowid-does-not-catch-unique-conflict {
+    CREATE TABLE r(a UNIQUE, c);
+    INSERT INTO r(rowid, a, c) VALUES (1, 5, 'old');
+    INSERT INTO r(rowid, a) VALUES (2, 5) ON CONFLICT (rowid) DO UPDATE SET c = 'new';
+}
+expect error {
+    UNIQUE constraint failed: r.a
+}
+
+@cross-check-integrity
+test upsert-target-collations-of-a-column-twice {
+    CREATE TABLE u(a TEXT, b, c, UNIQUE(a COLLATE nocase, a));
+    INSERT INTO u VALUES ('x', 1, 'old');
+    INSERT INTO u VALUES ('x', 2, 'z') ON CONFLICT (a COLLATE nocase, a COLLATE binary) DO UPDATE SET c = 'new';
+    SELECT * FROM u;
+}
+expect {
+    x|1|new
+}
+
+test upsert-target-collation-must-match-index-column {
+    CREATE TABLE u(a TEXT, b, c, UNIQUE(a COLLATE nocase, a));
+    INSERT INTO u VALUES ('x', 1, 'old');
+    INSERT INTO u VALUES ('x', 2, 'z') ON CONFLICT (a COLLATE nocase, b) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@cross-check-integrity
+test upsert-target-expression-index-with-an-expression-twice {
+    CREATE TABLE u(a TEXT, b, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a), lower(a));
+    INSERT INTO u VALUES ('x', 1, 'old');
+    INSERT INTO u VALUES ('X', 2, 'z') ON CONFLICT (lower(a), b) DO UPDATE SET c = 'new';
+    SELECT * FROM u;
+}
+expect {
+    x|1|new
+}
+
+test upsert-target-expression-with-operands-swapped-matches-nothing {
+    CREATE TABLE u(a, b, c);
+    CREATE UNIQUE INDEX ue ON u(a * b);
+    INSERT INTO u VALUES (1, 2, 'old');
+    INSERT INTO u VALUES (2, 1, 'z') ON CONFLICT (b * a) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+test upsert-target-where-with-operands-swapped-matches-nothing {
+    CREATE TABLE u(a, b, c);
+    CREATE UNIQUE INDEX uc ON u(c) WHERE a = b;
+    INSERT INTO u VALUES (1, 1, 'old');
+    INSERT INTO u VALUES (1, 1, 'old') ON CONFLICT (c) WHERE b = a DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@cross-check-integrity
+test upsert-target-without-collate-matches-expression-with-collate {
+    CREATE TABLE u(a TEXT, b, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase);
+    INSERT INTO u VALUES ('x', 1, 'old');
+    INSERT INTO u VALUES ('x', 2, 'z') ON CONFLICT (lower(a)) DO UPDATE SET c = 'new';
+    SELECT * FROM u;
+}
+expect {
+    x|1|new
+}
+
+@cross-check-integrity
+test upsert-target-with-collate-matches-expression-with-collate {
+    CREATE TABLE u(a TEXT, b, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase);
+    INSERT INTO u VALUES ('x', 1, 'old');
+    INSERT INTO u VALUES ('x', 2, 'z') ON CONFLICT (lower(a) COLLATE nocase) DO UPDATE SET c = 'new';
+    SELECT * FROM u;
+}
+expect {
+    x|1|new
+}
+
+test upsert-target-with-other-collate-matches-nothing {
+    CREATE TABLE u(a TEXT, b, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase);
+    INSERT INTO u VALUES ('x', 1, 'old');
+    INSERT INTO u VALUES ('x', 2, 'z') ON CONFLICT (lower(a) COLLATE binary) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@cross-check-integrity
+test upsert-target-matches-expression-with-collate-in-parentheses {
+    CREATE TABLE u(a TEXT, b, c);
+    CREATE UNIQUE INDEX ue ON u((lower(a) COLLATE nocase));
+    INSERT INTO u VALUES ('x', 1, 'old');
+    INSERT INTO u VALUES ('x', 2, 'z') ON CONFLICT (lower(a)) DO UPDATE SET c = 'new';
+    INSERT INTO u VALUES ('x', 3, 'z') ON CONFLICT (lower(a) COLLATE nocase) DO UPDATE SET c = c || '2';
+    SELECT * FROM u;
+}
+expect {
+    x|1|new2
+}
+
+test upsert-target-with-other-collate-matches-nothing-in-parentheses {
+    CREATE TABLE u(a TEXT, b, c);
+    CREATE UNIQUE INDEX ue ON u((lower(a) COLLATE nocase));
+    INSERT INTO u VALUES ('x', 1, 'old');
+    INSERT INTO u VALUES ('x', 2, 'z') ON CONFLICT (lower(a) COLLATE binary) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+test upsert-target-with-two-collates-matches-no-expression {
+    CREATE TABLE u(a TEXT, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase);
+    INSERT INTO u VALUES ('A', 'old');
+    INSERT INTO u VALUES ('a', 'z') ON CONFLICT (lower(a) COLLATE binary COLLATE nocase) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+test upsert-target-with-two-collates-matches-no-column {
+    CREATE TABLE u(a TEXT, c, UNIQUE(a));
+    INSERT INTO u VALUES ('A', 'old');
+    INSERT INTO u VALUES ('A', 'z') ON CONFLICT (a COLLATE nocase COLLATE binary) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+test upsert-target-with-one-collate-matches-no-expression-with-two {
+    CREATE TABLE u(a TEXT, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase COLLATE binary);
+    INSERT INTO u VALUES ('A', 'old');
+    INSERT INTO u VALUES ('a', 'z') ON CONFLICT (lower(a) COLLATE binary) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@cross-check-integrity
+test upsert-target-matches-expression-with-two-collates {
+    CREATE TABLE u(a TEXT, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase COLLATE binary);
+    INSERT INTO u VALUES ('A', 'old');
+    INSERT INTO u VALUES ('a', 'z') ON CONFLICT (lower(a) COLLATE nocase COLLATE binary) DO UPDATE SET c = 'new';
+    INSERT INTO u VALUES ('a', 'z') ON CONFLICT (lower(a)) DO UPDATE SET c = c || '!';
+    SELECT * FROM u;
+}
+expect {
+    A|new!
+}
+
+@cross-check-integrity
+test upsert-target-where-names-table-by-alias {
+    CREATE TABLE p(a, b, c);
+    CREATE UNIQUE INDEX pa ON p(a) WHERE b > 0;
+    INSERT INTO p VALUES (1, 1, 'old');
+    INSERT INTO p AS x VALUES (1, 2, 'z') ON CONFLICT (a) WHERE x.b > 0 DO UPDATE SET c = 'new';
+    SELECT * FROM p;
+}
+expect {
+    1|1|new
+}
+
+@cross-check-integrity
+test upsert-target-where-subquery-reads-cte {
+    CREATE TABLE p(a UNIQUE, c);
+    INSERT INTO p VALUES (1, 'old');
+    WITH k(x) AS (SELECT 'new') INSERT INTO p VALUES (1, 'z') ON CONFLICT (a) WHERE (SELECT x FROM k) DO UPDATE SET c = (SELECT x FROM k);
+    SELECT * FROM p;
+}
+expect {
+    1|new
+}
+
+# SQLite resolves the names in every term of the target and in its WHERE
+# clause, also in a term that no index column needs, and in the WHERE clause
+# of a target whose index is not partial.
+setup upsert_target_names {
+    CREATE TABLE t(a, b, c, UNIQUE(a, a));
+    INSERT INTO t VALUES (1, 2, 'old');
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-aggregate {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, max(b)) DO UPDATE SET c = 'new';
+}
+expect error {
+    misuse of aggregate function max()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-count-star {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, count(*)) DO UPDATE SET c = 'new';
+}
+expect error {
+    misuse of aggregate function count()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-window-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, count(*) OVER ()) DO UPDATE SET c = 'new';
+}
+expect error {
+    misuse of window function count()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-unknown-column {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, zz) DO UPDATE SET c = 'new';
+}
+expect error {
+    no such column: zz
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-unknown-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, nofn(b)) DO UPDATE SET c = 'new';
+}
+expect error {
+    no such function: nofn
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-wrong-argument-count {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, abs(b, 1)) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function abs()
+}
+
+# SQLite checks the argument count when it resolves the name, also for
+# functions that take a variable count with a minimum, and for math and
+# JSON functions.
+@setup upsert_target_names
+test upsert-target-term-with-too-few-arguments-to-variadic-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, coalesce(b)) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function coalesce()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-wrong-argument-count-to-math-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, sqrt(b, 1)) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function sqrt()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-wrong-argument-count-to-json-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, json_array_length()) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function json_array_length()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-subquery-with-wrong-argument-count {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, (SELECT iif(1))) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function iif()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-subquery-on-unknown-column {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, (SELECT zz)) DO UPDATE SET c = 'new';
+}
+expect error {
+    no such column: zz
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-subquery-calling-unknown-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, (SELECT nofn(1))) DO UPDATE SET c = 'new';
+}
+expect error {
+    no such function: nofn
+}
+
+@setup upsert_target_names
+@cross-check-integrity
+test upsert-target-term-no-index-column-needs {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, (SELECT max(b) FROM t)) DO UPDATE SET c = 'new';
+    SELECT * FROM t;
+}
+expect {
+    1|2|new
+}
+
+setup upsert_target_where_names {
+    CREATE TABLE t(a UNIQUE, b, c);
+    INSERT INTO t VALUES (1, 2, 'old');
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-aggregate {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE max(b) DO UPDATE SET c = 'new';
+}
+expect error {
+    misuse of aggregate function max()
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-unknown-column {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE zz DO UPDATE SET c = 'new';
+}
+expect error {
+    no such column: zz
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-unknown-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE nofn(b) DO NOTHING;
+}
+expect error {
+    no such function: nofn
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-wrong-argument-count {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE abs(1, 2) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function abs()
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-wrong-argument-count-to-math-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE pi(1) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function pi()
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-too-few-arguments-to-variadic-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE concat_ws(b) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function concat_ws()
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-subquery-on-unknown-column {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE EXISTS (SELECT zz) DO UPDATE SET c = 'new';
+}
+expect error {
+    no such column: zz
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-of-second-clause-with-unknown-column {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) DO NOTHING ON CONFLICT (a) WHERE zz DO NOTHING;
+}
+expect error {
+    no such column: zz
+}
+
+@setup upsert_target_where_names
+test upsert-target-of-second-clause-matches-nothing {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) DO NOTHING ON CONFLICT (b) DO NOTHING;
+}
+expect error {
+    2nd ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@setup upsert_target_where_names
+test upsert-target-before-catch-all-matches-nothing {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (b) DO NOTHING ON CONFLICT DO NOTHING;
+}
+expect error {
+    1st ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+# The conflict target of an UPSERT in a trigger can name NEW. UNIQUE(a, a)
+# needs only the term a, but the term new.x must still resolve.
+@cross-check-integrity
+test upsert-target-in-trigger-names-new {
+    CREATE TABLE t(a, b, c, UNIQUE(a, a));
+    CREATE TABLE src(x);
+    INSERT INTO t VALUES (1, 2, 'o');
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+      INSERT INTO t VALUES (1, new.x, 'z') ON CONFLICT (a, new.x) DO UPDATE SET c = 'n';
+    END;
+    INSERT INTO src VALUES (5);
+    SELECT * FROM t;
+}
+expect {
+    1|2|n
+}

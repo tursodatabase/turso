@@ -4999,3 +4999,59 @@ fn test_upsert_do_update_failure_aborts_statement(tmp_db: TempDatabase) -> anyho
 
     Ok(())
 }
+
+/// When an UPSERT target matches both the index of a UNIQUE table constraint
+/// and a later CREATE UNIQUE INDEX, SQLite selects the newest index. The
+/// selection must not change when a new connection loads the schema from disk.
+#[turso_macros::test]
+fn test_upsert_target_selects_newest_index_after_schema_load(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let cases = [
+        (
+            "unique_same_column_twice",
+            "CREATE TABLE t(a, b, c, UNIQUE(a, a)); \
+             CREATE UNIQUE INDEX i2 ON t(a, b); \
+             INSERT INTO t VALUES(1, 1, 'o');",
+            "INSERT INTO t VALUES(1, 2, 'z') ON CONFLICT(a, b) DO UPDATE SET c = 'n'",
+        ),
+        (
+            "unique_collate_nocase",
+            "CREATE TABLE t(a TEXT, c, UNIQUE(a COLLATE NOCASE)); \
+             CREATE UNIQUE INDEX i2 ON t(a); \
+             INSERT INTO t VALUES('x', 1);",
+            "INSERT INTO t VALUES('X', 2) ON CONFLICT(a) DO UPDATE SET c = 9",
+        ),
+    ];
+
+    for (label, ddl, upsert) in cases {
+        let limbo_db = TempDatabase::builder()
+            .with_db_name(format!("{label}.db"))
+            .build();
+        let limbo_conn = limbo_db.connect_limbo();
+        for stmt in ddl.split_terminator(';').map(str::trim) {
+            if !stmt.is_empty() {
+                limbo_conn.execute(stmt).unwrap();
+            }
+        }
+        let db_path = limbo_db.path.clone();
+        drop(limbo_conn);
+        drop(limbo_db);
+
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        sqlite_conn.execute_batch(ddl).unwrap();
+
+        let limbo_db = TempDatabase::new_with_existent(&db_path);
+        let limbo_conn = limbo_db.connect_limbo();
+        if let Err(e) = exec_and_compare(label, &sqlite_conn, &limbo_conn, upsert) {
+            panic!("{e}");
+        }
+        if let Some(e) = compare_tables(label, &sqlite_conn, &limbo_conn, "SELECT * FROM t") {
+            panic!("{e}");
+        }
+    }
+
+    Ok(())
+}

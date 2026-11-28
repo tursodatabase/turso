@@ -485,11 +485,24 @@ impl JsonFunc {
         match self {
             Self::Json | Self::Jsonb | Self::JsonQuote | Self::JsonErrorPosition => &[1],
             Self::JsonPatch | Self::JsonbPatch => &[2],
-            Self::JsonArrayLength | Self::JsonType | Self::JsonValid => &[1, 2],
+            Self::JsonArrayLength | Self::JsonType | Self::JsonValid | Self::JsonPretty => &[1, 2],
             // Operators — filtered out, arity doesn't matter
             Self::JsonArrowExtract | Self::JsonArrowShiftExtract => &[2],
             // Variable-arg
-            _ => &[-1],
+            Self::JsonArray
+            | Self::JsonbArray
+            | Self::JsonExtract
+            | Self::JsonbExtract
+            | Self::JsonObject
+            | Self::JsonbObject
+            | Self::JsonRemove
+            | Self::JsonbRemove
+            | Self::JsonReplace
+            | Self::JsonbReplace
+            | Self::JsonInsert
+            | Self::JsonbInsert
+            | Self::JsonSet
+            | Self::JsonbSet => &[-1],
         }
     }
 }
@@ -588,8 +601,8 @@ pub enum FtsFunc {
     /// fts_match(col1, col2, ..., query): returns true if document matches query
     /// Used in WHERE clause for filtering rows by FTS match
     Match,
-    /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
-    /// Wraps matching query terms in the text with before_tag and after_tag markers
+    /// fts_highlight(text1, text2, ..., before_tag, after_tag, query): returns the text columns
+    /// joined by spaces, with matching query terms wrapped in before_tag and after_tag markers
     Highlight,
 }
 
@@ -601,7 +614,8 @@ impl FtsFunc {
 
     pub fn arities(&self) -> &'static [i32] {
         match self {
-            Self::Highlight => &[4],
+            // One or more text columns, then before_tag, after_tag and query
+            Self::Highlight => &[-6],
             // Score and Match take variable columns + query
             Self::Score | Self::Match => &[-1],
         }
@@ -1683,7 +1697,8 @@ impl ScalarFunc {
 
     /// Returns the valid arities for this function.
     /// Each value becomes a separate row in PRAGMA function_list.
-    /// -1 means truly variable arguments (e.g. coalesce, printf).
+    /// -1 means any number of arguments (e.g. printf), -3 means 1 or more
+    /// (concat) and -4 means 2 or more (coalesce), as in SQLite.
     pub fn arities(&self) -> &'static [i32] {
         match self {
             // 0-arg
@@ -1730,12 +1745,11 @@ impl ScalarFunc {
             Self::Like => &[2, 3],
             Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],
             Self::Substr | Self::Substring => &[2, 3],
+            // Variable-arg, with a minimum argument count as in SQLite
+            Self::Concat => &[-3],
+            Self::Coalesce | Self::Iif | Self::ConcatWs => &[-4],
             // Truly variable-arg
             Self::Char
-            | Self::Coalesce
-            | Self::Iif
-            | Self::Concat
-            | Self::ConcatWs
             | Self::Date
             | Self::Time
             | Self::DateTime
@@ -1745,7 +1759,7 @@ impl ScalarFunc {
             | Self::Printf => &[-1],
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
-            Self::LoadExtension => &[-1],
+            Self::LoadExtension => &[1],
             // Internal functions that cannot be called by name
             Self::Cast
             | Self::StatInit
@@ -2347,7 +2361,7 @@ impl Func {
         funcs.push(FunctionListEntry {
             name: "if".into(),
             func_type: "s",
-            narg: -1,
+            narg: -4,
             deterministic: true,
         });
 
@@ -2358,6 +2372,6 @@ impl Func {
 pub struct FunctionListEntry {
     pub name: String,
     pub func_type: &'static str, // "s" = scalar, "a" = aggregate, "w" = window
-    pub narg: i32,               // -1 = variable
+    pub narg: i32,               // -1 = variable, -N = at least N-2
     pub deterministic: bool,
 }

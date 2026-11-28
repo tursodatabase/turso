@@ -359,7 +359,7 @@ pub fn translate_insert(
     }
     let BoundInsertResult {
         mut values,
-        mut upsert_actions,
+        upserts,
         inserting_multiple_rows,
     } = bind_insert(
         program,
@@ -368,7 +368,6 @@ pub fn translate_insert(
         &columns,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
-        namespace,
     )?;
 
     let is_mvcc = connection.mv_store_for_db(database_id).is_some();
@@ -382,6 +381,34 @@ pub fn translate_insert(
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
+
+    let mut table_references = plan_insert_table_references(
+        program,
+        resolver,
+        &table,
+        table_name.as_str(),
+        namespace,
+        &returning,
+        &upserts,
+        with_for_returning,
+        connection,
+    )?;
+
+    // Resolve the constraint each ON CONFLICT clause names.
+    let clause_count = upserts.len();
+    let mut upsert_actions = Vec::with_capacity(clause_count);
+    for (position, upsert) in upserts.into_iter().enumerate() {
+        let target = resolve_upsert_target(
+            program,
+            resolver,
+            connection,
+            &table_references,
+            tbl_name.alias.as_ref().map(|alias| alias.as_str()),
+            &upsert,
+            (clause_count > 1).then_some(position + 1),
+        )?;
+        upsert_actions.push((target, program.allocate_label(), upsert));
+    }
 
     let updates_on_conflict = upsert_actions
         .iter()
@@ -397,18 +424,13 @@ pub fn translate_insert(
         None
     };
 
-    let (mut table_references, mut result_columns, mut returning_subqueries) =
-        plan_insert_returning(
-            program,
-            resolver,
-            &table,
-            table_name.as_str(),
-            namespace,
-            &mut returning,
-            &upsert_actions,
-            with_for_returning,
-            connection,
-        )?;
+    let (mut result_columns, mut returning_subqueries) = plan_insert_returning(
+        program,
+        resolver,
+        &mut table_references,
+        &mut returning,
+        connection,
+    )?;
     let reads_columns = updates_on_conflict
         || upsert_actions
             .iter()
@@ -2139,7 +2161,9 @@ fn check_upsert_privileges(
 struct BoundInsertResult {
     #[allow(clippy::vec_box)]
     values: Vec<Box<Expr>>,
-    upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)>,
+    /// The ON CONFLICT clauses, in order.
+    #[allow(clippy::vec_box)]
+    upserts: Vec<Box<Upsert>>,
     inserting_multiple_rows: bool,
 }
 
@@ -2281,11 +2305,10 @@ fn bind_insert(
     columns: &[ast::Name],
     body: &mut InsertBody,
     on_conflict: ResolveType,
-    namespace: NamespaceRef,
 ) -> Result<BoundInsertResult> {
     let mut values: Vec<Box<Expr>> = vec![];
     let mut upsert: Option<Box<Upsert>> = None;
-    let mut upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)> = Vec::new();
+    let mut upserts: Vec<Box<Upsert>> = Vec::new();
     let mut inserting_multiple_rows = false;
     match body {
         InsertBody::DefaultValues => {
@@ -2404,19 +2427,12 @@ fn bind_insert(
             }
         }
         let next = upsert_opt.next.take();
-        upsert_actions.push((
-            // resolve the constrained target for UPSERT in the chain
-            resolver.with_schema(namespace.database_id, |s| {
-                resolve_upsert_target(s, namespace.id, table, &upsert_opt)
-            })?,
-            program.allocate_label(),
-            upsert_opt,
-        ));
+        upserts.push(upsert_opt);
         upsert = next;
     }
     Ok(BoundInsertResult {
         values,
-        upsert_actions,
+        upserts,
         inserting_multiple_rows,
     })
 }
@@ -3557,7 +3573,7 @@ fn translate_virtual_table_insert(
         );
     }
     let table = Table::Virtual(virtual_table.clone());
-    // The UPSERT actions are not used: a virtual table resolves conflicts itself,
+    // The UPSERT clauses are not used: a virtual table resolves conflicts itself,
     // from the conflict mode that VUpdate passes to it.
     let BoundInsertResult {
         values,
@@ -3570,17 +3586,23 @@ fn translate_virtual_table_insert(
         &columns,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
-        namespace,
     )?;
-    let (table_references, result_columns, mut returning_subqueries) = plan_insert_returning(
+    let mut table_references = plan_insert_table_references(
         program,
         resolver,
         &table,
         table_name,
         namespace,
-        &mut returning,
+        &returning,
         &[],
         with_for_returning,
+        connection,
+    )?;
+    let (result_columns, mut returning_subqueries) = plan_insert_returning(
+        program,
+        resolver,
+        &mut table_references,
+        &mut returning,
         connection,
     )?;
     let reads_columns = roles::reads_columns_of(
@@ -3787,24 +3809,20 @@ fn translate_virtual_table_insert(
 }
 
 /// Builds the table references of an INSERT, which hold only the target table,
-/// and plans the INSERT's RETURNING clause against them: its CTEs, its
-/// subqueries and its result columns.
+/// and plans the CTEs that the subqueries of RETURNING, of the ON CONFLICT
+/// targets and of DO UPDATE use.
 #[allow(clippy::too_many_arguments)]
-fn plan_insert_returning(
+fn plan_insert_table_references(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table: &Table,
     table_name: &str,
     namespace: NamespaceRef,
-    returning: &mut [ResultColumn],
-    upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    returning: &[ResultColumn],
+    upserts: &[Box<Upsert>],
     with: Option<With>,
     connection: &Arc<Connection>,
-) -> Result<(
-    TableReferences,
-    Vec<ResultSetColumn>,
-    Vec<NonFromClauseSubquery>,
-)> {
+) -> Result<TableReferences> {
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
             table: table.clone(),
@@ -3826,14 +3844,24 @@ fn plan_insert_returning(
     );
 
     // Plan CTEs and add them as outer query references for the subqueries of
-    // RETURNING and of DO UPDATE
+    // RETURNING, of the ON CONFLICT targets and of DO UPDATE
     let mut subquery_table_refs = Vec::new();
-    for column in returning.iter() {
+    for column in returning {
         if let ResultColumn::Expr(expr, _) = column {
             collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
         }
     }
-    for (_, _, upsert) in upsert_actions {
+    for upsert in upserts {
+        if let Some(target) = &upsert.index {
+            for expr in target
+                .targets
+                .iter()
+                .map(|term| &term.expr)
+                .chain(&target.where_clause)
+            {
+                collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+            }
+        }
         if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
             for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
                 collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
@@ -3848,21 +3876,32 @@ fn plan_insert_returning(
         &mut table_references,
         connection,
     )?;
+    Ok(table_references)
+}
 
+/// Plans the INSERT's RETURNING clause against the table references of the
+/// INSERT: its subqueries and its result columns.
+fn plan_insert_returning(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_references: &mut TableReferences,
+    returning: &mut [ResultColumn],
+    connection: &Arc<Connection>,
+) -> Result<(Vec<ResultSetColumn>, Vec<NonFromClauseSubquery>)> {
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut returning_subqueries = vec![];
     plan_subqueries_from_returning(
         program,
         &mut returning_subqueries,
-        &mut table_references,
+        table_references,
         returning,
         resolver,
         connection,
     )?;
 
-    let result_columns = process_returning_clause(returning, &mut table_references, resolver)?;
-    Ok((table_references, result_columns, returning_subqueries))
+    let result_columns = process_returning_clause(returning, table_references, resolver)?;
+    Ok((result_columns, returning_subqueries))
 }
 
 /// Emits the RETURNING row of an INSERT from the registers that hold the

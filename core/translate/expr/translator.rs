@@ -1129,13 +1129,7 @@ fn translate_function_call_expr(
         unreachable!("translate_function_call_expr expects Expr::FunctionCall");
     };
     let args_count = args.len();
-    let func_type = resolver.resolve_function(name.as_str(), args_count)?;
-
-    if func_type.is_none() {
-        crate::bail_parse_error!("no such function: {}", name.as_str());
-    }
-
-    let func = func_type.unwrap();
+    let func = resolve_scalar_function_call(name, args_count, filter_over, resolver)?;
     let collation = if func.needs_collation() {
         first_collation(
             args.iter()
@@ -1151,20 +1145,8 @@ fn translate_function_call_expr(
     };
 
     match &func_ctx.func {
-        func if func.is_aggregate() => {
-            crate::bail_parse_error!(
-                "misuse of {} function {}()",
-                if filter_over.over_clause.is_some() {
-                    "window"
-                } else {
-                    "aggregate"
-                },
-                name.as_str()
-            )
-        }
-        Func::Agg(_) => unreachable!("is_aggregate() is true for every built-in aggregate"),
-        Func::Window(_) => {
-            crate::bail_parse_error!("misuse of window function {}()", name.as_str())
+        Func::Agg(_) | Func::Window(_) => {
+            unreachable!("resolve_scalar_function_call rejects aggregate and window functions")
         }
         Func::External(_) | Func::Dialect(_) => {
             let argument_types: Vec<String> = match &func_ctx.func {
@@ -2461,6 +2443,38 @@ fn translate_function_call_expr(
             crate::bail_parse_error!("{} requires an FTS index query", name.as_str())
         }
         Func::AlterTable(_) => unreachable!(),
+    }
+}
+
+/// Resolves the function of a call where aggregate and window functions are
+/// not allowed. Fails, as SQLite does, when no function has the name and
+/// number of arguments, or when it is an aggregate or window function.
+pub(crate) fn resolve_scalar_function_call(
+    name: &ast::Name,
+    args_count: usize,
+    filter_over: &ast::FunctionTail,
+    resolver: &Resolver,
+) -> Result<Func> {
+    let Some(func) = resolver.resolve_function(name.as_str(), args_count)? else {
+        crate::bail_parse_error!("no such function: {}", name.as_str());
+    };
+    match func {
+        func if func.is_aggregate() => {
+            crate::bail_parse_error!(
+                "misuse of {} function {}()",
+                if filter_over.over_clause.is_some() {
+                    "window"
+                } else {
+                    "aggregate"
+                },
+                name.as_str()
+            )
+        }
+        Func::Agg(_) => unreachable!("is_aggregate() is true for every built-in aggregate"),
+        Func::Window(_) => {
+            crate::bail_parse_error!("misuse of window function {}()", name.as_str())
+        }
+        func => Ok(func),
     }
 }
 

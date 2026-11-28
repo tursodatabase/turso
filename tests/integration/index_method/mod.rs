@@ -1727,6 +1727,24 @@ fn test_fts_highlight_without_selected_index(tmp_db: TempDatabase) {
             "quick <b>fox</b>".to_string()
         )]]
     );
+    // Two text columns: each one before the tags is highlighted.
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT fts_highlight('The quick fox', 'brown dog', '<b>', '</b>', 'quick dog')"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "The <b>quick</b> fox brown <b>dog</b>".to_string()
+        )]]
+    );
+    let err = conn
+        .execute("SELECT fts_highlight('quick fox', '<b>', '</b>')")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("wrong number of arguments to function fts_highlight()"),
+        "{err}"
+    );
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
