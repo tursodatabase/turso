@@ -2180,6 +2180,12 @@ impl WalCoordination for ShmWalCoordination {
             self.authority.release_writer(self.owner);
             return false;
         }
+        // The writer lock is held, so no transaction is in progress and every
+        // index entry above the published `max_frame` was left by a writer that
+        // died before committing or rolling back. Drop them (like SQLite's
+        // `walCleanupHash`) so the next appended frame stays monotonic.
+        self.authority
+            .rollback_frames(self.authority.snapshot().max_frame);
         true
     }
 
@@ -8171,6 +8177,58 @@ pub mod test {
             vec![(7, 2), (9, 4)]
         );
         assert!(shm_path.exists());
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_shm_coordination_new_writer_discards_frames_left_by_dead_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-dead-writer.db-wal");
+        let shm_path = dir.path().join("test-dead-writer.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        set_shared_snapshot(
+            &shared,
+            WalSnapshot {
+                max_frame: 3,
+                nbackfills: 0,
+                last_checksum: (31, 37),
+                checkpoint_seq: 5,
+                transaction_count: 9,
+            },
+        );
+        let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+        coordination.cache_frame(7, 1);
+        coordination.cache_frame(9, 2);
+        coordination.cache_frame(7, 3);
+
+        // A writer that appended uncommitted frames 4..=6 and died: nothing
+        // published them, and nothing rolled the index back.
+        coordination.cache_frame(11, 4);
+        coordination.cache_frame(7, 5);
+        coordination.cache_frame(13, 6);
+        assert_eq!(authority.snapshot().max_frame, 3);
+
+        assert!(coordination.try_begin_write_tx());
+        assert_eq!(
+            authority.iter_latest_frames(0, u64::MAX),
+            vec![(7, 3), (9, 2)]
+        );
+        // Without the trim this panics: "frame ids must increase monotonically".
+        coordination.cache_frame(15, 4);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 4,
+            last_checksum: (55, 89),
+            transaction_count: 10,
+        });
+        coordination.end_write_tx();
+
+        assert_eq!(coordination.find_frame(7, 0, 4, None), Some(3));
+        assert_eq!(coordination.find_frame(11, 0, 4, None), None);
+        assert_eq!(coordination.find_frame(15, 0, 4, None), Some(4));
     }
 
     #[cfg(host_shared_wal)]

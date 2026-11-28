@@ -2393,6 +2393,18 @@ impl MappedSharedWalCoordination {
     /// clear the entire index) and by `install_snapshot` to trim stale
     /// entries from a previous WAL generation.
     pub(crate) fn rollback_frames(&self, max_frame: u64) {
+        self.rollback_frames_inner(max_frame, |_| {});
+    }
+
+    /// `after_hash_slot_write` runs after every hash slot store of the
+    /// mid-block trim, so tests can observe the table between stores. It gets
+    /// the trimmed block because `find_frame` would take the mapping lock the
+    /// trim already holds.
+    fn rollback_frames_inner(
+        &self,
+        max_frame: u64,
+        mut after_hash_slot_write: impl FnMut(&FrameIndexBlockMapping),
+    ) {
         let _publish_guard = self.frame_index_publish_lock.lock();
         let header = self.header();
         let len = header
@@ -2424,9 +2436,10 @@ impl MappedSharedWalCoordination {
         let retained_entries = new_len % FRAME_INDEX_BLOCK_CAPACITY;
         if retained_entries != 0 {
             let retained_block = (new_len - 1) / FRAME_INDEX_BLOCK_CAPACITY;
-            Self::rebuild_frame_index_block_hash(
+            Self::trim_frame_index_block_hash(
                 &mappings[retained_block as usize],
                 retained_entries,
+                &mut after_hash_slot_write,
             );
         }
     }
@@ -2777,15 +2790,29 @@ impl MappedSharedWalCoordination {
         panic!("shared WAL frame index block hash table is full");
     }
 
-    fn rebuild_frame_index_block_hash(mapping: &FrameIndexBlockMapping, visible_entries: u32) {
+    /// Drop hash slots whose entry index is `>= visible_entries`, never
+    /// touching a slot that points at a retained entry (sqlite walCleanupHash),
+    /// so concurrent lock-free readers always find every retained entry.
+    fn trim_frame_index_block_hash(
+        mapping: &FrameIndexBlockMapping,
+        visible_entries: u32,
+        after_slot_write: &mut impl FnMut(&FrameIndexBlockMapping),
+    ) {
         turso_assert!(
             visible_entries <= FRAME_INDEX_BLOCK_CAPACITY,
             "visible block entries out of range"
         );
-        Self::clear_frame_index_block_hash(mapping);
-        for local_index in 0..visible_entries {
-            let entry = unsafe { *mapping.entries_ptr.as_ptr().add(local_index as usize) };
-            Self::insert_frame_index_block_hash(mapping, local_index, entry.page_id);
+        let hash_ptr = Self::frame_index_block_hash_ptr(mapping);
+        for slot in 0..FRAME_INDEX_BLOCK_HASH_SLOTS as usize {
+            // SAFETY: slot is within the block's mapped hash table; u16 and
+            // AtomicU16 have the same layout.
+            let cell = unsafe { &*(hash_ptr.add(slot) as *const std::sync::atomic::AtomicU16) };
+            // Slots hold entry index + 1, so index >= visible_entries means
+            // value > visible_entries.
+            if cell.load(Ordering::Relaxed) as u32 > visible_entries {
+                cell.store(0, Ordering::Release);
+                after_slot_write(mapping);
+            }
         }
     }
 
@@ -4450,6 +4477,41 @@ mod tests {
         assert_eq!(found, Some(4));
         // 5 entries in the chain plus the empty slot that ends it.
         assert!(probe_steps <= 6, "probed {probe_steps} slots");
+    }
+
+    #[test]
+    fn mid_block_rollback_never_hides_a_retained_frame_from_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let colliding = colliding_page_ids(3);
+        let (a, b, c) = (colliding[0], colliding[1], colliding[2]);
+
+        mapped.record_frame(a, 1);
+        mapped.record_frame(b, 2);
+        mapped.record_frame(a, 3);
+        mapped.record_frame(c, 4);
+        mapped.record_frame(b, 5);
+        mapped.record_frame(c, 6);
+
+        let mut slots_cleared = 0;
+        mapped.rollback_frames_inner(3, |block| {
+            slots_cleared += 1;
+            // local entry index = frame - 1 in the first block
+            assert_eq!(
+                MappedSharedWalCoordination::find_frame_in_block(block, a, 3),
+                Some(2)
+            );
+            assert_eq!(
+                MappedSharedWalCoordination::find_frame_in_block(block, b, 3),
+                Some(1)
+            );
+        });
+
+        assert_eq!(slots_cleared, 3, "exactly the dead entries are unhooked");
+        assert_eq!(mapped.find_frame(c, 0, 6, None), None);
+        assert_eq!(mapped.find_frame(a, 0, 3, None), Some(3));
+        assert_eq!(mapped.find_frame(b, 0, 3, None), Some(2));
     }
 
     #[test]
