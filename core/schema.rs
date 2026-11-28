@@ -362,6 +362,17 @@ impl ResolvedType {
         self.base_type().and_then(|type_def| type_def.ordering())
     }
 
+    /// The affinity that a comparison with a value of the type uses: that of
+    /// the values the type reads as, or that of the stored form when the type
+    /// has an order of its own. A column of the type and a CAST to the type
+    /// compare by it.
+    pub fn comparison_affinity(&self) -> Affinity {
+        match self.ordering() {
+            Some(_) => Affinity::affinity(&self.primitive),
+            None => self.leaf().value_type().affinity(),
+        }
+    }
+
     /// The first type in the chain that is not a domain: the type itself, or
     /// the type a domain is based on. None for a domain over a plain SQLite
     /// type, such as `CREATE DOMAIN pos AS integer`.
@@ -8806,12 +8817,7 @@ impl Column {
                 let stored_affinity = Affinity::affinity(&resolved.primitive);
                 self.override_affinity(stored_affinity);
                 self.type_ordering = resolved.ordering();
-                self.value_affinity = Some(match self.type_ordering {
-                    // Its values compare in the type's own order, by how
-                    // they are stored.
-                    Some(_) => stored_affinity,
-                    None => resolved.leaf().value_type().affinity(),
-                });
+                self.value_affinity = Some(resolved.comparison_affinity());
             }
             None => self.value_affinity = None,
         }

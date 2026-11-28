@@ -30,6 +30,10 @@ pub(crate) trait ExprProperties<
     fn register_affinity(&self, register: usize) -> Option<Affinity>;
     fn register_collation(&self, register: usize) -> Option<TextCollation>;
     fn subquery_affinity(&self, query: SubqueryId, result_reg: usize) -> Option<Affinity>;
+    /// The comparison affinity of a CAST to `ty` when `ty` is a registered
+    /// type, which is that of a column of the type. None when `ty` is not
+    /// registered, or when the context has no schema to look it up in.
+    fn cast_affinity(&self, ty: &crate::ast::Type) -> Option<Affinity>;
 }
 
 #[derive(Clone, Copy)]
@@ -171,6 +175,23 @@ impl ExprProperties for ExprContext<'_, '_> {
         let subquery = self.resolver.row_value_subqueries.get(query)?;
         Some(subquery.column(result_reg)?.affinity)
     }
+
+    fn cast_affinity(&self, ty: &crate::ast::Type) -> Option<Affinity> {
+        if ty.array_dimensions > 0 {
+            return None;
+        }
+        let schema = self.resolver.schema();
+        let name = crate::util::dequote(&ty.name);
+        if super::expr::is_sqlite_cast_to(schema.get_type_def_unchecked(&name)?, ty) {
+            return None;
+        }
+        Some(
+            schema
+                .resolve_type_unchecked(&name)
+                .ok()??
+                .comparison_affinity(),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -252,5 +273,9 @@ impl ExprProperties for TableMetadata<'_> {
 
     fn subquery_affinity(&self, query: TableInternalId, _result_reg: usize) -> Option<Affinity> {
         self.tables?.scalar_subquery_affinity(query)
+    }
+
+    fn cast_affinity(&self, _ty: &crate::ast::Type) -> Option<Affinity> {
+        None
     }
 }

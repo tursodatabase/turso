@@ -56,6 +56,7 @@ macro_rules! scalar_functions {
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
     let options = crate::pg_type::register_integer_operator_functions(options);
+    let options = crate::pg_type::register_bytea_functions(options);
     options
         .extension_function(
             pg_scalar_function(
@@ -2055,18 +2056,38 @@ fn exec_textlike(args: &[Register]) -> Result<Option<Boolean>> {
     ) else {
         return Ok(None);
     };
-    Ok(Some(Boolean(like_matches(&text, &pattern)?)))
+    Ok(Some(Boolean(like_matches(
+        text.as_bytes(),
+        pattern.as_bytes(),
+        utf8_char_len,
+    )?)))
+}
+
+/// The length of the UTF-8 character that starts at `text[at]`.
+fn utf8_char_len(text: &[u8], at: usize) -> usize {
+    let len = match text[at] {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xFF => 4,
+        _ => 1,
+    };
+    len.min(text.len() - at)
 }
 
 /// PostgreSQL's LIKE (MatchText in like_match.c): case-sensitive, `%` and `_`
 /// wildcards, and `\` makes the next pattern character literal. Literals are
-/// compared byte by byte, and `_` steps over one UTF-8 character. A `%` with
+/// compared byte by byte, and `_` steps over what `char_len` gives for the
+/// position: one UTF-8 character for text and one byte for bytea. A `%` with
 /// the wildcards after it is skipped at once; on a later mismatch, matching
 /// resumes after it at the next text position that starts with the literal
 /// following it. Only the last `%` needs this: once the pattern after it
 /// reaches another `%`, no other position for the earlier one can do better.
-fn like_matches(text: &str, pattern: &str) -> Result<bool> {
-    let next_char = |t: usize| t + text[t..].chars().next().map_or(1, char::len_utf8);
+pub(crate) fn like_matches(
+    text: &[u8],
+    pattern: &[u8],
+    char_len: fn(&[u8], usize) -> usize,
+) -> Result<bool> {
+    let next_char = |t: usize| t + char_len(text, t);
     let trailing_escape = || {
         sqlstate_error(
             SQLSTATE_INVALID_ESCAPE_SEQUENCE,
@@ -2074,19 +2095,18 @@ fn like_matches(text: &str, pattern: &str) -> Result<bool> {
             None,
         )
     };
-    let (text_bytes, pattern_bytes) = (text.as_bytes(), pattern.as_bytes());
     let (mut p, mut t) = (0, 0);
     // The pattern position after the last `%` and the text position from
     // which to look for its next match.
     let mut resume: Option<(usize, usize)> = None;
     loop {
         if t == text.len() {
-            return Ok(pattern_bytes[p..].iter().all(|&b| b == b'%'));
+            return Ok(pattern[p..].iter().all(|&b| b == b'%'));
         }
-        let matched = match pattern_bytes.get(p) {
+        let matched = match pattern.get(p) {
             Some(b'%') => {
                 p += 1;
-                while let Some(&wildcard @ (b'%' | b'_')) = pattern_bytes.get(p) {
+                while let Some(&wildcard @ (b'%' | b'_')) = pattern.get(p) {
                     if wildcard == b'_' {
                         if t == text.len() {
                             return Ok(false);
@@ -2095,7 +2115,7 @@ fn like_matches(text: &str, pattern: &str) -> Result<bool> {
                     }
                     p += 1;
                 }
-                match &pattern_bytes[p..] {
+                match &pattern[p..] {
                     [] => return Ok(true),
                     [b'\\'] => return Err(trailing_escape()),
                     _ => {}
@@ -2109,17 +2129,17 @@ fn like_matches(text: &str, pattern: &str) -> Result<bool> {
                 true
             }
             Some(b'\\') => {
-                let Some(&literal) = pattern_bytes.get(p + 1) else {
+                let Some(&literal) = pattern.get(p + 1) else {
                     return Err(trailing_escape());
                 };
                 p += 2;
                 t += 1;
-                literal == text_bytes[t - 1]
+                literal == text[t - 1]
             }
             Some(&literal) => {
                 p += 1;
                 t += 1;
-                literal == text_bytes[t - 1]
+                literal == text[t - 1]
             }
             None => false,
         };
@@ -2129,12 +2149,12 @@ fn like_matches(text: &str, pattern: &str) -> Result<bool> {
         let Some((resume_p, search_from)) = resume else {
             return Ok(false);
         };
-        let first = match pattern_bytes[resume_p] {
-            b'\\' => pattern_bytes[resume_p + 1],
+        let first = match pattern[resume_p] {
+            b'\\' => pattern[resume_p + 1],
             literal => literal,
         };
         // `first` starts a character, so a text byte equal to it does too.
-        let Some(offset) = text_bytes[search_from..].iter().position(|&b| b == first) else {
+        let Some(offset) = text[search_from..].iter().position(|&b| b == first) else {
             return Ok(false);
         };
         p = resume_p;

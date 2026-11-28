@@ -1,0 +1,636 @@
+# The bytea type holds bytes. It reads the hex and the escape format of text,
+# compares the bytes one by one and casts to and from the integers.
+
+@database :memory:
+
+test bytea-reads-hex-text {
+    SELECT '\xDEADbeef'::bytea, '\x'::bytea, '\x00'::bytea;
+}
+expect {
+    \xdeadbeef|\x|\x00
+}
+
+test bytea-hex-text-allows-white-space-between-pairs {
+    SELECT '\x de ad
+    be	ef'::bytea;
+}
+expect {
+    \xdeadbeef
+}
+
+test bytea-refuses-hex-text-with-an-odd-digit-count {
+    SELECT '\xabc'::bytea;
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal data: odd number of digits
+}
+
+test bytea-refuses-a-bad-hex-digit {
+    SELECT '\xabzz'::bytea;
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal digit: "z"
+}
+
+test bytea-refuses-white-space-inside-a-pair {
+    SELECT '\xa b'::bytea;
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal digit: " "
+}
+
+test bytea-reads-escape-text {
+    SELECT 'abc'::bytea, ''::bytea, 'a b'::bytea;
+}
+expect {
+    \x616263|\x|\x612062
+}
+
+test bytea-escape-text-reads-octal-and-backslash {
+    SELECT 'a\101\000\377'::bytea, 'a\\\\b'::bytea;
+}
+expect {
+    \x614100ff|\x615c62
+}
+
+test bytea-escape-text-refuses-octal-above-377 {
+    SELECT '\400'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-escape-text-refuses-a-short-octal {
+    SELECT 'a\12'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-escape-text-refuses-a-lone-backslash {
+    SELECT 'abc\'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-hex-prefix-is-lowercase-only {
+    SELECT '\XAB'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-column-takes-literals {
+    CREATE TABLE b (id int PRIMARY KEY, v bytea);
+    INSERT INTO b VALUES (1, '\xcafe'), (2, 'plain'), (3, NULL);
+    SELECT id, v FROM b ORDER BY id;
+}
+expect {
+    1|\xcafe
+    2|\x706c61696e
+    3|
+}
+
+test bytea-column-refuses-bad-text {
+    CREATE TABLE b (v bytea);
+    INSERT INTO b VALUES ('\xzz');
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal digit: "z"
+}
+
+test bytea-column-refuses-a-number {
+    CREATE TABLE b (v bytea);
+    INSERT INTO b VALUES (1);
+}
+@sqlstate 42804
+expect error {
+    column "v" is of type bytea but expression is of type integer
+}
+@sqlstate 42804
+expect @tursopg error {
+    a value of type int4 cannot be assigned to type bytea
+}
+
+test bytea-column-refuses-a-text-column {
+    CREATE TABLE src (t text);
+    CREATE TABLE b (v bytea);
+    INSERT INTO src VALUES ('abc');
+    INSERT INTO b SELECT t FROM src;
+}
+@sqlstate 42804
+expect error {
+    column "v" is of type bytea but expression is of type text
+}
+@sqlstate 42804
+expect @tursopg error {
+    a value of type text cannot be assigned to type bytea
+}
+
+test bytea-pg-input-is-valid {
+    SELECT pg_input_is_valid('\xabcd', 'bytea'),
+           pg_input_is_valid('\xabc', 'bytea'),
+           pg_input_is_valid('abc\', 'bytea'),
+           pg_input_is_valid('abc', 'bytea');
+}
+expect {
+    t|f|f|t
+}
+
+test bytea-compares-byte-by-byte {
+    SELECT '\x01'::bytea < '\x02'::bytea,
+           '\x01'::bytea < '\x0100'::bytea,
+           '\x00ff'::bytea < '\x01'::bytea,
+           '\x80'::bytea > '\x7f'::bytea,
+           '\xab'::bytea = '\xab'::bytea,
+           '\xab'::bytea <> '\xac'::bytea,
+           '\x'::bytea < '\x00'::bytea;
+}
+expect {
+    t|t|t|t|t|t|t
+}
+
+test bytea-orders-by-bytes {
+    CREATE TABLE b (v bytea);
+    INSERT INTO b VALUES ('\x0100'), ('\xff'), ('\x'), ('\x01'), ('\x00ff');
+    SELECT v FROM b ORDER BY v;
+}
+expect {
+    \x
+    \x00ff
+    \x01
+    \x0100
+    \xff
+}
+
+test bytea-index-orders-and-finds-bytes {
+    CREATE TABLE b (v bytea PRIMARY KEY);
+    INSERT INTO b VALUES ('\x0100'), ('\xff'), ('\x'), ('\x01'), ('\x00ff');
+    SELECT v FROM b WHERE v >= '\x01' ORDER BY v;
+}
+expect {
+    \x01
+    \x0100
+    \xff
+}
+
+test bytea-unique-index-refuses-a-duplicate {
+    CREATE TABLE b (v bytea UNIQUE);
+    INSERT INTO b VALUES ('\xab'), ('\xab');
+}
+@sqlstate 23505
+expect error {
+    duplicate key value violates unique constraint "b_v_key"
+}
+
+test bytea-concatenates {
+    SELECT '\xab'::bytea || '\xcd'::bytea, '\x'::bytea || '\x01'::bytea;
+}
+expect {
+    \xabcd|\x01
+}
+
+test bytea-concatenates-a-column-and-a-literal {
+    CREATE TABLE b (v bytea);
+    INSERT INTO b VALUES ('\xff00');
+    SELECT v || '\x01' = '\xff0001'::bytea, '\x01' || v = '\x01ff00'::bytea FROM b;
+}
+expect {
+    t|t
+}
+
+test bytea-concatenates-with-text-as-text {
+    SELECT '\x01'::bytea || 'x'::text, 'x'::text || '\x01'::bytea,
+           '\x01'::bytea || 'x'::varchar;
+}
+expect {
+    \x01x|x\x01|\x01x
+}
+
+test bytea-concatenated-with-a-literal-reads-the-literal-as-bytea {
+    SELECT '\x01'::bytea || 'x', 'x' || '\x01'::bytea;
+}
+expect {
+    \x0178|\x7801
+}
+
+test bytea-concatenated-with-an-integer-errors {
+    SELECT '\x01'::bytea || 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: bytea || integer
+}
+
+test integer-concatenated-with-a-bytea-errors {
+    SELECT 1 || '\x01'::bytea;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer || bytea
+}
+
+test bytea-in-list-reads-literals-as-bytea {
+    CREATE TABLE b (v bytea);
+    INSERT INTO b VALUES ('\x01'), ('\x03'), ('abc');
+    SELECT '\x01'::bytea IN ('\x01', '\x02'), '\x03'::bytea IN ('\x01', '\x02'),
+           '\x03'::bytea NOT IN ('\x01', '\x02');
+    SELECT v FROM b WHERE v IN ('\x01', 'abc') ORDER BY v;
+}
+expect {
+    t|f|t
+    \x01
+    \x616263
+}
+
+test bytea-in-list-refuses-bad-bytea-text {
+    SELECT '\x01'::bytea IN ('\xzz', '\x01');
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal digit: "z"
+}
+
+test bytea-hex-text-refuses-a-form-feed {
+    SELECT ('\x01' || chr(12) || '02')::bytea;
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal digit
+}
+
+test bytea-has-no-contains-operator {
+    SELECT '\x01'::bytea @> '\x01'::bytea;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: bytea @> bytea
+}
+
+test bytea-has-no-contained-by-operator {
+    SELECT '\x01'::bytea <@ '\x01'::bytea;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: bytea <@ bytea
+}
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: bytea @> bytea
+}
+
+@compat-gap "operator:bytea && bytea"
+test bytea-has-no-overlap-operator {
+    SELECT '\x01'::bytea && '\x01'::bytea;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: bytea && bytea
+}
+expect @tursopg {
+    f
+}
+
+test bytea-column-has-no-contains-operator {
+    CREATE TABLE b (v bytea);
+    SELECT v @> '\x01' FROM b;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: bytea @> unknown
+}
+
+@compat-gap "operator:bytea ~~ bytea"
+test bytea-like-in-a-partial-index {
+    CREATE TABLE b (id int PRIMARY KEY, v bytea);
+    INSERT INTO b VALUES (1, 'abc'), (2, 'xbc'), (3, '\x6100ff');
+    CREATE INDEX b_like ON b (id) WHERE v LIKE 'a%';
+    INSERT INTO b VALUES (4, 'axx');
+    UPDATE b SET v = 'zzz' WHERE id = 1;
+    SELECT id FROM b WHERE v LIKE 'a%' ORDER BY id;
+}
+expect {
+    3
+    4
+}
+@sqlstate 42804
+expect @tursopg error {}
+
+test bytea-concatenation-with-null-is-null {
+    SELECT '\xab'::bytea || NULL::bytea IS NULL;
+}
+expect {
+    t
+}
+
+test bytea-like-is-byte-wise-and-case-sensitive {
+    SELECT 'abc'::bytea LIKE 'a%', 'abc'::bytea LIKE 'A%',
+           'abc'::bytea LIKE 'a_c', 'abc'::bytea LIKE 'ab',
+           'abc'::bytea NOT LIKE 'a%', 'a%c'::bytea LIKE 'a\\\\%c';
+}
+expect {
+    t|f|t|f|f|t
+}
+
+test bytea-like-matches-a-byte-that-is-not-text {
+    SELECT '\xff01'::bytea LIKE '\xff25'::bytea, '\xff01'::bytea LIKE '\x5f01'::bytea;
+}
+expect {
+    t|t
+}
+
+test bytea-casts-to-text-as-hex {
+    SELECT '\x616263'::bytea::text, 'abc'::text::bytea, ''::text::bytea;
+}
+expect {
+    \x616263|\x616263|\x
+}
+
+test bytea-casts-from-an-integer-as-big-endian-bytes {
+    SELECT 1::int2::bytea, (-1)::int2::bytea, 1::int4::bytea,
+           258::int4::bytea, 258::int8::bytea, (-2)::int8::bytea;
+}
+expect {
+    \x0001|\xffff|\x00000001|\x00000102|\x0000000000000102|\xfffffffffffffffe
+}
+
+test bytea-casts-an-integer-literal-that-fits-in-an-integer {
+    SELECT 5::bytea, (-5)::bytea, 2147483647::bytea, (-2147483648)::bytea;
+}
+expect {
+    \x00000005|\xfffffffb|\x7fffffff|\x80000000
+}
+
+@compat-gap "cast:int8 -> bytea"
+test bytea-casts-an-integer-literal-as-the-type-of-its-value {
+    SELECT 4294967296::bytea, 2147483648::bytea, (-2147483649)::bytea;
+}
+expect {
+    \x0000000100000000|\x0000000080000000|\xffffffff7fffffff
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "cast:int8 -> bytea"
+test bytea-casts-a-bigint-function-result {
+    CREATE TABLE n (v int);
+    INSERT INTO n VALUES (1);
+    SELECT count(*)::bytea, sum(v)::bytea FROM n;
+}
+expect {
+    \x0000000000000001|\x0000000000000001
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+test bytea-casts-an-integer-by-the-width-of-its-type {
+    CREATE TABLE n (v int);
+    INSERT INTO n VALUES (1);
+    SELECT count(*)::bigint::bytea, sum(v)::bigint::bytea FROM n;
+    SELECT v::bytea, (v + 1)::bytea, 4294967296::int8::bytea FROM n;
+}
+expect {
+    \x0000000000000001|\x0000000000000001
+    \x00000001|\x00000002|\x0000000100000000
+}
+
+test bytea-generated-column-with-a-literal-cast-to-bytea {
+    CREATE TABLE g (id int PRIMARY KEY, b bytea, k boolean GENERATED ALWAYS AS (b = '\x6162'::bytea) STORED);
+    INSERT INTO g (id, b) VALUES (1, '\x6162'), (2, '\x00');
+    SELECT id, k FROM g ORDER BY id;
+}
+expect {
+    1|t
+    2|f
+}
+
+@compat-gap "operator:bytea = bytea"
+test bytea-generated-column-reads-a-literal-as-bytea {
+    CREATE TABLE g (id int PRIMARY KEY, b bytea, k boolean GENERATED ALWAYS AS (b = '\x6162') STORED);
+    INSERT INTO g (id, b) VALUES (1, '\x6162'), (2, '\x00');
+    SELECT id, k FROM g ORDER BY id;
+}
+expect {
+    1|t
+    2|f
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "operator:bytea = bytea"
+test bytea-check-reads-a-literal-as-bytea {
+    CREATE TABLE c (b bytea CHECK (b = '\x6162'));
+    INSERT INTO c VALUES ('\x6162');
+    SELECT b FROM c;
+}
+expect {
+    \x6162
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+@compat-gap "operator:bytea || bytea"
+test bytea-default-reads-a-literal-as-bytea {
+    CREATE TABLE d (id int, b bytea DEFAULT ('\x01'::bytea || '\x02'));
+    INSERT INTO d (id) VALUES (1);
+    SELECT b FROM d;
+}
+expect {
+    \x0102
+}
+@sqlstate 42804
+expect @tursopg error {}
+
+test bytea-casts-to-an-integer-from-big-endian-bytes {
+    SELECT '\x0100'::bytea::int2, '\x00000100'::bytea::int4,
+           '\x0000000000000102'::bytea::int8, '\xffffffff'::bytea::int4,
+           '\x'::bytea::int4, '\x01'::bytea::int8;
+}
+expect {
+    256|256|258|-1|0|1
+}
+
+test bytea-cast-to-int2-refuses-three-bytes {
+    SELECT '\x000001'::bytea::int2;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test bytea-cast-to-int4-refuses-five-bytes {
+    SELECT '\x0000000001'::bytea::int4;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test bytea-cast-to-int8-refuses-nine-bytes {
+    SELECT '\x000000000000000001'::bytea::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test bytea-has-no-cast-to-boolean {
+    SELECT '\x01'::bytea::boolean;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type bytea to boolean
+}
+@sqlstate 42846
+expect @tursopg error {
+    cannot cast type bytea to bool
+}
+
+test bytea-has-no-cast-to-oid {
+    SELECT '\x01'::bytea::oid;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type bytea to oid
+}
+
+test bytea-assignment-refuses-an-integer-column {
+    CREATE TABLE b (v bytea);
+    CREATE TABLE n (i int4);
+    INSERT INTO n VALUES (1);
+    INSERT INTO b SELECT i FROM n;
+}
+@sqlstate 42804
+expect error {
+    column "v" is of type bytea but expression is of type integer
+}
+@sqlstate 42804
+expect @tursopg error {
+    a value of type int4 cannot be assigned to type bytea
+}
+
+test bytea-has-no-operator-with-an-integer {
+    SELECT '\x01'::bytea = 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: bytea = integer
+}
+
+test bytea-has-no-operator-with-a-text-column {
+    CREATE TABLE t (s text);
+    SELECT '\x01'::bytea = s FROM t;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: bytea = text
+}
+
+test bytea-takes-a-literal-next-to-a-bytea {
+    CREATE TABLE b (v bytea);
+    INSERT INTO b VALUES ('\xab'), ('\xcd');
+    SELECT v FROM b WHERE v = '\xab';
+}
+expect {
+    \xab
+}
+
+test bytea-appears-in-pg-type {
+    SELECT oid, typname, typcategory, typlen, typarray FROM pg_type WHERE typname = 'bytea';
+}
+expect {
+    17|bytea|U|-1|1001
+}
+
+test bytea-casts-are-in-pg-cast {
+    SELECT (SELECT count(*) FROM pg_cast WHERE castsource = 17 AND castcontext = 'e'),
+           (SELECT count(*) FROM pg_cast WHERE casttarget = 17 AND castcontext = 'e');
+}
+expect {
+    3|3
+}
+
+test bytea-operators-are-in-pg-operator {
+    SELECT count(*) FROM pg_operator WHERE oprleft = 17 AND oprright = 17;
+}
+expect {
+    9
+}
+
+test bytea-byteacat-joins-two-byteas {
+    SELECT byteacat('\xab'::bytea, '\xcd'::bytea), byteacat('\x'::bytea, '\x01'::bytea),
+           byteacat(NULL::bytea, '\x01'::bytea) IS NULL;
+}
+expect {
+    \xabcd|\x01|t
+}
+
+test bytea-bytealike-matches-bytes {
+    SELECT bytealike('abc'::bytea, 'a%'::bytea), bytealike('abc'::bytea, 'A%'::bytea),
+           bytealike('abc'::bytea, 'a_c'::bytea), bytealike('a%c'::bytea, 'a\\\\%c'::bytea),
+           bytealike('\xff01'::bytea, '\xff25'::bytea), bytealike(NULL::bytea, 'a'::bytea) IS NULL;
+}
+expect {
+    t|f|t|t|t|t
+}
+
+test bytea-byteanlike-is-the-opposite {
+    SELECT byteanlike('abc'::bytea, 'a%'::bytea), byteanlike('abc'::bytea, 'b%'::bytea),
+           byteanlike(NULL::bytea, 'a'::bytea) IS NULL;
+}
+expect {
+    f|t|t
+}
+
+test bytea-like-refuses-a-pattern-that-ends-with-an-escape {
+    SELECT bytealike('ab'::bytea, 'a\\\\'::bytea);
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
+}
+
+test bytea-functions-are-in-pg-proc {
+    SELECT oid, proname, prokind, proisstrict, provolatile, proargtypes::text, prorettype
+    FROM pg_proc WHERE proname IN ('byteacat', 'bytealike', 'byteanlike') ORDER BY oid;
+}
+expect {
+    2005|bytealike|f|t|i|17 17|16
+    2006|byteanlike|f|t|i|17 17|16
+    2011|byteacat|f|t|i|17 17|17
+}
+
+test bytea-cast-functions-are-in-pg-proc {
+    SELECT oid, proname, prokind, proleakproof, proisstrict, provolatile, proargtypes::text, prorettype
+    FROM pg_proc WHERE oid BETWEEN 6367 AND 6372 ORDER BY oid;
+}
+expect {
+    6367|bytea|f|t|t|i|21|17
+    6368|bytea|f|t|t|i|23|17
+    6369|bytea|f|t|t|i|20|17
+    6370|int2|f|f|t|i|17|21
+    6371|int4|f|f|t|i|17|23
+    6372|int8|f|f|t|i|17|20
+}
+
+test bytea-casts-name-their-functions-in-pg-cast {
+    SELECT castsource, casttarget, castfunc, castcontext, castmethod FROM pg_cast
+    WHERE (castsource = 17 OR casttarget = 17) AND castfunc BETWEEN 6367 AND 6372 ORDER BY castfunc;
+}
+expect {
+    21|17|6367|e|f
+    23|17|6368|e|f
+    20|17|6369|e|f
+    17|21|6370|e|f
+    17|23|6371|e|f
+    17|20|6372|e|f
+}

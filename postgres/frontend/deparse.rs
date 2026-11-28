@@ -3,7 +3,7 @@
 //! `pg_policies.qual`, `pg_constraint.conbin` and `pg_attrdef.adbin`.
 //!
 //! The catalog stores what the engine compiled the condition into, so this
-//! turns the engine's forms back into PostgreSQL's: `GLOB 'a*'` is printed
+//! turns the engine's forms back into PostgreSQL's: `LIKE 'a%'` and `GLOB 'a*'` are printed
 //! as `~~ 'a%'::text`, `CAST (1 AS boolean)` as `true`. PostgreSQL prints the
 //! condition after resolving types, with every operator in parentheses and
 //! the casts PostgreSQL adds where types meet, such as `'x'::text`,
@@ -346,10 +346,17 @@ impl Printer<'_> {
             ast::Expr::Like {
                 lhs,
                 not,
-                op: ast::LikeOperator::Glob,
+                op: ast::LikeOperator::Like,
                 rhs,
                 escape: None,
             } => self.like(lhs, *not, rhs),
+            ast::Expr::Like {
+                lhs,
+                not,
+                op: ast::LikeOperator::Glob,
+                rhs,
+                escape: None,
+            } => self.glob(lhs, *not, rhs),
             ast::Expr::FunctionCall {
                 name,
                 distinctness: None,
@@ -558,9 +565,19 @@ impl Printer<'_> {
         ))
     }
 
-    /// The engine runs PostgreSQL's case-sensitive LIKE with a literal
-    /// pattern as GLOB, with `%` and `_` turned into `*` and `?`.
+    /// A LIKE with a literal pattern, which PostgreSQL prints as `~~`.
     fn like(&self, lhs: &ast::Expr, not: bool, pattern: &ast::Expr) -> Option<Printed> {
+        let ast::Expr::Literal(ast::Literal::String(pattern)) = pattern else {
+            return None;
+        };
+        self.like_text(lhs, not, &unquote(pattern)?)
+    }
+
+    /// A GLOB, which an index holds in place of a LIKE with a literal pattern,
+    /// and which a database from before LIKE stopped being lowered to GLOB
+    /// holds in a policy, a CHECK or a default. The `%` and `_` of the LIKE
+    /// are `*` and `?`.
+    fn glob(&self, lhs: &ast::Expr, not: bool, pattern: &ast::Expr) -> Option<Printed> {
         let ast::Expr::Literal(ast::Literal::String(pattern)) = pattern else {
             return None;
         };
@@ -568,12 +585,15 @@ impl Printer<'_> {
         if glob.contains(['%', '_', '[', ']', '\\']) {
             return None;
         }
-        let like_pattern = glob.replace('*', "%").replace('?', "_");
+        self.like_text(lhs, not, &glob.replace('*', "%").replace('?', "_"))
+    }
+
+    fn like_text(&self, lhs: &ast::Expr, not: bool, like_pattern: &str) -> Option<Printed> {
         let lhs = self.expr(lhs)?;
         if !matches!(lhs.ty, PgType::Text | PgType::Varchar) {
             return None;
         }
-        let pattern = Printed::new(quote_literal(&like_pattern), PgType::UnknownLiteral);
+        let pattern = Printed::new(quote_literal(like_pattern), PgType::UnknownLiteral);
         let symbol = if not { "!~~" } else { "~~" };
         Some(Printed::new(
             format!(
@@ -827,8 +847,12 @@ mod tests {
                 "((\"Weird Col\" IS NULL) OR (id IS NOT NULL))",
             ),
             (
-                "((\"id\" + (1 * 2)) > 3) AND (lower (\"owner\") != 'x') AND (\"owner\" GLOB 'a*')",
+                "((\"id\" + (1 * 2)) > 3) AND (lower (\"owner\") != 'x') AND (\"owner\" LIKE 'a%')",
                 "(((id + (1 * 2)) > 3) AND (lower(owner) <> 'x'::text) AND (owner ~~ 'a%'::text))",
+            ),
+            (
+                "(\"owner\" GLOB 'a*') AND (\"owner\" NOT GLOB 'b?')",
+                "((owner ~~ 'a%'::text) AND (owner !~~ 'b_'::text))",
             ),
             (
                 "(session_user () = \"owner\") AND (\"id\" BETWEEN 1 AND 3) AND (\"price\" > 1.5)",
@@ -937,7 +961,9 @@ mod tests {
     fn conditions_postgres_prints_differently_give_none() {
         for stored in [
             "\"id\" = '1'",
+            "\"id\" LIKE 'a%'",
             "\"owner\" GLOB 'a[bc]'",
+            "\"id\" GLOB 'a*'",
             "\"missing\" = 1",
             "CAST (\"owner\" AS INTEGER) = 1",
             "abs ('1') = 1",

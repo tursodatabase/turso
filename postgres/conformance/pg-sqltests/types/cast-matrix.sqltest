@@ -849,15 +849,11 @@ test cast-bool-to-uuid {
 @sqlstate 42846
 expect error {}
 
-@compat-gap "type:bytea"
 test cast-text-literal-to-bytea {
     SELECT '\x6162'::bytea;
 }
 expect {
     \x6162
-}
-expect @tursopg {
-    \x5c7836313632
 }
 
 test cast-bytea-to-text {
@@ -867,37 +863,25 @@ expect {
     \x6162
 }
 
-@compat-gap "cast:bytea -> int4"
 test cast-bytea-to-int4 {
     SELECT '\x6162'::bytea::int4;
 }
 expect {
     24930
 }
-expect @tursopg {
-    0
-}
 
-@compat-gap "cast:int4 -> bytea"
 test cast-int4-to-bytea {
     SELECT 5::bytea;
 }
 expect {
     \x00000005
 }
-expect @tursopg {
-    \x35
-}
 
-@compat-gap "cast:bool -> bytea"
 test cast-bool-to-bytea {
     SELECT true::bytea;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    \x31
-}
 
 test cast-text-literal-to-inet {
     SELECT '10.0.0.1'::inet;
@@ -2374,7 +2358,6 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
-@compat-gap "type:bytea"
 test assign-text-literal-to-bytea-column {
     CREATE TABLE t (c bytea);
     INSERT INTO t VALUES ('\x6162');
@@ -2383,10 +2366,7 @@ test assign-text-literal-to-bytea-column {
 expect {
     \x6162
 }
-@sqlstate 23000
-expect @tursopg error {}
 
-@compat-gap "cast:int4 -> bytea"
 test assign-int4-to-bytea-column {
     CREATE TABLE t (c bytea);
     INSERT INTO t VALUES (5);
@@ -2394,10 +2374,7 @@ test assign-int4-to-bytea-column {
 }
 @sqlstate 42804
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
-@compat-gap "cast:bytea -> int4"
 test assign-bytea-to-int4-column {
     CREATE TABLE t (c int);
     INSERT INTO t VALUES ('\x6162'::bytea);
@@ -2405,10 +2382,7 @@ test assign-bytea-to-int4-column {
 }
 @sqlstate 42804
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
-@compat-gap "cast:bytea -> text"
 test assign-bytea-to-text-column {
     CREATE TABLE t (c text);
     INSERT INTO t VALUES ('\x6162'::bytea);
@@ -2417,8 +2391,6 @@ test assign-bytea-to-text-column {
 expect {
     \x6162
 }
-@sqlstate 23000
-expect @tursopg error {}
 
 test assign-text-literal-to-inet-column {
     CREATE TABLE t (c inet);

@@ -120,6 +120,7 @@ fn emit_generated_columns(
             };
             let target_reg = dml_ctx.to_column_reg(idx);
             let stores_value = dml_ctx.holds_stored_value(idx);
+            // FIXME(registered-types): The generation expression is translated without the binding pass, so a string literal next to a bytea in it is not read as bytea. The dialect refuses a bare string literal compared with such a value (`check_string_literal_comparison`). A typed expression tree that every context analyzes once replaces this.
             if stores_value
                 && resolver
                     .schema()

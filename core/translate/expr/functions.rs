@@ -26,6 +26,17 @@ pub(super) fn translate_like_base(
     else {
         crate::bail_parse_error!("expected Like expression");
     };
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
+        return Ok(target_register);
+    }
     match op {
         ast::LikeOperator::Like | ast::LikeOperator::Glob => {
             let arg_count = if escape.is_some() { 3 } else { 2 };
