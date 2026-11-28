@@ -465,9 +465,6 @@ pub(crate) fn estimate_rows_per_in_seek_value(
         return 1.0;
     }
     let base = *base_row_count;
-    if eq_prefix.is_empty() {
-        return (base * params.sel_eq_indexed).sqrt().max(1.0);
-    }
     if let Some(ctx) = analyze_ctx {
         let mut refs = eq_prefix.to_vec();
         refs.push(RangeConstraintRef {
@@ -485,6 +482,9 @@ pub(crate) fn estimate_rows_per_in_seek_value(
         if let Some(rows) = estimate_rows_from_analyze_stats(ctx, &refs) {
             return rows.max(1.0);
         }
+    }
+    if eq_prefix.is_empty() {
+        return (base * params.sel_eq_indexed).sqrt().max(1.0);
     }
     let prefix_selectivity: f64 = eq_prefix
         .iter()

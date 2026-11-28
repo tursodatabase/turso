@@ -80,6 +80,25 @@ expect pattern {
     \d+\|0\|0\|SEARCH spread USING COVERING INDEX idx_spread \(source=\?\)
 }
 
+# With stats the IN seek on (b) must be costed from sqlite_stat1 like the
+# prefixed one: 1500 rows per b value on (b), 30 rows per (a, b) on (a, b).
+setup in_seek_two_indexes_analyzed {
+    CREATE TABLE two_ix (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v TEXT);
+    CREATE INDEX two_ix_b ON two_ix(b);
+    CREATE INDEX two_ix_ab ON two_ix(a, b);
+    WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 5999)
+    INSERT INTO two_ix(a, b, v) SELECT x % 50, (x / 50) % 4, 'v' FROM n;
+    ANALYZE two_ix;
+}
+
+@setup in_seek_two_indexes_analyzed
+test in-seek-after-prefix-beats-in-seek-on-first-column-with-stats {
+    EXPLAIN QUERY PLAN SELECT v FROM two_ix WHERE a = 3 AND b IN (1, 2);
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH two_ix USING INDEX two_ix_ab \(a=\? AND b=\?\)
+}
+
 setup e_nonuniq_in_400 {
     CREATE TABLE e_nonuniq (book_id INTEGER, platform_id INTEGER NOT NULL, product_id TEXT NOT NULL, writer TEXT);
     CREATE INDEX e_nonuniq_idx ON e_nonuniq (platform_id, product_id);
