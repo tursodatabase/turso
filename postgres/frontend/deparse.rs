@@ -20,6 +20,8 @@ use turso_pg_parser::translator::role_keyword;
 
 use crate::catalog::{pg_type_oid, regclass_text};
 use crate::functions::quote_literal;
+use crate::pg_type::regtype_text;
+use turso_pg_parser::RegKind;
 
 /// PostgreSQL's text of `condition`, a condition on the columns of `table`,
 /// or None when it has a form this module does not print.
@@ -28,7 +30,7 @@ pub(crate) fn condition_text(
     condition: &ast::Expr,
     table: &BTreeTable,
 ) -> Option<String> {
-    let condition = name_regclass_constants(conn, condition);
+    let condition = name_reg_constants(conn, condition);
     let printed = Printer { table }.expr(&condition)?;
     Some(printed.typed_text(None))
 }
@@ -44,16 +46,17 @@ pub(crate) fn default_text(
     table: &BTreeTable,
     declared_type: &str,
 ) -> Option<String> {
-    if declared_type.eq_ignore_ascii_case("regclass") {
+    if let Some(kind) = reg_kind(declared_type) {
         if let ast::Expr::Literal(ast::Literal::String(quoted)) = default {
             let oid = unquote(quoted)?.parse().ok()?;
             return Some(format!(
-                "{}::regclass",
-                quote_literal(&regclass_text(conn, oid))
+                "{}::{}",
+                quote_literal(&reg_constant_text(conn, kind, oid)),
+                kind.type_name()
             ));
         }
     }
-    let default = name_regclass_constants(conn, default);
+    let default = name_reg_constants(conn, default);
     let printed = Printer { table }.expr(&default)?;
     if printed.ty != PgType::UnknownLiteral {
         return Some(printed.text);
@@ -231,11 +234,26 @@ fn operands(lhs: &Printed, rhs: &Printed) -> Option<(String, String, PgType)> {
     None
 }
 
-/// `expr` with each regclass constant written as the name of its relation.
-/// A statement stores such a constant as the oid of the relation, which
-/// PostgreSQL prints as the relation name, in the form the search path of the
-/// session finds it by.
-pub(crate) fn name_regclass_constants(conn: &Connection, expr: &ast::Expr) -> ast::Expr {
+/// The reg type that `type_name` names, when it is regclass or regtype.
+fn reg_kind(type_name: &str) -> Option<RegKind> {
+    [RegKind::Class, RegKind::Type]
+        .into_iter()
+        .find(|kind| type_name.eq_ignore_ascii_case(kind.type_name()))
+}
+
+/// The name that PostgreSQL prints for the oid `oid` of a reg type of `kind`.
+fn reg_constant_text(conn: &Connection, kind: RegKind, oid: i64) -> String {
+    match kind {
+        RegKind::Class => regclass_text(conn, oid),
+        RegKind::Type => regtype_text(conn, oid),
+    }
+}
+
+/// `expr` with each regclass or regtype constant written as the name of its
+/// relation or type. A statement stores such a constant as the oid, which
+/// PostgreSQL prints as the name, in the form the search path of the session
+/// finds it by.
+pub(crate) fn name_reg_constants(conn: &Connection, expr: &ast::Expr) -> ast::Expr {
     let mut expr = expr.clone();
     walk_expr_mut(&mut expr, &mut |expr| {
         if let ast::Expr::Cast {
@@ -243,17 +261,18 @@ pub(crate) fn name_regclass_constants(conn: &Connection, expr: &ast::Expr) -> as
             type_name: Some(type_name),
         } = expr
         {
-            if type_name.name.eq_ignore_ascii_case("regclass") {
+            if let Some(kind) = reg_kind(&type_name.name) {
                 if let ast::Expr::Literal(ast::Literal::String(quoted)) = operand.as_mut() {
                     if let Some(oid) = unquote(quoted).and_then(|text| text.parse().ok()) {
-                        *quoted = format!("'{}'", regclass_text(conn, oid).replace('\'', "''"));
+                        let name = reg_constant_text(conn, kind, oid);
+                        *quoted = format!("'{}'", name.replace('\'', "''"));
                     }
                 }
             }
         }
         Ok(WalkControl::Continue)
     })
-    .expect("naming regclass constants does not fail");
+    .expect("naming reg constants does not fail");
     expr
 }
 
@@ -273,9 +292,13 @@ impl Printer<'_> {
             ast::Expr::Cast {
                 expr,
                 type_name: Some(type_name),
-            } if type_name.name.eq_ignore_ascii_case("regclass") => match expr.as_ref() {
+            } if reg_kind(&type_name.name).is_some() => match expr.as_ref() {
                 ast::Expr::Literal(literal @ ast::Literal::String(_)) => Some(Printed::new(
-                    format!("{}::regclass", literal_text(literal)?.text),
+                    format!(
+                        "{}::{}",
+                        literal_text(literal)?.text,
+                        reg_kind(&type_name.name)?.type_name()
+                    ),
                     PgType::Other,
                 )),
                 _ => None,

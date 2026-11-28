@@ -4589,7 +4589,7 @@ fn check_condition_text(conn: &Connection, condition: &ast::Expr, table: &BTreeT
 }
 
 fn render_expr(conn: &Connection, expr: &ast::Expr) -> String {
-    let mut expr = crate::deparse::name_regclass_constants(conn, expr);
+    let mut expr = crate::deparse::name_reg_constants(conn, expr);
     walk_expr_mut(&mut expr, &mut |expr| {
         // The translator compiles PostgreSQL's binary collations to BINARY.
         if let ast::Expr::Collate(_, collation) = expr {
@@ -4767,9 +4767,10 @@ fn catalog_indexes(conn: &Connection, schema: &Schema) -> Vec<CatalogIndex> {
                                 .expect("index columns have names")
                         },
                         position: column.pos_in_table,
-                        expression: column.expr.as_ref().map(|expr| {
-                            crate::deparse::name_regclass_constants(conn, expr).to_string()
-                        }),
+                        expression: column
+                            .expr
+                            .as_ref()
+                            .map(|expr| crate::deparse::name_reg_constants(conn, expr).to_string()),
                         order: column.order,
                     })
                     .collect(),
@@ -4781,7 +4782,7 @@ fn catalog_indexes(conn: &Connection, schema: &Schema) -> Vec<CatalogIndex> {
                 where_clause: index
                     .where_clause
                     .as_ref()
-                    .map(|expr| crate::deparse::name_regclass_constants(conn, expr).to_string()),
+                    .map(|expr| crate::deparse::name_reg_constants(conn, expr).to_string()),
             });
         }
     }

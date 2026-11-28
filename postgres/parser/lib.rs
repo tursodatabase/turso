@@ -538,31 +538,50 @@ fn collect_foreign_key_tables(node: &pg_query::protobuf::Node, tables: &mut Vec<
     }
 }
 
-/// A string constant that is cast to regclass: `'t'::regclass`.
+/// The reg type that a string constant is cast to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegKind {
+    Class,
+    Type,
+}
+
+impl RegKind {
+    /// The name of the type in lowercase.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            RegKind::Class => "regclass",
+            RegKind::Type => "regtype",
+        }
+    }
+}
+
+/// A string constant that is cast to regclass or regtype: `'t'::regclass`.
 #[derive(Debug, PartialEq, Eq)]
-pub struct RegClassConstant {
+pub struct RegConstant {
+    pub kind: RegKind,
     /// The byte offset of the string constant.
     pub location: usize,
     pub text: String,
 }
 
-/// The string constants that a statement stores with the type regclass,
+/// The string constants that a statement stores with the type regclass or
+/// regtype,
 /// in the order they are written. PostgreSQL reads such a constant as an oid
 /// when it analyzes the statement, so a view, a default, a check or an index
 /// keeps the oid and not the name. Other statements are not stored, and give
 /// no constants.
-pub fn regclass_constants_to_resolve(parse_result: &ParseResult) -> Vec<RegClassConstant> {
+pub fn reg_constants_to_resolve(parse_result: &ParseResult) -> Vec<RegConstant> {
     let mut stored = StoredExpressions::default();
     for stmt in &parse_result.protobuf.stmts {
         if let Some(node) = stmt.stmt.as_ref().and_then(|stmt| stmt.node.as_ref()) {
             collect_stored_expressions(node, &mut stored);
         }
     }
-    let mut constants: Vec<RegClassConstant> = stored
+    let mut constants: Vec<RegConstant> = stored
         .expressions
         .iter()
         .flat_map(|expression| expression.nodes())
-        .filter_map(|(node, ..)| regclass_constant(node))
+        .filter_map(|(node, ..)| reg_constant(node))
         .chain(stored.defaults)
         .collect();
     constants.sort_by_key(|constant| constant.location);
@@ -574,7 +593,7 @@ pub fn regclass_constants_to_resolve(parse_result: &ParseResult) -> Vec<RegClass
 #[derive(Default)]
 struct StoredExpressions<'a> {
     expressions: Vec<&'a NodeEnum>,
-    defaults: Vec<RegClassConstant>,
+    defaults: Vec<RegConstant>,
 }
 
 /// The expressions that `node`, a statement or a part of one, stores.
@@ -627,21 +646,23 @@ fn collect_default_constants(
     constraints: &[pg_query::protobuf::Node],
     stored: &mut StoredExpressions,
 ) {
-    if !type_name.is_some_and(is_regclass_type) {
+    let Some(kind) = type_name.and_then(reg_kind) else {
         return;
-    }
+    };
     for constraint in constraints {
         let Some(NodeEnum::Constraint(constraint)) = &constraint.node else {
             continue;
         };
         if constraint.contype == pg_query::protobuf::ConstrType::ConstrDefault as i32 {
             let default = constraint.raw_expr.as_deref().and_then(|e| e.node.as_ref());
-            stored.defaults.extend(default.and_then(string_constant));
+            stored
+                .defaults
+                .extend(default.and_then(|node| string_constant(node, kind)));
         }
     }
 }
 
-fn is_regclass_type(type_name: &pg_query::protobuf::TypeName) -> bool {
+fn reg_kind(type_name: &pg_query::protobuf::TypeName) -> Option<RegKind> {
     let names: Vec<&str> = type_name
         .names
         .iter()
@@ -650,10 +671,14 @@ fn is_regclass_type(type_name: &pg_query::protobuf::TypeName) -> bool {
             _ => None,
         })
         .collect();
-    matches!(names.as_slice(), ["regclass"] | ["pg_catalog", "regclass"])
+    match names.as_slice() {
+        ["regclass"] | ["pg_catalog", "regclass"] => Some(RegKind::Class),
+        ["regtype"] | ["pg_catalog", "regtype"] => Some(RegKind::Type),
+        _ => None,
+    }
 }
 
-fn string_constant(node: &NodeEnum) -> Option<RegClassConstant> {
+fn string_constant(node: &NodeEnum, kind: RegKind) -> Option<RegConstant> {
     use pg_query::protobuf::a_const::Val;
 
     let NodeEnum::AConst(constant) = node else {
@@ -662,21 +687,21 @@ fn string_constant(node: &NodeEnum) -> Option<RegClassConstant> {
     let Some(Val::Sval(text)) = constant.val.as_ref() else {
         return None;
     };
-    Some(RegClassConstant {
+    Some(RegConstant {
+        kind,
         location: usize::try_from(constant.location).ok()?,
         text: text.sval.clone(),
     })
 }
 
-/// The constant of `node` when it is a string constant cast to regclass.
-fn regclass_constant(node: pg_query::NodeRef) -> Option<RegClassConstant> {
+/// The constant of `node` when it is a string constant cast to regclass or
+/// regtype.
+fn reg_constant(node: pg_query::NodeRef) -> Option<RegConstant> {
     let pg_query::NodeRef::TypeCast(cast) = node else {
         return None;
     };
-    if !is_regclass_type(cast.type_name.as_ref()?) {
-        return None;
-    }
-    string_constant(cast.arg.as_ref()?.node.as_ref()?)
+    let kind = reg_kind(cast.type_name.as_ref()?)?;
+    string_constant(cast.arg.as_ref()?.node.as_ref()?, kind)
 }
 
 /// `sql` with the string constant that starts at byte offset `location`
@@ -877,9 +902,9 @@ mod tests {
     }
 
     #[test]
-    fn regclass_constants_to_resolve_are_found_in_the_statements_that_store_them() {
+    fn reg_constants_to_resolve_are_found_in_the_statements_that_store_them() {
         let constants = |sql: &str| {
-            regclass_constants_to_resolve(&parse(sql).unwrap())
+            reg_constants_to_resolve(&parse(sql).unwrap())
                 .into_iter()
                 .map(|constant| (constant.location, constant.text))
                 .collect::<Vec<_>>()
@@ -910,6 +935,14 @@ mod tests {
             constants(default),
             [(default.find("'t'").unwrap(), "t".to_string())]
         );
+        let types = "CREATE VIEW w AS SELECT 'int4'::regtype, 't'::regclass";
+        assert_eq!(
+            reg_constants_to_resolve(&parse(types).unwrap())
+                .into_iter()
+                .map(|constant| constant.kind)
+                .collect::<Vec<_>>(),
+            [RegKind::Type, RegKind::Class]
+        );
         assert!(constants("SELECT 't'::regclass").is_empty());
         assert!(constants("CREATE TABLE s AS SELECT 't'::regclass").is_empty());
     }
@@ -921,7 +954,7 @@ mod tests {
             "SELECT U&'pg_class' UESCAPE '!'::regclass, 1",
         ] {
             let constants =
-                regclass_constants_to_resolve(&parse(&format!("CREATE VIEW v AS {sql}")).unwrap());
+                reg_constants_to_resolve(&parse(&format!("CREATE VIEW v AS {sql}")).unwrap());
             let sql = format!("CREATE VIEW v AS {sql}");
             let replaced = replace_string_constant(&sql, constants[0].location, "16384").unwrap();
             assert_eq!(

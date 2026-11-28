@@ -10,7 +10,7 @@ use turso_core::{Connection, Numeric, Result, Value};
 /// The oid that the text of a regtype names: `-` is 0, digits are an oid,
 /// and anything else is a type name, as a statement writes one, which must
 /// exist. A type modifier is read and dropped.
-pub(super) fn regtype_oid_of_text(conn: &Arc<Connection>, text: &str) -> Result<i64> {
+pub(crate) fn regtype_oid_of_text(conn: &Arc<Connection>, text: &str) -> Result<i64> {
     if text == "-" {
         return Ok(0);
     }

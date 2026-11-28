@@ -347,3 +347,53 @@ test regtype-reads-a-modifier-on-the-type-of-an-array {
 expect {
     character varying[]|character varying[]|numeric[]
 }
+
+test regtype-in-a-default-is-stored-as-the-type {
+    CREATE TABLE r (c regtype DEFAULT 'int4', d regtype DEFAULT 'text'::regtype);
+    SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'r'::regclass ORDER BY adnum;
+}
+expect {
+    1|'integer'::regtype
+    2|'text'::regtype
+}
+
+test regtype-in-a-check-is-printed-as-the-type {
+    CREATE TABLE r (c regtype, CHECK (c <> 'int4'::regtype));
+    SELECT pg_get_constraintdef(oid) LIKE '%integer%' FROM pg_constraint WHERE conrelid = 'r'::regclass;
+}
+expect {
+    t
+}
+
+test regtype-in-a-default-fills-the-column {
+    CREATE TABLE r (c regtype DEFAULT 'varchar');
+    INSERT INTO r DEFAULT VALUES;
+    SELECT c, c::oid FROM r;
+}
+expect {
+    character varying|1043
+}
+
+test regtype-in-a-default-needs-the-type {
+    CREATE TABLE r (c regtype DEFAULT 'nope');
+}
+@sqlstate 42704
+expect error {
+    type "nope" does not exist
+}
+
+test regtype-in-a-view-needs-the-type {
+    CREATE VIEW w AS SELECT 'nope'::regtype;
+}
+@sqlstate 42704
+expect error {
+    type "nope" does not exist
+}
+
+test regtype-in-a-view-gives-the-type {
+    CREATE VIEW w AS SELECT 'int4'::regtype AS t;
+    SELECT t, t::oid FROM w;
+}
+expect {
+    integer|23
+}
