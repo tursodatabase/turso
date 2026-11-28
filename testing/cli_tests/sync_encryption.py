@@ -212,6 +212,79 @@ class EncryptedSync(unittest.TestCase):
                 with self.subTest(cipher=cipher, directory=directory):
                     self.scenario(cipher, directory, mvcc=False)
 
+    def test_mvcc_push_after_server_checkpoint_is_not_sent_again(self):
+        for directory in [False, True]:
+            for change in [
+                "UPDATE t SET v = 'from server' WHERE id = 100",
+                "DELETE FROM t WHERE id = 100",
+            ]:
+                with self.subTest(directory=directory, change=change):
+                    self.push_after_server_checkpoint(directory, change)
+
+    def push_after_server_checkpoint(self, directory, change):
+        """A replica pushes a row after the server checkpointed its MVCC log,
+        the server changes that row, and the replica pulls and pushes. The
+        replica must not send its pushed row again over the change of the
+        server."""
+        with tempfile.TemporaryDirectory(prefix="sample-sync-checkpoint-") as tmp:
+            tmp = Path(tmp)
+            dbs = tmp / "dbs"
+            source = dbs / "example/data" if directory else tmp / "source.db"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            prepared = subprocess.run(
+                [str(CLI), str(source), "PRAGMA journal_mode=mvcc; "
+                 "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); PRAGMA wal_checkpoint(TRUNCATE);"],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            address = f"127.0.0.1:{port}"
+            url = f"http://{address}" + ("/db/example" if directory else "")
+            args = [str(CLI), "--sync-server", address]
+            args += ["--sync-dir", str(dbs)] if directory else [str(source)]
+            env = {**os.environ, "SYNC_E2E_CIPHER": "none"}
+            replica = tmp / "replica.db"
+
+            def run(action, sql=None):
+                result = subprocess.run([str(DRIVER), str(replica), url, action] + ([sql] if sql else []),
+                                        env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+
+            def rows(sql):
+                body = json.dumps({"requests": [{"type": "execute", "stmt": {"sql": sql}}]}).encode()
+                request = urllib.request.Request(url + "/v2/pipeline", body)
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    result = json.load(response)["results"][0]
+                self.assertEqual(result["type"], "ok", result)
+                return [[cell.get("value") for cell in row] for row in result["response"]["result"]["rows"]]
+
+            log = (tmp / "server.log").open("w+")
+            process = subprocess.Popen(args, stdout=log, stderr=log)
+            try:
+                self.wait_for_server(process, log, port)
+                # The replica reads its revision while the log has this frame.
+                rows("INSERT INTO t VALUES (1, 'one')")
+                run("bootstrap")
+                run("pull")
+                rows("PRAGMA wal_checkpoint(TRUNCATE)")
+                run("exec", "INSERT INTO t VALUES (100, 'from replica')")
+                run("push")
+                rows(change)
+                expected = rows("SELECT id, v FROM t ORDER BY id")
+                self.assertEqual(run("pull")["pending"], 0, "the pushed row is pending again")
+                run("push")
+                self.assertEqual(rows("SELECT id, v FROM t ORDER BY id"), expected)
+                self.assertEqual(run("scalar", "SELECT count(*) FROM t")["value"], len(expected))
+                self.assertEqual(
+                    run("scalar", "SELECT count(*) FROM t WHERE v = 'from replica'")["value"], 0
+                )
+            finally:
+                stop_server(process)
+                log.close()
+
 
 def stop_server(process):
     if process and process.poll() is None:

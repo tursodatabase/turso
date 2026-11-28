@@ -102,6 +102,9 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn reset_to_fresh_header(&self) -> Result<Completion>;
     fn get_logical_log_file(&self) -> Arc<dyn File>;
     fn logical_log_offset(&self) -> u64;
+    /// The salt of the logical log header. While the log is empty, this is
+    /// the salt of the header that the next frame writes.
+    fn logical_log_salt(&self) -> Result<u64>;
     fn should_checkpoint(&self) -> bool;
     /// Set the checkpoint threshold in bytes of logical-log data written.
     /// A negative value disables automatic checkpointing.
@@ -249,6 +252,10 @@ impl DurableStorage for Storage {
 
     fn logical_log_offset(&self) -> u64 {
         self.log_offset.load(Ordering::Relaxed)
+    }
+
+    fn logical_log_salt(&self) -> Result<u64> {
+        self.with_log(|log| log.header_salt())
     }
 
     fn encryption_ctx(&self) -> Option<EncryptionContext> {

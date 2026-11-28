@@ -81,6 +81,9 @@ pub struct TursoSyncServer {
     interrupt_count: Arc<AtomicUsize>,
     workers: usize,
     encryption: Option<SyncEncryption>,
+    /// The options of the served databases. A replace-base pull opens a copy
+    /// of a database with them.
+    db_opts: DatabaseOpts,
 }
 
 struct ConnectionQueue {
@@ -103,6 +106,7 @@ impl TursoSyncServer {
         interrupt_count: Arc<AtomicUsize>,
         workers: usize,
         encryption: Option<SyncEncryption>,
+        db_opts: DatabaseOpts,
     ) -> Result<Self> {
         require_server_key(encryption.as_ref())?;
         anyhow::ensure!(conn.get_encryption_cipher_mode() == encryption.as_ref().map(|e| e.cipher()),
@@ -119,6 +123,7 @@ impl TursoSyncServer {
             interrupt_count,
             workers,
             encryption,
+            db_opts,
         })
     }
 
@@ -140,6 +145,7 @@ impl TursoSyncServer {
         Ok(Self {
             address,
             encryption: config.encryption.clone(),
+            db_opts: config.db_opts,
             source: DbSource::Dir {
                 base: base.canonicalize()?,
                 config: Box::new(config),
@@ -739,10 +745,9 @@ impl TursoSyncServer {
             } else {
                 PullUpdatesProtocol::Pages
             };
-            let revision = if conn.mvcc_enabled() {
-                "g1:o0".to_string()
-            } else {
-                server_revision.to_string()
+            let revision = match read_mvcc_log(&conn, &db.path)? {
+                Some(log) => log.revision(0),
+                None => server_revision.to_string(),
             };
             drop(conn);
             return self.handle_snapshot_pages(
@@ -872,68 +877,48 @@ impl TursoSyncServer {
         db: &DbHandle,
         req: &PullUpdatesReqProtoBody,
     ) -> Result<HttpResponse> {
-        let log_path = match logical_log_path(&db.path) {
-            Ok(path) => path,
-            Err(_) if is_in_memory_db_path(&db.path) => {
-                info!(
-                    "logical pull requested for in-memory sync server database; returning incremental pages"
-                );
-                return self.handle_page_pull_updates(db, req, PullUpdatesApplyMode::Incremental);
-            }
-            Err(err) => return Err(err),
-        };
-        let (db_size, fallback_revision, legacy_current_revision, log) = {
+        if is_in_memory_db_path(&db.path) {
+            info!(
+                "logical pull requested for in-memory sync server database; returning incremental pages"
+            );
+            return self.handle_page_pull_updates(db, req, PullUpdatesApplyMode::Incremental);
+        }
+        let (db_size, fallback_revision, legacy_current_revision, current_log) = {
             let conn = db.conn.lock().expect("database connection lock poisoned");
             let wal_state = conn.wal_state()?;
             // The log is read under the connection lock so that no commit or
             // checkpoint changes it between the snapshot and the read.
-            let log = std::fs::read(&log_path).map(|mut log| {
-                if let Some(mv_store) = conn.mv_store().as_ref() {
-                    // Recovery ends the log at the last valid frame without
-                    // truncating the file, and the next commit overwrites
-                    // only part of the bytes after it. Serve only the
-                    // frames up to the write offset, as core reads them.
-                    // Core reports offset 0 until its first commit, while the
-                    // file already holds the header, so keep the header.
-                    let offset = mv_store.logical_log_offset() as usize;
-                    log.truncate(offset.max(MVCC_LOG_HEADER_SIZE));
-                }
-                log
-            });
             (
                 current_snapshot_db_size_pages(&conn, wal_state.max_frame)?,
                 format!("page:{}", wal_state.max_frame),
                 wal_state.max_frame.to_string(),
-                log,
+                read_mvcc_log(&conn, &db.path)?,
             )
         };
-        let log = match log {
-            Ok(log) => log,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                info!(
-                    "logical pull requested but no MVCC log exists at {}; returning replace-base fallback",
-                    log_path.display()
-                );
-                return self.handle_logical_fallback(
-                    db,
-                    req,
-                    fallback_revision,
-                    &legacy_current_revision,
-                    db_size,
-                );
-            }
-            Err(err) => return Err(err.into()),
-        };
-        if log.len() == MVCC_LOG_HEADER_SIZE {
-            frame_codec::validate_log_header(&log)?;
-            let start = parse_mvcc_revision_offset(&req.client_revision, log.len() as u64)?;
-            anyhow::ensure!(
-                start == 0 || start == log.len() as u64,
-                "MVCC logical pull offset is not a transaction boundary"
+        let Some(current_log) = current_log else {
+            info!(
+                "logical pull requested but {} has no MVCC log; returning replace-base fallback",
+                db.path
             );
+            return self.handle_logical_fallback(
+                db,
+                req,
+                fallback_revision,
+                &legacy_current_revision,
+                db_size,
+            );
+        };
+        let log_start = current_log.revision(0);
+        let client_offset = current_log.resume_offset(&req.client_revision);
+        let log = current_log.bytes.as_slice();
+        if log.len() == MVCC_LOG_HEADER_SIZE {
+            if !client_offset.is_some_and(|start| start == 0 || start == log.len() as u64) {
+                return self.handle_replace_base_pages(db, log_start);
+            }
             // A header-only log has no transactions to normalize, including
             // an older LML2 log awaiting its first portable transaction.
-            return self.handle_empty_logical_pull(format!("g1:o{}", log.len()), db_size);
+            let revision = current_log.revision(log.len() as u64);
+            return self.handle_empty_logical_pull(revision, db_size);
         }
         let crypto = self
             .encryption
@@ -941,7 +926,7 @@ impl TursoSyncServer {
             .map(SyncEncryption::local_context)
             .transpose()?
             .flatten();
-        let normalized = match normalize_mvcc_log(&log, crypto.as_ref()) {
+        let normalized = match normalize_mvcc_log(log, crypto.as_ref()) {
             Ok(normalized) => normalized,
             Err(err) if is_nonportable_mvcc_log_error(&err) => {
                 return self.handle_logical_fallback(
@@ -955,18 +940,20 @@ impl TursoSyncServer {
             Err(err) => return Err(err),
         };
         let snapshot = &normalized.snapshot;
-        let start_offset = parse_mvcc_revision_offset(&req.client_revision, snapshot.end_offset)?;
-        if start_offset > snapshot.end_offset {
-            return Err(anyhow!(
-                "MVCC logical pull revision is from the future: client_offset={} server_offset={}",
-                start_offset,
-                snapshot.end_offset
-            ));
-        }
-        let start = *normalized
-            .wire_offsets
-            .get(&start_offset)
-            .ok_or_else(|| anyhow!("MVCC offset is not a transaction boundary"))?;
+        // The frames between a revision of an earlier log and the current log
+        // are gone after a checkpoint, so such a client gets a page base.
+        let Some((start_offset, start)) = client_offset.and_then(|offset| {
+            normalized
+                .wire_offsets
+                .get(&offset)
+                .map(|&start| (offset, start))
+        }) else {
+            if snapshot.end_offset > MVCC_LOG_HEADER_SIZE as u64 {
+                return self.handle_replace_base_with_log(db);
+            }
+            // The log has no frames, so the pages hold every commit.
+            return self.handle_replace_base_pages(db, log_start);
+        };
         let log = normalized.body.as_ref();
         let end = log.len();
 
@@ -994,7 +981,7 @@ impl TursoSyncServer {
         };
 
         let header = PullUpdatesRespProtoBody {
-            server_revision: format!("g1:o{}", snapshot.end_offset),
+            server_revision: current_log.revision(snapshot.end_offset),
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -1010,7 +997,7 @@ impl TursoSyncServer {
 
         debug!(
             "pull-updates logical: path={} client_revision={} end_offset={} body_bytes={}",
-            log_path.display(),
+            db.path,
             req.client_revision,
             snapshot.end_offset,
             end - start
@@ -1076,6 +1063,74 @@ impl TursoSyncServer {
         self.handle_snapshot_pages(
             db,
             server_revision,
+            PullUpdatesApplyMode::ReplaceBase,
+            PullUpdatesProtocol::MvccLogical,
+            None,
+            None,
+        )
+    }
+
+    /// Answers a pull from a revision that is not a position in the current
+    /// logical log with the pages of a copy of the database whose checkpoint
+    /// wrote that log, and with the revision of the end of the log.
+    ///
+    /// The pages of the database hold only what the last checkpoint wrote. A
+    /// replica that pushed after that checkpoint would get a base without its
+    /// push. It would apply the push on that base, and send it again with its
+    /// next push, over later changes of the server to the same rows.
+    fn handle_replace_base_with_log(&self, db: &DbHandle) -> Result<HttpResponse> {
+        // Declared first, so that it is dropped last: the directory is removed
+        // only after the database of the copy is closed.
+        let dir = tempfile::Builder::new()
+            .prefix("tursodb-replace-base")
+            .tempdir()?;
+        let db_file = db_file_path(&db.path)?;
+        let file_name = db_file
+            .file_name()
+            .ok_or_else(|| anyhow!("database path has no file name: {}", db.path))?;
+        let copy_path = dir.path().join(file_name);
+        let log = {
+            let conn = db.conn.lock().expect("database connection lock poisoned");
+            // The lock keeps commits and checkpoints out while the files are
+            // copied, so the copy and the log are of the same moment.
+            let log = read_mvcc_log(&conn, &db.path)?
+                .ok_or_else(|| anyhow!("{} has no MVCC log", db.path))?;
+            std::fs::copy(&db_file, &copy_path)?;
+            copy_if_present(&wal_path(&db_file), &wal_path(&copy_path))?;
+            log
+        };
+        let crypto = self
+            .encryption
+            .as_ref()
+            .map(SyncEncryption::local_context)
+            .transpose()?
+            .flatten();
+        let end_offset = normalize_mvcc_log(&log.bytes, crypto.as_ref())?
+            .snapshot
+            .end_offset;
+        // Only complete frames go into the copy, so that its recovery ends at
+        // the same offset as the revision.
+        std::fs::write(
+            logical_log_path(&copy_path.to_string_lossy())?,
+            &log.bytes[..end_offset as usize],
+        )?;
+        let copy = open_db_handle(
+            &copy_path,
+            &OpenConfig {
+                vfs: None,
+                flags: OpenFlags::Create,
+                db_opts: self.db_opts,
+                max_open: 1,
+                encryption: self.encryption.clone(),
+            },
+        )?;
+        copy.conn
+            .lock()
+            .expect("database connection lock poisoned")
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        self.handle_snapshot_pages(
+            &copy,
+            log.revision(end_offset),
             PullUpdatesApplyMode::ReplaceBase,
             PullUpdatesProtocol::MvccLogical,
             None,
@@ -1371,6 +1426,20 @@ fn logical_log_path(db_path: &str) -> Result<PathBuf> {
     Ok(db_file_path(db_path)?.with_extension("db-log"))
 }
 
+fn wal_path(db_file: &Path) -> PathBuf {
+    let mut path = db_file.as_os_str().to_owned();
+    path.push("-wal");
+    PathBuf::from(path)
+}
+
+fn copy_if_present(from: &Path, to: &Path) -> Result<()> {
+    match std::fs::copy(from, to) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn is_in_memory_db_path(db_path: &str) -> bool {
     db_path == ":memory:"
 }
@@ -1389,29 +1458,67 @@ fn db_file_path(db_path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn parse_mvcc_revision_offset(revision: &str, legacy_default: u64) -> Result<u64> {
-    if revision.is_empty() {
-        return Ok(0);
+/// The logical log of an MVCC database, read with its connection locked.
+struct MvccLog {
+    bytes: Vec<u8>,
+    /// The salt of the log header. A checkpoint truncates the log and gives
+    /// the next log a new salt, so revisions, which are
+    /// `g1:s<salt>:o<offset>`, name the log their offset belongs to.
+    salt: u64,
+}
+
+/// Reads the logical log of the database at `db_path` up to the write offset
+/// of core, or returns `None` when the database is not in MVCC mode or has no
+/// log file. `conn` must be locked: a commit or checkpoint between reading the
+/// file and reading the salt of an empty log would pair the file with the salt
+/// of another log.
+fn read_mvcc_log(conn: &Connection, db_path: &str) -> Result<Option<MvccLog>> {
+    let Some(mv_store) = conn.mv_store().clone() else {
+        return Ok(None);
+    };
+    if is_in_memory_db_path(db_path) {
+        return Ok(None);
     }
-    if let Some((generation, offset)) = revision.split_once(":o") {
-        let generation = generation
-            .strip_prefix('g')
-            .ok_or_else(|| anyhow!("invalid MVCC pull revision generation: {revision}"))?
-            .parse::<u64>()
-            .map_err(|err| anyhow!("invalid MVCC pull revision generation: {revision}: {err}"))?;
-        if generation != 1 {
-            return Err(anyhow!(
-                "sync_server supports only single-generation MVCC logical pulls: {revision}"
-            ));
-        }
-        return offset
-            .parse::<u64>()
-            .map_err(|err| anyhow!("invalid MVCC pull revision offset: {revision}: {err}"));
+    let mut bytes = match std::fs::read(logical_log_path(db_path)?) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    // Recovery ends the log at the last valid frame without truncating the
+    // file, and the next commit overwrites only part of the bytes after it.
+    // Serve only the frames up to the write offset, as core reads them.
+    // Core reports offset 0 until its first commit, while the file already
+    // holds the header, so keep the header.
+    let offset = mv_store.logical_log_offset() as usize;
+    bytes.truncate(offset.max(MVCC_LOG_HEADER_SIZE));
+    let salt = if bytes.is_empty() {
+        // The page base of an empty log is followed by the log that the next
+        // commit starts, whose header has the salt that core holds now.
+        mv_store.logical_log_salt()?
+    } else {
+        let header = bytes
+            .get(..MVCC_LOG_HEADER_SIZE)
+            .ok_or_else(|| anyhow!("truncated MVCC log header"))?;
+        frame_codec::validate_log_header(header)?.salt()
+    };
+    Ok(Some(MvccLog { bytes, salt }))
+}
+
+impl MvccLog {
+    /// The revision of the position `offset` in this log.
+    fn revision(&self, offset: u64) -> String {
+        format!("g1:s{:016x}:o{offset}", self.salt)
     }
-    // Older page bootstrap responses from this test server used WAL frame
-    // numbers. Treat them as "the page snapshot already includes the current
-    // logical log" so the required follow-up logical pull becomes a no-op.
-    Ok(legacy_default)
+
+    /// Returns the offset in this log where a pull from `revision` resumes, or
+    /// `None` when `revision` is not a position in this log. Revisions of
+    /// other formats, such as `g1:o<offset>` of older servers, return `None`.
+    fn resume_offset(&self, revision: &str) -> Option<u64> {
+        revision
+            .strip_prefix(&format!("g1:s{:016x}:o", self.salt))?
+            .parse()
+            .ok()
+    }
 }
 
 fn is_nonportable_mvcc_log_error(err: &anyhow::Error) -> bool {
@@ -1990,14 +2097,17 @@ mod tests {
             }
             let mut server = dir_server(dir.path());
             server.encryption = Some(encryption);
+            let log_path = logical_log_path(path.to_str().unwrap()).unwrap();
+            let original = std::fs::read(&log_path).unwrap();
+            let salt = frame_codec::validate_log_header(&original[..MVCC_LOG_HEADER_SIZE])
+                .unwrap()
+                .salt();
             let request = PullUpdatesReqProtoBody {
                 stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
-                client_revision: "g1:o0".into(),
+                client_revision: format!("g1:s{salt:016x}:o0"),
                 ..Default::default()
             }
             .encode_to_vec();
-            let log_path = logical_log_path(path.to_str().unwrap()).unwrap();
-            let original = std::fs::read(&log_path).unwrap();
             assert_eq!(original[4], MVCC_LOG_VERSION);
             assert!(original.len() > MVCC_LOG_HEADER_SIZE);
             let crypto = server.encryption.as_ref().unwrap().local_context().unwrap();
@@ -2020,7 +2130,10 @@ mod tests {
                 assert_eq!(response.status, 200);
                 let mut bytes = response.body.as_slice();
                 let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
-                assert_eq!(header.server_revision, format!("g1:o{committed}"));
+                assert_eq!(
+                    header.server_revision,
+                    format!("g1:s{salt:016x}:o{committed}")
+                );
                 assert_eq!(
                     bytes,
                     &normalized.body[..normalized.wire_offsets[&committed]]
@@ -2064,7 +2177,7 @@ mod tests {
                 let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
                 assert_eq!(
                     header.server_revision,
-                    format!("g1:o{MVCC_LOG_HEADER_SIZE}")
+                    format!("g1:s{salt:016x}:o{MVCC_LOG_HEADER_SIZE}")
                 );
                 assert_eq!(header.apply_mode, PullUpdatesApplyMode::Incremental as i32);
                 assert_eq!(
@@ -2415,13 +2528,16 @@ mod tests {
             .is_err());
     }
 
-    fn pull_logical(
+    /// Pulls `stream_kind` from `revision` and returns the header of the
+    /// response and the bytes after it.
+    fn pull(
         server: &TursoSyncServer,
         handle: &DbHandle,
+        stream_kind: PullUpdatesStreamKind,
         revision: &str,
     ) -> Result<(PullUpdatesRespProtoBody, Vec<u8>)> {
         let request = PullUpdatesReqProtoBody {
-            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            stream_kind: stream_kind as i32,
             client_revision: revision.into(),
             ..Default::default()
         }
@@ -2431,6 +2547,28 @@ mod tests {
         let mut bytes = response.body.as_slice();
         let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes)?;
         Ok((header, bytes.to_vec()))
+    }
+
+    fn pull_logical(
+        server: &TursoSyncServer,
+        handle: &DbHandle,
+        revision: &str,
+    ) -> Result<(PullUpdatesRespProtoBody, Vec<u8>)> {
+        pull(
+            server,
+            handle,
+            PullUpdatesStreamKind::MvccLogicalLog,
+            revision,
+        )
+    }
+
+    /// The revision of the position `offset` in the logical log at `log_path`.
+    fn log_revision(log_path: &Path, offset: u64) -> String {
+        let log = std::fs::read(log_path).unwrap();
+        let salt = frame_codec::validate_log_header(&log[..MVCC_LOG_HEADER_SIZE])
+            .unwrap()
+            .salt();
+        format!("g1:s{salt:016x}:o{offset}")
     }
 
     #[test]
@@ -2469,9 +2607,13 @@ mod tests {
             let handle = server
                 .resolve_db(None)
                 .unwrap_or_else(|_| panic!("open source"));
+            let log_start = log_revision(&log_path, 0);
             let (header, _) =
-                pull_logical(&server, &handle, "g1:o0").expect("a torn last frame is skipped");
-            assert_eq!(header.server_revision, format!("g1:o{}", torn_frame.start));
+                pull_logical(&server, &handle, &log_start).expect("a torn last frame is skipped");
+            assert_eq!(
+                header.server_revision,
+                log_revision(&log_path, torn_frame.start)
+            );
             // Recovery ended the log before the torn frame, so this commit
             // overwrites the start of it and the rest of it stays after the
             // new frame.
@@ -2479,9 +2621,9 @@ mod tests {
             conn.execute("INSERT INTO t VALUES (3, 'small')").unwrap();
             let log_end = conn.mv_store().as_ref().unwrap().logical_log_offset();
             assert!(std::fs::metadata(&log_path).unwrap().len() > log_end);
-            let (header, body) = pull_logical(&server, &handle, "g1:o0")
+            let (header, body) = pull_logical(&server, &handle, &log_start)
                 .expect("bytes after the last valid frame are skipped");
-            assert_eq!(header.server_revision, format!("g1:o{log_end}"));
+            assert_eq!(header.server_revision, log_revision(&log_path, log_end));
             assert_eq!(body, std::fs::read(&log_path).unwrap()[..log_end as usize]);
             conn.close().unwrap();
             log_end
@@ -2498,33 +2640,34 @@ mod tests {
         let handle = server
             .resolve_db(None)
             .unwrap_or_else(|_| panic!("open source"));
-        let (header, _) = pull_logical(&server, &handle, "g1:o0")
+        let (header, _) = pull_logical(&server, &handle, &log_revision(&log_path, 0))
             .expect("zero bytes after the last valid frame are skipped");
-        assert_eq!(header.server_revision, format!("g1:o{log_end}"));
+        assert_eq!(header.server_revision, log_revision(&log_path, log_end));
     }
 
     #[test]
     fn header_only_logical_log_keeps_its_revision() {
         let dir = tempfile::tempdir().unwrap();
-        {
+        let revision = {
             let server = plaintext_server(dir.path(), false);
             let handle = server
                 .resolve_db(None)
                 .unwrap_or_else(|_| panic!("open source"));
+            let log_path = logical_log_path(&handle.path).unwrap();
             let conn = handle.conn.lock().unwrap().clone();
             conn.execute("PRAGMA journal_mode=mvcc").unwrap();
-            let (header, _) = pull_logical(&server, &handle, "g1:o0").unwrap();
+            let (header, _) = pull_logical(&server, &handle, &log_revision(&log_path, 0)).unwrap();
             assert_eq!(
                 header.server_revision,
-                format!("g1:o{MVCC_LOG_HEADER_SIZE}")
+                log_revision(&log_path, MVCC_LOG_HEADER_SIZE as u64)
             );
             conn.close().unwrap();
-        }
+            header.server_revision
+        };
         let server = plaintext_server(dir.path(), false);
         let handle = server
             .resolve_db(None)
             .unwrap_or_else(|_| panic!("open source"));
-        let revision = format!("g1:o{MVCC_LOG_HEADER_SIZE}");
         let (header, _) = pull_logical(&server, &handle, &revision).unwrap();
         assert_eq!(header.server_revision, revision);
     }
@@ -2551,6 +2694,233 @@ mod tests {
         let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
         assert_eq!(header.db_size, 2);
         assert!(bytes.is_empty());
+    }
+
+    fn insert_rows(handle: &DbHandle, ids: std::ops::RangeInclusive<i64>, value: &str) {
+        let conn = handle.conn.lock().unwrap();
+        for id in ids {
+            conn.execute(format!("INSERT INTO t VALUES ({id}, '{value}-{id:03}')"))
+                .unwrap();
+        }
+    }
+
+    fn checkpoint(handle: &DbHandle) {
+        handle
+            .conn
+            .lock()
+            .unwrap()
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
+
+    /// Opens an MVCC database with table `t` and an empty logical log.
+    fn mvcc_server(base: &Path) -> (TursoSyncServer, Arc<DbHandle>) {
+        let server = plaintext_server(base, false);
+        let handle = server
+            .resolve_db(None)
+            .unwrap_or_else(|_| panic!("open source"));
+        {
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        checkpoint(&handle);
+        (server, handle)
+    }
+
+    /// Asserts that a pull from `revision` replaces the base with pages that
+    /// hold the rows `ids` of table `t`, also the rows that only the frames of
+    /// the current log hold, and gives the revision of the end of that log.
+    fn assert_pull_replaces_base(
+        server: &TursoSyncServer,
+        handle: &DbHandle,
+        revision: &str,
+        ids: std::ops::RangeInclusive<i64>,
+    ) {
+        let log_path = logical_log_path(&handle.path).unwrap();
+        let log_len = std::fs::metadata(&log_path).unwrap().len();
+        assert!(log_len > MVCC_LOG_HEADER_SIZE as u64, "the log has frames");
+        let (header, pages) = pull_logical(server, handle, revision).unwrap();
+        assert_eq!(
+            header.apply_mode,
+            PullUpdatesApplyMode::ReplaceBase as i32,
+            "a pull from {revision} must replace the base, got {header:?}"
+        );
+        assert_eq!(header.stream_kind, PullUpdatesStreamKind::Pages as i32);
+        assert_eq!(header.server_revision, log_revision(&log_path, log_len));
+        assert_eq!(ids_in_pages(&pages), ids.collect::<Vec<_>>());
+        let (header, frames) = pull_logical(server, handle, &header.server_revision).unwrap();
+        assert_eq!(header.apply_mode, PullUpdatesApplyMode::Incremental as i32);
+        assert!(frames.is_empty());
+    }
+
+    /// The ids of the rows of table `t` in the database that `pages`, the
+    /// pages after the header of a pull response, make.
+    fn ids_in_pages(pages: &[u8]) -> Vec<i64> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pages.db");
+        let mut file = Vec::new();
+        let mut bytes = pages;
+        while !bytes.is_empty() {
+            let page = PageData::decode_length_delimited(&mut bytes).unwrap();
+            let start = page.page_id as usize * PAGE_SIZE;
+            file.resize(file.len().max(start + PAGE_SIZE), 0);
+            file[start..start + PAGE_SIZE].copy_from_slice(&page.encoded_page);
+        }
+        std::fs::write(&path, file).unwrap();
+        let db = Database::open_file_with_flags(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.prepare("SELECT id FROM t ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_revision_from_before_a_checkpoint_is_not_resumed_in_the_next_log() {
+        // With values of the same size, the client's offset is a transaction
+        // boundary of the next log; with longer values it is not.
+        for value_after_checkpoint in ["value", "a-much-longer-value"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (server, handle) = mvcc_server(dir.path());
+            insert_rows(&handle, 1..=5, "value");
+            let (header, _) = pull(&server, &handle, PullUpdatesStreamKind::Pages, "").unwrap();
+            let (header, _) = pull_logical(&server, &handle, &header.server_revision).unwrap();
+            let client_revision = header.server_revision;
+            // Rows 6-8 are committed after the client's pull and before the checkpoint.
+            insert_rows(&handle, 6..=8, "value");
+            checkpoint(&handle);
+            insert_rows(&handle, 9..=15, value_after_checkpoint);
+            assert_pull_replaces_base(&server, &handle, &client_revision, 1..=15);
+        }
+    }
+
+    #[test]
+    fn a_revision_read_while_the_log_was_empty_is_not_resumed_after_a_checkpoint() {
+        for commit_after_checkpoint in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (server, handle) = mvcc_server(dir.path());
+            let (header, _) = pull(&server, &handle, PullUpdatesStreamKind::Pages, "").unwrap();
+            let client_revision = header.server_revision;
+            insert_rows(&handle, 1..=5, "value");
+            checkpoint(&handle);
+            if commit_after_checkpoint {
+                insert_rows(&handle, 6..=8, "value");
+                assert_pull_replaces_base(&server, &handle, &client_revision, 1..=8);
+            } else {
+                let (header, pages) = pull_logical(&server, &handle, &client_revision).unwrap();
+                assert_eq!(header.apply_mode, PullUpdatesApplyMode::ReplaceBase as i32);
+                assert_ne!(header.server_revision, client_revision);
+                assert_eq!(ids_in_pages(&pages), (1..=5).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn a_revision_is_not_resumed_after_writes_in_wal_mode() {
+        // The client's revision is read once while the log is empty and once
+        // while it has frames.
+        for rows_before_pull in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (server, handle) = mvcc_server(dir.path());
+            if rows_before_pull {
+                insert_rows(&handle, 1..=5, "value");
+            }
+            let (header, _) = pull(&server, &handle, PullUpdatesStreamKind::Pages, "").unwrap();
+            let (header, _) = pull_logical(&server, &handle, &header.server_revision).unwrap();
+            let client_revision = header.server_revision;
+            handle
+                .conn
+                .lock()
+                .unwrap()
+                .execute("PRAGMA journal_mode=wal")
+                .unwrap();
+            insert_rows(&handle, 6..=8, "value");
+            handle
+                .conn
+                .lock()
+                .unwrap()
+                .execute("PRAGMA journal_mode=mvcc")
+                .unwrap();
+            insert_rows(&handle, 9..=10, "value");
+            let first = if rows_before_pull { 1 } else { 6 };
+            assert_pull_replaces_base(&server, &handle, &client_revision, first..=10);
+        }
+    }
+
+    #[test]
+    fn an_encrypted_replace_base_includes_the_current_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let encryption = SyncEncryption::new(
+            CipherMode::Aes256Gcm,
+            Some(EncryptionKey::new_256([11; 32])),
+            None,
+        )
+        .unwrap();
+        let handle = open_db_handle(
+            &dir.path().join("data"),
+            &OpenConfig {
+                vfs: None,
+                flags: OpenFlags::Create,
+                db_opts: DatabaseOpts::new(),
+                max_open: 1,
+                encryption: Some(encryption.clone()),
+            },
+        )
+        .unwrap();
+        {
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        checkpoint(&handle);
+        let mut server = dir_server(dir.path());
+        server.encryption = Some(encryption);
+        insert_rows(&handle, 1..=3, "value");
+        let (header, _) = pull(&server, &handle, PullUpdatesStreamKind::Pages, "").unwrap();
+        let (header, _) = pull_logical(&server, &handle, &header.server_revision).unwrap();
+        let client_revision = header.server_revision;
+        checkpoint(&handle);
+        insert_rows(&handle, 4..=6, "value");
+        assert_pull_replaces_base(&server, &handle, &client_revision, 1..=6);
+    }
+
+    #[test]
+    fn a_revision_read_while_the_log_was_empty_resumes_at_the_start_of_the_next_log() {
+        // A reopened database has an empty log with no header until its first
+        // commit.
+        for reopen in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut server, mut handle) = mvcc_server(dir.path());
+            if reopen {
+                drop((server, handle));
+                server = plaintext_server(dir.path(), false);
+                handle = server
+                    .resolve_db(None)
+                    .unwrap_or_else(|_| panic!("open source"));
+            }
+            let (header, _) = pull(&server, &handle, PullUpdatesStreamKind::Pages, "").unwrap();
+            insert_rows(&handle, 1..=5, "value");
+            let log = std::fs::read(logical_log_path(&handle.path).unwrap()).unwrap();
+            let (header, frames) = pull_logical(&server, &handle, &header.server_revision).unwrap();
+            assert_eq!(header.apply_mode, PullUpdatesApplyMode::Incremental as i32);
+            assert_eq!(frames, log);
+        }
     }
 
     #[test]
@@ -2675,6 +3045,7 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             TEST_WORKERS,
             None,
+            DatabaseOpts::new(),
         )
         .unwrap()
     }

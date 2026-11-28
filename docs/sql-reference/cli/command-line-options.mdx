@@ -141,6 +141,12 @@ existing MVCC database with recovery-only log frames, run
 `PRAGMA wal_checkpoint(TRUNCATE)` on it. Enabling portable changes affects new
 transactions; it does not rewrite existing log frames.
 
+After the server checkpoints an MVCC database, a replica that pulled before the
+checkpoint gets all pages of the database with its next pull. If transactions
+came after the checkpoint, the server makes these pages from a copy of the
+database in the temporary directory of the system (`TMPDIR` on Unix). This
+directory must have space for one copy of the database.
+
 ### `--sync-encryption-cipher <CIPHER>` and `--sync-encryption-key-file <PATH>`
 
 Serve encrypted databases with the sample sync server. Both options are required

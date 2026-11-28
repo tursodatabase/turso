@@ -682,6 +682,21 @@ impl LogicalLog {
         self.header.as_ref()
     }
 
+    /// Returns the salt of the log header. A log has no header only while it
+    /// is empty; then this chooses the header that the first frame writes, so
+    /// that the salt is known before that frame exists.
+    pub(crate) fn header_salt(&mut self) -> Result<u64> {
+        self.publish_finished_header_change();
+        if let Some(header) = &self.header {
+            return Ok(header.salt);
+        }
+        let header = self.current_or_new_header()?;
+        let salt = header.salt;
+        self.running_crc = derive_initial_crc(salt);
+        self.header = Some(header);
+        Ok(salt)
+    }
+
     pub(crate) fn encryption_ctx(&self) -> Option<&EncryptionContext> {
         self.encryption_ctx.as_ref()
     }
@@ -7644,6 +7659,35 @@ mod tests {
         assert_eq!(published.version, on_disk.version);
         assert_eq!(published.salt, on_disk.salt);
         assert_eq!(log.running_crc, derive_initial_crc(on_disk.salt));
+    }
+
+    /// What this test checks: the salt that `header_salt` returns for an empty
+    /// log, new or truncated, is the salt of the header that its first frame
+    /// writes.
+    #[test]
+    fn test_header_salt_of_empty_log_is_written_by_first_frame() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("header-salt.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        assert!(log.header().is_none());
+        for rowid in [1, 2] {
+            let salt = log.header_salt().unwrap();
+            assert_eq!(log.header_salt().unwrap(), salt);
+            append_single_table_op_tx(&mut log, &io, (-2).into(), rowid, 1, false, false, "a");
+            let bytes = read_file_bytes(file.clone(), &io);
+            assert_eq!(
+                LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap().salt,
+                salt
+            );
+            let (c, _) = log.truncate(u64::MAX).unwrap();
+            io.wait_for_completion(c).unwrap();
+            log.publish_finished_header_change();
+            assert_eq!(file.size().unwrap(), 0);
+            assert_ne!(log.header_salt().unwrap(), salt);
+        }
     }
 
     /// What this test checks: a fresh-header reset whose header write fails
