@@ -8,6 +8,7 @@ mod integer;
 mod integer_operators;
 mod oid;
 mod regclass;
+mod temporal;
 mod uuid;
 
 pub use integer::IntegerType;
@@ -110,12 +111,9 @@ pub(crate) static BUILT_IN_TYPES: [BuiltInType; 21] = built_in_types! {
     (869, "inet", "I", true, -1, false, "i", "m", 1041, ",", Support::NotRegistered),
     // FIXME(registered-types): varchar with a length is the type that core registers, and without a length it is the TEXT of the engine. A varchar type registered in the frontend, with its INPUT, replaces this.
     (1043, "varchar", "S", false, -1, false, "i", "x", 1015, ",", Support::NotRegistered),
-    // FIXME(registered-types): date: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A date type registered in the frontend, with its INPUT, replaces this. It has no array yet: `date[]` is refused, so typarray is 0 and not the 1182 of PostgreSQL.
-    (1082, "date", "D", false, 4, true, "i", "p", 0, ",", Support::NotRegistered),
-    // FIXME(registered-types): timestamp: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A timestamp type registered in the frontend, with its INPUT, replaces this. It has no array yet: `timestamp[]` is refused, so typarray is 0 and not the 1115 of PostgreSQL.
-    (1114, "timestamp", "D", false, 8, true, "d", "p", 0, ",", Support::NotRegistered),
-    // FIXME(registered-types): timestamptz: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A timestamptz type registered in the frontend, with its INPUT, replaces this. It has no array yet: `timestamptz[]` is refused, so typarray is 0 and not the 1185 of PostgreSQL.
-    (1184, "timestamptz", "D", true, 8, true, "d", "p", 0, ",", Support::NotRegistered),
+    (1082, "date", "D", false, 4, true, "i", "p", 0, ",", Support::Registered(&temporal::DATE)),
+    (1114, "timestamp", "D", false, 8, true, "d", "p", 0, ",", Support::Registered(&temporal::TIMESTAMP)),
+    (1184, "timestamptz", "D", true, 8, true, "d", "p", 0, ",", Support::Registered(&temporal::TIMESTAMPTZ)),
     // FIXME(registered-types): numeric with a precision is the type that core registers, and without one it is the REAL of the engine, which does not keep all its digits. A numeric type registered in the frontend, with its INPUT, replaces this.
     (1700, "numeric", "N", false, -1, false, "i", "m", 1231, ",", Support::NotRegistered),
     (2205, "regclass", "N", false, 4, true, "i", "p", 2210, ",", Support::Registered(&regclass::RegClass)),
