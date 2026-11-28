@@ -1428,6 +1428,34 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
         Ok(())
     }
+
+    /// Initialize MVCC iterator for backward iteration from the last visible row, and set the
+    /// MVCC peek to that row (used by last(), and when prev() is called without last())
+    fn init_mvcc_iterator_backward(&mut self) -> Result<()> {
+        let last_key = match &self.mv_cursor_type {
+            MvccCursorType::Table => self.db.get_last_table_rowid(
+                self.table_id,
+                &mut self.table_iterator,
+                self.tx_id,
+                cursor_work(&self.work),
+            ),
+            MvccCursorType::Index(_) => self.db.get_last_index_rowid(
+                self.table_id,
+                self.tx_id,
+                &mut self.index_iterator,
+                cursor_work(&self.work),
+            )?,
+        };
+        tracing::trace!("init_mvcc_iterator_backward: mvcc_key: {:?}", last_key);
+        self.dual_peek.mvcc_peek = match last_key {
+            Some(key) => CursorPeek::Row {
+                key,
+                versions: None,
+            },
+            None => CursorPeek::Exhausted,
+        };
+        Ok(())
+    }
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCursor<Clock, A> {
@@ -1472,42 +1500,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.invalidate_record();
         self.current_pos = CursorPosition::End;
 
-        // Initialize MVCC iterator to last position
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => match self.db.get_last_table_rowid(
-                self.table_id,
-                &mut self.table_iterator,
-                self.tx_id,
-                cursor_work(&self.work),
-            ) {
-                Some(k) => {
-                    tracing::trace!("last: mvcc_key: {:?}", k);
-                    self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
-                    };
-                }
-                None => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-            MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
-                self.table_id,
-                self.tx_id,
-                &mut self.index_iterator,
-                cursor_work(&self.work),
-            )? {
-                Some(k) => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
-                    };
-                }
-                None => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-        };
+        self.init_mvcc_iterator_backward()?;
 
         self.refresh_current_position(IterationDirection::Backwards);
         self.invalidate_record();
@@ -1618,13 +1611,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
-            // If End and peek not initialized, initialize via last()
+            // If End and peek not initialized, initialize the peek values from the last rows
             if matches!(self.current_pos, CursorPosition::End) {
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     self.state
                         .replace(MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized));
-                    return_if_io!(self.last());
                 } else {
                     self.state
                         .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
@@ -1639,7 +1631,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.state.as_ref().expect("prev state is not initialized"),
             MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized)
         ) {
-            return_if_io!(self.last());
+            // The MVCC iterator is initialized after the B-tree, because the B-tree step can
+            // yield for IO and is then called again.
+            return_if_io!(self.advance_btree_backward());
+            self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+            self.init_mvcc_iterator_backward()?;
             self.state
                 .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
         }
@@ -1651,7 +1647,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // Determine which cursor(s) need to be advanced based on current position
             let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::End => {
-                    // First call after last() - peek values should already be populated
+                    // First call after last() or after the peek values were initialized
+                    // above - just need to pick the larger one
                     (false, false)
                 }
                 CursorPosition::Loaded {
