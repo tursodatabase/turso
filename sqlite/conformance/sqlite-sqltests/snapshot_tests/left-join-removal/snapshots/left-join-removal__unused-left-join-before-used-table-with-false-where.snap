@@ -1,0 +1,40 @@
+---
+source: left-join-removal.sqltest
+expression: SELECT t.c, b.z FROM t LEFT JOIN a ON a.id = t.x LEFT JOIN b ON b.id = t.id WHERE 0;
+info:
+  statement_type: SELECT
+  tables:
+  - a
+  - a.id
+  - b
+  - b.id
+  - t
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN t
+`--SCAN b LEFT-JOIN
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4          p5  comment
+   0  Init            0  17   0               0  Start at 17
+   1  Goto            0  16   0               0
+   2  OpenRead        0   2   0  k(3,B,B,B)   0  table=t, root=2, iDb=0
+   3  OpenRead        1   7   0  k(2,B,B)     0  table=b, root=7, iDb=0
+   4  Rewind          0  16   0               0  Rewind table t
+   5    Integer       0   3   0               0  r[3]=0
+   6    Rewind        1  12   0               0  Rewind table b
+   7      Integer     1   3   0               0  r[3]=1
+   8      Column      0   2   1               0  r[1]=t.c
+   9      Column      1   1   2               0  r[2]=b.z
+  10      ResultRow   1   2   0               0  output=r[1..2]
+  11    Next          1   7   0               1
+  12    IfPos         3  15   0               0  r[3]>0 -> r[3]-=0, goto 15
+  13    NullRow       1   0   0               0  Set cursor 1 to a (pseudo) NULL row
+  14    Goto          0   7   0               0
+  15  Next            0   5   0               1
+  16  Halt            0   0   0               0
+  17  Transaction     0   1   4               0  iDb=0 tx_mode=Read
+  18  Goto            0   1   0               0
