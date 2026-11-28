@@ -2493,9 +2493,6 @@ fn hand_written_input_error(
             }
             None
         }
-        "date" => check_temporal_input(input, "date"),
-        "timestamp" => check_temporal_input(input, "timestamp"),
-        "timestamptz" => check_temporal_input(input, "timestamptz"),
         "time" => check_temporal_input(input, "time"),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
