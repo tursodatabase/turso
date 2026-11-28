@@ -243,6 +243,7 @@ expect {
     ok
 }
 
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test reindex-attached-qualified-targets {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t(id INTEGER PRIMARY KEY, a TEXT, b INT);

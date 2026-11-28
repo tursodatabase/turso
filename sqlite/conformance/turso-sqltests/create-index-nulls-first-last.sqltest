@@ -747,6 +747,7 @@ expect {
 }
 
 @skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@skip-if spec-model "WITHOUT ROWID tables are not supported in spec-model storage"
 test pk-nulls-inert-on-without-rowid {
     CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST)) WITHOUT ROWID;
     INSERT INTO t VALUES (1, 1), (2, 2);

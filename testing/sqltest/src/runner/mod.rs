@@ -32,6 +32,8 @@ pub struct RunOptions {
     pub setups: HashMap<String, Setup>,
     /// Whether MVCC mode is enabled
     pub mvcc: bool,
+    /// Whether all B-trees are in the in-memory spec-model (`--spec-model`)
+    pub spec_model: bool,
     /// Global skip directives
     pub global_skip: Vec<Skip>,
     /// Global capability requirements (used by tests)
@@ -567,6 +569,7 @@ async fn run_single<B: SqlBackend, R: Runnable>(
                 Some(SkipCondition::Sqlite) => options.backend_is_sqlite,
                 Some(SkipCondition::Postgres) => options.backend_type == Backend::Postgres,
                 Some(SkipCondition::Debug) => cfg!(debug_assertions),
+                Some(SkipCondition::SpecModel) => options.spec_model,
             };
             if should_skip {
                 return TestResult {
@@ -605,6 +608,15 @@ async fn run_single<B: SqlBackend, R: Runnable>(
         // Create database instance
         let mut db = match backend.create_database(&options.db_config).await {
             Ok(db) => db,
+            Err(BackendError::Unsupported(reason)) => {
+                return TestResult {
+                    name: test.name().to_string(),
+                    file: options.file_path,
+                    database: options.db_config,
+                    outcome: TestOutcome::Skipped { reason },
+                    duration: start.elapsed(),
+                };
+            }
             Err(e) => {
                 return TestResult {
                     name: test.name().to_string(),
@@ -1004,6 +1016,8 @@ pub struct RunnerConfig {
     pub filter: Option<String>,
     /// Whether MVCC mode is enabled
     pub mvcc: bool,
+    /// Whether all B-trees are in the in-memory spec-model (`--spec-model`)
+    pub spec_model: bool,
     /// Snapshot update mode (Auto, New, Always, No)
     pub snapshot_update_mode: SnapshotUpdateMode,
     /// Snapshot name filter (glob pattern)
@@ -1021,6 +1035,7 @@ impl Default for RunnerConfig {
             max_jobs: num_cpus::get(),
             filter: None,
             mvcc: false,
+            spec_model: false,
             snapshot_update_mode: SnapshotUpdateMode::Auto,
             snapshot_filter: None,
             cross_check_binary: None,
@@ -1042,6 +1057,11 @@ impl RunnerConfig {
 
     pub fn with_mvcc(mut self, mvcc: bool) -> Self {
         self.mvcc = mvcc;
+        self
+    }
+
+    pub fn with_spec_model(mut self, spec_model: bool) -> Self {
+        self.spec_model = spec_model;
         self
     }
 
@@ -1134,6 +1154,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     db_config: effective_db_config,
                     setups: test_file.setups.clone(),
                     mvcc: self.config.mvcc,
+                    spec_model: self.config.spec_model,
                     global_skip: test_file.global_skip.clone(),
                     global_requires: test_file.global_requires.clone(),
                     backend_capabilities: backend_capabilities.clone(),
@@ -1208,6 +1229,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     db_config: db_config.clone(),
                     setups: test_file.setups.clone(),
                     mvcc: self.config.mvcc,
+                    spec_model: self.config.spec_model,
                     global_skip: test_file.global_skip.clone(),
                     global_requires: test_file.global_requires.clone(),
                     backend_capabilities: backend_capabilities.clone(),
@@ -1267,6 +1289,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         db_config: db_config.clone(),
                         setups: test_file.setups.clone(),
                         mvcc: self.config.mvcc,
+                        spec_model: self.config.spec_model,
                         global_skip: test_file.global_skip.clone(),
                         global_requires: test_file.global_requires.clone(),
                         backend_capabilities: backend_capabilities.clone(),
@@ -1726,6 +1749,7 @@ expect {
                 db_config: file.databases[0].clone(),
                 setups: file.setups.clone(),
                 mvcc: false,
+                spec_model: false,
                 global_skip: file.global_skip.clone(),
                 global_requires: file.global_requires.clone(),
                 backend_capabilities: HashSet::new(),
@@ -1752,6 +1776,63 @@ expect {
                     "{backend_type}: {:?}",
                     result.outcome
                 ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_if_spec_model_skips_only_with_spec_model() {
+        let file = crate::parser::parse(
+            r#"
+@database :memory:
+
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#,
+        )
+        .unwrap();
+
+        for spec_model in [false, true] {
+            let options = RunOptions {
+                file_path: PathBuf::from("skip.sqltest"),
+                db_config: file.databases[0].clone(),
+                setups: file.setups.clone(),
+                mvcc: false,
+                spec_model,
+                global_skip: file.global_skip.clone(),
+                global_requires: file.global_requires.clone(),
+                backend_capabilities: HashSet::new(),
+                backend_type: Backend::Rust,
+                backend_is_sqlite: false,
+                backend_reports_sqlstate: false,
+                snapshot_update_mode: SnapshotUpdateMode::No,
+                cross_check_binary: None,
+                verify_materialized_views: false,
+            };
+            let backend = Arc::new(OneRowBackend {
+                backend_type: Backend::Rust,
+            });
+            let result = run_single(backend, file.tests[0].clone(), options).await;
+            if spec_model {
+                assert!(
+                    matches!(
+                        &result.outcome,
+                        TestOutcome::Skipped { reason } if reason == "ATTACH is not supported in spec-model storage"
+                    ),
+                    "{:?}",
+                    result.outcome
+                );
+            } else {
+                assert!(
+                    matches!(result.outcome, TestOutcome::Passed),
+                    "{:?}",
+                    result.outcome
+                );
             }
         }
     }
@@ -1784,6 +1865,7 @@ expect {
                 db_config: file.databases[0].clone(),
                 setups: file.setups.clone(),
                 mvcc: false,
+                spec_model: false,
                 global_skip: file.global_skip.clone(),
                 global_requires: file.global_requires.clone(),
                 backend_capabilities: HashSet::new(),
@@ -1837,6 +1919,7 @@ expect error {
                 db_config: file.databases[0].clone(),
                 setups: file.setups.clone(),
                 mvcc: false,
+                spec_model: false,
                 global_skip: file.global_skip.clone(),
                 global_requires: file.global_requires.clone(),
                 backend_capabilities: HashSet::new(),
@@ -2050,6 +2133,7 @@ expect @tursopg {
             },
             setups: HashMap::new(),
             mvcc: false,
+            spec_model: false,
             global_skip: Vec::new(),
             global_requires: Vec::new(),
             backend_capabilities: HashSet::new(),

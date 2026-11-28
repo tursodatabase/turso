@@ -4462,6 +4462,7 @@ expect {
     ok
 }
 
+@skip-if spec-model "VACUUM INTO is not supported in spec-model storage"
 test gencol_stored_vacuum_into_copies_table_with_stored_column {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b, c AS (b*2) STORED);
     INSERT INTO t1(b) VALUES(1);
@@ -7079,6 +7080,7 @@ expect {
 }
 
 @skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@skip-if spec-model "WITHOUT ROWID tables are not supported in spec-model storage"
 test gencol_issue7064_without_rowid_matched_rows_after_unmatched_row {
     CREATE TABLE l(x);
     CREATE TABLE r(a PRIMARY KEY, b, g AS (b + 1), h AS (1)) WITHOUT ROWID;

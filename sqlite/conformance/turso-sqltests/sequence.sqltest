@@ -349,6 +349,7 @@ expect {
 
 # A trigger body resolves names without a qualifier in the trigger's own
 # database, but a sequence named with another database is that database's.
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test trigger-body-finds-a-sequence-of-another-database {
     ATTACH DATABASE ':memory:' AS aux;
     CREATE SEQUENCE aux.s;

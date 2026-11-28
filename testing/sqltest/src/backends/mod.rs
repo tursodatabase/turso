@@ -213,6 +213,10 @@ pub enum BackendError {
     #[error("backend not available: {0}")]
     NotAvailable(String),
 
+    /// The backend cannot open a database of this kind. The runner skips the test.
+    #[error("{0}")]
+    Unsupported(String),
+
     #[error("timeout after {0:?}")]
     Timeout(Duration),
 }

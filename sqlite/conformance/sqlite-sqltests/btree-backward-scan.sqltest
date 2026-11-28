@@ -6,6 +6,7 @@
 # between interior pages, causing rightmost subtrees to be skipped.
 
 @cross-check-integrity
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test backward-scan-deep-btree {
     PRAGMA page_size = 512;
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);

@@ -758,6 +758,13 @@ pub(crate) fn open_table_cursor(
         )));
     };
     let root_page = table.get_root_page()?;
+    if let Some(store) = pager.tree_store() {
+        return store.open_cursor(
+            pager.clone(),
+            root_page,
+            crate::storage::tree_store::TreeKind::Table,
+        );
+    }
     let cursor = BTreeCursor::new_table_boxed(
         pager,
         btree_root_page(connection, database_id, root_page),

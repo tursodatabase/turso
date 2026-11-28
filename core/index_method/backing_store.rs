@@ -323,6 +323,10 @@ impl BackingStore {
     pub fn open_cursor(&self) -> Result<Box<dyn CursorTrait>> {
         let connection = self.connection()?;
         let pager = connection.get_pager_from_database_index(&self.database_id)?;
+        if let Some(store) = pager.tree_store() {
+            let kind = crate::storage::tree_store::TreeKind::Keys(&self.index_info);
+            return store.open_cursor(pager.clone(), self.root_page, kind);
+        }
         let mut cursor = BTreeCursor::new(
             pager,
             btree_root_page(&connection, self.database_id, self.root_page),

@@ -99,6 +99,7 @@ expect {
 
 @skip-if mvcc "attach is not supported for mvcc"
 @cross-check-integrity
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test pragma-foreign-key-list-attached-database {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.parent(id INTEGER PRIMARY KEY);

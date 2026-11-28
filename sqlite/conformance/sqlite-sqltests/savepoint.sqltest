@@ -355,6 +355,7 @@ expect error {
 # touches lots of overflow pages under cache pressure must not leave the
 # pager with dirty entries whose buffers cannot be loaded at commit time.
 @cross-check-integrity
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test savepoint-rollback-overflow-issue-6352 {
     PRAGMA page_size = 2048;
     PRAGMA cache_size = 8;
@@ -378,6 +379,7 @@ expect {
 # released, and only the outer one is rolled back. Exercises the
 # subjournal entry coalescing across nested savepoints.
 @cross-check-integrity
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test savepoint-rollback-overflow-nested-issue-6352 {
     PRAGMA page_size = 2048;
     PRAGMA cache_size = 4;
@@ -404,6 +406,7 @@ expect {
 # Repeated rollback of the same savepoint within a transaction. Each cycle
 # must produce a clean state for the surrounding outer transaction.
 @cross-check-integrity
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test savepoint-rollback-overflow-repeated-issue-6352 {
     PRAGMA page_size = 2048;
     PRAGMA cache_size = 8;
@@ -434,6 +437,7 @@ expect {
 # truncate dirty page state and the database size cleanly so a follow-up
 # INSERT can append fresh overflow chains.
 @cross-check-integrity
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test savepoint-rollback-overflow-grow-issue-6352 {
     PRAGMA page_size = 2048;
     PRAGMA cache_size = 8;
@@ -456,6 +460,7 @@ expect {
 # Regression test for #6351: ROLLBACK TO must restore every subjournaled
 # before-image even when the page cache is full of dirty pages.
 @cross-check-integrity
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test savepoint-rollback-cache-spill-issue-6351 {
     PRAGMA page_size = 512;
     PRAGMA cache_size = 2;

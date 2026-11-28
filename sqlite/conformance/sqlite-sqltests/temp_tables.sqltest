@@ -259,6 +259,7 @@ expect {
     0|-1|-1
 }
 
+@skip-if spec-model "PRAGMA page_size is not supported in spec-model storage"
 test pragma-temp-page-size-independent-of-main {
     PRAGMA temp.page_size=1024;
     CREATE TEMP TABLE pagesize_temp_t(a);
@@ -270,6 +271,7 @@ expect {
     4096
 }
 
+@skip-if spec-model "PRAGMA freelist_count is not supported in spec-model storage"
 test pragma-temp-freelist-count-matches-sqlite {
     CREATE TEMP TABLE t(a);
     INSERT INTO t SELECT zeroblob(5000) FROM generate_series(1, 10);

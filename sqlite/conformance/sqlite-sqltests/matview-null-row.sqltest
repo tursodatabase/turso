@@ -2,6 +2,7 @@
 @skip-file-if mvcc "materialized views not supported in MVCC mode"
 @skip-file-if sqlite "materialized views are a turso-specific feature"
 @requires-file materialized_views "requires materialized view support"
+@skip-file-if spec-model "materialized views are not supported in spec-model storage"
 
 setup matview {
     CREATE TABLE t (id INT PRIMARY KEY, type TEXT, amt INT);

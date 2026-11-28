@@ -75,6 +75,7 @@ expect error {
 
 @skip-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
 @cross-check-integrity
+@skip-if spec-model "WITHOUT ROWID tables are not supported in spec-model storage"
 test strict-without-rowid-table-options {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) STRICT, WITHOUT ROWID;
     INSERT INTO t VALUES (1, 'one'), (2, 'two');
@@ -91,6 +92,7 @@ expect {
 
 @skip-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
 @cross-check-integrity
+@skip-if spec-model "WITHOUT ROWID tables are not supported in spec-model storage"
 test strict-without-rowid-table-options-reversed {
     CREATE TABLE t(a TEXT, b INTEGER, c ANY, PRIMARY KEY(a, b)) without rowid, strict;
     INSERT INTO t VALUES ('one', 1, '0001'), ('two', 2, X'0102');

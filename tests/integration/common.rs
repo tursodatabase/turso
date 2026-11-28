@@ -321,6 +321,26 @@ impl TempDatabase {
         Self::builder().with_db_name(db_name).build()
     }
 
+    /// Creates a `:spec-model:` database: like `:memory:`, but every tree is in the in-memory
+    /// spec-model of the cursor contract. It exists only in debug builds.
+    #[allow(dead_code)]
+    pub fn new_spec_model() -> Self {
+        let io: Arc<dyn IO + Send> = Arc::new(turso_core::MemoryIO::new());
+        let opts = turso_core::DatabaseOpts::new();
+        let options = turso_core::OpenOptions::new(Arc::new(SqliteDialect)).db_opts(opts);
+        let db = Database::open(io.clone(), ":spec-model:", options).unwrap();
+        TempDatabase {
+            path: PathBuf::from(":spec-model:"),
+            io,
+            db,
+            db_opts: opts,
+            db_flags: turso_core::OpenFlags::default(),
+            init_sql: None,
+            enable_mvcc: false,
+            encryption: None,
+        }
+    }
+
     /// Creates a new database with MVCC mode enabled.
     pub fn new_with_mvcc(db_name: &str) -> Self {
         let db = Self::new(db_name);

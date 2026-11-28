@@ -72,6 +72,12 @@ enum Commands {
         #[arg(long)]
         mvcc: bool,
 
+        /// Open every new database as `:spec-model:`, where all trees are in the in-memory
+        /// spec-model of the cursor contract (--backend rust, debug builds only). Tests that
+        /// need a pre-built database file are skipped.
+        #[arg(long)]
+        spec_model: bool,
+
         /// Snapshot update mode:
         /// - auto: 'no' in CI, 'new' otherwise (default)
         /// - new: write .snap.new files for review
@@ -238,6 +244,8 @@ pub struct BackendRun<'a> {
     pub resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
     pub timeout: Duration,
     pub mvcc: bool,
+    /// Open every new database as `:spec-model:` (`--spec-model`).
+    pub spec_model: bool,
     config: RunnerConfig,
     loaded: LoadedTests,
     output: &'a mut Box<dyn OutputFormat>,
@@ -299,6 +307,7 @@ pub async fn run(flavor: &dyn Flavor) -> ExitCode {
             output,
             timeout,
             mvcc,
+            spec_model,
             snapshot_mode,
             snapshot_filter,
             cross_check_binary,
@@ -319,6 +328,7 @@ pub async fn run(flavor: &dyn Flavor) -> ExitCode {
                 output,
                 timeout,
                 mvcc,
+                spec_model,
                 snapshot_mode,
                 snapshot_filter,
                 cross_check_binary,
@@ -363,6 +373,7 @@ async fn run_tests(
     output_format: String,
     timeout: u64,
     mvcc: bool,
+    spec_model: bool,
     snapshot_mode: SnapshotUpdateMode,
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
@@ -381,6 +392,10 @@ async fn run_tests(
             return ExitCode::from(2);
         }
         _ => {}
+    }
+    if spec_model && (mvcc || backend_type != "rust") {
+        eprintln!("Error: --spec-model works only with --backend rust and without --mvcc");
+        return ExitCode::from(2);
     }
     if mvcc && backend_type == "tursopg-embedded" {
         eprintln!("Error: --mvcc does not work with --backend tursopg-embedded");
@@ -453,6 +468,7 @@ async fn run_tests(
     let mut config = RunnerConfig::default()
         .with_max_jobs(jobs)
         .with_mvcc(mvcc)
+        .with_spec_model(spec_model)
         .with_snapshot_update_mode(snapshot_mode)
         .with_fail_fast(fail_fast);
     if let Some(f) = filter {
@@ -592,6 +608,7 @@ async fn run_tests(
                 resolver,
                 timeout: Duration::from_secs(timeout),
                 mvcc,
+                spec_model,
                 config,
                 loaded,
                 output: &mut output,

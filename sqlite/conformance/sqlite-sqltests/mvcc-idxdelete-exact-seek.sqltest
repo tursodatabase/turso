@@ -1,5 +1,6 @@
 @database :temp:
 @skip-file-if sqlite "MVCC is not supported in SQLite"
+@skip-file-if spec-model "MVCC is not supported in spec-model storage"
 
 # Regression coverage for https://github.com/tursodatabase/turso/issues/7579:
 # an exact-seek IdxDelete on the same MVCC index cursor skipped MVCC-only

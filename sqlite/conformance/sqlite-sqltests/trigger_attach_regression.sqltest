@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file trigger "trigger tests require trigger support"
 @skip-file-if mvcc "attach is not supported for mvcc"
+@skip-file-if spec-model "ATTACH is not supported in spec-model storage"
 
 # Triggers cannot reference objects in attached databases
 # SQLite rejects triggers whose body references tables in a different database

@@ -1,5 +1,6 @@
 @database :memory:
 
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test pragma-synchronous-tvf-schema-qualified {
     ATTACH ':memory:' AS aux;
     PRAGMA aux.synchronous=OFF;
@@ -11,6 +12,7 @@ expect {
     2
 }
 
+@skip-if spec-model "ATTACH is not supported in spec-model storage"
 test pragma-synchronous-tvf-schema-hidden-column-reads-back-null {
     ATTACH ':memory:' AS aux;
     SELECT schema IS NULL FROM pragma_synchronous('aux');

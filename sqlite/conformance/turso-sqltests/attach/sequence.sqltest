@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if spec-model "ATTACH is not supported in spec-model storage"
 
 # Schema-qualified nextval resolves to the correct database
 test sequence-schema-qualified-nextval {

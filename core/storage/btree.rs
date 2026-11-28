@@ -823,6 +823,20 @@ pub trait CursorTrait: Any + Send + Sync {
     fn get_null_flag(&self) -> bool;
     /// Check if a key exists.
     fn exists(&mut self, key: &Value) -> IOResultOr<bool>;
+    /// True when the cursor is on the row `rowid` and its record has the bytes `payload`, so
+    /// an `Insert` of that row would change nothing. `Insert` asks this before it writes.
+    fn holds_row(&mut self, rowid: i64, payload: &[u8]) -> IOResultOr<bool> {
+        if return_if_io!(self.rowid()) != Some(rowid) {
+            return Ok(IOResult::Done(false));
+        }
+        let existing = return_if_io!(self.record_payload());
+        Ok(IOResult::Done(existing == Some(payload)))
+    }
+    /// A second cursor on the same tree, for `OpenDup`. `None`: the caller opens a cursor on
+    /// the same root page of the same pager.
+    fn duplicate(&self) -> Option<Box<dyn CursorTrait>> {
+        None
+    }
     /// Remove every entry but keep the root page. Returns the number of entries removed.
     fn clear_btree(&mut self) -> IOResultOr<u64>;
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>>;

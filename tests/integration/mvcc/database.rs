@@ -4974,7 +4974,6 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
 
 /// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[turso_macros::test(encryption)]
-#[ignore] // FIXME: This fails constantly on main and is really annoying, disabling for now :]
 fn test_cursor_with_btree_and_mvcc_fuzz() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     let mut rows_in_db = sorted_vec::SortedVec::new();
@@ -5149,6 +5148,7 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
                 // This forces things to move to the BTree file (.db)
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
                 // This forces MVCC to be cleared
+                maybe_conn.take().unwrap().close().unwrap();
                 db.restart();
                 maybe_conn = Some(db.connect());
             }

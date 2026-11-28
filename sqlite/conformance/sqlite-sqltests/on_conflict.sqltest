@@ -963,6 +963,7 @@ expect {
 # Regression test: INSERT ... ON CONFLICT(<col>) DO UPDATE that mutates the
 # row's primary key must not falsely raise a UNIQUE conflict on <col>.
 @skip-if sqlite "MVCC is not supported in SQLite"
+@skip-if spec-model "MVCC is not supported in spec-model storage"
 test mvcc-upsert-set-pk-on-conflict-target-resolves {
     PRAGMA journal_mode='MVCC';
     CREATE TABLE t (id INTEGER PRIMARY KEY, a UNIQUE);

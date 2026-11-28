@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if spec-model "ATTACH is not supported in spec-model storage"
 
 # Test querying attached in-memory database
 test attach-db-query {

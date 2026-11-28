@@ -32,9 +32,12 @@ pub(crate) mod pager;
 pub(crate) mod shared_wal_coordination;
 #[allow(dead_code)]
 pub(super) mod slot_bitmap;
+#[cfg(debug_assertions)]
+pub mod spec_model;
 pub mod sqlite3_ondisk;
 mod state_machines;
 pub(crate) mod subjournal;
+pub mod tree_store;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod wal;
 

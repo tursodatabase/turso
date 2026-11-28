@@ -82,7 +82,9 @@ impl Flavor for SqliteFlavor {
         if name != "rust" {
             return None;
         }
-        let mut backend = RustBackend::new().with_mvcc(run.mvcc);
+        let mut backend = RustBackend::new()
+            .with_mvcc(run.mvcc)
+            .with_spec_model(run.spec_model);
         if let Some(resolver) = run.resolver.clone() {
             backend = backend.with_default_db_resolver(resolver);
         }

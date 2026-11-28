@@ -24,6 +24,7 @@ expect error {
     Concurrent transaction mode is only supported when MVCC is enabled
 }
 
+@skip-if spec-model "MVCC is not supported in spec-model storage"
 test temp-autoincrement-is-allowed-when-main-db-is-mvcc {
     PRAGMA journal_mode='MVCC';
     CREATE TEMP TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);

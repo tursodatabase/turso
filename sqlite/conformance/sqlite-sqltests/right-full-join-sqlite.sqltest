@@ -403,6 +403,7 @@ expect error {
 
 @skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
 @cross-check-integrity
+@skip-if spec-model "WITHOUT ROWID tables are not supported in spec-model storage"
 test right-and-full-join-record-without-rowid-right-rows-by-primary-key {
     CREATE TABLE t1(k INT PRIMARY KEY, a) WITHOUT ROWID;
     CREATE TABLE t2(k INT PRIMARY KEY, b) WITHOUT ROWID;
@@ -449,6 +450,7 @@ expect {
 
 @skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
 @cross-check-integrity
+@skip-if spec-model "WITHOUT ROWID tables are not supported in spec-model storage"
 test right-and-full-join-accept-without-rowid-tables-on-the-left {
     CREATE TABLE t1(k INT PRIMARY KEY, a) WITHOUT ROWID;
     CREATE TABLE t2(k INT, b);

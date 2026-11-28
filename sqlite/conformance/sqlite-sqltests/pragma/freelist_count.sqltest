@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if spec-model "ATTACH is not supported in spec-model storage"
 
 @skip-if mvcc "freelist_count doesn't work under mvcc"
 test pragma-aux-freelist-count-matches-sqlite {
