@@ -2075,7 +2075,7 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     header.schema_cookie = 77.into();
 
     db.mvcc_store
-        .with_global_header_mut_for_testing(|header| *header = DatabaseHeader::default())
+        .with_header_mut(|header| *header = DatabaseHeader::default(), None)
         .unwrap();
     db.mvcc_store
         .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));

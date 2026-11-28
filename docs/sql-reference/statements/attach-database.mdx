@@ -61,16 +61,6 @@ JOIN customers_db.customers c ON o.customer_id = c.id;
 ATTACH ':memory:' AS scratch;
 ```
 
-### Attach an Encrypted Database
-
-The main and attached databases select encryption independently: either can be plaintext or encrypted. Supply the attached database's own credentials in its URI:
-
-```sql
-ATTACH 'file:encrypted.db?cipher=aegis256&hexkey=YOUR_HEX_KEY' AS encrypted;
-```
-
-Non-NULL `ATTACH ... KEY` values are rejected before the target is opened. Use the URI parameters above to configure encryption. `KEY NULL` is accepted.
-
 ## See Also
 
 - [DETACH DATABASE](/docs/sql-reference/statements/detach-database) for removing an attached database

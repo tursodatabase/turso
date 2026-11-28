@@ -48,8 +48,6 @@ PRAGMA page_size;
 PRAGMA page_size = 8192;
 ```
 
-Encrypted databases reject page-size assignments, including before their first write. Select the page size in core `OpenOptions::page_size` when opening a new encrypted database.
-
 ### max_page_count
 
 Returns or sets the maximum number of pages allowed in the database file.
@@ -813,13 +811,11 @@ CDC respects transaction boundaries. Changes are only recorded when a transactio
 
 ### cipher
 
-Reports the immutable encryption cipher for the current connection:
+Sets the encryption cipher for the database.
 
 ```sql
-PRAGMA cipher;
+PRAGMA cipher = 'aegis256';
 ```
-
-Encryption must be configured when opening the database. Assignments to `cipher` or `hexkey` are rejected during preparation, including on a new empty database. Enabling the experimental encryption feature without credentials creates a plaintext database that cannot later become encrypted.
 
 Supported ciphers:
 
@@ -836,27 +832,34 @@ Supported ciphers:
 
 ### hexkey
 
-Reports whether the current connection has an encryption key. It never returns key material:
+Sets the encryption key as a hexadecimal string.
 
 ```sql
-PRAGMA hexkey;
+PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
 ```
 
-Supply both cipher and key at open time, for example:
+#### Encryption Example
 
-```shell
-tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=YOUR_HEX_KEY"
+```sql
+-- Set cipher and key before creating tables
+PRAGMA cipher = 'aegis256';
+PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
+
+CREATE TABLE secrets (id INTEGER PRIMARY KEY, data TEXT);
+INSERT INTO secrets VALUES (1, 'sensitive data');
 ```
 
-This URI can expose the key through process arguments, shell history, and command-line recording. It is not a protected secret-input channel.
+Alternatively, specify encryption parameters in the database URI:
 
-Every open and connection independently authenticates its credentials before shared schema or MVCC state is accessible. Missing keys, wrong keys, and cipher mismatches are rejected. An unknown cipher, or a key that is not valid hex or does not have the size that the cipher needs, is rejected before the database file is created. Existing encrypted files retain their format and credentials. Choose an encrypted database's page size in core `OpenOptions::page_size` before opening it; the default for a new database is 4096. Page size and reserved bytes are immutable afterward.
+```
+file:database.db?cipher=aegis256&hexkey=2d7a30...
+```
 
-Each encrypted attachment requires its own cipher/key URI. Non-NULL `ATTACH ... KEY` values are rejected before opening or creating the target. `KEY NULL` uses the URI credentials. Serialize other opens of a fresh target until ATTACH completes. In-place VACUUM preserves encryption for the main database and rejects encrypted attached databases. VACUUM INTO produces a plaintext destination.
+To open an existing encrypted database, the cipher and key must be provided as URI parameters.
 
-After an external storage restore, reload through the connection with its current encryption key. Reload rejects database or sidecar files encrypted with another key and cannot change the page size or reserved bytes. Sync encryption is not supported.
+An unknown cipher, or a key that is not valid hex or does not have the size that the cipher needs, is rejected before the database file is created.
 
-Built-in encryption protects database storage, WAL, and encrypted MVCC storage. Serialize writes until the first page of a new database has been initialized, including across connections, raw/custom-storage opens, and separate processes. Recovery after a failed or abandoned initial write is not guaranteed.
+After an external storage restore, reload through the connection with its current encryption key. Reload rejects database or sidecar files encrypted with another key and cannot change the page size or reserved bytes.
 
 MVCC recovery ignores an incomplete or checksum-invalid log tail and keeps the preceding committed frames. A checksum-valid encrypted frame that cannot be decrypted with the configured key causes opening or recovery to fail.
 

@@ -1,4 +1,4 @@
-use rand::{rng, seq::SliceRandom, RngCore, SeedableRng};
+use rand::{rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
@@ -58,7 +58,6 @@ pub struct TempDatabaseBuilder {
     enable_views: bool,
     dialect: Option<Arc<dyn Dialect>>,
     encryption: Option<turso_core::EncryptionOpts>,
-    page_size: Option<turso_core::storage::sqlite3_ondisk::PageSize>,
 }
 
 struct TestIo {
@@ -146,7 +145,6 @@ impl TempDatabaseBuilder {
             enable_views: false,
             dialect: None,
             encryption: None,
-            page_size: None,
         }
     }
 
@@ -216,11 +214,6 @@ impl TempDatabaseBuilder {
         self
     }
 
-    pub fn with_page_size(mut self, size: u32) -> Self {
-        self.page_size = Some(turso_core::storage::sqlite3_ondisk::PageSize::new(size).unwrap());
-        self
-    }
-
     pub fn build(self) -> TempDatabase {
         let mut opts = self
             .opts
@@ -271,25 +264,24 @@ impl TempDatabaseBuilder {
             }
         };
         let dialect = self.dialect.unwrap_or_else(|| Arc::new(SqliteDialect));
-        let mut options = turso_core::OpenOptions::new(dialect)
-            .flags(flags)
-            .db_opts(opts)
-            .encryption(self.encryption.clone());
-        if let Some(size) = self.page_size {
-            options = options.page_size(size);
-        }
-        let db = Database::open(io.clone(), db_path.to_str().unwrap(), options).unwrap();
-        let connect_opts = || {
-            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
-                self.encryption
-                    .as_ref()
-                    .map(|opts| turso_core::EncryptionKey::from_hex_string(&opts.hexkey).unwrap()),
-            )
-        };
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            flags,
+            opts,
+            self.encryption.clone(),
+            dialect,
+        )
+        .unwrap();
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
-            let conn = db.connect(connect_opts()).unwrap();
+            let conn = db
+                .connect(
+                    ConnectOpts::new(SessionRole::Superuser)
+                        .with_encryption_key(encryption_key(self.encryption.as_ref())),
+                )
+                .unwrap();
             conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
@@ -358,11 +350,8 @@ impl TempDatabase {
         let conn = self
             .db
             .connect(
-                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
-                    self.encryption.as_ref().map(|opts| {
-                        turso_core::EncryptionKey::from_hex_string(&opts.hexkey).unwrap()
-                    }),
-                ),
+                ConnectOpts::new(SessionRole::Superuser)
+                    .with_encryption_key(encryption_key(self.encryption.as_ref())),
             )
             .unwrap();
         log::debug!("connected to limbo");
@@ -406,6 +395,12 @@ impl TempDatabase {
         const PENDING_BYTE: u32 = 2u32.pow(30);
         Self::set_pending_byte(PENDING_BYTE);
     }
+}
+
+fn encryption_key(
+    encryption: Option<&turso_core::EncryptionOpts>,
+) -> Option<turso_core::EncryptionKey> {
+    encryption.map(|opts| turso_core::EncryptionKey::from_hex_string(&opts.hexkey).unwrap())
 }
 
 pub fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
@@ -599,19 +594,6 @@ pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
     );
     let rng = ChaCha8Rng::seed_from_u64(seed as u64);
     (rng, seed as u64)
-}
-
-/// Set ENCRYPTION_TEST_FULL=1 for every case; SEED replays sampled cases.
-pub fn sample_encryption_cases<T>(mut cases: Vec<T>, count: usize, rng: &mut ChaCha8Rng) -> Vec<T> {
-    if !full_encryption_tests() {
-        cases.shuffle(rng);
-        cases.truncate(count);
-    }
-    cases
-}
-
-pub fn full_encryption_tests() -> bool {
-    std::env::var("ENCRYPTION_TEST_FULL").as_deref() == Ok("1")
 }
 
 pub fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {

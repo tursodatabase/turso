@@ -518,7 +518,11 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
         .to_string();
     assert_eq!(
         err,
-        "page size mismatch: requested 8192 bytes, database uses 4096 bytes"
+        format!(
+            "cannot attach database 'aux': page size mismatch (main={:?}, attached={:?})",
+            turso_core::storage::sqlite3_ondisk::PageSize::new(8192).unwrap(),
+            turso_core::storage::sqlite3_ondisk::PageSize::new(4096).unwrap(),
+        )
     );
 
     Ok(())

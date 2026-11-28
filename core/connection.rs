@@ -30,7 +30,7 @@ use crate::{
     translate,
     translate::collate::TextCollation,
     util::IOExt,
-    vdbe, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
+    vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
     CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
     ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
@@ -515,7 +515,8 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
-    pub(crate) encryption_key: Option<EncryptionKey>,
+    pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
+    pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
     pub(super) data_sync_retry: AtomicBool,
@@ -1593,6 +1594,19 @@ impl Connection {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
+        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                MEMORY_PATH,
+                flags,
+                db_opts,
+                None,
+                dialect,
+            )?;
+            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+            return Ok((io, conn));
+        }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
             (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
             (Some(_), None) => {
@@ -1607,26 +1621,6 @@ impl Connection {
             }
             (None, None) => None,
         };
-        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
-            let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                MEMORY_PATH,
-                flags,
-                db_opts,
-                encryption_opts.clone(),
-                dialect,
-            )?;
-            let conn = db.connect(
-                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
-                    encryption_opts
-                        .as_ref()
-                        .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
-                        .transpose()?,
-                ),
-            )?;
-            return Ok((io, conn));
-        }
         let (io, db) = Database::open_new(
             &opts.path,
             opts.vfs.as_ref(),
@@ -1640,12 +1634,13 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let key = opts
-            .hexkey
-            .as_deref()
-            .map(EncryptionKey::from_hex_string)
-            .transpose()?;
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key))?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        if let Some(cipher) = opts.cipher {
+            let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
+        }
+        if let Some(hexkey) = opts.hexkey {
+            let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
+        }
         Ok((io, conn))
     }
 
@@ -1656,8 +1651,7 @@ impl Connection {
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
         dialect: Arc<dyn crate::Dialect>,
-        page_size: PageSize,
-    ) -> Result<(Arc<Database>, Option<EncryptionKey>)> {
+    ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
         if main_db_flags.contains(OpenFlags::ReadOnly) {
@@ -1677,27 +1671,24 @@ impl Connection {
             }
             (None, None) => None,
         };
-        let encryption_key = encryption_opts
-            .as_ref()
-            .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
-            .transpose()?;
-        db_opts = db_opts.with_encryption(encryption_opts.is_some());
+        if encryption_opts.is_some() {
+            db_opts = db_opts.with_encryption(true);
+        }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open(
+        let db = Database::open_file_with_flags(
             io.clone(),
             &opts.path,
-            crate::OpenOptions::new(dialect)
-                .flags(flags)
-                .db_opts(db_opts)
-                .encryption(encryption_opts)
-                .page_size(page_size),
+            flags,
+            db_opts,
+            encryption_opts.clone(),
+            dialect,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        Ok((db, encryption_key))
+        Ok((db, encryption_opts))
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
@@ -2424,7 +2415,7 @@ impl Connection {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn reload_wal_after_external_restore(&self) -> Result<()> {
-        let encryption_key = self.encryption_key.clone();
+        let encryption_key = self.encryption_key.read().clone();
         self.db
             .reload_wal_after_external_restore_with_encryption_key(encryption_key)
     }
@@ -2636,15 +2627,6 @@ impl Connection {
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     /// `VACUUM INTO` uses it for the output database even in WAL mode.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
-        if self
-            .get_pager_from_database_index(&database_id)?
-            .encryption_cipher()
-            != CipherMode::None
-        {
-            return Err(LimboError::InvalidArgument(
-                "encrypted database page size is fixed when opening the database".into(),
-            ));
-        }
         self.next_page_size.store(size, Ordering::SeqCst);
         if self.get_source_database(database_id).initialized() {
             return Ok(());
@@ -4451,28 +4433,24 @@ impl Connection {
         Arc::as_ptr(&self.db) as usize
     }
 
-    pub fn set_encryption_key(&self, _key: EncryptionKey) -> Result<()> {
-        Err(LimboError::InvalidArgument(
-            "encryption must be configured when opening the database".into(),
-        ))
+    pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
+        tracing::trace!("setting encryption key for connection");
+        self.ensure_can_change_encryption_settings()?;
+        *self.encryption_key.write() = Some(key);
+        self.bump_prepare_context_generation();
+        self.set_encryption_context()
     }
 
-    pub fn set_encryption_cipher(&self, _cipher_mode: CipherMode) -> Result<()> {
-        Err(LimboError::InvalidArgument(
-            "encryption must be configured when opening the database".into(),
-        ))
+    pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
+        tracing::trace!("setting encryption cipher for connection");
+        self.ensure_can_change_encryption_settings()?;
+        self.encryption_cipher_mode.set(cipher_mode);
+        self.bump_prepare_context_generation();
+        self.set_encryption_context()
     }
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
-        if pager.encryption_cipher() != CipherMode::None {
-            if reserved_bytes as usize == pager.encryption_cipher().metadata_size() {
-                return Ok(());
-            }
-            return Err(LimboError::InvalidArgument(
-                "encrypted database reserved bytes are fixed when opening the database".into(),
-            ));
-        }
         if let Some(codec) = pager.page_codec_external() {
             let required_reserved_bytes = codec.required_reserved_bytes();
             if reserved_bytes != required_reserved_bytes {
@@ -4496,10 +4474,47 @@ impl Connection {
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
-        match self.pager.load().encryption_cipher() {
+        match self.encryption_cipher_mode.get() {
             CipherMode::None => None,
             mode => Some(mode),
         }
+    }
+
+    fn ensure_can_change_encryption_settings(&self) -> Result<()> {
+        let pager = self.pager.load();
+        if pager.is_encryption_ctx_set() {
+            return Err(LimboError::InvalidArgument(
+                "cannot reset encryption attributes if already set in the session".to_string(),
+            ));
+        }
+        if pager.has_external_page_codec() {
+            return Err(LimboError::InvalidArgument(
+                "cannot configure built-in encryption while an external page codec is installed"
+                    .to_string(),
+            ));
+        }
+        if self.db.get_mv_store().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "cannot enable encryption after MVCC is active; configure encryption before PRAGMA journal_mode='mvcc'"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    // if both key and cipher are set, set encryption context on pager
+    fn set_encryption_context(&self) -> Result<()> {
+        let key_guard = self.encryption_key.read();
+        let Some(key) = key_guard.as_ref() else {
+            return Ok(());
+        };
+        let cipher_mode = self.get_encryption_cipher_mode();
+        let Some(cipher_mode) = cipher_mode else {
+            return Ok(());
+        };
+        tracing::trace!("setting encryption ctx for connection");
+        let pager = self.pager.load();
+        pager.set_encryption_context(cipher_mode, key)
     }
 
     /// Sets a custom busy handler callback.
@@ -5342,21 +5357,6 @@ mod tests {
     }
 
     #[test]
-    fn close_marks_connection_closed_and_decrements_count_once() {
-        let directory = TempDir::new().unwrap();
-        let connection = open_connection(&directory.path().join("close.db"));
-        let database = connection.db.clone();
-        assert_eq!(database.n_connections.load(Ordering::SeqCst), 1);
-        connection.close().unwrap();
-        assert!(connection.is_closed());
-        assert_eq!(database.n_connections.load(Ordering::SeqCst), 0);
-        connection.close().unwrap();
-        assert_eq!(database.n_connections.load(Ordering::SeqCst), 0);
-        drop(connection);
-        assert_eq!(database.n_connections.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
     fn test_attach_database_with_config_overrides_reserved_space_before_initialization() {
         let temp_dir = TempDir::new().unwrap();
         let main_path = temp_dir.path().join("main.db");
@@ -5386,183 +5386,5 @@ mod tests {
             err,
             "cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
         );
-    }
-}
-
-#[cfg(all(test, shuttle))]
-mod shuttle_encryption_tests {
-    use super::*;
-    use crate::thread;
-
-    #[test]
-    fn seeded_connections_authenticate_independent_keys() {
-        seeded("connections authenticate independent keys", || {
-            let (db, _, _) = connections();
-            let first_db = db.clone();
-            let second_db = db.clone();
-            assert_eq!(
-                race(
-                    move || first_db
-                        .connect(
-                            ConnectOpts::new(crate::SessionRole::Superuser)
-                                .with_encryption_key(Some(key(1)))
-                        )
-                        .is_ok(),
-                    move || second_db
-                        .connect(
-                            ConnectOpts::new(crate::SessionRole::Superuser)
-                                .with_encryption_key(Some(key(2)))
-                        )
-                        .is_ok()
-                ),
-                [true, false]
-            );
-            assert_single_binding(&db, CipherMode::Aegis256, 1);
-        });
-    }
-
-    #[test]
-    fn seeded_encrypted_schema_publication() {
-        seeded("schema publication", || {
-            let (db, writer, _) = connections();
-            let observer = db.clone();
-            assert_eq!(
-                race(
-                    move || {
-                        let pager = writer.get_pager();
-                        writer.db.io.block(|| pager.maybe_allocate_page1()).unwrap();
-                        writer
-                            .with_schema_mut(|schema| schema.schema_version += 1)
-                            .unwrap();
-                        writer.publish_schema_if_newer();
-                        true
-                    },
-                    move || observer
-                        .connect(
-                            ConnectOpts::new(crate::SessionRole::Superuser)
-                                .with_encryption_key(Some(key(2)))
-                        )
-                        .is_ok()
-                ),
-                [true, false]
-            );
-            assert_eq!(db.clone_schema().schema_version, 1);
-            assert_single_binding(&db, CipherMode::Aegis256, 1);
-        });
-    }
-
-    fn connections() -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
-        let db = Database::open(
-            Arc::new(crate::MemoryIO::new()),
-            ":memory:",
-            crate::OpenOptions::new(Arc::new(
-                crate::dialect::cannot_parse::DialectThatCannotParse,
-            ))
-            .db_opts(DatabaseOpts::new().with_encryption(true))
-            .encryption(crate::EncryptionOpts {
-                cipher: "aegis256".into(),
-                hexkey: "01".repeat(32),
-            }),
-        )
-        .unwrap();
-        let first = db
-            .connect(
-                ConnectOpts::new(crate::SessionRole::Superuser).with_encryption_key(Some(key(1))),
-            )
-            .unwrap();
-        let second = db
-            .connect(
-                ConnectOpts::new(crate::SessionRole::Superuser).with_encryption_key(Some(key(1))),
-            )
-            .unwrap();
-        (db, first, second)
-    }
-
-    fn key(byte: u8) -> EncryptionKey {
-        EncryptionKey::new_256([byte; 32])
-    }
-
-    fn race(
-        first: impl FnOnce() -> bool + Send + 'static,
-        second: impl FnOnce() -> bool + Send + 'static,
-    ) -> [bool; 2] {
-        let first = thread::spawn(first);
-        let second = thread::spawn(second);
-        [first.join().unwrap(), second.join().unwrap()]
-    }
-
-    fn assert_single_binding(db: &Arc<Database>, cipher: CipherMode, winner: u8) {
-        let valid = db
-            .connect(
-                ConnectOpts::new(crate::SessionRole::Superuser)
-                    .with_encryption_key(Some(key(winner))),
-            )
-            .unwrap();
-        assert_eq!(valid.get_encryption_cipher_mode(), Some(cipher));
-        assert!(db
-            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
-            .is_err());
-        assert!(db
-            .connect(
-                ConnectOpts::new(crate::SessionRole::Superuser)
-                    .with_encryption_key(Some(key(3 - winner)))
-            )
-            .is_err());
-    }
-
-    fn seeded(name: &'static str, body: impl Fn() + Send + Sync + 'static) {
-        let iterations = if std::env::var("ENCRYPTION_TEST_FULL").as_deref() == Ok("1") {
-            256
-        } else {
-            8
-        };
-        let mut config = shuttle::Config::default();
-        config.stack_size = 1024 * 1024;
-        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
-        let scheduler = EncryptionScheduler {
-            inner: shuttle::scheduler::RandomScheduler::new(iterations),
-        };
-        let executions = shuttle::Runner::new(scheduler, config).run(body);
-        assert_eq!(executions, iterations);
-        eprintln!("encryption {name}: {executions} complete executions");
-    }
-
-    /// Runs the test's root thread alone and lets other threads interleave
-    /// at labelled shared-state accesses.
-    struct EncryptionScheduler<S> {
-        inner: S,
-    }
-
-    impl<S: shuttle::scheduler::Scheduler> shuttle::scheduler::Scheduler for EncryptionScheduler<S> {
-        fn new_execution(&mut self) -> Option<shuttle::scheduler::Schedule> {
-            self.inner.new_execution()
-        }
-
-        fn next_task(
-            &mut self,
-            runnable: &[&shuttle::scheduler::Task],
-            current: Option<shuttle::scheduler::TaskId>,
-            yielding: bool,
-        ) -> Option<shuttle::scheduler::TaskId> {
-            if let Some(root) = runnable.iter().find(|task| usize::from(task.id()) == 0) {
-                return self.inner.next_task(&[root], current, yielding);
-            }
-            if let Some(current) = current {
-                let shared = shuttle::current::get_label_for_task::<
-                    crate::sync::EncryptionSchedulePoint,
-                >(current)
-                .is_some_and(|point| point.0);
-                if !shared {
-                    if let Some(task) = runnable.iter().find(|task| task.id() == current) {
-                        return self.inner.next_task(&[task], Some(current), yielding);
-                    }
-                }
-            }
-            self.inner.next_task(runnable, current, yielding)
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            self.inner.next_u64()
-        }
     }
 }
