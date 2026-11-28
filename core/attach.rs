@@ -548,9 +548,10 @@ impl Connection {
                         Self::set_mvcc_journal_mode_fresh_db(&pager)?;
                         Self::install_database_wal_on_pager(&init.db, &mut pager);
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
+                        // A fresh database has no commits in any log, so it uses the new name.
                         let mv_store = journal_mode::open_mv_store(
                             init.db.io.clone(),
-                            &init.db.path,
+                            &journal_mode::logical_log_path(&init.db.path),
                             init.db.open_flags,
                             init.db.durable_storage.clone(),
                             enc_ctx,

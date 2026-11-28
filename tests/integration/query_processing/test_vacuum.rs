@@ -2903,7 +2903,7 @@ fn test_vacuum_into_file_targets_create_the_named_file(tmp_db: TempDatabase) -> 
         let remove_files = || {
             let _ = std::fs::remove_file(&file_name);
             let _ = std::fs::remove_file(format!("{file_name}-wal"));
-            let _ = std::fs::remove_file(Path::new(&file_name).with_extension("db-log"));
+            let _ = std::fs::remove_file(turso_core::logical_log_path(&file_name));
         };
         remove_files();
 

@@ -6,6 +6,7 @@ mod cost_scaling;
 mod database;
 mod group_commit;
 mod hermitage;
+mod log_path;
 mod logical_log;
 mod persistence;
 mod store;

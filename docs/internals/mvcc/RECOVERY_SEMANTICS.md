@@ -10,7 +10,7 @@ The checkpoint model is stop-the-world (blocking checkpoint lock).
 Startup decisions use four durable artifacts:
 - Main database file (`.db`)
 - WAL file (`.db-wal`)
-- MVCC logical log (`.db-log`)
+- MVCC logical log (the database file name followed by `-log`, for example `app.db-log`)
 - MVCC metadata table row: `__turso_internal_mvcc_meta(k='persistent_tx_ts_max')`
 
 The logical-log header (56 bytes) contains format metadata and a CRC chain seed:

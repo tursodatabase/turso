@@ -204,8 +204,14 @@ pub fn sync_database_file_paths(main_db_path: &str) -> Vec<String> {
         create_changes_path(main_db_path),
         // MVCC may be selected only after the remote protocol is known.
         create_main_db_log_path(main_db_path),
-        create_replace_base_marker_path(main_db_path),
     ];
+    // Older versions named the log after the file name without its last
+    // extension. A log with that name can be left from an older version.
+    let old_log_path = create_old_main_db_log_path(main_db_path);
+    if !paths.contains(&old_log_path) {
+        paths.push(old_log_path);
+    }
+    paths.push(create_replace_base_marker_path(main_db_path));
     paths.extend(
         replace_base_file_specs(main_db_path)
             .map(|(_, name)| replace_base_backup_path(main_db_path, name)),
@@ -216,6 +222,11 @@ fn create_main_db_wal_path(main_db_path: &str) -> String {
     format!("{main_db_path}-wal")
 }
 fn create_main_db_log_path(main_db_path: &str) -> String {
+    turso_core::logical_log_path(main_db_path)
+        .to_string_lossy()
+        .to_string()
+}
+fn create_old_main_db_log_path(main_db_path: &str) -> String {
     std::path::Path::new(main_db_path)
         .with_extension("db-log")
         .to_string_lossy()
@@ -3611,6 +3622,7 @@ mod tests {
                 "replica.sqlite-wal-revert",
                 "replica.sqlite-info",
                 "replica.sqlite-changes",
+                "replica.sqlite-log",
                 "replica.db-log",
                 "replica.sqlite-replace-base-apply",
                 "replica.sqlite-replace-base-apply-main-db.backup",

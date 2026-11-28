@@ -1,0 +1,324 @@
+use crate::common::ExecRows;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use turso_core::io::{Buffer, Completion, MemoryIO, PlatformIO, IO};
+use turso_core::{ConnectOpts, Connection, Database, OpenFlags, SessionRole};
+use turso_sqlite::SqliteDialect;
+
+/// Two database files whose names differ only after the last dot must not
+/// share a logical log. Before, `app.1` and `app.2` both used `app.db-log`,
+/// so `app.2` replayed the commits of `app.1`.
+#[test]
+fn test_databases_that_differ_after_the_last_dot_use_separate_logs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    let one = dir.path().join("app.1");
+    let two = dir.path().join("app.2");
+    std::fs::copy(&template, &one).unwrap();
+    std::fs::copy(&template, &two).unwrap();
+
+    with_conn(&one, |conn| {
+        conn.execute("INSERT INTO notes VALUES ('app.1')").unwrap();
+    });
+    with_conn(&two, |conn| {
+        assert_eq!(notes(conn), vec![]);
+        conn.execute("INSERT INTO notes VALUES ('app.2')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    });
+
+    assert_eq!(with_conn(&two, notes), vec![("app.2".to_string(),)]);
+    assert_eq!(with_conn(&one, notes), vec![("app.1".to_string(),)]);
+    let names = file_names(dir.path());
+    assert!(names.contains(&"app.1-log".to_string()), "{names:?}");
+    assert!(names.contains(&"app.2-log".to_string()), "{names:?}");
+    assert!(!names.contains(&"app.db-log".to_string()), "{names:?}");
+    // For a `.db` file, the new name is the same as the old name.
+    assert!(names.contains(&"template.db-log".to_string()), "{names:?}");
+}
+
+/// A database whose log an older version wrote with the old name continues to
+/// use that log until a checkpoint empties it, and then uses the new name.
+#[test]
+fn test_database_continues_to_use_its_log_from_an_older_version() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    let path = create_with_old_log(dir.path(), &template, "app.sqlite");
+    let old_log = dir.path().join("app.db-log");
+    let new_log = sidecar(&path, "-log");
+
+    with_conn(&path, |conn| {
+        assert_eq!(notes(conn), vec![("app.sqlite".to_string(),)]);
+        // A commit after a checkpoint goes to the log that is open.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO notes VALUES ('second')").unwrap();
+    });
+    assert!(!new_log.exists());
+    assert!(file_len(&old_log) > 0);
+
+    with_conn(&path, |conn| {
+        assert_eq!(
+            notes(conn),
+            vec![("app.sqlite".to_string(),), ("second".to_string(),)]
+        );
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    });
+    assert_eq!(file_len(&old_log), 0);
+
+    with_conn(&path, |conn| {
+        conn.execute("INSERT INTO notes VALUES ('third')").unwrap();
+    });
+    assert!(file_len(&new_log) > 0);
+    assert_eq!(file_len(&old_log), 0);
+    assert_eq!(
+        with_conn(&path, notes),
+        vec![
+            ("app.sqlite".to_string(),),
+            ("second".to_string(),),
+            ("third".to_string(),)
+        ]
+    );
+}
+
+/// When an older version used one log for two MVCC databases, the log can hold
+/// commits of each of them, so neither database opens.
+#[test]
+fn test_old_log_of_two_mvcc_databases_is_an_error() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    let one = create_with_old_log(dir.path(), &template, "app.1");
+    let two = dir.path().join("app.2");
+    std::fs::copy(&template, &two).unwrap();
+
+    for path in [&one, &two] {
+        let err = try_open(path).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&err, turso_core::LimboError::InvalidArgument(msg) if msg.contains("app.db-log")),
+            "{err:?}"
+        );
+        assert!(!sidecar(path, "-log").exists());
+    }
+}
+
+/// A log with the old name does not belong to a database in WAL mode. Before,
+/// a WAL database next to the log of another database failed to open with a
+/// corruption error.
+#[test]
+fn test_old_log_next_to_a_wal_database() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    let path = create_with_old_log(dir.path(), &template, "app.sqlite");
+    let wal_db = dir.path().join("app.bak");
+    create_wal_database(&wal_db);
+
+    assert_eq!(with_conn(&wal_db, notes), vec![]);
+    assert_eq!(with_conn(&path, notes), vec![("app.sqlite".to_string(),)]);
+}
+
+/// A database that enters MVCC mode next to the old log of another database
+/// uses the new name, and the other database continues to own the old log.
+#[test]
+fn test_journal_mode_change_next_to_an_old_log() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    let one = create_with_old_log(dir.path(), &template, "app.1");
+    let two = dir.path().join("app.2");
+    create_wal_database(&two);
+
+    with_conn(&two, |conn| {
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("INSERT INTO notes VALUES ('app.2')").unwrap();
+    });
+    assert!(file_len(&sidecar(&two, "-log")) > 0);
+
+    assert_eq!(with_conn(&two, notes), vec![("app.2".to_string(),)]);
+    assert_eq!(with_conn(&one, notes), vec![("app.1".to_string(),)]);
+}
+
+/// A database whose files are not in the OS file system, for example with
+/// MemoryIO or the browser IO, continues to use its log from an older version.
+#[test]
+fn test_database_with_other_io_continues_to_use_its_log_from_an_older_version() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    create_with_old_log(dir.path(), &template, "app.1");
+
+    // This directory does not exist, so the files are only in the MemoryIO.
+    let mem_dir = format!(
+        "not-on-disk-{}",
+        dir.path().file_name().unwrap().to_string_lossy()
+    );
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    for name in ["app.1", "app.1-wal", "app.db-log"] {
+        let from = dir.path().join(name);
+        if from.exists() {
+            copy_into_io(&io, &from, &format!("{mem_dir}/{name}"));
+        }
+    }
+
+    let db = Database::open_file(io, &format!("{mem_dir}/app.1"), Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(notes(&conn), vec![("app.1".to_string(),)]);
+    conn.close().unwrap();
+}
+
+/// Opening a database that uses its old log keeps the file locks of the
+/// database and of another database that this process has open. Unix file
+/// locks belong to the process, so closing any descriptor of a locked file
+/// releases them, and then a second process can open the database.
+#[cfg(unix)]
+#[test]
+fn test_old_log_lookup_keeps_file_locks() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("template.db");
+    create_template(&template);
+    let wal_db = dir.path().join("app.bak");
+    create_wal_database(&wal_db);
+    let path = create_with_old_log(dir.path(), &template, "app.sqlite");
+
+    let wal_conn = try_open(&wal_db).unwrap();
+    let conn = try_open(&path).unwrap();
+    for locked in [&path, &wal_db] {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(LOCKED_DATABASE_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(LOCKED_DATABASE_ENV, locked)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "a second process opened {}: stdout={}; stderr={}",
+            locked.display(),
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+    assert_eq!(notes(&conn), vec![("app.sqlite".to_string(),)]);
+    conn.close().unwrap();
+    wal_conn.close().unwrap();
+}
+
+#[cfg(unix)]
+const LOCKED_DATABASE_CHILD_TEST: &str = "mvcc::log_path::open_locked_database_child_process";
+#[cfg(unix)]
+const LOCKED_DATABASE_ENV: &str = "TURSO_LOG_PATH_LOCKED_DATABASE";
+
+/// Runs in the child process of `test_old_log_lookup_keeps_file_locks`, and
+/// checks that the database is locked.
+#[cfg(unix)]
+#[test]
+fn open_locked_database_child_process() {
+    let Some(path) = std::env::var_os(LOCKED_DATABASE_ENV) else {
+        return;
+    };
+    let err = try_open(Path::new(&path)).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(err, turso_core::LimboError::LockingError(_)),
+        "{err:?}"
+    );
+}
+
+/// Creates an MVCC database at `path` with an empty `notes` table and no
+/// commits in its logical log.
+fn create_template(path: &Path) {
+    with_conn(path, |conn| {
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE notes (owner TEXT)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    });
+}
+
+/// Copies the template to `name` in `dir` and commits one row with owner
+/// `name` that is only in the logical log. Then gives the log the name that
+/// older versions used, as if an older version had written it.
+fn create_with_old_log(dir: &Path, template: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::copy(template, &path).unwrap();
+    with_conn(&path, |conn| {
+        conn.execute(format!("INSERT INTO notes VALUES ('{name}')"))
+            .unwrap();
+    });
+    let log_path = sidecar(&path, "-log");
+    assert!(file_len(&log_path) > 0);
+
+    // The row is only in the log: the database file without its log has no rows.
+    let copy_dir = tempfile::TempDir::new().unwrap();
+    let copy = copy_dir.path().join(name);
+    std::fs::copy(&path, &copy).unwrap();
+    assert_eq!(with_conn(&copy, notes), vec![]);
+
+    std::fs::rename(&log_path, path.with_extension("db-log")).unwrap();
+    path
+}
+
+/// Creates a database at `path` in WAL mode with an empty `notes` table and an
+/// empty WAL.
+fn create_wal_database(path: &Path) {
+    with_conn(path, |conn| {
+        conn.execute("CREATE TABLE notes (owner TEXT)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    });
+}
+
+/// Opens the database at `path`, runs `f` on a connection, and closes the
+/// database, so that the next open reads the files again.
+fn with_conn<T>(path: &Path, f: impl FnOnce(&Arc<Connection>) -> T) -> T {
+    let conn = try_open(path).unwrap();
+    let result = f(&conn);
+    conn.close().unwrap();
+    result
+}
+
+fn try_open(path: &Path) -> turso_core::Result<Arc<Connection>> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
+    db.connect(ConnectOpts::new(SessionRole::Superuser))
+}
+
+/// Writes the content of the file at `from` to a new file at `to` in `io`.
+fn copy_into_io(io: &Arc<dyn IO>, from: &Path, to: &str) {
+    let data = std::fs::read(from).unwrap();
+    let file = io.open_file(to, OpenFlags::Create, false).unwrap();
+    if data.is_empty() {
+        return;
+    }
+    let c = file
+        .pwrite(
+            0,
+            Arc::new(Buffer::new(data)),
+            Completion::new_write(|_| {}),
+        )
+        .unwrap();
+    io.wait_for_completion(c).unwrap();
+}
+
+fn notes(conn: &Arc<Connection>) -> Vec<(String,)> {
+    conn.exec_rows("SELECT owner FROM notes ORDER BY owner")
+}
+
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
+}
+
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}

@@ -128,12 +128,12 @@ class EncryptedSync(unittest.TestCase):
                     run("scalar", "SELECT count(*) FROM items", path=plain, environment=plain_env)["value"], 3
                 )
                 self.assert_encrypted_files(cipher, [
-                    source, Path(str(source) + "-wal"), source.with_suffix(".db-log"), replica,
+                    source, Path(str(source) + "-wal"), Path(str(source) + "-log"), replica,
                     Path(str(replica) + "-info"),
                 ])
                 if mvcc:
                     before = run("scalar", "SELECT count(*) FROM items", remote="-")
-                    source_log = source.with_suffix(".db-log")
+                    source_log = Path(str(source) + "-log")
                     original = source_log.read_bytes()
                     corrupt = bytearray(original)
                     self.assertEqual(corrupt[4], 3)

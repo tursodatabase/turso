@@ -320,6 +320,8 @@ PRAGMA journal_mode = mvcc;
 ```
 
 When MVCC mode is active, you can use `BEGIN CONCURRENT` for optimistic concurrent write transactions. See [Transactions](/docs/sql-reference/statements/transactions#begin-concurrent) for details.
+
+In MVCC mode, commits go to a logical log file next to the database file. The name of the log is the database file name followed by `-log`, for example `app.db-log` for `app.db` and `app.sqlite-log` for `app.sqlite`. Older versions removed the last extension of the database file name and added `.db-log`, so `app.1` and `app.2` both used `app.db-log`. A database that has commits in a log with the old name continues to use that log until a checkpoint empties it. If another MVCC database file in the same directory can also have written that log, the database does not open, because the log can hold commits of both databases.
 </Info>
 
 ### auto_vacuum
