@@ -55,11 +55,14 @@ fn hash_join_key<V: AsValueRef>(key_values: &[V], collations: &[CollationSeq]) -
     hasher.finish()
 }
 
-/// Normalize signed zero so 0.0 and -0.0 hash the same.
+/// The bits of a float for hashing and for sort prefixes. Values that are
+/// equal have the same bits: 0.0 and -0.0, and all NaNs.
 #[inline]
 pub(crate) const fn normalized_f64_bits(f: f64) -> u64 {
     if f == 0.0 {
         0.0f64.to_bits()
+    } else if f.is_nan() {
+        0x7ff8_0000_0000_0000
     } else {
         f.to_bits()
     }
@@ -3359,6 +3362,23 @@ fn record_distinct_key_on_disk(
 #[cfg(test)]
 mod hashtests {
     use super::*;
+
+    #[test]
+    fn equal_floats_have_the_same_normalized_bits() {
+        assert_eq!(normalized_f64_bits(-0.0), normalized_f64_bits(0.0));
+        for bits in [
+            0x7ff8_0000_0000_0000u64,
+            0xfff8_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+            0x7fff_ffff_ffff_ffff,
+        ] {
+            assert_eq!(
+                normalized_f64_bits(f64::from_bits(bits)),
+                normalized_f64_bits(f64::NAN)
+            );
+        }
+        assert_ne!(normalized_f64_bits(1.5), normalized_f64_bits(-1.5));
+    }
     use crate::alloc::vec;
     use crate::io::Buffer;
     use crate::MemoryIO;

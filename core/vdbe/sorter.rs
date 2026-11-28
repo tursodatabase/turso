@@ -80,8 +80,7 @@ fn normalized_first_key(values: &[ValueRef<'_>], key_info: &[KeyInfo]) -> (u64, 
                 Numeric::Integer(i) => (*i as f64, i.unsigned_abs() < (1u64 << 49)),
                 Numeric::Float(f) => (f64::from(*f), false),
             };
-            let f = if f == 0.0 { 0.0 } else { f }; // collapse -0.0 with +0.0
-            let bits = f.to_bits();
+            let bits = crate::vdbe::hash_table::normalized_f64_bits(f);
             let monotone = if bits >> 63 == 1 {
                 !bits
             } else {

@@ -158,9 +158,7 @@ fn hash_sqlite_value<H: Hasher>(value: ValueRef, state: &mut H) {
                 Numeric::Integer(i) => i as f64,
                 Numeric::Float(f) => f64::from(f),
             };
-            // -0.0 equals 0.0 but has other bits.
-            let real = if real == 0.0 { 0.0 } else { real };
-            real.to_bits().hash(state);
+            crate::vdbe::hash_table::normalized_f64_bits(real).hash(state);
         }
         ValueRef::Text(text) => {
             2u8.hash(state);
