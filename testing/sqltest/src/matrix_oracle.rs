@@ -12,7 +12,7 @@
 //! to Turso values (notably `format_real`'s `%!.15g`), so comparing the
 //! resulting strings compares typed values, not incidental text formatting.
 
-use crate::backends::rust::format_real;
+use crate::format_real::format_real;
 use rusqlite::types::ValueRef;
 
 /// Outcome of running one statement against the oracle.

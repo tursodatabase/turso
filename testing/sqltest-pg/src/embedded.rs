@@ -1,9 +1,11 @@
-use super::pg_connection::{copy_text_columns, split_statements};
-use super::tursopg::database_path;
-use super::{BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend};
-use crate::backends::DefaultDatabaseResolver;
-use crate::parser::ast::{Backend, Capability, DatabaseConfig};
 use async_trait::async_trait;
+use sqltest::backends::pg_connection::{copy_text_columns, split_statements};
+use sqltest::backends::tursopg::database_path;
+use sqltest::backends::{
+    BackendError, DatabaseFileHandle, DatabaseInstance, DefaultDatabaseResolver, QueryResult,
+    SqlBackend,
+};
+use sqltest::parser::ast::{Backend, Capability, DatabaseConfig};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
