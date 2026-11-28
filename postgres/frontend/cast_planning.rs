@@ -205,6 +205,7 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
         "boolean" => Bool,
         "oid" => Oid,
         "regclass" => RegClass,
+        "uuid" => Uuid,
         "timestamp" => Timestamp,
         "timestamptz" => TimestampTz,
         // FIXME(pg-catalog): numeric is registered only with a type modifier. Without one it is REAL, which `is_lowered_type_name` leaves to the engine. A numeric type that needs no modifier lets every numeric go through CASTS.
@@ -255,7 +256,6 @@ const ENGINE_RULE_TYPES: &[&str] = &[
     "time",
     "json",
     "jsonb",
-    "uuid",
     "bytea",
     "inet",
     "cidr",

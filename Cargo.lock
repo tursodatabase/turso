@@ -7370,7 +7370,6 @@ dependencies = [
  "turso_pg_catalog",
  "turso_pg_parser",
  "turso_sqlite",
- "uuid",
 ]
 
 [[package]]

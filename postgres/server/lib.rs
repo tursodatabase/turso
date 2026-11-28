@@ -2452,8 +2452,21 @@ mod tests {
     #[test]
     fn test_pg_bytes_to_value_unknown_type_as_text() {
         // Unknown types should be treated as text
-        let val = pg_bytes_to_value(b"some-uuid-value", &Type::UUID).unwrap();
-        assert_eq!(val, Value::from_text("some-uuid-value".to_owned()));
+        let val = pg_bytes_to_value(b"some-macaddr-value", &Type::MACADDR).unwrap();
+        assert_eq!(val, Value::from_text("some-macaddr-value".to_owned()));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_uuid_is_read_by_its_input() {
+        let stored = pg_bytes_to_value(b"{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}", &Type::UUID);
+        let canonical = pg_bytes_to_value(b"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", &Type::UUID);
+        assert_eq!(stored.unwrap(), canonical.unwrap());
+        for text in [
+            "urn:uuid:a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+            " a0eebc999c0b4ef8bb6d6bb9bd380a11",
+        ] {
+            assert!(pg_bytes_to_value(text.as_bytes(), &Type::UUID).is_err());
+        }
     }
 
     #[test]

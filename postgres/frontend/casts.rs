@@ -33,6 +33,7 @@ pub(crate) enum CastType {
     Bool,
     Oid,
     RegClass,
+    Uuid,
     // FIXME(pg-catalog): bytea is not a registered type yet, so the engine casts it as before. It is listed here and in CASTS once bytea has a pg_type row.
     Timestamp,
     TimestampTz,
@@ -51,6 +52,7 @@ impl CastType {
             Self::Bool => "bool",
             Self::Oid => "oid",
             Self::RegClass => "regclass",
+            Self::Uuid => "uuid",
             Self::Timestamp => "timestamp",
             Self::TimestampTz => "timestamptz",
         }
@@ -73,6 +75,7 @@ impl CastType {
             "bool" => Self::Bool,
             "oid" => Self::Oid,
             "regclass" => Self::RegClass,
+            "uuid" => Self::Uuid,
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::TimestampTz,
             _ => return None,

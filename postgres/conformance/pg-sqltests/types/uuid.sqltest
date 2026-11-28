@@ -1,0 +1,356 @@
+# The uuid type is 16 bytes. It reads text as PostgreSQL does, writes it in the
+# canonical form, and sorts by its bytes.
+
+@database :memory:
+
+test uuid-reads-the-forms-that-postgres-reads {
+    SELECT
+        'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid,
+        '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid,
+        'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid,
+        '{a0eebc999c0b4ef8bb6d6bb9bd380a11}'::uuid,
+        'a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11'::uuid,
+        'a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11'::uuid;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test uuid-names-the-text-it-refuses {
+    SELECT 'nope'::uuid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: "nope"
+}
+
+test uuid-refuses-text-with-a-space-around-it {
+    SELECT ' a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: " a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+}
+
+test uuid-refuses-a-urn {
+    SELECT 'urn:uuid:a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+}
+@sqlstate 22P02
+expect error {}
+
+test uuid-refuses-a-hyphen-after-the-last-group {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-'::uuid;
+}
+@sqlstate 22P02
+expect error {}
+
+test uuid-refuses-a-hyphen-inside-a-group {
+    SELECT 'a0eebc9-99c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+}
+@sqlstate 22P02
+expect error {}
+
+test uuid-refuses-unbalanced-braces {
+    SELECT (chr(123) || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')::uuid;
+}
+@sqlstate 22P02
+expect error {}
+
+test uuid-refuses-too-few-digits {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1'::uuid;
+}
+@sqlstate 22P02
+expect error {}
+
+test uuid-refuses-empty-text {
+    SELECT ''::uuid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: ""
+}
+
+test uuid-column-keeps-the-canonical-form {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('{A0EEBC999C0B4EF8BB6D6BB9BD380A11}');
+    SELECT u, u::text FROM t;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test uuid-column-refuses-text-that-is-not-a-uuid {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"
+}
+
+test uuid-column-takes-null {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES (NULL);
+    SELECT u IS NULL FROM t;
+}
+expect {
+    t
+}
+
+test uuid-compares-equal-across-spellings {
+    SELECT
+        'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid = 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid,
+        'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid <> 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'::uuid;
+}
+expect {
+    t|t
+}
+
+test uuid-sorts-by-its-bytes {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES
+        ('ffffffff-ffff-ffff-ffff-ffffffffffff'),
+        ('00000000-0000-0000-0000-0000000000ff'),
+        ('80000000-0000-0000-0000-000000000000'),
+        ('00000000-0000-0000-0000-000000000001'),
+        ('7fffffff-ffff-ffff-ffff-ffffffffffff');
+    SELECT u FROM t ORDER BY u;
+}
+expect {
+    00000000-0000-0000-0000-000000000001
+    00000000-0000-0000-0000-0000000000ff
+    7fffffff-ffff-ffff-ffff-ffffffffffff
+    80000000-0000-0000-0000-000000000000
+    ffffffff-ffff-ffff-ffff-ffffffffffff
+}
+
+test uuid-sorts-in-descending-order {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES
+        ('80000000-0000-0000-0000-000000000000'),
+        ('7fffffff-ffff-ffff-ffff-ffffffffffff'),
+        ('00000000-0000-0000-0000-000000000001');
+    SELECT u FROM t ORDER BY u DESC;
+}
+expect {
+    80000000-0000-0000-0000-000000000000
+    7fffffff-ffff-ffff-ffff-ffffffffffff
+    00000000-0000-0000-0000-000000000001
+}
+
+test uuid-comparison-operators-follow-the-bytes {
+    SELECT
+        '80000000-0000-0000-0000-000000000000'::uuid > '7fffffff-ffff-ffff-ffff-ffffffffffff'::uuid,
+        '00000000-0000-0000-0000-000000000001'::uuid < '00000000-0000-0000-0000-0000000000ff'::uuid,
+        '00000000-0000-0000-0000-000000000001'::uuid <= '00000000-0000-0000-0000-000000000001'::uuid,
+        '00000000-0000-0000-0000-000000000001'::uuid >= '00000000-0000-0000-0000-000000000002'::uuid;
+}
+expect {
+    t|t|t|f
+}
+
+test uuid-between-follows-the-bytes {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES
+        ('00000000-0000-0000-0000-000000000001'),
+        ('7fffffff-ffff-ffff-ffff-ffffffffffff'),
+        ('80000000-0000-0000-0000-000000000000'),
+        ('ffffffff-ffff-ffff-ffff-ffffffffffff');
+    SELECT u FROM t
+    WHERE u BETWEEN '7fffffff-ffff-ffff-ffff-ffffffffffff' AND '80000000-0000-0000-0000-000000000000'
+    ORDER BY u;
+}
+expect {
+    7fffffff-ffff-ffff-ffff-ffffffffffff
+    80000000-0000-0000-0000-000000000000
+}
+
+test uuid-column-is-compared-with-a-string-literal-as-a-uuid {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12');
+    SELECT count(*) FROM t WHERE u = 'A0EEBC999C0B4EF8BB6D6BB9BD380A11';
+}
+expect {
+    1
+}
+
+test uuid-column-refuses-a-string-literal-that-is-not-a-uuid {
+    CREATE TABLE t (u uuid);
+    SELECT count(*) FROM t WHERE u = 'nope';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: "nope"
+}
+
+test uuid-in-list-reads-its-literals-as-uuids {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12');
+    SELECT count(*) FROM t WHERE u IN ('{A0EEBC999C0B4EF8BB6D6BB9BD380A11}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13');
+}
+expect {
+    1
+}
+
+test uuid-does-not-compare-with-an-integer {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = 1;
+}
+@sqlstate 42883
+expect error {}
+
+test uuid-does-not-add-an-integer {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid + 1;
+}
+@sqlstate 42883
+expect error {}
+
+test uuid-distinct-counts-a-value-once-across-spellings {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES
+        ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'),
+        ('A0EEBC999C0B4EF8BB6D6BB9BD380A11'),
+        ('{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'),
+        ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12');
+    SELECT count(DISTINCT u) FROM t;
+}
+expect {
+    2
+}
+
+test uuid-group-by-puts-the-spellings-of-a-value-in-one-group {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES
+        ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'),
+        ('A0EEBC999C0B4EF8BB6D6BB9BD380A11'),
+        ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12');
+    SELECT u, count(*) FROM t GROUP BY u ORDER BY u;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|2
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12|1
+}
+
+test uuid-primary-key-refuses-another-spelling-of-a-value {
+    CREATE TABLE t (id uuid PRIMARY KEY);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    INSERT INTO t VALUES ('{A0EEBC999C0B4EF8BB6D6BB9BD380A11}');
+}
+@sqlstate 23505
+expect error {}
+
+test uuid-index-answers-a-range {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    CREATE INDEX t_u ON t (u);
+    INSERT INTO t VALUES
+        (1, 'ffffffff-ffff-ffff-ffff-ffffffffffff'),
+        (2, '80000000-0000-0000-0000-000000000000'),
+        (3, '7fffffff-ffff-ffff-ffff-ffffffffffff'),
+        (4, '00000000-0000-0000-0000-000000000001');
+    SELECT id FROM t WHERE u > '7fffffff-ffff-ffff-ffff-ffffffffffff' ORDER BY u;
+}
+expect {
+    2
+    1
+}
+
+test uuid-index-follows-updates-and-deletes {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    CREATE INDEX t_u ON t (u);
+    INSERT INTO t VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (2, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'), (3, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13');
+    UPDATE t SET u = '00000000-0000-0000-0000-000000000000' WHERE id = 3;
+    DELETE FROM t WHERE u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12';
+    SELECT id FROM t WHERE u >= '00000000-0000-0000-0000-000000000000' ORDER BY u;
+}
+expect {
+    3
+    1
+}
+
+test uuid-column-is-cast-to-text {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('A0EEBC999C0B4EF8BB6D6BB9BD380A11');
+    SELECT u::text, length(u::text) FROM t;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|36
+}
+
+test uuid-from-a-text-column-is-read-by-the-input {
+    CREATE TABLE t (s text);
+    INSERT INTO t VALUES ('{A0EEBC999C0B4EF8BB6D6BB9BD380A11}');
+    SELECT s::uuid FROM t;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test uuid-from-a-text-column-refuses-text-that-is-not-a-uuid {
+    CREATE TABLE t (s text);
+    INSERT INTO t VALUES ('nope');
+    SELECT s::uuid FROM t;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: "nope"
+}
+
+test gen-random-uuid-is-a-version-4-uuid {
+    SELECT substr(gen_random_uuid()::text, 15, 1), substr(gen_random_uuid()::text, 20, 1) IN ('8', '9', 'a', 'b'), length(gen_random_uuid()::text);
+}
+expect {
+    4|t|36
+}
+
+test gen-random-uuid-does-not-compare-with-an-integer {
+    SELECT gen_random_uuid() = 1;
+}
+@sqlstate 42883
+expect error {}
+
+test gen-random-uuid-gives-another-value-at-each-call {
+    SELECT gen_random_uuid() = gen_random_uuid();
+}
+expect {
+    f
+}
+
+test uuid-column-default-is-gen-random-uuid {
+    CREATE TABLE t (id int, u uuid DEFAULT gen_random_uuid());
+    INSERT INTO t (id) VALUES (1), (2);
+    SELECT count(DISTINCT u), count(*) FROM t;
+}
+expect {
+    2|2
+}
+
+@compat-gap "operator:uuid ~~ unknown"
+test uuid-has-no-like-operator {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid LIKE 'a0%';
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+@compat-gap "function:max(uuid)"
+test uuid-has-no-max-aggregate {
+    SELECT max('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+@compat-gap "operator:uuid = jsonb"
+test uuid-does-not-compare-with-jsonb {
+    CREATE TABLE t (u uuid, j jsonb);
+    SELECT u = j FROM t;
+}
+@sqlstate 42883
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type uuid with type jsonb
+}
