@@ -20,6 +20,7 @@
 #[cfg(test)]
 pub(crate) mod cannot_parse;
 pub mod catalog;
+pub mod linked;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
