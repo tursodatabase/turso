@@ -1131,6 +1131,23 @@ fn integer_text_matches_to_string() {
 }
 
 #[test]
+fn write_decimal_digits_matches_to_string() {
+    // Each power of ten and its neighbors, where the number of digits and
+    // the number of digit pairs change.
+    let mut values: Vec<u64> = (0..1_000).chain([u64::MAX - 1, u64::MAX]).collect();
+    for exponent in 1..=19 {
+        let power = 10u64.pow(exponent);
+        values.extend([power - 1, power, power + 1, power + 10]);
+        values.extend(power.checked_mul(9).and_then(|v| v.checked_add(99)));
+    }
+    for value in values {
+        let mut buf = [0u8; 20];
+        let digits = write_decimal_digits(&mut buf, value);
+        assert_eq!(digits, value.to_string().as_bytes(), "{value}");
+    }
+}
+
+#[test]
 fn test_format_float_for_quote() {
     assert_eq!(format_float_for_quote(f64::INFINITY), "9.0e+999");
     assert_eq!(format_float_for_quote(f64::NEG_INFINITY), "-9.0e+999");
