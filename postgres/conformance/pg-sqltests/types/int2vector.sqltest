@@ -1,0 +1,176 @@
+# int2vector and oidvector are the arrays of the catalogs. They start at
+# subscript 0, and they are read and printed as their elements separated by
+# spaces.
+
+@database :memory:
+
+test int2vector-reads-numbers-separated-by-spaces {
+    SELECT ' 1  2 '::int2vector, '-1 2'::int2vector, '+1'::int2vector, ''::int2vector;
+}
+expect {
+    1 2|-1 2|1|
+}
+
+test oidvector-reads-oids {
+    SELECT '4294967295 0'::oidvector, '-1'::oidvector, ' 7 '::oidvector;
+}
+expect {
+    4294967295 0|4294967295|7
+}
+
+test int2vector-refuses-text-that-is-not-numbers {
+    SELECT '1,2'::int2vector;
+}
+@sqlstate 22P02
+expect error {}
+
+test int2vector-refuses-a-tab-between-numbers {
+    SELECT E'1\t2'::int2vector;
+}
+@sqlstate 22P02
+expect error {}
+
+test int2vector-refuses-a-hexadecimal-number {
+    SELECT '0x10'::int2vector;
+}
+@sqlstate 22P02
+expect error {}
+
+test int2vector-refuses-a-number-out-of-range {
+    SELECT '1 70000'::int2vector;
+}
+@sqlstate 22003
+expect error {}
+
+test oidvector-refuses-a-number-out-of-range {
+    SELECT '4294967296'::oidvector;
+}
+@sqlstate 22003
+expect error {}
+
+test oidvector-refuses-text-that-is-not-numbers {
+    SELECT '1 x'::oidvector;
+}
+@sqlstate 22P02
+expect error {}
+
+test the-vectors-have-oids-and-names {
+    SELECT 'int2vector'::regtype::oid, 'oidvector'::regtype::oid, 22::regtype::text, format_type(30, -1);
+}
+expect {
+    22|30|int2vector|oidvector
+}
+
+test a-vector-is-printed-by-a-cast-to-text {
+    SELECT '1 2'::int2vector::text, '3 4'::oidvector::text;
+}
+expect {
+    1 2|3 4
+}
+
+test a-vector-cast-to-an-array-keeps-its-lower-bound {
+    SELECT '1 2'::int2vector::int2[], '3 4'::oidvector::oid[];
+}
+expect {
+    [0:1]={1,2}|[0:1]={3,4}
+}
+
+test a-vector-subscript-counts-from-zero {
+    CREATE TABLE t (v int2vector);
+    INSERT INTO t VALUES ('10 20');
+    SELECT v[-1], v[0], v[1], v[2] FROM t;
+}
+expect {
+    |10|20|
+}
+
+test a-vector-is-stored-in-a-column {
+    CREATE TABLE t (v int2vector, o oidvector);
+    INSERT INTO t VALUES ('3 4', '5 6'), ('1 2', '7');
+    SELECT v, o FROM t ORDER BY v[0];
+}
+expect {
+    1 2|7
+    3 4|5 6
+}
+
+test vectors-are-compared {
+    SELECT '1 2'::int2vector = '1 2'::int2vector, '1 2'::int2vector = '1 3'::int2vector,
+           '1 2'::oidvector = '1 2'::oidvector;
+}
+expect {
+    t|f|t
+}
+
+test vectors-sort-by-their-elements {
+    SELECT '1 2'::int2vector < '3'::int2vector, '2 1'::int2vector < '1 300'::int2vector,
+           '1'::oidvector < '1 0'::oidvector, '4294967295'::oidvector > '1'::oidvector;
+}
+expect {
+    t|f|t|t
+}
+
+test a-column-of-vectors-is-ordered-by-its-elements {
+    CREATE TABLE t (id int, v int2vector);
+    INSERT INTO t VALUES (1, '3'), (2, '1 2'), (3, '300'), (4, '-1');
+    SELECT id FROM t ORDER BY v;
+    SELECT id FROM t WHERE v < '2' ORDER BY id;
+    SELECT id FROM t WHERE v BETWEEN '1 2' AND '3' ORDER BY id;
+    SELECT id FROM t WHERE v = '1 2';
+    SELECT max(v)::text, min(v)::text FROM t;
+}
+expect {
+    4
+    2
+    1
+    3
+    2
+    4
+    1
+    2
+    2
+    300|-1
+}
+
+test a-vector-is-compared-with-text-as-a-vector {
+    CREATE TABLE t (v int2vector);
+    INSERT INTO t VALUES ('1');
+    SELECT v = 'x' FROM t;
+}
+@sqlstate 22P02
+expect error {}
+
+test a-vector-is-an-array-for-the-array-functions {
+    SELECT '1 2'::int2vector || '3'::int2vector, 0::int2 || '1 2'::int2vector,
+           array_append('1 2'::int2vector, 3::int2), array_position('5 6'::int2vector, 6::int2),
+           array_upper('1 2'::int2vector, 1);
+}
+expect {
+    [0:2]={1,2,3}|[0:2]={0,1,2}|[0:2]={1,2,3}|1|1
+}
+
+test a-vector-has-the-elements-of-its-array {
+    SELECT oid, typelem FROM pg_type WHERE oid IN (22, 30) ORDER BY oid;
+}
+expect {
+    22|21
+    30|26
+}
+
+test an-array-is-not-cast-to-a-vector {
+    SELECT (ARRAY[1,2]::int2[])::int2vector;
+}
+@sqlstate 42846
+expect error {}
+
+test an-integer-is-not-cast-to-a-vector {
+    SELECT 1::int2vector;
+}
+@sqlstate 42846
+expect error {}
+
+test a-vector-is-not-cast-to-the-other-vector {
+    SELECT '1 2'::int2vector::oidvector;
+}
+@sqlstate 42846
+expect error {}

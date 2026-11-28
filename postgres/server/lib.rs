@@ -1185,6 +1185,8 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "BOOLEAN" | "BOOL" => Type::BOOL,
         "REGCLASS" => Type::REGCLASS,
         "REGTYPE" => Type::REGTYPE,
+        "INT2VECTOR" => Type::INT2_VECTOR,
+        "OIDVECTOR" => Type::OID_VECTOR,
         "UUID" => Type::UUID,
         "JSON" => Type::JSON,
         "JSONB" => Type::JSONB,

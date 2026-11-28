@@ -13,6 +13,7 @@ mod oid_alias;
 mod regclass;
 mod regtype;
 mod uuid;
+mod vector;
 
 pub(crate) use bytea_functions::{bytea_to_int, int_to_bytea, register_bytea_functions};
 pub use integer::IntegerType;
@@ -21,6 +22,7 @@ pub(crate) use oid::{check_oid_range, oid_input};
 pub(crate) use regclass::{parse_regclass, RegClassInput};
 pub(crate) use regtype::{regtype_oid_of_text, regtype_text};
 pub(crate) use uuid::{canonical_uuid, random_uuid_text};
+pub(crate) use vector::vector_text;
 
 use crate::error::sqlstate_error;
 use crate::session::relation_lookup_namespaces;
@@ -50,6 +52,19 @@ pub(crate) struct BuiltInType {
     pub(crate) array_oid: i64,
     pub(crate) delimiter: &'static str,
     pub(crate) support: Support,
+}
+
+impl BuiltInType {
+    /// The oid of the elements when the values of the type are arrays, else 0.
+    pub(crate) fn element_oid(&self) -> i64 {
+        match &self.support {
+            Support::Registered(ty) => ty
+                .array_element()
+                .and_then(crate::catalog::pg_type_oid)
+                .unwrap_or(0),
+            Support::NotRegistered(_) => 0,
+        }
+    }
 }
 
 /// How PostgreSQL prints the name of a type, as `format_type` does.
@@ -132,15 +147,19 @@ macro_rules! built_in_types {
 /// another type without reading its text, such as point, xml or money, and a
 /// type that it refuses as the type of a column, such as interval or time,
 /// has no row.
-pub(crate) static BUILT_IN_TYPES: [BuiltInType; 22] = built_in_types! {
+pub(crate) static BUILT_IN_TYPES: [BuiltInType; 24] = built_in_types! {
     (16, "bool", "B", true, 1, true, "c", "p", 1000, ",", Support::Registered(&boolean::Boolean)),
     (17, "bytea", "U", false, -1, false, "i", "x", 1001, ",", Support::Registered(&bytea::Bytea)),
     (20, "int8", "N", false, 8, true, "d", "p", 1016, ",", Support::Registered(&IntegerType::Int8)),
     (21, "int2", "N", false, 2, true, "s", "p", 1005, ",", Support::Registered(&IntegerType::Int2)),
+    // FIXME(registered-types): int2vector has no array yet: `int2vector[]` is refused, so typarray is 0 and not the 1006 of PostgreSQL.
+    (22, "int2vector", "A", false, -1, false, "i", "p", 0, ",", Support::Registered(&vector::Vector::Int2)),
     (23, "int4", "N", false, 4, true, "i", "p", 1007, ",", Support::Registered(&IntegerType::Int4)),
     // FIXME(registered-types): text is the TEXT of the engine and has no registered type, so core cannot name the type of a text value to the dialect. A text type registered in the frontend, with its INPUT, replaces this.
     (25, "text", "S", true, -1, false, "i", "x", 1009, ",", Support::NotRegistered(FormatName::Plain("text"))),
     (26, "oid", "N", true, 4, true, "i", "p", 1028, ",", Support::Registered(&oid::Oid)),
+    // FIXME(registered-types): oidvector has no array yet: `oidvector[]` is refused, so typarray is 0 and not the 1013 of PostgreSQL.
+    (30, "oidvector", "A", false, -1, false, "i", "p", 0, ",", Support::Registered(&vector::Vector::Oid)),
     // FIXME(registered-types): json: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A json type registered in the frontend, with its INPUT, replaces this.
     (114, "json", "U", false, -1, false, "i", "x", 199, ",", Support::NotRegistered(FormatName::Plain("json"))),
     // FIXME(registered-types): cidr: the frontend uses the type that core registers, which does not check its text. A cidr type registered in the frontend, with its INPUT, replaces this.

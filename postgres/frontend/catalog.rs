@@ -705,6 +705,8 @@ pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
         "OID" => 26,
         "REGCLASS" => 2205,
         "REGTYPE" => 2206,
+        "INT2VECTOR" => 22,
+        "OIDVECTOR" => 30,
         _ => return None,
     };
     Some(oid)
@@ -2090,7 +2092,7 @@ impl PgTypeInfo {
             typispreferred: ty.is_preferred,
             typlen: ty.len,
             typarray: ty.array_oid,
-            typelem: 0,
+            typelem: ty.element_oid(),
             typbyval: ty.by_value,
             typalign: ty.align,
             typstorage: ty.storage,
