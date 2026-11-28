@@ -612,7 +612,8 @@ pub(super) fn choose_best_in_seek_candidate(
     let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
     let mut best_in_seek = None;
     let mut best_in_seek_cost = best_cost;
-    let mut best_in_seek_without_stats = false;
+    let mut without_stats_in_seek = None;
+    let mut without_stats_cost = Cost(f64::INFINITY);
     let may_null_extend = table_references.outer_join_may_null_extend(rhs_table.internal_id);
 
     for candidate in rhs_constraints.candidates.iter() {
@@ -743,24 +744,13 @@ pub(super) fn choose_best_in_seek_candidate(
                         .is_none_or(|ts| !ts.index_stats.contains_key(&index.name))
                 });
             let total_cost = in_cost + sort_penalty;
-            let beats_best = if without_stats {
-                !best_in_seek_without_stats || total_cost < best_in_seek_cost
-            } else {
-                !best_in_seek_without_stats && total_cost < best_in_seek_cost
-            };
-            if !beats_best {
-                continue;
-            }
-
             let lhs_affinity = if let Some(col_pos) = constraint.table_col_pos {
                 btree.columns()[col_pos].comparison_affinity()
             } else {
                 Affinity::Integer
             };
             let affinity = do_comparison_affinity(lhs_affinity, Affinity::None);
-            best_in_seek_cost = total_cost;
-            best_in_seek_without_stats = without_stats;
-            best_in_seek = Some(ChosenInSeekCandidate {
+            let candidate_in_seek = ChosenInSeekCandidate {
                 index: candidate.index.clone(),
                 affinity,
                 constraint_idx: constraint.where_clause_pos.0,
@@ -773,11 +763,21 @@ pub(super) fn choose_best_in_seek_candidate(
                     (estimated_values * rows_per_seek).max(1.0)
                 },
                 without_stats,
-            });
+            };
+            if total_cost < best_in_seek_cost {
+                best_in_seek_cost = total_cost;
+                best_in_seek = Some(candidate_in_seek);
+            } else if without_stats && total_cost < without_stats_cost {
+                without_stats_cost = total_cost;
+                without_stats_in_seek = Some(candidate_in_seek);
+            }
         }
     }
 
-    Ok(best_in_seek)
+    // No candidate beats the best access method on cost. An IN seek on an
+    // index without stats still replaces a seek on the same index (the final
+    // step checks that), so keep the cheapest one for it.
+    Ok(best_in_seek.or(without_stats_in_seek))
 }
 
 /// Whether a constraint of the table is an `IN` that can drive an IN seek.
