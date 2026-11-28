@@ -9,8 +9,9 @@ use super::StorageClass;
 use crate::ast;
 use crate::schema::{OperatorSignature, RangeOffsets};
 use crate::type_ordering::TypeOrdering;
-use crate::{Result, Value};
+use crate::{Connection, Result, Value};
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// A Rust function that converts `value`, which is never NULL. `params` are
 /// the values written after the type name, such as 10 and 2 in
@@ -18,8 +19,12 @@ use std::fmt::Debug;
 /// them. An ENCODE and a DECODE get none.
 pub type ConversionFn = fn(value: &Value, params: &[Value]) -> Result<Value>;
 
-/// A Rust function that reads `text` as a value of a type.
-pub type TextInput = fn(text: &str) -> Result<Value>;
+/// A Rust function that reads `text` as a value of a type. `connection` is
+/// the connection that reads the text, for a type whose text names an object
+/// of the database, such as a relation. It is `None` where the caller has no
+/// connection, and then only a type that does not look at the database reads
+/// the text.
+pub type TextInput = fn(connection: Option<&Arc<Connection>>, text: &str) -> Result<Value>;
 
 /// How a type converts a value when it stores the value or reads it back.
 #[derive(Debug, Clone)]

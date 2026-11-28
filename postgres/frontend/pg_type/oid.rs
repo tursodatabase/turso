@@ -1,6 +1,7 @@
 //! PostgreSQL's oid type.
 
 use super::integer::{integer_text_out_of_range, read_integer_text, IntegerSpelling};
+use super::{FormatName, RegisteredType};
 use crate::error::sqlstate_error;
 use turso_core::ast;
 use turso_core::types::{Conversion, StorageClass, TextInput, Type};
@@ -28,7 +29,7 @@ impl Type for Oid {
     }
 
     fn input(&self) -> Option<TextInput> {
-        Some(oid_input)
+        Some(|_, text| oid_input(text))
     }
 
     fn coerce(&self) -> Option<Conversion> {
@@ -68,5 +69,11 @@ pub(crate) fn check_oid_range(value: &Value) -> Result<Value> {
             None,
         )),
         other => Ok(other.clone()),
+    }
+}
+
+impl RegisteredType for Oid {
+    fn format_name(&self) -> FormatName {
+        FormatName::Plain("oid")
     }
 }

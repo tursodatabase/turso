@@ -1,42 +1,11 @@
 //! PostgreSQL's regclass type: the oid of a relation.
 
-use super::oid::{oid_coerce, oid_input};
+use super::oid::oid_input;
 use crate::error::sqlstate_error;
-use turso_core::ast;
-use turso_core::types::{Conversion, StorageClass, Type};
 use turso_core::{Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_NAME, SQLSTATE_SYNTAX_ERROR,
 };
-
-/// A regclass value is the oid of a relation, stored as that integer.
-#[derive(Debug)]
-pub(super) struct RegClass;
-
-impl Type for RegClass {
-    fn name(&self) -> &str {
-        "regclass"
-    }
-
-    fn params(&self) -> Vec<ast::TypeParam> {
-        vec![ast::TypeParam {
-            name: "value".to_string(),
-            ty: Some("any".to_string()),
-        }]
-    }
-
-    fn base(&self) -> &str {
-        "integer"
-    }
-
-    fn coerce(&self) -> Option<Conversion> {
-        Some(Conversion::Function(oid_coerce))
-    }
-
-    fn reads_as(&self) -> Option<StorageClass> {
-        Some(StorageClass::Integer)
-    }
-}
 
 /// What the text of a regclass says.
 #[derive(Debug, PartialEq, Eq)]

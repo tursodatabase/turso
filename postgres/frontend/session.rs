@@ -9,7 +9,7 @@ use crate::catalog::{self, PostgresDialect};
 use crate::error::{
     in_failed_sql_transaction_error, not_supported, sql_parse_error, sqlstate_error,
 };
-use crate::pg_type::{type_exists, RegClassInput};
+use crate::pg_type::{regtype_oid_of_text, type_exists, RegClassInput};
 use crate::roles::connection_roles;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
@@ -42,6 +42,7 @@ use turso_pg_parser::translator::{
     PostgreSQLTranslator, SerialSequence, TranslateResult,
 };
 use turso_pg_parser::ParseError;
+use turso_pg_parser::RegKind;
 
 use crate::copy::parse_copy_text_format;
 use turso_core::SessionRole;
@@ -547,7 +548,7 @@ fn translate_statement<'a>(
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
-    let (sql, parse_result) = resolve_regclass_constants(&pg_conn.conn, sql, parse_result)?;
+    let (sql, parse_result) = resolve_reg_constants(&pg_conn.conn, sql, parse_result)?;
     let existing_generated = turso_pg_parser::alter_table_add_column_table(&parse_result)
         .and_then(|(schema, table)| {
             relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
@@ -1561,16 +1562,16 @@ fn name_foreign_key_tables<'a>(
     Ok((Cow::Owned(sql), parse_result))
 }
 
-/// `sql` with each regclass constant that the statement stores replaced by
-/// the oid of its relation, as PostgreSQL does when it analyzes the
-/// statement: a view, a default or a check then keeps the relation when it is
-/// renamed, and a name with no relation fails the statement with 42P01.
-fn resolve_regclass_constants<'a>(
+/// `sql` with each regclass or regtype constant that the statement stores
+/// replaced by the oid of its relation or type, as PostgreSQL does when it analyzes the
+/// statement: a view, a default or a check then keeps the relation or type when it is
+/// renamed, and a name with none fails the statement.
+fn resolve_reg_constants<'a>(
     conn: &Arc<Connection>,
     sql: Cow<'a, str>,
     parse_result: turso_pg_parser::ParseResult,
 ) -> Result<(Cow<'a, str>, turso_pg_parser::ParseResult)> {
-    let constants = turso_pg_parser::regclass_constants_to_resolve(&parse_result);
+    let constants = turso_pg_parser::reg_constants_to_resolve(&parse_result);
     if constants.is_empty() {
         return Ok((sql, parse_result));
     }
@@ -1579,10 +1580,15 @@ fn resolve_regclass_constants<'a>(
     for constant in constants.iter().rev() {
         // The table that the statement creates does not exist yet, so a
         // constant that names it keeps its name.
-        if names_created_table(conn, &constant.text, created.as_ref()) {
+        if constant.kind == RegKind::Class
+            && names_created_table(conn, &constant.text, created.as_ref())
+        {
             continue;
         }
-        let oid = crate::catalog::regclass_oid_of_text(conn, &constant.text)?;
+        let oid = match constant.kind {
+            RegKind::Class => crate::catalog::regclass_oid_of_text(conn, &constant.text)?,
+            RegKind::Type => regtype_oid_of_text(conn, &constant.text)?,
+        };
         sql = turso_pg_parser::replace_string_constant(&sql, constant.location, &oid.to_string())
             .map_err(sql_parse_error)?;
     }

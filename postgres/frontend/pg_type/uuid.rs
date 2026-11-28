@@ -1,5 +1,6 @@
 //! PostgreSQL's uuid type.
 
+use super::{FormatName, RegisteredType};
 use crate::error::sqlstate_error;
 use turso_core::ast;
 use turso_core::types::{Conversion, StorageClass, TextInput, Type};
@@ -31,7 +32,7 @@ impl Type for Uuid {
     }
 
     fn input(&self) -> Option<TextInput> {
-        Some(uuid_input)
+        Some(|_, text| uuid_input(text))
     }
 
     fn encode(&self) -> Option<Conversion> {
@@ -158,6 +159,12 @@ fn uuid_to_string(uuid: &[u8; UUID_LEN]) -> String {
         text.push(char::from(HEX_CHARS[usize::from(byte & 0x0F)]));
     }
     text
+}
+
+impl RegisteredType for Uuid {
+    fn format_name(&self) -> FormatName {
+        FormatName::Plain("uuid")
+    }
 }
 
 #[cfg(test)]

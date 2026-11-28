@@ -1,5 +1,5 @@
 use crate::functions::validate_pg_input;
-use crate::pg_type::{built_in_type, BuiltInType, BUILT_IN_TYPES};
+use crate::pg_type::{built_in_type, type_modifier_input, BuiltInType, BUILT_IN_TYPES};
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
@@ -693,6 +693,7 @@ pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
         "MACADDR" => 829,
         "OID" => 26,
         "REGCLASS" => 2205,
+        "REGTYPE" => 2206,
         _ => return None,
     };
     Some(oid)
@@ -2073,6 +2074,18 @@ pub(crate) fn pg_type_name(oid: i64) -> Option<&'static str> {
     built_in_type(oid).map(|info| info.name)
 }
 
+/// The name of the type made by CREATE TYPE or CREATE DOMAIN that has the oid
+/// `oid`, quoted where it needs it. The oid of such a type is the one that its
+/// pg_type row has.
+pub(crate) fn custom_type_name(conn: &Connection, oid: i64) -> Option<String> {
+    let schema = conn.current_schema();
+    schema
+        .type_registry
+        .values()
+        .find(|ty| !ty.is_builtin && user_type_oid(&ty.name) == oid)
+        .map(|ty| quote_identifier(&ty.name))
+}
+
 /// The `typcategory` of the built-in type with this oid.
 pub(crate) fn pg_type_category(oid: i64) -> Option<&'static str> {
     built_in_type(oid).map(|info| info.category)
@@ -2134,7 +2147,7 @@ impl SnapshotRows for PgTypeTable {
                 Value::Null,                      // typoutput
                 Value::Null,                      // typreceive
                 Value::Null,                      // typsend
-                Value::Null,                      // typmodin
+                Value::build_text("-"),           // typmodin
                 Value::Null,                      // typmodout
                 Value::Null,                      // typanalyze
                 Value::build_text("i"),           // typalign
@@ -2153,7 +2166,7 @@ impl SnapshotRows for PgTypeTable {
     }
 }
 
-fn user_type_oid(name: &str) -> i64 {
+pub(crate) fn user_type_oid(name: &str) -> i64 {
     50000
         + (name
             .as_bytes()
@@ -2180,38 +2193,38 @@ fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
     vec![
-        Value::from_i64(t.oid),                       // oid
-        Value::build_text(t.name.clone()),            // typname
-        Value::from_i64(11),                          // typnamespace (pg_catalog)
-        Value::from_i64(10),                          // typowner
-        Value::from_i64(t.typlen),                    // typlen
-        Value::from_i64(i64::from(t.typbyval)),       // typbyval
-        Value::build_text("b"),                       // typtype
-        Value::build_text(t.typcategory),             // typcategory
-        Value::from_i64(i64::from(t.typispreferred)), // typispreferred
-        Value::from_i64(1),                           // typisdefined
-        Value::build_text(t.typdelim),                // typdelim
-        Value::from_i64(0),                           // typrelid
-        Value::Null,                                  // typsubscript
-        Value::from_i64(t.typelem),                   // typelem
-        Value::from_i64(t.typarray),                  // typarray
-        Value::Null,                                  // typinput
-        Value::Null,                                  // typoutput
-        Value::Null,                                  // typreceive
-        Value::Null,                                  // typsend
-        Value::Null,                                  // typmodin
-        Value::Null,                                  // typmodout
-        Value::Null,                                  // typanalyze
-        Value::build_text(t.typalign),                // typalign
-        Value::build_text(t.typstorage),              // typstorage
-        Value::from_i64(0),                           // typnotnull
-        Value::from_i64(0),                           // typbasetype
-        Value::from_i64(-1),                          // typtypmod
-        Value::from_i64(0),                           // typndims
-        Value::from_i64(0),                           // typcollation
-        Value::Null,                                  // typdefaultbin
-        Value::Null,                                  // typdefault
-        Value::Null,                                  // typacl
+        Value::from_i64(t.oid),                                       // oid
+        Value::build_text(t.name.clone()),                            // typname
+        Value::from_i64(11),                                          // typnamespace (pg_catalog)
+        Value::from_i64(10),                                          // typowner
+        Value::from_i64(t.typlen),                                    // typlen
+        Value::from_i64(i64::from(t.typbyval)),                       // typbyval
+        Value::build_text("b"),                                       // typtype
+        Value::build_text(t.typcategory),                             // typcategory
+        Value::from_i64(i64::from(t.typispreferred)),                 // typispreferred
+        Value::from_i64(1),                                           // typisdefined
+        Value::build_text(t.typdelim),                                // typdelim
+        Value::from_i64(0),                                           // typrelid
+        Value::Null,                                                  // typsubscript
+        Value::from_i64(t.typelem),                                   // typelem
+        Value::from_i64(t.typarray),                                  // typarray
+        Value::Null,                                                  // typinput
+        Value::Null,                                                  // typoutput
+        Value::Null,                                                  // typreceive
+        Value::Null,                                                  // typsend
+        Value::build_text(type_modifier_input(t.oid).unwrap_or("-")), // typmodin
+        Value::Null,                                                  // typmodout
+        Value::Null,                                                  // typanalyze
+        Value::build_text(t.typalign),                                // typalign
+        Value::build_text(t.typstorage),                              // typstorage
+        Value::from_i64(0),                                           // typnotnull
+        Value::from_i64(0),                                           // typbasetype
+        Value::from_i64(-1),                                          // typtypmod
+        Value::from_i64(0),                                           // typndims
+        Value::from_i64(0),                                           // typcollation
+        Value::Null,                                                  // typdefaultbin
+        Value::Null,                                                  // typdefault
+        Value::Null,                                                  // typacl
     ]
 }
 
@@ -4576,7 +4589,7 @@ fn check_condition_text(conn: &Connection, condition: &ast::Expr, table: &BTreeT
 }
 
 fn render_expr(conn: &Connection, expr: &ast::Expr) -> String {
-    let mut expr = crate::deparse::name_regclass_constants(conn, expr);
+    let mut expr = crate::deparse::name_reg_constants(conn, expr);
     walk_expr_mut(&mut expr, &mut |expr| {
         // The translator compiles PostgreSQL's binary collations to BINARY.
         if let ast::Expr::Collate(_, collation) = expr {
@@ -4754,9 +4767,10 @@ fn catalog_indexes(conn: &Connection, schema: &Schema) -> Vec<CatalogIndex> {
                                 .expect("index columns have names")
                         },
                         position: column.pos_in_table,
-                        expression: column.expr.as_ref().map(|expr| {
-                            crate::deparse::name_regclass_constants(conn, expr).to_string()
-                        }),
+                        expression: column
+                            .expr
+                            .as_ref()
+                            .map(|expr| crate::deparse::name_reg_constants(conn, expr).to_string()),
                         order: column.order,
                     })
                     .collect(),
@@ -4768,7 +4782,7 @@ fn catalog_indexes(conn: &Connection, schema: &Schema) -> Vec<CatalogIndex> {
                 where_clause: index
                     .where_clause
                     .as_ref()
-                    .map(|expr| crate::deparse::name_regclass_constants(conn, expr).to_string()),
+                    .map(|expr| crate::deparse::name_reg_constants(conn, expr).to_string()),
             });
         }
     }

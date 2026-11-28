@@ -576,3 +576,19 @@ test regclass-default-names-a-table-with-the-case-it-is-created-in {
 }
 @sqlstate 42P01
 expect error {}
+
+@setup relations
+test regclass-input-is-checked-by-pg-input-is-valid {
+    SELECT pg_input_is_valid('t', 'regclass'), pg_input_is_valid('other.t', 'regclass'), pg_input_is_valid('1259', 'regclass'), pg_input_is_valid('nosuch', 'regclass'), pg_input_is_valid('"', 'regclass');
+}
+expect {
+    t|t|t|f|f
+}
+
+@setup relations
+test regclass-input-error-info-says-why {
+    SELECT message, sql_error_code FROM pg_input_error_info('nosuch', 'regclass');
+}
+expect {
+    relation "nosuch" does not exist|42P01
+}

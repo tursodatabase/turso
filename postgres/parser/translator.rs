@@ -7543,8 +7543,9 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "BIT" | "VARBIT" => "TEXT".into(),
         "OID" => "oid".into(),
         "REGCLASS" => "regclass".into(),
-        "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR" | "REGCONFIG"
-        | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
+        "REGTYPE" => "regtype".into(),
+        "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR" | "REGCONFIG" | "REGDICTIONARY"
+        | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
         // Unknown types pass through as-is (e.g. user-defined enums).
@@ -8152,6 +8153,7 @@ fn pg_type_name_to_ast_type(
         ("UUID", false) => "uuid",
         ("OID", false) => "oid",
         ("REGCLASS", false) => "regclass",
+        ("REGTYPE", false) => "regtype",
         ("SERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE", _) => "INTEGER",
         ("BIGSERIAL", _) => "BIGINT",
         (
