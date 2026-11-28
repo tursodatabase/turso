@@ -1100,12 +1100,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         result
     }
 
-    /// Returns all checkpointable [RowVersion]s for that `table_id`
+    /// Returns all checkpointable [RowVersion]s for that `table_id`, and whether the row is in
+    /// the database file before this checkpoint writes anything.
     fn maybe_get_checkpointable_versions(
         &self,
         versions: &[RowVersion],
         table_id: MVTableId,
-    ) -> Result<smallvec::SmallVec<[RowVersion; 1]>> {
+    ) -> Result<(smallvec::SmallVec<[RowVersion; 1]>, bool)> {
         checkpointable_versions(
             versions,
             table_id,
@@ -1291,12 +1292,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return Ok(());
         }
         let write_set_len_before = self.write_set.len();
-        for version in self.maybe_get_checkpointable_versions(row_versions, key.table_id)? {
+        // A sqlite_schema rowid can hold several objects over time, because a new object can
+        // reuse the rowid of a dropped one after a restart. The versions below can then be
+        // deletes of different objects. Only the row that is in the database file must be
+        // deleted, and only once. Thus this tracks whether the rowid has a row in the database
+        // file while the versions are added to the write set.
+        let (versions_to_checkpoint, mut row_in_db_file) =
+            self.maybe_get_checkpointable_versions(row_versions, key.table_id)?;
+        for version in versions_to_checkpoint {
             let is_delete = version.end().is_some();
 
             let mut special_write = None;
-            // Set to true for schema deletes of never-checkpointed tables/indexes.
-            // These don't need to be written to the B-tree, we just need to track them.
+            // Set to true for deletes that have no row to remove from the B-tree, e.g. a schema
+            // delete of a rowid that has no row in the database file.
             let mut skip_write = false;
 
             if let Some(schema_identity) = sqlite_schema_btree_identity(key.table_id, &version)? {
@@ -1313,7 +1321,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 self.destroyed_indexes.insert(index_id);
                                 self.pending_rootmap_ops
                                     .push(RootMapOp::Remove { id: index_id });
-                                skip_write = true;
+                                // The index row is not in the database file, but the row of an
+                                // older object with the same rowid can be.
+                                skip_write = !row_in_db_file;
                             } else if let Some(index_id) =
                                 self.resolve_dropped_binding(root_page as u64, &version)
                             {
@@ -1368,7 +1378,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 self.destroyed_tables.insert(table_id);
                                 self.pending_rootmap_ops
                                     .push(RootMapOp::Remove { id: table_id });
-                                skip_write = true;
+                                // The table row is not in the database file, but the row of an
+                                // older object with the same rowid can be.
+                                skip_write = !row_in_db_file;
                             } else if let Some(table_id) =
                                 self.resolve_dropped_binding(root_page as u64, &version)
                             {
@@ -1396,29 +1408,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         }
                     }
                 }
-            } else if is_delete
-                && key.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
-                && !version.btree_resident
-            {
-                // Schema row without a B-tree identity (e.g. sequence, trigger, view).
-                // If it was never checkpointed to the B-tree, skip the delete — there
-                // is nothing to remove from the pager.
-                let begin_ts = match &version.begin() {
-                    Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
-                    _ => None,
-                };
-                let was_checkpointed = self.durable_txid_max_old.is_some_and(|txid_max_old| {
-                    begin_ts.is_some_and(|b| b <= u64::from(txid_max_old))
-                });
-                if !was_checkpointed {
-                    skip_write = true;
-                }
+            } else if is_delete && key.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                // Schema row without a B-tree identity (e.g. sequence, trigger, view). The
+                // begin timestamp of this version does not tell if the rowid has a row in the
+                // database file: an older version of the same object, or an older object with
+                // the same rowid, can be there.
+                skip_write = !row_in_db_file;
             } else if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
                 && is_delete
                 && !self.table_exists_for_snapshot(key.table_id)
             {
                 // B-tree was destroyed in a prior checkpoint; late tombstones are logical-only.
                 skip_write = true;
+            }
+            if key.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID && !skip_write {
+                row_in_db_file = !is_delete;
             }
             if !skip_write {
                 tracing::trace!("adding to write_set {:?}", (key, &version, &special_write));
@@ -1624,7 +1628,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let index_destroyed = self.destroyed_indexes.contains(&index_id);
         let index_write_set_len_before = self.index_write_set.len();
         if !index_destroyed {
-            for version in self.maybe_get_checkpointable_versions(versions, index_id)? {
+            for version in self
+                .maybe_get_checkpointable_versions(versions, index_id)?
+                .0
+            {
                 let is_delete = version.end().is_some();
                 if is_delete && !self.table_exists_for_snapshot(index_id) {
                     continue;
@@ -1694,6 +1701,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             let versions = entry.value().read();
             if self
                 .maybe_get_checkpointable_versions(&versions, key.table_id)?
+                .0
                 .is_empty()
             {
                 continue;
@@ -1720,6 +1728,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 let versions = entry.value().read();
                 if self
                     .maybe_get_checkpointable_versions(&versions, index_id)?
+                    .0
                     .is_empty()
                 {
                     continue;
@@ -3491,7 +3500,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 }
 
-/// Returns the versions of one row that a checkpoint has to write to the database file.
+/// Returns the versions of one row that a checkpoint has to write to the database file, and
+/// whether the row is in the database file before this checkpoint writes anything.
 ///
 /// `versions` is the row's version chain from oldest to newest. `durable_txid_max_old` is the
 /// highest commit timestamp an earlier checkpoint already wrote, and `snapshot_ts` is the highest
@@ -3503,7 +3513,7 @@ fn checkpointable_versions(
     durable_txid_max_old: Option<NonZeroU64>,
     snapshot_ts: u64,
     committed_ts: impl Fn(Option<TxTimestampOrID>) -> Option<u64>,
-) -> Result<smallvec::SmallVec<[RowVersion; 1]>> {
+) -> Result<(smallvec::SmallVec<[RowVersion; 1]>, bool)> {
     let mut versions_to_checkpoint: smallvec::SmallVec<[_; 1]> =
         smallvec::SmallVec::with_capacity(1);
     let mut exists_in_db_file = false;
@@ -3610,7 +3620,10 @@ fn checkpointable_versions(
         }
     }
 
-    Ok(versions_to_checkpoint)
+    // A version that begins after `durable_txid_max_old` also ends after it, so it does not
+    // change `exists_in_db_file`. Thus, after the walk, the value tells whether the row is in
+    // the database file as of the previous checkpoint.
+    Ok((versions_to_checkpoint, exists_in_db_file))
 }
 
 struct CollectEntry<'a, 'g, K, V, C, A: SkiplistAllocator> {
@@ -4318,6 +4331,7 @@ mod tests {
             },
         )
         .unwrap()
+        .0
     }
 
     fn insert_row_version(

@@ -4380,6 +4380,191 @@ fn test_checkpoint_recovers_after_restart_drop_checkpointed_index() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// Regression test for https://github.com/tursodatabase/turso/issues/9284.
+///
+/// A trigger is checkpointed and dropped. After a restart, a new trigger gets the same
+/// sqlite_schema rowid and is dropped too. The checkpoint must delete the row of the first
+/// trigger from the database file.
+#[test]
+fn test_checkpoint_deletes_dropped_trigger_when_new_trigger_reuses_its_rowid() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let tr1_rowid = {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("CREATE TABLE log(x)").unwrap();
+        conn.execute("CREATE TRIGGER tr1 AFTER INSERT ON t BEGIN INSERT INTO log VALUES(1); END")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let rowid = sqlite_schema_rowid(&conn, "tr1");
+        conn.execute("DROP TRIGGER tr1").unwrap();
+        rowid
+    };
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TRIGGER tr2 AFTER INSERT ON t BEGIN INSERT INTO log VALUES(2); END")
+            .unwrap();
+        assert_eq!(
+            sqlite_schema_rowid(&conn, "tr2"),
+            tr1_rowid,
+            "the test needs tr2 to reuse the sqlite_schema rowid of tr1"
+        );
+        conn.execute("DROP TRIGGER tr2").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_dropped_trigger_stays_dropped(&conn);
+    }
+    db.restart();
+
+    assert_dropped_trigger_stays_dropped(&db.connect());
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/9284.
+///
+/// A trigger is checkpointed and dropped. After a restart, a new table gets the same
+/// sqlite_schema rowid and is dropped before a checkpoint creates its B-tree. The checkpoint
+/// must delete the row of the trigger from the database file.
+#[test]
+fn test_checkpoint_deletes_dropped_trigger_when_new_table_reuses_its_rowid() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let tr_rowid = create_checkpoint_and_drop_trigger(&db);
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE x(y)").unwrap();
+        assert_eq!(
+            sqlite_schema_rowid(&conn, "x"),
+            tr_rowid,
+            "the test needs x to reuse the sqlite_schema rowid of tr"
+        );
+        conn.execute("DROP TABLE x").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    db.restart();
+
+    assert_dropped_trigger_stays_dropped(&db.connect());
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/9284.
+///
+/// Like [test_checkpoint_deletes_dropped_trigger_when_new_table_reuses_its_rowid], but the
+/// new object that reuses the rowid is an index.
+#[test]
+fn test_checkpoint_deletes_dropped_trigger_when_new_index_reuses_its_rowid() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let tr_rowid = create_checkpoint_and_drop_trigger(&db);
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE INDEX ix ON t(x)").unwrap();
+        assert_eq!(
+            sqlite_schema_rowid(&conn, "ix"),
+            tr_rowid,
+            "the test needs ix to reuse the sqlite_schema rowid of tr"
+        );
+        conn.execute("DROP INDEX ix").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    db.restart();
+
+    assert_dropped_trigger_stays_dropped(&db.connect());
+}
+
+/// A table is checkpointed and dropped. After a restart, a new trigger gets the same
+/// sqlite_schema rowid and is dropped too. The checkpoint deletes the row of the table when it
+/// destroys the table's B-tree, so it must not delete the same rowid again for the trigger.
+#[test]
+fn test_checkpoint_deletes_rowid_once_when_new_trigger_reuses_dropped_table_rowid() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let t_rowid = {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE base(a)").unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let rowid = sqlite_schema_rowid(&conn, "t");
+        conn.execute("DROP TABLE t").unwrap();
+        rowid
+    };
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TRIGGER tr AFTER INSERT ON base BEGIN SELECT 1; END")
+            .unwrap();
+        assert_eq!(
+            sqlite_schema_rowid(&conn, "tr"),
+            t_rowid,
+            "the test needs tr to reuse the sqlite_schema rowid of t"
+        );
+        conn.execute("DROP TRIGGER tr").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT name FROM sqlite_schema WHERE name NOT LIKE '__turso_internal_%' ORDER BY name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "base");
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+/// Creates tables `t` and `log` and a trigger `tr` on `t` that inserts into `log`. Then
+/// checkpoints, drops `tr` and returns the sqlite_schema rowid that `tr` had.
+fn create_checkpoint_and_drop_trigger(db: &MvccTestDbNoConn) -> i64 {
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(x)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(1); END")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rowid = sqlite_schema_rowid(&conn, "tr");
+    conn.execute("DROP TRIGGER tr").unwrap();
+    rowid
+}
+
+/// Checks that the schema has no trigger and that an insert into `t` does not write to `log`.
+fn assert_dropped_trigger_stays_dropped(conn: &Arc<Connection>) {
+    let rows = get_rows(
+        conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'trigger'",
+    );
+    assert!(rows.is_empty(), "dropped trigger came back: {rows:?}");
+    conn.execute("INSERT INTO t VALUES(1)").unwrap();
+    let rows = get_rows(conn, "SELECT count(*) FROM log");
+    assert_eq!(rows[0][0].as_int().unwrap(), 0, "dropped trigger fired");
+    let rows = get_rows(conn, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+fn sqlite_schema_rowid(conn: &Arc<Connection>, name: &str) -> i64 {
+    let rows = get_rows(
+        conn,
+        &format!("SELECT rowid FROM sqlite_schema WHERE name = '{name}'"),
+    );
+    assert_eq!(rows.len(), 1, "expected one sqlite_schema row for {name}");
+    rows[0][0].as_int().unwrap()
+}
+
 #[test]
 fn test_recovery_after_drop_table_with_uncheckpointed_index() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
