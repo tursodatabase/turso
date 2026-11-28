@@ -148,8 +148,9 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compute_array_length, compute_array_lower_bound, exec_array_slice,
-        make_array_from_registers, parse_text_array_value, serialize_array_from_blob,
+        compute_array_length, compute_array_lower_bound, exec_array_append, exec_array_cat,
+        exec_array_prepend, exec_array_slice, make_array_from_registers, parse_text_array_value,
+        serialize_array_from_blob,
     },
     array_value::{encode_array, position_of, ArrayValue, ArrayView, DEFAULT_LOWER_BOUND},
     insn::{
@@ -3361,22 +3362,9 @@ pub fn op_array_concat(
     }
 
     let result = match (lhs_ref, rhs_ref) {
-        (Value::Blob(lb), Value::Blob(rb)) => {
-            let mut elems_a = array_values_from_blob(lb)?;
-            let elems_b = array_values_from_blob(rb)?;
-            elems_a.extend(elems_b);
-            encode_array(DEFAULT_LOWER_BOUND, &elems_a)?
-        }
-        (Value::Blob(lb), _) => {
-            let mut elems = array_values_from_blob(lb)?;
-            elems.push(rhs_ref.clone());
-            encode_array(DEFAULT_LOWER_BOUND, &elems)?
-        }
-        (_, Value::Blob(rb)) => {
-            let mut elems = array_values_from_blob(rb)?;
-            elems.insert(0, lhs_ref.clone());
-            encode_array(DEFAULT_LOWER_BOUND, &elems)?
-        }
+        (Value::Blob(_), Value::Blob(_)) => exec_array_cat(lhs_ref, rhs_ref)?,
+        (Value::Blob(_), _) => exec_array_append(lhs_ref, rhs_ref)?,
+        (_, Value::Blob(_)) => exec_array_prepend(rhs_ref, lhs_ref)?,
         _ => {
             // Neither is an array blob — fall back to string concat
             Value::build_text(format!("{lhs_ref}{rhs_ref}"))
@@ -21104,7 +21092,7 @@ mod tests {
             Value::Blob(b) => b,
             _ => panic!("Expected Blob, got {result:?}"),
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = ArrayValue::decode(blob).unwrap().elements;
         assert_eq!(elements.len(), 100);
         for (i, elem) in elements.iter().enumerate() {
             assert_eq!(*elem, Value::from_i64(i as i64));

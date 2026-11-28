@@ -337,6 +337,7 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::InvalidTextRepresentation(_) => SQLSTATE_INVALID_TEXT_REPRESENTATION,
         LimboError::IntegerOverflow => SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
         LimboError::TooBig => SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
+        LimboError::ArrayBoundTooLarge { .. } => SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
         LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,

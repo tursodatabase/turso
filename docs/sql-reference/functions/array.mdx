@@ -661,6 +661,8 @@ SELECT a FROM t;
 
 The text in front of the braces gives the lower bound and the upper bound. `[2]` stands for `[1:2]`. The upper bound must fit the number of elements, and no space is allowed inside the brackets. An array that starts at 1 is printed without bounds. Two arrays with the same elements and other lower bounds are different values.
 
+`array_append`, `array_prepend`, `array_cat`, `array_remove` and `||` keep the lower bound of the array they change, and of the first array for `array_cat` and `||`. If the first array is empty, they take the lower bound of the second. `array_append` and `||` fail when the upper bound of the result would not fit in 32 bits, and `array_prepend` fails for an array that starts at -2147483648. A slice starts at 1.
+
 An array with a lower bound other than 1 takes 9 more bytes. A Turso version that does not know lower bounds cannot read it: it reports a corrupt record or reads the array as NULL.
 
 ---

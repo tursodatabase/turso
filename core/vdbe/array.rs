@@ -5,14 +5,7 @@ use super::array_value::{encode_array, ArrayValue, ArrayView, DEFAULT_LOWER_BOUN
 use crate::dialect::Dialect;
 use crate::numeric::Numeric;
 use crate::types::Value;
-use crate::Result;
-
-/// Extract values from a record-format array blob.
-/// Returns Err if the blob is not a valid record.
-/// Uses zero-copy iteration over the blob bytes — no Vec<u8> allocation.
-pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
-    Ok(ArrayValue::decode(blob)?.elements)
-}
+use crate::{LimboError, Result};
 
 /// Extract elements from any Value that represents an array.
 /// Handles record blobs, JSON text input, and NULL (empty array).
@@ -381,47 +374,52 @@ fn array_dimension(val: &Value, dim: i64) -> Option<(i64, i64)> {
 }
 
 pub(crate) fn exec_array_append(arr: &Value, elem: &Value) -> Result<Value> {
-    let Some(mut elements) = array_values_from_any(arr) else {
+    let Some(mut array) = array_from_any(arr) else {
         return Ok(Value::Null);
     };
-    elements.push(elem.clone());
-    encode_array(DEFAULT_LOWER_BOUND, &elements)
+    array.elements.push(elem.clone());
+    array.encode()
 }
 
 pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Result<Value> {
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(array) = array_from_any(arr) else {
         return Ok(Value::Null);
     };
-    // Build new vec with elem first — avoids O(n) shift from Vec::insert(0, ...)
-    let mut result = Vec::with_capacity(elements.len() + 1);
-    result.push(elem.clone());
-    result.extend(elements);
-    encode_array(DEFAULT_LOWER_BOUND, &result)
+    if array.lower_bound == i32::MIN && !array.elements.is_empty() {
+        return Err(LimboError::IntegerOverflow);
+    }
+    let mut elements = Vec::with_capacity(array.elements.len() + 1);
+    elements.push(elem.clone());
+    elements.extend(array.elements);
+    encode_array(array.lower_bound, &elements)
 }
 
 pub(crate) fn exec_array_cat(a: &Value, b: &Value) -> Result<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(mut elems_a) = array_values_from_any(a) else {
+    let Some(mut array_a) = array_from_any(a) else {
         return Ok(Value::Null);
     };
-    let Some(elems_b) = array_values_from_any(b) else {
+    let Some(array_b) = array_from_any(b) else {
         return Ok(Value::Null);
     };
-    elems_a.extend(elems_b);
-    encode_array(DEFAULT_LOWER_BOUND, &elems_a)
+    if array_a.elements.is_empty() {
+        array_a.lower_bound = array_b.lower_bound;
+    }
+    array_a.elements.extend(array_b.elements);
+    array_a.encode()
 }
 
 pub(crate) fn exec_array_remove(arr: &Value, target: &Value) -> Result<Value> {
     if matches!(arr, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(array) = array_from_any(arr) else {
         return Ok(Value::Null);
     };
-    let result: Vec<Value> = elements.into_iter().filter(|e| e != target).collect();
-    encode_array(DEFAULT_LOWER_BOUND, &result)
+    let result: Vec<Value> = array.elements.into_iter().filter(|e| e != target).collect();
+    encode_array(array.lower_bound, &result)
 }
 
 pub(crate) fn exec_array_contains(arr: &Value, target: &Value) -> Value {
@@ -773,7 +771,7 @@ mod tests {
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = ArrayValue::decode(blob).unwrap().elements;
         assert_eq!(elements.len(), 3);
         assert_eq!(elements[0], Value::from_i64(1));
         assert_eq!(elements[1], Value::from_i64(3));
@@ -828,7 +826,7 @@ mod tests {
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob, got {result:?}");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = ArrayValue::decode(blob).unwrap().elements;
         assert_eq!(elements.len(), 5);
         assert_eq!(elements[0], Value::build_text("h"));
         assert_eq!(elements[1], Value::build_text("e"));
@@ -1064,7 +1062,7 @@ mod tests {
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = ArrayValue::decode(blob).unwrap().elements;
         assert_eq!(elements.len(), 3);
         assert_eq!(elements[0], Value::from_i64(1));
         assert_eq!(elements[1], Value::build_text("two"));
