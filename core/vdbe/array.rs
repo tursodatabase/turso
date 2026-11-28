@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
+use super::array_value::{encode_array, DEFAULT_LOWER_BOUND};
 use crate::dialect::Dialect;
 use crate::numeric::Numeric;
-use crate::types::{ImmutableRecord, Value, ValueIterator};
+use crate::types::{Value, ValueIterator};
 use crate::Result;
 
 /// Extract values from a record-format array blob.
@@ -164,13 +165,6 @@ fn parse_pg_text_array(text: &str, unquoted: UnquotedElements) -> Option<Vec<Val
     Some(elements)
 }
 
-/// Pack values into a record-format array blob.
-pub(crate) fn values_to_record_blob(values: &[Value]) -> Result<Value> {
-    Ok(Value::Blob(
-        ImmutableRecord::from_values(values, values.len())?.into_payload(),
-    ))
-}
-
 /// Serialize a record-format array blob to PostgreSQL text representation.
 /// Uses `{...}` delimiters and PG quoting rules:
 /// - NULL elements → uppercase `NULL` (unquoted)
@@ -310,7 +304,7 @@ pub(crate) fn exec_array_append(arr: &Value, elem: &Value) -> Result<Value> {
         return Ok(Value::Null);
     };
     elements.push(elem.clone());
-    values_to_record_blob(&elements)
+    encode_array(DEFAULT_LOWER_BOUND, &elements)
 }
 
 pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Result<Value> {
@@ -321,7 +315,7 @@ pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Result<Value> {
     let mut result = Vec::with_capacity(elements.len() + 1);
     result.push(elem.clone());
     result.extend(elements);
-    values_to_record_blob(&result)
+    encode_array(DEFAULT_LOWER_BOUND, &result)
 }
 
 pub(crate) fn exec_array_cat(a: &Value, b: &Value) -> Result<Value> {
@@ -335,7 +329,7 @@ pub(crate) fn exec_array_cat(a: &Value, b: &Value) -> Result<Value> {
         return Ok(Value::Null);
     };
     elems_a.extend(elems_b);
-    values_to_record_blob(&elems_a)
+    encode_array(DEFAULT_LOWER_BOUND, &elems_a)
 }
 
 pub(crate) fn exec_array_remove(arr: &Value, target: &Value) -> Result<Value> {
@@ -346,7 +340,7 @@ pub(crate) fn exec_array_remove(arr: &Value, target: &Value) -> Result<Value> {
         return Ok(Value::Null);
     };
     let result: Vec<Value> = elements.into_iter().filter(|e| e != target).collect();
-    values_to_record_blob(&result)
+    encode_array(DEFAULT_LOWER_BOUND, &result)
 }
 
 pub(crate) fn exec_array_contains(arr: &Value, target: &Value) -> Value {
@@ -420,7 +414,7 @@ pub(crate) fn exec_array_slice(arr: &Value, start: &Value, end: &Value) -> Resul
     };
     let end = end_idx.min(elements.len());
     let start = start_idx.min(end);
-    values_to_record_blob(&elements[start..end])
+    encode_array(DEFAULT_LOWER_BOUND, &elements[start..end])
 }
 
 /// Split a string into an array using a delimiter.
@@ -459,7 +453,7 @@ pub(crate) fn exec_string_to_array(
                 Value::build_text(s)
             })
             .collect();
-        return values_to_record_blob(&values);
+        return encode_array(DEFAULT_LOWER_BOUND, &values);
     }
 
     let delim_str = match delimiter {
@@ -486,7 +480,7 @@ pub(crate) fn exec_string_to_array(
         })
         .collect();
 
-    values_to_record_blob(&values)
+    encode_array(DEFAULT_LOWER_BOUND, &values)
 }
 
 /// Join array elements into a string with a delimiter.
@@ -619,8 +613,12 @@ pub(crate) fn make_array_from_registers(
     start_reg: usize,
     count: usize,
 ) -> Result<Value> {
-    let record = ImmutableRecord::from_registers(&registers[start_reg..start_reg + count], count)?;
-    Ok(Value::Blob(record.into_payload()))
+    encode_array(
+        DEFAULT_LOWER_BOUND,
+        registers[start_reg..start_reg + count]
+            .iter()
+            .map(|register| register.get_value()),
+    )
 }
 
 #[cfg(test)]
@@ -662,7 +660,11 @@ mod tests {
 
     #[test]
     fn test_compute_array_length_valid_array() {
-        let blob = values_to_record_blob(&[Value::from_i64(1), Value::from_i64(2)]).unwrap();
+        let blob = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[Value::from_i64(1), Value::from_i64(2)],
+        )
+        .unwrap();
         assert_eq!(compute_array_length(&blob), Some(2));
     }
 
@@ -673,13 +675,16 @@ mod tests {
 
     #[test]
     fn test_array_remove_all_occurrences() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(1),
-            Value::from_i64(2),
-            Value::from_i64(3),
-            Value::from_i64(2),
-            Value::from_i64(1),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(1),
+                Value::from_i64(2),
+                Value::from_i64(3),
+                Value::from_i64(2),
+                Value::from_i64(1),
+            ],
+        )
         .unwrap();
         let result = exec_array_remove(&arr, &Value::from_i64(2)).unwrap();
         let Value::Blob(blob) = &result else {
@@ -749,11 +754,14 @@ mod tests {
 
     #[test]
     fn test_exec_array_contains_streaming() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(10),
-            Value::from_i64(20),
-            Value::from_i64(30),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(10),
+                Value::from_i64(20),
+                Value::from_i64(30),
+            ],
+        )
         .unwrap();
         assert_eq!(
             exec_array_contains(&arr, &Value::from_i64(20)),
@@ -767,11 +775,14 @@ mod tests {
 
     #[test]
     fn test_exec_array_position_streaming() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(10),
-            Value::from_i64(20),
-            Value::from_i64(30),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(10),
+                Value::from_i64(20),
+                Value::from_i64(30),
+            ],
+        )
         .unwrap();
         // 1-based: element 20 is at position 2
         assert_eq!(
@@ -783,11 +794,14 @@ mod tests {
 
     #[test]
     fn test_dc1_negative_index_preserves_array() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(10),
-            Value::from_i64(20),
-            Value::from_i64(30),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(10),
+                Value::from_i64(20),
+                Value::from_i64(30),
+            ],
+        )
         .unwrap();
         // array_find_streaming with impossible predicate should return None
         let Value::Blob(blob) = &arr else {
@@ -826,12 +840,15 @@ mod tests {
 
     #[test]
     fn test_serialize_array_from_blob() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(1),
-            Value::build_text("hello"),
-            Value::Null,
-            Value::Blob(crate::alloc::vec![b'a', b'b']),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(1),
+                Value::build_text("hello"),
+                Value::Null,
+                Value::Blob(crate::alloc::vec![b'a', b'b']),
+            ],
+        )
         .unwrap();
         let Value::Blob(blob) = &arr else {
             panic!("Expected Blob");

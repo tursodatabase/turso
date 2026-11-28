@@ -149,8 +149,9 @@ impl OpenedBTree {
 use super::{
     array::{
         array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
-        parse_text_array, serialize_array_from_blob, values_to_record_blob,
+        parse_text_array, serialize_array_from_blob,
     },
+    array_value::{encode_array, DEFAULT_LOWER_BOUND},
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
         IntegrityCkData, IvmSumKind, RegisterOrLiteral, SorterOpenData,
@@ -2868,8 +2869,7 @@ pub fn op_array_encode(
     let coerced_elements = convert_array_elements(raw_elements, *dimensions, data)?;
 
     // Serialize coerced elements as a native record-format BLOB
-    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
-    state.registers[*reg].set_blob(record.into_payload())?;
+    state.registers[*reg].set_value(encode_array(DEFAULT_LOWER_BOUND, &coerced_elements)?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2921,7 +2921,7 @@ fn convert_array_elements(
                 let sub_elements =
                     array_values_from_blob(&sub_array).map_err(|_| not_an_array())?;
                 let sub_elements = convert_array_elements(sub_elements, dimensions - 1, data)?;
-                values_to_record_blob(&sub_elements)?
+                encode_array(DEFAULT_LOWER_BOUND, &sub_elements)?
             }
             (2.., Value::Numeric(_) | Value::Text(_)) => return Err(not_an_array()),
             (1, element @ (Value::Numeric(_) | Value::Text(_) | Value::Blob(_))) => {
@@ -3319,17 +3319,17 @@ pub fn op_array_concat(
             let mut elems_a = array_values_from_blob(lb)?;
             let elems_b = array_values_from_blob(rb)?;
             elems_a.extend(elems_b);
-            values_to_record_blob(&elems_a)?
+            encode_array(DEFAULT_LOWER_BOUND, &elems_a)?
         }
         (Value::Blob(lb), _) => {
             let mut elems = array_values_from_blob(lb)?;
             elems.push(rhs_ref.clone());
-            values_to_record_blob(&elems)?
+            encode_array(DEFAULT_LOWER_BOUND, &elems)?
         }
         (_, Value::Blob(rb)) => {
             let mut elems = array_values_from_blob(rb)?;
             elems.insert(0, lhs_ref.clone());
-            values_to_record_blob(&elems)?
+            encode_array(DEFAULT_LOWER_BOUND, &elems)?
         }
         _ => {
             // Neither is an array blob — fall back to string concat
@@ -3390,7 +3390,7 @@ pub fn op_array_set_element(
         state.registers[*dest].set_blob(blob.clone())?;
     } else {
         elements[idx] = new_val;
-        state.registers[*dest].set_value(values_to_record_blob(&elements)?);
+        state.registers[*dest].set_value(encode_array(DEFAULT_LOWER_BOUND, &elements)?);
     }
 
     state.pc += 1;
@@ -8515,7 +8515,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &mut [Value], take_first: bool)
                 )));
             } else {
                 let elements = &payload[1..1 + count];
-                Value::Blob(ImmutableRecord::from_values(elements, count)?.into_payload())
+                encode_array(DEFAULT_LOWER_BOUND, elements)?
             }
         }
         AggFunc::Mode => {

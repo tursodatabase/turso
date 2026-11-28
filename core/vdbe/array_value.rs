@@ -1,5 +1,5 @@
 use crate::storage::sqlite3_ondisk::{read_varint, write_varint_to_vec};
-use crate::types::{ImmutableRecord, Value, ValueIterator};
+use crate::types::{AsValueRef, ImmutableRecord, RecordBuf, Value, ValueIterator};
 use crate::{LimboError, Result};
 
 pub const DEFAULT_LOWER_BOUND: i32 = 1;
@@ -35,22 +35,33 @@ impl ArrayValue {
     }
 
     pub fn encode(&self) -> Result<Value> {
-        let record = ImmutableRecord::from_values(&self.elements, self.elements.len())?;
-        if self.lower_bound == DEFAULT_LOWER_BOUND || self.elements.is_empty() {
-            return Ok(Value::Blob(record.into_payload()));
-        }
-        if i64::from(self.lower_bound) + self.elements.len() as i64 > i64::from(i32::MAX) {
+        encode_array(self.lower_bound, &self.elements)
+    }
+}
+
+/// Stores `elements` as an array whose first element has subscript `lower_bound`.
+pub fn encode_array<'a>(
+    lower_bound: i32,
+    elements: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
+) -> Result<Value> {
+    let is_empty = elements.clone().into_iter().next().is_none();
+    if lower_bound > DEFAULT_LOWER_BOUND && !is_empty {
+        let length = elements.clone().into_iter().count() as i64;
+        if i64::from(lower_bound) + length > i64::from(i32::MAX) {
             return Err(LimboError::ArrayBoundTooLarge {
                 which: "lower",
-                bound: i64::from(self.lower_bound),
+                bound: i64::from(lower_bound),
             });
         }
-        let payload = record.into_payload();
-        let mut framed = Vec::with_capacity(FRAME_LEN + payload.len());
-        write_varint_to_vec(FRAME_MARK | u64::from(self.lower_bound as u32), &mut framed);
-        framed.extend_from_slice(&payload);
-        Ok(Value::from_slice(&framed)?)
     }
+    let payload = ImmutableRecord::build(elements, RecordBuf::alloc())?.into_payload();
+    if lower_bound == DEFAULT_LOWER_BOUND || is_empty {
+        return Ok(Value::Blob(payload));
+    }
+    let mut framed = Vec::with_capacity(FRAME_LEN + payload.len());
+    write_varint_to_vec(FRAME_MARK | u64::from(lower_bound as u32), &mut framed);
+    framed.extend_from_slice(&payload);
+    Ok(Value::from_slice(&framed)?)
 }
 
 /// A stored array, read in place.
