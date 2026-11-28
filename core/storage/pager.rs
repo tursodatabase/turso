@@ -1760,6 +1760,8 @@ pub struct Pager {
     /// Whether this pager holds an ephemeral table or index, whose file no
     /// other pager reads.
     ephemeral: AtomicBool,
+    /// Whether the database was opened read-only.
+    read_only: AtomicBool,
     shared: Arc<SharedPagerState>,
     /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
     /// Only stored on Apple platforms; on others, always returns Fsync.
@@ -2069,6 +2071,7 @@ impl Pager {
             encryption_verified: AtomicBool::new(false),
             enable_encryption: AtomicBool::new(false),
             ephemeral: AtomicBool::new(false),
+            read_only: AtomicBool::new(false),
             shared,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
@@ -3206,6 +3209,14 @@ impl Pager {
 
     pub(crate) fn mark_ephemeral(&self) {
         self.ephemeral.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_read_only(&self) {
+        self.read_only.store(true, Ordering::Relaxed);
     }
 
     /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
@@ -5290,7 +5301,17 @@ impl Pager {
                         }
                     });
                     let mut state = self.checkpoint_state.write();
-                    if matches!(mode, CheckpointMode::Truncate { .. })
+                    if self.is_read_only() {
+                        // A read-only connection backfilled nothing and holds no write
+                        // access to the files: no phase that syncs or truncates the DB file
+                        // or truncates the WAL may run, it could cut a writer's frames.
+                        // Its page cache stays: nothing it holds became stale, and another
+                        // process may have restarted the WAL, so the cached pages can be
+                        // the only valid copy of the snapshot this connection reads.
+                        state.phase = CheckpointPhase::Finalize {
+                            clear_page_cache: false,
+                        };
+                    } else if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
                         && res.should_truncate()
                     {
@@ -5339,7 +5360,23 @@ impl Pager {
                     // directly to DB file from the WAL, so the checkpointer connections' page 1 may have stale database_size.
                     if !page1_invalidated {
                         let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
-                        self.page_cache.write().delete(page1_key)?;
+                        match self.page_cache.write().delete(page1_key) {
+                            Ok(()) => {}
+                            // A cursor of a finished statement on this connection still pins page 1,
+                            // so its database_size may be stale. Truncating the DB file to a stale size
+                            // could cut live pages; keep the file as is (it is only larger than needed)
+                            // and go on to the WAL truncation.
+                            Err(CacheError::Pinned { .. }) => {
+                                let mut state = self.checkpoint_state.write();
+                                state.phase = if sync_mode == crate::SyncMode::Off {
+                                    CheckpointPhase::TruncateWalFile { clear_page_cache }
+                                } else {
+                                    CheckpointPhase::SyncDbFile { clear_page_cache }
+                                };
+                                continue;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
                         let mut state = self.checkpoint_state.write();
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,

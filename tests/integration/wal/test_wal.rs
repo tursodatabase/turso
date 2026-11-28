@@ -87,6 +87,80 @@ fn test_truncate_checkpoint_not_busy_after_rollback(tmp_db: TempDatabase) -> Res
     Ok(())
 }
 
+/// With a reader pinned to an old snapshot, FULL/RESTART/TRUNCATE backfill what the
+/// reader allows and report busy=1, the WAL frame count and the backfilled count.
+fn assert_blocked_checkpoint_row(tmp_db: &TempDatabase, mode: &str) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN;")?;
+    assert_eq!(execute_and_get_ints(&reader, "SELECT x FROM t")?, vec![1]);
+    conn.execute("INSERT INTO t VALUES (2);")?;
+
+    let checkpoint = execute_and_get_ints(&conn, &format!("PRAGMA wal_checkpoint({mode});"))?;
+    assert_that!(checkpoint).is_equal_to(vec![1, 4, 3]);
+    reader.execute("COMMIT;")?;
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_blocked_by_reader_reports_frames(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_blocked_checkpoint_row(&tmp_db, "TRUNCATE")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_restart_checkpoint_blocked_by_reader_reports_frames(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_blocked_checkpoint_row(&tmp_db, "RESTART")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_full_checkpoint_blocked_by_reader_reports_frames(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_blocked_checkpoint_row(&tmp_db, "FULL")
+}
+
+/// PASSIVE never reports busy: with the reader pinned it backfills up to the reader (SQLite: 0|4|3).
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_passive_checkpoint_with_reader_is_not_busy(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN;")?;
+    assert_eq!(execute_and_get_ints(&reader, "SELECT x FROM t")?, vec![1]);
+    conn.execute("INSERT INTO t VALUES (2);")?;
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(PASSIVE);")?;
+    assert_that!(checkpoint).is_equal_to(vec![0, 4, 3]);
+    reader.execute("COMMIT;")?;
+    Ok(())
+}
+
+/// Without readers TRUNCATE succeeds and empties the WAL (SQLite: 0|0|0).
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_without_reader_is_not_busy(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+    conn.execute("INSERT INTO t VALUES (2);")?;
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_that!(checkpoint).is_equal_to(vec![0, 0, 0]);
+    Ok(())
+}
+
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
 fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
@@ -490,5 +564,233 @@ fn test_wal_with_bad_header_checksum_is_ignored() -> anyhow::Result<()> {
     assert_eq!(quick_check, "ok");
     let count: i64 = sqlite.query_row("SELECT count(*) FROM t", (), |row| row.get(0))?;
     assert_eq!(count, 51);
+    Ok(())
+}
+
+/// Another connection holds the write lock with no frames written. FULL, RESTART and TRUNCATE
+/// try the writer lock first, so they report busy=1 with the WAL totals every time, even when
+/// the WAL is already fully backfilled (SQLite: 1|3|3 on both calls).
+fn assert_checkpoint_busy_while_writer_holds_lock(tmp_db: &TempDatabase, mode: &str) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA wal_autocheckpoint=0;")?;
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+
+    let writer = tmp_db.connect_limbo();
+    writer.execute("BEGIN IMMEDIATE;")?;
+    let sql = format!("PRAGMA wal_checkpoint({mode});");
+    assert_that!(execute_and_get_ints(&conn, &sql)?).is_equal_to(vec![1, 3, 3]);
+    assert_that!(execute_and_get_ints(&conn, &sql)?).is_equal_to(vec![1, 3, 3]);
+    writer.execute("COMMIT;")?;
+    assert_that!(execute_and_get_ints(&conn, &sql)?[0]).is_equal_to(0);
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_full_checkpoint_busy_while_writer_holds_lock(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_checkpoint_busy_while_writer_holds_lock(&tmp_db, "FULL")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_restart_checkpoint_busy_while_writer_holds_lock(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_checkpoint_busy_while_writer_holds_lock(&tmp_db, "RESTART")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_busy_while_writer_holds_lock(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_checkpoint_busy_while_writer_holds_lock(&tmp_db, "TRUNCATE")
+}
+
+/// A read-only connection on a database with an empty WAL has nothing to truncate:
+/// TRUNCATE returns 0|0|0 instead of failing on the read-only WAL file (SQLite: 0|0|0).
+#[test]
+fn test_truncate_checkpoint_on_readonly_connection_with_clean_wal() -> Result<()> {
+    maybe_setup_tracing();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ro_clean_truncate.db");
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("PRAGMA wal_autocheckpoint=0;")?;
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY);")?;
+        conn.execute("INSERT INTO t VALUES (1);")?;
+        assert_that!(execute_and_get_ints(
+            &conn,
+            "PRAGMA wal_checkpoint(TRUNCATE);"
+        )?)
+        .is_equal_to(vec![0, 0, 0]);
+        conn.close()?;
+    }
+    let wal_path = dir.path().join("ro_clean_truncate.db-wal");
+    assert_eq!(
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0),
+        0
+    );
+
+    let db = TempDatabase::new_with_existent_with_flags(
+        &path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+    );
+    let conn = db.connect_limbo();
+    assert_that!(execute_and_get_ints(&conn, "SELECT count(*) FROM t")?).is_equal_to(vec![1]);
+    let sql = "PRAGMA wal_checkpoint(TRUNCATE);";
+    assert_that!(execute_and_get_ints(&conn, sql)?).is_equal_to(vec![0, 0, 0]);
+    assert_that!(execute_and_get_ints(&conn, sql)?).is_equal_to(vec![0, 0, 0]);
+    Ok(())
+}
+
+/// Finished statements that are kept alive (not reset or dropped) can still pin page 1.
+/// TRUNCATE must still succeed and keep the data; it skips shrinking the DB file then.
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_with_finished_statements_still_alive(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    let mut create = conn.prepare("CREATE TABLE t(x);")?;
+    create.run_with_row_callback(|_| Ok(()))?;
+    let mut insert = conn.prepare("INSERT INTO t VALUES (1), (2);")?;
+    insert.run_with_row_callback(|_| Ok(()))?;
+    let mut schema = conn.prepare("SELECT count(*) FROM sqlite_schema;")?;
+    schema.run_with_row_callback(|_| Ok(()))?;
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_that!(checkpoint).is_equal_to(vec![0, 0, 0]);
+    assert_eq!(
+        execute_and_get_ints(&conn, "SELECT count(*) FROM t")?,
+        vec![2]
+    );
+
+    drop((create, insert, schema));
+    let reopened = tmp_db.connect_limbo();
+    assert_eq!(
+        execute_and_get_ints(&reopened, "SELECT count(*) FROM t")?,
+        vec![2]
+    );
+    Ok(())
+}
+
+/// Copies a database and its WAL while the writer connection is still open, so the
+/// copy has a non-empty WAL whose frames are already backfilled into the DB file.
+fn copy_backfilled_db_with_wal(dir: &std::path::Path) -> std::path::PathBuf {
+    let src = dir.join("src.db");
+    let db = TempDatabase::new_with_existent(&src);
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA wal_autocheckpoint=0;").unwrap();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY);")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1);").unwrap();
+    let res = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(PASSIVE);").unwrap();
+    assert_eq!(res[0], 0, "PASSIVE must not be busy: {res:?}");
+    assert!(res[1] > 0, "the WAL must hold frames: {res:?}");
+    assert_eq!(
+        res[1], res[2],
+        "every WAL frame must be backfilled: {res:?}"
+    );
+    let dst = dir.join("copy.db");
+    std::fs::copy(&src, &dst).unwrap();
+    std::fs::copy(dir.join("src.db-wal"), dir.join("copy.db-wal")).unwrap();
+    assert!(std::fs::metadata(dir.join("copy.db-wal")).unwrap().len() > 0);
+    // Keep the writer alive until the files are copied.
+    drop(conn);
+    std::mem::forget(db);
+    dst
+}
+
+/// A checkpoint on a read-only connection never writes, and takes the same locks as a
+/// read-write one. The copy's frames are not backfilled (the backfill count is not
+/// persisted), so PASSIVE reports them without copying them and is never busy because of
+/// them, with or without another reader pinning the snapshot; FULL, RESTART and TRUNCATE
+/// would have to backfill into the read-only DB file, so they report busy.
+#[test]
+fn test_checkpoint_on_readonly_connection_never_writes() -> Result<()> {
+    maybe_setup_tracing();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = copy_backfilled_db_with_wal(dir.path());
+    let wal_path = dir.path().join("copy.db-wal");
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+    let db_bytes = std::fs::read(&path).unwrap();
+
+    let db = TempDatabase::new_with_existent_with_flags(
+        &path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+    );
+    let conn = db.connect_limbo();
+    assert_that!(execute_and_get_ints(&conn, "SELECT count(*) FROM t")?).is_equal_to(vec![1]);
+    let reader = db.connect_limbo();
+    for pinned in [false, true] {
+        if pinned {
+            reader.execute("BEGIN;")?;
+            assert_that!(execute_and_get_ints(&reader, "SELECT count(*) FROM t")?)
+                .is_equal_to(vec![1]);
+        }
+        for pragma in ["PRAGMA wal_checkpoint;", "PRAGMA wal_checkpoint(PASSIVE);"] {
+            let res = execute_and_get_ints(&conn, pragma)?;
+            assert_eq!(res.len(), 3, "{pragma} pinned={pinned}: {res:?}");
+            assert_eq!(
+                res[0], 0,
+                "{pragma} pinned={pinned} must not be busy: {res:?}"
+            );
+            assert!(
+                res[1] > 0,
+                "{pragma} pinned={pinned} must report the WAL frames: {res:?}"
+            );
+            assert_eq!(
+                res[2], 0,
+                "{pragma} pinned={pinned} must not backfill: {res:?}"
+            );
+        }
+        for mode in ["FULL", "RESTART", "TRUNCATE"] {
+            let res = execute_and_get_ints(&conn, &format!("PRAGMA wal_checkpoint({mode});"))?;
+            assert_eq!(res.len(), 3, "{mode} pinned={pinned}");
+            assert_eq!(
+                res[0], 1,
+                "{mode} pinned={pinned} must report busy: {res:?}"
+            );
+        }
+    }
+    reader.execute("ROLLBACK;")?;
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+    assert_eq!(std::fs::read(&path).unwrap(), db_bytes);
+    Ok(())
+}
+
+/// A checkpoint on a read-only connection leaves its page cache alone. Without the
+/// multiprocess WAL, another process that restarts the WAL is invisible to the connection:
+/// its cached pages are then the only valid copy of the snapshot it reads, and the WAL
+/// frames it maps pages to no longer exist. Emptying the WAL file stands in for that
+/// restart.
+#[test]
+fn test_checkpoint_on_readonly_connection_keeps_page_cache() -> Result<()> {
+    maybe_setup_tracing();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = copy_backfilled_db_with_wal(dir.path());
+    let wal_path = dir.path().join("copy.db-wal");
+
+    let db = TempDatabase::new_with_existent_with_flags(
+        &path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+    );
+    let conn = db.connect_limbo();
+    assert_that!(execute_and_get_ints(&conn, "SELECT count(*) FROM t")?).is_equal_to(vec![1]);
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&wal_path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    for pragma in ["PRAGMA wal_checkpoint;", "PRAGMA wal_checkpoint(PASSIVE);"] {
+        let res = execute_and_get_ints(&conn, pragma)?;
+        assert_eq!(res[0], 0, "{pragma} must not be busy: {res:?}");
+    }
+    assert_that!(execute_and_get_ints(&conn, "SELECT count(*) FROM t")?).is_equal_to(vec![1]);
     Ok(())
 }

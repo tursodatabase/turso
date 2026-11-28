@@ -646,35 +646,77 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    let step_result = pager.checkpoint(*checkpoint_mode, sync_mode, true);
-    match step_result {
+    // After a Busy on FULL/RESTART/TRUNCATE, SQLite still backfills what the readers
+    // allow and reports busy=1 with the counts. The flag keeps that fallback alive
+    // when this opcode is re-entered after IO.
+    let mode_to_run = if state.checkpoint_busy_fallback {
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        }
+    } else {
+        *checkpoint_mode
+    };
+    match pager.checkpoint(mode_to_run, sync_mode, true) {
         Ok(IOResult::Done(CheckpointResult {
             wal_max_frame,
             wal_total_backfilled,
             ..
         })) => {
-            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-            state.registers[*dest].set_int(0);
-            // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1].set_int(wal_max_frame as i64);
-            // 3rd col: # pages moved to db after checkpoint
-            state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
-
+            if state.checkpoint_busy_fallback {
+                set_checkpoint_busy_result(
+                    state,
+                    *dest,
+                    Some((wal_max_frame, wal_total_backfilled)),
+                );
+            } else {
+                // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+                // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+                state.registers[*dest].set_int(0);
+                // 2nd col: # modified pages written to wal file
+                state.registers[*dest + 1].set_int(wal_max_frame as i64);
+                // 3rd col: # pages moved to db after checkpoint
+                state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
+            }
+            state.checkpoint_busy_fallback = false;
             state.explicit_checkpoint_guard = None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
-        Err(err) => {
-            tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
+        Err(err) if matches!(*err, LimboError::Busy) => {
+            tracing::debug!("PRAGMA wal_checkpoint busy");
             pager.clear_checkpoint_state();
+            let can_fall_back = !state.checkpoint_busy_fallback
+                && !matches!(mode_to_run, CheckpointMode::Passive { .. });
+            if can_fall_back {
+                state.checkpoint_busy_fallback = true;
+                // Re-run this opcode as a Passive checkpoint.
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            // Passive was busy too: even the checkpoint lock was unavailable.
+            state.checkpoint_busy_fallback = false;
             state.explicit_checkpoint_guard = None;
-            state.registers[*dest].set_int(1);
+            set_checkpoint_busy_result(state, *dest, None);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
+        Err(err) => {
+            tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
+            pager.clear_checkpoint_state();
+            state.checkpoint_busy_fallback = false;
+            state.explicit_checkpoint_guard = None;
+            Err(err)
+        }
     }
+}
+
+/// Writes the busy row. `counts` is (WAL max frame, frames backfilled); `None` means
+/// SQLite's "no count" value of -1 for both.
+fn set_checkpoint_busy_result(state: &mut ProgramState, dest: usize, counts: Option<(u64, u64)>) {
+    let (log, checkpointed) = counts.map_or((-1, -1), |(log, done)| (log as i64, done as i64));
+    state.registers[dest].set_int(1);
+    state.registers[dest + 1].set_int(log);
+    state.registers[dest + 2].set_int(checkpointed);
 }
 
 pub fn op_null(

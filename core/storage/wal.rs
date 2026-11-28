@@ -5011,9 +5011,14 @@ impl WalFile {
                             { "max_frame": max_frame, "nbackfills": nbackfills }
                         );
                     }
-                    if !needs_backfill && !mode.should_restart_log() {
+                    if !needs_backfill
+                        && !mode.should_restart_log()
+                        && !mode.require_all_backfilled()
+                    {
                         // there are no frames to copy over and we don't need to reset
-                        // the log so we can return early success.
+                        // the log, and the mode does not need the writer lock (FULL
+                        // takes it even with nothing to backfill, like SQLite), so we
+                        // can return early success.
                         return Ok(IOResult::Done(CheckpointResult::new(
                             max_frame, nbackfills, 0,
                         )));
@@ -5039,6 +5044,13 @@ impl WalFile {
                     } = mode
                     {
                         max_frame = max_frame.min(upper_bound);
+                    }
+                    if pager.is_read_only() {
+                        // A read-only connection takes the same locks as a read-write one,
+                        // so it is busy in the same cases, but it never backfills: the DB
+                        // file is not written. With frames left, FULL/RESTART/TRUNCATE
+                        // end up busy in `DetermineResult`, PASSIVE reports them as is.
+                        max_frame = nbackfills;
                     }
 
                     {
@@ -5233,7 +5245,16 @@ impl WalFile {
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy.into());
                     }
-                    if mode.should_restart_log() {
+                    if pager.is_read_only() {
+                        // A read-only connection cannot restart the log: begin_restart
+                        // resets the shared WAL index, but the WAL file keeps its frames
+                        // and nobody can write a new header. RESTART leaves the index
+                        // alone. TRUNCATE must empty the file, so it is busy while
+                        // the WAL holds frames.
+                        if matches!(mode, CheckpointMode::Truncate { .. }) && wal_max_frame > 0 {
+                            return Err(LimboError::Busy.into());
+                        }
+                    } else if mode.should_restart_log() {
                         turso_assert!(
                             matches!(
                                 *self.checkpoint_guard.read(),
@@ -5255,7 +5276,9 @@ impl WalFile {
                     // This ensures data durability: if a crash occurs after WAL truncation
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
-                    if mode.should_restart_log() {
+                    // A read-only connection never ran `begin_restart`, so it has no
+                    // read marks to release.
+                    if mode.should_restart_log() && !pager.is_read_only() {
                         Self::unlock_after_restart(&self.coordination, None);
                     }
                     let mut checkpoint_result = {
@@ -5407,6 +5430,15 @@ impl WalFile {
     ) -> IOResultOr<()> {
         let file = self.coordination.prepare_truncate()?;
 
+        // An already-empty log has nothing to truncate or sync. Skipping keeps TRUNCATE
+        // a no-op on a read-only connection, as in SQLite.
+        if !result.wal_truncate_sent && wal_file_is_empty(file.as_ref()) {
+            result.wal_truncate_sent = true;
+            result.wal_sync_sent = true;
+            result.wal_max_frame = 0;
+            result.wal_total_backfilled = 0;
+            return Ok(IOResult::Done(()));
+        }
         if !result.wal_truncate_sent {
             let c = Completion::new_trunc({
                 move |res| {
@@ -5571,7 +5603,10 @@ impl WalFile {
     }
 }
 
-#[cfg(host_shared_wal)]
+fn wal_file_is_empty(file: &dyn File) -> bool {
+    matches!(file.size(), Ok(0))
+}
+
 fn read_exact_bytes_from_file(
     io: &Arc<dyn IO>,
     file: &Arc<dyn File>,
