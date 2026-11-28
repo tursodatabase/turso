@@ -374,6 +374,8 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::Dialect(error) => error.code,
         LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         LimboError::DependentObjects(_) => SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+        LimboError::UndefinedObject { .. } => SQLSTATE_UNDEFINED_OBJECT,
+        LimboError::WrongObjectType(_) => SQLSTATE_WRONG_OBJECT_TYPE,
         _ => SQLSTATE_INTERNAL_ERROR,
     }
 }
@@ -389,6 +391,7 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
+        || msg.starts_with("cannot drop built-in type: ")
         || (msg.starts_with("cannot change column \"") && msg.contains("\" because policy \""))
         || (msg.starts_with("error in table ")
             && msg.contains(" after drop column: no such column"))
