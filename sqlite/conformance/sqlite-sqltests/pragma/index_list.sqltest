@@ -186,3 +186,38 @@ expect {
     0|sqlite_autoindex_w_2|1|u|0
     1|sqlite_autoindex_w_1|1|pk|0
 }
+
+# A numeric argument names the table or index whose name is the number's text.
+@cross-check-integrity
+test pragma-index-pragmas-numeric-names {
+    CREATE TABLE "-1"(a, b);
+    CREATE INDEX "-7" ON "-1"(b);
+    PRAGMA index_list(-1);
+    PRAGMA index_info(-7);
+    PRAGMA index_xinfo(-7);
+}
+expect {
+    0|-7|0|c|0
+    0|1|b
+    0|1|b|0|BINARY|1
+    1|-1||0|BINARY|0
+}
+
+# The bare keywords ON, DEFAULT and DELETE name the table or index of that name.
+@cross-check-integrity
+test pragma-index-pragmas-keyword-names {
+    CREATE TABLE t(a, b);
+    CREATE INDEX "default" ON t(b);
+    CREATE INDEX "on" ON t(a, b);
+    CREATE TABLE "delete"(x UNIQUE);
+    PRAGMA index_info(default);
+    PRAGMA index_xinfo(on);
+    PRAGMA index_list(delete);
+}
+expect {
+    0|1|b
+    0|0|a|0|BINARY|1
+    1|1|b|0|BINARY|1
+    2|-1||0|BINARY|0
+    0|sqlite_autoindex_delete_1|1|u|0
+}

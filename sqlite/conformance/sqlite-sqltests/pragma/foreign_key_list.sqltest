@@ -108,3 +108,41 @@ test pragma-foreign-key-list-attached-database {
 expect {
     0|0|parent|parent_id|id|NO ACTION|NO ACTION|NONE
 }
+
+# A numeric PRAGMA argument names the table whose name is that number's text,
+# including a leading minus. SQLite keeps the minus and drops a leading plus.
+@cross-check-integrity
+test pragma-foreign-key-list-numeric-table-name {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE "-1"(a REFERENCES p);
+    CREATE TABLE "1"(b REFERENCES p);
+    CREATE TABLE "2"(d REFERENCES p);
+    CREATE TABLE "-1.5"(e REFERENCES p);
+    PRAGMA foreign_key_list(-1);
+    PRAGMA foreign_key_list(1);
+    PRAGMA foreign_key_list("-1");
+    PRAGMA foreign_key_list(+2);
+    PRAGMA foreign_key_list(-1.5);
+    PRAGMA foreign_key_list = -1;
+}
+expect {
+    0|0|p|a||NO ACTION|NO ACTION|NONE
+    0|0|p|b||NO ACTION|NO ACTION|NONE
+    0|0|p|a||NO ACTION|NO ACTION|NONE
+    0|0|p|d||NO ACTION|NO ACTION|NONE
+    0|0|p|e||NO ACTION|NO ACTION|NONE
+    0|0|p|a||NO ACTION|NO ACTION|NONE
+}
+
+# The bare keywords ON, DEFAULT and DELETE are read as a table name too.
+@cross-check-integrity
+test pragma-foreign-key-list-keyword-table-name {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE "on"(a REFERENCES p);
+    PRAGMA foreign_key_list(on);
+    PRAGMA foreign_key_list = ON;
+}
+expect {
+    0|0|p|a||NO ACTION|NO ACTION|NONE
+    0|0|p|a||NO ACTION|NO ACTION|NONE
+}

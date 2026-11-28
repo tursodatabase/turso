@@ -132,3 +132,42 @@ expect {
     main|t|table|1|0|0
     temp|t|table|1|0|0
 }
+
+# A numeric argument names the table whose name is the number's text. The
+# minus sign is part of the name and a leading plus is not.
+@cross-check-integrity
+test pragma-table-pragmas-numeric-table-name {
+    CREATE TABLE "-1"(a, b);
+    CREATE TABLE "3"(c);
+    CREATE TABLE "+4"(z);
+    PRAGMA table_info(-1);
+    PRAGMA table_xinfo(+3);
+    PRAGMA table_list(-1);
+    PRAGMA table_info(+4);
+}
+expect {
+    0|a||0||0
+    1|b||0||0
+    0|c||0||0|0
+    main|-1|table|2|0|0
+}
+
+# SQLite also reads the bare keywords ON, DEFAULT and DELETE as a name here
+# (its `nmnum` rule), so they find the table of that name.
+@cross-check-integrity
+test pragma-table-pragmas-keyword-table-name {
+    CREATE TABLE "on"(z);
+    CREATE TABLE "default"(a, b);
+    CREATE TABLE "delete"(c);
+    PRAGMA table_info(on);
+    PRAGMA table_xinfo(DEFAULT);
+    PRAGMA table_list(delete);
+    PRAGMA table_info(Delete);
+}
+expect {
+    0|z||0||0
+    0|a||0||0|0
+    1|b||0||0|0
+    main|delete|table|1|0|0
+    0|c||0||0
+}
