@@ -158,3 +158,108 @@ fn current_time_does_not_change_within_one_step() {
         ]
     );
 }
+
+/// Runs `sql` with the local time zone set to `tz` and returns its one row.
+#[cfg(unix)]
+fn exec_row_in_zone(tz: &str, sql: &str) -> Vec<String> {
+    std::env::set_var("TZ", tz);
+    // chrono caches the zone per thread and reads TZ again only after a
+    // second, so run the query on a new thread, which reads TZ on first use.
+    let sql = sql.to_string();
+    let row = std::thread::spawn(move || {
+        let db = Database::open_file(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut row = Vec::new();
+        stmt.run_with_row_callback(|r| {
+            row = (0..r.len()).map(|i| r.get::<String>(i).unwrap()).collect();
+            Ok(())
+        })
+        .unwrap();
+        row
+    })
+    .join()
+    .unwrap();
+    std::env::remove_var("TZ");
+    row
+}
+
+// chrono reads TZ only on Unix. The tests that set TZ run one at a time, and no
+// other test in this binary reads the local time zone.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn utc_and_localtime_modifiers_match_sqlite_near_offset_changes() {
+    assert_eq!(
+        exec_row_in_zone(
+            "America/Los_Angeles",
+            "SELECT datetime('2024-06-15 03:00:00','utc'), \
+             datetime('2024-03-10 03:00:00','utc'), \
+             CAST(unixepoch('2024-03-10 03:00:00','utc') AS TEXT), \
+             datetime('2024-03-10 03:00:00','utc','localtime'), \
+             datetime('2024-11-03 01:30:00','utc'), \
+             datetime('2024-03-10 02:30:00','utc'), \
+             datetime('2024-03-10 03:00:00.123','subsec','utc')",
+        ),
+        vec![
+            "2024-06-15 10:00:00",
+            "2024-03-10 10:00:00",
+            "1710064800",
+            "2024-03-10 03:00:00",
+            "2024-11-03 08:30:00",
+            "2024-03-10 10:30:00",
+            "2024-03-10 10:00:00",
+        ]
+    );
+    assert_eq!(
+        exec_row_in_zone(
+            "Europe/Moscow",
+            "SELECT datetime('2014-10-25 23:00:00','utc')"
+        ),
+        vec!["2014-10-25 19:00:00"]
+    );
+    assert_eq!(
+        exec_row_in_zone(
+            "Australia/Lord_Howe",
+            "SELECT datetime('2024-04-06 20:00:00','utc')"
+        ),
+        vec!["2024-04-06 09:00:00"]
+    );
+}
+
+// SQLite reads the offset of a year before 1970 or after 2037 in one of the
+// years 2000 to 2003, and keeps the local date as fields, even when the date
+// does not exist (1900-02-29).
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn utc_and_localtime_modifiers_map_years_outside_1970_to_2037_like_sqlite() {
+    assert_eq!(
+        exec_row_in_zone(
+            "Europe/Moscow",
+            "SELECT datetime('1960-07-15 12:00:00','localtime'), \
+             datetime('2050-07-15 12:00:00','localtime'), \
+             datetime('2050-07-15 12:00:00','utc')",
+        ),
+        vec![
+            "1960-07-15 16:00:00",
+            "2050-07-15 16:00:00",
+            "2050-07-15 08:00:00",
+        ]
+    );
+    assert_eq!(
+        exec_row_in_zone(
+            "America/Los_Angeles",
+            "SELECT datetime('1900-02-28 20:00:00','localtime'), \
+             datetime('1900-03-01 04:00:00','localtime')",
+        ),
+        vec!["1900-02-28 12:00:00", "1900-02-29 20:00:00"]
+    );
+}

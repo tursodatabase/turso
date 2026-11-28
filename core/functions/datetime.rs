@@ -527,14 +527,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         }
         'l' if z.eq_ignore_ascii_case("localtime") => {
             if !p.is_local {
-                p.compute_jd();
-                let timestamp = (p.i_jd - 210866760000000) / 1000;
-                let offset_sec = match Local.timestamp_opt(timestamp, 0) {
-                    chrono::LocalResult::Single(dt) => dt.offset().fix().local_minus_utc(),
-                    _ => 0,
-                };
-                p.i_jd += (offset_sec as i64) * 1000;
-                p.clear_ymd_hms_tz();
+                to_localtime(p);
                 p.is_local = true;
                 p.is_utc = false;
             }
@@ -571,15 +564,35 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         'u' if z.eq_ignore_ascii_case("utc") => {
             if !p.is_utc {
                 p.compute_jd();
-                let timestamp = (p.i_jd - 210866760000000) / 1000;
-                let offset_sec = match Local.timestamp_opt(timestamp, 0) {
-                    chrono::LocalResult::Single(dt) => dt.offset().fix().local_minus_utc(),
-                    _ => 0,
+                // The zone offset depends on the UTC instant, which is not known
+                // yet. As SQLite does, start with the local time as the guess,
+                // convert the guess back to local time, and correct the guess by
+                // the error. Stop after four passes: a local time in the gap of
+                // a forward step has no UTC instant that converts back to it.
+                let orig_jd = p.i_jd;
+                let mut guess = orig_jd;
+                let mut err = 0;
+                for _ in 0..4 {
+                    guess -= err;
+                    let mut local = DateTime {
+                        i_jd: guess,
+                        valid_jd: true,
+                        ..DateTime::default()
+                    };
+                    to_localtime(&mut local);
+                    local.compute_jd();
+                    err = local.i_jd - orig_jd;
+                    if err == 0 {
+                        break;
+                    }
+                }
+                // SQLite resets every other field too, 'subsec' included.
+                *p = DateTime {
+                    i_jd: guess,
+                    valid_jd: true,
+                    is_utc: true,
+                    ..DateTime::default()
                 };
-                p.i_jd -= (offset_sec as i64) * 1000;
-                p.clear_ymd_hms_tz();
-                p.is_utc = true;
-                p.is_local = false;
             }
             Ok(())
         }
@@ -645,6 +658,47 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         '+' | '-' | '0'..='9' => parse_arithmetic_modifier(p, z),
         _ => Err(InvalidModifier(format!("Unknown modifier: {z}"))),
     }
+}
+
+/// Converts `p` from UTC to local time, as SQLite's toLocaltime() does: it
+/// sets the date and time fields to the local time and clears the julian day.
+fn to_localtime(p: &mut DateTime) {
+    p.compute_jd();
+    // As SQLite does, read the offset of an instant before 1970-01-01 or after
+    // 2038-01-18 at the same date and time in one of the years 2000 to 2003,
+    // chosen so that the leap years match, and then move the year back.
+    let mut x = *p;
+    let mut year_diff = 0;
+    if !(210866760000000..=213014145600000).contains(&p.i_jd) {
+        x.compute_ymd_hms();
+        year_diff = 2000 + x.y % 4 - x.y;
+        x.y += year_diff;
+        x.valid_jd = false;
+        x.compute_jd();
+    }
+    let timestamp = x.i_jd / 1000 - 210866760000;
+    let offset_sec = match Local.timestamp_opt(timestamp, 0) {
+        chrono::LocalResult::Single(dt) => dt.offset().fix().local_minus_utc(),
+        _ => 0,
+    };
+    let mut local = DateTime {
+        i_jd: x.i_jd + offset_sec as i64 * 1000,
+        valid_jd: true,
+        ..DateTime::default()
+    };
+    local.compute_ymd_hms();
+    p.y = local.y - year_diff;
+    p.m = local.m;
+    p.d = local.d;
+    p.h = local.h;
+    p.min = local.min;
+    p.s = local.s;
+    p.valid_ymd = true;
+    p.valid_hms = true;
+    p.valid_jd = false;
+    p.raw_s = false;
+    p.tz = 0;
+    p.is_error = false;
 }
 
 fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
@@ -2340,6 +2394,7 @@ mod tests {
         assert!(parse_modifier(&mut p, "SUBSECOND", 1).is_ok());
 
         // These must be at index 0 to parse validly
+        p.raw_s = true;
         assert!(parse_modifier(&mut p, "unixepoch", 0).is_ok());
         p.raw_s = true;
         assert!(parse_modifier(&mut p, "UNIXEPOCH", 0).is_ok());
