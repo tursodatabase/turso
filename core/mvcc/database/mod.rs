@@ -8629,7 +8629,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
 
-        for entry in self.rows.iter() {
+        let mut next_entry = self.rows.front();
+        while let Some(entry) = next_entry {
+            // The next entry is read before `entry` can be unlinked below: the
+            // next entry of an unlinked entry takes a search from the head of
+            // the list, and this loop unlinks most entries in a checkpoint.
+            next_entry = entry.next();
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
             if self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
                 continue;
@@ -8676,7 +8681,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             let inner_map = outer_entry.value();
 
-            for inner_entry in inner_map.iter() {
+            let mut next_inner_entry = inner_map.front();
+            while let Some(inner_entry) = next_inner_entry {
+                // See gc_table_row_versions: the next entry is read before
+                // `inner_entry` can be unlinked.
+                next_inner_entry = inner_entry.next();
                 let mut versions = inner_entry.value().write();
                 dropped += self.gc_chain_now(
                     &mut versions,
