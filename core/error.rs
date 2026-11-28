@@ -171,6 +171,9 @@ pub enum LimboError {
     InvalidTextRepresentation(String),
     #[error("string or blob too big")]
     TooBig,
+    /// An array has a bound that does not fit its 32-bit subscripts.
+    #[error("array {which} bound is too large: {bound}")]
+    ArrayBoundTooLarge { which: &'static str, bound: i64 },
     #[error("database table is locked")]
     TableLocked,
     #[error("attempt to write a readonly database")]
