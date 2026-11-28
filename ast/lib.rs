@@ -2295,6 +2295,8 @@ pub enum PragmaName {
     EncryptionCipher,
     /// Control fsync error retry behavior (0 = off/panic, 1 = on/retry)
     DataSyncRetry,
+    /// Changes when another connection commits to the database.
+    DataVersion,
     /// List databases
     DatabaseList,
     /// Defer all foreign key checks until the transaction commits
