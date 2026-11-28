@@ -3274,6 +3274,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         is_type_of_conditions: _,
         casts_to_numbers_and_booleans: _,
         can_be_rowid_alias: _,
+        array_element: _,
         sql: _,
         domain_checks,
         kind,

@@ -1153,6 +1153,12 @@ fn containment_func(
     }))
 }
 
+/// Whether `expr` is an array, or a value of a type whose values are arrays,
+/// such as int2vector.
 fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> bool {
-    type_of(expr, &TypeEnv::new(referenced_tables, resolver)).is_array()
+    array_valued_type(
+        type_of(expr, &TypeEnv::new(referenced_tables, resolver)),
+        resolver.schema(),
+    )
+    .is_array()
 }

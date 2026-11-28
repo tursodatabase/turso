@@ -185,6 +185,11 @@ pub trait Type: Debug + Send + Sync {
         false
     }
 
+    /// The type of the elements, when values of the type are arrays.
+    fn array_element(&self) -> Option<&str> {
+        None
+    }
+
     /// How values of the type compare, when the stored forms do not compare
     /// in the order of the values.
     fn ordering(&self) -> Option<TypeOrdering> {
