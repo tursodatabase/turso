@@ -67,6 +67,91 @@ test error-insert-values-default-and-short-row {
 @sqlstate 42601
 expect error {}
 
+test error-insert-values-defaults-fewer-than-columns {
+    CREATE TABLE t (a int, b int, c int);
+    INSERT INTO t (a, b, c) VALUES (DEFAULT, DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+test error-insert-values-one-default-fewer-than-columns {
+    CREATE TABLE t (a int, b int, c int);
+    INSERT INTO t (a, b, c) VALUES (DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+test error-insert-values-value-and-default-fewer-than-columns {
+    CREATE TABLE t (a int, b int, c int);
+    INSERT INTO t (a, b, c) VALUES (1, DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+test error-insert-several-default-rows-fewer-than-columns {
+    CREATE TABLE t (a int, b int, c int);
+    INSERT INTO t (a, b, c) VALUES (DEFAULT, DEFAULT), (DEFAULT, DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+test error-insert-values-defaults-more-than-columns {
+    CREATE TABLE t (a int, b int, c int);
+    INSERT INTO t (a, b) VALUES (DEFAULT, DEFAULT, 3);
+}
+@sqlstate 42601
+expect error {}
+
+test error-insert-values-only-defaults-more-than-columns {
+    CREATE TABLE t (a int, b int, c int);
+    INSERT INTO t (a, b) VALUES (DEFAULT, DEFAULT, DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+# PostgreSQL looks up the table and the values before it
+# compares the row length with the column list.
+test error-insert-default-row-wrong-length-missing-table {
+    INSERT INTO missing (a, b) VALUES (DEFAULT);
+}
+@sqlstate 42P01
+expect error {}
+
+test error-insert-default-row-wrong-length-missing-value-column {
+    CREATE TABLE t (a int, b int, c int);
+    INSERT INTO t (a, b) VALUES (DEFAULT, DEFAULT, nonexistent);
+}
+@sqlstate 42703
+expect error {}
+
+test error-insert-into-missing-column {
+    CREATE TABLE t (a int, b int DEFAULT 7);
+    INSERT INTO t (a, zz) VALUES (1, 2);
+}
+@sqlstate 42703
+expect error {}
+
+test error-insert-default-into-missing-column {
+    CREATE TABLE t (a int, b int DEFAULT 7);
+    INSERT INTO t (zz) VALUES (DEFAULT);
+}
+@sqlstate 42703
+expect error {}
+
+test error-insert-value-and-default-into-missing-column {
+    CREATE TABLE t (a int, b int DEFAULT 7);
+    INSERT INTO t (a, zz) VALUES (1, DEFAULT);
+}
+@sqlstate 42703
+expect error {}
+
+test error-insert-defaults-into-missing-column {
+    CREATE TABLE t (a int, b int DEFAULT 7);
+    INSERT INTO t (a, zz) VALUES (DEFAULT, DEFAULT), (DEFAULT, DEFAULT);
+}
+@sqlstate 42703
+expect error {}
+
 test error-aborts-rest-of-batch {
     CREATE TABLE t (a int);
     INSERT INTO t VALUES (1);
@@ -105,6 +190,30 @@ test error-drop-type-used-by-a-cast-in-a-policy {
     DROP TYPE err_policy_mood;
 }
 @sqlstate 2BP01
+expect error {}
+
+test error-insert-with-values-default {
+    CREATE TABLE t (a int DEFAULT 9, b int);
+    INSERT INTO t (a) WITH x AS (SELECT 1) VALUES (DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+@compat-gap "syntax:values"
+test error-insert-values-union-default {
+    CREATE TABLE t (a int DEFAULT 9, b int);
+    INSERT INTO t (a) VALUES (DEFAULT) UNION VALUES (1);
+}
+@sqlstate 42601
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-insert-select-from-values-default {
+    CREATE TABLE t (a int DEFAULT 9, b int);
+    INSERT INTO t (a) SELECT * FROM (VALUES (DEFAULT)) v;
+}
+@sqlstate 42601
 expect error {}
 
 # The statements below are valid PostgreSQL that tursopg refuses. A refusal

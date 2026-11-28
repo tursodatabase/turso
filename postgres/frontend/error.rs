@@ -411,7 +411,10 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("no such object")
     {
         SQLSTATE_UNDEFINED_TABLE
-    } else if msg.contains("no such column") || msg.contains("column not found") {
+    } else if msg.contains("no such column")
+        || msg.contains("column not found")
+        || (msg.starts_with("table ") && msg.contains(" has no column named "))
+    {
         SQLSTATE_UNDEFINED_COLUMN
     } else if msg.contains("no such function") || msg.contains("no such window") {
         SQLSTATE_UNDEFINED_FUNCTION
@@ -798,6 +801,7 @@ mod tests {
                 "table plain has no column named no such column already exists",
                 SQLSTATE_UNDEFINED_COLUMN,
             ),
+            ("table t has no column named c", SQLSTATE_UNDEFINED_COLUMN),
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
             (
                 "error in table t after drop column: no such column: a",

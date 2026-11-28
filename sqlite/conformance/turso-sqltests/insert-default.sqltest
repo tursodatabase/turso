@@ -54,6 +54,33 @@ expect {
     1|10|hello
 }
 
+test default-without-column-list-skips-generated-column {
+    CREATE TABLE t (a INTEGER, b AS (a * 2), c INTEGER DEFAULT 3);
+    INSERT INTO t VALUES (1, DEFAULT);
+    SELECT * FROM t;
+}
+expect {
+    1|2|3
+}
+
+test default-for-generated-column {
+    CREATE TABLE t (a INTEGER, b AS (a * 2) STORED, c INTEGER DEFAULT 3);
+    INSERT INTO t (b, a, c) VALUES (DEFAULT, 1, DEFAULT), (DEFAULT, 2, 4);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|2|3
+    2|4|4
+}
+
+test value-for-generated-column-errors {
+    CREATE TABLE t (a INTEGER, b AS (a * 2));
+    INSERT INTO t (a, b) VALUES (1, DEFAULT), (2, 5);
+}
+expect error {
+    cannot INSERT into generated column
+}
+
 test default-on-not-null-column-without-default-errors {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
     INSERT INTO t (id, name) VALUES (1, DEFAULT);
