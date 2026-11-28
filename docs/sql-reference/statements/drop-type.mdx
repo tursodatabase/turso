@@ -34,7 +34,7 @@ DROP TYPE removes the named custom type from the database. The type must exist u
 A type cannot be dropped while anything in the schema uses it:
 
 - a table column of that type
-- an expression that casts to it (`CAST(x AS type-name)`) in an expression index, a partial index, a CHECK constraint, a generated column, a column default, a view, a materialized view or a trigger
+- an expression that casts to it (`CAST(x AS type-name)`) in an expression index, a partial index, a CHECK constraint, a generated column, a column default, a view, a materialized view or a trigger. For a type with parameters, `CAST(x AS type-name)` without arguments is SQLite's CAST and does not count, but `CAST(x AS type-name[])` does, since it checks the elements against the type's BASE
 - another type or domain based on it, with a field of that type, with a parameter of that type (`CREATE TYPE outer_t(value type-name) ...`), or with an expression that casts to it
 
 Remove those objects before dropping the type.

@@ -455,6 +455,84 @@ expect error {
     CHECK constraint failed: amount < CAST\(50 AS cents\)
 }
 
+# A CAST that gives none of the arguments of a type with parameters is SQLite's
+# CAST, so in a CHECK, as in a query, CAST(a AS money) is a NUMERIC.
+@requires strict "uses STRICT tables"
+test cast-without-arguments-in-check-is-sqlite-cast {
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+    CREATE TABLE t(a TEXT CHECK (CAST(a AS money) > 0)) STRICT;
+    INSERT INTO t VALUES ('5');
+    SELECT a, CAST(a AS money) > 0 FROM t;
+}
+expect {
+    5|1
+}
+
+@requires strict "uses STRICT tables"
+test cast-without-arguments-in-check-is-sqlite-cast-error {
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+    CREATE TABLE t(a TEXT CHECK (CAST(a AS money) > 0)) STRICT;
+    INSERT INTO t VALUES ('-1');
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test cast-with-arguments-in-check-is-custom-type-cast {
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+    CREATE TABLE t(a TEXT CHECK (CAST(a AS money(1)) > 0)) STRICT;
+}
+expect error {
+    type mismatch in CHECK constraint: cannot compare TEXT with INTEGER
+}
+
+# A CAST to an array gives a blob, whatever the element type.
+@requires strict "uses STRICT tables"
+test array-cast-in-check-is-blob {
+    CREATE TABLE t(a TEXT CHECK (CAST(a AS text[]) = x'020F31')) STRICT;
+    INSERT INTO t VALUES ('{1}');
+    SELECT a FROM t;
+}
+expect {
+    {1}
+}
+
+@requires strict "uses STRICT tables"
+test array-cast-in-check-compared-with-integer-error {
+    CREATE TABLE t(a TEXT CHECK (CAST(a AS int[]) > 1)) STRICT;
+}
+expect error {
+    type mismatch in CHECK constraint: cannot compare BLOB with INTEGER
+}
+
+@requires strict "uses STRICT tables"
+test array-cast-to-custom-type-in-check-compared-with-integer-error {
+    CREATE TYPE money(value text, cur text) BASE text ENCODE value DECODE value;
+    CREATE TABLE t(a TEXT CHECK (CAST(a AS money[]) > 0)) STRICT;
+}
+expect error {
+    type mismatch in CHECK constraint: cannot compare BLOB with INTEGER
+}
+
+@requires strict "uses STRICT tables"
+test array-column-in-check-is-blob {
+    CREATE TABLE t(a int[] CHECK (typeof(a) = 'blob' AND a <> x'00')) STRICT;
+    INSERT INTO t VALUES ('{2}');
+    SELECT a FROM t;
+}
+expect {
+    {2}
+}
+
+@requires strict "uses STRICT tables"
+test array-column-in-check-compared-with-integer-error {
+    CREATE TABLE t(a int[] CHECK (a > 1)) STRICT;
+}
+expect error {
+    type mismatch in CHECK constraint: cannot compare BLOB with INTEGER
+}
+
 # A CAST gives the decoded value whether or not it is inside another CAST.
 @requires strict "uses STRICT tables"
 test cast-inside-cast-in-check-gives-decoded-value {
