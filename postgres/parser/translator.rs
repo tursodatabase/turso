@@ -127,12 +127,15 @@ impl PostgreSQLTranslator {
         if !range_var.catalogname.is_empty() {
             return Err(ParseError::not_supported("a cross-database reference"));
         }
-        let is_schemata = range_var
+        let is_information_schema_view = range_var
             .schemaname
             .eq_ignore_ascii_case("information_schema")
-            && range_var.relname.eq_ignore_ascii_case("schemata");
-        let mapped_name = if is_schemata {
-            "pg_information_schema_schemata".to_string()
+            && matches!(
+                range_var.relname.as_str(),
+                "schemata" | "tables" | "columns"
+            );
+        let mapped_name = if is_information_schema_view {
+            format!("pg_information_schema_{}", range_var.relname)
         } else {
             self.map_table_name(&range_var.relname)
         };
@@ -192,8 +195,6 @@ impl PostgreSQLTranslator {
             | "pg_extension"
             | "pg_tables"
             | "pg_indexes" => table_name.to_string(),
-            "information_schema.tables" => "sqlite_master".to_string(),
-            "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
             _ => table_name.to_string(),
         }

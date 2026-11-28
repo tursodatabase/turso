@@ -378,27 +378,21 @@ expect {
 
 # E-31: information_schema.columns
 @setup t_id
-@compat-gap "syntax:information-schema"
 test information-schema-columns {
     SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 't';
 }
 expect {
     id|integer
 }
-@sqlstate 42P01
-expect @tursopg error {}
 
 # E-32: information_schema.tables
 @setup t_id
-@compat-gap "syntax:information-schema"
 test information-schema-tables {
     SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public';
 }
 expect {
     t|BASE TABLE
 }
-@sqlstate 42P01
-expect @tursopg error {}
 
 # E-33: pg_class rows for non-public schema
 @setup schema_api_api_items_id

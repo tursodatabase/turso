@@ -1110,6 +1110,399 @@ impl SnapshotRows for SchemataTable {
     }
 }
 
+/// A table or view of a user schema, which information_schema.tables and
+/// information_schema.columns list.
+struct InformationSchemaRelation {
+    oid: i64,
+    schema: String,
+    name: String,
+    is_view: bool,
+}
+
+fn namespace_names(conn: &Connection) -> HashMap<i64, String> {
+    PgNamespaceTable::load_rows(conn)
+        .into_iter()
+        .map(|row| {
+            let oid = row[0].as_int().expect("namespace oids are integers");
+            let name = row[1].to_text().expect("namespace names are text");
+            (oid, name.to_string())
+        })
+        .collect()
+}
+
+fn information_schema_relations(conn: &Connection) -> Vec<InformationSchemaRelation> {
+    let namespaces = namespace_names(conn);
+    let mut relations: Vec<_> = PgClassTable::load_rows(conn)
+        .into_iter()
+        .filter_map(|row| {
+            let is_view = match row[RelationRow::KIND_COLUMN].to_text()? {
+                "r" => false,
+                "v" => true,
+                _ => return None,
+            };
+            let schema = namespaces.get(&row[RelationRow::NAMESPACE_OID_COLUMN].as_int()?)?;
+            if BUILTIN_SCHEMAS.iter().any(|(_, builtin)| builtin == schema) {
+                return None;
+            }
+            Some(InformationSchemaRelation {
+                oid: row[RelationRow::OID_COLUMN].as_int()?,
+                schema: schema.clone(),
+                name: row[1].to_text()?.to_string(),
+                is_view,
+            })
+        })
+        .collect();
+    relations.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+    relations
+}
+
+/// Virtual table implementation for information_schema.tables
+#[derive(Debug)]
+struct InformationSchemaTablesTable;
+
+impl SnapshotRows for InformationSchemaTablesTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_information_schema_tables (
+            table_catalog TEXT,
+            table_schema TEXT,
+            table_name TEXT,
+            table_type TEXT,
+            self_referencing_column_name TEXT,
+            reference_generation TEXT,
+            user_defined_type_catalog TEXT,
+            user_defined_type_schema TEXT,
+            user_defined_type_name TEXT,
+            is_insertable_into TEXT,
+            is_typed TEXT,
+            commit_action TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 100;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let catalog = db_name_from_path(conn.db_file_path());
+        information_schema_relations(conn)
+            .into_iter()
+            .map(|relation| {
+                vec![
+                    Value::build_text(catalog.clone()),
+                    Value::build_text(relation.schema),
+                    Value::build_text(relation.name),
+                    Value::build_text(if relation.is_view {
+                        "VIEW"
+                    } else {
+                        "BASE TABLE"
+                    }),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::build_text(if relation.is_view { "NO" } else { "YES" }),
+                    Value::build_text("NO"),
+                    Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
+/// The columns of information_schema.columns that depend on the type of the
+/// column and its modifier.
+#[derive(Default)]
+struct TypeFacts {
+    character_maximum_length: Option<i64>,
+    character_octet_length: Option<i64>,
+    numeric_precision: Option<i64>,
+    numeric_precision_radix: Option<i64>,
+    numeric_scale: Option<i64>,
+    datetime_precision: Option<i64>,
+}
+
+/// FIXME(pg-catalog): This hand-codes how PostgreSQL's information_schema derives these columns from the type oid and the modifier, for the types that tursopg has. A lookup in pg_type replaces it.
+fn type_facts(type_oid: i64, typmod: i64) -> TypeFacts {
+    const UNBOUNDED_CHARACTER_OCTETS: i64 = 1_073_741_824;
+    const UTF8_MAXIMUM_OCTETS: i64 = 4;
+    const DEFAULT_TIME_PRECISION: i64 = 6;
+    let binary = |precision| TypeFacts {
+        numeric_precision: Some(precision),
+        numeric_precision_radix: Some(2),
+        ..TypeFacts::default()
+    };
+    match type_oid {
+        25 => TypeFacts {
+            character_octet_length: Some(UNBOUNDED_CHARACTER_OCTETS),
+            ..TypeFacts::default()
+        },
+        1042 | 1043 => TypeFacts {
+            character_maximum_length: (typmod > 4).then(|| typmod - 4),
+            character_octet_length: Some(if typmod > 4 {
+                (typmod - 4) * UTF8_MAXIMUM_OCTETS
+            } else {
+                UNBOUNDED_CHARACTER_OCTETS
+            }),
+            ..TypeFacts::default()
+        },
+        21 => TypeFacts {
+            numeric_scale: Some(0),
+            ..binary(16)
+        },
+        23 => TypeFacts {
+            numeric_scale: Some(0),
+            ..binary(32)
+        },
+        20 => TypeFacts {
+            numeric_scale: Some(0),
+            ..binary(64)
+        },
+        700 => binary(24),
+        701 => binary(53),
+        1700 => {
+            let modifier = crate::pg_type::numeric_modifier(typmod);
+            TypeFacts {
+                numeric_precision: modifier.map(|(precision, _)| precision),
+                numeric_precision_radix: Some(10),
+                numeric_scale: modifier.map(|(_, scale)| scale),
+                ..TypeFacts::default()
+            }
+        }
+        1082 => TypeFacts {
+            datetime_precision: Some(0),
+            ..TypeFacts::default()
+        },
+        1083 | 1114 | 1184 => TypeFacts {
+            datetime_precision: Some(if typmod >= 0 {
+                typmod
+            } else {
+                DEFAULT_TIME_PRECISION
+            }),
+            ..TypeFacts::default()
+        },
+        _ => TypeFacts::default(),
+    }
+}
+
+/// The type of a column as information_schema.columns names it.
+struct ColumnType {
+    data_type: String,
+    udt_schema: String,
+    udt_name: String,
+}
+
+/// FIXME(pg-catalog): This hand-codes the CASE of PostgreSQL's information_schema.columns that names a type: ARRAY for an array, USER-DEFINED for a type outside pg_catalog, and format_type otherwise. A lookup in pg_type replaces it.
+fn column_type(
+    types: &HashMap<i64, Vec<Value>>,
+    namespaces: &HashMap<i64, String>,
+    type_oid: i64,
+) -> ColumnType {
+    const OID: usize = 0;
+    const NAME: usize = 1;
+    const NAMESPACE: usize = 2;
+    const LENGTH: usize = 4;
+    const KIND: usize = 6;
+    const ELEMENT: usize = 13;
+    const BASE_TYPE: usize = 25;
+    let integer =
+        |row: &[Value], column: usize| row[column].as_int().expect("pg_type holds integers");
+    let Some(row) = types.get(&type_oid) else {
+        return ColumnType {
+            data_type: crate::functions::format_type(type_oid, -1),
+            udt_schema: "pg_catalog".to_string(),
+            udt_name: crate::functions::format_type(type_oid, -1),
+        };
+    };
+    let is_domain = row[KIND].to_text() == Some("d");
+    let resolved = if is_domain {
+        types.get(&integer(row, BASE_TYPE)).unwrap_or(row)
+    } else {
+        row
+    };
+    let is_array = integer(resolved, ELEMENT) != 0 && integer(resolved, LENGTH) == -1;
+    let namespace = integer(resolved, NAMESPACE);
+    let data_type = if is_array {
+        "ARRAY".to_string()
+    } else if namespace == 11 {
+        crate::functions::format_type(integer(resolved, OID), -1)
+    } else {
+        "USER-DEFINED".to_string()
+    };
+    ColumnType {
+        data_type,
+        udt_schema: namespaces.get(&namespace).cloned().unwrap_or_default(),
+        udt_name: resolved[NAME]
+            .to_text()
+            .expect("type names are text")
+            .to_string(),
+    }
+}
+
+/// Virtual table implementation for information_schema.columns
+#[derive(Debug)]
+struct InformationSchemaColumnsTable;
+
+impl SnapshotRows for InformationSchemaColumnsTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_information_schema_columns (
+            table_catalog TEXT,
+            table_schema TEXT,
+            table_name TEXT,
+            column_name TEXT,
+            ordinal_position INTEGER,
+            column_default TEXT,
+            is_nullable TEXT,
+            data_type TEXT,
+            character_maximum_length INTEGER,
+            character_octet_length INTEGER,
+            numeric_precision INTEGER,
+            numeric_precision_radix INTEGER,
+            numeric_scale INTEGER,
+            datetime_precision INTEGER,
+            interval_type TEXT,
+            interval_precision INTEGER,
+            character_set_catalog TEXT,
+            character_set_schema TEXT,
+            character_set_name TEXT,
+            collation_catalog TEXT,
+            collation_schema TEXT,
+            collation_name TEXT,
+            domain_catalog TEXT,
+            domain_schema TEXT,
+            domain_name TEXT,
+            udt_catalog TEXT,
+            udt_schema TEXT,
+            udt_name TEXT,
+            scope_catalog TEXT,
+            scope_schema TEXT,
+            scope_name TEXT,
+            maximum_cardinality INTEGER,
+            dtd_identifier TEXT,
+            is_self_referencing TEXT,
+            is_identity TEXT,
+            identity_generation TEXT,
+            identity_start TEXT,
+            identity_increment TEXT,
+            identity_maximum TEXT,
+            identity_minimum TEXT,
+            identity_cycle TEXT,
+            is_generated TEXT,
+            generation_expression TEXT,
+            is_updatable TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 1000.0;
+    const ESTIMATED_ROWS: u32 = 1000;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        const ATTRELID: usize = 0;
+        const ATTNAME: usize = 1;
+        const ATTTYPID: usize = 2;
+        const ATTNUM: usize = 5;
+        const ATTTYPMOD: usize = 8;
+        const ATTNOTNULL: usize = 13;
+        const ATTIDENTITY: usize = 16;
+        const ATTGENERATED: usize = 17;
+        let integer = |value: &Value| value.as_int().expect("catalog numbers are integers");
+        let text = |value: &Value| value.to_text().expect("catalog names are text").to_string();
+        let nullable_integer = |value: Option<i64>| value.map_or(Value::Null, Value::from_i64);
+
+        let catalog = db_name_from_path(conn.db_file_path());
+        let namespaces = namespace_names(conn);
+        let types: HashMap<i64, Vec<Value>> = PgTypeTable::load_rows(conn)
+            .into_iter()
+            .map(|row| (integer(&row[0]), row))
+            .collect();
+        let defaults: HashMap<(i64, i64), String> = PgAttrdefTable::load_rows(conn)
+            .into_iter()
+            .map(|row| ((integer(&row[1]), integer(&row[2])), text(&row[3])))
+            .collect();
+        let mut attributes: HashMap<i64, Vec<Vec<Value>>> = HashMap::default();
+        for row in PgAttributeTable::load_rows(conn) {
+            if integer(&row[ATTNUM]) > 0 {
+                attributes
+                    .entry(integer(&row[ATTRELID]))
+                    .or_default()
+                    .push(row);
+            }
+        }
+
+        let mut rows = Vec::new();
+        for relation in information_schema_relations(conn) {
+            let mut relation_attributes = attributes.remove(&relation.oid).unwrap_or_default();
+            relation_attributes.sort_by_key(|row| integer(&row[ATTNUM]));
+            for attribute in relation_attributes {
+                let ordinal = integer(&attribute[ATTNUM]);
+                let type_oid = integer(&attribute[ATTTYPID]);
+                let column_type = column_type(&types, &namespaces, type_oid);
+                let facts = type_facts(type_oid, integer(&attribute[ATTTYPMOD]));
+                let identity = text(&attribute[ATTIDENTITY]);
+                let generated = !text(&attribute[ATTGENERATED]).is_empty();
+                let definition = defaults.get(&(relation.oid, ordinal)).cloned();
+                let (column_default, generation_expression) = if generated {
+                    (None, definition)
+                } else {
+                    (definition, None)
+                };
+                let optional_text =
+                    |value: Option<String>| value.map_or(Value::Null, Value::build_text);
+                rows.push(vec![
+                    Value::build_text(catalog.clone()),
+                    Value::build_text(relation.schema.clone()),
+                    Value::build_text(relation.name.clone()),
+                    attribute[ATTNAME].clone(),
+                    Value::from_i64(ordinal),
+                    optional_text(column_default),
+                    Value::build_text(if integer(&attribute[ATTNOTNULL]) == 0 {
+                        "YES"
+                    } else {
+                        "NO"
+                    }),
+                    Value::build_text(column_type.data_type),
+                    nullable_integer(facts.character_maximum_length),
+                    nullable_integer(facts.character_octet_length),
+                    nullable_integer(facts.numeric_precision),
+                    nullable_integer(facts.numeric_precision_radix),
+                    nullable_integer(facts.numeric_scale),
+                    nullable_integer(facts.datetime_precision),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::build_text(catalog.clone()),
+                    Value::build_text(column_type.udt_schema),
+                    Value::build_text(column_type.udt_name),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::build_text(ordinal.to_string()),
+                    Value::build_text("NO"),
+                    Value::build_text(if identity.is_empty() { "NO" } else { "YES" }),
+                    match identity.as_str() {
+                        "a" => Value::build_text("ALWAYS"),
+                        "d" => Value::build_text("BY DEFAULT"),
+                        _ => Value::Null,
+                    },
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::build_text(if generated { "ALWAYS" } else { "NEVER" }),
+                    optional_text(generation_expression),
+                    Value::build_text(if relation.is_view { "NO" } else { "YES" }),
+                ]);
+            }
+        }
+        rows
+    }
+}
+
 /// Virtual table implementation for pg_catalog.pg_attribute
 /// Maps column information to PostgreSQL's pg_attribute
 #[derive(Debug)]
@@ -2892,6 +3285,16 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_information_schema_schemata",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<SchemataTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_information_schema_tables",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<InformationSchemaTablesTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_information_schema_columns",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<InformationSchemaColumnsTable>(PhantomData),
     );
     options = options.native_module(
         "pg_get_tabledef",
