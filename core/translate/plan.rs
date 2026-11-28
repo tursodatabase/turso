@@ -137,16 +137,24 @@ impl ResultSetColumn {
                             return None;
                         }
                     }
+                    // Fall back to `implicit_column_name` when an expression
+                    // (such as an inner window function or aggregate) was
+                    // pushed into an unnamed internal subquery column.
                     joined_table_ref
                         .table
                         .get_column_at(*column)
                         .unwrap()
                         .name
                         .as_deref()
+                        .or(self.implicit_column_name.as_deref())
                 } else {
                     // Column references an outer query table (correlated subquery).
                     let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
-                    table_ref.get_column_at(*column)?.name.as_deref()
+                    table_ref
+                        .get_column_at(*column)?
+                        .name
+                        .as_deref()
+                        .or(self.implicit_column_name.as_deref())
                 }
             }
             ast::Expr::RowId { table, .. } => {
