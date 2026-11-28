@@ -372,14 +372,6 @@ fn to_float(value: &Value, source: CastType, target: CastType) -> Result<Value> 
         Value::Text(text) => parse_float(text.as_str(), target)?,
         _ => return Ok(value.clone()),
     };
-    // FIXME(pg-catalog): This is a stop gap. The engine's float cannot hold NaN and stores it as NULL, so NaN is refused here, where PostgreSQL stores it. Registered float4, float8 and numeric types, with their own stored form, will store NaN.
-    if number.is_nan() {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "the value NaN is not supported",
-            None,
-        ));
-    }
     if target == Float4 {
         let narrowed = number as f32;
         if narrowed.is_infinite() && number.is_finite() {
@@ -396,14 +388,27 @@ fn to_float(value: &Value, source: CastType, target: CastType) -> Result<Value> 
                 None,
             ));
         }
-        return Ok(Value::from_f64(shortest_float8(narrowed)));
+        return float_value(shortest_float8(narrowed));
+    }
+    float_value(number)
+}
+
+/// The value of a float4, float8 or numeric that holds `number`.
+pub fn float_value(number: f64) -> Result<Value> {
+    // FIXME(pg-catalog): This is a stop gap. The engine's float cannot hold NaN and stores it as NULL, so NaN is refused here, where PostgreSQL stores it. Registered float4, float8 and numeric types, with their own stored form, will store NaN.
+    if number.is_nan() {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "the value NaN is not supported",
+            None,
+        ));
     }
     Ok(Value::from_f64(number))
 }
 
 /// The float8 that prints with the digits of the float4, so 0.1 as a float4
 /// stays 0.1 and is not 0.10000000149011612.
-fn shortest_float8(narrowed: f32) -> f64 {
+pub fn shortest_float8(narrowed: f32) -> f64 {
     narrowed
         .to_string()
         .parse()

@@ -27,6 +27,7 @@ mod text;
 mod unique_index;
 mod unnest;
 
+pub use casts::{float_value, shortest_float8};
 pub use catalog::PostgresDialect;
 pub use copy::CopyTextEncoder;
 pub use error::{sql_parse_error, sqlstate_error, Error, ErrorReport, Result};
