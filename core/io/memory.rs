@@ -16,7 +16,9 @@ pub struct MemoryIO {
 
 // TODO: page size flag
 pub(super) const PAGE_SIZE: usize = 4096;
-pub(super) type MemPage = Box<[u8; PAGE_SIZE]>;
+/// The bytes of a page from its start to the end of the last write into it,
+/// at most `PAGE_SIZE`. The bytes of the page after them read as zeros.
+pub(super) type MemPage = Vec<u8>;
 
 struct MemStoreInner {
     pages: BTreeMap<usize, MemPage>,
@@ -162,21 +164,29 @@ impl MemStore {
             let src = &data[buf_offset..buf_offset + bytes_to_write];
             match inner.pages.entry(page_no) {
                 // A new page is made from the written bytes, with zeros only
-                // before and after them, instead of a page of zeros that the
-                // copy then partly overwrites.
+                // before them. The bytes after them are not stored, and read
+                // as zeros: a sequential writer would write over zeros that
+                // the page stored there.
                 Entry::Vacant(slot) => {
                     let mut page = Vec::with_capacity(PAGE_SIZE);
                     page.resize(page_offset, 0);
                     page.extend_from_slice(src);
-                    page.resize(PAGE_SIZE, 0);
-                    let page: MemPage = page
-                        .into_boxed_slice()
-                        .try_into()
-                        .expect("a new page has PAGE_SIZE bytes");
                     slot.insert(page);
                 }
                 Entry::Occupied(mut slot) => {
-                    slot.get_mut()[page_offset..page_offset + bytes_to_write].copy_from_slice(src);
+                    let page = slot.get_mut();
+                    let stored = page.len();
+                    let end = page_offset + bytes_to_write;
+                    if end <= stored {
+                        page[page_offset..end].copy_from_slice(src);
+                    } else if page_offset <= stored {
+                        let (overwritten, appended) = src.split_at(stored - page_offset);
+                        page[page_offset..].copy_from_slice(overwritten);
+                        page.extend_from_slice(appended);
+                    } else {
+                        page.resize(page_offset, 0);
+                        page.extend_from_slice(src);
+                    }
                 }
             }
             offset += bytes_to_write;
@@ -211,12 +221,14 @@ impl MemStore {
             let page_no = offset / PAGE_SIZE;
             let page_offset = offset % PAGE_SIZE;
             let bytes_to_read = remaining.min(PAGE_SIZE - page_offset);
-            if let Some(page) = inner.pages.get(&page_no) {
-                dst[buf_offset..buf_offset + bytes_to_read]
-                    .copy_from_slice(&page[page_offset..page_offset + bytes_to_read]);
-            } else {
-                dst[buf_offset..buf_offset + bytes_to_read].fill(0);
-            }
+            let out = &mut dst[buf_offset..buf_offset + bytes_to_read];
+            // The bytes of a page after the stored ones, and all the bytes of
+            // a missing page, read as zeros.
+            let stored = inner.pages.get(&page_no).map_or(&[][..], |page| {
+                &page[page_offset.min(page.len())..(page_offset + bytes_to_read).min(page.len())]
+            });
+            out[..stored.len()].copy_from_slice(stored);
+            out[stored.len()..].fill(0);
             offset += bytes_to_read;
             buf_offset += bytes_to_read;
             remaining -= bytes_to_read;
@@ -360,8 +372,9 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     /// A write into a new page makes the page from its bytes, with zeros
-    /// before and after them, and a write into an existing page copies into
-    /// it. Both must give the bytes of a flat file, with zeros in the holes.
+    /// before them, and a write into an existing page copies into it or
+    /// extends it. Both must give the bytes of a flat file, with zeros in the
+    /// holes and after the stored bytes of a page.
     #[test]
     fn writes_read_back_like_a_flat_file() {
         let store = MemStore::new();
@@ -374,6 +387,12 @@ mod tests {
             (PAGE_SIZE * 6, PAGE_SIZE * 2, 4),
             (PAGE_SIZE, PAGE_SIZE, 5),
             (PAGE_SIZE * 6, PAGE_SIZE, 6),
+            // Page 5 stores 100 bytes: a write over its end, and a write after
+            // a gap of unstored bytes.
+            (PAGE_SIZE * 5 + 50, 100, 7),
+            (PAGE_SIZE * 5 + 1000, 10, 8),
+            // A new page after a missing page.
+            (PAGE_SIZE * 9 + 10, 5, 9),
         ];
         for (pos, len, first) in writes {
             let data: Vec<u8> = (0..len).map(|i| first.wrapping_add(i as u8)).collect();

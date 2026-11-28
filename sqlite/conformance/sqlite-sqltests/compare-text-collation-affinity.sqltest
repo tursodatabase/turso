@@ -1,0 +1,60 @@
+@database :memory:
+
+# Comparisons of texts with the NOCASE and RTRIM collations under TEXT, NUMERIC
+# and BLOB affinity. A numeric affinity converts a text that looks like a
+# number, so `'-abc' > '10'` with NUMERIC affinity compares a text with the
+# integer 10, and a text is larger than every number. TEXT affinity converts
+# only numbers.
+
+test compare-nocase-text-with-text-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n NUMERIC COLLATE NOCASE, x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES (1, 'abc', 'ABC'), (2, '-abc', '10'), (3, 10, '9');
+    SELECT id, x = 'abc', x < 'abd', x > 'ABB', x = 10, x < 9, x > 9 FROM t ORDER BY id;
+}
+expect {
+    1|1|1|1|0|0|1
+    2|0|1|0|1|1|0
+    3|0|1|0|0|0|0
+}
+
+test compare-nocase-text-with-numeric-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n NUMERIC COLLATE NOCASE, x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES (1, 'abc', 'ABC'), (2, '-abc', '10'), (3, 10, '9');
+    SELECT id, typeof(n), n = x, n < x, n > x, n = 'ABC', n < '10' FROM t ORDER BY id;
+}
+expect {
+    1|text|1|0|0|1|0
+    2|text|0|0|1|0|0
+    3|integer|0|0|1|0|0
+}
+
+test compare-rtrim-text {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, r TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES (1, 'abc  '), (2, 'abc'), (3, ' abc');
+    SELECT id, r = 'abc', r = 'abc ', r < 'abd' FROM t ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|1|1|1
+    3|0|0|1
+}
+
+test compare-nocase-text-with-blob-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB COLLATE NOCASE, x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES (1, 'Abc', 'ABC'), (2, 'abc', '10'), (3, 'ABD', '9');
+    SELECT id, b = 'ABC', b < 'abd', b = x FROM t ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|1|1|0
+    3|0|0|0
+}
+
+test compare-nocase-text-in-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n NUMERIC COLLATE NOCASE, x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES (1, 'abc', 'ABC'), (2, '-abc', '10'), (3, 10, '9');
+    SELECT id FROM t WHERE x = 'abc' OR n = x ORDER BY id;
+}
+expect {
+    1
+}

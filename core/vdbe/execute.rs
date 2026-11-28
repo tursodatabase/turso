@@ -1039,9 +1039,38 @@ macro_rules! comparison_opcode {
                     return Ok(InsnFunctionStepResult::Step);
                 }
             }
+            // Two numbers, such as a REAL column and an integer constant,
+            // compare by their numeric order. Only TEXT affinity converts a
+            // number, and a type's order can place numbers differently.
+            // Otherwise op_comparison_slow converts nothing and gives this
+            // order too. The test is here and not in op_comparison_slow,
+            // because that function saves and restores on each call the
+            // registers that its other paths need.
+            if let (Register::Value(Value::Numeric(l)), Register::Value(Value::Numeric(r))) =
+                (&state.registers[*lhs], &state.registers[*rhs])
+            {
+                if flags.get_affinity() != Affinity::Text
+                    && matches!(collation, CollationSeq::Text(_))
+                {
+                    state.pc = if comparison_matches_order($op, numeric_order(l, r)) {
+                        target_pc
+                    } else {
+                        state.pc + 1
+                    };
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            }
             op_comparison_slow(state, *lhs, *rhs, target_pc, *flags, *collation, $op)
         }
     };
+}
+
+/// The order of two numbers, for the comparison opcodes. Not inlined, so that
+/// the comparison of an integer with a REAL does not add its code to each
+/// comparison opcode of the dispatch loop.
+#[inline(never)]
+fn numeric_order(lhs: &Numeric, rhs: &Numeric) -> std::cmp::Ordering {
+    lhs.cmp(rhs)
 }
 
 comparison_opcode!(op_eq, Eq, ComparisonOp::Eq, |l: i64, r: i64| l == r);
@@ -1066,9 +1095,25 @@ fn texts_compare_as_bytes(
             && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
 }
 
-/// The comparison opcodes for every operand pair that is not two integers or
-/// two texts compared by their bytes: NULLs, affinity conversions, text
-/// collations and array comparison.
+/// Whether the affinity of a comparison leaves two texts as they are. Only a
+/// numeric affinity converts a text, and only a text that looks like a number.
+/// This is the test of [texts_compare_as_bytes] without its collation test.
+/// The comparison opcodes inline [texts_compare_as_bytes], and this function
+/// is separate so that their code does not change.
+#[inline]
+fn texts_keep_their_values(
+    lhs: &Value,
+    rhs: &Value,
+    flags: crate::vdbe::insn::CmpInsFlags,
+) -> bool {
+    !flags.get_affinity().is_numeric()
+        || (apply_numeric_affinity(lhs.as_value_ref(), false).is_none()
+            && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
+}
+
+/// The comparison opcodes for every operand pair that is not two integers, two
+/// texts compared by their bytes or two numbers compared by their numeric
+/// order: NULLs, affinity conversions, text collations and array comparison.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn op_comparison_slow(
@@ -1098,14 +1143,15 @@ fn op_comparison_slow(
         };
     }
 
-    // Two numbers, such as a REAL column and an integer constant, compare by
-    // their numeric order. Only TEXT affinity converts a number, and a type's
-    // order can place numbers differently. Otherwise the general comparison
-    // below converts nothing and gives this order too.
-    if let (Value::Numeric(l), Value::Numeric(r)) = (lhs_value, rhs_value) {
-        if affinity != Affinity::Text && matches!(collation, CollationSeq::Text(_)) {
-            take_jump_if!(comparison_matches_order(op, l.cmp(r)));
-        }
+    // Two texts that the affinity leaves as they are, for example with a
+    // NOCASE collation, compare with the collation. The general comparison
+    // at the end gives the same order, after conversions that change nothing.
+    if matches!((lhs_value, rhs_value), (Value::Text(_), Value::Text(_)))
+        && texts_keep_their_values(lhs_value, rhs_value, flags)
+    {
+        let order =
+            collation.compare_operands(lhs_value.as_value_ref(), rhs_value.as_value_ref())?;
+        take_jump_if!(comparison_matches_order(op, order));
     }
 
     match (lhs_value, rhs_value) {
@@ -7293,9 +7339,9 @@ pub fn op_idx_ge(
     }
 
     let pc = {
-        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
+        let (idx_payload, index_info) = get_cursor!(state, *cursor_id).index_record_payload();
 
-        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, idx_payload) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
@@ -7359,9 +7405,9 @@ pub fn op_idx_le(
     }
 
     let pc = {
-        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
+        let (idx_payload, index_info) = get_cursor!(state, *cursor_id).index_record_payload();
 
-        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, idx_payload) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
@@ -7408,9 +7454,9 @@ pub fn op_idx_gt(
     }
 
     let pc = {
-        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
+        let (idx_payload, index_info) = get_cursor!(state, *cursor_id).index_record_payload();
 
-        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, idx_payload) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
@@ -7457,9 +7503,9 @@ pub fn op_idx_lt(
     }
 
     let pc = {
-        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
+        let (idx_payload, index_info) = get_cursor!(state, *cursor_id).index_record_payload();
 
-        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, idx_payload) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,

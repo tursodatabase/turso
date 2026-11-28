@@ -174,6 +174,14 @@ impl BufferPool {
         inner.get_wal_frame_buffer()
     }
 
+    /// Request a `Buffer` for a WAL frame, as [`BufferPool::get_wal_frame`]
+    /// does, that holds `header` and then `page`.
+    #[inline]
+    pub fn get_wal_frame_from(&self, header: &[u8], page: &[u8]) -> Buffer {
+        let inner = self.inner_mut();
+        inner.get_wal_frame_buffer_from(header, page)
+    }
+
     #[inline]
     fn inner(&self) -> &PoolInner {
         unsafe { &*self.inner.get() }
@@ -275,6 +283,31 @@ impl PoolInner {
             .as_ref()
             .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
             .unwrap_or_else(|| Buffer::new_temporary(len))
+    }
+
+    fn get_wal_frame_buffer_from(&mut self, header: &[u8], page: &[u8]) -> Buffer {
+        let len = self.get_db_page_size() + WAL_FRAME_HEADER_SIZE;
+        turso_assert!(
+            header.len() + page.len() == len,
+            "WAL frame parts must fill the frame",
+            { "header_len": header.len(), "page_len": page.len(), "frame_len": len }
+        );
+        // A large transaction can use all the slots of the arena. A new
+        // temporary buffer is then built from the two parts instead of a
+        // buffer of zeros that the two copies write over.
+        match self
+            .wal_frame_arena
+            .as_ref()
+            .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
+        {
+            Some(buffer) => {
+                let (header_bytes, page_bytes) = buffer.as_mut_slice().split_at_mut(header.len());
+                header_bytes.copy_from_slice(header);
+                page_bytes.copy_from_slice(page);
+                buffer
+            }
+            None => Buffer::new_temporary_from(header, page),
+        }
     }
 
     /// Allocate a new arena for the pool to use
@@ -409,6 +442,15 @@ impl Arena {
         if size > arena.slot_size {
             // The buffer pool only supports single-slot allocations. Larger requests fall back to
             // temporary heap buffers via the caller.
+            return None;
+        }
+        // When the cache holds more pages than the arena has slots, each page
+        // read asks a full arena for a slot. `alloc_one` then reads all the
+        // words of the bitmap before it fails, and the count of allocated
+        // slots gives the same result without the scan. While another thread
+        // frees a slot, the count can be one too high. The caller then uses a
+        // temporary buffer, as it does when the arena is full.
+        if arena.allocated_slots.load(Ordering::Acquire) >= arena.free_slots.n_slots() as usize {
             return None;
         }
         let first_idx = arena.free_slots.alloc_one()?;
@@ -1836,5 +1878,30 @@ mod tests {
             }
         }
         panic!("no mapping in /proc/self/smaps holds {addr:#x}");
+    }
+}
+
+#[cfg(test)]
+mod arena_slot_tests {
+    use super::*;
+    use crate::io::MemoryIO;
+
+    /// A full arena gives no slot, so the pool gives temporary buffers, and a
+    /// slot that is freed can be taken again.
+    #[test]
+    fn full_arena_gives_a_slot_again_after_a_free() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        pool.finalize_with_page_size(4096).unwrap();
+        let slots = BufferPool::TEST_ARENA_SIZE / 4096;
+
+        let mut pages: Vec<Buffer> = (0..slots).map(|_| pool.get_page()).collect();
+        assert!(pages.iter().all(Buffer::is_pooled));
+        assert!(!pool.get_page().is_pooled());
+
+        pages.pop();
+        let page = pool.get_page();
+        assert!(page.is_pooled());
+        assert!(!pool.get_page().is_pooled());
     }
 }

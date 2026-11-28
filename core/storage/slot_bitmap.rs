@@ -64,6 +64,11 @@ impl AtomicSlotBitmap {
         }
     }
 
+    /// Returns the number of slots that the bitmap tracks.
+    pub fn n_slots(&self) -> u32 {
+        self.n_slots
+    }
+
     /// Returns whether a slot is currently free (snapshot, may be stale).
     pub fn is_free(&self, slot: u32) -> bool {
         if slot >= self.n_slots {

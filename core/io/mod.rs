@@ -863,6 +863,27 @@ impl Buffer {
         })
     }
 
+    /// Makes a temporary buffer that holds `head` and then `tail`, as
+    /// [`Buffer::new_temporary`] and two copies do. When the cache has no
+    /// buffer of this size, the new buffer is built from the two slices, so
+    /// its bytes are written once and are not set to zero first.
+    pub fn new_temporary_from(head: &[u8], tail: &[u8]) -> Self {
+        let size = head.len() + tail.len();
+        TEMP_BUFFER_CACHE.with(|cache| {
+            if let Some(mut buffer) = cache.borrow_mut().get_buffer(size) {
+                let (head_bytes, tail_bytes) = buffer.split_at_mut(head.len());
+                head_bytes.copy_from_slice(head);
+                tail_bytes.copy_from_slice(tail);
+                Self::Heap(buffer)
+            } else {
+                let mut data = Vec::with_capacity(size);
+                data.extend_from_slice(head);
+                data.extend_from_slice(tail);
+                Self::Heap(Pin::new(data.into_boxed_slice()))
+            }
+        })
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Heap(buf) => buf.len(),
@@ -972,6 +993,27 @@ mod buffer_tests {
         assert_eq!(buffer.len(), 3);
         assert_eq!(buffer.as_slice(), &[2, 3, 4]);
         assert_eq!(buffer.as_ptr(), shared.as_ptr());
+    }
+
+    /// A temporary buffer made from two parts holds the parts, both when it
+    /// is new and when it comes from the cache with the bytes of its last use.
+    #[test]
+    fn temporary_buffer_from_parts_holds_the_parts() {
+        let size = BufferPool::DEFAULT_PAGE_SIZE + WAL_FRAME_HEADER_SIZE;
+        let head: Vec<u8> = (0..WAL_FRAME_HEADER_SIZE as u8).collect();
+        let tail: Vec<u8> = (0..size - head.len()).map(|i| (i % 251) as u8).collect();
+        let expected = [head.as_slice(), tail.as_slice()].concat();
+
+        let new = Buffer::new_temporary_from(&head, &tail);
+        assert_eq!(new.as_slice(), expected.as_slice());
+
+        // A dropped temporary buffer of this size goes into the cache.
+        let used = Buffer::new(vec![0xff; size]);
+        let used_ptr = used.as_ptr();
+        drop(used);
+        let cached = Buffer::new_temporary_from(&head, &tail);
+        assert_eq!(cached.as_ptr(), used_ptr);
+        assert_eq!(cached.as_slice(), expected.as_slice());
     }
 }
 

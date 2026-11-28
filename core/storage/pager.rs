@@ -38,7 +38,6 @@ use crate::{
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use tracing::{instrument, trace, Level};
 
 use super::btree::offset::{
@@ -1709,8 +1708,9 @@ pub struct Pager {
     /// `cache_insert` has not yet succeeded because the cache was full and we
     /// yielded waiting for a spill to complete. The next call to
     /// `read_page_nonblock(idx)` reuses the stored `(page, disk_read)` pair
-    /// instead of issuing a duplicate disk read.
-    pending_reads: RwLock<HashMap<i64, PendingRead>>,
+    /// instead of issuing a duplicate disk read. Each read from disk adds and
+    /// removes an entry, so the map hashes with FxHash, not SipHash.
+    pending_reads: RwLock<rustc_hash::FxHashMap<i64, PendingRead>>,
     /// True while `pending_reads` may hold an entry. Set before an entry is
     /// added and cleared after the last one is removed, both under the write
     /// lock, so a reader that sees false can skip the lock: every page read
@@ -2028,7 +2028,7 @@ impl Pager {
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
-            pending_reads: RwLock::new(HashMap::new()),
+            pending_reads: RwLock::new(rustc_hash::FxHashMap::default()),
             has_pending_reads: AtomicBool::new(false),
             #[cfg(any(test, feature = "test_helper"))]
             spill_yield: SpillYieldHook::new(),
@@ -2344,17 +2344,20 @@ impl Pager {
         let buffer = {
             let page_id = page.get().id() as u32;
             let contents = page.get_contents();
-            let buffer = self.buffer_pool.allocate(page_size + 4);
             let contents_buffer = contents.as_ptr();
             turso_assert!(
                 contents_buffer.len() == page_size,
                 "contents buffer length should be equal to page size"
             );
 
-            buffer.as_mut_slice()[0..4].copy_from_slice(&page_id.to_be_bytes());
-            buffer.as_mut_slice()[4..4 + page_size].copy_from_slice(contents_buffer);
-
-            Arc::new(buffer)
+            // The record is larger than a slot of the buffer pool, so
+            // `BufferPool::allocate` gave a heap buffer of zeros, and the two
+            // copies then wrote over all of it. The record is built from the
+            // copies instead.
+            let mut record = Vec::with_capacity(page_size + 4);
+            record.extend_from_slice(&page_id.to_be_bytes());
+            record.extend_from_slice(contents_buffer);
+            Arc::new(Buffer::new(record))
         };
 
         let savepoints = self.savepoints.clone();

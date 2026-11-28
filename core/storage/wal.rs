@@ -40,8 +40,8 @@ use crate::storage::shared_wal_coordination::{
 };
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame_header,
-    recompute_wal_frame_checksum, write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE,
-    WAL_HEADER_SIZE,
+    prepare_wal_frame_with_page, recompute_wal_frame_checksum, write_pages_vectored, PageSize,
+    WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 use crate::types::{IOCompletions, IOResult};
 use crate::util::IOExt as _;
@@ -3270,7 +3270,16 @@ impl WalFile {
             { "input_len": page.len(), "page_size": page_size }
         );
 
-        let frame = prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size);
+        // Without a codec, the body starts as a copy of the page, so the frame
+        // is made with this copy. A codec writes the body itself.
+        let frame = match page_transform {
+            PageTransform::Codec(_) => {
+                prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size)
+            }
+            PageTransform::Checksum(_) | PageTransform::None => {
+                prepare_wal_frame_with_page(buffer_pool, wal_header, page_number, db_size, page)
+            }
+        };
         turso_assert!(
             frame.len() == WAL_FRAME_HEADER_SIZE + page_size,
             "WAL frame buffer size must match its header and page body",
@@ -3293,10 +3302,9 @@ impl WalFile {
                 frame_body,
             )?,
             PageTransform::Checksum(checksum) => {
-                frame_body.copy_from_slice(page);
                 checksum.add_checksum_to_page(frame_body, page_number as usize)?;
             }
-            PageTransform::None => frame_body.copy_from_slice(page),
+            PageTransform::None => {}
         }
 
         let checksum =
