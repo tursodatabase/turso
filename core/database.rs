@@ -830,7 +830,6 @@ pub struct Database<
     /// and shared by all connections because the parsed [`Schema`] is
     /// shared per database.
     dialect: Arc<dyn Dialect>,
-    nan_policy: crate::types::NanPolicy,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
@@ -988,7 +987,6 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
-            nan_policy: crate::types::NanPolicy::for_dialect(dialect.as_ref()),
             dialect,
             io: io.clone(),
             open_flags: flags,
@@ -4021,9 +4019,9 @@ impl Database {
         self.with_schema_mut(|schema| schema.register_internal_vtab(table))
     }
 
-    /// The NaN rule fixed when the database was opened.
+    /// Whether a REAL can be NaN in this database, from its dialect.
     pub(crate) fn nan_policy(&self) -> crate::types::NanPolicy {
-        self.nan_policy
+        crate::types::NanPolicy::for_dialect(self.dialect.as_ref())
     }
 
     /// The SQL dialect this database was opened with.

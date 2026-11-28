@@ -537,6 +537,15 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         )
                         .into());
                     };
+                    // FIXME(nan): the keys of this index method are built with
+                    // ImmutableRecord::from_values, not from registers, so the
+                    // NaN rule never applies to them. A vector given as a blob
+                    // is not checked for NaN or infinite components (text input
+                    // is), so a component, or the sum of an inf and a -inf
+                    // component, can be NaN. It is then written as NaN bits to
+                    // a key here, in the stats keys and in the delete path,
+                    // even in a SQLite-dialect database. Refuse non-finite
+                    // components in blob input as text input does.
                     let sum = vector.as_f32_sparse().values.iter().sum::<f32>() as f64;
                     self.insert_state = VectorSparseInvertedIndexInsertState::Prepare {
                         vector: Some(vector),

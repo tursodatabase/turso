@@ -398,9 +398,7 @@ mod tests {
                 prev_count: AtomicUsize::new(0),
                 current_rowid: Some(1),
                 record,
-                index_info: Arc::new(
-                    IndexInfo::new([], true, 1, false, crate::types::NanPolicy::Null).unwrap(),
-                ),
+                index_info: Arc::new(IndexInfo::new([], true, 1, false).unwrap()),
                 advance_completion: Completion::new_yield(),
                 advance_error: None,
                 null_flag: false,

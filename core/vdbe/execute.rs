@@ -1389,7 +1389,6 @@ pub fn op_open_read(
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     table.as_ref(),
                     num_columns,
-                    connection.nan_policy(),
                 )
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
@@ -1404,14 +1403,11 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
-                connection.nan_policy(),
             )?;
             let index_info = match mv_store.as_ref() {
-                Some(mv_store) => Arc::new(IndexInfo::new_from_index_in(
-                    index,
-                    connection.nan_policy(),
-                    mv_store.allocator(),
-                )?),
+                Some(mv_store) => {
+                    Arc::new(IndexInfo::new_from_index_in(index, mv_store.allocator())?)
+                }
                 None => btree_cursor
                     .index_info
                     .as_ref()
@@ -12398,7 +12394,6 @@ pub fn op_insert(
                             let maybe_record = return_if_io!(state, cursor.record());
                             if let Some(record) = maybe_record {
                                 let values = record.get_values_owned()?;
-                                connection.nan_policy().check_stored_row(&values)?;
                                 let route =
                                     state.active_op_state.insert().route.as_ref().ok_or_else(
                                         || {
@@ -12811,7 +12806,6 @@ pub fn op_delete(
                     let maybe_record = return_if_io!(state, cursor.record());
                     if let Some(record) = maybe_record {
                         let values = record.get_values_owned()?;
-                        connection.nan_policy().check_stored_row(&values)?;
                         let values = if route.is_materialized_view {
                             values
                         } else {
@@ -13889,14 +13883,13 @@ pub fn op_open_write(
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     index.as_ref(),
                     num_columns,
-                    connection.nan_policy(),
                 )?,
                 connection,
             );
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
-                IndexInfo::new_from_index_in(index, connection.nan_policy(), mv_store.allocator())?
+                IndexInfo::new_from_index_in(index, mv_store.allocator())?
             } else {
-                IndexInfo::new_from_index(index, connection.nan_policy())?
+                IndexInfo::new_from_index(index)?
             });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
@@ -13929,7 +13922,6 @@ pub fn op_open_write(
                             maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                             table_rc.as_ref(),
                             num_columns,
-                            connection.nan_policy(),
                         ),
                         connection,
                     )
@@ -16529,13 +16521,7 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index_boxed(
-                    pager.clone(),
-                    root_page,
-                    index,
-                    num_columns,
-                    connection.nan_policy(),
-                )
+                BTreeCursor::new_index_boxed(pager.clone(), root_page, index, num_columns)
             } else {
                 Ok(BTreeCursor::new_table_boxed(
                     pager.clone(),
@@ -16667,7 +16653,6 @@ pub fn op_open_dup(
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.as_ref(),
                     table.columns().len(),
-                    connection.nan_policy(),
                 )
             };
             let cursor = if !is_ephemeral {

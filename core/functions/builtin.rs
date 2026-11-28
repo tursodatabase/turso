@@ -864,7 +864,6 @@ pub fn call_builtin_scalar(
                             ));
                         }
                     };
-                    connection.nan_policy().check_stored(&val)?;
 
                     if let ValueRef::Blob(..) = val {
                         return Err(LimboError::InvalidArgument(

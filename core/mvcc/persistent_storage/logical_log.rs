@@ -6548,7 +6548,6 @@ mod tests {
                 true,
                 2,
                 false,
-                crate::types::NanPolicy::Null,
             )
             .unwrap(),
         )
