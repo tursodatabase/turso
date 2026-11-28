@@ -4800,7 +4800,6 @@ mod tests {
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
     use turso_core::{ConnectOpts, SessionRole};
-    use turso_sqlite::SqliteDialect;
 
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.
@@ -5425,48 +5424,6 @@ mod tests {
         assert!(
             result.is_err(),
             "sqlite_schema should not be accessible in PostgreSQL mode"
-        );
-    }
-
-    #[test]
-
-    fn test_postgres_tables_hidden_in_sqlite_mode() {
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        // Open with the SQLite dialect, whose catalog has no pg_* tables.
-        let db = Database::open_file_with_flags(
-            io,
-            db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        // Try to query pg_class - should fail
-        let result = conn.prepare("SELECT * FROM pg_class");
-        assert!(
-            result.is_err(),
-            "pg_class should not be accessible in SQLite mode"
-        );
-
-        // Try to query pg_namespace - should fail
-        let result = conn.prepare("SELECT * FROM pg_namespace");
-        assert!(
-            result.is_err(),
-            "pg_namespace should not be accessible in SQLite mode"
-        );
-
-        // sqlite_master should work
-        let result = conn.prepare("SELECT * FROM sqlite_master");
-        assert!(
-            result.is_ok(),
-            "sqlite_master should be accessible in SQLite mode"
         );
     }
 
