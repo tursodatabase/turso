@@ -1936,6 +1936,7 @@ pub fn translate_alter_table(
                     old_name: old_column_name,
                     written_old_name: from,
                     definition: &definition,
+                    statement: input,
                 })
             };
             resolver

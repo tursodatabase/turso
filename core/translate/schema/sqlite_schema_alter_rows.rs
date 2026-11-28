@@ -9,14 +9,17 @@ use crate::schema::BTreeTable;
 use crate::sync::Arc;
 use crate::translate::alter::database_uses_mvcc;
 use crate::translate::collate::CollationSeq;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::{
+    emit_cdc_autocommit_commit, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+    UpdateRowSource,
+};
 use crate::translate::schema::sqlite_schema_rows::open_sqlite_schema_for_write;
 use crate::translate::schema::SQLITE_TABLEID;
 use crate::translate::update::translate_update_for_schema_change;
 use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
-use crate::{LimboError, Result, TEMP_DB_ID};
+use crate::{CaptureDataChangesExt, LimboError, Result, TEMP_DB_ID};
 
 /// Renames a table in every row of `sqlite_schema` of its database, in its
 /// row of `sqlite_sequence`, in the row of its AUTOINCREMENT backing table,
@@ -42,8 +45,12 @@ pub(super) fn emit_rename_table_rows(
         ctx,
         AlterTableFunc::RenameTable,
         &[old_name_argument.to_string(), stored_new_name.to_string()],
-        table.written_old_name,
-    );
+        &AlteredTable {
+            stored_name: stored_old_name,
+            written_name: table.written_old_name,
+            statement: table.statement,
+        },
+    )?;
     if table.is_virtual {
         return Ok(());
     }
@@ -105,6 +112,7 @@ pub(super) fn emit_rename_column_rows(
         database_id: ctx.database_id,
         id: column.namespace,
     };
+    let stored_table_name = resolver.mangle_name(namespace, column.table);
     let new_definition = ast::ColumnDefinition {
         col_name: column.new_name.clone(),
         col_type: None,
@@ -115,46 +123,54 @@ pub(super) fn emit_rename_column_rows(
         ctx,
         AlterTableFunc::RenameColumn,
         &[
-            resolver.mangle_name(namespace, column.table),
+            stored_table_name.clone(),
             column.written_old_name.to_string(),
             new_definition.to_string(),
         ],
-        column.written_table_name,
-    );
+        &AlteredTable {
+            stored_name: &stored_table_name,
+            written_name: column.written_table_name,
+            statement: column.statement,
+        },
+    )?;
 
-    for trigger in column.triggers {
-        let stored_name = resolver.mangle_name(trigger.namespace, &trigger.name);
-        emit_update_of_stored_sql(
-            program,
-            ctx,
-            &StoredSqlUpdate {
-                database_id: trigger.namespace.database_id,
-                object_type: "trigger",
-                name_for_errors: &trigger.name,
-                name: &stored_name,
-                sql: &trigger.sql,
-                new_tbl_name: None,
-                statement: column.statement,
-            },
-        )?;
-    }
-    for view in column.views {
-        let stored_name = resolver.mangle_name(view.namespace, &view.name);
-        emit_update_of_stored_sql(
-            program,
-            ctx,
-            &StoredSqlUpdate {
-                database_id: view.namespace.database_id,
-                object_type: "view",
-                name_for_errors: &stored_name,
-                name: &stored_name,
-                sql: &view.sql,
-                new_tbl_name: None,
-                statement: column.statement,
-            },
-        )?;
-    }
-    Ok(())
+    // The table row's UPDATE records the statement, whose replay rewrites
+    // these rows too.
+    program.without_capture_data_changes(|program| {
+        for trigger in column.triggers {
+            let stored_name = resolver.mangle_name(trigger.namespace, &trigger.name);
+            emit_update_of_stored_sql(
+                program,
+                ctx,
+                &StoredSqlUpdate {
+                    database_id: trigger.namespace.database_id,
+                    object_type: "trigger",
+                    name_for_errors: &trigger.name,
+                    name: &stored_name,
+                    sql: &trigger.sql,
+                    new_tbl_name: None,
+                    statement: column.statement,
+                },
+            )?;
+        }
+        for view in column.views {
+            let stored_name = resolver.mangle_name(view.namespace, &view.name);
+            emit_update_of_stored_sql(
+                program,
+                ctx,
+                &StoredSqlUpdate {
+                    database_id: view.namespace.database_id,
+                    object_type: "view",
+                    name_for_errors: &stored_name,
+                    name: &stored_name,
+                    sql: &view.sql,
+                    new_tbl_name: None,
+                    statement: column.statement,
+                },
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// Replaces the definition of a column in every row of `sqlite_schema` of
@@ -168,18 +184,22 @@ pub(super) fn emit_alter_column_rows(
         database_id: ctx.database_id,
         id: column.namespace,
     };
+    let stored_table_name = ctx.resolver.mangle_name(namespace, column.table);
     emit_rewrite_of_every_row(
         program,
         ctx,
         AlterTableFunc::AlterColumn,
         &[
-            ctx.resolver.mangle_name(namespace, column.table),
+            stored_table_name.clone(),
             column.written_old_name.to_string(),
             column.definition.to_string(),
         ],
-        column.written_table_name,
-    );
-    Ok(())
+        &AlteredTable {
+            stored_name: &stored_table_name,
+            written_name: column.written_table_name,
+            statement: column.statement,
+        },
+    )
 }
 
 /// Stores the `CREATE TABLE` text of a table with its new column.
@@ -219,16 +239,17 @@ pub(super) fn emit_drop_column_rows(
 /// Emits a loop over every row of `sqlite_schema` of the database the
 /// statement changes. `func` gets the five columns of a row and then
 /// `arguments`, and gives the five columns to store in place of the row.
-/// `written_table_name` is the table the statement alters, as the statement
-/// spells it.
 fn emit_rewrite_of_every_row(
     program: &mut ProgramBuilder,
     ctx: &CmdContext<'_>,
     func: AlterTableFunc,
     arguments: &[String],
-    written_table_name: &str,
-) {
+    altered_table: &AlteredTable<'_>,
+) -> Result<()> {
     let cursor_id = ctx.sqlite_schema_cursor(program);
+    let cdc_cursor_id =
+        prepare_cdc_if_necessary(program, ctx.schema, ctx.database_id, Some(SQLITE_TABLEID))?
+            .map(|(cdc_cursor_id, _)| cdc_cursor_id);
     program.cursor_loop(cursor_id, |program, rowid| {
         let first_column = program.alloc_registers(SQLITE_SCHEMA_COLUMN_COUNT);
         for i in 0..SQLITE_SCHEMA_COLUMN_COUNT {
@@ -260,6 +281,18 @@ fn emit_rewrite_of_every_row(
             affinity_str: None,
         });
 
+        if let Some(cdc_cursor_id) = cdc_cursor_id {
+            emit_cdc_for_altered_table_row(
+                program,
+                ctx.resolver,
+                cdc_cursor_id,
+                rowid,
+                first_column,
+                record,
+                altered_table,
+            )?;
+        }
+
         // In MVCC mode, we need to delete before insert to properly
         // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
         if database_uses_mvcc(ctx.connection, ctx.database_id) {
@@ -275,9 +308,113 @@ fn emit_rewrite_of_every_row(
             key_reg: rowid,
             record_reg: record,
             flag: InsertFlags(0),
-            table_name: written_table_name.to_string(),
+            table_name: altered_table.written_name.to_string(),
         });
+        Ok::<_, LimboError>(())
+    })?;
+    emit_cdc_autocommit_commit(program, ctx.resolver, cdc_cursor_id)
+}
+
+/// The table an `ALTER TABLE` statement changes.
+struct AlteredTable<'a> {
+    /// The `name` column of the table's row in `sqlite_schema`.
+    stored_name: &'a str,
+    /// The table's name as the statement spells it.
+    written_name: &'a str,
+    /// The text of the `ALTER TABLE` statement, for change data capture.
+    statement: &'a str,
+}
+
+/// Records the rewrite of the altered table's own `sqlite_schema` row the way
+/// ADD COLUMN records it: one UPDATE whose `updates` hold the ALTER statement
+/// in place of the new `sql`, so that a CDC consumer replays the statement
+/// once. The other rows rewritten by the ALTER (indexes, triggers, views) are
+/// not recorded, because replaying the statement rewrites them too.
+fn emit_cdc_for_altered_table_row(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_cursor_id: usize,
+    rowid_reg: usize,
+    old_row_start_reg: usize,
+    new_row_record_reg: usize,
+    altered_table: &AlteredTable<'_>,
+) -> Result<()> {
+    let skip_cdc_label = program.allocate_label();
+    let table_type_reg = program.emit_string8_new_reg("table".to_string());
+    program.mark_last_insn_constant();
+    let table_name_reg = program.emit_string8_new_reg(altered_table.stored_name.to_string());
+    program.mark_last_insn_constant();
+    program.emit_insn(Insn::Ne {
+        lhs: old_row_start_reg,
+        rhs: table_type_reg,
+        target_pc: skip_cdc_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
     });
+    program.emit_insn(Insn::Ne {
+        lhs: old_row_start_reg + 1,
+        rhs: table_name_reg,
+        target_pc: skip_cdc_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::NOCASE,
+    });
+
+    let before_record_reg = if program.capture_data_changes_info().has_before() {
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(old_row_start_reg),
+            count: to_u32(SQLITE_SCHEMA_COLUMN_COUNT),
+            dest_reg: to_u32(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        Some(record_reg)
+    } else {
+        None
+    };
+    let after_record_reg = program
+        .capture_data_changes_info()
+        .has_after()
+        .then_some(new_row_record_reg);
+    let updates_record_reg = if program.capture_data_changes_info().has_updates() {
+        let sql_column = 4;
+        let updates_start_reg = program.alloc_registers(2 * SQLITE_SCHEMA_COLUMN_COUNT);
+        for column in 0..SQLITE_SCHEMA_COLUMN_COUNT {
+            program.emit_bool(column == sql_column, updates_start_reg + column);
+            program.emit_null(
+                updates_start_reg + SQLITE_SCHEMA_COLUMN_COUNT + column,
+                None,
+            );
+        }
+        program.emit_string8(
+            altered_table.statement.to_string(),
+            updates_start_reg + SQLITE_SCHEMA_COLUMN_COUNT + sql_column,
+        );
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(updates_start_reg),
+            count: to_u32(2 * SQLITE_SCHEMA_COLUMN_COUNT),
+            dest_reg: to_u32(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        Some(record_reg)
+    } else {
+        None
+    };
+    emit_cdc_insns(
+        program,
+        resolver,
+        OperationMode::UPDATE(UpdateRowSource::Normal),
+        cdc_cursor_id,
+        rowid_reg,
+        before_record_reg,
+        after_record_reg,
+        updates_record_reg,
+        SQLITE_TABLEID,
+    )?;
+    program.preassign_label_to_next_insn(skip_cdc_label);
+    Ok(())
 }
 
 const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;

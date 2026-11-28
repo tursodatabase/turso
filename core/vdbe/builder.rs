@@ -1201,6 +1201,14 @@ impl ProgramBuilder {
         Some(depth)
     }
 
+    /// Runs `f` without writing CDC rows, for writes that the statement already records as a whole.
+    pub fn without_capture_data_changes<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let capture_data_changes_info = self.capture_data_changes_info.take();
+        let result = f(self);
+        self.capture_data_changes_info = capture_data_changes_info;
+        result
+    }
+
     /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
