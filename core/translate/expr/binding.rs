@@ -324,6 +324,7 @@ pub fn bind_and_rewrite_expr_except<'a>(
                             referenced_tables,
                             &normalized_table_name,
                             resolver,
+                            excluded,
                         )? {
                             *expr = make_field_access_expr(
                                 m.table_id,
@@ -440,7 +441,8 @@ pub fn bind_and_rewrite_expr_except<'a>(
                                 let is_rowid_alias = col.is_rowid_alias();
                                 let normalized_tbl_name = normalize_ident(&tbl_name_str);
                                 let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name)
+                                    .filter(|(tbl_id, _)| !excluded.contains(tbl_id));
 
                                 if let Some((tbl_id, _)) = matching_tbl {
                                     *expr = Expr::Column {
@@ -467,7 +469,8 @@ pub fn bind_and_rewrite_expr_except<'a>(
                         let normalized_col = normalize_ident(&tbl_name_str);
                         let field_name = normalize_ident(&col_name_str);
                         let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name)
+                            .filter(|(tbl_id, _)| !excluded.contains(tbl_id));
                         if let Some((tbl_id, tbl)) = matching_tbl {
                             let col_idx = tbl.columns().iter().position(|c| {
                                 c.name
@@ -514,6 +517,7 @@ pub fn bind_and_rewrite_expr_except<'a>(
                                 &mid_name,
                                 &leaf_field,
                                 resolver,
+                                excluded,
                             )?
                         {
                             *expr = nested_expr;
@@ -1216,17 +1220,21 @@ pub(super) struct CustomTypeColumnMatch<'a> {
     type_def: &'a crate::schema::TypeDef,
 }
 
-/// Search all joined tables for a column named `col_name` with a struct/union type.
+/// Search the joined tables, except those in `excluded`, for a column named `col_name` with a struct/union type.
 /// Errors on ambiguity (>1 match). Returns `None` if no match.
 #[turso_macros::trace_stack]
 pub(super) fn find_custom_type_column<'a>(
     referenced_tables: &TableReferences,
     col_name: &str,
     resolver: &'a Resolver<'a>,
+    excluded: &[TableInternalId],
 ) -> crate::Result<Option<CustomTypeColumnMatch<'a>>> {
     let mut result: Option<CustomTypeColumnMatch<'a>> = None;
     let mut match_count = 0usize;
     for joined_table in referenced_tables.joined_tables().iter() {
+        if excluded.contains(&joined_table.internal_id) {
+            continue;
+        }
         let cols = joined_table.table.columns();
         if let Some(col_idx) = cols.iter().position(|c| {
             c.name
@@ -1308,8 +1316,9 @@ pub(super) fn try_resolve_nested_field_access<'a>(
     mid_name: &str,
     leaf_name: &str,
     resolver: &'a Resolver<'a>,
+    excluded: &[TableInternalId],
 ) -> crate::Result<Option<(Expr, TableInternalId, usize)>> {
-    let m = find_custom_type_column(referenced_tables, col_name, resolver)?;
+    let m = find_custom_type_column(referenced_tables, col_name, resolver, excluded)?;
     let Some(m) = m else {
         return Ok(None);
     };

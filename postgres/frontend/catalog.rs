@@ -360,6 +360,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn join_condition_reads_only_tables_since_comma(&self) -> bool {
+        true
+    }
+
     fn binds_names_at_create(&self) -> bool {
         true
     }

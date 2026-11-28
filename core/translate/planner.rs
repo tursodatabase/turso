@@ -1,6 +1,6 @@
 use crate::namespace::NamespaceRef;
 use crate::sync::{Arc, Mutex};
-use crate::{turso_assert, turso_assert_greater_than_or_equal};
+use crate::turso_assert;
 
 use super::plan::NamedWindowBound;
 use super::{
@@ -3010,6 +3010,7 @@ pub fn parse_from(
         let has_right_or_full_join = joins_owned
             .iter()
             .any(|join| PlanJoinType::from_join_operator(&join.operator).keeps_right_rows());
+        let mut from_item_start = table_references.joined_tables().len();
         parse_from_clause_table(
             select_owned,
             resolver,
@@ -3021,6 +3022,9 @@ pub fn parse_from(
         )?;
 
         for join in joins_owned.into_iter() {
+            if matches!(join.operator, ast::JoinOperator::Comma) {
+                from_item_start = table_references.joined_tables().len();
+            }
             parse_join(
                 join,
                 resolver,
@@ -3031,6 +3035,7 @@ pub fn parse_from(
                 table_references,
                 connection,
                 has_right_or_full_join,
+                from_item_start,
             )?;
         }
     }
@@ -3556,6 +3561,7 @@ fn loop_index_for_table_row(
 }
 
 /// Plans one join of a FROM clause.
+/// `from_item_start` is the index of the first table listed after the last comma.
 ///
 /// This function is not inlined, so that its values are not in the frame of
 /// [parse_from], which is on the stack one time for each level of nested
@@ -3574,6 +3580,7 @@ fn parse_join(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
     has_right_or_full_join: bool,
+    from_item_start: usize,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,
@@ -3597,11 +3604,13 @@ fn parse_join(
         out_where_clause,
         table_references,
         has_right_or_full_join,
+        from_item_start,
     )
 }
 
 /// Plans the join operator and the join constraint of the table that a join
 /// added last to `table_references`.
+/// `from_item_start` is the index of the first table listed after the last comma.
 #[inline(never)]
 fn plan_join_constraint(
     join_operator: ast::JoinOperator,
@@ -3610,6 +3619,7 @@ fn plan_join_constraint(
     out_where_clause: &mut Vec<WhereTerm>,
     table_references: &mut TableReferences,
     has_right_or_full_join: bool,
+    from_item_start: usize,
 ) -> Result<()> {
     let lateral_reference = left_table_read_by_rightmost_table(table_references).map(str::to_owned);
 
@@ -3644,21 +3654,35 @@ fn plan_join_constraint(
 
     // SQLite allows duplicate table names/aliases in FROM clauses.
     // Ambiguity is detected later during column resolution.
-    let rightmost_table = table_references.joined_tables().last().unwrap();
+    // The condition can name the tables from `first_visible_table` on.
+    let first_visible_table = if resolver
+        .catalog
+        .dialect
+        .join_condition_reads_only_tables_since_comma()
+    {
+        from_item_start
+    } else {
+        0
+    };
+    let (rightmost_table, left_tables) = table_references
+        .joined_tables()
+        .split_last()
+        .expect("the joined table was just added");
+    let visible_left_tables = &left_tables[first_visible_table..];
+    let hidden_tables: Vec<TableInternalId> = left_tables[..first_visible_table]
+        .iter()
+        .map(|table| table.internal_id)
+        .collect();
     let join_origin = JoinOrigin::new(rightmost_table.internal_id, outer);
     let constraint = if natural {
-        turso_assert_greater_than_or_equal!(table_references.joined_tables().len(), 2);
+        turso_assert!(!visible_left_tables.is_empty());
         // NATURAL JOIN is first transformed into a USING join with the common columns
         let mut distinct_names: Vec<ast::Name> = vec![];
         // TODO: O(n^2) maybe not great for large tables or big multiway joins
         // SQLite doesn't use HIDDEN columns for NATURAL joins: https://www3.sqlite.org/src/info/ab09ef427181130b
         for right_col in rightmost_table.columns().iter().filter(|col| !col.hidden()) {
             let mut found_match = false;
-            for left_table in table_references
-                .joined_tables()
-                .iter()
-                .take(table_references.joined_tables().len() - 1)
-            {
+            for left_table in visible_left_tables {
                 for left_col in left_table.columns().iter().filter(|col| !col.hidden()) {
                     if left_col
                         .name
@@ -3697,12 +3721,13 @@ fn plan_join_constraint(
                 break_predicate_at_and_boundaries(*expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
                     predicate.origin = WhereTermOrigin::Join(join_origin);
-                    bind_and_rewrite_expr(
+                    bind_and_rewrite_expr_except(
                         &mut predicate.expr,
                         Some(table_references),
                         None,
                         resolver,
                         BindingBehavior::TryResultColumnsFirst,
+                        &hidden_tables,
                     )?;
                 }
             }
@@ -3711,7 +3736,8 @@ fn plan_join_constraint(
                 for distinct_name in distinct_names.iter() {
                     let name_normalized = normalize_ident(distinct_name.as_str());
                     let cur_table_idx = table_references.joined_tables().len() - 1;
-                    let left_tables = &table_references.joined_tables()[..cur_table_idx];
+                    let left_tables =
+                        &table_references.joined_tables()[first_visible_table..cur_table_idx];
                     turso_assert!(!left_tables.is_empty());
                     let right_table = table_references.joined_tables().last().unwrap();
                     // SQLite checks the right side before it checks ambiguity on the left.
@@ -3778,6 +3804,10 @@ fn plan_join_constraint(
                 using = distinct_names;
             }
         }
+    }
+
+    if !hidden_tables.is_empty() {
+        table_references.hide_tables_from_join_condition(join_origin.right_table(), hidden_tables);
     }
 
     assert!(table_references.joined_tables().len() >= 2);
