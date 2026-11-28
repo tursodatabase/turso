@@ -47,8 +47,8 @@ pub mod vtab {
     pub use turso_core::VirtualTable;
 }
 
-/// Tells core that a REAL cannot hold NaN in a binary that links this crate.
+/// Tells core that a REAL can hold NaN in a binary that links this crate.
 #[no_mangle]
 pub fn turso_frontend_nan_is_a_value() -> bool {
-    false
+    true
 }

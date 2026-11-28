@@ -1,0 +1,13 @@
+@database :memory:
+
+@compat-gap "function:to_char"
+test to-char-nan-is-explicitly-unsupported {
+    SELECT to_char('Infinity'::float8 - 'Infinity'::float8, 'FM999');
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {
+    to_char does not support NaN
+}

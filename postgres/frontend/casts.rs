@@ -372,7 +372,7 @@ fn to_float(value: &Value, source: CastType, target: CastType) -> Result<Value> 
         Value::Text(text) => parse_float(text.as_str(), target)?,
         _ => return Ok(value.clone()),
     };
-    // FIXME(pg-catalog): This is a stop gap. The engine's float cannot hold NaN and stores it as NULL, so NaN is refused here, where PostgreSQL stores it. Registered float4, float8 and numeric types, with their own stored form, will store NaN.
+    // FIXME(pg-catalog): The legacy float casts still reject NaN input. Registered float4 and float8 conversion functions replace this path.
     if number.is_nan() {
         return Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
