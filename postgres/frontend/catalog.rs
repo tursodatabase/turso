@@ -3362,11 +3362,11 @@ struct ConstraintRow<'a> {
     referenced_column_numbers: Option<&'a str>,
 }
 
-struct IndexRow<'a> {
+struct IndexRow {
     oid: i64,
     table_oid: i64,
     is_unique: bool,
-    column_numbers: Option<&'a str>,
+    column_numbers: Option<String>,
 }
 
 struct ColumnDefaultRow {
@@ -3427,7 +3427,7 @@ impl SnapshotRows for PgDependTable {
         // Match indexes to their owning PK/UNIQUE constraints for internal dependencies.
         // Other indexes have automatic dependencies on their indexed columns.
         for index in indexes.clone() {
-            let columns = catalog_column_numbers(index.column_numbers);
+            let columns = catalog_column_numbers(index.column_numbers.as_deref());
             let constraint = constraints.clone().find(|constraint| {
                 matches!(
                     constraint.kind,
@@ -3477,7 +3477,8 @@ impl SnapshotRows for PgDependTable {
                 if let Some(index) = indexes.clone().find(|index| {
                     index.table_oid == constraint.referenced_table_oid
                         && index.is_unique
-                        && catalog_column_numbers(index.column_numbers) == referenced_columns
+                        && catalog_column_numbers(index.column_numbers.as_deref())
+                            == referenced_columns
                 }) {
                     rows.push(dependency_row(
                         ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
@@ -3840,14 +3841,14 @@ impl<'a> ConstraintRow<'a> {
     }
 }
 
-impl<'a> IndexRow<'a> {
+impl IndexRow {
     // Zero-based positions in PgIndexTable's SQL column order.
     const OID_COLUMN: usize = 0;
     const TABLE_OID_COLUMN: usize = 1;
     const IS_UNIQUE_COLUMN: usize = 4;
     const COLUMN_NUMBERS_COLUMN: usize = 15;
 
-    fn from_row(row: &'a [Value]) -> Self {
+    fn from_row(row: &[Value]) -> Self {
         Self {
             oid: row[Self::OID_COLUMN]
                 .as_int()
@@ -3859,7 +3860,8 @@ impl<'a> IndexRow<'a> {
                 .as_int()
                 .expect("catalog index uniqueness is an integer")
                 == CATALOG_BOOLEAN_TRUE,
-            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
+            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN])
+                .map(str::to_owned),
         }
     }
 }
