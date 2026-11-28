@@ -7322,6 +7322,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_dialect_definitions"
+version = "0.9.0-pre.6"
+dependencies = [
+ "turso_core",
+ "turso_parser",
+]
+
+[[package]]
 name = "turso_ext"
 version = "0.9.0-pre.6"
 dependencies = [
@@ -7393,11 +7401,11 @@ dependencies = [
  "tempfile",
  "tracing",
  "turso_core",
+ "turso_dialect_definitions",
  "turso_ext",
  "turso_parser",
  "turso_pg_catalog",
  "turso_pg_parser",
- "turso_sqlite",
 ]
 
 [[package]]
@@ -7586,7 +7594,7 @@ dependencies = [
  "rusqlite",
  "tempfile",
  "turso_core",
- "turso_parser",
+ "turso_dialect_definitions",
 ]
 
 [[package]]

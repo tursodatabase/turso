@@ -26,6 +26,7 @@ members = [
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
+    "dialect-definitions",
     "sqlite/frontend",
     "sqlite/parser",
     "postgres/catalog",
@@ -91,6 +92,7 @@ default-members = [
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
+    "dialect-definitions",
     "sqlite/frontend",
     "sqlite/parser",
     "postgres/tests",
@@ -137,6 +139,7 @@ turso_sync_engine = { path = "sync/engine", version = "0.9.0-pre.6" }
 turso_ext = { path = "extensions/core", version = "0.9.0-pre.6" }
 turso_macros = { path = "macros", version = "0.9.0-pre.6" }
 turso_parser = { path = "sqlite/parser", version = "0.9.0-pre.6" }
+turso_dialect_definitions = { path = "dialect-definitions", version = "0.9.0-pre.6" }
 turso_sqlite = { path = "sqlite/frontend", version = "0.9.0-pre.6" }
 turso_pg = { path = "postgres/frontend", version = "0.9.0-pre.6" }
 turso_pg_catalog = { path = "postgres/catalog", version = "0.9.0-pre.6" }
