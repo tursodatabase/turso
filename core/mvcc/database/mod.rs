@@ -327,8 +327,6 @@ impl SortableIndexKey {
 
             let lhs_value = lhs.next().expect("we already checked length")?;
             let rhs_value = rhs.next().expect("we already checked length")?;
-            self.metadata.check_stored(&lhs_value)?;
-            self.metadata.check_stored(&rhs_value)?;
 
             let cmp = cmp_in_column(&lhs_value, &rhs_value, &self.metadata.key_info[i]);
 
@@ -891,12 +889,9 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: Concurre
         }
         let values = match &record_values {
             Some(values) => values,
-            None => {
-                let values = ImmutableRecordRef::from_bin_record(row_version.payload(id))
-                    .get_values_owned()?;
-                connection.nan_policy().check_stored_row(&values)?;
-                record_values.insert(values)
-            }
+            None => record_values.insert(
+                ImmutableRecordRef::from_bin_record(row_version.payload(id)).get_values_owned()?,
+            ),
         };
         let physical_column = table.logical_to_physical_column(logical_column);
         let Some(value) = values.get(physical_column).cloned() else {
@@ -9963,12 +9958,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .all_indexes()
                     .find(|idx| idx.root_page == root_page)
                     .map(|idx| {
-                        IndexInfo::new_from_index_in(
-                            idx.as_ref(),
-                            connection.nan_policy(),
-                            self.alloc.clone(),
-                        )
-                        .map(Arc::new)
+                        IndexInfo::new_from_index_in(idx.as_ref(), self.alloc.clone()).map(Arc::new)
                     })
                     .transpose()
             };

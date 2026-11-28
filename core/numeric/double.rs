@@ -40,6 +40,18 @@ impl Double {
     }
 
     /// The value of the 8 bytes of a REAL in a record, or `None` for NULL.
+    //
+    // FIXME(nan): this returns NaN for `RECORD_NAN` in every dialect. A value
+    // decoded into a register then becomes NULL where NaN is not a value, but
+    // index key comparisons (`compare_record`, the MVCC `SortableIndexKey`)
+    // use this value directly. A SQLite-dialect database holds these bits only
+    // if the file is damaged or a program other than Turso wrote them: the
+    // SQLite dialect never writes them, and it refuses to open a file that the
+    // PostgreSQL dialect wrote (`reject_postgres_table_sql`). In such a file a
+    // table scan reads NULL while an index orders the key as NaN, so `a IS
+    // NULL` misses the row through the index and PRAGMA integrity_check
+    // reports it. SQLite reads NULL on every path. Make the comparators read
+    // these bits as NULL in a database where NaN is not a value.
     pub const fn from_record_bytes(bytes: [u8; 8]) -> Option<Self> {
         if u64::from_be_bytes(bytes) == Self::RECORD_NAN {
             return Some(Double(f64::NAN));

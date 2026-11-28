@@ -243,7 +243,6 @@ fn index_key_payload_allocation_uses_passed_allocator() {
             false,
             1,
             false,
-            crate::types::NanPolicy::Null,
         )
         .unwrap(),
     );
@@ -322,7 +321,6 @@ fn index_key_order_matches_compare_immutable() {
                 true,
                 num_cols,
                 false,
-                crate::types::NanPolicy::Null,
             )
             .unwrap(),
         )
@@ -388,7 +386,6 @@ fn index_key_compare_reports_corrupt_values() {
             false,
             1,
             false,
-            crate::types::NanPolicy::Null,
         )
         .unwrap(),
     );
@@ -1580,7 +1577,6 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
             false,
             1,
             false,
-            crate::types::NanPolicy::Null,
         )
         .unwrap(),
     );
@@ -2448,14 +2444,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         .block(|| pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()))
         .unwrap() as i64;
     let cursor = Arc::new(RwLock::new(
-        BTreeCursor::new_index(
-            pager.clone(),
-            root_page,
-            &index,
-            index.columns.len(),
-            crate::types::NanPolicy::Null,
-        )
-        .unwrap(),
+        BTreeCursor::new_index(pager.clone(), root_page, &index, index.columns.len()).unwrap(),
     ));
 
     for key in 1..=600 {
@@ -2518,8 +2507,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         pager.as_ref(),
     )
     .unwrap();
-    let index_info =
-        Arc::new(IndexInfo::new_from_index(&index, crate::types::NanPolicy::Null).unwrap());
+    let index_info = Arc::new(IndexInfo::new_from_index(&index).unwrap());
     let record = ImmutableRecord::from_values(
         &[Value::from_i64(interior_key), Value::from_i64(interior_key)],
         2,

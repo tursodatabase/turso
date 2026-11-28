@@ -339,8 +339,7 @@ fn test_logical_log_read_table_and_index_rows() {
         .expect("Index should exist");
     // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
     let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);
-    let index_info =
-        Arc::new(IndexInfo::new_from_index(index, turso_core::types::NanPolicy::Null).unwrap());
+    let index_info = Arc::new(IndexInfo::new_from_index(index).unwrap());
 
     // Verify table rows can be read
     let tx = mvcc_store.begin_tx(pager).unwrap();
