@@ -64,6 +64,15 @@ pub(crate) enum FormatName {
     Numeric,
 }
 
+/// The precision and the scale that the modifier of a numeric holds, or None
+/// when the numeric has no modifier.
+pub(crate) fn numeric_modifier(typmod: i64) -> Option<(i64, i64)> {
+    (typmod > 4).then(|| {
+        let packed = typmod - 4;
+        ((packed >> 16) & 0xffff, ((packed & 0x7ff) ^ 0x400) - 0x400)
+    })
+}
+
 impl FormatName {
     /// The name for the modifier `typmod`, which is -1 when there is none.
     fn render(self, typmod: i64) -> String {
@@ -71,12 +80,10 @@ impl FormatName {
             FormatName::Plain(name) => name.to_string(),
             FormatName::Length(name) if typmod > 4 => format!("{name}({})", typmod - 4),
             FormatName::Length(name) => name.to_string(),
-            FormatName::Numeric if typmod > 4 => {
-                let precision = ((typmod - 4) >> 16) & 0xffff;
-                let scale = (((typmod - 4) & 0x7ff) ^ 0x400) - 0x400;
-                format!("numeric({precision},{scale})")
-            }
-            FormatName::Numeric => "numeric".to_string(),
+            FormatName::Numeric => match numeric_modifier(typmod) {
+                Some((precision, scale)) => format!("numeric({precision},{scale})"),
+                None => "numeric".to_string(),
+            },
         }
     }
 }

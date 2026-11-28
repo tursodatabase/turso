@@ -127,12 +127,24 @@ impl PostgreSQLTranslator {
         if !range_var.catalogname.is_empty() {
             return Err(ParseError::not_supported("a cross-database reference"));
         }
-        let is_schemata = range_var
+        let in_information_schema = range_var
             .schemaname
-            .eq_ignore_ascii_case("information_schema")
-            && range_var.relname.eq_ignore_ascii_case("schemata");
-        let mapped_name = if is_schemata {
-            "pg_information_schema_schemata".to_string()
+            .eq_ignore_ascii_case("information_schema");
+        if in_information_schema
+            && UNSUPPORTED_INFORMATION_SCHEMA_VIEWS.contains(&range_var.relname.as_str())
+        {
+            return Err(ParseError::not_supported(format!(
+                "information_schema.{}",
+                range_var.relname
+            )));
+        }
+        let is_information_schema_view = in_information_schema
+            && matches!(
+                range_var.relname.as_str(),
+                "schemata" | "tables" | "columns"
+            );
+        let mapped_name = if is_information_schema_view {
+            format!("pg_information_schema_{}", range_var.relname)
         } else {
             self.map_table_name(&range_var.relname)
         };
@@ -192,8 +204,6 @@ impl PostgreSQLTranslator {
             | "pg_extension"
             | "pg_tables"
             | "pg_indexes" => table_name.to_string(),
-            "information_schema.tables" => "sqlite_master".to_string(),
-            "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
             _ => table_name.to_string(),
         }
@@ -6919,6 +6929,70 @@ fn bare_table_name(name: &str) -> &str {
         _ => name,
     }
 }
+
+/// The views of PostgreSQL's information schema that tursopg does not have.
+const UNSUPPORTED_INFORMATION_SCHEMA_VIEWS: &[&str] = &[
+    "administrable_role_authorizations",
+    "applicable_roles",
+    "attributes",
+    "character_sets",
+    "check_constraint_routine_usage",
+    "check_constraints",
+    "collation_character_set_applicability",
+    "collations",
+    "column_column_usage",
+    "column_domain_usage",
+    "column_options",
+    "column_privileges",
+    "column_udt_usage",
+    "constraint_column_usage",
+    "constraint_table_usage",
+    "data_type_privileges",
+    "domain_constraints",
+    "domain_udt_usage",
+    "domains",
+    "element_types",
+    "enabled_roles",
+    "foreign_data_wrapper_options",
+    "foreign_data_wrappers",
+    "foreign_server_options",
+    "foreign_servers",
+    "foreign_table_options",
+    "foreign_tables",
+    "key_column_usage",
+    "parameters",
+    "referential_constraints",
+    "role_column_grants",
+    "role_routine_grants",
+    "role_table_grants",
+    "role_udt_grants",
+    "role_usage_grants",
+    "routine_column_usage",
+    "routine_privileges",
+    "routine_routine_usage",
+    "routine_sequence_usage",
+    "routine_table_usage",
+    "routines",
+    "sequences",
+    "sql_features",
+    "sql_implementation_info",
+    "sql_parts",
+    "sql_sizing",
+    "table_constraints",
+    "table_privileges",
+    "transforms",
+    "triggered_update_columns",
+    "triggers",
+    "udt_privileges",
+    "usage_privileges",
+    "user_defined_types",
+    "user_mapping_options",
+    "user_mappings",
+    "view_column_usage",
+    "view_routine_usage",
+    "view_table_usage",
+    "views",
+];
 
 pub fn is_catalog_table_name(name: &str) -> bool {
     matches!(
@@ -14234,6 +14308,26 @@ mod tests {
             err.contains("not supported") && err.contains(needle),
             "{sql}: expected a not-supported error mentioning {needle:?}, got: {err}"
         );
+    }
+
+    #[test]
+    fn information_schema_views_that_tursopg_lacks_are_not_supported() {
+        for view in UNSUPPORTED_INFORMATION_SCHEMA_VIEWS {
+            assert_not_supported(
+                &format!("SELECT * FROM information_schema.{view}"),
+                &format!("information_schema.{view}"),
+            );
+        }
+    }
+
+    #[test]
+    fn information_schema_views_that_tursopg_has_are_translated() {
+        for view in ["schemata", "tables", "columns"] {
+            let parsed = crate::parse(&format!("SELECT * FROM information_schema.{view}")).unwrap();
+            PostgreSQLTranslator::new()
+                .translate_with_prereqs(&parsed)
+                .unwrap_or_else(|error| panic!("information_schema.{view}: {error}"));
+        }
     }
 
     fn assert_rejected(sql: &str, needle: &str) {
