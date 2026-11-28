@@ -5,7 +5,7 @@ use crate::{
         Command, CommandParser,
     },
     config::Config,
-    dot_command::tokenize_dot_command,
+    dot_command::{tokenize_dot_command, tokenize_dot_command_spans},
     helper::LimboHelper,
     input::{
         get_io, get_writer, open_flags, ApplyWriter, DbLocation, NoopProgress, OutputMode,
@@ -799,8 +799,6 @@ impl Limbo {
     }
 
     fn reset_line(&mut self) {
-        // Entry is auto added to history
-        // self.rl.add_history_entry(line.to_owned())?;
         self.interrupt_count.store(0, Ordering::Release);
     }
 
@@ -1845,6 +1843,8 @@ impl Limbo {
         if let Some(rl) = &mut self.rl {
             let result = rl.readline(&self.prompt)?;
             let _ = self.input_buff.write_str(result.as_str());
+            // The history is saved to a file, which must not keep a key.
+            let _ = rl.add_history_entry(line_without_keys(&self.input_buff, prev_len));
         } else {
             let mut reader = std::io::stdin().lock();
             if reader.read_line(&mut self.input_buff)? == 0 {
@@ -2431,6 +2431,214 @@ pub(crate) fn database_name_without_query(name: &str) -> &str {
     }
 }
 
+/// Returns `input[line_start..]`, the last line that the user typed, with
+/// `***` in place of each encryption key in it: the value of a `hexkey` URI
+/// parameter or of `PRAGMA hexkey`. `input` also holds the earlier lines of
+/// the same statement, because a key can be on a later line than `hexkey`.
+fn line_without_keys(input: &str, line_start: usize) -> String {
+    let mut keys = Vec::new();
+    // A URI can be outside of a string, for example on a dot command line
+    // that the user typed after an unfinished statement.
+    uri_key_ranges(input, 0, &mut keys);
+    // Limbo::consume finds a dot command in the same way.
+    if input.trim_start().starts_with('.') {
+        dot_command_key_ranges(input, &mut keys);
+    } else {
+        sql_key_ranges(input, &mut keys);
+    }
+    keys.sort_by_key(|key| key.start);
+    let mut line = String::new();
+    let mut copied = line_start;
+    for key in keys {
+        let start = key.start.max(copied);
+        if start < key.end {
+            line.push_str(&input[copied..start]);
+            line.push_str("***");
+            copied = key.end;
+        }
+    }
+    line.push_str(&input[copied..]);
+    line
+}
+
+/// Adds to `keys` the byte range of each argument of the dot command
+/// `line` that has a `hexkey` URI parameter only after its quotes are
+/// removed, such as `"c.db?hex"key=ab12`. The raw text does not show where
+/// the key is in such an argument, so all of the argument is a key.
+fn dot_command_key_ranges(line: &str, keys: &mut Vec<std::ops::Range<usize>>) {
+    let (args, _) = tokenize_dot_command_spans(line);
+    for (arg, span) in args {
+        let raw = &line[span.clone()];
+        let quoted_whole = ['\'', '"']
+            .iter()
+            .any(|&q| raw.strip_prefix(q).and_then(|r| r.strip_suffix(q)) == Some(&arg));
+        let mut arg_keys = Vec::new();
+        uri_key_ranges(&arg, 0, &mut arg_keys);
+        if raw != arg && !quoted_whole && !arg_keys.is_empty() {
+            keys.push(span);
+        }
+    }
+}
+
+/// Adds to `keys` the byte ranges of the encryption keys in the SQL text
+/// `sql`: the values of `PRAGMA hexkey`, the `KEY` of `ATTACH`, and the
+/// file name of `ATTACH` if it is more than one token. `sql` can end
+/// inside a statement or a string.
+fn sql_key_ranges(sql: &str, keys: &mut Vec<std::ops::Range<usize>>) {
+    use turso_parser::{lexer::Lexer, token::TokenType};
+    enum State {
+        None,
+        /// After `PRAGMA`, before `=` or `(`. `hexkey` tells if the last
+        /// name is `hexkey`.
+        PragmaName {
+            hexkey: bool,
+        },
+        /// After `ATTACH`, before the file name.
+        Attach,
+        /// After the `AS` of `ATTACH`.
+        AttachName,
+        /// An expression, from its first to its last token. It ends at `;`,
+        /// at a `)` that it did not open, or at `AS` if it is the file name
+        /// of `ATTACH`.
+        Value {
+            attach_file: bool,
+            depth: usize,
+            tokens: usize,
+            range: Option<std::ops::Range<usize>>,
+        },
+    }
+    let value = |attach_file| State::Value {
+        attach_file,
+        depth: 0,
+        tokens: 0,
+        range: None,
+    };
+    // The file name of ATTACH is an expression, so the key can be in any of
+    // its tokens, or come from a function such as printf(). A file name of
+    // one token is a string, which keeps all of its URI but the key.
+    let value_key = |attach_file: bool, tokens: usize, range| {
+        if attach_file && tokens == 1 {
+            None
+        } else {
+            range
+        }
+    };
+    let mut state = State::None;
+    let mut lexer = Lexer::new(sql.as_bytes());
+    let mut end = 0;
+    while let Some(token) = lexer.next() {
+        let start = end;
+        let token_type = match token {
+            Ok(token) => {
+                end = sql.len() - lexer.remaining().len();
+                token.token_type
+            }
+            Err(_) => {
+                // The lexer does not go past a token that it cannot read.
+                // A string that a later line closes goes to the end of `sql`.
+                end = if sql[start..].starts_with(['\'', '"', '`']) {
+                    sql.len()
+                } else {
+                    start + sql[start..].chars().next().map_or(1, char::len_utf8)
+                };
+                lexer = Lexer::new(&sql.as_bytes()[end..]);
+                TokenType::TK_ILLEGAL
+            }
+        };
+        let text = &sql[start..end];
+        if token_type == TokenType::TK_NONE {
+            // Spaces and comments.
+            continue;
+        }
+        if matches!(state, State::Attach) && token_type != TokenType::TK_DATABASE {
+            state = value(true);
+        }
+        if let State::Value {
+            attach_file,
+            depth,
+            tokens,
+            range,
+        } = &mut state
+        {
+            let ends = match token_type {
+                TokenType::TK_SEMI => true,
+                TokenType::TK_RP if *depth == 0 => true,
+                TokenType::TK_AS if *attach_file && *depth == 0 => true,
+                _ => false,
+            };
+            if !ends {
+                match token_type {
+                    TokenType::TK_LP => *depth += 1,
+                    TokenType::TK_RP => *depth -= 1,
+                    _ => {}
+                }
+                *tokens += 1;
+                *range = Some(range.as_ref().map_or(start, |range| range.start)..end);
+                continue;
+            }
+            keys.extend(value_key(*attach_file, *tokens, range.take()));
+            state = if *attach_file && token_type == TokenType::TK_AS {
+                State::AttachName
+            } else {
+                State::None
+            };
+            continue;
+        }
+        state = match (state, token_type) {
+            (_, TokenType::TK_SEMI) => State::None,
+            (State::PragmaName { hexkey: true }, TokenType::TK_EQ | TokenType::TK_LP) => {
+                value(false)
+            }
+            (State::PragmaName { .. }, TokenType::TK_EQ | TokenType::TK_LP) => State::None,
+            // `schema.name` and `[name]`.
+            (
+                state @ State::PragmaName { .. },
+                TokenType::TK_DOT | TokenType::TK_LBRACKET | TokenType::TK_RBRACKET,
+            ) => state,
+            (State::PragmaName { .. }, _) => State::PragmaName {
+                // The pragma name can be quoted, in any letter case.
+                hexkey: token_type != TokenType::TK_ILLEGAL
+                    && turso_core::ast::Name::from_string(text)
+                        .as_str()
+                        .eq_ignore_ascii_case("hexkey"),
+            },
+            (State::AttachName, TokenType::TK_KEY) => value(false),
+            (State::None, TokenType::TK_PRAGMA) => State::PragmaName { hexkey: false },
+            (State::None, TokenType::TK_ATTACH) => State::Attach,
+            (state, _) => state,
+        };
+    }
+    if let State::Value {
+        attach_file,
+        tokens,
+        range,
+        ..
+    } = state
+    {
+        keys.extend(value_key(attach_file, tokens, range));
+    }
+}
+
+/// Adds to `keys` the byte ranges of the values of the `hexkey` parameters
+/// of the URIs in `text`. `text` starts at byte `offset` of the input.
+fn uri_key_ranges(text: &str, offset: usize, keys: &mut Vec<std::ops::Range<usize>>) {
+    for (name, param) in text.match_indices("hexkey=") {
+        // parse_query_params in core/util.rs reads a parameter name exactly.
+        if !text[..name].ends_with(['?', '&']) {
+            continue;
+        }
+        let start = name + param.len();
+        // A key ends at the next parameter, at the fragment, or at the end
+        // of the dot command argument or SQL string that holds the URI.
+        let end = text[start..]
+            .find(|c: char| c.is_whitespace() || "&#'\"`".contains(c))
+            .map_or(text.len(), |n| start + n);
+        if start < end {
+            keys.push(offset + start..offset + end);
+        }
+    }
+}
+
 /// Returns the `file:` URI that the database name `name` stands for, or
 /// `None` if `name` is a plain file name. The database argument of tursodb,
 /// `.open` and the `open_database` tool of the MCP server use this
@@ -2739,6 +2947,102 @@ mod tests {
             ("file:x.db#fragment", "file:x.db"),
         ] {
             assert_eq!(database_name_without_query(name), shown, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_line_without_keys() {
+        for (input, line_start, line) in [
+            ("PRAGMA hexkey = 'ab12';", 0, "PRAGMA hexkey = ***;"),
+            ("pragma HEXKEY=ab12;", 0, "pragma HEXKEY=***;"),
+            (
+                "PRAGMA main.hexkey(\"ab12\");",
+                0,
+                "PRAGMA main.hexkey(***);",
+            ),
+            ("PRAGMA hexkey = x'ab12';", 0, "PRAGMA hexkey = ***;"),
+            ("PRAGMA hexkey = 12ab;", 0, "PRAGMA hexkey = ***;"),
+            ("PRAGMA \"hexkey\" = 'ab12';", 0, "PRAGMA \"hexkey\" = ***;"),
+            ("PRAGMA [HexKey] = 'ab12';", 0, "PRAGMA [HexKey] = ***;"),
+            ("PRAGMA `hexkey` = 'ab12';", 0, "PRAGMA `hexkey` = ***;"),
+            (
+                "PRAGMA \"main\".'hexkey' /* c */ = 'ab12';",
+                0,
+                "PRAGMA \"main\".'hexkey' /* c */ = ***;",
+            ),
+            ("PRAGMA hexkey -- c\n= 'ab12';", 19, "= ***;"),
+            ("PRAGMA hexkey = 'ab''12';", 0, "PRAGMA hexkey = ***;"),
+            (
+                "SELECT 1; PRAGMA hexkey = 'ab12'; SELECT 2;",
+                0,
+                "SELECT 1; PRAGMA hexkey = ***; SELECT 2;",
+            ),
+            (
+                "ATTACH 'file:b.db?cipher=aegis256&hexkey=ab12' AS b;",
+                0,
+                "ATTACH 'file:b.db?cipher=aegis256&hexkey=***' AS b;",
+            ),
+            (
+                "attach database 'file:b.db?cipher=aegis256&hexkey=' || 'ab12' as b;",
+                0,
+                "attach database *** as b;",
+            ),
+            (
+                "ATTACH printf('file:b.db?cipher=%s&hexkey=%s', 'aegis256', 'ab12') AS b;",
+                0,
+                "ATTACH *** AS b;",
+            ),
+            (
+                "ATTACH (CAST(x'6162' AS TEXT)) AS \"b\"; SELECT 'ab12';",
+                0,
+                "ATTACH *** AS \"b\"; SELECT 'ab12';",
+            ),
+            (
+                "ATTACH 'b.db' AS b KEY 'ab12';",
+                0,
+                "ATTACH 'b.db' AS b KEY ***;",
+            ),
+            ("ATTACH 'b.db' AS b;", 0, "ATTACH 'b.db' AS b;"),
+            (
+                "ATTACH 'file:b.db?hexkey=' ||\n'ab12' AS b;",
+                27,
+                "*** AS b;",
+            ),
+            (
+                ".open c.db?hexkey=ab12&cipher=aegis256",
+                0,
+                ".open c.db?hexkey=***&cipher=aegis256",
+            ),
+            (
+                ".clone 'file:d.db?cipher=aegis256&hexkey=ab12#x'",
+                0,
+                ".clone 'file:d.db?cipher=aegis256&hexkey=***#x'",
+            ),
+            (
+                ".open \"/p/e.db?cipher=aegis256&hex\"key=ab12 x",
+                0,
+                ".open *** x",
+            ),
+            (
+                "SELECT 1\n.open c.db?cipher=aegis256&hexkey=ab12",
+                9,
+                ".open c.db?cipher=aegis256&hexkey=***",
+            ),
+            ("PRAGMA hexkey =\n'ab12';", 16, "***;"),
+            ("PRAGMA hexkey = 'ab\n12';", 20, "***;"),
+            ("PRAGMA hexkey = 'ab12';\nSELECT 1;", 24, "SELECT 1;"),
+            ("PRAGMA hexkey = 'ab", 0, "PRAGMA hexkey = ***"),
+            ("PRAGMA hexkey;", 0, "PRAGMA hexkey;"),
+            ("PRAGMA hexkeys = 'ab12';", 0, "PRAGMA hexkeys = 'ab12';"),
+            (
+                "PRAGMA cipher = 'aegis256';",
+                0,
+                "PRAGMA cipher = 'aegis256';",
+            ),
+            ("SELECT 'hexkey=ab12';", 0, "SELECT 'hexkey=ab12';"),
+            ("SELECT 'hexkey';", 0, "SELECT 'hexkey';"),
+        ] {
+            assert_eq!(line_without_keys(input, line_start), line, "{input}");
         }
     }
 
