@@ -1994,20 +1994,9 @@ fn exec_to_json(connection: &Connection, args: &[Register]) -> Result<Option<Jso
 /// keeps one field of each name, orders the fields, and writes numbers as
 /// numeric does, so `to_jsonb(1e20::float8)` is `100000000000000000000`.
 fn exec_to_jsonb(connection: &Connection, args: &[Register]) -> Result<Option<Jsonb>> {
-    let [value, type_name] = args else {
-        unreachable!("to_jsonb takes one argument and its type name");
-    };
-    let value = value.get_value();
-    if matches!(value, Value::Null) {
+    let Some(Json(json)) = exec_to_json(connection, args)? else {
         return Ok(None);
-    }
-    let mut json = String::new();
-    write_json_of_type(
-        connection,
-        value,
-        &type_name.get_value().to_string(),
-        &mut json,
-    )?;
+    };
     Ok(Some(Jsonb(jsonb_text(&json)?)))
 }
 
