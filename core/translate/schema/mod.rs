@@ -23,8 +23,8 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, FromDefinitionFlags, Schema, SchemaObjectType, StructDef, Table,
+    Type, TypeDef, TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -762,8 +762,11 @@ fn validate(
 
         let is_strict = options.contains_strict();
 
+        let flags =
+            FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict);
         for c in columns {
-            check_column_type(c, table_name, is_strict, resolver.schema())?;
+            let column = Column::from_definition(c, flags)?;
+            check_column_type(&column, table_name, is_strict, resolver.schema())?;
         }
 
         // In STRICT tables, validate that CHECK constraint comparisons have
@@ -828,31 +831,33 @@ fn validate(
     Ok(())
 }
 
-/// Refuses a column type that a table cannot have. CREATE TABLE, ADD COLUMN
-/// and ALTER COLUMN all call this, so ALTER cannot give a column a type that
-/// CREATE TABLE refuses.
+/// Refuses a column type that a table cannot have. CREATE TABLE, ADD COLUMN,
+/// ALTER COLUMN and loading the schema all call this, so neither ALTER nor an
+/// edited `sqlite_schema` can give a column a type that CREATE TABLE refuses.
 pub(crate) fn check_column_type(
-    column: &ast::ColumnDefinition,
+    column: &Column,
     table_name: &str,
     is_strict: bool,
     schema: &Schema,
 ) -> Result<()> {
-    let Some(col_type) = &column.col_type else {
+    let column_name = column.name.as_deref().unwrap_or_default();
+    let written_type = column.written_ty_str.as_deref().unwrap_or(&column.ty_str);
+    if written_type.is_empty() {
         if is_strict {
-            bail_parse_error!("missing datatype for {}.{}", table_name, column.col_name);
+            bail_parse_error!("missing datatype for {}.{}", table_name, column_name);
         }
         return Ok(());
-    };
-    let type_name = &column_declared_type(&col_type.name);
-    let is_builtin = is_builtin_strict_type(&col_type.name);
+    }
+    let type_name = &column.ty_str;
+    let is_builtin = is_builtin_strict_type(written_type);
 
-    if col_type.is_array() {
+    if column.is_array() {
         // Arrays are encoded and decoded only in STRICT tables.
         if !is_strict {
             bail_parse_error!(
                 "array type columns require STRICT tables: {}.{}",
                 table_name,
-                column.col_name
+                column_name
             );
         }
         schema.check_array_element_type(type_name)?;
@@ -869,7 +874,7 @@ pub(crate) fn check_column_type(
             bail_parse_error!(
                 "domain type columns require STRICT tables: {}.{}",
                 table_name,
-                column.col_name
+                column_name
             );
         }
         return Ok(());
@@ -878,18 +883,14 @@ pub(crate) fn check_column_type(
         bail_parse_error!(
             "unknown datatype for {}.{}: \"{}\"",
             table_name,
-            column.col_name,
+            column_name,
             type_name
         );
     };
     // A column gives one modifier for each type parameter besides `value`, as
     // in `p(10)`, and none for a type without such parameters.
     let expected = td.user_params().count();
-    let provided = match &col_type.size {
-        Some(ast::TypeSize::TypeSize(_, _)) => 2,
-        Some(ast::TypeSize::MaxSize(_)) => 1,
-        None => 0,
-    };
+    let provided = column.ty_params.len();
     if provided != expected {
         bail_parse_error!(
             "type \"{}\" requires {} parameter(s), got {}",

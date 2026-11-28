@@ -698,6 +698,100 @@ mod tests {
             .contains("malformed database schema");
     }
 
+    /// A STRICT column whose type has arguments CREATE TABLE refuses can only
+    /// come from an edited `sqlite_schema`. Such a database does not open, as
+    /// SQLite does not open a schema with a column type its CREATE TABLE refuses.
+    #[test]
+    fn test_reopen_fails_when_stored_column_type_has_arguments_create_table_refuses() {
+        for (table_sql, expected) in [
+            (
+                "CREATE TABLE t(v varchar) STRICT",
+                r#"type "varchar" requires 1 parameter(s), got 0"#,
+            ),
+            (
+                "CREATE TABLE t(v varchar(2,3)) STRICT",
+                r#"type "varchar" requires 1 parameter(s), got 2"#,
+            ),
+            (
+                "CREATE TABLE t(v p) STRICT",
+                r#"type "p" requires 1 parameter(s), got 0"#,
+            ),
+            (
+                "CREATE TABLE t(v p(2,3)) STRICT",
+                r#"type "p" requires 1 parameter(s), got 2"#,
+            ),
+            (
+                "CREATE TABLE t(v varchar[]) STRICT",
+                r#"type "varchar" requires 1 parameter(s), got 0"#,
+            ),
+            (
+                "CREATE TABLE t(v numeric(10,2)[]) STRICT",
+                "arrays of type numeric are not supported",
+            ),
+        ] {
+            let (_temp_dir, path) = database_with_stored_table_sql(table_sql);
+            let err = open_error(&path);
+            assert!(
+                err.contains("malformed database schema (t)") && err.contains(expected),
+                "unexpected error for {table_sql}: {err}"
+            );
+        }
+    }
+
+    /// A column type with the arguments its type takes still opens, and the
+    /// arguments still limit what the column stores.
+    #[test]
+    fn test_reopen_with_stored_column_types_that_have_their_arguments() {
+        for table_sql in [
+            "CREATE TABLE t(v varchar(3)) STRICT",
+            "CREATE TABLE t(v p(3)) STRICT",
+        ] {
+            let (_temp_dir, path) = database_with_stored_table_sql(table_sql);
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("INSERT INTO t VALUES ('abc')").unwrap();
+            let err = conn
+                .execute("INSERT INTO t VALUES ('abcd')")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("value too long"), "{table_sql}: {err}");
+            let rows: Vec<(String,)> = conn.exec_rows("SELECT v FROM t");
+            assert_eq!(rows, vec![("abc".to_string(),)], "{table_sql}");
+        }
+    }
+
+    /// Creates type `p`, which takes one argument, and a STRICT table
+    /// `t(v text)`, then replaces the stored SQL of `t` with `table_sql`.
+    fn database_with_stored_table_sql(table_sql: &str) -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_stored_table_sql.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE p(value text, maxlen integer) BASE text \
+                 COERCE CASE WHEN length(value) <= maxlen THEN value \
+                 ELSE RAISE(ABORT, 'value too long for p') END",
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE t(v text) STRICT").unwrap();
+
+            // Turso has no writable_schema pragma. Use the same schema-write
+            // bypass as VACUUM during prepare, then execute normally.
+            conn.start_nested();
+            let stmt = conn.prepare(format!(
+                "UPDATE sqlite_schema SET sql = '{table_sql}' WHERE name = 't'"
+            ));
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+        (temp_dir, path)
+    }
+
     /// An array column whose stored value is not an array is a damaged
     /// database. Reading it through DECODE must fail, not loop forever.
     #[test]
