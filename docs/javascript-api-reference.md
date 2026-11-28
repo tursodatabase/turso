@@ -224,4 +224,8 @@ db.prepare("SELECT id, name AS display, id + 1 AS next FROM users").columns();
 
 #### bind([...bindParameters]) ⇒ this
 
-This function is currently not supported.
+| Param          | Type                          | Description                                      |
+| -------------- | ----------------------------- | ------------------------------------------------ |
+| bindParameters | <code>array of objects</code> | The bind parameters for executing the statement. |
+
+Binds **permanently** the given parameters to the statement. After a statement's parameters are bound this way, you may no longer provide it with execution-specific (temporary) bound parameters.

@@ -309,6 +309,45 @@ test.serial("Statement.run() [named]", async (t) => {
   t.is(info.lastInsertRowid, 3);
 });
 
+test.serial("Statement.run() [missing parameter]", async (t) => {
+  const db = t.context.db;
+  const missingEmail = { instanceOf: RangeError, message: 'Missing named parameter "email"' };
+
+  const insert = db.prepare("INSERT INTO users(name, email) VALUES (:name, :email)");
+  insert.run({ name: "Carol", email: "carol@example.net" });
+  t.throws(() => insert.run({ name: "Dave" }), missingEmail);
+  const update = db.prepare("UPDATE users SET email = :email WHERE id = :id");
+  update.run({ id: 1, email: "alice@example.net" });
+  t.throws(() => update.run({ id: 2, Email: "bob@example.net" }), missingEmail);
+  t.deepEqual(db.prepare("SELECT email FROM users").pluck().all(), ["alice@example.net", "bob@example.com", "carol@example.net"]);
+});
+
+test.serial("Statement.bind() [missing parameter]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("INSERT INTO users(name, email) VALUES (?, ?)");
+  t.throws(() => stmt.bind("Carol"), { instanceOf: RangeError, message: "Too few parameter values were provided" });
+  t.is(stmt.bind("Carol", "carol@example.net").run().changes, 1);
+});
+
+test.serial("Statement.bind() [unbindable value]", async (t) => {
+  const db = t.context.db;
+  const unbindable = { instanceOf: TypeError, message: "SQLite3 can only bind numbers, strings, bigints, buffers, and null" };
+
+  const stmt = db.prepare("SELECT ? AS x, ? AS y");
+  t.throws(() => stmt.get(Symbol("s")), unbindable);
+  t.throws(() => stmt.bind(Symbol("s")), unbindable);
+});
+
+test.serial("Statement.get() [after bind()]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT ? AS a, ? AS b").bind(1, 2);
+  t.deepEqual(stmt.get(), { a: 1, b: 2 });
+  t.throws(() => stmt.get(9), { instanceOf: TypeError, message: "This statement already has bound parameters" });
+  t.throws(() => stmt.bind(3, 4), { instanceOf: TypeError, message: "The bind() method can only be invoked once per statement object" });
+});
+
 test.serial("Statement.run() with array bind parameter", async (t) => {
   const db = t.context.db;
 
@@ -467,6 +506,43 @@ test.serial("Statement.get() [named]", async (t) => {
   t.is(stmt.get({ id: 0 }), undefined);
   t.is(stmt.get({ id: 1 }).name, "Alice");
   t.is(stmt.get({ id: 2 }).name, "Bob");
+});
+
+test.serial("Statement.get() [undefined]", async (t) => {
+  const db = t.context.db;
+
+  const positional = db.prepare("SELECT ? AS x");
+  t.deepEqual(positional.get(1), { x: 1 });
+  t.deepEqual(positional.get(undefined), { x: null });
+
+  const named = db.prepare("SELECT :a AS x");
+  t.deepEqual(named.get({ a: 1 }), { x: 1 });
+  t.deepEqual(named.get({ a: undefined }), { x: null });
+});
+
+test.serial("Statement.get() [arrays among values]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT ? AS x, ? AS y");
+  t.deepEqual(stmt.get([1], 2), { x: 1, y: 2 });
+  t.deepEqual(stmt.get(1, [2]), { x: 1, y: 2 });
+});
+
+test.serial("Statement.get() [missing parameter]", async (t) => {
+  const db = t.context.db;
+  const tooFew = { instanceOf: RangeError, message: "Too few parameter values were provided" };
+  const missingA = { instanceOf: RangeError, message: 'Missing named parameter "a"' };
+
+  t.throws(() => db.prepare("SELECT ?, ? AS y").get(1), tooFew);
+  t.throws(() => db.prepare("SELECT :a AS x").get({ A: 1 }), missingA);
+
+  const positional = db.prepare("SELECT ? AS x");
+  t.deepEqual(positional.get(1), { x: 1 });
+  t.throws(() => positional.get(), tooFew);
+
+  const named = db.prepare("SELECT :a AS x");
+  t.deepEqual(named.get({ a: 1 }), { x: 1 });
+  t.throws(() => named.get({}), missingA);
 });
 
 test.serial("Statement.get() [raw]", async (t) => {

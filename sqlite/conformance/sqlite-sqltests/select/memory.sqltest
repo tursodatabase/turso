@@ -1950,3 +1950,7 @@ test where-variable-predicate {
 }
 expect {
 }
+# The JavaScript driver refuses a call that leaves a parameter without a value.
+expect @js error {
+    Too few parameter values were provided
+}
