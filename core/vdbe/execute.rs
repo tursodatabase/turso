@@ -19837,6 +19837,11 @@ pub(crate) struct VacuumIntoOpContext {
     escaped_schema_name: String,
     /// Keep output database alive while vacuum is in progress.
     _output_db: Option<Arc<Database>>,
+    /// Where a file-backed copy is built — a temporary file moved to the
+    /// destination once complete, or the destination itself — and how the
+    /// destination is left as found on failure. None for an in-memory
+    /// output.
+    output_file: Option<crate::vdbe::vacuum::VacuumIntoOutputFile>,
     /// Configuration for the shared vacuum target build state machine.
     target_build_config: Option<VacuumTargetBuildConfig>,
     /// Context for the shared vacuum target build state machine.
@@ -19925,8 +19930,23 @@ fn cleanup_op_vacuum_into(
         target_build_context.cleanup_after_error()?;
     }
 
+    let copy_committed = vacuum_state
+        .target_build_context
+        .as_ref()
+        .is_some_and(|target_build_context| target_build_context.committed());
     vacuum_state.target_build_context = None;
     vacuum_state._output_db = None;
+    // The output database is closed above; leave the destination as it
+    // was found: the temporary copy goes, or a destination the copy was
+    // built at is emptied again (unless the copy committed there and only
+    // its checkpoint failed).
+    if let Err(err) = vacuum_state
+        .output_file
+        .take()
+        .map_or(Ok(()), |output_file| output_file.discard(copy_committed))
+    {
+        tracing::warn!("VACUUM INTO could not discard its failed copy: {err}");
+    }
 
     if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
         let pager = connection.pager.load();
@@ -20084,24 +20104,54 @@ fn op_vacuum_into_inner(
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                let (io, dest_path): (Arc<dyn crate::IO>, String) = if output_in_memory {
+                // A file-backed copy is written through the source database's
+                // IO, so a database on io_uring, or under a test IO, copies
+                // through it as well; a source that lives in memory has no file
+                // IO, so its copy goes through the platform's. The copy is
+                // built in a temporary file beside the destination and moved
+                // there once complete, unless the destination already exists or
+                // the IO cannot rename a file (see VacuumIntoOutputFile).
+                let (io, build_path, output_file): (
+                    Arc<dyn crate::IO>,
+                    String,
+                    Option<crate::vdbe::vacuum::VacuumIntoOutputFile>,
+                ) = if output_in_memory {
                     (
                         Arc::new(crate::MemoryIO::new()),
                         crate::util::MEMORY_PATH.to_string(),
-                    )
-                } else if crate::is_memory_like(&target.path) {
-                    (
-                        Arc::new(crate::io::PlatformIO::new()?),
-                        format!("./{}", target.path),
+                        None,
                     )
                 } else {
-                    (Arc::new(crate::io::PlatformIO::new()?), target.path)
+                    // A file-backed copy is built through the source
+                    // database's IO so a source on io_uring, or under a
+                    // simulator or VFS IO, copies through it as well. A
+                    // source that is only in memory — a `:memory:` database,
+                    // or any database on a volatile in-memory IO — has no
+                    // host file, so its copy is built through the platform IO
+                    // instead and lands on disk where the destination path
+                    // names it.
+                    let io: Arc<dyn crate::IO> =
+                        if source_db.is_in_memory_db() || source_db.io.is_in_memory() {
+                            Arc::new(crate::io::PlatformIO::new()?)
+                        } else {
+                            source_db.io.clone()
+                        };
+                    let dest_path = if crate::is_memory_like(&target.path) {
+                        format!("./{}", target.path)
+                    } else {
+                        target.path
+                    };
+                    let output_file =
+                        crate::vdbe::vacuum::VacuumIntoOutputFile::prepare(io.clone(), &dest_path)?;
+                    let build_path = output_file.build_path().to_string();
+                    (io, build_path, Some(output_file))
                 };
+                vacuum_state.output_file = output_file;
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
                         io,
-                        &dest_path,
+                        &build_path,
                         crate::OpenOptions::new(source_db.dialect())
                             .flags(OpenFlags::Create)
                             .db_opts(output_opts)
@@ -20109,7 +20159,7 @@ fn op_vacuum_into_inner(
                     )?,
                     None => crate::Database::open_file_with_flags(
                         io,
-                        &dest_path,
+                        &build_path,
                         OpenFlags::Create,
                         output_opts,
                         None,
@@ -20139,6 +20189,21 @@ fn op_vacuum_into_inner(
                     target_mvcc_enabled: source_db.mvcc_enabled(),
                     target_auto_vacuum_mode: source_auto_vacuum_mode,
                     copy_mvcc_metadata_table: false,
+                    // Only a copy built in a temporary file is committed in
+                    // batches: a batch that failed, or a process that died,
+                    // leaves a partial copy there, which goes, and the
+                    // destination is untouched until the complete copy is
+                    // moved over it. A copy built at the destination itself —
+                    // an existing empty file, an IO that cannot rename, an
+                    // in-memory output — is one transaction, so that it is
+                    // all or nothing there too: a failure rolls it back and
+                    // leaves no rows. That costs the memory bound on those
+                    // paths, as the copy was before it was batched.
+                    commit_every: vacuum_state
+                        .output_file
+                        .as_ref()
+                        .filter(|output_file| output_file.is_temporary())
+                        .map(|_| crate::vdbe::vacuum::VacuumCommitBatch::VACUUM_INTO),
                 };
 
                 vacuum_state._output_db = Some(output_db);
@@ -20177,6 +20242,18 @@ fn op_vacuum_into_inner(
                     .as_ref()
                     .expect("VacuumTargetBuildContext must be set in FinalizeOutput state");
                 crate::vdbe::vacuum::finalize_vacuum_into_output(target_build_context)?;
+                // The copy is complete and synced: close it, then move it to
+                // the destination (a copy built there is in place already).
+                // Until the move the destination is untouched, and a failure
+                // here discards the copy like any earlier failure.
+                vacuum_state.target_build_context = None;
+                vacuum_state._output_db = None;
+                if let Some(output_file) = vacuum_state.output_file.take() {
+                    if let Err(err) = output_file.install() {
+                        vacuum_state.output_file = Some(output_file);
+                        return Err(err.into());
+                    }
+                }
                 vacuum_state.phase = VacuumIntoOpPhase::Done;
                 continue;
             }
