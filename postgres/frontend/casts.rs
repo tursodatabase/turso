@@ -11,6 +11,7 @@
 use crate::catalog::regclass_text;
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text};
+use crate::pg_type::regtype_text;
 use crate::pg_type::{check_oid_range, type_input};
 use crate::text::{value_text, TextType};
 use std::sync::Arc;
@@ -34,6 +35,7 @@ pub(crate) enum CastType {
     Oid,
     RegClass,
     Uuid,
+    RegType,
     // FIXME(pg-catalog): bytea is not a registered type yet, so the engine casts it as before. It is listed here and in CASTS once bytea has a pg_type row.
     Timestamp,
     TimestampTz,
@@ -53,6 +55,7 @@ impl CastType {
             Self::Oid => "oid",
             Self::RegClass => "regclass",
             Self::Uuid => "uuid",
+            Self::RegType => "regtype",
             Self::Timestamp => "timestamp",
             Self::TimestampTz => "timestamptz",
         }
@@ -76,6 +79,7 @@ impl CastType {
             "oid" => Self::Oid,
             "regclass" => Self::RegClass,
             "uuid" => Self::Uuid,
+            "regtype" => Self::RegType,
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::TimestampTz,
             _ => return None,
@@ -92,7 +96,7 @@ impl CastType {
             Self::Int2 => Some(i64::from(i16::MIN)),
             Self::Int4 => Some(i64::from(i32::MIN)),
             Self::Int8 => Some(i64::MIN),
-            Self::Oid | Self::RegClass => Some(0),
+            Self::Oid | Self::RegClass | Self::RegType => Some(0),
             _ => None,
         }
     }
@@ -148,6 +152,13 @@ const CASTS: &[Cast] = &[
     cast(RegClass, Int4, A),
     cast(RegClass, Int8, A),
     cast(Text, RegClass, I),
+    cast(Int2, RegType, I),
+    cast(Int4, RegType, I),
+    cast(Int8, RegType, I),
+    cast(Oid, RegType, I),
+    cast(RegType, Oid, I),
+    cast(RegType, Int4, A),
+    cast(RegType, Int8, A),
     cast(Int4, Bool, E),
     cast(Bool, Int4, E),
     cast(Bool, Text, A),
@@ -254,7 +265,7 @@ pub(crate) fn convert(
     if target.is_float() {
         return to_float(value, source, target);
     }
-    if target == Oid || target == RegClass {
+    if matches!(target, Oid | RegClass | RegType) {
         return to_oid(value, source);
     }
     match target {
@@ -278,7 +289,7 @@ fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value
         (Value::Text(text), CastType::Numeric) => {
             float_to_i64(parse_numeric(text.as_str())?.round(), target)?
         }
-        (Value::Numeric(Numeric::Integer(n)), Oid | RegClass) if target == Int4 => {
+        (Value::Numeric(Numeric::Integer(n)), Oid | RegClass | RegType) if target == Int4 => {
             i64::from(*n as u32 as i32)
         }
         (Value::Numeric(Numeric::Integer(n)), _) => *n,
@@ -427,6 +438,7 @@ fn to_text(connection: &Arc<Connection>, value: &Value, source: CastType) -> Res
             if *n == 0 { "false" } else { "true" }.to_string()
         }
         (Value::Numeric(Numeric::Integer(n)), CastType::RegClass) => regclass_text(connection, *n),
+        (Value::Numeric(Numeric::Integer(n)), CastType::RegType) => regtype_text(connection, *n),
         (Value::Numeric(Numeric::Integer(n)), _) => n.to_string(),
         // FIXME(pg-catalog): A numeric without a type modifier is REAL, which is read as float8, so `1.0::numeric::text` is `1` where PostgreSQL gives `1.0`. A registered numeric type that needs no modifier gives the value its own output function.
         // FIXME(pg-catalog): Core types a float4 expression REAL, which is read as float8, so no float4 value gets here and `1e6::float4::text` is `1000000` where PostgreSQL gives `1e+06`. A registered float4 type gives the value its own output function.

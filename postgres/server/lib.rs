@@ -745,8 +745,8 @@ enum BinaryEncoding {
     Int8,
     Float8,
     Bytea,
-    /// Four bytes, the oid as an unsigned number.
-    Regclass,
+    /// Four bytes, the oid as an unsigned number: regclass and regtype.
+    OidAlias,
 }
 
 impl BinaryEncoding {
@@ -760,7 +760,7 @@ impl BinaryEncoding {
             Type::INT8 => Some(Self::Int8),
             Type::FLOAT8 => Some(Self::Float8),
             Type::BYTEA => Some(Self::Bytea),
-            Type::REGCLASS => Some(Self::Regclass),
+            Type::REGCLASS | Type::REGTYPE => Some(Self::OidAlias),
             _ => None,
         }
     }
@@ -1026,7 +1026,7 @@ fn binary_parameter_value(
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
             | BinaryEncoding::Float8
-            | BinaryEncoding::Regclass,
+            | BinaryEncoding::OidAlias,
         )
         | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
     }
@@ -1165,7 +1165,7 @@ fn encode_binary(
     connection: &Arc<turso_core::Connection>,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, Regclass, Text};
+    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, OidAlias, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
@@ -1184,7 +1184,7 @@ fn encode_binary(
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
-        (Regclass, Value::Numeric(Integer(i))) => match u32::try_from(*i) {
+        (OidAlias, Value::Numeric(Integer(i))) => match u32::try_from(*i) {
             Ok(oid) => encoder.encode_field_with_type_and_format(
                 &oid,
                 &Type::OID,
@@ -1193,10 +1193,10 @@ fn encode_binary(
             ),
             Err(_) => return Err(binary_value_not_supported(pg_type)),
         },
-        (Bool | Int2 | Int4 | Int8 | Regclass, Value::Numeric(Float(_)))
+        (Bool | Int2 | Int4 | Int8 | OidAlias, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea | Regclass, Value::Text(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8 | Regclass, Value::Blob(_)) => {
+        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea | OidAlias, Value::Text(_))
+        | (Bool | Int2 | Int4 | Int8 | Float8 | OidAlias, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1224,6 +1224,7 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
         "REGCLASS" => Type::REGCLASS,
+        "REGTYPE" => Type::REGTYPE,
         "UUID" => Type::UUID,
         "JSON" => Type::JSON,
         "JSONB" => Type::JSONB,
@@ -1708,6 +1709,12 @@ mod tests {
                 Type::REGCLASS,
                 b"\0\0\0\x04\0\0\x04\xeb",
                 b"\0\0\0\x08pg_class",
+            ),
+            (
+                "SELECT 'int4'::regtype",
+                Type::REGTYPE,
+                b"\0\0\0\x04\0\0\0\x17",
+                b"\0\0\0\x07integer",
             ),
             // The column's type, not the stored value, picks the encoding.
             (

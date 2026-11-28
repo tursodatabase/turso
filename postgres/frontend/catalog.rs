@@ -693,6 +693,7 @@ pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
         "MACADDR" => 829,
         "OID" => 26,
         "REGCLASS" => 2205,
+        "REGTYPE" => 2206,
         _ => return None,
     };
     Some(oid)
@@ -2165,7 +2166,7 @@ impl SnapshotRows for PgTypeTable {
     }
 }
 
-fn user_type_oid(name: &str) -> i64 {
+pub(crate) fn user_type_oid(name: &str) -> i64 {
     50000
         + (name
             .as_bytes()

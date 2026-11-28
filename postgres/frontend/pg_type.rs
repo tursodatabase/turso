@@ -7,13 +7,16 @@ mod boolean;
 mod integer;
 mod integer_operators;
 mod oid;
+mod oid_alias;
 mod regclass;
+mod regtype;
 mod uuid;
 
 pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
 pub(crate) use oid::{check_oid_range, oid_input};
 pub(crate) use regclass::{parse_regclass, RegClassInput};
+pub(crate) use regtype::regtype_text;
 pub(crate) use uuid::{canonical_uuid, random_uuid_text};
 
 use crate::error::sqlstate_error;
@@ -23,7 +26,8 @@ use turso_core::schema::{RelationKind, SchemaBuilder};
 use turso_core::types::{TextInput, Type};
 use turso_core::{Connection, Result};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_SYNTAX_ERROR,
+    SQLSTATE_UNDEFINED_OBJECT,
 };
 use turso_pg_parser::WrittenTypeName;
 
@@ -125,7 +129,7 @@ macro_rules! built_in_types {
 /// another type without reading its text, such as point, xml or money, and a
 /// type that it refuses as the type of a column, such as interval or time,
 /// has no row.
-pub(crate) static BUILT_IN_TYPES: [BuiltInType; 21] = built_in_types! {
+pub(crate) static BUILT_IN_TYPES: [BuiltInType; 22] = built_in_types! {
     (16, "bool", "B", true, 1, true, "c", "p", 1000, ",", Support::Registered(&boolean::Boolean)),
     // FIXME(registered-types): bytea: the frontend uses the type that core registers, which stores text as its bytes and does not read the hex and escape formats. A bytea type registered in the frontend, with its INPUT, replaces this.
     (17, "bytea", "U", false, -1, false, "i", "x", 1001, ",", Support::NotRegistered(FormatName::Plain("bytea"))),
@@ -157,7 +161,8 @@ pub(crate) static BUILT_IN_TYPES: [BuiltInType; 21] = built_in_types! {
     (1184, "timestamptz", "D", true, 8, true, "d", "p", 0, ",", Support::NotRegistered(FormatName::Plain("timestamp with time zone"))),
     // FIXME(registered-types): numeric with a precision is the type that core registers, and without one it is the REAL of the engine, which does not keep all its digits. A numeric type registered in the frontend, with its INPUT, replaces this.
     (1700, "numeric", "N", false, -1, false, "i", "m", 1231, ",", Support::NotRegistered(FormatName::Numeric)),
-    (2205, "regclass", "N", false, 4, true, "i", "p", 2210, ",", Support::Registered(&regclass::RegClass)),
+    (2205, "regclass", "N", false, 4, true, "i", "p", 2210, ",", Support::Registered(&oid_alias::OidAlias::RegClass)),
+    (2206, "regtype", "N", false, 4, true, "i", "p", 2211, ",", Support::Registered(&oid_alias::OidAlias::RegType)),
     (2950, "uuid", "U", false, 16, false, "c", "p", 2951, ",", Support::Registered(&uuid::Uuid)),
     // FIXME(registered-types): jsonb: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A jsonb type registered in the frontend, with its INPUT, replaces this.
     (3802, "jsonb", "U", false, -1, false, "i", "x", 3807, ",", Support::NotRegistered(FormatName::Plain("jsonb"))),
@@ -175,7 +180,7 @@ impl BuiltInType {
 }
 
 /// FIXME(pg-catalog): These types have no row in `BUILT_IN_TYPES`, because tursopg does not have them, but `format_type` prints their names: an oid can reach it as a number. An entry goes away when its type gets a row.
-const NAMED_WITHOUT_A_ROW: [(i64, FormatName); 7] = [
+const NAMED_WITHOUT_A_ROW: [(i64, FormatName); 6] = [
     // FIXME(pg-catalog): "char" is not a type that tursopg has.
     (18, FormatName::Plain("\"char\"")),
     // FIXME(pg-catalog): name is not a type that tursopg has.
@@ -188,8 +193,6 @@ const NAMED_WITHOUT_A_ROW: [(i64, FormatName); 7] = [
     (1186, FormatName::Plain("interval")),
     // FIXME(pg-catalog): void is the type of a function result only.
     (2278, FormatName::Plain("void")),
-    // FIXME(pg-catalog): regtype is stored as an integer.
-    (2206, FormatName::Plain("regtype")),
 ];
 
 /// The name that `format_type` prints for the type with the oid `oid` and the
@@ -250,6 +253,8 @@ pub(crate) struct NamedType {
     /// The name of the type as PostgreSQL writes it in an error, with its
     /// schema when the name was written with one.
     pub(crate) written_name: String,
+    /// The name without its schema.
+    pub(crate) name: String,
     /// The modifiers written after the name, such as 10 and 2 in
     /// `numeric(10, 2)`.
     pub(crate) modifiers: Vec<i64>,
@@ -289,6 +294,15 @@ pub(crate) fn lookup_type_name(conn: &Arc<Connection>, text: &str) -> Result<Nam
                 None,
             ));
         }
+        if let Some(schema) = written.schema.as_deref() {
+            if schema != "pg_catalog" && conn.qualifier(schema).is_none() {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_SCHEMA_NAME,
+                    format!("schema \"{schema}\" does not exist"),
+                    None,
+                ));
+            }
+        }
         return Err(sqlstate_error(
             SQLSTATE_UNDEFINED_OBJECT,
             format!("type \"{written_name}\" does not exist"),
@@ -308,6 +322,7 @@ pub(crate) fn lookup_type_name(conn: &Arc<Connection>, text: &str) -> Result<Nam
     }
     Ok(NamedType {
         written_name,
+        name: written.name,
         modifiers: written.modifiers,
         array_dimensions,
         kind,
@@ -330,7 +345,7 @@ fn only_postgres_has_type(typname: &str) -> bool {
 }
 
 /// FIXME(pg-catalog): These are the types of `pg_catalog` in PostgreSQL 18 that have no row in `BUILT_IN_TYPES`, so that a name of one is refused as not supported and not as a type that does not exist. A name leaves this list when its type gets a row.
-const TYPES_ONLY_POSTGRES_HAS: [&str; 85] = [
+const TYPES_ONLY_POSTGRES_HAS: [&str; 83] = [
     "time",
     "timetz",
     "point",
@@ -345,8 +360,6 @@ const TYPES_ONLY_POSTGRES_HAS: [&str; 85] = [
     "regprocedure",
     "regoper",
     "regoperator",
-    "regclass",
-    "regtype",
     "regconfig",
     "regdictionary",
     "regnamespace",

@@ -1,0 +1,349 @@
+# regtype is the oid of a type. A cast from text reads a type name the way a
+# statement writes one, and a cast to text prints the name back.
+
+@database :memory:
+
+setup types {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+}
+
+test regtype-gives-the-oid-of-a-built-in-type {
+    SELECT 'int4'::regtype::oid, 'bool'::regtype::oid, 'text'::regtype::oid, 'regtype'::regtype::oid;
+}
+expect {
+    23|16|25|2206
+}
+
+test regtype-reads-the-names-a-statement-writes {
+    SELECT 'integer'::regtype::oid, 'int'::regtype::oid, 'smallint'::regtype::oid, 'bigint'::regtype::oid, 'double precision'::regtype::oid, 'character varying'::regtype::oid, 'timestamp with time zone'::regtype::oid;
+}
+expect {
+    23|23|21|20|701|1043|1184
+}
+
+test regtype-prints-the-name-as-format-type-does {
+    SELECT 'int8'::regtype::text, 'varchar'::regtype::text, 'timestamptz'::regtype::text, 'bool'::regtype::text, 'float8'::regtype::text, 'float4'::regtype::text, 'text'::regtype::text, 'uuid'::regtype::text;
+}
+expect {
+    bigint|character varying|timestamp with time zone|boolean|double precision|real|text|uuid
+}
+
+test regtype-reads-and-drops-a-type-modifier {
+    SELECT 'varchar(10)'::regtype::text, 'numeric(10, 2)'::regtype::text;
+}
+expect {
+    character varying|numeric
+}
+
+test regtype-reads-a-schema-and-a-name {
+    SELECT 'pg_catalog.int4'::regtype::text, 'pg_catalog.text'::regtype::text;
+}
+expect {
+    integer|text
+}
+
+test regtype-folds-unquoted-names-to-lowercase {
+    SELECT 'INT4'::regtype::text, ' Integer '::regtype::text;
+}
+expect {
+    integer|integer
+}
+
+test regtype-reads-a-quoted-name {
+    SELECT '"int4"'::regtype::text, '"text"'::regtype::text;
+}
+expect {
+    integer|text
+}
+
+test regtype-keeps-the-case-of-a-quoted-name {
+    SELECT '"INT4"'::regtype;
+}
+@sqlstate 42704
+expect error {
+    type "INT4" does not exist
+}
+
+test regtype-reads-an-array-type {
+    SELECT 'int4[]'::regtype::oid, '_int4'::regtype::oid, 'text[]'::regtype::text, 'integer[]'::regtype::text, 'int8[][]'::regtype::text;
+}
+expect {
+    1007|1007|text[]|integer[]|bigint[]
+}
+
+test regtype-prints-the-name-of-an-array-type {
+    SELECT 1016::regtype::text, 1009::regtype::text, 2210::regtype::text;
+}
+expect {
+    bigint[]|text[]|regclass[]
+}
+
+test regtype-of-zero-is-a-dash {
+    SELECT '-'::regtype::oid, 0::regtype::text;
+}
+expect {
+    0|-
+}
+
+test regtype-reads-digits-as-an-oid {
+    SELECT '23'::regtype::text, '4294967295'::regtype::text, '2206'::regtype::text;
+}
+expect {
+    integer|4294967295|regtype
+}
+
+test regtype-prints-the-number-of-an-oid-without-a-type {
+    SELECT 999999::regtype::text;
+}
+expect {
+    999999
+}
+
+test regtype-of-a-missing-type-fails {
+    SELECT 'nosuch'::regtype;
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+test regtype-of-a-missing-schema-fails {
+    SELECT 'nosuch.int4'::regtype;
+}
+@sqlstate 3F000
+expect error {
+    schema "nosuch" does not exist
+}
+
+test regtype-refuses-text-that-is-not-a-type-name {
+    SELECT 'int4 int4'::regtype;
+}
+@sqlstate 42601
+expect error {
+    syntax error at or near "int4"
+}
+@sqlstate 42601
+expect @tursopg error {
+    invalid type name "int4 int4"
+}
+
+test regtype-refuses-the-empty-text {
+    SELECT ''::regtype;
+}
+@sqlstate 42601
+expect error {
+    invalid type name ""
+}
+
+test regtype-refuses-an-oid-out-of-range {
+    SELECT '4294967296'::regtype;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+@setup types
+test regtype-finds-an-enum-type {
+    SELECT 'mood'::regtype::text, 'public.mood'::regtype::text, 'mood'::regtype = (SELECT oid FROM pg_type WHERE typname = 'mood');
+}
+expect {
+    mood|mood|t
+}
+
+@setup types
+test regtype-finds-a-domain {
+    SELECT 'posint'::regtype::text, 'posint'::regtype = (SELECT oid FROM pg_type WHERE typname = 'posint');
+}
+expect {
+    posint|t
+}
+
+@setup types
+test regtype-prints-an-enum-type-of-a-column {
+    CREATE TABLE feelings (m mood);
+    SELECT atttypid::regtype::text FROM pg_attribute WHERE attrelid = 'feelings'::regclass AND attname = 'm';
+}
+expect {
+    mood
+}
+
+test regtype-matches-the-types-of-columns {
+    CREATE TABLE r (a int, b text, c bigint);
+    SELECT attname FROM pg_attribute WHERE attrelid = 'r'::regclass AND atttypid = 'text'::regtype;
+}
+expect {
+    b
+}
+
+test regtype-prints-the-types-of-columns {
+    CREATE TABLE r (a int, b text, c bigint, d varchar(5));
+    SELECT attname, atttypid::regtype::text FROM pg_attribute WHERE attrelid = 'r'::regclass AND attnum > 0 ORDER BY attnum;
+}
+expect {
+    a|integer
+    b|text
+    c|bigint
+    d|character varying
+}
+
+test regtype-is-compared-with-an-oid {
+    SELECT 'int4'::regtype = 23, 'int4'::regtype = 23::oid, 'int4'::regtype IN (21, 23), 'int4'::regtype BETWEEN 1 AND 30;
+}
+expect {
+    t|t|t|t
+}
+
+test regtype-is-compared-with-a-regtype {
+    SELECT 'int4'::regtype = 'integer'::regtype, 'int4'::regtype <> 'text'::regtype, 'int4'::regtype < 'text'::regtype;
+}
+expect {
+    t|t|t
+}
+
+test regtype-has-no-arithmetic {
+    SELECT 'int4'::regtype + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: regtype
+}
+
+test regtype-is-compared-with-a-regclass-as-oids {
+    SELECT 'int4'::regtype = 'pg_class'::regclass, 'int4'::regtype = 23::oid::regclass;
+}
+expect {
+    f|t
+}
+
+test regtype-casts-to-and-from-the-integers {
+    SELECT 23::regtype::text, 23::int2::regtype::text, 23::int8::regtype::text, 23::oid::regtype::text, 'int4'::regtype::int4, 'int4'::regtype::int8, 'int4'::regtype::oid::int4;
+}
+expect {
+    integer|integer|integer|integer|23|23|23
+}
+
+test regtype-casts-to-an-integer-by-assignment {
+    CREATE TABLE r (n int, b bigint);
+    INSERT INTO r VALUES ('int4'::regtype, 'text'::regtype);
+    SELECT n, b FROM r;
+}
+expect {
+    23|25
+}
+
+test regtype-casts-text-with-an-explicit-cast-only {
+    CREATE TABLE r (t regtype);
+    INSERT INTO r VALUES ('int4'::text);
+}
+@sqlstate 42804
+expect error {
+    column "t" is of type regtype but expression is of type text
+}
+@sqlstate 42804
+expect @tursopg error {
+    a value of type text cannot be assigned to type regtype
+}
+
+test regtype-refuses-a-cast-to-boolean {
+    SELECT 'int4'::regtype::boolean;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type regtype to boolean
+}
+@sqlstate 42846
+expect @tursopg error {
+    cannot cast type regtype to bool
+}
+
+test regtype-refuses-a-cast-from-a-regclass {
+    SELECT 'pg_class'::regclass::regtype;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type regclass to regtype
+}
+
+test regtype-is-stored-in-a-column {
+    CREATE TABLE r (t regtype);
+    INSERT INTO r VALUES ('int4'), ('text'), (0), (NULL);
+    SELECT t, t::oid FROM r ORDER BY t::oid NULLS LAST;
+}
+expect {
+    -|0
+    integer|23
+    text|25
+    |
+}
+
+test regtype-a-column-keeps-its-type {
+    CREATE TABLE r (t regtype);
+    SELECT atttypid::regtype::text FROM pg_attribute WHERE attrelid = 'r'::regclass AND attname = 't';
+}
+expect {
+    regtype
+}
+
+test regtype-reads-the-name-of-a-parameter-default {
+    CREATE TABLE r (t regtype DEFAULT 'int4');
+    INSERT INTO r DEFAULT VALUES;
+    SELECT t FROM r;
+}
+expect {
+    integer
+}
+
+test regtype-format-type-prints-array-oids {
+    SELECT format_type(1016, NULL), format_type(1009, NULL), format_type(2211, NULL);
+}
+expect {
+    bigint[]|text[]|regtype[]
+}
+
+test regtype-input-is-checked-by-pg-input-is-valid {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT pg_input_is_valid('int4', 'regtype'), pg_input_is_valid('mood', 'regtype'), pg_input_is_valid('23', 'regtype'), pg_input_is_valid('nosuch', 'regtype');
+}
+expect {
+    t|t|t|f
+}
+
+test regtype-input-error-info-says-why {
+    SELECT message, sql_error_code FROM pg_input_error_info('nosuch', 'regtype');
+}
+expect {
+    type "nosuch" does not exist|42704
+}
+
+test regtype-prints-the-name-of-a-type-that-tursopg-has-no-row-for {
+    SELECT 1083::regtype::text, 1186::regtype::text, 1042::regtype::text, 19::regtype::text;
+}
+expect {
+    time without time zone|interval|character|name
+}
+
+test regtype-refuses-a-modifier-on-a-type-that-takes-none {
+    SELECT 'int4(3)'::regtype;
+}
+@sqlstate 42601
+expect error {
+    type modifier is not allowed for type "int4"
+}
+
+test regtype-refuses-a-modifier-on-an-enum-type {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 'mood(3)'::regtype;
+}
+@sqlstate 42601
+expect error {
+    type modifier is not allowed for type "mood"
+}
+
+test regtype-reads-a-modifier-on-the-type-of-an-array {
+    SELECT 'varchar(3)[]'::regtype::text, '_varchar(3)'::regtype::text, 'numeric(3, 1)[]'::regtype::text;
+}
+expect {
+    character varying[]|character varying[]|numeric[]
+}
