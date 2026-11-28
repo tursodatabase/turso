@@ -621,6 +621,24 @@ Out-of-bounds assignments are silently ignored (the array is unchanged).
 
 ---
 
+## Lower Bounds
+
+The subscript of the first element of an array is its lower bound. It is 1, unless the array is written with other bounds, as in PostgreSQL:
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER[]) STRICT;
+INSERT INTO t VALUES (1, '[0:2]={10,20,30}');
+
+SELECT a FROM t;
+-- [0:2]={10,20,30}
+```
+
+The text in front of the braces gives the lower bound and the upper bound. `[2]` stands for `[1:2]`. The upper bound must fit the number of elements, and no space is allowed inside the brackets. An array that starts at 1 is printed without bounds. Two arrays with the same elements and other lower bounds are different values.
+
+An array with a lower bound other than 1 takes 9 more bytes. A Turso version that does not know lower bounds cannot read it: it reports a corrupt record or reads the array as NULL.
+
+---
+
 ## Examples
 
 ### Tagging system

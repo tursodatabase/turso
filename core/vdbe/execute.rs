@@ -149,9 +149,9 @@ impl OpenedBTree {
 use super::{
     array::{
         array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
-        parse_text_array, serialize_array_from_blob,
+        parse_text_array_value, serialize_array_from_blob,
     },
-    array_value::{encode_array, ArrayView, DEFAULT_LOWER_BOUND},
+    array_value::{encode_array, ArrayValue, ArrayView, DEFAULT_LOWER_BOUND},
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
         IntegrityCkData, IvmSumKind, RegisterOrLiteral, SorterOpenData,
@@ -2850,26 +2850,26 @@ pub fn op_array_encode(
     }
 
     // Extract elements from either blob (MakeArray) or text (JSON literal)
-    let raw_elements = match val {
-        Value::Blob(b) => array_values_from_blob(b).ok(),
-        Value::Text(text) => parse_text_array(text.as_str()),
+    let raw_array = match val {
+        Value::Blob(b) => ArrayValue::decode(b).ok(),
+        Value::Text(text) => parse_text_array_value(text.as_str()),
         _ => None,
     };
-    let Some(raw_elements) = raw_elements else {
+    let Some(raw_array) = raw_array else {
         return crate::error::cold_return(Err(non_array_value_error(element_type, target).into()));
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
-    if raw_elements.len() > MAX_ARRAY_ELEMENTS {
+    if raw_array.elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
             "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target}"
         );
     }
 
-    let coerced_elements = convert_array_elements(raw_elements, *dimensions, data)?;
+    let coerced_elements = convert_array_elements(raw_array.elements, *dimensions, data)?;
 
     // Serialize coerced elements as a native record-format BLOB
-    state.registers[*reg].set_value(encode_array(DEFAULT_LOWER_BOUND, &coerced_elements)?);
+    state.registers[*reg].set_value(encode_array(raw_array.lower_bound, &coerced_elements)?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2918,10 +2918,10 @@ fn convert_array_elements(
             }
             (_, Value::Null) => Value::Null,
             (2.., Value::Blob(sub_array)) => {
+                let sub_array = ArrayValue::decode(&sub_array).map_err(|_| not_an_array())?;
                 let sub_elements =
-                    array_values_from_blob(&sub_array).map_err(|_| not_an_array())?;
-                let sub_elements = convert_array_elements(sub_elements, dimensions - 1, data)?;
-                encode_array(DEFAULT_LOWER_BOUND, &sub_elements)?
+                    convert_array_elements(sub_array.elements, dimensions - 1, data)?;
+                encode_array(sub_array.lower_bound, &sub_elements)?
             }
             (2.., Value::Numeric(_) | Value::Text(_)) => return Err(not_an_array()),
             (1, element @ (Value::Numeric(_) | Value::Text(_) | Value::Blob(_))) => {

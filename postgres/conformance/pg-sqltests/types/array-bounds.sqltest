@@ -1,0 +1,60 @@
+# The lower bound of an array: the subscript of its first element.
+
+@database :memory:
+
+test array-bounds-are-read-and-printed {
+    SELECT '[0:1]={a,b}'::text[], '[-2:0]={a,b,c}'::text[], '[5:5]={a}'::text[];
+}
+expect {
+    [0:1]={a,b}|[-2:0]={a,b,c}|[5:5]={a}
+}
+
+test array-bounds-of-one-are-not-printed {
+    SELECT '[1:2]={a,b}'::text[], '{a,b}'::text[];
+}
+expect {
+    {a,b}|{a,b}
+}
+
+test array-bounds-allow-spaces-around-the-bounds {
+    SELECT ' [0:1] = {a,b} '::text[];
+}
+expect {
+    [0:1]={a,b}
+}
+
+test an-array-bound-of-one-number-is-the-upper-bound {
+    SELECT '[2]={a,b}'::text[];
+}
+expect {
+    {a,b}
+}
+
+test array-bounds-are-stored-in-a-column {
+    CREATE TABLE t (id int, a text[]);
+    INSERT INTO t VALUES (1, '[0:1]={a,b}'), (2, '{a,b}'), (3, '[7:8]={a,b}');
+    SELECT a FROM t ORDER BY id;
+}
+expect {
+    [0:1]={a,b}
+    {a,b}
+    [7:8]={a,b}
+}
+
+test arrays-with-other-bounds-are-different-values {
+    SELECT '[0:1]={a,b}'::text[] = '{a,b}'::text[],
+           '[0:1]={a,b}'::text[] <> '{a,b}'::text[],
+           '[0:1]={a,b}'::text[] = '[0:1]={a,b}'::text[];
+}
+expect {
+    f|t|t
+}
+
+test arrays-with-other-bounds-are-distinct {
+    CREATE TABLE t (a text[]);
+    INSERT INTO t VALUES ('{a,b}'), ('[0:1]={a,b}'), ('[0:1]={a,b}'), ('[1:2]={a,b}');
+    SELECT count(*), count(DISTINCT a) FROM t;
+}
+expect {
+    4|2
+}

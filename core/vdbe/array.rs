@@ -29,12 +29,22 @@ pub fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
 /// Parse a text array literal in PG format `{1, hello, NULL}` into a Vec<Value>.
 /// Handles integers, floats, strings (quoted and unquoted), and NULL.
 pub(crate) fn parse_text_array(text: &str) -> Option<Vec<Value>> {
+    parse_text_array_value(text).map(|array| array.elements)
+}
+
+/// [parse_text_array] with the lower bound that the text gives.
+pub(crate) fn parse_text_array_value(text: &str) -> Option<ArrayValue> {
     parse_text_array_as(text, UnquotedElements::Numbers)
 }
 
 /// [parse_text_array] for an array whose elements are texts, such as a
 /// `text[]`: an unquoted `1.0` stays the text `1.0`.
 pub fn parse_text_array_of_texts(text: &str) -> Option<Vec<Value>> {
+    parse_text_array_of_texts_value(text).map(|array| array.elements)
+}
+
+/// [parse_text_array_of_texts] with the lower bound that the text gives.
+pub(crate) fn parse_text_array_of_texts_value(text: &str) -> Option<ArrayValue> {
     parse_text_array_as(text, UnquotedElements::Texts)
 }
 
@@ -46,12 +56,38 @@ enum UnquotedElements {
     Texts,
 }
 
-fn parse_text_array_as(text: &str, unquoted: UnquotedElements) -> Option<Vec<Value>> {
-    let text = text.trim();
-    if text.starts_with('{') && text.ends_with('}') {
-        return parse_pg_text_array(text, unquoted);
+fn parse_text_array_as(text: &str, unquoted: UnquotedElements) -> Option<ArrayValue> {
+    let (bounds, body) = split_bounds(text.trim())?;
+    if !(body.starts_with('{') && body.ends_with('}')) {
+        return None;
     }
-    None
+    let elements = parse_pg_text_array(body, unquoted)?;
+    let Some((lower_bound, upper_bound)) = bounds else {
+        return Some(ArrayValue::new(elements));
+    };
+    let length = i64::from(upper_bound) - i64::from(lower_bound) + 1;
+    if upper_bound < lower_bound || upper_bound == i32::MAX || length != elements.len() as i64 {
+        return None;
+    }
+    Some(ArrayValue {
+        lower_bound,
+        elements,
+    })
+}
+
+/// Splits the bounds of `[0:1]={1,2}` from its braces. `[2]` stands for
+/// `[1:2]`. The bounds are None for text without them.
+fn split_bounds(text: &str) -> Option<(Option<(i32, i32)>, &str)> {
+    let Some(rest) = text.strip_prefix('[') else {
+        return Some((None, text));
+    };
+    let (range, body) = rest.split_once(']')?;
+    let (lower, upper) = match range.split_once(':') {
+        Some((lower, upper)) => (lower.parse().ok()?, upper.parse().ok()?),
+        None => (DEFAULT_LOWER_BOUND, range.parse().ok()?),
+    };
+    let body = body.trim_start().strip_prefix('=')?.trim_start();
+    Some((Some((lower, upper)), body))
 }
 
 /// Parse a PG-style text array like `{1, hello, NULL, 3.14}` into a Vec<Value>.
@@ -168,7 +204,13 @@ fn parse_pg_text_array(text: &str, unquoted: UnquotedElements) -> Option<Vec<Val
 /// - Blob elements → as `dialect` writes them
 pub(crate) fn serialize_array_from_blob(blob: &[u8], dialect: &dyn Dialect) -> Result<String> {
     let view = ArrayView::parse(blob)?;
-    let mut result = String::from("{");
+    let mut result = String::new();
+    if view.lower_bound() != DEFAULT_LOWER_BOUND {
+        let count = view.elements().count() as i64;
+        let upper_bound = i64::from(view.lower_bound()) + count - 1;
+        let _ = write!(result, "[{}:{upper_bound}]=", view.lower_bound());
+    }
+    result.push('{');
     let mut first = true;
     for vref in view.elements() {
         let vref = vref?;
@@ -831,6 +873,69 @@ mod tests {
             exec_array_cat(&Value::Null, &Value::from_i64(1)).unwrap(),
             Value::Null,
         );
+    }
+
+    fn bounded_blob(lower_bound: i32, elements: &[Value]) -> Vec<u8> {
+        match encode_array(lower_bound, elements).unwrap() {
+            Value::Blob(blob) => blob.to_vec(),
+            other => panic!("expected a blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize_prints_the_bounds_of_an_array_that_does_not_start_at_one() {
+        let elements = [Value::from_i64(1), Value::from_i64(2)];
+        let dialect = crate::dialect::cannot_parse::DialectThatCannotParse;
+        for (lower_bound, expected) in [(1, "{1,2}"), (0, "[0:1]={1,2}"), (-3, "[-3:-2]={1,2}")] {
+            let blob = bounded_blob(lower_bound, &elements);
+            assert_eq!(
+                serialize_array_from_blob(&blob, &dialect).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn parse_reads_the_bounds_of_an_array_text() {
+        for (text, lower_bound, count) in [
+            ("{1,2}", 1, 2),
+            ("[1:2]={1,2}", 1, 2),
+            ("[2]={1,2}", 1, 2),
+            ("[0:1]={1,2}", 0, 2),
+            (" [-2:0] = {1,2,3} ", -2, 3),
+            ("[2147483646:2147483646]={1}", 2147483646, 1),
+        ] {
+            let array = parse_text_array_value(text).unwrap();
+            assert_eq!(
+                (array.lower_bound, array.elements.len()),
+                (lower_bound, count)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_refuses_bounds_that_do_not_fit_the_elements() {
+        for text in [
+            "[0:3]={1,2}",
+            "[0:1]={1,2,3}",
+            "[1:0]={}",
+            "[0:-1]={}",
+            "[2147483647:2147483647]={1}",
+            "[2147483647:2147483648]={1,2}",
+            "[x:1]={1,2}",
+            "[ 0:1]={1,2}",
+            "[0 :1]={1,2}",
+            "[0: 1]={1,2}",
+            "[0:1 ]={1,2}",
+            "[0:1]",
+            "[0:1]{1,2}",
+            "[2]={1}",
+            "[0]={}",
+            "[]={}",
+            "[1:2][0:1]={{1,2},{3,4}}",
+        ] {
+            assert!(parse_text_array_value(text).is_none(), "{text}");
+        }
     }
 
     #[test]

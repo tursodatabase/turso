@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 use crate::numeric::decimal::{numeric_compare, numeric_compare_operands, numeric_hash};
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
-use crate::vdbe::array::{parse_text_array, parse_text_array_of_texts};
+use crate::vdbe::array::{parse_text_array_of_texts_value, parse_text_array_value};
 use crate::vdbe::array_value::ArrayValue;
 use crate::{Value, ValueRef};
 
@@ -43,10 +43,10 @@ impl TypeOrdering {
     pub fn compare(self, left: ValueRef, right: ValueRef) -> Ordering {
         match self {
             Self::Numeric => numeric_compare(left, right),
-            Self::Array => ArraySortKey::of(left, parse_text_array)
-                .cmp(&ArraySortKey::of(right, parse_text_array)),
-            Self::TextArray => ArraySortKey::of(left, parse_text_array_of_texts)
-                .cmp(&ArraySortKey::of(right, parse_text_array_of_texts)),
+            Self::Array => ArraySortKey::of(left, parse_text_array_value)
+                .cmp(&ArraySortKey::of(right, parse_text_array_value)),
+            Self::TextArray => ArraySortKey::of(left, parse_text_array_of_texts_value)
+                .cmp(&ArraySortKey::of(right, parse_text_array_of_texts_value)),
         }
     }
 
@@ -64,8 +64,8 @@ impl TypeOrdering {
     pub fn hash<H: Hasher>(self, value: ValueRef, state: &mut H) {
         match self {
             Self::Numeric => numeric_hash(value, state),
-            Self::Array => ArraySortKey::of(value, parse_text_array).hash(state),
-            Self::TextArray => ArraySortKey::of(value, parse_text_array_of_texts).hash(state),
+            Self::Array => ArraySortKey::of(value, parse_text_array_value).hash(state),
+            Self::TextArray => ArraySortKey::of(value, parse_text_array_of_texts_value).hash(state),
         }
     }
 }
@@ -81,11 +81,11 @@ enum ArraySortKey<'a> {
 
 impl<'a> ArraySortKey<'a> {
     /// `parse_text` reads an array in text form.
-    fn of(value: ValueRef<'a>, parse_text: fn(&str) -> Option<Vec<Value>>) -> Self {
+    fn of(value: ValueRef<'a>, parse_text: fn(&str) -> Option<ArrayValue>) -> Self {
         let array = match value {
             ValueRef::Null => return Self::Null,
             ValueRef::Blob(blob) => ArrayValue::decode(blob).ok(),
-            ValueRef::Text(text) => parse_text(text.as_str()).map(ArrayValue::new),
+            ValueRef::Text(text) => parse_text(text.as_str()),
             ValueRef::Numeric(_) => None,
         };
         match array {
