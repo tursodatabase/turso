@@ -381,6 +381,28 @@ expect {
     3
 }
 
+test cast-numeric-column-to-integers-exactly {
+    CREATE TABLE t (a numeric(30,1), b numeric(30,20), c numeric(20,0));
+    INSERT INTO t VALUES
+        ('9007199254740993', '0.49999999999999999999', '9223372036854775807'),
+        ('-9007199254740993.5', '-0.5', '-9223372036854775808');
+    SELECT a::int8, b::int4, b::int2, c::int8 FROM t ORDER BY a DESC;
+}
+expect {
+    9007199254740993|0|0|9223372036854775807
+    -9007199254740994|-1|-1|-9223372036854775808
+}
+
+test cast-numeric-column-out-of-range-of-int8 {
+    CREATE TABLE t (c numeric(20,0));
+    INSERT INTO t VALUES ('9223372036854775808');
+    SELECT c::int8 FROM t;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
 test cast-numeric-to-float4 {
     SELECT (2.5)::float4::text;
 }
@@ -1887,6 +1909,18 @@ test assign-numeric-to-int4-column {
 }
 expect {
     3
+}
+
+test assign-numeric-column-to-int8-column-exactly {
+    CREATE TABLE n (a numeric(30,1));
+    INSERT INTO n VALUES ('9007199254740993'), ('-9007199254740993.5');
+    CREATE TABLE t (c int8);
+    INSERT INTO t SELECT a FROM n;
+    SELECT c FROM t ORDER BY c DESC;
+}
+expect {
+    9007199254740993
+    -9007199254740994
 }
 
 test assign-numeric-to-int8-column {

@@ -405,6 +405,44 @@ fn from_jsonb(connection: &Arc<Connection>, value: &Value, target: CastType) -> 
     ))
 }
 
+fn to_oid(value: &Value, source: CastType) -> Result<Value> {
+    match value {
+        Value::Numeric(Numeric::Integer(n @ -0x8000_0000..=-1)) if source != Int8 => {
+            Ok(Value::from_i64(n + (1 << 32)))
+        }
+        _ => check_oid_range(value),
+    }
+}
+
+fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value> {
+    let number = match (value, source) {
+        // A numeric with a type modifier is stored as its text, which is cast
+        // exactly, and not through a float8.
+        (Value::Text(text), CastType::Numeric) => {
+            return numeric_text_to_integer(text.as_str(), target)
+        }
+        (Value::Numeric(Numeric::Integer(n)), Oid | RegClass | RegType) if target == Int4 => {
+            i64::from(*n as u32 as i32)
+        }
+        (Value::Numeric(Numeric::Integer(n)), _) => *n,
+        // The server reads the text of a parameter with no type as a float
+        // when it looks like one. As text it is not an integer.
+        (Value::Numeric(Numeric::Float(f)), CastType::Text) => {
+            let read = type_input(target.oid()).expect("an integer type has an INPUT");
+            return read(None, &format!("{:?}", f64::from(*f)));
+        }
+        (Value::Numeric(Numeric::Float(f)), CastType::Numeric) => {
+            float_to_i64(f64::from(*f).round(), target)?
+        }
+        (Value::Numeric(Numeric::Float(f)), _) => {
+            float_to_i64(f64::from(*f).round_ties_even(), target)?
+        }
+        _ => return Ok(value.clone()),
+    };
+    check_integer_range(number, target)?;
+    Ok(Value::from_i64(number))
+}
+
 /// The integer of type `target` that the numeric text `text` rounds to, half
 /// away from zero, as PostgreSQL casts a numeric to an integer type:
 /// `9007199254740993` stays exact and `-1.5` is -2.
@@ -428,42 +466,6 @@ fn numeric_text_to_integer(text: &str, target: CastType) -> Result<Value> {
         .ok_or_else(|| out_of_range(target))?;
     let number = if negative { -magnitude } else { magnitude };
     let number = i64::try_from(number).map_err(|_| out_of_range(target))?;
-    check_integer_range(number, target)?;
-    Ok(Value::from_i64(number))
-}
-
-fn to_oid(value: &Value, source: CastType) -> Result<Value> {
-    match value {
-        Value::Numeric(Numeric::Integer(n @ -0x8000_0000..=-1)) if source != Int8 => {
-            Ok(Value::from_i64(n + (1 << 32)))
-        }
-        _ => check_oid_range(value),
-    }
-}
-
-fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value> {
-    let number = match (value, source) {
-        (Value::Text(text), CastType::Numeric) => {
-            float_to_i64(parse_numeric(text.as_str())?.round(), target)?
-        }
-        (Value::Numeric(Numeric::Integer(n)), Oid | RegClass | RegType) if target == Int4 => {
-            i64::from(*n as u32 as i32)
-        }
-        (Value::Numeric(Numeric::Integer(n)), _) => *n,
-        // The server reads the text of a parameter with no type as a float
-        // when it looks like one. As text it is not an integer.
-        (Value::Numeric(Numeric::Float(f)), CastType::Text) => {
-            let read = type_input(target.oid()).expect("an integer type has an INPUT");
-            return read(None, &format!("{:?}", f64::from(*f)));
-        }
-        (Value::Numeric(Numeric::Float(f)), CastType::Numeric) => {
-            float_to_i64(f64::from(*f).round(), target)?
-        }
-        (Value::Numeric(Numeric::Float(f)), _) => {
-            float_to_i64(f64::from(*f).round_ties_even(), target)?
-        }
-        _ => return Ok(value.clone()),
-    };
     check_integer_range(number, target)?;
     Ok(Value::from_i64(number))
 }
