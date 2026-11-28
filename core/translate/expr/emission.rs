@@ -160,13 +160,14 @@ pub fn process_returning_clause(
                     Some(ast::As::ImplicitColumnName(name)) => {
                         (None, Some(name.as_str().to_string()))
                     }
-                    None => (None, None),
+                    Some(ast::As::ReplacedColumnName(_)) | None => (None, None),
                 };
 
                 result_columns.push(ResultSetColumn {
                     expr: expr.as_ref().clone(),
                     alias,
                     implicit_column_name,
+                    written_name: None,
                     contains_aggregates: false,
                     values_condition_type: None,
                 });
@@ -192,6 +193,7 @@ pub fn process_returning_clause(
                         expr: column_expr,
                         alias: column.name.clone(),
                         implicit_column_name: None,
+                        written_name: None,
                         contains_aggregates: false,
                         values_condition_type: None,
                     });

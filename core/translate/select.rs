@@ -17,8 +17,9 @@ use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextC
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::expr_type::select_column_type;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement, expr_vector_size,
-    walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, column_reference_name,
+    expr_contains_function_that_changes_within_statement, expr_vector_size,
+    skip_parens_and_collate, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -136,7 +137,12 @@ fn insert_value_sources(
             ]);
         }
     }
-    let (_, types) = crate::translate::plan::query_output_columns(plan, None, resolver)?;
+    let (_, types) = crate::translate::plan::query_output_columns(
+        plan,
+        None,
+        crate::translate::plan::OutputColumnNames::AsWritten,
+        resolver,
+    )?;
     Ok(types
         .into_iter()
         .map(|ty| crate::translate::expr::expr_type::dialect_cast_source(ty, resolver.schema()))
@@ -782,6 +788,20 @@ fn finish_select_plan(
                     )?;
                 }
                 ResultColumn::Expr(mut expr, maybe_alias) => {
+                    // Take the name before binding replaces the identifier.
+                    // SQLite parses TRUE and FALSE as identifiers, so they
+                    // are names as written too.
+                    let true_false_are_identifiers =
+                        resolver.catalog.dialect.parses_true_false_as_identifiers();
+                    let written_name = match skip_parens_and_collate(&expr) {
+                        ast::Expr::Literal(ast::Literal::True) if true_false_are_identifiers => {
+                            Some("true".to_string())
+                        }
+                        ast::Expr::Literal(ast::Literal::False) if true_false_are_identifiers => {
+                            Some("false".to_string())
+                        }
+                        _ => column_reference_name(&expr).map(|name| name.as_str().to_string()),
+                    };
                     bind_and_rewrite_expr(
                         &mut expr,
                         Some(&mut plan.table_references),
@@ -796,18 +816,22 @@ fn finish_select_plan(
                         Some(&mut windows),
                         &mut named_windows,
                     )?;
-                    let (alias, implicit_column_name) = match &maybe_alias {
+                    let (alias, implicit_column_name, written_name) = match &maybe_alias {
                         Some(ast::As::As(name)) | Some(ast::As::Elided(name)) => {
-                            (Some(name.as_str().to_string()), None)
+                            (Some(name.as_str().to_string()), None, None)
                         }
                         Some(ast::As::ImplicitColumnName(name)) => {
-                            (None, Some(name.as_str().to_string()))
+                            (None, Some(name.as_str().to_string()), written_name)
                         }
-                        None => (None, None),
+                        Some(ast::As::ReplacedColumnName(name)) => {
+                            (None, None, Some(name.as_str().to_string()))
+                        }
+                        None => (None, None, written_name),
                     };
                     plan.result_columns.push(ResultSetColumn {
                         alias,
                         implicit_column_name,
+                        written_name,
                         expr: *expr,
                         contains_aggregates,
                         values_condition_type: None,
@@ -1167,6 +1191,7 @@ fn prepare_values_plan(
             expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
             alias: Some(format!("column{}", i + 1)),
             implicit_column_name: None,
+            written_name: None,
             contains_aggregates: false,
             values_condition_type: None,
         });

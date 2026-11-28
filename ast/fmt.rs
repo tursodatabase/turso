@@ -1449,7 +1449,7 @@ impl WriteSql for As {
                 name.write_sql(s, context)
             }
             Self::Elided(ref name) => name.write_sql(s, context),
-            Self::ImplicitColumnName(_) => Ok(()),
+            Self::ImplicitColumnName(_) | Self::ReplacedColumnName(_) => Ok(()),
         }
     }
 }

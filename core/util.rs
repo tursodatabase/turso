@@ -1412,17 +1412,6 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
     ))
 }
 
-/// Extract column name from an expression (e.g., for SELECT clauses)
-pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<String> {
-    match expr.as_ref() {
-        ast::Expr::Id(name) => Some(name.as_str().to_string()),
-        ast::Expr::DoublyQualified(_, _, name) | ast::Expr::Qualified(_, name) => {
-            Some(normalize_ident(name.as_str()))
-        }
-        _ => None,
-    }
-}
-
 /// What a walk over a statement, a SELECT or a trigger reports. A closure
 /// over `&ast::Expr` is a visitor that only looks at expressions.
 pub trait AstVisitor {

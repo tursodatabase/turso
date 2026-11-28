@@ -536,6 +536,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn parses_true_false_as_identifiers(&self) -> bool {
+        false
+    }
+
     fn text_input_types_refuse_other_kinds(&self) -> bool {
         true
     }
@@ -1240,6 +1244,7 @@ impl SnapshotRows for PgAttributeTable {
                         class.relnamespace,
                         &select,
                         &schema,
+                        &PostgresDialect,
                     )
                     .expect("index expressions reference their table")
                     .columns

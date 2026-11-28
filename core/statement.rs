@@ -1256,13 +1256,12 @@ impl Statement {
                 let full = self.connection.get_full_column_names();
                 let short = self.connection.get_short_column_names();
 
-                // 2. For column references, apply full/short column name logic.
-                match &column.expr {
-                    crate::ast::Expr::Column {
-                        table,
-                        column: col_idx,
-                        ..
-                    } => {
+                // 2. For column and rowid references, apply full/short column name logic.
+                let reference =
+                    crate::translate::expr::unwrap_parens(&column.expr).unwrap_or(&column.expr);
+                match reference {
+                    crate::ast::Expr::Column { table, .. }
+                    | crate::ast::Expr::RowId { table, .. } => {
                         if full {
                             // full_column_names=ON: use REAL_TABLE_NAME.COLUMN
                             if let Some((_, table_ref)) = self
@@ -1270,10 +1269,16 @@ impl Statement {
                                 .table_references
                                 .find_table_by_internal_id(*table)
                             {
-                                let col_name = table_ref
-                                    .get_column_at(*col_idx)
-                                    .and_then(|c| c.name.as_deref())
-                                    .unwrap_or("?");
+                                let col_name = match reference {
+                                    crate::ast::Expr::Column {
+                                        column: col_idx, ..
+                                    } => table_ref
+                                        .get_column_at(*col_idx)
+                                        .and_then(|c| c.name.as_deref()),
+                                    // The rowid alias column, else rowid.
+                                    _ => column.name(&self.program.table_references),
+                                }
+                                .unwrap_or("?");
                                 return Cow::Owned(format!(
                                     "{}.{}",
                                     table_ref.get_name(),

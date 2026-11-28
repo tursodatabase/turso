@@ -1099,6 +1099,7 @@ fn build_materialized_build_input_plan(
             },
             alias: None,
             implicit_column_name: None,
+            written_name: None,
             contains_aggregates: false,
             values_condition_type: None,
         }],
@@ -1113,6 +1114,7 @@ fn build_materialized_build_input_plan(
                     expr: expr.clone(),
                     alias: None,
                     implicit_column_name: None,
+                    written_name: None,
                     contains_aggregates: false,
                     values_condition_type: None,
                 });
@@ -1138,6 +1140,7 @@ fn build_materialized_build_input_plan(
                     expr,
                     alias: None,
                     implicit_column_name: None,
+                    written_name: None,
                     contains_aggregates: false,
                     values_condition_type: None,
                 });

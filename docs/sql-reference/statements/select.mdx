@@ -455,6 +455,16 @@ FROM (
 WHERE avg_salary > 70000;
 ```
 
+A column of a subquery in FROM or of a CTE gets the name of its `AS` alias. Without an
+alias, a column reference gets its name as written: `SELECT t.X` names it `X`, and
+`SELECT rowid` names it `rowid` also when the table has an `INTEGER PRIMARY KEY` column.
+In a trigger, `NEW.x` and `OLD.x` name it `x`. Other expressions get their text as the
+name. A view and CREATE TABLE AS name a column reference by the column it reads instead,
+so there `rowid` gets the name of the `INTEGER PRIMARY KEY` column, and `likely(x)`,
+`unlikely(x)` and `likelihood(x, p)` get the name of `x`. A column of a subquery,
+a CTE, a view or CREATE TABLE AS never gets the name `true` or `false`, also not from an
+alias or a column list: column N gets the name `columnN` instead.
+
 ## Common Table Expressions (CTE)
 
 A WITH clause defines one or more temporary named result sets that exist for the duration of the query.

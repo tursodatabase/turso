@@ -69,6 +69,64 @@ pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
     }
 }
 
+/// Skip parentheses and COLLATE around an expression. SQLite's parser keeps
+/// no node for parentheses, and SQLite's sqlite3ExprSkipCollate() skips
+/// COLLATE, so `(t.x) COLLATE nocase` names a column like `t.x` does.
+pub fn skip_parens_and_collate(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        match expr {
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => expr = &exprs[0],
+            ast::Expr::Collate(inner, _) => expr = inner,
+            _ => return expr,
+        }
+    }
+}
+
+/// Skip parentheses, COLLATE, and calls to likely(), unlikely() and
+/// likelihood() around an expression, as SQLite's
+/// sqlite3ExprSkipCollateAndLikely() does after it resolves names. A view
+/// or CREATE TABLE AS names its column `x` for `likely(x)`.
+pub fn skip_parens_collate_and_likely(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        expr = skip_parens_and_collate(expr);
+        match expr {
+            ast::Expr::FunctionCall {
+                name,
+                distinctness: None,
+                args,
+                order_by,
+                within_group,
+                filter_over,
+            } if !args.is_empty()
+                && order_by.is_empty()
+                && within_group.is_empty()
+                && filter_over.filter_clause.is_none()
+                && filter_over.over_clause.is_none()
+                && matches!(
+                    crate::functions::builtin::resolve_builtin_function(name.as_str(), args.len()),
+                    Ok(Some(Func::Scalar(
+                        ScalarFunc::Likely | ScalarFunc::Unlikely | ScalarFunc::Likelihood
+                    )))
+                ) =>
+            {
+                expr = &args[0]
+            }
+            _ => return expr,
+        }
+    }
+}
+
+/// The name, as written, of `expr` if it is a column reference: `X` in
+/// `t.X`, `(X)` or `X COLLATE nocase`.
+pub(crate) fn column_reference_name(expr: &ast::Expr) -> Option<&ast::Name> {
+    match skip_parens_and_collate(expr) {
+        ast::Expr::Id(name)
+        | ast::Expr::Qualified(_, name)
+        | ast::Expr::DoublyQualified(_, _, name) => Some(name),
+        _ => None,
+    }
+}
+
 /// If the right-hand side of `IS` / `IS NOT` is the TRUE or FALSE keyword —
 /// possibly inside parentheses or under COLLATE — return its boolean value.
 /// `x IS TRUE` and friends then test the truth of x instead of comparing

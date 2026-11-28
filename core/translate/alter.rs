@@ -3146,6 +3146,7 @@ impl TargetQualifiers {
                                 NamespaceId::ROOT,
                                 select_table,
                                 schema,
+                                resolver.catalog.dialect.as_ref(),
                                 &self.ctes,
                             )
                         })?
@@ -3614,6 +3615,7 @@ fn apply_select_for_column_rename(
                 NamespaceId::ROOT,
                 &select.with,
                 schema,
+                resolver.catalog.dialect.as_ref(),
                 &outer_target_qualifiers.ctes,
             )
         })?,

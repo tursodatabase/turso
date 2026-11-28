@@ -9,8 +9,8 @@ use super::{
         alias_or_stored_name, left_using_column_sources, merge_columns, query_output_columns,
         resolve_unqualified_column, Aggregate, ColumnUsedMask, Distinctness, EvalAt,
         IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin, JoinType as PlanJoinType,
-        JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination, ResolvedColumn,
-        ResultSetColumn, Scan, TableReferences, WhereTerm, WhereTermOrigin,
+        JoinedTable, Operation, OuterQueryReference, OutputColumnNames, Plan, QueryDestination,
+        ResolvedColumn, ResultSetColumn, Scan, TableReferences, WhereTerm, WhereTermOrigin,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -1416,6 +1416,7 @@ fn cte_table_from_plan(
                 None,
                 program.table_reference_counter.next(),
                 explicit_columns,
+                OutputColumnNames::AsWritten,
                 Some(cte_definition.cte_id),
                 cte_definition.materialize_hint,
                 resolver,
@@ -1970,7 +1971,8 @@ fn add_subquery_table(
         subplan,
         None,
         program.table_reference_counter.next(),
-        None,  // No explicit columns for regular subqueries
+        None, // No explicit columns for regular subqueries
+        OutputColumnNames::AsWritten,
         None,  // Regular inline subqueries don't have a CTE identity
         false, // No materialize hint for inline subqueries
         resolver,
@@ -2165,7 +2167,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver)
     }
 
     (subquery.columns, subquery.column_types) =
-        query_output_columns(&subquery.plan, None, resolver)?;
+        query_output_columns(&subquery.plan, None, OutputColumnNames::AsWritten, resolver)?;
     assert_eq!(subquery.columns.len(), join_columns.len());
     for column_index in 0..subquery.columns.len() {
         let original_name = subquery.columns[column_index]
@@ -2212,6 +2214,7 @@ fn parenthesized_join_result_column(expr: Expr, column_name: &str) -> ResultSetC
         expr,
         alias: Some(column_name.to_string()),
         implicit_column_name: None,
+        written_name: None,
         contains_aggregates: false,
         values_condition_type: None,
     }
@@ -2507,6 +2510,7 @@ fn add_outer_cte_plan_table(
         None,
         program.table_reference_counter.next(),
         explicit_columns,
+        OutputColumnNames::AsWritten,
         cte_id,
         materialize_hint,
         resolver,
@@ -2724,6 +2728,7 @@ fn add_view_table(
         None,
         program.table_reference_counter.next(),
         (!view.explicit_columns.is_empty()).then_some(view.explicit_columns.as_slice()),
+        OutputColumnNames::Resolved,
         None,
         false,
         resolver,

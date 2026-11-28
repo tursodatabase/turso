@@ -103,7 +103,12 @@ pub fn translate_create_materialized_view(
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
     let mut view_column_schema = resolver.with_schema(database_id, |s| {
-        extract_view_columns(namespace.id, select_stmt, s)
+        extract_view_columns(
+            namespace.id,
+            select_stmt,
+            s,
+            resolver.catalog.dialect.as_ref(),
+        )
     })?;
     // The parser checks the column count when it can count the SELECT's
     // columns; a `*` is only expanded here.
@@ -115,7 +120,7 @@ pub fn translate_create_materialized_view(
             view_column_schema.columns.len()
         );
     }
-    view_column_schema.rename_columns(columns);
+    view_column_schema.rename_columns(columns, resolver.catalog.dialect.as_ref());
     let view_columns = view_column_schema.flat_columns()?;
 
     // One plan owns validation, the executable operator DAG, and the hidden

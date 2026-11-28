@@ -126,9 +126,10 @@ pub(crate) use translator::is_sqlite_cast_to;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };
+pub(crate) use utils::column_reference_name;
 pub use utils::{
-    as_binary_components, maybe_apply_affinity, sanitize_string, truth_test_rhs, unwrap_parens,
-    unwrap_parens_owned,
+    as_binary_components, maybe_apply_affinity, sanitize_string, skip_parens_and_collate,
+    skip_parens_collate_and_likely, truth_test_rhs, unwrap_parens, unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
 pub(crate) use walk::expression_can_fail_on_input;

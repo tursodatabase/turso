@@ -528,6 +528,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
             },
             alias: None,
             implicit_column_name: None,
+            written_name: None,
             contains_aggregates: false,
             values_condition_type: None,
         }],

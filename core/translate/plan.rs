@@ -41,6 +41,7 @@ use crate::ast::TableInternalId;
 
 use super::emitter::OperationMode;
 use super::expr::expr_type::{query_column_type, type_ordering, ExprType};
+use super::expr::{skip_parens_and_collate, skip_parens_collate_and_likely, unwrap_parens};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -130,6 +131,12 @@ pub struct ResultSetColumn {
     /// a simple column reference. This preserves the verbatim SQL text
     /// (e.g. "f1+F2") as the column name, matching SQLite behavior.
     pub implicit_column_name: Option<String>,
+    /// The name of a column reference without an alias, as written and
+    /// without its table: `X` in `SELECT t.X`, `rowid` in `SELECT rowid`.
+    /// The keywords TRUE and FALSE have the names true and false, as SQLite
+    /// parses them as identifiers. It names the column in a FROM subquery or
+    /// a CTE.
+    pub(crate) written_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
     /// The type of this column of a VALUES list, when it is the schema's type
@@ -142,7 +149,49 @@ impl ResultSetColumn {
         if let Some(alias) = &self.alias {
             return Some(alias);
         }
-        match &self.expr {
+        // SQLite's parser keeps no node for parentheses, so `(t.x)` is named x.
+        self.expr_name(unwrap_parens(&self.expr).unwrap_or(&self.expr), tables)
+    }
+
+    /// The name of the column this result column gives CREATE TABLE AS.
+    /// SQLite's sqlite3ColumnsFromExprList() names it after it resolves
+    /// names: unlike `name`, it also looks through COLLATE and likely(), so
+    /// `t.x COLLATE nocase` and `likely(t.x)` are named x. The result set itself is named by
+    /// `name`, as SQLite's sqlite3GenerateColumnNames() names it
+    /// `t.x COLLATE nocase`.
+    pub fn output_column_name<'a>(&'a self, tables: &'a TableReferences) -> Option<&'a str> {
+        if let Some(alias) = &self.alias {
+            return Some(alias);
+        }
+        self.expr_name(skip_parens_collate_and_likely(&self.expr), tables)
+    }
+
+    /// The name of the column this result column gives a FROM subquery or a
+    /// CTE. SQLite's sqlite3ColumnsFromExprList() names it before it resolves
+    /// names, so a column reference has its name as written: `rowid` and
+    /// `t.X` are named rowid and X, also when the table has a rowid alias
+    /// column.
+    pub(crate) fn subquery_column_name<'a>(
+        &'a self,
+        tables: &'a TableReferences,
+    ) -> Option<&'a str> {
+        if let Some(name) = self.alias.as_ref().or(self.written_name.as_ref()) {
+            return Some(name);
+        }
+        // SQLite skips likely() only after it resolves names, so unlike
+        // `output_column_name`, `likely(x)` keeps its text.
+        self.expr_name(skip_parens_and_collate(&self.expr), tables)
+    }
+
+    /// The name of `expr`, which is this column's expression or a part of it
+    /// that names the column: the name of a column reference, else
+    /// `implicit_column_name`.
+    fn expr_name<'a>(
+        &'a self,
+        expr: &'a ast::Expr,
+        tables: &'a TableReferences,
+    ) -> Option<&'a str> {
+        match expr {
             ast::Expr::Column { table, column, .. } => {
                 if let Some(joined_table_ref) = tables.find_joined_table_by_internal_id(*table) {
                     if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
@@ -178,13 +227,6 @@ impl ResultSetColumn {
             }
             _ => self.implicit_column_name.as_deref(),
         }
-    }
-
-    /// Returns the column name, falling back to the expression's display form.
-    pub fn name_or_expr(&self, tables: &TableReferences) -> String {
-        self.name(tables)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.expr.to_string())
     }
 
     /// Returns the canonical short type name for this column's affinity,
@@ -1660,6 +1702,7 @@ fn star_result_column(
     ResultSetColumn {
         alias,
         implicit_column_name: None,
+        written_name: None,
         expr,
         contains_aggregates: false,
         values_condition_type: None,
@@ -3434,10 +3477,23 @@ impl Operation {
     }
 }
 
+/// How a query names the columns it gives an outer query, when no explicit
+/// column list names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputColumnNames {
+    /// By [ResultSetColumn::subquery_column_name]: a FROM subquery or a CTE.
+    AsWritten,
+    /// By [ResultSetColumn::output_column_name]: a view. SQLite's
+    /// sqlite3ViewGetColumnNames() names the columns of a view after it
+    /// resolves names, as CREATE TABLE AS does.
+    Resolved,
+}
+
 /// The columns a query gives an outer query, and the type of each.
 pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    names: OutputColumnNames,
     resolver: &Resolver,
 ) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
@@ -3477,7 +3533,17 @@ pub(super) fn query_output_columns(
         .map(|(column_index, result_column)| {
             let name = explicit_columns
                 .and_then(|names| names.get(column_index).cloned())
-                .or_else(|| result_column.name(table_references).map(String::from));
+                .or_else(|| {
+                    match names {
+                        OutputColumnNames::AsWritten => {
+                            result_column.subquery_column_name(table_references)
+                        }
+                        OutputColumnNames::Resolved => {
+                            result_column.output_column_name(table_references)
+                        }
+                    }
+                    .map(String::from)
+                });
             let affinity = compound_arms
                 .as_ref()
                 .map(|arms| compound_column_affinity(arms, column_index, resolver))
@@ -3530,12 +3596,39 @@ pub(super) fn query_output_columns(
     Ok((columns, column_types))
 }
 
+/// The name a stored column gets from the name `name` of the column at the
+/// 0-based `index`. SQLite's sqlite3ColumnsFromExprList() does not name a
+/// column true or false, also when an alias or a column list gives that
+/// name, and uses columnN instead. It keeps the name when `dialect` does
+/// not parse TRUE and FALSE as identifiers.
+pub(crate) fn stored_column_name(
+    name: String,
+    index: usize,
+    dialect: &dyn crate::dialect::Dialect,
+) -> String {
+    if dialect.parses_true_false_as_identifiers()
+        && (name.eq_ignore_ascii_case("true") || name.eq_ignore_ascii_case("false"))
+    {
+        format!("column{}", index + 1)
+    } else {
+        name
+    }
+}
+
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    names: OutputColumnNames,
     resolver: &Resolver,
 ) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
-    let (mut columns, column_types) = query_output_columns(plan, explicit_columns, resolver)?;
+    let (mut columns, column_types) =
+        query_output_columns(plan, explicit_columns, names, resolver)?;
+    for (index, column) in columns.iter_mut().enumerate() {
+        column.name = column
+            .name
+            .take()
+            .map(|name| stored_column_name(name, index, resolver.catalog.dialect.as_ref()));
+    }
     make_column_names_unique(&mut columns);
     Ok((columns, column_types))
 }
@@ -3595,7 +3688,8 @@ impl JoinedTable {
         resolver: &Resolver,
     ) -> Result<Self> {
         let plan = Plan::Select(Box::new(plan));
-        let (columns, column_types) = subquery_output_columns(&plan, None, resolver)?;
+        let (columns, column_types) =
+            subquery_output_columns(&plan, None, OutputColumnNames::AsWritten, resolver)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
@@ -3627,6 +3721,7 @@ impl JoinedTable {
 
     /// Creates a new TableReference for a subquery from a Plan (either SelectPlan or CompoundSelect).
     /// If `explicit_columns` is provided, those names override the derived column names from the SELECT.
+    /// `names` says how the derived column names are chosen.
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
@@ -3637,11 +3732,13 @@ impl JoinedTable {
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
+        names: OutputColumnNames,
         cte_id: Option<usize>,
         materialize_hint: bool,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let (columns, column_types) = subquery_output_columns(&plan, explicit_columns, resolver)?;
+        let (columns, column_types) =
+            subquery_output_columns(&plan, explicit_columns, names, resolver)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3686,8 +3783,12 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let (mut columns, column_types) =
-            subquery_output_columns(query, explicit_columns, resolver)?;
+        let (mut columns, column_types) = subquery_output_columns(
+            query,
+            explicit_columns,
+            OutputColumnNames::AsWritten,
+            resolver,
+        )?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the

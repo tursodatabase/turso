@@ -1252,13 +1252,22 @@ pub enum As {
     /// Used to preserve the original expression text as the column name
     /// for unaliased expressions, matching SQLite behavior.
     ImplicitColumnName(Name),
+    /// The name, as written, of a column reference that a rewrite replaced
+    /// before planning, such as a trigger's `NEW.x` or `OLD.x` (not
+    /// serialized to SQL). A FROM subquery or a CTE names its column by it,
+    /// as it names a column reference by its name as written. It is not an
+    /// alias: ORDER BY terms do not match it.
+    ReplacedColumnName(Name),
 }
 
 impl As {
     /// Returns the inner `Name` regardless of variant.
     pub fn name(&self) -> &Name {
         match self {
-            As::As(name) | As::Elided(name) | As::ImplicitColumnName(name) => name,
+            As::As(name)
+            | As::Elided(name)
+            | As::ImplicitColumnName(name)
+            | As::ReplacedColumnName(name) => name,
         }
     }
 
