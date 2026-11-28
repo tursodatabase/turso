@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use genawaiter::GeneratorState;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, IO};
+use turso_core::{Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, IO};
 use turso_sqlite::SqliteDialect;
 use turso_sync_engine::database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts};
 use turso_sync_engine::database_sync_operations::SyncEngineIoStats;
@@ -136,6 +136,28 @@ impl Replica {
         })
     }
 
+    /// Pulls, and calls `on_yield` each time the pull returns control to its caller, as the SDK
+    /// does when the pull waits for IO or for a lock. Returns how many times that happened.
+    pub fn pull_calling_on_yield(&self, mut on_yield: impl FnMut()) -> (usize, Result<()>) {
+        let mut generator = genawaiter::sync::Gen::new(|co| async move {
+            let coro: Coro<()> = co.into();
+            self.engine.pull_changes_from_remote(&coro).await
+        });
+        let mut yields = 0;
+        loop {
+            match generator.resume_with(Ok(())) {
+                GeneratorState::Yielded(_) => {
+                    yields += 1;
+                    on_yield();
+                    if let Err(error) = self.io.step() {
+                        return (yields, Err(error.into()));
+                    }
+                }
+                GeneratorState::Complete(result) => return (yields, result),
+            }
+        }
+    }
+
     pub fn is_mvcc(&self) -> bool {
         drive(&self.io, async |coro| self.engine.connect_rw(coro).await)
             .unwrap()
@@ -167,8 +189,20 @@ impl Replica {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let conn = drive(&self.io, async |coro| self.engine.connect_rw(coro).await)?;
-        Snapshot::capture(&conn)
+        Snapshot::capture(&self.connect()?)
+    }
+
+    pub fn connect(&self) -> Result<Arc<Connection>> {
+        drive(&self.io, async |coro| self.engine.connect_rw(coro).await)
+    }
+
+    /// How many local changes are waiting to be pushed.
+    pub fn pending_local_changes(&self) -> Result<i64> {
+        drive(&self.io, async |coro| self.engine.stats(coro).await).map(|s| s.cdc_operations)
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        drive(&self.io, async |coro| self.engine.checkpoint(coro).await)
     }
 }
 
@@ -190,6 +224,7 @@ fn replica_opts(db_opts: DatabaseOpts) -> DatabaseSyncEngineOpts {
         pull_bytes_threshold: None,
         pull_parallel_requests: None,
         logical_mvcc_pull: None,
+        busy_timeout: turso_sync_engine::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
     }
 }
 

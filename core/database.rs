@@ -4002,6 +4002,22 @@ impl Database {
         *self.schema.lock() = schema;
     }
 
+    /// Replaces the shared schema with `schema` if it is still `expected`, the schema that was
+    /// read earlier. Returns whether it replaced it.
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn replace_schema_if_unchanged(
+        &self,
+        expected: &Arc<Schema>,
+        schema: Arc<Schema>,
+    ) -> bool {
+        let mut current = self.schema.lock();
+        if !Arc::ptr_eq(&current, expected) {
+            return false;
+        }
+        *current = schema;
+        true
+    }
+
     /// Register an `InternalVirtualTable` into this database's catalog. The
     /// table is visible to connections opened after this call and is queryable
     /// like any other table.

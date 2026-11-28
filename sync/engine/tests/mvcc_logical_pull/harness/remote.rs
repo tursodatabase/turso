@@ -11,6 +11,7 @@ use super::snapshot::Snapshot;
 use turso_core::SessionRole;
 
 pub struct Remote {
+    pub(super) mvcc: bool,
     conn: Arc<Connection>,
     pub(super) crypto: Option<turso_core::EncryptionContext>,
     db_path: PathBuf,
@@ -20,19 +21,29 @@ pub struct Remote {
 
 impl Remote {
     pub fn new(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::create(setup, false, true)
+        Self::create(setup, true, false, true)
     }
 
     pub fn new_encrypted(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::create(setup, true, true)
+        Self::create(setup, true, true, true)
     }
 
     /// A remote whose commits write plain frames with no portable changes.
     pub fn without_portable_changes(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::create(setup, false, false)
+        Self::create(setup, true, false, false)
     }
 
-    fn create(setup: &[&str], encrypted: bool, enabled: bool) -> Result<Arc<Self>> {
+    /// A remote in plain WAL mode, without MVCC.
+    pub fn new_wal(setup: &[&str]) -> Result<Arc<Self>> {
+        Self::create(setup, false, false, false)
+    }
+
+    fn create(
+        setup: &[&str],
+        mvcc: bool,
+        encrypted: bool,
+        portable_changes: bool,
+    ) -> Result<Arc<Self>> {
         let key = encrypted.then(|| turso_core::EncryptionKey::new_256([11; 32]));
         let crypto = key
             .as_ref()
@@ -53,12 +64,15 @@ impl Remote {
                 })),
         )?;
         let conn = db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key))?;
-        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
-        conn.set_portable_logical_changes_enabled(enabled);
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+            conn.set_portable_logical_changes_enabled(portable_changes);
+        }
         for sql in setup {
             conn.execute(sql)?;
         }
         Ok(Arc::new(Self {
+            mvcc,
             conn,
             crypto,
             db_path,

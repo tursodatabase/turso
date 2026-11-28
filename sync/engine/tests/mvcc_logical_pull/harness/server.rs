@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -29,6 +29,9 @@ pub struct InProcessServer {
     pub host_files: Option<SharedHostFiles>,
     pub bootstrap_failure: Arc<AtomicU8>,
     pub force_page_updates: bool,
+    /// Set when every pull is answered with the whole database as pages. Counts the pulls,
+    /// so each answer has a new revision.
+    page_pulls: Option<AtomicUsize>,
 }
 
 type SharedHostFiles = Arc<Mutex<HashMap<String, Vec<u8>>>>;
@@ -44,6 +47,7 @@ impl InProcessServer {
             host_files: None,
             bootstrap_failure: Arc::new(AtomicU8::new(0)),
             force_page_updates: false,
+            page_pulls: None,
         }
     }
 
@@ -69,7 +73,15 @@ impl InProcessServer {
             host_files: None,
             bootstrap_failure: Arc::new(AtomicU8::new(0)),
             force_page_updates: false,
+            page_pulls: None,
         }
+    }
+
+    /// Answers every pull with the whole remote database as pages.
+    pub fn pages_only(remote: Arc<Remote>) -> Self {
+        let mut server = Self::new(remote);
+        server.page_pulls = Some(AtomicUsize::new(0));
+        server
     }
 }
 
@@ -169,7 +181,14 @@ impl InProcessServer {
     fn pull_updates(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request = PullUpdatesReqProtoBody::decode(body)
             .map_err(|error| Error::DatabaseSyncEngineError(error.to_string()))?;
-        if request.client_revision.is_empty() || self.force_page_updates {
+        let pull = self
+            .page_pulls
+            .as_ref()
+            .map(|pulls| pulls.fetch_add(1, Ordering::Relaxed) + 1);
+        if let Some(pull) = pull {
+            let database = self.remote.checkpoint_and_read_database_file()?;
+            self.pages(&self.remote, database, revision_at(pull), false)
+        } else if request.client_revision.is_empty() || self.force_page_updates {
             self.page_bootstrap(false)
         } else if self.replace_once.swap(false, Ordering::SeqCst) {
             self.page_bootstrap(true)
@@ -189,8 +208,23 @@ impl InProcessServer {
         } else {
             self.bootstrap_base.read_logical_log()?.len()
         };
+        self.pages(
+            &self.bootstrap_base,
+            database,
+            revision_at(log_end),
+            replace,
+        )
+    }
+
+    fn pages(
+        &self,
+        source: &Remote,
+        database: Vec<u8>,
+        server_revision: String,
+        replace: bool,
+    ) -> Result<Vec<u8>> {
         let header = PullUpdatesRespProtoBody {
-            server_revision: revision_at(log_end),
+            server_revision,
             db_size: (database.len() / PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -201,7 +235,7 @@ impl InProcessServer {
                 PullUpdatesApplyMode::Incremental
             } as i32,
             mvcc_log: None,
-            protocol: if self.force_page_updates {
+            protocol: if self.force_page_updates || !source.mvcc {
                 PullUpdatesProtocol::Pages
             } else {
                 PullUpdatesProtocol::MvccLogical
