@@ -10,6 +10,7 @@ use super::checkpoint::{
 };
 use super::test_db::MvccTestDbNoConn;
 use super::transactions::{generate_simple_string_row, get_record_value, write_synthetic_row};
+use crate::statement_lifecycle::YieldAtEveryVisit;
 use crate::unreliable_io::UnreliableIo;
 use rand::Rng;
 use rand::SeedableRng;
@@ -6913,6 +6914,143 @@ fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
     }
 }
 
+/// A scan must return a row that `ROLLBACK TO` restores ahead of the scan
+/// position, also when the scan's current row comes from MVCC and the B-tree
+/// side of the cursor already stepped past the hidden row. Each scan also runs
+/// with a yield at every cursor boundary, so that the cursor resumes in the
+/// middle of each of its B-tree seeks. When another connection deletes the
+/// row and runs `ROLLBACK TO`, the scan returns the row the whole time.
+#[test]
+fn test_scan_returns_row_restored_by_rollback_to_behind_btree_peek() {
+    let cases = [
+        // The hidden row is the last B-tree row in scan order, so the B-tree
+        // side of the cursor is exhausted when `ROLLBACK TO` runs.
+        ("SELECT id FROM t NOT INDEXED", 4, false, "10,20,30,40,50"),
+        (
+            "SELECT id FROM t NOT INDEXED ORDER BY id DESC",
+            4,
+            false,
+            "50,40,30,20,10",
+        ),
+        ("SELECT id FROM t NOT INDEXED", 2, false, "10,20,30,40,50"),
+        (
+            "SELECT id FROM t WHERE id >= 10",
+            2,
+            false,
+            "10,20,30,40,50",
+        ),
+        (
+            "SELECT id FROM t NOT INDEXED ORDER BY id DESC",
+            2,
+            false,
+            "50,40,30,20,10",
+        ),
+        ("SELECT v FROM t INDEXED BY i", 1, true, "5,10,30,50,55"),
+        (
+            "SELECT v FROM t INDEXED BY i ORDER BY v DESC",
+            1,
+            true,
+            "55,50,30,10,5",
+        ),
+        (
+            "SELECT v FROM t INDEXED BY i WHERE v >= 1",
+            1,
+            true,
+            "5,10,30,50,55",
+        ),
+        (
+            "SELECT v FROM t INDEXED BY i WHERE v <= 100 ORDER BY v DESC",
+            1,
+            true,
+            "55,50,30,10,5",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (yield_at_every_visit, begin, writer_is_other_connection) in [
+        (false, "BEGIN", false),
+        (true, "BEGIN", false),
+        (false, "BEGIN CONCURRENT", false),
+        (true, "BEGIN CONCURRENT", false),
+        (false, "BEGIN CONCURRENT", true),
+        (true, "BEGIN CONCURRENT", true),
+    ] {
+        for (scan_sql, rows_before_rollback, index_case, expected) in cases {
+            let db = MvccTestDb::new();
+            let conn = &db.conn;
+            conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                .unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX i ON t(v)").unwrap();
+            // These rows go to the B-tree.
+            conn.execute("INSERT INTO t VALUES (10,10),(30,30),(50,50)")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            // These rows stay in MVCC. The scan's first rows come from them.
+            let hidden = if index_case {
+                conn.execute("INSERT INTO t VALUES (5,5),(55,55)").unwrap();
+                if scan_sql.contains("DESC") {
+                    50
+                } else {
+                    10
+                }
+            } else {
+                conn.execute("INSERT INTO t VALUES (20,20),(40,40)")
+                    .unwrap();
+                match (rows_before_rollback, scan_sql.contains("DESC")) {
+                    (4, false) => 50,
+                    (4, true) => 10,
+                    _ => 30,
+                }
+            };
+            let writer = if writer_is_other_connection {
+                db.db
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap()
+            } else {
+                conn.clone()
+            };
+            writer.execute(begin).unwrap();
+            writer.execute("SAVEPOINT s").unwrap();
+            writer
+                .execute(format!("DELETE FROM t WHERE id = {hidden}"))
+                .unwrap();
+            if writer_is_other_connection {
+                conn.execute(begin).unwrap();
+            }
+            let injector = Arc::new(YieldAtEveryVisit::default());
+            if yield_at_every_visit {
+                conn.set_yield_injector(Some(injector.clone()));
+            }
+            let actual = scan_with_write_after_rows(
+                conn,
+                scan_sql,
+                rows_before_rollback,
+                &writer,
+                "ROLLBACK TO s",
+            );
+            if yield_at_every_visit {
+                conn.set_yield_injector(None);
+                assert!(
+                    injector.fired.load(Ordering::SeqCst) > 0,
+                    "{scan_sql}: no yield"
+                );
+            }
+            writer.execute("COMMIT").unwrap();
+            if writer_is_other_connection {
+                conn.execute("COMMIT").unwrap();
+            }
+            if actual != expected {
+                failures.push(format!(
+                    "{scan_sql} ({begin}, yields: {yield_at_every_visit}, \
+                     other connection: {writer_is_other_connection}): got {actual}, want {expected}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// Steps `scan_sql` on `conn` and runs `write_sql` on `writer` once the scan has
 /// returned `rows_before_write` rows. Returns the rows, with columns joined by `|`.
 fn scan_with_write_after_rows(
@@ -6937,6 +7075,7 @@ fn scan_with_write_after_rows(
                 rows.push(columns.join("|"));
             }
             StepResult::IO => scan.get_pager().io.step().unwrap(),
+            StepResult::Yield => {}
             StepResult::Done => break,
             other => panic!("unexpected step result {other:?}"),
         }
