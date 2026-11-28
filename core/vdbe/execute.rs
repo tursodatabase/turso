@@ -17060,8 +17060,12 @@ pub fn op_cast(
 }
 
 /// Regenerate trigger SQL from its in-memory fields to keep trigger.sql
-/// in sync after table/column renames.
-fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
+/// in sync after table/column renames. `table_qualifier` is the `db.` of the
+/// trigger's `ON db.t` as its SQL wrote it, which the new SQL has to keep.
+fn regenerate_trigger_sql(
+    trigger: &crate::schema::Trigger,
+    table_qualifier: Option<Name>,
+) -> String {
     use crate::translate::trigger::create_trigger_to_sql;
 
     let trigger_name = QualifiedName {
@@ -17070,7 +17074,7 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
         alias: None,
     };
     let tbl_name = QualifiedName {
-        namespace: None,
+        namespace: table_qualifier,
         name: Name::from_string(&trigger.table_name),
         alias: None,
     };
@@ -17099,18 +17103,21 @@ fn sql_might_reference_identifier(sql: &str, ident: &str) -> bool {
 }
 
 fn rewrite_trigger_for_table_rename(
+    conn: &Connection,
     trigger: &mut crate::schema::Trigger,
     normalized_from: &str,
     normalized_to: &str,
 ) {
     let old_sql = trigger.sql.clone();
+    // Keep `ON aux.t` qualified and `ON t` unqualified, as written.
+    let table_qualifier = trigger.written_table_qualifier(conn.dialect().as_ref());
     for cmd in &mut trigger.commands {
         rewrite_trigger_cmd_table_refs(cmd, normalized_from, normalized_to);
     }
     if let Some(ref mut when) = trigger.when_clause {
         rewrite_check_expr_table_refs(when, normalized_from, normalized_to);
     }
-    let new_sql = regenerate_trigger_sql(trigger);
+    let new_sql = regenerate_trigger_sql(trigger, table_qualifier);
     if new_sql != old_sql {
         trigger.sql = new_sql;
     }
@@ -17234,7 +17241,7 @@ pub fn op_rename_table(
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
                 normalized_to.clone_into(&mut trigger.table_name);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                rewrite_trigger_for_table_rename(&conn, trigger, &normalized_from, &normalized_to);
             }
             schema.insert_triggers(*namespace, normalized_to.to_owned(), triggers);
         }
@@ -17289,7 +17296,7 @@ pub fn op_rename_table(
                 continue;
             }
             let trigger = Arc::make_mut(trigger_arc);
-            rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+            rewrite_trigger_for_table_rename(&conn, trigger, &normalized_from, &normalized_to);
         }
 
         let qualifiers = table_qualifiers(schema, *namespace);
@@ -17346,7 +17353,12 @@ pub fn op_rename_table(
                     if targets_renamed_database {
                         let trigger = Arc::make_mut(&mut trigger_arc);
                         normalized_to.clone_into(&mut trigger.table_name);
-                        rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                        rewrite_trigger_for_table_rename(
+                            &conn,
+                            trigger,
+                            &normalized_from,
+                            &normalized_to,
+                        );
                         triggers_to_rename.push_back(trigger_arc);
                     } else {
                         triggers_to_keep.push_back(trigger_arc);
@@ -17371,7 +17383,7 @@ pub fn op_rename_table(
                     continue;
                 }
                 let trigger = Arc::make_mut(trigger_arc);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                rewrite_trigger_for_table_rename(&conn, trigger, &normalized_from, &normalized_to);
             }
             Ok(())
         })??;

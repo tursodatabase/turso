@@ -2433,6 +2433,223 @@ expect {
     900
 }
 
+# A TEMP trigger on a main table lives in the temp schema, but its table is in
+# main. RENAME COLUMN on any other table (in main or attached) must still find
+# that table and leave the trigger alone.
+test alter-table-rename-column-attached-with-temp-trigger-on-main {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE tt_main_m (x);
+    CREATE TABLE aux.tt_aux_s (a);
+    CREATE TEMP TRIGGER tt_main_tr AFTER INSERT ON main.tt_main_m BEGIN SELECT 1; END;
+    ALTER TABLE aux.tt_aux_s RENAME COLUMN a TO z;
+    SELECT sql FROM aux.sqlite_schema WHERE name = 'tt_aux_s';
+}
+expect {
+    CREATE TABLE tt_aux_s (z)
+}
+
+test alter-table-rename-column-other-table-with-temp-trigger-on-main {
+    CREATE TABLE tt_m2 (x);
+    CREATE TABLE tt_s2 (a);
+    CREATE TEMP TRIGGER tt_tr2 AFTER INSERT ON tt_m2 BEGIN SELECT 1; END;
+    ALTER TABLE tt_s2 RENAME COLUMN a TO z;
+    SELECT sql FROM sqlite_schema WHERE name = 'tt_s2';
+}
+expect {
+    CREATE TABLE tt_s2 (z)
+}
+
+test alter-table-rename-column-of-main-table-with-temp-trigger {
+    CREATE TABLE tt_m3 (x);
+    CREATE TABLE tt_log3 (v);
+    CREATE TEMP TRIGGER tt_tr3 AFTER UPDATE OF x ON main.tt_m3 BEGIN
+        INSERT INTO tt_log3 VALUES (new.x);
+    END;
+    ALTER TABLE tt_m3 RENAME COLUMN x TO y;
+    INSERT INTO tt_m3 VALUES (5);
+    UPDATE tt_m3 SET y = 7;
+    SELECT * FROM tt_log3;
+}
+expect {
+    7
+}
+
+# A TEMP trigger on main.m is not on aux.m or temp.m, even though the names
+# match. Renaming a column of one of those tables must leave the trigger's
+# NEW/OLD references and its UPDATE OF list alone.
+test alter-table-rename-column-attached-same-name-keeps-temp-trigger-on-main {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE tt_m4 (x);
+    CREATE TABLE aux.tt_m4 (x);
+    CREATE TABLE tt_log4 (v);
+    CREATE TEMP TRIGGER tt_tr4 AFTER INSERT ON main.tt_m4 BEGIN
+        INSERT INTO tt_log4 VALUES (new.x);
+    END;
+    ALTER TABLE aux.tt_m4 RENAME COLUMN x TO y;
+    INSERT INTO main.tt_m4 VALUES (1);
+    SELECT * FROM tt_log4;
+    SELECT sql FROM aux.sqlite_schema WHERE name = 'tt_m4';
+}
+expect {
+    1
+    CREATE TABLE tt_m4 (y)
+}
+
+test alter-table-rename-column-attached-same-name-keeps-update-of {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE tt_m5 (x);
+    CREATE TABLE aux.tt_m5 (x);
+    CREATE TABLE tt_log5 (v);
+    CREATE TEMP TRIGGER tt_tr5 AFTER UPDATE OF x ON main.tt_m5 BEGIN
+        INSERT INTO tt_log5 VALUES (new.x);
+    END;
+    ALTER TABLE aux.tt_m5 RENAME COLUMN x TO y;
+    INSERT INTO main.tt_m5 VALUES (1);
+    UPDATE main.tt_m5 SET x = 2;
+    SELECT * FROM tt_log5;
+    SELECT sql FROM aux.sqlite_schema WHERE name = 'tt_m5';
+}
+expect {
+    2
+    CREATE TABLE tt_m5 (y)
+}
+
+test alter-table-rename-column-temp-same-name-keeps-temp-trigger-on-main {
+    CREATE TABLE tt_m6 (x);
+    CREATE TEMP TABLE tt_m6 (x);
+    CREATE TABLE tt_log6 (v);
+    CREATE TEMP TRIGGER tt_tr6 AFTER UPDATE OF x ON main.tt_m6 BEGIN
+        INSERT INTO tt_log6 VALUES (new.x);
+    END;
+    ALTER TABLE temp.tt_m6 RENAME COLUMN x TO y;
+    INSERT INTO main.tt_m6 VALUES (1);
+    UPDATE main.tt_m6 SET x = 2;
+    SELECT * FROM tt_log6;
+    SELECT sql FROM sqlite_temp_schema WHERE name = 'tt_m6';
+}
+expect {
+    2
+    CREATE TABLE tt_m6 (y)
+}
+
+# A TEMP trigger on an attached table (ON aux.s) names its table with the
+# database. ALTER TABLE on any table must look the trigger's table up in aux,
+# not in temp or main.
+test alter-table-rename-column-with-temp-trigger-on-attached-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s7 (a);
+    CREATE TABLE tt_o7 (b);
+    CREATE TEMP TRIGGER tt_tr7 AFTER INSERT ON aux.tt_s7 BEGIN SELECT 1; END;
+    ALTER TABLE tt_o7 RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'tt_o7';
+}
+expect {
+    CREATE TABLE tt_o7 (c)
+}
+
+test alter-table-rename-column-of-attached-table-with-temp-trigger {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s8 (a);
+    CREATE TABLE aux.tt_t8 (b);
+    CREATE TEMP TRIGGER tt_tr8 AFTER UPDATE OF a ON aux.tt_s8 BEGIN
+        SELECT new.a, old.a;
+    END;
+    ALTER TABLE aux.tt_t8 RENAME COLUMN b TO c;
+    ALTER TABLE aux.tt_s8 RENAME COLUMN a TO z;
+    INSERT INTO aux.tt_s8 VALUES (1);
+    UPDATE aux.tt_s8 SET z = 2;
+    SELECT * FROM aux.tt_s8;
+    SELECT sql FROM aux.sqlite_schema WHERE name IN ('tt_s8', 'tt_t8') ORDER BY name;
+    SELECT instr(sql, 'UPDATE OF z') > 0, instr(sql, 'new.z') > 0, instr(sql, 'old.z') > 0
+    FROM sqlite_temp_schema WHERE name = 'tt_tr8';
+}
+expect {
+    2
+    CREATE TABLE tt_s8 (z)
+    CREATE TABLE tt_t8 (c)
+    1|1|1
+}
+
+# RENAME TO, ADD COLUMN and DROP COLUMN on another table, then RENAME COLUMN
+# and RENAME TO on the trigger's own table. The trigger keeps its `aux.`
+# qualifier throughout.
+test alter-table-other-alters-with-temp-trigger-on-attached-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s9 (a);
+    CREATE TABLE tt_o9 (b);
+    CREATE TEMP TRIGGER tt_tr9 AFTER INSERT ON aux.tt_s9 BEGIN SELECT new.a; END;
+    ALTER TABLE tt_o9 RENAME TO tt_o9b;
+    ALTER TABLE tt_o9b ADD COLUMN d;
+    ALTER TABLE tt_o9b DROP COLUMN d;
+    ALTER TABLE tt_o9b RENAME COLUMN b TO c;
+    ALTER TABLE aux.tt_s9 RENAME TO tt_s9b;
+    INSERT INTO aux.tt_s9b VALUES (1);
+    SELECT name, sql LIKE '%(c)' FROM sqlite_schema WHERE name = 'tt_o9b';
+    SELECT name FROM aux.sqlite_schema WHERE type = 'table';
+    SELECT instr(sql, 'ON aux.') > 0 FROM sqlite_temp_schema WHERE name = 'tt_tr9';
+}
+expect {
+    tt_o9b|1
+    tt_s9b
+    1
+}
+
+# An unqualified TEMP trigger on a main table keeps its unqualified `ON` name
+# when its SQL is rebuilt after a RENAME TO or RENAME COLUMN.
+test alter-table-rename-keeps-unqualified-temp-trigger-table {
+    CREATE TABLE tt_m10 (x);
+    CREATE TABLE tt_o10 (b);
+    CREATE TEMP TRIGGER tt_tr10 AFTER INSERT ON tt_m10 BEGIN SELECT * FROM tt_o10; END;
+    ALTER TABLE tt_o10 RENAME TO tt_o10b;
+    ALTER TABLE tt_m10 RENAME COLUMN x TO y;
+    SELECT instr(sql, 'ON tt_m10') > 0, instr(sql, 'main.') = 0, instr(sql, 'tt_o10b') > 0
+    FROM sqlite_temp_schema WHERE name = 'tt_tr10';
+    ALTER TABLE tt_m10 RENAME TO tt_m10b;
+    SELECT instr(sql, 'tt_m10b') > 0, instr(sql, 'main.') = 0
+    FROM sqlite_temp_schema WHERE name = 'tt_tr10';
+}
+expect {
+    1|1|1
+    1|1
+}
+
+# A TEMP trigger ON aux.s whose body names o: RENAME o TO o2 rebuilds the
+# trigger's SQL, which must keep `aux.` so a later RENAME COLUMN still finds s.
+test alter-table-rename-body-table-keeps-attached-temp-trigger-qualifier {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s11 (a);
+    CREATE TABLE tt_o11 (b);
+    CREATE TABLE tt_p11 (q);
+    CREATE TEMP TRIGGER tt_tr11 AFTER INSERT ON aux.tt_s11 BEGIN SELECT * FROM tt_o11; END;
+    ALTER TABLE tt_o11 RENAME TO tt_o11b;
+    ALTER TABLE tt_p11 RENAME COLUMN q TO r;
+    SELECT sql FROM sqlite_schema WHERE name = 'tt_p11';
+    SELECT instr(sql, 'ON aux.tt_s11') > 0, instr(sql, 'tt_o11b') > 0
+    FROM sqlite_temp_schema WHERE name = 'tt_tr11';
+}
+expect {
+    CREATE TABLE tt_p11 (r)
+    1|1
+}
+
+# The trigger's `ON aux.` names the database by name. After aux is detached
+# and attached again under another index, ALTER TABLE still finds aux.s.
+test alter-table-temp-trigger-on-reattached-database {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s12 (a);
+    CREATE TABLE tt_p12 (q);
+    CREATE TEMP TRIGGER tt_tr12 AFTER INSERT ON aux.tt_s12 BEGIN SELECT 1; END;
+    DETACH aux;
+    ATTACH ':memory:' AS tt_x12;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s12 (a);
+    ALTER TABLE tt_p12 RENAME COLUMN q TO r;
+    SELECT sql FROM sqlite_schema WHERE name = 'tt_p12';
+}
+expect {
+    CREATE TABLE tt_p12 (r)
+}
+
 test temp-trigger-attached-read-cross-table {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.src_temp_aux_read (a INTEGER PRIMARY KEY, b);

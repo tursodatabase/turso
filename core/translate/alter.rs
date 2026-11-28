@@ -2890,9 +2890,20 @@ fn rewrite_trigger_sql_for_column_rename(
     // Get the trigger's owning table to check unqualified column references
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
-    let trigger_table = resolver
-        .with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(NamespaceId::ROOT, &trigger_table_name)
+    // A TEMP trigger can be on a table in another database (`ON main.t`, or an
+    // unqualified name that is not a temp table), so look the table up where
+    // the trigger's table lives, not in the trigger's own schema.
+    let trigger_table_namespace = trigger_table_namespace(
+        resolver,
+        trigger_database_id,
+        &trigger_table_name,
+        tbl_name.namespace.as_ref().map(|db| db.as_str()),
+    );
+    let trigger_table = trigger_table_namespace
+        .and_then(|namespace| {
+            resolver.with_schema(namespace.database_id, |schema| {
+                schema.get_btree_table(namespace.id, &trigger_table_name)
+            })
         })
         .ok_or_else(|| {
             LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
@@ -2913,7 +2924,8 @@ fn rewrite_trigger_sql_for_column_rename(
     }
 
     // Rewrite UPDATE OF column list if renaming a column in the trigger's owning table
-    let is_renaming_trigger_table = trigger_table_name == target_table_name;
+    let is_renaming_trigger_table = trigger_table_name == target_table_name
+        && trigger_table_namespace.is_some_and(|ns| ns.database_id == target_database_id);
     let new_event = if is_renaming_trigger_table {
         match event {
             ast::TriggerEvent::UpdateOf(mut cols) => {
@@ -2993,6 +3005,7 @@ fn rewrite_trigger_sql_for_column_rename(
             cmd,
             &trigger_table,
             trigger_table_name_raw,
+            is_renaming_trigger_table,
             &target_table_name,
             &old_col_norm,
             &new_col_norm,
@@ -3008,6 +3021,7 @@ fn rewrite_trigger_sql_for_column_rename(
         &new_commands,
         trigger_table.as_ref(),
         trigger_table_name_raw,
+        is_renaming_trigger_table,
         &target_table_name,
         &old_col_norm,
         trigger_database_id,
@@ -3346,6 +3360,7 @@ fn apply_expr_for_column_rename(
     traversal: ColumnRenameExprTraversal,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     context_table_name: Option<&str>,
@@ -3353,8 +3368,6 @@ fn apply_expr_for_column_rename(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let is_renaming_trigger_table = trigger_table_name.eq_ignore_ascii_case(target_table_name);
-
     let context_table_info: Option<(Arc<BTreeTable>, String, bool)> = if let Some(ctx_name) =
         context_table_name
     {
@@ -3380,6 +3393,7 @@ fn apply_expr_for_column_rename(
                     select,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     from_target_qualifiers,
@@ -3393,6 +3407,7 @@ fn apply_expr_for_column_rename(
                     select,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     from_target_qualifiers,
@@ -3406,6 +3421,7 @@ fn apply_expr_for_column_rename(
                     rhs,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     from_target_qualifiers,
@@ -3442,6 +3458,7 @@ fn apply_result_expr_for_column_rename(
     expr: &mut ast::Expr,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     visible_target_qualifiers: &TargetQualifiers,
@@ -3458,6 +3475,7 @@ fn apply_result_expr_for_column_rename(
         traversal,
         trigger_table,
         trigger_table_name,
+        is_renaming_trigger_table,
         target_table_name,
         old_col_norm,
         None,
@@ -3473,6 +3491,7 @@ fn apply_upsert_for_column_rename(
     upsert: &mut ast::Upsert,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     insert_table_name: &str,
     old_col_norm: &str,
@@ -3490,6 +3509,7 @@ fn apply_upsert_for_column_rename(
                 ColumnRenameExprTraversal::Normal,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 Some(&insert_table_name_norm),
@@ -3510,6 +3530,7 @@ fn apply_upsert_for_column_rename(
                 ColumnRenameExprTraversal::Normal,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 Some(&insert_table_name_norm),
@@ -3544,6 +3565,7 @@ fn apply_upsert_for_column_rename(
                 ColumnRenameExprTraversal::Normal,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 Some(&insert_table_name_norm),
@@ -3564,6 +3586,7 @@ fn apply_upsert_for_column_rename(
                 ColumnRenameExprTraversal::Normal,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 Some(&insert_table_name_norm),
@@ -3585,6 +3608,7 @@ fn apply_upsert_for_column_rename(
             next,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             insert_table_name,
             old_col_norm,
@@ -3602,6 +3626,7 @@ fn apply_select_for_column_rename(
     select: &mut ast::Select,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     outer_target_qualifiers: &TargetQualifiers,
@@ -3626,6 +3651,7 @@ fn apply_select_for_column_rename(
                 &mut cte.select,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 outer_target_qualifiers,
@@ -3640,6 +3666,7 @@ fn apply_select_for_column_rename(
         &mut select.body.select,
         trigger_table,
         trigger_table_name,
+        is_renaming_trigger_table,
         target_table_name,
         old_col_norm,
         outer_target_qualifiers,
@@ -3653,6 +3680,7 @@ fn apply_select_for_column_rename(
             &mut compound.select,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             old_col_norm,
             outer_target_qualifiers,
@@ -3687,6 +3715,7 @@ fn apply_select_for_column_rename(
             ColumnRenameExprTraversal::Normal,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             old_col_norm,
             None,
@@ -3703,6 +3732,7 @@ fn apply_select_for_column_rename(
             ColumnRenameExprTraversal::Normal,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             old_col_norm,
             None,
@@ -3717,6 +3747,7 @@ fn apply_select_for_column_rename(
                 ColumnRenameExprTraversal::Normal,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 None,
@@ -3736,6 +3767,7 @@ fn apply_one_select_for_column_rename(
     one_select: &mut ast::OneSelect,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     outer_target_qualifiers: &TargetQualifiers,
@@ -3766,6 +3798,7 @@ fn apply_one_select_for_column_rename(
                         expr,
                         trigger_table,
                         trigger_table_name,
+                        is_renaming_trigger_table,
                         target_table_name,
                         old_col_norm,
                         &visible_target_qualifiers,
@@ -3781,6 +3814,7 @@ fn apply_one_select_for_column_rename(
                     from_clause,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     outer_target_qualifiers,
@@ -3796,6 +3830,7 @@ fn apply_one_select_for_column_rename(
                     ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     None,
@@ -3815,6 +3850,7 @@ fn apply_one_select_for_column_rename(
                     ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     None,
@@ -3832,6 +3868,7 @@ fn apply_one_select_for_column_rename(
                         ColumnRenameExprTraversal::Normal,
                         trigger_table,
                         trigger_table_name,
+                        is_renaming_trigger_table,
                         target_table_name,
                         old_col_norm,
                         None,
@@ -3847,6 +3884,7 @@ fn apply_one_select_for_column_rename(
                         ColumnRenameExprTraversal::Normal,
                         trigger_table,
                         trigger_table_name,
+                        is_renaming_trigger_table,
                         target_table_name,
                         old_col_norm,
                         None,
@@ -3863,6 +3901,7 @@ fn apply_one_select_for_column_rename(
                     &mut window_def.window,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     &visible_target_qualifiers,
@@ -3880,6 +3919,7 @@ fn apply_one_select_for_column_rename(
                         ColumnRenameExprTraversal::Normal,
                         trigger_table,
                         trigger_table_name,
+                        is_renaming_trigger_table,
                         target_table_name,
                         old_col_norm,
                         None,
@@ -3900,6 +3940,7 @@ fn apply_from_clause_for_column_rename(
     from_clause: &mut ast::FromClause,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     visible_target_qualifiers: &TargetQualifiers,
@@ -3911,6 +3952,7 @@ fn apply_from_clause_for_column_rename(
         &mut from_clause.select,
         trigger_table,
         trigger_table_name,
+        is_renaming_trigger_table,
         target_table_name,
         old_col_norm,
         visible_target_qualifiers,
@@ -3957,6 +3999,7 @@ fn apply_from_clause_for_column_rename(
             &mut join.table,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             old_col_norm,
             table_target_qualifiers,
@@ -3970,6 +4013,7 @@ fn apply_from_clause_for_column_rename(
                 ColumnRenameExprTraversal::Normal,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 None,
@@ -3988,6 +4032,7 @@ fn apply_select_table_for_column_rename(
     select_table: &mut ast::SelectTable,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     outer_target_qualifiers: &TargetQualifiers,
@@ -4001,6 +4046,7 @@ fn apply_select_table_for_column_rename(
                 select,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 outer_target_qualifiers,
@@ -4014,6 +4060,7 @@ fn apply_select_table_for_column_rename(
                 from_clause,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 outer_target_qualifiers,
@@ -4029,6 +4076,7 @@ fn apply_select_table_for_column_rename(
                     ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     None,
@@ -4050,6 +4098,7 @@ fn apply_window_for_column_rename(
     window: &mut ast::Window,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     visible_target_qualifiers: &TargetQualifiers,
@@ -4063,6 +4112,7 @@ fn apply_window_for_column_rename(
             ColumnRenameExprTraversal::Normal,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             old_col_norm,
             None,
@@ -4079,6 +4129,7 @@ fn apply_window_for_column_rename(
             ColumnRenameExprTraversal::Normal,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             old_col_norm,
             None,
@@ -4097,6 +4148,7 @@ fn apply_trigger_cmd_for_column_rename(
     cmd: &mut ast::TriggerCmd,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     database_id: usize,
@@ -4141,6 +4193,7 @@ fn apply_trigger_cmd_for_column_rename(
                     ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     Some(&update_table_name_norm),
@@ -4157,6 +4210,7 @@ fn apply_trigger_cmd_for_column_rename(
                     ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     Some(&update_table_name_norm),
@@ -4172,6 +4226,7 @@ fn apply_trigger_cmd_for_column_rename(
                     from_clause,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     &TargetQualifiers::default(),
@@ -4204,6 +4259,7 @@ fn apply_trigger_cmd_for_column_rename(
                 select,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 &TargetQualifiers::default(),
@@ -4217,6 +4273,7 @@ fn apply_trigger_cmd_for_column_rename(
                     upsert,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     tbl_name.as_str(),
                     old_col_norm,
@@ -4237,6 +4294,7 @@ fn apply_trigger_cmd_for_column_rename(
                     ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
+                    is_renaming_trigger_table,
                     target_table_name,
                     old_col_norm,
                     Some(&delete_table_name_norm),
@@ -4252,6 +4310,7 @@ fn apply_trigger_cmd_for_column_rename(
                 select,
                 trigger_table,
                 trigger_table_name,
+                is_renaming_trigger_table,
                 target_table_name,
                 old_col_norm,
                 &TargetQualifiers::default(),
@@ -4271,13 +4330,14 @@ fn validate_trigger_after_column_rename(
     commands: &[ast::TriggerCmd],
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     let mut event = event.clone();
-    if trigger_table_name.eq_ignore_ascii_case(target_table_name) {
+    if is_renaming_trigger_table {
         if let ast::TriggerEvent::UpdateOf(cols) = &mut event {
             for col in cols {
                 if normalize_ident(col.as_str()) == *old_col_norm {
@@ -4295,6 +4355,7 @@ fn validate_trigger_after_column_rename(
             ColumnRenameExprTraversal::Normal,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             old_col_norm,
             None,
@@ -4311,6 +4372,7 @@ fn validate_trigger_after_column_rename(
             &mut cmd,
             trigger_table,
             trigger_table_name,
+            is_renaming_trigger_table,
             target_table_name,
             old_col_norm,
             database_id,
@@ -4351,6 +4413,7 @@ fn rewrite_trigger_cmd_for_column_rename(
     cmd: ast::TriggerCmd,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
+    is_renaming_trigger_table: bool,
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
@@ -4363,6 +4426,7 @@ fn rewrite_trigger_cmd_for_column_rename(
         &mut cmd,
         trigger_table,
         trigger_table_name,
+        is_renaming_trigger_table,
         target_table_name,
         old_col_norm,
         database_id,
@@ -4634,6 +4698,19 @@ impl crate::util::AstVisitor for RenameTableRefCheck<'_> {
 
     fn report_target_tables(&self) -> bool {
         true
+    }
+
+    fn trigger_table(&mut self, trigger: &crate::schema::Trigger) -> Result<()> {
+        // Name a TEMP trigger's own table with the `aux.` its `ON aux.s`
+        // writes, so it is looked up in aux rather than in temp and main.
+        // The qualifier is resolved by name, as SQLite does, so a database
+        // that was detached and attached again is still found.
+        let table_name = ast::Name::exact(trigger.table_name.clone());
+        let name = match trigger.written_table_qualifier(self.resolver.catalog.dialect.as_ref()) {
+            Some(db_name) => ast::QualifiedName::fullname(db_name, table_name),
+            None => ast::QualifiedName::single(table_name),
+        };
+        self.table(&name)
     }
 }
 
