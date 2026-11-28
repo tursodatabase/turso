@@ -316,4 +316,81 @@ mod tests {
         registers.set_value(1, payload[0].clone());
         assert!(registers[1].is_null());
     }
+
+    const NAN_BITS: [u64; 3] = [
+        0x7ff8_0000_0000_0000,
+        0xfff8_0000_0000_0001,
+        0x7ff0_0000_0000_0001,
+    ];
+
+    const RECORD_NAN: u64 = 0x7ff8_0054_5552_534f;
+
+    fn record_with_stored_nan() -> crate::types::ImmutableRecord {
+        let values = [Value::from_i64(7), Value::from_f64(1.25)];
+        let record = crate::types::ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let mut payload = record.into_payload();
+        let end = payload.len();
+        payload[end - 8..].copy_from_slice(&RECORD_NAN.to_be_bytes());
+        crate::types::ImmutableRecord::from_bin_record(payload)
+    }
+
+    #[test]
+    fn decoders_refuse_a_stored_nan_where_nan_is_not_a_value() {
+        let is_corrupt = |result: crate::Result<()>| {
+            assert!(matches!(result, Err(crate::LimboError::Corrupt(_))));
+        };
+        {
+            let record = record_with_stored_nan();
+            let mut registers = Registers::new(5);
+            is_corrupt(
+                registers
+                    .decode_column(record.get_payload(), 1, 1)
+                    .map(drop),
+            );
+            is_corrupt(
+                registers
+                    .decode_columns(record.get_payload(), 1, 2..4)
+                    .map(drop),
+            );
+            let stored = RECORD_NAN.to_be_bytes();
+            is_corrupt(registers.decode_serial(7, &mut &stored[..], 4));
+            *registers.write(0) = Register::Record(record.clone());
+            is_corrupt(registers.decode_record_columns(0, 1, 1..3).map(drop));
+            let mut blob = crate::alloc::vec![42];
+            blob.extend_from_slice(record.get_payload());
+            registers.set_blob(0, blob).unwrap();
+            is_corrupt(registers.decode_blob_column(0, 1, 1, 1));
+            for index in 1..5 {
+                assert!(!registers[index].get_value().is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn decoders_read_other_nan_bits_as_null() {
+        for bits in NAN_BITS {
+            let mut registers = Registers::new(1);
+            registers
+                .decode_serial(7, &mut &bits.to_be_bytes()[..], 0)
+                .unwrap();
+            assert!(registers[0].is_null());
+        }
+    }
+
+    #[test]
+    fn a_decode_error_keeps_completed_values() {
+        let values = [Value::from_f64(1.5), Value::from_i64(42)];
+        let record = crate::types::ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let mut payload = record.into_payload();
+        payload.pop();
+        let mut registers = Registers::new(3);
+        registers.set_int(2, 99);
+        assert!(registers.decode_columns(&payload, 0, 1..3).is_err());
+        assert_eq!(registers[1].get_value(), &Value::from_f64(1.5));
+        assert_eq!(registers[2].get_value(), &Value::from_i64(99));
+
+        // A truncated REAL must leave its destination untouched too.
+        assert!(registers.decode_serial(7, &mut &[0; 7][..], 2).is_err());
+        assert_eq!(registers[2].get_value(), &Value::from_i64(99));
+    }
 }

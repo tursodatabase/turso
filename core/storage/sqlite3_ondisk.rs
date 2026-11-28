@@ -1105,7 +1105,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 .get(..8)
                 .and_then(|s| s.try_into().ok())
                 .ok_or_else(|| LimboError::Corrupt("Invalid BEFloat64 value".into()))?;
-            Ok((ValueRef::from_record_real(*bytes), 8))
+            Ok((ValueRef::from_record_real(*bytes)?, 8))
         }
         SerialTypeKind::ConstInt0 => Ok((ValueRef::Numeric(Numeric::Integer(0)), 0)),
         SerialTypeKind::ConstInt1 => Ok((ValueRef::Numeric(Numeric::Integer(1)), 0)),
@@ -1227,7 +1227,7 @@ pub fn read_value_serial_type<'a>(
             Ok((
                 ValueRef::from_record_real([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                ]),
+                ])?,
                 8,
             ))
         }

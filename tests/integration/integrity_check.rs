@@ -108,6 +108,56 @@ fn check_indexed_real_nan(mvcc: bool) {
     }
 }
 
+// Only a frontend that keeps NaN writes these bits. A database that has no NaN
+// must not read them as NULL from the table and compare them as NaN in an index.
+#[test]
+#[cfg(not(feature = "checksum"))]
+fn the_nan_bits_of_another_frontend_are_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stored-nan.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(a REAL, b INTEGER); CREATE INDEX t_a ON t(a); INSERT INTO t VALUES (1.25, 1);",
+        )
+        .unwrap();
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    let positions: Vec<_> = bytes
+        .windows(8)
+        .enumerate()
+        .filter_map(|(i, b)| (b == 1.25f64.to_be_bytes()).then_some(i))
+        .collect();
+    assert_eq!(positions.len(), 2, "one table field and one index field");
+    for position in positions {
+        bytes[position..position + 8].copy_from_slice(&0x7ff8_0054_5552_534fu64.to_be_bytes());
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    for sql in [
+        "SELECT a FROM t NOT INDEXED",
+        "SELECT a FROM t INDEXED BY t_a",
+        "SELECT b FROM t NOT INDEXED WHERE a IS NULL",
+        "SELECT b FROM t INDEXED BY t_a WHERE a IS NULL",
+        "SELECT count(*) FROM t INDEXED BY t_a WHERE a > 5",
+        "DELETE FROM t WHERE rowid = 1",
+        "INSERT OR REPLACE INTO t(rowid, a, b) VALUES (1, 2.5, 2)",
+        "SELECT bin_record_json_object('[\"a\"]', x'02077ff800545552534f')",
+        "PRAGMA integrity_check",
+    ] {
+        let error = conn
+            .prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .expect_err(sql);
+        assert!(
+            matches!(error, turso_core::LimboError::Corrupt(_)),
+            "{sql}: {error}"
+        );
+    }
+}
+
 #[cfg(not(feature = "checksum"))]
 fn assert_indexed_nan_row(conn: &Arc<turso_core::Connection>, b: i64) {
     assert_eq!(run_integrity_check(conn), "ok");

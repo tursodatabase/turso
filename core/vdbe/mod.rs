@@ -4623,13 +4623,11 @@ pub(crate) fn decode_serial_type_into_register(
             if unlikely(data.len() < 8) {
                 return Err(LimboError::Corrupt("Invalid 8-byte float".into()));
             }
-            let val = f64::from_be_bytes([
+            match Double::from_record_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ]);
-            if let Some(nn) = Double::non_nan(val) {
-                dest.set_float(nn);
-            } else {
-                dest.set_null();
+            ])? {
+                Some(real) => dest.set_float(real),
+                None => dest.set_null(),
             }
             *data = &data[8..];
         }

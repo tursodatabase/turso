@@ -10,6 +10,10 @@ use std::cmp::Ordering;
 pub struct Double(f64);
 
 impl Double {
+    // Every NaN is written with these bits. SQLite never writes NaN bits and
+    // reads all of them as NULL, so all other NaN bits in a record are NULL.
+    const RECORD_NAN: u64 = 0x7ff8_0054_5552_534f;
+
     pub const fn new(value: f64) -> Self {
         Double(value)
     }
@@ -24,6 +28,38 @@ impl Double {
 
     pub const fn is_nan(self) -> bool {
         self.0.is_nan()
+    }
+
+    /// The 8 bytes of this value in a record, or `None` when a record holds
+    /// NULL for it.
+    #[inline]
+    pub fn to_record_bytes(self) -> Option<[u8; 8]> {
+        if !self.0.is_nan() {
+            Some(self.0.to_be_bytes())
+        } else if crate::dialect::linked::nan_is_a_value() {
+            Some(Self::RECORD_NAN.to_be_bytes())
+        } else {
+            None
+        }
+    }
+
+    /// The value of the 8 bytes of a REAL in a record, or `None` for NULL.
+    #[inline]
+    pub fn from_record_bytes(bytes: [u8; 8]) -> crate::Result<Option<Self>> {
+        let real = f64::from_be_bytes(bytes);
+        if !real.is_nan() {
+            return Ok(Some(Double(real)));
+        }
+        if u64::from_be_bytes(bytes) != Self::RECORD_NAN {
+            return Ok(None);
+        }
+        if crate::dialect::linked::nan_is_a_value() {
+            Ok(Some(Double(real)))
+        } else {
+            Err(crate::LimboError::Corrupt(
+                "a REAL field holds a NaN, which this database cannot store".into(),
+            ))
+        }
     }
 
     /// Bits for hashing and sort prefixes, consistent with this type's equality.
@@ -197,6 +233,57 @@ mod tests {
         let infinity = Double::new(f64::INFINITY);
         assert!((infinity - infinity).is_nan());
         assert!((Double::new(f64::NAN) + Double::new(1.0)).is_nan());
+    }
+
+    const NAN_BITS: [u64; 5] = [
+        0x7ff8_0000_0000_0000,
+        0xfff8_0000_0000_0000,
+        0xfff8_0000_0000_0001,
+        0x7ff0_0000_0000_0001,
+        0x7fff_ffff_ffff_ffff,
+    ];
+
+    #[test]
+    fn a_nan_has_no_bytes_in_a_record_where_nan_is_not_a_value() {
+        for bits in NAN_BITS {
+            assert!(Double::new(f64::from_bits(bits))
+                .to_record_bytes()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn other_nan_bytes_in_a_record_are_null() {
+        for bits in NAN_BITS {
+            assert!(Double::from_record_bytes(bits.to_be_bytes())
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn the_nan_bytes_of_a_record_are_corrupt_where_nan_is_not_a_value() {
+        assert!(matches!(
+            Double::from_record_bytes(Double::RECORD_NAN.to_be_bytes()),
+            Err(crate::LimboError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn a_number_keeps_its_bytes_in_a_record() {
+        for number in [
+            0.0,
+            -0.0,
+            1.5,
+            f64::MIN_POSITIVE,
+            f64::INFINITY,
+            -f64::INFINITY,
+        ] {
+            let bytes = Double::new(number).to_record_bytes().unwrap();
+            assert_eq!(bytes, number.to_be_bytes());
+            let read = Double::from_record_bytes(bytes).unwrap().unwrap();
+            assert_eq!(f64::from(read).to_bits(), number.to_bits());
+        }
     }
 
     #[test]
