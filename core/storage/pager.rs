@@ -5023,7 +5023,7 @@ impl Pager {
     }
 
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        self.wal_insert_frame_with_commit(frame_no, frame, || {})
+        self.wal_insert_frame_with_hook(frame_no, frame, |_| {})
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -5037,11 +5037,11 @@ impl Pager {
         verify = "full",
         id = "wal_insert_frame_marks_cached_page_with_frame_number"
     )]
-    pub(crate) fn wal_insert_frame_with_commit(
+    pub(crate) fn wal_insert_frame_with_hook(
         &self,
         frame_no: u64,
         frame: &[u8],
-        on_commit: impl FnOnce(),
+        on_append: impl FnOnce(&WalFrameInfo),
     ) -> Result<WalFrameInfo> {
         turso_assert!(
             self.is_authenticated(),
@@ -5112,15 +5112,16 @@ impl Pager {
             &header,
             raw_page,
         );
-        // A new commit frame is already visible, even if updating the local cache failed.
-        if frame_is_new && header.is_commit_frame() {
-            on_commit();
-        }
-        result?;
-        Ok(WalFrameInfo {
+        let info = WalFrameInfo {
             page_no: header.page_number,
             db_size: header.db_size,
-        })
+        };
+        // The append succeeded even if updating the local cache failed.
+        if frame_is_new {
+            on_append(&info);
+        }
+        result?;
+        Ok(info)
     }
 
     fn update_cache_from_wal_frame(

@@ -2084,10 +2084,14 @@ impl Connection {
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
         self.pager
             .load()
-            .wal_insert_frame_with_commit(frame_no, frame, || {
+            .wal_insert_frame_with_hook(frame_no, frame, |info| {
                 // Imported pages can replace dirty SQL pages without describing their row keys.
-                self.pending_changes.finish(None, None);
-                self.db.subscriptions.refresh();
+                if info.is_commit_frame() {
+                    self.pending_changes.finish(None, None);
+                    self.db.subscriptions.refresh();
+                } else {
+                    self.pending_changes.record_refresh(self);
+                }
             })
     }
 
@@ -2131,7 +2135,9 @@ impl Connection {
                 ));
             };
 
+            let mut committed = false;
             let commit_err = if force_commit {
+                let previous_commit = wal.get_max_frame_in_wal();
                 pager
                     .io
                     .block(|| {
@@ -2142,6 +2148,8 @@ impl Connection {
                             self.get_data_sync_retry(),
                         ));
                         pager.commit_wal_end();
+                        // With no dirty SQL pages, the pager can finish without a commit frame.
+                        committed = wal.get_max_frame_in_wal() > previous_commit;
                         Ok(IOResult::Done(()))
                     })
                     .err()
@@ -2174,7 +2182,6 @@ impl Connection {
             }
             wal.end_write_tx();
             wal.end_read_tx();
-            let committed = force_commit && commit_err.is_none();
             self.pending_changes
                 .finish(None, committed.then_some(&self.db.subscriptions));
             if let Some(err) = commit_err {

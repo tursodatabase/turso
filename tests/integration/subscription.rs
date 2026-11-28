@@ -452,6 +452,45 @@ fn async_receive_wakes_on_commit_and_close() {
 
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 #[test]
+fn mixed_wal_commit_refreshes_the_imported_table() {
+    let db = TempDatabase::new_empty();
+    let writer = db.connect_limbo();
+    let reader = db.connect_limbo();
+    writer.execute("CREATE TABLE a(x)").unwrap();
+    writer.execute("CREATE TABLE b(x)").unwrap();
+
+    // Save the populated page so we can import it without a commit marker.
+    writer.execute("INSERT INTO a VALUES(1)").unwrap();
+    let mut frame = [0; 24 + 4096];
+    let mut info = writer
+        .wal_get_frame(writer.wal_state().unwrap().max_frame, &mut frame)
+        .unwrap();
+    info.db_size = 0;
+    info.put_to_frame_header(&mut frame);
+    writer.execute("DELETE FROM a").unwrap();
+
+    let sub = reader
+        .db
+        .subscribe_changes(ChangeFilter::Table { table: "a".into() });
+    writer.wal_insert_begin().unwrap();
+    let next_frame = writer.wal_state().unwrap().max_frame + 1;
+    writer.wal_insert_frame(next_frame, &frame).unwrap();
+    writer.execute("INSERT INTO b VALUES(2)").unwrap();
+    assert_eq!(sub.try_recv(), None);
+    writer.wal_insert_end(true).unwrap();
+
+    let rows = reader
+        .prepare("SELECT a.x, b.x FROM a CROSS JOIN b")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(2)]]);
+    assert_eq!(sub.try_recv(), Some(ChangeBatch::Refresh));
+    assert_eq!(sub.try_recv(), None);
+}
+
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+#[test]
 fn local_wal_import_refreshes_at_each_new_commit_frame() {
     let source = TempDatabase::new_empty();
     let src = source.connect_limbo();
@@ -476,7 +515,19 @@ fn local_wal_import_refreshes_at_each_new_commit_frame() {
     }
     dst.wal_insert_end(false).unwrap();
     assert_eq!(sub.try_recv(), None);
-    let rows = dst
+
+    // Without dirty SQL pages, forcing the session to end only syncs the WAL.
+    src.execute("INSERT INTO imported VALUES(2)").unwrap();
+    let n = src.wal_state().unwrap().max_frame;
+    let mut info = src.wal_get_frame(n, &mut frame).unwrap();
+    info.db_size = 0;
+    info.put_to_frame_header(&mut frame);
+    dst.wal_insert_begin().unwrap();
+    dst.wal_insert_frame(n, &frame).unwrap();
+    dst.wal_insert_end(true).unwrap();
+    assert_eq!(sub.try_recv(), None);
+    let rows = target
+        .connect_limbo()
         .prepare("SELECT x FROM imported")
         .unwrap()
         .run_collect_rows()
