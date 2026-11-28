@@ -536,6 +536,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn drop_type_drops_domains(&self) -> bool {
+        true
+    }
+
     fn text_input_types_refuse_other_kinds(&self) -> bool {
         true
     }

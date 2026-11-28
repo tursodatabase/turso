@@ -3138,7 +3138,7 @@ pub fn translate_drop_type(
     if is_domain_drop && !target_is_domain {
         bail_parse_error!("{normalized_name} is a type, not a domain. Use DROP TYPE instead");
     }
-    if !is_domain_drop && target_is_domain {
+    if !is_domain_drop && target_is_domain && !resolver.catalog.dialect.drop_type_drops_domains() {
         bail_parse_error!("{normalized_name} is a domain, not a type. Use DROP DOMAIN instead");
     }
 
