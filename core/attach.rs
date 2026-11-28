@@ -34,6 +34,7 @@ pub fn translate_attach(
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
 ) -> Result<()> {
+    connection.dialect_ref().validate_attach()?;
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
             "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
@@ -139,6 +140,7 @@ pub fn translate_detach(
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
 ) -> Result<()> {
+    connection.dialect_ref().validate_attach()?;
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
             "DETACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
@@ -446,6 +448,7 @@ impl Connection {
         reserved_space: Option<u8>,
         state: &mut AttachDatabaseState,
     ) -> IOResultOr<()> {
+        self.dialect_ref().validate_attach()?;
         loop {
             match state {
                 AttachDatabaseState::Start => {
@@ -635,6 +638,7 @@ impl Connection {
 
     // Detach a database by alias name
     pub(crate) fn detach_database(&self, alias: &str) -> Result<()> {
+        self.dialect_ref().validate_attach()?;
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }

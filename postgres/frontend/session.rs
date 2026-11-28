@@ -77,7 +77,6 @@ pub fn tursopg_database_opts() -> turso_core::DatabaseOpts {
         .with_custom_types(true)
         .with_encryption(true)
         .with_index_method(true)
-        .with_attach(true)
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -3103,8 +3102,7 @@ mod tests {
             let db = Database::open(
                 Arc::new(MemoryIO::new()),
                 path,
-                OpenOptions::new(Arc::new(PostgresDialect))
-                    .db_opts(DatabaseOpts::new().with_attach(true)),
+                OpenOptions::new(Arc::new(PostgresDialect)),
             )
             .unwrap();
             let conn = PgConnection::connect(&db).unwrap();
