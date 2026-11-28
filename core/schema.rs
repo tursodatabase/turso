@@ -486,6 +486,8 @@ pub struct TypeDef {
     /// table (see `Type::can_be_rowid_alias`). False for a domain, a user
     /// type and a STRUCT or UNION.
     pub can_be_rowid_alias: bool,
+    /// The type of the elements when values of the type are arrays.
+    pub array_element: Option<String>,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -821,6 +823,7 @@ impl TypeDef {
                     is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
                     can_be_rowid_alias: false,
+                    array_element: None,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -859,6 +862,7 @@ impl TypeDef {
                     is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
                     can_be_rowid_alias: false,
+                    array_element: None,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -891,6 +895,7 @@ impl TypeDef {
             is_type_of_conditions: ty.is_type_of_conditions(),
             casts_to_numbers_and_booleans: ty.casts_to_numbers_and_booleans(),
             can_be_rowid_alias: ty.can_be_rowid_alias(),
+            array_element: ty.array_element().map(str::to_string),
             sql,
             domain_checks: std::vec::Vec::new(),
             kind: TypeDefKind::Custom {
@@ -930,6 +935,7 @@ impl TypeDef {
             is_type_of_conditions: false,
             casts_to_numbers_and_booleans: false,
             can_be_rowid_alias: false,
+            array_element: None,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {

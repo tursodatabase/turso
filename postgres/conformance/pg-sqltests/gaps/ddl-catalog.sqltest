@@ -1041,17 +1041,13 @@ expect @tursopg {
 }
 
 # E-103: indkey cast to int2[]
-# Fails because tursopg returns int2vector columns as text, see E-39.
 @setup p_a_b_c_x_y_fkey
-@compat-gap "syntax:catalog"
 test indkey-cast-to-int2-array {
     SELECT indkey::int2[] FROM pg_index WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 'p');
 }
 expect {
     [0:1]={1,2}
 }
-@sqlstate 23000
-expect @tursopg error {}
 
 # E-104: unquoted name does not find a quoted mixed-case schema
 # Fails because tursopg folds the quoted schema name to lower case, see E-81.

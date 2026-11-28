@@ -20,6 +20,8 @@ pub(super) fn emit_array_element_loop(
     });
 
     let reg_len = program.alloc_register();
+    let reg_lower_bound = program.alloc_register();
+    let reg_last = program.alloc_register();
     let reg_idx = program.alloc_register();
     let reg_elem = program.alloc_register();
     let reg_acc = program.alloc_register();
@@ -47,10 +49,23 @@ pub(super) fn emit_array_element_loop(
         target_pc: done_label,
         jump_if_null: false,
     });
-    // reg_idx is the 1-based array index for ArrayElement (PG convention)
-    program.emit_insn(Insn::Integer {
-        value: 1,
-        dest: reg_idx,
+    program.emit_insn(Insn::ArrayLowerBound {
+        reg,
+        dest: reg_lower_bound,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_lower_bound,
+        dst_reg: reg_idx,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Add {
+        lhs: reg_lower_bound,
+        rhs: reg_len,
+        dest: reg_last,
+    });
+    program.emit_insn(Insn::AddImm {
+        register: reg_last,
+        value: -1,
     });
     // A NULL accumulator starts a new array_agg.
     program.emit_insn(Insn::Null {
@@ -64,7 +79,7 @@ pub(super) fn emit_array_element_loop(
 
     program.emit_insn(Insn::Gt {
         lhs: reg_idx,
-        rhs: reg_len,
+        rhs: reg_last,
         target_pc: loop_end_label,
         flags: CmpInsFlags::default(),
         collation: CollationSeq::for_internal_values(),
@@ -108,6 +123,10 @@ pub(super) fn emit_array_element_loop(
         src_reg: reg_acc,
         dst_reg: reg,
         extra_amount: 0,
+    });
+    program.emit_insn(Insn::ArraySetLowerBound {
+        reg,
+        bound_reg: reg_lower_bound,
     });
 
     program.preassign_label_to_next_insn(done_label);

@@ -679,9 +679,9 @@ fn base_table_column_type(
         ) {
             return None;
         }
-        return Some(column_type(
+        return Some(table_column_type(
+            table,
             table.get_column_at(column)?,
-            table.is_strict(),
             env.schema(),
         ));
     }
@@ -689,6 +689,19 @@ fn base_table_column_type(
         return env.self_table_column_type(column);
     }
     None
+}
+
+/// The type of a column of `table`, which for a virtual table is its declared registered type.
+fn table_column_type(table: &Table, column: &Column, schema: &Schema) -> ExprType {
+    if matches!(table, Table::Virtual(_)) {
+        if let Some(type_def) = schema.get_type_def_unchecked(&column.ty_str) {
+            return ExprType::Custom {
+                type_def: Arc::clone(type_def),
+                params: column.ty_params.clone(),
+            };
+        }
+    }
+    column_type(column, table.is_strict(), schema)
 }
 
 /// The type of a struct field or union variant, as declared in CREATE TYPE.
@@ -867,7 +880,7 @@ fn binary_type(
             if let Some(ty) = custom_operator_type(expr, &types, env) {
                 return ty;
             }
-            let [lhs, rhs] = types;
+            let [lhs, rhs] = types.map(|ty| array_valued_type(ty, env.schema()));
             if lhs.is_array() {
                 return lhs;
             }
@@ -888,6 +901,24 @@ fn binary_type(
         // `->>` gives the SQL value it extracts, whose kind varies.
         Operator::ArrowRightShift => affinity_type(expr, env),
     }
+}
+
+/// The array that a value of `ty` is when its type has arrays as values, else `ty`.
+pub(crate) fn array_valued_type(ty: ExprType, schema: &Schema) -> ExprType {
+    let ExprType::Custom { type_def, .. } = &ty else {
+        return ty;
+    };
+    let Some(element) = type_def.array_element.as_deref() else {
+        return ty;
+    };
+    let scalar = match schema.get_type_def_unchecked(element) {
+        Some(type_def) => ExprType::Custom {
+            type_def: Arc::clone(type_def),
+            params: Vec::new(),
+        },
+        None => ExprType::Builtin(builtin_type_of_affinity(Affinity::of_written_type(element))),
+    };
+    ExprType::array(scalar, 1)
 }
 
 /// The type of the operator expression `expr` when a custom type's function runs

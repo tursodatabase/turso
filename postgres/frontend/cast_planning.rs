@@ -9,7 +9,9 @@ use std::sync::Arc;
 use turso_core::ast;
 use turso_core::dialect::{CastContext, CastDecision, CastSource, TypeIdentity, TypeRef};
 use turso_core::{Connection, DialectError, LimboError, Register, Result, Value};
-use turso_pg_parser::sqlstate::{SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED,
+};
 
 /// Decides a CAST of `operand` to `target` as PostgreSQL does when `CASTS`
 /// covers both types, and fails when PostgreSQL has no such cast.
@@ -121,7 +123,12 @@ fn table_cast(
                 );
                 (cast_type, context)
             }
-            CastRule::Engine => return Ok(None),
+            CastRule::Engine => {
+                if matches!(target, Int2Vector | OidVector) && source.array_dimensions > 0 {
+                    return Err(array_to_vector_error(&source, target));
+                }
+                return Ok(None);
+            }
         },
         // FIXME(pg-catalog): Core cannot name the type of every expression, such as the result of most functions, so such a value is cast by the rules of the engine. `bool_cast` of pg_type/boolean.rs still decides its cast to boolean. A typed expression tree, where every expression has a registered type, removes this case.
         CastSource::Unnamed => return Ok(None),
@@ -132,6 +139,17 @@ fn table_cast(
         context,
         source_is_a_guess,
     }))
+}
+
+/// PostgreSQL has no cast from an array to int2vector or oidvector.
+fn array_to_vector_error(source: &TypeRef, target: CastType) -> LimboError {
+    let element = crate::catalog::pg_type_oid(source.name())
+        .map_or_else(|| source.name().to_string(), |oid| format_type(oid, -1));
+    sqlstate_error(
+        SQLSTATE_CANNOT_COERCE,
+        format!("cannot cast type {element}[] to {}", target.name()),
+        None,
+    )
 }
 
 fn conversion_call(operand: &ast::Expr, source: CastType, target: CastType) -> ast::Expr {
@@ -244,6 +262,8 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
         "regclass" => RegClass,
         "uuid" => Uuid,
         "regtype" => RegType,
+        "int2vector" => Int2Vector,
+        "oidvector" => OidVector,
         "bytea" => Bytea,
         "timestamp" => Timestamp,
         "timestamptz" => TimestampTz,

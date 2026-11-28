@@ -1,31 +1,25 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
+use super::array_value::{encode_array, ArrayValue, ArrayView, DEFAULT_LOWER_BOUND};
 use crate::dialect::Dialect;
 use crate::numeric::Numeric;
-use crate::types::{ImmutableRecord, Value, ValueIterator};
-use crate::Result;
-
-/// Extract values from a record-format array blob.
-/// Returns Err if the blob is not a valid record.
-/// Uses zero-copy iteration over the blob bytes — no Vec<u8> allocation.
-pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
-    let iter = ValueIterator::new(blob)?;
-    let mut values = Vec::with_capacity(iter.size_hint().0);
-    for value in iter {
-        values.push(value?.to_owned()?);
-    }
-    Ok(values)
-}
+use crate::types::Value;
+use crate::{LimboError, Result};
 
 /// Extract elements from any Value that represents an array.
 /// Handles record blobs, JSON text input, and NULL (empty array).
 /// Returns None if the value cannot be interpreted as an array.
 pub fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
+    array_from_any(arr).map(|array| array.elements)
+}
+
+/// [array_values_from_any] with the lower bound of the array.
+pub(crate) fn array_from_any(arr: &Value) -> Option<ArrayValue> {
     match arr {
-        Value::Blob(blob) => array_values_from_blob(blob).ok(),
-        Value::Text(text) => parse_text_array(text.as_str()),
-        Value::Null => Some(Vec::new()),
+        Value::Blob(blob) => ArrayValue::decode(blob).ok(),
+        Value::Text(text) => parse_text_array_value(text.as_str()),
+        Value::Null => Some(ArrayValue::new(Vec::new())),
         _ => None,
     }
 }
@@ -33,12 +27,22 @@ pub fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
 /// Parse a text array literal in PG format `{1, hello, NULL}` into a Vec<Value>.
 /// Handles integers, floats, strings (quoted and unquoted), and NULL.
 pub(crate) fn parse_text_array(text: &str) -> Option<Vec<Value>> {
+    parse_text_array_value(text).map(|array| array.elements)
+}
+
+/// [parse_text_array] with the lower bound that the text gives.
+pub(crate) fn parse_text_array_value(text: &str) -> Option<ArrayValue> {
     parse_text_array_as(text, UnquotedElements::Numbers)
 }
 
 /// [parse_text_array] for an array whose elements are texts, such as a
 /// `text[]`: an unquoted `1.0` stays the text `1.0`.
 pub fn parse_text_array_of_texts(text: &str) -> Option<Vec<Value>> {
+    parse_text_array_of_texts_value(text).map(|array| array.elements)
+}
+
+/// [parse_text_array_of_texts] with the lower bound that the text gives.
+pub(crate) fn parse_text_array_of_texts_value(text: &str) -> Option<ArrayValue> {
     parse_text_array_as(text, UnquotedElements::Texts)
 }
 
@@ -50,12 +54,38 @@ enum UnquotedElements {
     Texts,
 }
 
-fn parse_text_array_as(text: &str, unquoted: UnquotedElements) -> Option<Vec<Value>> {
-    let text = text.trim();
-    if text.starts_with('{') && text.ends_with('}') {
-        return parse_pg_text_array(text, unquoted);
+fn parse_text_array_as(text: &str, unquoted: UnquotedElements) -> Option<ArrayValue> {
+    let (bounds, body) = split_bounds(text.trim())?;
+    if !(body.starts_with('{') && body.ends_with('}')) {
+        return None;
     }
-    None
+    let elements = parse_pg_text_array(body, unquoted)?;
+    let Some((lower_bound, upper_bound)) = bounds else {
+        return Some(ArrayValue::new(elements));
+    };
+    let length = i64::from(upper_bound) - i64::from(lower_bound) + 1;
+    if upper_bound < lower_bound || upper_bound == i32::MAX || length != elements.len() as i64 {
+        return None;
+    }
+    Some(ArrayValue {
+        lower_bound,
+        elements,
+    })
+}
+
+/// Splits the bounds of `[0:1]={1,2}` from its braces. `[2]` stands for
+/// `[1:2]`. The bounds are None for text without them.
+fn split_bounds(text: &str) -> Option<(Option<(i32, i32)>, &str)> {
+    let Some(rest) = text.strip_prefix('[') else {
+        return Some((None, text));
+    };
+    let (range, body) = rest.split_once(']')?;
+    let (lower, upper) = match range.split_once(':') {
+        Some((lower, upper)) => (lower.parse().ok()?, upper.parse().ok()?),
+        None => (DEFAULT_LOWER_BOUND, range.parse().ok()?),
+    };
+    let body = body.trim_start().strip_prefix('=')?.trim_start();
+    Some((Some((lower, upper)), body))
 }
 
 /// Parse a PG-style text array like `{1, hello, NULL, 3.14}` into a Vec<Value>.
@@ -164,13 +194,6 @@ fn parse_pg_text_array(text: &str, unquoted: UnquotedElements) -> Option<Vec<Val
     Some(elements)
 }
 
-/// Pack values into a record-format array blob.
-pub(crate) fn values_to_record_blob(values: &[Value]) -> Result<Value> {
-    Ok(Value::Blob(
-        ImmutableRecord::from_values(values, values.len())?.into_payload(),
-    ))
-}
-
 /// Serialize a record-format array blob to PostgreSQL text representation.
 /// Uses `{...}` delimiters and PG quoting rules:
 /// - NULL elements → uppercase `NULL` (unquoted)
@@ -178,10 +201,16 @@ pub(crate) fn values_to_record_blob(values: &[Value]) -> Result<Value> {
 /// - Numeric elements → unquoted
 /// - Blob elements → as `dialect` writes them
 pub(crate) fn serialize_array_from_blob(blob: &[u8], dialect: &dyn Dialect) -> Result<String> {
-    let iter = ValueIterator::new(blob)?;
-    let mut result = String::from("{");
+    let view = ArrayView::parse(blob)?;
+    let mut result = String::new();
+    if view.lower_bound() != DEFAULT_LOWER_BOUND {
+        let count = view.elements().count() as i64;
+        let upper_bound = i64::from(view.lower_bound()) + count - 1;
+        let _ = write!(result, "[{}:{upper_bound}]=", view.lower_bound());
+    }
+    result.push('{');
     let mut first = true;
-    for vref in iter {
+    for vref in view.elements() {
         let vref = vref?;
         if !first {
             result.push(',');
@@ -271,11 +300,23 @@ fn write_pg_text_element(result: &mut String, s: &str) {
 pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     match val {
         Value::Null => None,
-        Value::Blob(b) => match ValueIterator::new(b) {
-            Ok(iter) => Some(iter.count() as i64),
+        Value::Blob(b) => match ArrayView::parse(b) {
+            Ok(view) => Some(view.elements().count() as i64),
             Err(_) => None,
         },
         Value::Text(t) => parse_text_array(t.as_str()).map(|v| v.len() as i64),
+        _ => None,
+    }
+}
+
+/// The subscript of the first element of an array value. None for NULL and
+/// for a value that is not an array.
+pub(crate) fn compute_array_lower_bound(val: &Value) -> Option<i64> {
+    match val {
+        Value::Blob(b) => ArrayView::parse(b)
+            .ok()
+            .map(|view| i64::from(view.lower_bound())),
+        Value::Text(t) => parse_text_array_value(t.as_str()).map(|a| i64::from(a.lower_bound)),
         _ => None,
     }
 }
@@ -305,48 +346,80 @@ pub(crate) fn compute_array_length_at_dim(val: &Value, dim: i64) -> Option<i64> 
     compute_array_length_at_dim(&first, dim - 1)
 }
 
+/// The lower bound of array dimension `dim` (1-based). None for NULL, for a
+/// value that is not an array, for an empty array and for a `dim` that the
+/// array does not have.
+pub(crate) fn compute_array_lower_at_dim(val: &Value, dim: i64) -> Option<i64> {
+    array_dimension(val, dim).map(|(lower_bound, _)| lower_bound)
+}
+
+/// The upper bound of array dimension `dim`; None where
+/// [compute_array_lower_at_dim] is.
+pub(crate) fn compute_array_upper_at_dim(val: &Value, dim: i64) -> Option<i64> {
+    array_dimension(val, dim).map(|(lower_bound, length)| lower_bound + length - 1)
+}
+
+/// The lower bound and the length of dimension `dim`. Inner dimensions are
+/// read from the first element, as [compute_array_length_at_dim] does.
+fn array_dimension(val: &Value, dim: i64) -> Option<(i64, i64)> {
+    if dim < 1 || matches!(val, Value::Null) {
+        return None;
+    }
+    let array = array_from_any(val)?;
+    let first = array.elements.first()?;
+    if dim == 1 {
+        return Some((i64::from(array.lower_bound), array.elements.len() as i64));
+    }
+    array_dimension(first, dim - 1)
+}
+
 pub(crate) fn exec_array_append(arr: &Value, elem: &Value) -> Result<Value> {
-    let Some(mut elements) = array_values_from_any(arr) else {
+    let Some(mut array) = array_from_any(arr) else {
         return Ok(Value::Null);
     };
-    elements.push(elem.clone());
-    values_to_record_blob(&elements)
+    array.elements.push(elem.clone());
+    array.encode()
 }
 
 pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Result<Value> {
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(array) = array_from_any(arr) else {
         return Ok(Value::Null);
     };
-    // Build new vec with elem first — avoids O(n) shift from Vec::insert(0, ...)
-    let mut result = Vec::with_capacity(elements.len() + 1);
-    result.push(elem.clone());
-    result.extend(elements);
-    values_to_record_blob(&result)
+    if array.lower_bound == i32::MIN && !array.elements.is_empty() {
+        return Err(LimboError::IntegerOverflow);
+    }
+    let mut elements = Vec::with_capacity(array.elements.len() + 1);
+    elements.push(elem.clone());
+    elements.extend(array.elements);
+    encode_array(array.lower_bound, &elements)
 }
 
 pub(crate) fn exec_array_cat(a: &Value, b: &Value) -> Result<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(mut elems_a) = array_values_from_any(a) else {
+    let Some(mut array_a) = array_from_any(a) else {
         return Ok(Value::Null);
     };
-    let Some(elems_b) = array_values_from_any(b) else {
+    let Some(array_b) = array_from_any(b) else {
         return Ok(Value::Null);
     };
-    elems_a.extend(elems_b);
-    values_to_record_blob(&elems_a)
+    if array_a.elements.is_empty() {
+        array_a.lower_bound = array_b.lower_bound;
+    }
+    array_a.elements.extend(array_b.elements);
+    array_a.encode()
 }
 
 pub(crate) fn exec_array_remove(arr: &Value, target: &Value) -> Result<Value> {
     if matches!(arr, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(array) = array_from_any(arr) else {
         return Ok(Value::Null);
     };
-    let result: Vec<Value> = elements.into_iter().filter(|e| e != target).collect();
-    values_to_record_blob(&result)
+    let result: Vec<Value> = array.elements.into_iter().filter(|e| e != target).collect();
+    encode_array(array.lower_bound, &result)
 }
 
 pub(crate) fn exec_array_contains(arr: &Value, target: &Value) -> Value {
@@ -371,32 +444,32 @@ pub(crate) fn exec_array_position(arr: &Value, target: &Value) -> Value {
     }
     if let Value::Blob(blob) = arr {
         return array_find_streaming(blob, |vref| vref == *target)
-            .map(|i| Value::from_i64(i as i64 + 1)) // 1-based (PG convention)
+            .map(Value::from_i64)
             .unwrap_or(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(array) = array_from_any(arr) else {
         return Value::Null;
     };
-    for (i, elem) in elements.iter().enumerate() {
+    for (i, elem) in array.elements.iter().enumerate() {
         if elem == target {
-            return Value::from_i64(i as i64 + 1); // 1-based (PG convention)
+            return Value::from_i64(i64::from(array.lower_bound) + i as i64);
         }
     }
     Value::Null
 }
 
 /// Stream through a record-format blob, calling `predicate` on each element.
-/// Returns Some(index) for the first element where the predicate returns true,
-/// or None if no match or on error.
+/// Returns Some(subscript) for the first element where the predicate returns
+/// true, or None if no match or on error.
 fn array_find_streaming(
     blob: &[u8],
     predicate: impl Fn(crate::ValueRef<'_>) -> bool,
-) -> Option<usize> {
-    let iter = ValueIterator::new(blob).ok()?;
-    for (i, vref) in iter.enumerate() {
+) -> Option<i64> {
+    let view = ArrayView::parse(blob).ok()?;
+    for (i, vref) in view.elements().enumerate() {
         let vref = vref.ok()?;
         if predicate(vref) {
-            return Some(i);
+            return Some(i64::from(view.lower_bound()) + i as i64);
         }
     }
     None
@@ -406,21 +479,23 @@ pub(crate) fn exec_array_slice(arr: &Value, start: &Value, end: &Value) -> Resul
     if matches!(arr, Value::Null) {
         return Ok(Value::Null);
     }
-    let Some(elements) = array_values_from_any(arr) else {
+    let Some(array) = array_from_any(arr) else {
         return Ok(Value::Null);
     };
-    // PG convention: 1-based inclusive bounds
-    let start_idx = match start {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
+    let lower_bound = i64::from(array.lower_bound);
+    let start = match start {
+        Value::Numeric(Numeric::Integer(subscript)) => subscript.saturating_sub(lower_bound),
         _ => 0,
     };
-    let end_idx = match end {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => *i as usize, // inclusive → exclusive
+    let end = match end {
+        Value::Numeric(Numeric::Integer(subscript)) => {
+            subscript.saturating_sub(lower_bound).saturating_add(1)
+        }
         _ => 0,
     };
-    let end = end_idx.min(elements.len());
-    let start = start_idx.min(end);
-    values_to_record_blob(&elements[start..end])
+    let end = end.clamp(0, array.elements.len() as i64) as usize;
+    let start = (start.max(0) as usize).min(end);
+    encode_array(DEFAULT_LOWER_BOUND, &array.elements[start..end])
 }
 
 /// Split a string into an array using a delimiter.
@@ -459,7 +534,7 @@ pub(crate) fn exec_string_to_array(
                 Value::build_text(s)
             })
             .collect();
-        return values_to_record_blob(&values);
+        return encode_array(DEFAULT_LOWER_BOUND, &values);
     }
 
     let delim_str = match delimiter {
@@ -486,7 +561,7 @@ pub(crate) fn exec_string_to_array(
         })
         .collect();
 
-    values_to_record_blob(&values)
+    encode_array(DEFAULT_LOWER_BOUND, &values)
 }
 
 /// Join array elements into a string with a delimiter.
@@ -515,10 +590,10 @@ pub(crate) fn exec_array_to_string(
 
     // Fast path: stream from blob without materializing Vec<Value>
     if let Value::Blob(blob) = arr {
-        if let Ok(iter) = ValueIterator::new(blob) {
+        if let Ok(view) = ArrayView::parse(blob) {
             let mut result = String::new();
             let mut first = true;
-            for vref in iter {
+            for vref in view.elements() {
                 let Ok(vref) = vref else {
                     return Value::Null;
                 };
@@ -619,8 +694,12 @@ pub(crate) fn make_array_from_registers(
     start_reg: usize,
     count: usize,
 ) -> Result<Value> {
-    let record = ImmutableRecord::from_registers(&registers[start_reg..start_reg + count], count)?;
-    Ok(Value::Blob(record.into_payload()))
+    encode_array(
+        DEFAULT_LOWER_BOUND,
+        registers[start_reg..start_reg + count]
+            .iter()
+            .map(|register| register.get_value()),
+    )
 }
 
 #[cfg(test)]
@@ -662,7 +741,11 @@ mod tests {
 
     #[test]
     fn test_compute_array_length_valid_array() {
-        let blob = values_to_record_blob(&[Value::from_i64(1), Value::from_i64(2)]).unwrap();
+        let blob = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[Value::from_i64(1), Value::from_i64(2)],
+        )
+        .unwrap();
         assert_eq!(compute_array_length(&blob), Some(2));
     }
 
@@ -673,19 +756,22 @@ mod tests {
 
     #[test]
     fn test_array_remove_all_occurrences() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(1),
-            Value::from_i64(2),
-            Value::from_i64(3),
-            Value::from_i64(2),
-            Value::from_i64(1),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(1),
+                Value::from_i64(2),
+                Value::from_i64(3),
+                Value::from_i64(2),
+                Value::from_i64(1),
+            ],
+        )
         .unwrap();
         let result = exec_array_remove(&arr, &Value::from_i64(2)).unwrap();
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = ArrayValue::decode(blob).unwrap().elements;
         assert_eq!(elements.len(), 3);
         assert_eq!(elements[0], Value::from_i64(1));
         assert_eq!(elements[1], Value::from_i64(3));
@@ -740,7 +826,7 @@ mod tests {
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob, got {result:?}");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = ArrayValue::decode(blob).unwrap().elements;
         assert_eq!(elements.len(), 5);
         assert_eq!(elements[0], Value::build_text("h"));
         assert_eq!(elements[1], Value::build_text("e"));
@@ -749,11 +835,14 @@ mod tests {
 
     #[test]
     fn test_exec_array_contains_streaming() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(10),
-            Value::from_i64(20),
-            Value::from_i64(30),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(10),
+                Value::from_i64(20),
+                Value::from_i64(30),
+            ],
+        )
         .unwrap();
         assert_eq!(
             exec_array_contains(&arr, &Value::from_i64(20)),
@@ -767,11 +856,14 @@ mod tests {
 
     #[test]
     fn test_exec_array_position_streaming() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(10),
-            Value::from_i64(20),
-            Value::from_i64(30),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(10),
+                Value::from_i64(20),
+                Value::from_i64(30),
+            ],
+        )
         .unwrap();
         // 1-based: element 20 is at position 2
         assert_eq!(
@@ -783,11 +875,14 @@ mod tests {
 
     #[test]
     fn test_dc1_negative_index_preserves_array() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(10),
-            Value::from_i64(20),
-            Value::from_i64(30),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(10),
+                Value::from_i64(20),
+                Value::from_i64(30),
+            ],
+        )
         .unwrap();
         // array_find_streaming with impossible predicate should return None
         let Value::Blob(blob) = &arr else {
@@ -824,14 +919,127 @@ mod tests {
         );
     }
 
+    fn bounded_blob(lower_bound: i32, elements: &[Value]) -> Vec<u8> {
+        match encode_array(lower_bound, elements).unwrap() {
+            Value::Blob(blob) => blob.to_vec(),
+            other => panic!("expected a blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize_prints_the_bounds_of_an_array_that_does_not_start_at_one() {
+        let elements = [Value::from_i64(1), Value::from_i64(2)];
+        let dialect = crate::dialect::cannot_parse::DialectThatCannotParse;
+        for (lower_bound, expected) in [(1, "{1,2}"), (0, "[0:1]={1,2}"), (-3, "[-3:-2]={1,2}")] {
+            let blob = bounded_blob(lower_bound, &elements);
+            assert_eq!(
+                serialize_array_from_blob(&blob, &dialect).unwrap(),
+                expected
+            );
+        }
+    }
+
+    fn ints(lower_bound: i32, values: &[i64]) -> Value {
+        encode_array(
+            lower_bound,
+            values
+                .iter()
+                .map(|v| Value::from_i64(*v))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn slice_counts_from_the_lower_bound() {
+        let array = ints(0, &[10, 20, 30]);
+        for (start, end, expected) in [
+            (0, 1, vec![10, 20]),
+            (1, 2, vec![20, 30]),
+            (0, 5, vec![10, 20, 30]),
+            (-4, 1, vec![10, 20]),
+            (2, 2, vec![30]),
+            (3, 4, vec![]),
+            (1, 0, vec![]),
+        ] {
+            let slice =
+                exec_array_slice(&array, &Value::from_i64(start), &Value::from_i64(end)).unwrap();
+            assert_eq!(slice, ints(1, &expected), "[{start}:{end}]");
+        }
+    }
+
+    #[test]
+    fn position_is_a_subscript() {
+        let array = ints(0, &[10, 20, 30]);
+        for (target, expected) in [(10, Some(0)), (20, Some(1)), (30, Some(2)), (99, None)] {
+            let position = exec_array_position(&array, &Value::from_i64(target));
+            assert_eq!(position, expected.map_or(Value::Null, Value::from_i64));
+        }
+    }
+
+    #[test]
+    fn position_in_a_text_array_with_a_lower_bound_is_a_subscript() {
+        let array = Value::build_text("[5:6]={10,20}");
+        assert_eq!(
+            exec_array_position(&array, &Value::from_i64(20)),
+            Value::from_i64(6)
+        );
+    }
+
+    #[test]
+    fn parse_reads_the_bounds_of_an_array_text() {
+        for (text, lower_bound, count) in [
+            ("{1,2}", 1, 2),
+            ("[1:2]={1,2}", 1, 2),
+            ("[2]={1,2}", 1, 2),
+            ("[0:1]={1,2}", 0, 2),
+            (" [-2:0] = {1,2,3} ", -2, 3),
+            ("[2147483646:2147483646]={1}", 2147483646, 1),
+        ] {
+            let array = parse_text_array_value(text).unwrap();
+            assert_eq!(
+                (array.lower_bound, array.elements.len()),
+                (lower_bound, count)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_refuses_bounds_that_do_not_fit_the_elements() {
+        for text in [
+            "[0:3]={1,2}",
+            "[0:1]={1,2,3}",
+            "[1:0]={}",
+            "[0:-1]={}",
+            "[2147483647:2147483647]={1}",
+            "[2147483647:2147483648]={1,2}",
+            "[x:1]={1,2}",
+            "[ 0:1]={1,2}",
+            "[0 :1]={1,2}",
+            "[0: 1]={1,2}",
+            "[0:1 ]={1,2}",
+            "[0:1]",
+            "[0:1]{1,2}",
+            "[2]={1}",
+            "[0]={}",
+            "[]={}",
+            "[1:2][0:1]={{1,2},{3,4}}",
+        ] {
+            assert!(parse_text_array_value(text).is_none(), "{text}");
+        }
+    }
+
     #[test]
     fn test_serialize_array_from_blob() {
-        let arr = values_to_record_blob(&[
-            Value::from_i64(1),
-            Value::build_text("hello"),
-            Value::Null,
-            Value::Blob(crate::alloc::vec![b'a', b'b']),
-        ])
+        let arr = encode_array(
+            DEFAULT_LOWER_BOUND,
+            &[
+                Value::from_i64(1),
+                Value::build_text("hello"),
+                Value::Null,
+                Value::Blob(crate::alloc::vec![b'a', b'b']),
+            ],
+        )
         .unwrap();
         let Value::Blob(blob) = &arr else {
             panic!("Expected Blob");
@@ -854,7 +1062,7 @@ mod tests {
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob");
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = ArrayValue::decode(blob).unwrap().elements;
         assert_eq!(elements.len(), 3);
         assert_eq!(elements[0], Value::from_i64(1));
         assert_eq!(elements[1], Value::build_text("two"));

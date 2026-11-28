@@ -2240,6 +2240,8 @@ fn translate_function_call_expr(
                     func_ctx,
                 ),
                 ScalarFunc::ArrayLength
+                | ScalarFunc::ArrayLower
+                | ScalarFunc::ArrayUpper
                 | ScalarFunc::ArrayAppend
                 | ScalarFunc::ArrayPrepend
                 | ScalarFunc::ArrayCat

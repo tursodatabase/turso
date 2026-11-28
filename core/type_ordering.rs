@@ -13,7 +13,8 @@ use std::hash::{Hash, Hasher};
 use crate::numeric::decimal::{numeric_compare, numeric_compare_operands, numeric_hash};
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
-use crate::vdbe::array::{array_values_from_blob, parse_text_array, parse_text_array_of_texts};
+use crate::vdbe::array::{parse_text_array_of_texts_value, parse_text_array_value};
+use crate::vdbe::array_value::ArrayValue;
 use crate::{Value, ValueRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,10 +26,17 @@ pub enum TypeOrdering {
     /// Arrays whose elements are texts, such as `text[]`. An array in text
     /// form is read with texts for its elements, so `{1}` and `{1.0}` differ.
     TextArray,
+    /// Arrays whose type reads text itself, such as `int2vector`.
+    StoredArray,
 }
 
 impl TypeOrdering {
-    pub const ALL: [Self; 3] = [Self::Numeric, Self::Array, Self::TextArray];
+    pub const ALL: [Self; 4] = [
+        Self::Numeric,
+        Self::Array,
+        Self::TextArray,
+        Self::StoredArray,
+    ];
 
     /// The name EXPLAIN shows for the order.
     pub const fn name(self) -> &'static str {
@@ -36,16 +44,25 @@ impl TypeOrdering {
             Self::Numeric => "numeric",
             Self::Array => "array",
             Self::TextArray => "text_array",
+            Self::StoredArray => "stored_array",
         }
+    }
+
+    /// Whether the order reads a text operand itself.
+    pub const fn reads_text_operands(self) -> bool {
+        !matches!(self, Self::StoredArray)
     }
 
     pub fn compare(self, left: ValueRef, right: ValueRef) -> Ordering {
         match self {
             Self::Numeric => numeric_compare(left, right),
-            Self::Array => ArraySortKey::of(left, parse_text_array)
-                .cmp(&ArraySortKey::of(right, parse_text_array)),
-            Self::TextArray => ArraySortKey::of(left, parse_text_array_of_texts)
-                .cmp(&ArraySortKey::of(right, parse_text_array_of_texts)),
+            Self::Array => ArraySortKey::of(left, parse_text_array_value)
+                .cmp(&ArraySortKey::of(right, parse_text_array_value)),
+            Self::TextArray => ArraySortKey::of(left, parse_text_array_of_texts_value)
+                .cmp(&ArraySortKey::of(right, parse_text_array_of_texts_value)),
+            Self::StoredArray => {
+                ArraySortKey::of(left, no_array).cmp(&ArraySortKey::of(right, no_array))
+            }
         }
     }
 
@@ -63,14 +80,19 @@ impl TypeOrdering {
     pub fn hash<H: Hasher>(self, value: ValueRef, state: &mut H) {
         match self {
             Self::Numeric => numeric_hash(value, state),
-            Self::Array => ArraySortKey::of(value, parse_text_array).hash(state),
-            Self::TextArray => ArraySortKey::of(value, parse_text_array_of_texts).hash(state),
+            Self::Array => ArraySortKey::of(value, parse_text_array_value).hash(state),
+            Self::TextArray => ArraySortKey::of(value, parse_text_array_of_texts_value).hash(state),
+            Self::StoredArray => ArraySortKey::of(value, no_array).hash(state),
         }
     }
 }
 
-/// NULL first; then arrays, element by element and then shorter first; then
-/// any other value in SQLite's order.
+fn no_array(_: &str) -> Option<ArrayValue> {
+    None
+}
+
+/// NULL first; then arrays, element by element, then shorter first, then by
+/// lower bound; then any other value in SQLite's order.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum ArraySortKey<'a> {
     Null,
@@ -80,15 +102,15 @@ enum ArraySortKey<'a> {
 
 impl<'a> ArraySortKey<'a> {
     /// `parse_text` reads an array in text form.
-    fn of(value: ValueRef<'a>, parse_text: fn(&str) -> Option<Vec<Value>>) -> Self {
-        let elements = match value {
+    fn of(value: ValueRef<'a>, parse_text: fn(&str) -> Option<ArrayValue>) -> Self {
+        let array = match value {
             ValueRef::Null => return Self::Null,
-            ValueRef::Blob(blob) => array_values_from_blob(blob).ok(),
+            ValueRef::Blob(blob) => ArrayValue::decode(blob).ok(),
             ValueRef::Text(text) => parse_text(text.as_str()),
             ValueRef::Numeric(_) => None,
         };
-        match elements {
-            Some(elements) => Self::Elements(ArrayElements(elements)),
+        match array {
+            Some(array) => Self::Elements(ArrayElements(array)),
             None => Self::Other(value),
         }
     }
@@ -98,10 +120,11 @@ impl Hash for ArraySortKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             Self::Null => 0u8.hash(state),
-            Self::Elements(elements) => {
+            Self::Elements(array) => {
                 1u8.hash(state);
-                elements.0.len().hash(state);
-                for element in &elements.0 {
+                array.0.elements.len().hash(state);
+                array.0.lower_bound.hash(state);
+                for element in &array.0.elements {
                     hash_sqlite_value(element.as_value_ref(), state);
                 }
             }
@@ -113,10 +136,11 @@ impl Hash for ArraySortKey<'_> {
     }
 }
 
-/// Array elements compared element by element, as PostgreSQL's `array_cmp`
-/// does: a NULL element is greater than any other element and equal to
-/// another NULL. Other elements compare in SQLite's order.
-struct ArrayElements(Vec<Value>);
+/// Arrays compared as PostgreSQL's `array_cmp` does: element by element, then
+/// by length, then by lower bound. A NULL element is greater than any other
+/// element and equal to another NULL. Other elements compare in SQLite's
+/// order.
+struct ArrayElements(ArrayValue);
 
 impl PartialEq for ArrayElements {
     fn eq(&self, other: &Self) -> bool {
@@ -135,9 +159,11 @@ impl PartialOrd for ArrayElements {
 impl Ord for ArrayElements {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0
+            .elements
             .iter()
             .map(null_last_key)
-            .cmp(other.0.iter().map(null_last_key))
+            .cmp(other.0.elements.iter().map(null_last_key))
+            .then(self.0.lower_bound.cmp(&other.0.lower_bound))
     }
 }
 
@@ -231,6 +257,44 @@ mod tests {
                 &[Value::from_blob(crate::alloc::vec![0xff, 0xff])],
             ],
         );
+    }
+
+    fn array_with_bound(lower_bound: i32, elements: &[i64]) -> Value {
+        ArrayValue {
+            lower_bound,
+            elements: elements.iter().map(|element| int(*element)).collect(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn array_order_compares_the_lower_bound_after_the_elements() {
+        assert_order(
+            TypeOrdering::Array,
+            &[
+                &[array_with_bound(0, &[1, 2])],
+                &[array_with_bound(1, &[1, 2]), Value::from_text("{1, 2}")],
+                &[array_with_bound(5, &[1, 2])],
+                &[array_with_bound(0, &[1, 2, 3])],
+            ],
+        );
+    }
+
+    #[test]
+    fn stored_array_order_does_not_read_text() {
+        assert_order(
+            TypeOrdering::StoredArray,
+            &[
+                &[Value::Null],
+                &[array_with_bound(0, &[-1])],
+                &[array_with_bound(0, &[1, 2])],
+                &[array_with_bound(0, &[3])],
+                &[array_with_bound(0, &[300])],
+                &[Value::from_text("1 2")],
+            ],
+        );
+        assert!(!TypeOrdering::StoredArray.reads_text_operands());
     }
 
     #[test]

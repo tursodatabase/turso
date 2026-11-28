@@ -1,0 +1,240 @@
+# The lower bound of an array: the subscript of its first element.
+
+@database :memory:
+
+test array-bounds-are-read-and-printed {
+    SELECT '[0:1]={a,b}'::text[], '[-2:0]={a,b,c}'::text[], '[5:5]={a}'::text[];
+}
+expect {
+    [0:1]={a,b}|[-2:0]={a,b,c}|[5:5]={a}
+}
+
+test array-bounds-of-one-are-not-printed {
+    SELECT '[1:2]={a,b}'::text[], '{a,b}'::text[];
+}
+expect {
+    {a,b}|{a,b}
+}
+
+test array-bounds-allow-spaces-around-the-bounds {
+    SELECT ' [0:1] = {a,b} '::text[];
+}
+expect {
+    [0:1]={a,b}
+}
+
+test an-array-bound-of-one-number-is-the-upper-bound {
+    SELECT '[2]={a,b}'::text[];
+}
+expect {
+    {a,b}
+}
+
+test array-bounds-are-stored-in-a-column {
+    CREATE TABLE t (id int, a text[]);
+    INSERT INTO t VALUES (1, '[0:1]={a,b}'), (2, '{a,b}'), (3, '[7:8]={a,b}');
+    SELECT a FROM t ORDER BY id;
+}
+expect {
+    [0:1]={a,b}
+    {a,b}
+    [7:8]={a,b}
+}
+
+test arrays-with-other-bounds-are-different-values {
+    SELECT '[0:1]={a,b}'::text[] = '{a,b}'::text[],
+           '[0:1]={a,b}'::text[] <> '{a,b}'::text[],
+           '[0:1]={a,b}'::text[] = '[0:1]={a,b}'::text[];
+}
+expect {
+    f|t|t
+}
+
+test arrays-with-other-bounds-are-distinct {
+    CREATE TABLE t (a text[]);
+    INSERT INTO t VALUES ('{a,b}'), ('[0:1]={a,b}'), ('[0:1]={a,b}'), ('[1:2]={a,b}');
+    SELECT count(*), count(DISTINCT a) FROM t;
+}
+expect {
+    4|2
+}
+
+test array-bounds-are-kept-by-a-cast-of-the-elements {
+    SELECT '[0:1]={1,2}'::int[], '[3:4]={1,2}'::bigint[], '[0:1]={1,2}'::smallint[];
+}
+expect {
+    [0:1]={1,2}|[3:4]={1,2}|[0:1]={1,2}
+}
+
+test array-bounds-of-an-int-array-are-stored-in-a-column {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}'), ('{10,20,30}');
+    SELECT a FROM t ORDER BY a[1];
+}
+expect {
+    {10,20,30}
+    [0:2]={10,20,30}
+}
+
+test a-subscript-counts-from-the-lower-bound {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}');
+    SELECT a[-1], a[0], a[1], a[2], a[3] FROM t;
+}
+expect {
+    |10|20|30|
+}
+
+test a-subscript-of-an-array-that-starts-at-one {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('{10,20,30}');
+    SELECT a[0], a[1], a[3], a[4] FROM t;
+}
+expect {
+    |10|30|
+}
+
+test a-subscript-reads-a-column-with-another-lower-bound {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[5:6]={1,2}');
+    SELECT a[4], a[5], a[6], a[7] FROM t;
+}
+expect {
+    |1|2|
+}
+
+test a-slice-counts-from-the-lower-bound {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}');
+    SELECT a[0:1], a[1:2], a[0:5], a[-4:1], a[3:4] FROM t;
+}
+expect {
+    {10,20}|{20,30}|{10,20,30}|{10,20}|{}
+}
+
+test a-slice-starts-at-one {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[5:7]={10,20,30}');
+    SELECT a[5:6], a[6:9], array_position(a, 30) FROM t;
+}
+expect {
+    {10,20}|{20,30}|7
+}
+
+test array-position-is-a-subscript {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}'), ('{10,20,30}');
+    SELECT array_position(a, 10), array_position(a, 20), array_position(a, 99) FROM t ORDER BY a[1];
+}
+expect {
+    1|2|
+    0|1|
+}
+
+test array-lower-and-upper-are-subscripts {
+    CREATE TABLE t (id int, a int[]);
+    INSERT INTO t VALUES (1, '[0:2]={10,20,30}'), (2, '{10,20,30}'), (3, '[-3:-2]={1,2}');
+    SELECT array_lower(a, 1), array_upper(a, 1), array_length(a, 1) FROM t ORDER BY id;
+}
+expect {
+    0|2|3
+    1|3|3
+    -3|-2|2
+}
+
+test array-lower-and-upper-of-a-missing-dimension-are-null {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}');
+    SELECT array_lower(a, 2), array_upper(a, 2), array_lower(a, 0), array_upper(a, -1) FROM t;
+}
+expect {
+    |||
+}
+
+test array-lower-and-upper-of-an-empty-array-are-null {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('{}');
+    SELECT array_lower(a, 1), array_upper(a, 1) FROM t;
+}
+expect {
+    |
+}
+
+test array-lower-and-upper-of-a-null-array-are-null {
+    SELECT array_lower(NULL::int[], 1), array_upper(NULL::int[], 1);
+}
+expect {
+    |
+}
+
+test array-lower-and-upper-read-an-inner-dimension {
+    SELECT array_lower(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]], 1), array_upper(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]], 1),
+           array_lower(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]], 2), array_upper(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]], 2);
+}
+expect {
+    1|2|1|3
+}
+
+test array-functions-keep-the-lower-bound {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}');
+    SELECT array_append(a, 9), array_prepend(9, a), array_cat(a, '{1}'), array_cat('{1}'::int[], a),
+           array_remove(a, 20), array_remove(a, 99)
+    FROM t;
+}
+expect {
+    [0:3]={10,20,30,9}|[0:3]={9,10,20,30}|[0:3]={10,20,30,1}|{1,10,20,30}|[0:1]={10,30}|[0:2]={10,20,30}
+}
+
+test the-concatenation-operator-keeps-the-lower-bound {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}');
+    SELECT a || 40, 5 || a, a || '[5:6]={1,2}'::int[], '{1}'::int[] || a FROM t;
+}
+expect {
+    [0:3]={10,20,30,40}|[0:3]={5,10,20,30}|[0:4]={10,20,30,1,2}|{1,10,20,30}
+}
+
+test array-functions-with-an-empty-array-take-the-bound-of-the-other {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}');
+    SELECT array_cat('{}'::int[], a), array_cat(a, '{}'::int[]), array_append('{}'::int[], 1), '{}'::int[] || a
+    FROM t;
+}
+expect {
+    [0:2]={10,20,30}|[0:2]={10,20,30}|{1}|[0:2]={10,20,30}
+}
+
+test removing-every-element-leaves-an-empty-array {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:1]={1,1}');
+    SELECT array_remove(a, 1) FROM t;
+}
+expect {
+    {}
+}
+
+test an-append-cannot-pass-the-largest-subscript {
+    SELECT array_append('[2147483646:2147483646]={1}'::int[], 2);
+}
+@sqlstate 54000
+expect error {}
+
+test a-concatenation-cannot-pass-the-largest-subscript {
+    SELECT '[2147483646:2147483646]={1}'::int[] || '{2,3}'::int[];
+}
+@sqlstate 54000
+expect error {}
+
+test an-append-up-to-the-largest-subscript-is-allowed {
+    SELECT array_upper(array_append('[2147483645:2147483645]={1}'::int[], 2), 1);
+}
+expect {
+    2147483646
+}
+
+test a-prepend-cannot-pass-the-smallest-subscript {
+    SELECT array_prepend(0, '[-2147483648:-2147483648]={1}'::int[]);
+}
+@sqlstate 22003
+expect error {}

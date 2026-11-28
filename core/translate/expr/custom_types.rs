@@ -521,11 +521,13 @@ fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
 }
 
 /// Whether a string literal or parameter compared with a value of `resolved`
-/// is converted to the type. A type with its own order, such as numeric,
+/// is converted to the type. A type whose order reads text, such as numeric,
 /// converts the other operand when it compares instead, and a type without
 /// ENCODE or DECODE reads a value as it is written.
 fn converts_untyped_operands(resolved: &ResolvedType) -> bool {
-    resolved.ordering().is_none()
+    resolved
+        .ordering()
+        .is_none_or(|ordering| !ordering.reads_text_operands())
         && (resolved
             .chain
             .iter()

@@ -148,9 +148,11 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
-        parse_text_array, serialize_array_from_blob, values_to_record_blob,
+        compute_array_length, compute_array_lower_bound, exec_array_append, exec_array_cat,
+        exec_array_prepend, exec_array_slice, make_array_from_registers, parse_text_array_value,
+        serialize_array_from_blob,
     },
+    array_value::{encode_array, position_of, ArrayValue, ArrayView, DEFAULT_LOWER_BOUND},
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
         IntegrityCkData, IvmSumKind, RegisterOrLiteral, SorterOpenData,
@@ -2835,8 +2837,8 @@ pub fn op_array_encode(
             // Validate blob is a well-formed record using streaming iterator
             // (no Vec<Value> allocation). Rejects empty blobs and invalid records.
             let valid = !b.is_empty()
-                && ValueIterator::new(b)
-                    .map(|iter| iter.into_iter().all(|r| r.is_ok()))
+                && ArrayView::parse(b)
+                    .map(|view| view.elements().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
                 return crate::error::cold_return(Err(
@@ -2849,27 +2851,26 @@ pub fn op_array_encode(
     }
 
     // Extract elements from either blob (MakeArray) or text (JSON literal)
-    let raw_elements = match val {
-        Value::Blob(b) => array_values_from_blob(b).ok(),
-        Value::Text(text) => parse_text_array(text.as_str()),
+    let raw_array = match val {
+        Value::Blob(b) => ArrayValue::decode(b).ok(),
+        Value::Text(text) => parse_text_array_value(text.as_str()),
         _ => None,
     };
-    let Some(raw_elements) = raw_elements else {
+    let Some(raw_array) = raw_array else {
         return crate::error::cold_return(Err(non_array_value_error(element_type, target).into()));
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
-    if raw_elements.len() > MAX_ARRAY_ELEMENTS {
+    if raw_array.elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
             "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target}"
         );
     }
 
-    let coerced_elements = convert_array_elements(raw_elements, *dimensions, data)?;
+    let coerced_elements = convert_array_elements(raw_array.elements, *dimensions, data)?;
 
     // Serialize coerced elements as a native record-format BLOB
-    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
-    state.registers[*reg].set_blob(record.into_payload())?;
+    state.registers[*reg].set_value(encode_array(raw_array.lower_bound, &coerced_elements)?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2918,10 +2919,10 @@ fn convert_array_elements(
             }
             (_, Value::Null) => Value::Null,
             (2.., Value::Blob(sub_array)) => {
+                let sub_array = ArrayValue::decode(&sub_array).map_err(|_| not_an_array())?;
                 let sub_elements =
-                    array_values_from_blob(&sub_array).map_err(|_| not_an_array())?;
-                let sub_elements = convert_array_elements(sub_elements, dimensions - 1, data)?;
-                values_to_record_blob(&sub_elements)?
+                    convert_array_elements(sub_array.elements, dimensions - 1, data)?;
+                encode_array(sub_array.lower_bound, &sub_elements)?
             }
             (2.., Value::Numeric(_) | Value::Text(_)) => return Err(not_an_array()),
             (1, element @ (Value::Numeric(_) | Value::Text(_) | Value::Blob(_))) => {
@@ -3024,30 +3025,76 @@ pub fn op_array_element(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let idx = match state.registers[*index_reg].get_value() {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
-        _ => {
-            // Non-positive, non-integer, or NULL index → NULL result (PG convention: 1-based)
-            state.registers[*dest].set_null();
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
+    let Value::Numeric(Numeric::Integer(subscript)) = state.registers[*index_reg].get_value()
+    else {
+        state.registers[*dest].set_null();
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     };
 
     let result = match arr_val {
-        Value::Blob(blob) => match ValueIterator::new(blob) {
-            Ok(mut iter) => iter
-                .nth(idx)
-                .transpose()?
-                .map(|vref| vref.to_owned())
-                .transpose()?
-                .unwrap_or(Value::Null),
+        Value::Blob(blob) => match ArrayView::parse(blob) {
+            Ok(view) => match view.position_of(*subscript) {
+                Some(position) => view
+                    .elements()
+                    .nth(position)
+                    .transpose()?
+                    .map(|vref| vref.to_owned())
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+                None => Value::Null,
+            },
             Err(_) => Value::Null,
         },
         _ => Value::Null,
     };
 
     state.registers[*dest].set_value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Get the subscript of the first element of an array.
+pub fn op_array_lower_bound(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _connection: &Arc<Connection>,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(ArrayLowerBound { reg, dest }, insn);
+
+    match compute_array_lower_bound(state.registers[*reg].get_value()) {
+        Some(lower_bound) => state.registers[*dest].set_int(lower_bound),
+        None => state.registers[*dest].set_null(),
+    };
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Give an array the lower bound in a register.
+pub fn op_array_set_lower_bound(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _connection: &Arc<Connection>,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(ArraySetLowerBound { reg, bound_reg }, insn);
+
+    let (Value::Blob(blob), Value::Numeric(Numeric::Integer(bound))) = (
+        state.registers[*reg].get_value(),
+        state.registers[*bound_reg].get_value(),
+    ) else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let lower_bound = i32::try_from(*bound).map_err(|_| {
+        LimboError::InternalError(format!("array lower bound {bound} is out of range"))
+    })?;
+    let mut array = ArrayValue::decode(blob)?;
+    array.lower_bound = lower_bound;
+    state.registers[*reg].set_value(array.encode()?);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3315,22 +3362,9 @@ pub fn op_array_concat(
     }
 
     let result = match (lhs_ref, rhs_ref) {
-        (Value::Blob(lb), Value::Blob(rb)) => {
-            let mut elems_a = array_values_from_blob(lb)?;
-            let elems_b = array_values_from_blob(rb)?;
-            elems_a.extend(elems_b);
-            values_to_record_blob(&elems_a)?
-        }
-        (Value::Blob(lb), _) => {
-            let mut elems = array_values_from_blob(lb)?;
-            elems.push(rhs_ref.clone());
-            values_to_record_blob(&elems)?
-        }
-        (_, Value::Blob(rb)) => {
-            let mut elems = array_values_from_blob(rb)?;
-            elems.insert(0, lhs_ref.clone());
-            values_to_record_blob(&elems)?
-        }
+        (Value::Blob(_), Value::Blob(_)) => exec_array_cat(lhs_ref, rhs_ref)?,
+        (Value::Blob(_), _) => exec_array_append(lhs_ref, rhs_ref)?,
+        (_, Value::Blob(_)) => exec_array_prepend(rhs_ref, lhs_ref)?,
         _ => {
             // Neither is an array blob — fall back to string concat
             Value::build_text(format!("{lhs_ref}{rhs_ref}"))
@@ -3367,14 +3401,11 @@ pub fn op_array_set_element(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let idx = match state.registers[*index_reg].get_value() {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
-        _ => {
-            // Invalid index (non-positive, non-integer): preserve original array (PG: 1-based)
-            state.registers[*dest].set_value(arr_val.clone());
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
+    let Value::Numeric(Numeric::Integer(subscript)) = state.registers[*index_reg].get_value()
+    else {
+        state.registers[*dest].set_value(arr_val.clone());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     };
 
     let new_val = state.registers[*value_reg].get_value().clone();
@@ -3384,13 +3415,15 @@ pub fn op_array_set_element(
             LimboError::InternalError("ArraySetElement: expected blob array".into()).into(),
         );
     };
-    let mut elements = array_values_from_blob(blob)?;
-    if idx >= elements.len() {
-        // Out-of-bounds: preserve original array unchanged
-        state.registers[*dest].set_blob(blob.clone())?;
-    } else {
-        elements[idx] = new_val;
-        state.registers[*dest].set_value(values_to_record_blob(&elements)?);
+    let mut array = ArrayValue::decode(blob)?;
+    let position = position_of(array.lower_bound, *subscript)
+        .filter(|position| *position < array.elements.len());
+    match position {
+        Some(position) => {
+            array.elements[position] = new_val;
+            state.registers[*dest].set_value(array.encode()?);
+        }
+        None => state.registers[*dest].set_blob(blob.clone())?,
     }
 
     state.pc += 1;
@@ -8515,7 +8548,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &mut [Value], take_first: bool)
                 )));
             } else {
                 let elements = &payload[1..1 + count];
-                Value::Blob(ImmutableRecord::from_values(elements, count)?.into_payload())
+                encode_array(DEFAULT_LOWER_BOUND, elements)?
             }
         }
         AggFunc::Mode => {
@@ -21059,7 +21092,7 @@ mod tests {
             Value::Blob(b) => b,
             _ => panic!("Expected Blob, got {result:?}"),
         };
-        let elements = array_values_from_blob(blob).unwrap();
+        let elements = ArrayValue::decode(blob).unwrap().elements;
         assert_eq!(elements.len(), 100);
         for (i, elem) in elements.iter().enumerate() {
             assert_eq!(*elem, Value::from_i64(i as i64));

@@ -23,9 +23,10 @@ use crate::stats::StatAccum;
 use crate::translate::roles;
 use crate::types::AsValueRef;
 use crate::vdbe::array::{
-    compute_array_length_at_dim, exec_array_append, exec_array_cat, exec_array_contains,
-    exec_array_contains_all, exec_array_overlap, exec_array_position, exec_array_prepend,
-    exec_array_remove, exec_array_slice, exec_array_to_string, exec_string_to_array,
+    compute_array_length_at_dim, compute_array_lower_at_dim, compute_array_upper_at_dim,
+    exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
+    exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
+    exec_array_slice, exec_array_to_string, exec_string_to_array,
 };
 use crate::vdbe::{registers_to_ref_values, Register};
 use crate::{LimboError, Value, ValueRef};
@@ -426,7 +427,9 @@ pub(crate) fn resolve_builtin_function_name(
         "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),
         "array_set_element" => Ok(Some(Func::Scalar(ScalarFunc::ArraySetElement))),
         // Array functions
-        "array_length" | "array_upper" => Ok(Some(Func::Scalar(ScalarFunc::ArrayLength))),
+        "array_length" => Ok(Some(Func::Scalar(ScalarFunc::ArrayLength))),
+        "array_lower" => Ok(Some(Func::Scalar(ScalarFunc::ArrayLower))),
+        "array_upper" => Ok(Some(Func::Scalar(ScalarFunc::ArrayUpper))),
         "array_append" => Ok(Some(Func::Scalar(ScalarFunc::ArrayAppend))),
         "array_prepend" => Ok(Some(Func::Scalar(ScalarFunc::ArrayPrepend))),
         "array_cat" => Ok(Some(Func::Scalar(ScalarFunc::ArrayCat))),
@@ -1201,6 +1204,15 @@ pub fn call_builtin_scalar(
                     None => Value::Null,
                 },
             )
+        }
+        ScalarFunc::ArrayLower | ScalarFunc::ArrayUpper => {
+            check_arg_count(args, 2)?;
+            let dim = args[1].get_value().as_int().unwrap_or(0);
+            let bound = match func {
+                ScalarFunc::ArrayLower => compute_array_lower_at_dim(args[0].get_value(), dim),
+                _ => compute_array_upper_at_dim(args[0].get_value(), dim),
+            };
+            Ok(bound.map_or(Value::Null, Value::from_i64))
         }
         ScalarFunc::ArraySlice => {
             check_arg_count(args, 3)?;

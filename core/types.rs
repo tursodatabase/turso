@@ -1710,8 +1710,7 @@ mod immutable_record {
     }
 
     fn contains_null(payload: &[u8]) -> Result<bool> {
-        let (header_size, header_varint_len) = read_varint(payload)?;
-        let header_size = header_size as usize;
+        let (header_size, header_varint_len) = read_header_size(payload)?;
 
         if header_size > payload.len() || header_varint_len > payload.len() {
             return Err(LimboError::Corrupt(
@@ -2261,8 +2260,7 @@ impl<'a> ValueIterator<'a> {
     /// payload is malformed.
     #[inline(always)]
     pub fn new(payload: &'a [u8]) -> Result<Self> {
-        let (header_size, header_varint_len) = read_varint(payload)?;
-        let header_size = header_size as usize;
+        let (header_size, header_varint_len) = read_header_size(payload)?;
 
         if header_size > payload.len()
             || header_varint_len > payload.len()
@@ -3064,8 +3062,7 @@ where
         return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint(left_packed)?;
-    let header_size = header_size as usize;
+    let (header_size, offset_1st_serialtype) = read_header_size(left_packed)?;
 
     if left_packed.len() < header_size {
         return Err(LimboError::Corrupt(format!(
@@ -3159,8 +3156,7 @@ where
         return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint(left_packed)?;
-    let header_size = header_size as usize;
+    let (header_size, offset_1st_serialtype) = read_header_size(left_packed)?;
 
     if left_packed.len() < header_size {
         return Err(LimboError::Corrupt(format!(
@@ -3275,11 +3271,10 @@ where
         return Ok(std::cmp::Ordering::Less);
     }
 
-    let (header_size, mut header_pos) = read_varint(left_packed)?;
-    let header_end = header_size as usize;
+    let (header_end, mut header_pos) = read_header_size(left_packed)?;
     turso_debug_assert!(header_end <= left_packed.len());
 
-    let mut data_pos = header_size as usize;
+    let mut data_pos = header_end;
 
     // Skip over `skip` number of fields
     for _ in 0..skip {
@@ -4082,6 +4077,15 @@ impl WalFrameInfo {
     }
 }
 
+/// Reads the header size of a record. It is a 64-bit varint on disk, and fails
+/// with a corrupt record when it does not fit in memory.
+fn read_header_size(payload: &[u8]) -> Result<(usize, usize)> {
+    let (size, varint_len) = read_varint(payload)?;
+    let size = usize::try_from(size)
+        .map_err(|_| LimboError::Corrupt("record header size does not fit in memory".into()))?;
+    Ok((size, varint_len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4518,6 +4522,32 @@ mod tests {
             gold_result, generic_result,
             "Test '{test_name}' failed with generic: Full Comparison: {gold_result:?}, Generic: {generic_result:?}\n LHS: {serialized_values:?}\n RHS: {unpacked_values:?}"
         );
+    }
+
+    #[test]
+    fn a_header_size_larger_than_the_payload_is_corrupt_whatever_the_pointer_width() {
+        let record = ImmutableRecord::from_values(&[Value::from_i64(1)], 1)
+            .unwrap()
+            .into_payload();
+        for header_size in [
+            (1u64 << 32) | 3,
+            (1u64 << 40) | 3,
+            (1u64 << 63) | 3,
+            u64::MAX,
+        ] {
+            let mut payload = Vec::new();
+            crate::storage::sqlite3_ondisk::write_varint_to_vec(header_size, &mut payload);
+            payload.extend_from_slice(&record);
+            assert!(
+                matches!(ValueIterator::new(&payload), Err(LimboError::Corrupt(_))),
+                "{header_size:#x}"
+            );
+            assert!(
+                matches!(read_header_size(&payload), Err(LimboError::Corrupt(_)))
+                    || read_header_size(&payload).is_ok_and(|(size, _)| size as u64 == header_size),
+                "{header_size:#x}"
+            );
+        }
     }
 
     #[test]

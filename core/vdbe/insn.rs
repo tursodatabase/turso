@@ -1059,6 +1059,19 @@ pub enum Insn {
         dest: usize,
     },
 
+    /// Get the subscript of the first element of an array.
+    /// If the value is not an array, dest = NULL.
+    ArrayLowerBound {
+        reg: usize,
+        dest: usize,
+    },
+
+    /// Give the array in `reg` the lower bound in `bound_reg`.
+    ArraySetLowerBound {
+        reg: usize,
+        bound_reg: usize,
+    },
+
     /// Create an array from contiguous registers (static count).
     /// Reads `count` values from start_reg..start_reg+count,
     /// serializes via ImmutableRecord, stores Value::Blob in dest.
@@ -2514,6 +2527,8 @@ impl InsnVariants {
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,
             InsnVariants::ArrayLength => execute::op_array_length,
+            InsnVariants::ArrayLowerBound => execute::op_array_lower_bound,
+            InsnVariants::ArraySetLowerBound => execute::op_array_set_lower_bound,
             InsnVariants::MakeArray => execute::op_make_array,
             InsnVariants::StructField => execute::op_struct_field,
             InsnVariants::UnionPack => execute::op_union_pack,

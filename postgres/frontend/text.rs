@@ -4,7 +4,7 @@
 mod pgwire_text;
 
 use crate::catalog::regclass_text;
-use crate::pg_type::regtype_text;
+use crate::pg_type::{regtype_text, vector_text};
 pub(crate) use pgwire_text::encode_bytea;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -25,6 +25,8 @@ pub enum TextType {
     RegClass,
     /// An integer prints as the name of the type that has it as oid.
     RegType,
+    /// An int2vector or an oidvector prints as its elements, separated by spaces.
+    Vector,
 }
 
 impl TextType {
@@ -47,6 +49,7 @@ impl TextType {
                     ("TIMESTAMPTZ", 0) => Some(TextType::TimestampTz),
                     ("REGCLASS", 0) => Some(TextType::RegClass),
                     ("REGTYPE", 0) => Some(TextType::RegType),
+                    ("INT2VECTOR" | "OIDVECTOR", 0) => Some(TextType::Vector),
                     _ => None,
                 },
             )
@@ -88,6 +91,10 @@ pub fn value_text<'a>(
                 Cow::Borrowed(text)
             }
         }
+        Value::Blob(bytes) if text_type == TextType::Vector => match vector_text(bytes) {
+            Some(text) => Cow::Owned(text),
+            None => Cow::Owned(pgwire_text::encode_bytea(bytes, false)),
+        },
         Value::Blob(bytes) => Cow::Owned(pgwire_text::encode_bytea(bytes, false)),
     };
     Some(text)

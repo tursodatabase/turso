@@ -705,6 +705,8 @@ pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
         "OID" => 26,
         "REGCLASS" => 2205,
         "REGTYPE" => 2206,
+        "INT2VECTOR" => 22,
+        "OIDVECTOR" => 30,
         _ => return None,
     };
     Some(oid)
@@ -1579,7 +1581,7 @@ impl SnapshotRows for PgProcTable {
             pronargs INTEGER,
             pronargdefaults INTEGER,
             prorettype INTEGER,
-            proargtypes TEXT,
+            proargtypes OIDVECTOR,
             proallargtypes TEXT,
             proargmodes TEXT,
             proargnames TEXT,
@@ -1601,12 +1603,6 @@ impl SnapshotRows for PgProcTable {
         crate::procs::PROCS
             .iter()
             .map(|proc| {
-                let arg_types = proc
-                    .arg_types
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
                 vec![
                     Value::from_i64(proc.oid),
                     Value::build_text(proc.name),
@@ -1626,7 +1622,7 @@ impl SnapshotRows for PgProcTable {
                     Value::from_i64(proc.arg_types.len() as i64),
                     Value::from_i64(0),
                     Value::from_i64(proc.result),
-                    Value::build_text(arg_types),
+                    crate::pg_type::oidvector_value(proc.arg_types),
                     Value::Null,
                     Value::Null,
                     Value::Null,
@@ -2090,7 +2086,7 @@ impl PgTypeInfo {
             typispreferred: ty.is_preferred,
             typlen: ty.len,
             typarray: ty.array_oid,
-            typelem: 0,
+            typelem: ty.element_oid(),
             typbyval: ty.by_value,
             typalign: ty.align,
             typstorage: ty.storage,
@@ -2282,7 +2278,7 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indnullsnotdistinct BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indnullsnotdistinct BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey INT2VECTOR, indcollation OIDVECTOR, indclass OIDVECTOR, indoption INT2VECTOR, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
@@ -2299,18 +2295,17 @@ impl SnapshotRows for PgIndexTable {
 
         for index in catalog_indexes(conn, &schema) {
             let indnatts = index.columns.len() as i64;
-            let indkey: String = index
+            let indkey: Vec<i64> = index
                 .columns
                 .iter()
                 .map(|column| {
                     if column.expression.is_some() {
-                        "0".to_string()
+                        0
                     } else {
-                        (column.position + 1).to_string()
+                        column.position as i64 + 1
                     }
                 })
-                .collect::<Vec<_>>()
-                .join(" ");
+                .collect();
 
             let indpred = index
                 .where_clause
@@ -2349,7 +2344,7 @@ impl SnapshotRows for PgIndexTable {
                 Value::from_i64(1),                        // indisready
                 Value::from_i64(1),                        // indislive
                 Value::from_i64(0),                        // indisreplident
-                Value::build_text(indkey),                 // indkey
+                crate::pg_type::int2vector_value(&indkey), // indkey
                 Value::Null,                               // indcollation
                 Value::Null,                               // indclass
                 Value::Null,                               // indoption
@@ -2927,7 +2922,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr INT2VECTOR, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_statistic_ext",
@@ -3362,11 +3357,11 @@ struct ConstraintRow<'a> {
     referenced_column_numbers: Option<&'a str>,
 }
 
-struct IndexRow<'a> {
+struct IndexRow {
     oid: i64,
     table_oid: i64,
     is_unique: bool,
-    column_numbers: Option<&'a str>,
+    column_numbers: Option<String>,
 }
 
 struct ColumnDefaultRow {
@@ -3427,7 +3422,7 @@ impl SnapshotRows for PgDependTable {
         // Match indexes to their owning PK/UNIQUE constraints for internal dependencies.
         // Other indexes have automatic dependencies on their indexed columns.
         for index in indexes.clone() {
-            let columns = catalog_column_numbers(index.column_numbers);
+            let columns = catalog_column_numbers(index.column_numbers.as_deref());
             let constraint = constraints.clone().find(|constraint| {
                 matches!(
                     constraint.kind,
@@ -3477,7 +3472,8 @@ impl SnapshotRows for PgDependTable {
                 if let Some(index) = indexes.clone().find(|index| {
                     index.table_oid == constraint.referenced_table_oid
                         && index.is_unique
-                        && catalog_column_numbers(index.column_numbers) == referenced_columns
+                        && catalog_column_numbers(index.column_numbers.as_deref())
+                            == referenced_columns
                 }) {
                     rows.push(dependency_row(
                         ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
@@ -3840,14 +3836,14 @@ impl<'a> ConstraintRow<'a> {
     }
 }
 
-impl<'a> IndexRow<'a> {
+impl IndexRow {
     // Zero-based positions in PgIndexTable's SQL column order.
     const OID_COLUMN: usize = 0;
     const TABLE_OID_COLUMN: usize = 1;
     const IS_UNIQUE_COLUMN: usize = 4;
     const COLUMN_NUMBERS_COLUMN: usize = 15;
 
-    fn from_row(row: &'a [Value]) -> Self {
+    fn from_row(row: &[Value]) -> Self {
         Self {
             oid: row[Self::OID_COLUMN]
                 .as_int()
@@ -3859,7 +3855,7 @@ impl<'a> IndexRow<'a> {
                 .as_int()
                 .expect("catalog index uniqueness is an integer")
                 == CATALOG_BOOLEAN_TRUE,
-            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
+            column_numbers: catalog_vector_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
         }
     }
 }
@@ -3882,6 +3878,16 @@ impl ColumnDefaultRow {
                 .as_int()
                 .expect("catalog column numbers are integers"),
         }
+    }
+}
+
+fn catalog_vector_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Blob(blob) => Some(
+            crate::pg_type::vector_text(blob).expect("a catalog column list is a stored vector"),
+        ),
+        _ => unreachable!("catalog column lists are vectors or null"),
     }
 }
 

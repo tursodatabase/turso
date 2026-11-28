@@ -11,8 +11,8 @@
 use crate::catalog::regclass_text;
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text};
-use crate::pg_type::regtype_text;
 use crate::pg_type::{bytea_to_int, check_oid_range, int_to_bytea, type_input, IntegerType};
+use crate::pg_type::{regtype_text, vector_text};
 use crate::text::{encode_bytea, value_text, TextType};
 use std::sync::Arc;
 use turso_core::dialect::CastContext;
@@ -36,6 +36,8 @@ pub(crate) enum CastType {
     RegClass,
     Uuid,
     RegType,
+    Int2Vector,
+    OidVector,
     Bytea,
     Timestamp,
     TimestampTz,
@@ -56,6 +58,8 @@ impl CastType {
             Self::RegClass => "regclass",
             Self::Uuid => "uuid",
             Self::RegType => "regtype",
+            Self::Int2Vector => "int2vector",
+            Self::OidVector => "oidvector",
             Self::Bytea => "bytea",
             Self::Timestamp => "timestamp",
             Self::TimestampTz => "timestamptz",
@@ -81,6 +85,8 @@ impl CastType {
             "regclass" => Self::RegClass,
             "uuid" => Self::Uuid,
             "regtype" => Self::RegType,
+            "int2vector" => Self::Int2Vector,
+            "oidvector" => Self::OidVector,
             "bytea" => Self::Bytea,
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::TimestampTz,
@@ -504,6 +510,12 @@ fn to_text(connection: &Arc<Connection>, value: &Value, source: CastType) -> Res
             float8_text(f64::from(*f))
         }
         (Value::Blob(bytes), CastType::Bytea) => encode_bytea(bytes, false),
+        (Value::Blob(bytes), CastType::Int2Vector | CastType::OidVector) => {
+            match vector_text(bytes) {
+                Some(text) => text,
+                None => return Ok(value.clone()),
+            }
+        }
         (Value::Text(_), CastType::TimestampTz) => {
             match value_text(value, TextType::TimestampTz, connection) {
                 Some(text) => text.into_owned(),
