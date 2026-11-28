@@ -892,3 +892,23 @@ expect {
     b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
+
+test stored-generated-column-compares-numeric-with-a-string-literal {
+    CREATE TABLE ng (n numeric(5,2), eq boolean GENERATED ALWAYS AS (n = '1.50') STORED);
+    INSERT INTO ng (n) VALUES (1.5), (2.5);
+    SELECT n, eq FROM ng ORDER BY n;
+}
+expect {
+    1.50|t
+    2.50|f
+}
+
+test partial-index-predicate-compares-numeric-with-a-string-literal {
+    CREATE TABLE np (n numeric(5,2), v int);
+    CREATE INDEX np_v ON np (v) WHERE n = '1.50';
+    INSERT INTO np VALUES (1.5, 1), (2.5, 1);
+    SELECT count(*) FROM np WHERE v = 1 AND n = '1.50';
+}
+expect {
+    1
+}

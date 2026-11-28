@@ -904,16 +904,12 @@ expect @tursopg {
 }
 
 # PostgreSQL has no LIKE operator for a date.
-@compat-gap "operator:date ~~ unknown"
 test date-like-text {
     SELECT DATE '2020-01-05' LIKE '2020%';
 }
 @sqlstate 42883
 expect error {
     operator does not exist: date ~~ unknown
-}
-expect @tursopg {
-    t
 }
 
 # PostgreSQL accepts the special date value infinity. tursopg refuses it as

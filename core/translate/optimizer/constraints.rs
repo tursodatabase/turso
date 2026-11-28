@@ -881,7 +881,11 @@ pub fn table_constraints_from_where_clause(
                 .as_ast_operator()
                 .filter(|op| op.is_comparison())
                 .map(|_| {
-                    comparison_affinity(lhs, rhs, &TableMetadata::new(Some(table_references)))
+                    comparison_affinity(
+                        lhs,
+                        rhs,
+                        &ExprContext::new(Some(table_references), resolver),
+                    )
                 });
             let cmp_collation = match operator.as_ast_operator() {
                 Some(op) if op.is_comparison() => {
@@ -1145,7 +1149,7 @@ pub fn table_constraints_from_where_clause(
             // is the LHS column's affinity; the RHS literals are not folded.
             let cmp_aff = Some(get_expr_affinity(
                 lhs,
-                &TableMetadata::new(Some(table_references)),
+                &ExprContext::new(Some(table_references), resolver),
             ));
             let cmp_collation = Some(decide_once(&mut term_collations[i], || {
                 in_list_collation(
@@ -2288,7 +2292,7 @@ pub(crate) fn summarize_binary_term_for_index(
         rhs,
         operator,
         table_col_pos,
-        &TableMetadata::new(Some(table_references)),
+        &ExprContext::new(Some(table_references), resolver),
     );
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2352,7 +2356,7 @@ pub(crate) fn analyze_binary_term_for_index(
         rhs,
         operator,
         table_col_pos,
-        &TableMetadata::new(Some(table_references)),
+        &ExprContext::new(Some(table_references), resolver),
     );
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(

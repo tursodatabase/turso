@@ -3080,6 +3080,7 @@ fn translate_column_default(
         });
         return Ok(());
     };
+    // FIXME(registered-types): A DEFAULT is translated without the binding pass, so a string literal next to a bytea in it is not read as bytea. The dialect refuses a bare string literal compared with such a value (`check_string_literal_comparison`). A typed expression tree that every context analyzes once replaces this.
     let has_custom_encode = resolved.as_ref().is_some_and(|r| r.has_encode_or_coerce());
     if has_custom_encode {
         translate_expr_no_constant_opt(

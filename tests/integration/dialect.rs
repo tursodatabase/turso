@@ -1662,6 +1662,27 @@ fn function_a_dialect_names_for_an_operator_runs_it() {
         row("SELECT p + q, p + q + p FROM t"),
         vec![Value::from_i64(40), Value::from_i64(40)]
     );
+    // `||` of two percents is the smaller one, and `||` of a percent and text
+    // is the engine's concatenation, because the dialect chose no function.
+    assert_eq!(
+        row("SELECT p || q, p || q || q FROM t"),
+        vec![Value::from_i64(30), Value::from_i64(30)]
+    );
+    assert_eq!(
+        row("SELECT p || 'x' FROM t"),
+        vec![Value::build_text("30x")]
+    );
+    // `LIKE` is the operator `~~`: the dialect chose `min` for two percents, and
+    // `NOT LIKE` negates what the function gives. With a text operand the
+    // dialect chose nothing, so the engine's LIKE runs.
+    assert_eq!(
+        row("SELECT p LIKE q, p NOT LIKE q FROM t"),
+        vec![Value::from_i64(30), Value::from_i64(0)]
+    );
+    assert_eq!(
+        row("SELECT p LIKE '3%', p NOT LIKE '3%' FROM t"),
+        vec![Value::from_i64(1), Value::from_i64(0)]
+    );
     // The dialect names no function for `-`, and the type has none.
     let error = conn.prepare("SELECT q - p FROM t").unwrap_err();
     assert!(
@@ -1750,7 +1771,7 @@ impl Dialect for RustTypesDialect {
     ) -> Result<OperatorChoice> {
         let is_percent = |operand: &OperandType| matches!(operand, OperandType::Registered(ty) if ty.name == "percent");
         let operands = operands();
-        if op != "+" || !operands.iter().all(is_percent) {
+        if !matches!(op, "+" | "||" | "~~") || !operands.iter().all(is_percent) {
             return Ok(OperatorChoice::LeftToTheEngine);
         }
         let percent = turso_core::ast::Type {
@@ -1763,7 +1784,7 @@ impl Dialect for RustTypesDialect {
             operands: vec![percent.clone(); operands.len()],
             cast_operands: vec![],
             function: Some(OperatorFunction {
-                name: "max".to_string(),
+                name: if op == "+" { "max" } else { "min" }.to_string(),
                 result: percent,
             }),
         }))

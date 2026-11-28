@@ -17,7 +17,7 @@ use crate::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
             lookup_unqualified_column, unwrap_parens, StorageClassMask,
         },
-        expr_context::{ExprContext, ExprProperties, TableMetadata},
+        expr_context::{ExprContext, ExprProperties},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::{
             constraints::{BinaryExprSide, SeekRangeConstraint},
@@ -55,8 +55,12 @@ use super::expr::expr_type::{query_column_type, type_ordering, ExprType};
 ///
 /// The affinity (and whether it's a real declared one) determines comparison
 /// behavior in IN expressions, etc.
-fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, &TableMetadata::new(tables))
+fn infer_type_from_expr(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Affinity {
+    get_expr_affinity(expr, &ExprContext::new(tables, resolver))
 }
 
 /// Computes the affinity of each column of a compound (UNION/INTERSECT/EXCEPT)
@@ -81,7 +85,7 @@ pub(super) fn compound_column_affinities(
     let arm_parts: Vec<_> = arms
         .iter()
         .map(|arm| {
-            let metadata = TableMetadata::new(Some(&arm.table_references));
+            let metadata = ExprContext::new(Some(&arm.table_references), resolver);
             let parts = if arm.values.is_empty() {
                 vec![CompoundPart::Select(&arm.result_columns)]
             } else {
@@ -113,14 +117,14 @@ enum CompoundPart<'a> {
 
 fn compound_column_affinity(
     arms: &[&SelectPlan],
-    arm_parts: &[(TableMetadata, Vec<CompoundPart>)],
+    arm_parts: &[(ExprContext<'_, '_>, Vec<CompoundPart>)],
     i: usize,
 ) -> CompoundColumnAffinity {
     let plain = |affinity| CompoundColumnAffinity {
         affinity,
         flexible_numeric: false,
     };
-    let column_types = |expr: Option<&ast::Expr>, metadata: &TableMetadata| match expr {
+    let column_types = |expr: Option<&ast::Expr>, metadata: &ExprContext<'_, '_>| match expr {
         Some(expr) => (
             get_expr_affinity(expr, metadata),
             expr_data_type(expr, metadata),
@@ -307,8 +311,8 @@ impl ResultSetColumn {
 
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
-    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, &TableMetadata::new(Some(tables))).short_type_name()
+    pub fn declared_type(&self, tables: &TableReferences, resolver: &Resolver) -> &'static str {
+        get_expr_affinity(&self.expr, &ExprContext::new(Some(tables), resolver)).short_type_name()
     }
 }
 
@@ -3650,7 +3654,7 @@ pub(super) fn query_output_columns(
                 .as_ref()
                 .map(|affinities| affinities[column_index])
                 .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                    infer_type_from_expr(&result_column.expr, Some(table_references), resolver)
                 });
             let column_type = affinity.to_type();
             let mut column = Column::new(

@@ -56,7 +56,9 @@ pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
-                Affinity::of_written_type(&crate::util::dequote(&type_name.name))
+                metadata.cast_affinity(type_name).unwrap_or_else(|| {
+                    Affinity::of_written_type(&crate::util::dequote(&type_name.name))
+                })
             } else {
                 Affinity::None
             }

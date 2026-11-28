@@ -194,6 +194,7 @@ pub(crate) fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) ->
 /// Resolved type of an expression node for strict type checking of CHECK constraints.
 /// In STRICT tables, every comparison operand must have a determinable, compatible type.
 /// If a type cannot be determined (e.g. function calls), the user must use an explicit CAST.
+// FIXME(registered-types): This checks the kinds of values that the engine has, not the types of the dialect, so it refuses `bytea_column = '\x6162'` where PostgreSQL reads the literal as bytea. A typed expression tree gives the check the types it needs.
 #[derive(Debug, Clone, PartialEq)]
 enum CheckExprType {
     Integer,
@@ -1012,7 +1013,7 @@ fn derive_ctas_schema(
                     affinity.affinity.short_type_name()
                 }
             })
-            .unwrap_or_else(|| col.declared_type(table_refs));
+            .unwrap_or_else(|| col.declared_type(table_refs, resolver));
 
         let quoted = quote_identifier(name);
         if ty.is_empty() {
