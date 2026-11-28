@@ -7,9 +7,11 @@ use super::{
 use crate::error::io_error;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::unix::{
-    unix_shared_wal_lock_byte, unix_shared_wal_map, unix_shared_wal_unlock_byte,
+    is_ignorable_dir_sync_errno, open_parent_dir, parent_dir_for_open, unix_shared_wal_lock_byte,
+    unix_shared_wal_map, unix_shared_wal_unlock_byte,
 };
 use crate::storage::wal::CKPT_BATCH_PAGES;
+use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Mutex;
 use crate::turso_assert;
 use crate::{CompletionError, LimboError, Result};
@@ -19,7 +21,11 @@ use std::{
     collections::{HashMap, VecDeque},
     io::ErrorKind,
     ops::Deref,
-    os::{fd::AsFd, unix::io::AsRawFd},
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::io::AsRawFd,
+    },
+    path::PathBuf,
     sync::Arc,
 };
 use tracing::{debug, trace, warn};
@@ -84,6 +90,7 @@ crate::assert::assert_send_sync!(UringIO);
 struct RingState {
     pending_ops: usize,
     writev_states: HashMap<u64, WritevState>,
+    dir_sync_states: HashMap<u64, DirSyncState>,
     overflow: VecDeque<io_uring::squeue::Entry>,
     iov_pool: IovecPool,
     free_arenas: [Option<(NonNull<u8>, usize)>; ARENA_COUNT],
@@ -214,6 +221,7 @@ impl UringIO {
             overflow: VecDeque::new(),
             pending_ops: 0,
             writev_states: HashMap::default(),
+            dir_sync_states: HashMap::default(),
             iov_pool: IovecPool::new(),
             free_arenas: [const { None }; ARENA_COUNT],
         };
@@ -224,6 +232,35 @@ impl UringIO {
             wait_lock: Arc::new(Mutex::new(())),
             caps: Arc::new(caps),
         })
+    }
+
+    fn open_uring_file(&self, path: &str, flags: OpenFlags) -> Result<Arc<UringFile>> {
+        trace!("open_file(path = {})", path);
+        let mut file = std::fs::File::options();
+        file.read(true);
+
+        if !flags.contains(OpenFlags::ReadOnly) {
+            file.write(true);
+            file.create(flags.contains(OpenFlags::Create));
+        }
+
+        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
+        let parent_dir = parent_dir_for_open(path, flags);
+        let dir_needs_sync = parent_dir.is_some();
+        let uring_file = Arc::new(UringFile {
+            ring: self.ring.clone(),
+            state: self.state.clone(),
+            caps: self.caps.clone(),
+            file,
+            parent_dir,
+            dir_needs_sync: Arc::new(AtomicBool::new(dir_needs_sync)),
+        });
+        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
+        {
+            uring_file.lock_file(true)?;
+        }
+        Ok(uring_file)
     }
 }
 
@@ -250,6 +287,18 @@ fn permission_denied_message(disabled: Option<&str>) -> String {
         Some(setting) => format!("io_uring_setup: permission denied (io_uring_disabled={setting})"),
         None => "io_uring_setup: permission denied".to_string(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirSyncPhase {
+    FileSync,
+    DirSync,
+}
+
+struct DirSyncState {
+    dir_fd: Option<OwnedFd>,
+    dir_needs_sync: Arc<AtomicBool>,
+    phase: DirSyncPhase,
 }
 
 /// State to track an ongoing writev operation in
@@ -450,6 +499,52 @@ impl RingState {
         }
         Ok(())
     }
+
+    /// Handle a two-stage file + parent-directory fsync CQE.
+    /// SAFETY: caller must hold the `RingState` Mutex.
+    unsafe fn handle_dir_sync_completion(
+        &mut self,
+        ring: &io_uring::IoUring,
+        mut state: DirSyncState,
+        user_data: u64,
+        result: i32,
+    ) -> Result<()> {
+        match state.phase {
+            DirSyncPhase::FileSync => {
+                if result < 0 {
+                    let err = std::io::Error::from_raw_os_error(-result);
+                    completion_from_key(user_data)
+                        .error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
+                } else if clone_completion_from_key(user_data).finished() {
+                    drop(completion_from_key(user_data));
+                } else if let Some(dir_fd) = &state.dir_fd {
+                    let dir_sync =
+                        io_uring::opcode::Fsync::new(io_uring::types::Fd(dir_fd.as_raw_fd()))
+                            .build()
+                            .user_data(user_data);
+                    state.phase = DirSyncPhase::DirSync;
+                    self.dir_sync_states.insert(user_data, state);
+                    self.submit_entry(ring, &dir_sync)?;
+                    wake_user_data(user_data);
+                } else {
+                    state.dir_needs_sync.store(false, Ordering::Release);
+                    completion_from_key(user_data).complete(0);
+                }
+            }
+            DirSyncPhase::DirSync => {
+                state.dir_fd = None;
+                if result >= 0 || is_ignorable_dir_sync_errno(-result) {
+                    state.dir_needs_sync.store(false, Ordering::Release);
+                    completion_from_key(user_data).complete(0);
+                } else {
+                    let err = std::io::Error::from_raw_os_error(-result);
+                    completion_from_key(user_data)
+                        .error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl IO for UringIO {
@@ -458,28 +553,7 @@ impl IO for UringIO {
     }
 
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
-        trace!("open_file(path = {})", path);
-        let mut file = std::fs::File::options();
-        file.read(true);
-
-        if !flags.contains(OpenFlags::ReadOnly) {
-            file.write(true);
-            file.create(flags.contains(OpenFlags::Create));
-        }
-
-        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
-        let uring_file = Arc::new(UringFile {
-            ring: self.ring.clone(),
-            state: self.state.clone(),
-            caps: self.caps.clone(),
-            file,
-        });
-        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
-        {
-            uring_file.lock_file(true)?;
-        }
-        Ok(uring_file)
+        Ok(self.open_uring_file(path, flags)?)
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
@@ -630,6 +704,12 @@ impl UringIO {
                 unsafe { state.handle_writev_completion(&self.ring, wstate, user_data, result)? };
                 continue;
             }
+            if let Some(dstate) = state.dir_sync_states.remove(&user_data) {
+                drop(cq);
+                // SAFETY: still holding `state` Mutex.
+                unsafe { state.handle_dir_sync_completion(&self.ring, dstate, user_data, result)? };
+                continue;
+            }
             if result < 0 {
                 let errno = -result;
                 let err = std::io::Error::from_raw_os_error(errno);
@@ -668,23 +748,24 @@ fn completion_from_key(key: u64) -> Completion {
     }
 }
 
-/// Wake the waker registered on the completion identified by `key` (and on
-/// its parent group, if any) without consuming the kernel's `Arc::into_raw`
-/// reference. Used to fire a progress wake when an operation is resubmitted
-/// (e.g., a writev split across chunks) so the future re-polls and continues
-/// draining the CQ.
-fn wake_user_data(key: u64) {
-    let ptr = key as *const CompletionInner;
+fn clone_completion_from_key(key: u64) -> Completion {
     // SAFETY: kernel owns one strong ref via the Arc::into_raw'd `key`. We
     // re-materialize the Arc to clone it, then re-leak the original so the
     // kernel's ref count is unchanged when this function returns.
-    let kernel_ref = unsafe { Arc::from_raw(ptr) };
+    let kernel_ref = unsafe { Arc::from_raw(key as *const CompletionInner) };
     let cloned = kernel_ref.clone();
     let _ = Arc::into_raw(kernel_ref);
     Completion {
         inner: Some(cloned),
     }
-    .wake_progress();
+}
+
+/// Wake the waker registered on a completion (or its parent group, if any)
+/// without consuming the kernel's `Arc::into_raw` reference. Used to fire a
+/// progress wake when an operation is resubmitted (e.g., a writev split across
+/// chunks) so the future re-polls and continues draining the CQ.
+fn wake_user_data(key: u64) {
+    clone_completion_from_key(key).wake_progress();
 }
 
 pub struct UringFile {
@@ -692,6 +773,8 @@ pub struct UringFile {
     state: Arc<Mutex<RingState>>,
     caps: Arc<UringCapabilities>,
     file: std::fs::File,
+    parent_dir: Option<PathBuf>,
+    dir_needs_sync: Arc<AtomicBool>,
 }
 
 impl Deref for UringFile {
@@ -821,6 +904,27 @@ impl File for UringFile {
     fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         trace!("sync()");
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        if self.dir_needs_sync.load(Ordering::Acquire) {
+            if let Some(parent_dir) = &self.parent_dir {
+                let dir_fd = open_parent_dir(parent_dir)?;
+                let key = get_key(c.clone());
+                let sync = io_uring::opcode::Fsync::new(fd).build().user_data(key);
+                let mut state = self.state.lock();
+                state.dir_sync_states.insert(
+                    key,
+                    DirSyncState {
+                        dir_fd,
+                        dir_needs_sync: self.dir_needs_sync.clone(),
+                        phase: DirSyncPhase::FileSync,
+                    },
+                );
+                // SAFETY: holding `state` Mutex.
+                unsafe { state.submit_entry(&self.ring, &sync)? };
+                return Ok(c);
+            } else {
+                self.dir_needs_sync.store(false, Ordering::Release);
+            }
+        }
         let sync = io_uring::opcode::Fsync::new(fd)
             .build()
             .user_data(get_key(c.clone()));
@@ -935,5 +1039,423 @@ mod tests {
             permission_denied_message(None),
             "io_uring_setup: permission denied"
         );
+    }
+
+    #[test]
+    fn test_first_sync_executes_two_stage_dir_sync_and_clears_flag() {
+        let io = match UringIO::new() {
+            Ok(io) => io,
+            Err(LimboError::IoBackendUnavailable(_)) => return,
+            Err(e) => panic!("unexpected UringIO::new error: {e}"),
+        };
+        let eloop_kind = std::io::Error::from_raw_os_error(libc::ELOOP).kind();
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        let sub_moved = root.path().join("sub_moved");
+        std::fs::create_dir(&sub).unwrap();
+        let db_path = sub.join("test.db");
+
+        let file = io
+            .open_uring_file(db_path.to_str().unwrap(), OpenFlags::Create)
+            .unwrap();
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+        io.wait_for_completion(w).unwrap();
+        assert!(file.dir_needs_sync.load(Ordering::SeqCst));
+
+        std::fs::rename(&sub, &sub_moved).unwrap();
+        std::os::unix::fs::symlink("sub", &sub).unwrap();
+
+        for _ in 0..2 {
+            let err = file
+                .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    LimboError::CompletionError(CompletionError::IOError(kind, "open_parent_dir"))
+                        if kind == eloop_kind
+                ),
+                "expected ELOOP from open_parent_dir, got {err:?}"
+            );
+            assert!(file.dir_needs_sync.load(Ordering::SeqCst));
+            assert!(io.state.lock().dir_sync_states.is_empty());
+        }
+
+        std::fs::remove_file(&sub).unwrap();
+        std::fs::rename(&sub_moved, &sub).unwrap();
+        let s1 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("first sync must submit after parent dir restored");
+        assert!(file.dir_needs_sync.load(Ordering::SeqCst));
+        {
+            let state = io.state.lock();
+            assert_eq!(state.dir_sync_states.len(), 1);
+            let dir_state = state.dir_sync_states.values().next().unwrap();
+            assert_eq!(dir_state.phase, DirSyncPhase::FileSync);
+            assert!(dir_state.dir_fd.is_some());
+        }
+        io.wait_for_completion(s1).unwrap();
+        assert!(!file.dir_needs_sync.load(Ordering::SeqCst));
+        assert!(io.state.lock().dir_sync_states.is_empty());
+
+        std::fs::rename(&sub, &sub_moved).unwrap();
+        std::os::unix::fs::symlink("sub", &sub).unwrap();
+        let s2 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("subsequent sync must not reopen parent dir");
+        assert!(io.state.lock().dir_sync_states.is_empty());
+        io.wait_for_completion(s2).unwrap();
+
+        std::fs::remove_file(&sub).unwrap();
+        std::fs::rename(&sub_moved, &sub).unwrap();
+        drop(file);
+
+        let existing = io
+            .open_uring_file(db_path.to_str().unwrap(), OpenFlags::None)
+            .unwrap();
+        assert!(!existing.dir_needs_sync.load(Ordering::SeqCst));
+        assert!(existing.parent_dir.is_none());
+
+        std::fs::rename(&sub, &sub_moved).unwrap();
+        std::os::unix::fs::symlink("sub", &sub).unwrap();
+        let s3 = existing
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("sync on non-Create open must not open parent dir");
+        assert!(io.state.lock().dir_sync_states.is_empty());
+        io.wait_for_completion(s3).unwrap();
+    }
+
+    #[test]
+    fn test_sync_succeeds_after_parent_dir_renamed_while_open() {
+        let io = match UringIO::new() {
+            Ok(io) => io,
+            Err(LimboError::IoBackendUnavailable(_)) => return,
+            Err(e) => panic!("unexpected UringIO::new error: {e}"),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        let sub_moved = root.path().join("sub_moved");
+        std::fs::create_dir(&sub).unwrap();
+        let db_path = sub.join("test.db");
+
+        let file = io
+            .open_uring_file(db_path.to_str().unwrap(), OpenFlags::Create)
+            .unwrap();
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+        io.wait_for_completion(w).unwrap();
+        assert!(file.dir_needs_sync.load(Ordering::SeqCst));
+
+        std::fs::rename(&sub, &sub_moved).unwrap();
+        let s1 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("first sync must submit after parent dir rename");
+        {
+            let state = io.state.lock();
+            assert_eq!(state.dir_sync_states.len(), 1);
+            let dir_state = state.dir_sync_states.values().next().unwrap();
+            assert!(dir_state.dir_fd.is_none());
+        }
+        io.wait_for_completion(s1).unwrap();
+        assert!(!file.dir_needs_sync.load(Ordering::SeqCst));
+
+        let s2 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("subsequent sync must submit");
+        assert!(io.state.lock().dir_sync_states.is_empty());
+        io.wait_for_completion(s2).unwrap();
+    }
+
+    #[test]
+    fn test_sync_succeeds_after_parent_dir_renamed_and_recreated() {
+        let io = match UringIO::new() {
+            Ok(io) => io,
+            Err(LimboError::IoBackendUnavailable(_)) => return,
+            Err(e) => panic!("unexpected UringIO::new error: {e}"),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        let sub_moved = root.path().join("sub_moved");
+        std::fs::create_dir(&sub).unwrap();
+        let db_path = sub.join("test.db");
+
+        let file = io
+            .open_uring_file(db_path.to_str().unwrap(), OpenFlags::Create)
+            .unwrap();
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+        io.wait_for_completion(w).unwrap();
+        assert!(file.dir_needs_sync.load(Ordering::SeqCst));
+
+        std::fs::rename(&sub, &sub_moved).unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        let s1 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("first sync must submit after parent dir rename and recreate");
+        {
+            let state = io.state.lock();
+            assert_eq!(state.dir_sync_states.len(), 1);
+            let dir_state = state.dir_sync_states.values().next().unwrap();
+            assert!(dir_state.dir_fd.is_some());
+        }
+        io.wait_for_completion(s1).unwrap();
+        assert!(!file.dir_needs_sync.load(Ordering::SeqCst));
+
+        let s2 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("subsequent sync must submit");
+        assert!(io.state.lock().dir_sync_states.is_empty());
+        io.wait_for_completion(s2).unwrap();
+    }
+
+    #[test]
+    fn test_sync_completion_group_fires_once_after_dir_sync() {
+        use crate::io::CompletionGroup;
+        use crate::sync::atomic::AtomicUsize;
+
+        let io = match UringIO::new() {
+            Ok(io) => io,
+            Err(LimboError::IoBackendUnavailable(_)) => return,
+            Err(e) => panic!("unexpected UringIO::new error: {e}"),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let db_path = sub.join("group.db");
+
+        let file = io
+            .open_uring_file(db_path.to_str().unwrap(), OpenFlags::Create)
+            .unwrap();
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+        io.wait_for_completion(w).unwrap();
+        assert!(file.dir_needs_sync.load(Ordering::SeqCst));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cb = calls.clone();
+        let mut group = CompletionGroup::new(move |res| {
+            assert_eq!(res, Ok(0));
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let sync_c = Completion::new_sync(|res| assert_eq!(res, Ok(0)));
+        group.add(&sync_c);
+        drop(
+            file.sync(sync_c, crate::io::FileSyncType::Fsync)
+                .expect("sync submission must succeed"),
+        );
+        {
+            let state = io.state.lock();
+            assert_eq!(state.dir_sync_states.len(), 1);
+            let dir_state = state.dir_sync_states.values().next().unwrap();
+            assert!(dir_state.dir_fd.is_some());
+        }
+        let group_c = group.build();
+        io.wait_for_completion(group_c).unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!file.dir_needs_sync.load(Ordering::SeqCst));
+        assert!(io.state.lock().dir_sync_states.is_empty());
+
+        let s2 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("subsequent sync must submit");
+        assert!(io.state.lock().dir_sync_states.is_empty());
+        io.wait_for_completion(s2).unwrap();
+    }
+
+    #[test]
+    fn test_dir_sync_inter_phase_completion_group_waits_for_dir_sync() {
+        use crate::io::CompletionGroup;
+        use crate::sync::atomic::AtomicUsize;
+
+        let io = match UringIO::new() {
+            Ok(io) => io,
+            Err(LimboError::IoBackendUnavailable(_)) => return,
+            Err(e) => panic!("unexpected UringIO::new error: {e}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir_fd = open_parent_dir(dir.path()).unwrap();
+        assert!(dir_fd.is_some());
+        let dir_needs_sync = Arc::new(AtomicBool::new(true));
+        let group_calls = Arc::new(AtomicUsize::new(0));
+        let group_calls_cb = group_calls.clone();
+        let mut group = CompletionGroup::new(move |res| {
+            assert_eq!(res, Ok(0));
+            group_calls_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let sync_c = Completion::new_sync(|res| assert_eq!(res, Ok(0)));
+        group.add(&sync_c);
+        let group_c = group.build();
+        let key = get_key(sync_c.clone());
+        let dstate = DirSyncState {
+            dir_fd,
+            dir_needs_sync: dir_needs_sync.clone(),
+            phase: DirSyncPhase::FileSync,
+        };
+
+        {
+            let mut state = io.state.lock();
+            unsafe {
+                state
+                    .handle_dir_sync_completion(&io.ring, dstate, key, 0)
+                    .unwrap();
+            }
+            assert!(!sync_c.finished());
+            assert!(!group_c.finished());
+            assert_eq!(group_calls.load(Ordering::SeqCst), 0);
+            assert!(dir_needs_sync.load(Ordering::SeqCst));
+            assert_eq!(
+                state.dir_sync_states.get(&key).map(|s| s.phase),
+                Some(DirSyncPhase::DirSync)
+            );
+        }
+
+        io.wait_for_completion(group_c.clone()).unwrap();
+        assert!(sync_c.finished());
+        assert!(group_c.finished());
+        assert_eq!(group_calls.load(Ordering::SeqCst), 1);
+        assert!(!dir_needs_sync.load(Ordering::SeqCst));
+        assert!(io.state.lock().dir_sync_states.is_empty());
+    }
+
+    #[test]
+    fn test_dir_sync_state_machine_transitions() {
+        let io = match UringIO::new() {
+            Ok(io) => io,
+            Err(LimboError::IoBackendUnavailable(_)) => return,
+            Err(e) => panic!("unexpected UringIO::new error: {e}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let dir_fd = open_parent_dir(dir.path()).unwrap();
+            let dir_needs_sync = Arc::new(AtomicBool::new(true));
+            let err_seen = Arc::new(AtomicBool::new(false));
+            let err_cb = err_seen.clone();
+            let c = Completion::new_sync(move |res| {
+                assert!(res.is_err());
+                err_cb.store(true, Ordering::SeqCst);
+            });
+            let key = get_key(c);
+            let dstate = DirSyncState {
+                dir_fd,
+                dir_needs_sync: dir_needs_sync.clone(),
+                phase: DirSyncPhase::DirSync,
+            };
+            let mut state = io.state.lock();
+            unsafe {
+                state
+                    .handle_dir_sync_completion(&io.ring, dstate, key, -libc::EIO)
+                    .unwrap();
+            }
+            assert!(dir_needs_sync.load(Ordering::SeqCst));
+            assert!(err_seen.load(Ordering::SeqCst));
+        }
+
+        for errno in [libc::EINVAL, libc::EROFS] {
+            let dir_fd = open_parent_dir(dir.path()).unwrap();
+            let dir_needs_sync = Arc::new(AtomicBool::new(true));
+            let ok_seen = Arc::new(AtomicBool::new(false));
+            let ok_cb = ok_seen.clone();
+            let c = Completion::new_sync(move |res| {
+                assert_eq!(res, Ok(0));
+                ok_cb.store(true, Ordering::SeqCst);
+            });
+            let key = get_key(c);
+            let dstate = DirSyncState {
+                dir_fd,
+                dir_needs_sync: dir_needs_sync.clone(),
+                phase: DirSyncPhase::DirSync,
+            };
+            let mut state = io.state.lock();
+            unsafe {
+                state
+                    .handle_dir_sync_completion(&io.ring, dstate, key, -errno)
+                    .unwrap();
+            }
+            assert!(!dir_needs_sync.load(Ordering::SeqCst));
+            assert!(ok_seen.load(Ordering::SeqCst));
+        }
+
+        {
+            use crate::sync::atomic::AtomicUsize;
+
+            let dir_fd = open_parent_dir(dir.path()).unwrap();
+            let dir_needs_sync = Arc::new(AtomicBool::new(true));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_cb = calls.clone();
+            let c = Completion::new_sync(move |res| {
+                assert_eq!(res, Err(CompletionError::Aborted));
+                calls_cb.fetch_add(1, Ordering::SeqCst);
+            });
+            let key = get_key(c.clone());
+            c.abort();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let dstate = DirSyncState {
+                dir_fd,
+                dir_needs_sync: dir_needs_sync.clone(),
+                phase: DirSyncPhase::FileSync,
+            };
+            let mut state = io.state.lock();
+            unsafe {
+                state
+                    .handle_dir_sync_completion(&io.ring, dstate, key, 0)
+                    .unwrap();
+            }
+            assert!(state.dir_sync_states.is_empty());
+            assert!(dir_needs_sync.load(Ordering::SeqCst));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        {
+            let dir_fd = open_parent_dir(dir.path()).unwrap();
+            let dir_needs_sync = Arc::new(AtomicBool::new(true));
+            let err_seen = Arc::new(AtomicBool::new(false));
+            let err_cb = err_seen.clone();
+            let c_err = Completion::new_sync(move |res| {
+                assert!(res.is_err());
+                err_cb.store(true, Ordering::SeqCst);
+            });
+            let key_err = get_key(c_err);
+            let dstate_err = DirSyncState {
+                dir_fd,
+                dir_needs_sync: dir_needs_sync.clone(),
+                phase: DirSyncPhase::FileSync,
+            };
+            let mut state = io.state.lock();
+            unsafe {
+                state
+                    .handle_dir_sync_completion(&io.ring, dstate_err, key_err, -libc::EIO)
+                    .unwrap();
+            }
+            assert!(dir_needs_sync.load(Ordering::SeqCst));
+            assert!(err_seen.load(Ordering::SeqCst));
+        }
+
+        {
+            let dir_needs_sync = Arc::new(AtomicBool::new(true));
+            let ok_seen = Arc::new(AtomicBool::new(false));
+            let ok_cb = ok_seen.clone();
+            let c = Completion::new_sync(move |res| {
+                assert_eq!(res, Ok(0));
+                ok_cb.store(true, Ordering::SeqCst);
+            });
+            let key = get_key(c);
+            let dstate = DirSyncState {
+                dir_fd: None,
+                dir_needs_sync: dir_needs_sync.clone(),
+                phase: DirSyncPhase::FileSync,
+            };
+            let mut state = io.state.lock();
+            unsafe {
+                state
+                    .handle_dir_sync_completion(&io.ring, dstate, key, 0)
+                    .unwrap();
+            }
+            assert!(!dir_needs_sync.load(Ordering::SeqCst));
+            assert!(ok_seen.load(Ordering::SeqCst));
+            assert!(state.dir_sync_states.is_empty());
+        }
     }
 }
