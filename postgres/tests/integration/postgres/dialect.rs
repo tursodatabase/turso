@@ -1920,8 +1920,8 @@ fn test_postgres_window_avg_partition(db: TempDatabase) {
 }
 
 // PostgreSQL rejects `1e308::float8 * 10` as an overflow, so its results
-// below come from the same rows written with 'Infinity'::float8. NaN is
-// returned as NULL.
+// below come from the same rows written with 'Infinity'::float8. A frame
+// with both positive and negative infinity produces NaN.
 #[turso_macros::test(mvcc)]
 fn test_postgres_window_sum_avg_are_finite_after_infinite_values_leave_frame(db: TempDatabase) {
     let conn = db.connect_postgres();
@@ -1952,7 +1952,7 @@ fn test_postgres_window_sum_avg_are_finite_after_infinite_values_leave_frame(db:
             "3|3.0|1.5",
             "4|6.0|3.0",
             "5|-Inf|-Inf",
-            "6||",
+            "6|NaN|NaN",
             "7|Inf|Inf",
         ]
     );
