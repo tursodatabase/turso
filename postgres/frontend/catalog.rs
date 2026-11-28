@@ -1176,18 +1176,18 @@ impl SnapshotRows for PgAttributeTable {
                 };
 
                 rows.push(vec![
-                    Value::from_i64(table_oid),   // attrelid
-                    Value::Text(col_name.into()), // attname
-                    Value::from_i64(type_oid),    // atttypid
-                    Value::from_i64(-1),          // attstattarget
-                    Value::from_i64(-1),          // attlen
-                    Value::from_i64(attnum),      // attnum
-                    Value::from_i64(0),           // attndims
-                    Value::from_i64(-1),          // attcacheoff
-                    Value::from_i64(-1),          // atttypmod
-                    Value::from_i64(1),           // attbyval
-                    Value::build_text(storage),   // attstorage
-                    Value::Text("i".into()),      // attalign (int)
+                    Value::from_i64(table_oid),                         // attrelid
+                    Value::Text(col_name.into()),                       // attname
+                    Value::from_i64(type_oid),                          // atttypid
+                    Value::from_i64(-1),                                // attstattarget
+                    Value::from_i64(-1),                                // attlen
+                    Value::from_i64(attnum),                            // attnum
+                    Value::from_i64(i64::from(col.array_dimensions())), // attndims
+                    Value::from_i64(-1),                                // attcacheoff
+                    Value::from_i64(-1),                                // atttypmod
+                    Value::from_i64(1),                                 // attbyval
+                    Value::build_text(storage),                         // attstorage
+                    Value::Text("i".into()),                            // attalign (int)
                     Value::Text("".into()),
                     Value::from_i64(notnull),      // attnotnull
                     Value::from_i64(has_def),      // atthasdef
@@ -1285,7 +1285,7 @@ fn simple_attribute_row(
         Value::from_i64(-1),
         Value::from_i64(-1),
         Value::from_i64(position as i64 + 1),
-        Value::from_i64(0),
+        Value::from_i64(i64::from(column.array_dimensions())),
         Value::from_i64(-1),
         Value::from_i64(-1),
         Value::from_i64(1),
@@ -1314,10 +1314,17 @@ fn attribute_type_oid(
     column: &turso_core::schema::Column,
     is_strict: bool,
 ) -> i64 {
-    match schema.get_type_def(&column.ty_str, is_strict) {
+    let element = match schema.get_type_def(&column.ty_str, is_strict) {
         Some(td) if !td.is_builtin => user_type_oid(&td.name),
         _ => sqlite_type_to_pg_oid(&column.ty_str),
+    };
+    if column.array_dimensions() == 0 {
+        return element;
     }
+    built_in_type(element)
+        .map(|ty| ty.array_oid)
+        .filter(|array_oid| *array_oid != 0)
+        .unwrap_or(element)
 }
 
 const SUPERUSER_OID: i64 = 10;

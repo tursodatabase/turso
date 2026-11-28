@@ -382,7 +382,7 @@ expect @tursopg {
     ts|timestamp with time zone
     j|jsonb
     u|uuid
-    a|text
+    a|text[]
 }
 
 # E-31: information_schema.columns
