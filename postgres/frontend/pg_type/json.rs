@@ -82,13 +82,22 @@ fn check_json_syntax(text: &str) -> Result<()> {
 /// PostgreSQL's jsonb: a JSON value stored in the form jsonb_out writes it,
 /// as text such as `{"a": 1, "b": [1, 2]}`. An object keeps one field of each
 /// name, the last one, and its fields are ordered by the length of their
-/// names and then by their bytes. A number is written as numeric writes it.
-/// Two equal values thus have the same stored form.
+/// names and then by their bytes. A number is written as numeric writes it,
+/// with the decimal places of its text, so `1` and `1.0` are stored apart.
+///
+// FIXME(pg-jsonb-order): PostgreSQL compares jsonb values by the jsonb order
+// of its btree operator class (compareJsonbContainers): `1` equals `1.0`, and
+// `[10]` sorts after `[9]`. The engine compares the stored text, so `=`,
+// UNIQUE and DISTINCT tell `1` and `1.0` apart, and ORDER BY a jsonb column
+// fails because the type has no `<`. An order of the type, as core's
+// TypeOrdering gives numeric and arrays one, replaces this.
 ///
 /// Older versions stored a jsonb value in the binary form of SQLite's
-/// jsonb(), as the jsonb of core does. The frontend cannot read that form, so
-/// such a value fails with 0A000 instead of being read as something else.
-/// jsonb columns are custom types, which are an experimental feature.
+/// jsonb(), as the jsonb of core does. The frontend does not convert that
+/// form: such a value fails with 0A000 instead of being read as something
+/// else. That is a choice. jsonb columns are custom types, which are an
+/// experimental feature, so a file that has them need not open in a newer
+/// version.
 #[derive(Debug)]
 pub(super) struct Jsonb;
 

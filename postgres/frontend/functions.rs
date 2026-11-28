@@ -2158,8 +2158,10 @@ fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) -> 
         (JsonElement::Boolean, Value::Numeric(Numeric::Integer(0))) => json.push_str("false"),
         (JsonElement::Boolean, Value::Numeric(_)) => json.push_str("true"),
         (JsonElement::Json, Value::Text(text)) => json.push_str(text.as_str()),
-        // tursopg keeps a jsonb value as the text it was given, so it is read
-        // and written again in the form PostgreSQL gives it.
+        // A jsonb value that a column stores is in the form jsonb_out writes
+        // it. The value is read and written again all the same, so that a
+        // function whose jsonb result has another form does not give other
+        // JSON here.
         (JsonElement::Jsonb, Value::Text(text)) => json.push_str(&jsonb_text(text.as_str())?),
         (JsonElement::Timestamp, Value::Text(text)) => {
             write_json_string(&text.as_str().replacen(' ', "T", 1), json)
