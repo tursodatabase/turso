@@ -7116,6 +7116,11 @@ impl CursorTrait for BTreeCursor {
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
+        // Overwriting a cell reads the old cell's rowid, which notes the old
+        // cell's payload position; a smaller or larger new cell moves on the
+        // page. SQLite zeroes pCur->info.nSize after building the new cell
+        // (btree.c:9535) for the same reason.
+        self.invalidate_record();
         self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
             self.set_has_record(true);

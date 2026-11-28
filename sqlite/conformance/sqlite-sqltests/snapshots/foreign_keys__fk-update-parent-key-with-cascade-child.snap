@@ -14,7 +14,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4                 p5  comment
-   0  Init                0  42   0                      0  Start at 42
+   0  Init                0  40   0                      0  Start at 40
    1  OpenEphemeral       0   1   0                      0  cursor=0 is_table=true
    2  OpenRead            1   2   0  k(3,B,B,B)          0  table=parent, root=2, iDb=0
    3    SeekRowid         1   2   7                      0  if (r[2]!=cursor 1 for table parent.rowid) goto 7
@@ -23,9 +23,9 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
    6    Insert            0   3   1  ephemeral_scratch   6  intkey=r[1] data=r[3]
    7    OpenWrite         1   2   0                      0  root=2; iDb=0
    8    OpenWrite         2   3   0                      0  root=3; iDb=0
-   9    Rewind            0  41   0                      0  Rewind table ephemeral(ephemeral_scratch)
+   9    Rewind            0  39   0                      0  Rewind table ephemeral(ephemeral_scratch)
   10      RowId           0   5   0                      0  r[5]=ephemeral(ephemeral_scratch).rowid
-  11      NotExists       1  40   5                      0
+  11      NotExists       1  38   5                      0
   12      Null            0   6   0                      0  r[6]=NULL
   13      Column          1   1   9                      0  r[9]=parent.k
   14      Add             9  10   7                      0  r[7]=r[9]+r[10]
@@ -46,20 +46,18 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
   29      IdxDelete       2  17   2                      1
   30      IdxInsert       2   4  14                      2  key=r[4]
   31      MakeRecord      6   3  19                      0  r[19]=mkrec(r[6..8])
-  32      NotExists       1  40   5                      0
-  33      Delete          1   0   0  parent              0
-  34      Insert          1  19   5  parent             11  intkey=r[5] data=r[19]
-  35      Copy           12  20   0                      0  r[20]=r[12]
-  36      Copy            7  21   0                      0  r[21]=r[7]
-  37      Eq             20  21  40  Binary              0  if r[20]==r[21] goto 40
-  38      Goto            0  39   0                      0
-  39      Program        20  40   2  fk cascade update   0  subprogram=fk cascade update
-  40    Next              0  10   0                      1
-  41    Halt              0   0   0                      0
-  42    Transaction       0   2   2                      0  iDb=0 tx_mode=Write
-  43    Integer           1   2   0                      0  r[2]=1
-  44    Integer           1  10   0                      0  r[10]=1
-  45    Goto              0   1   0                      0
+  32      Insert          1  19   5  parent              8  intkey=r[5] data=r[19]
+  33      Copy           12  20   0                      0  r[20]=r[12]
+  34      Copy            7  21   0                      0  r[21]=r[7]
+  35      Eq             20  21  38  Binary              0  if r[20]==r[21] goto 38
+  36      Goto            0  37   0                      0
+  37      Program        20  38   2  fk cascade update   0  subprogram=fk cascade update
+  38    Next              0  10   0                      1
+  39    Halt              0   0   0                      0
+  40    Transaction       0   2   2                      0  iDb=0 tx_mode=Write
+  41    Integer           1   2   0                      0  r[2]=1
+  42    Integer           1  10   0                      0  r[10]=1
+  43    Goto              0   1   0                      0
    0    Init              0   1   0                      0  Start at 1
    1    OpenWrite         0   4   0                      0  root=4; iDb=0
    2    Rewind            0  23   0                      0  Rewind table child

@@ -129,6 +129,18 @@ snapshot update-where-self-subquery {
     );
 }
 
+setup after_update_trigger {
+    CREATE TABLE a(k INTEGER, v INTEGER);
+    CREATE TRIGGER t1 AFTER UPDATE ON a BEGIN SELECT 1; END;
+}
+
+# An UPDATE trigger makes the UPDATE collect rowids first. A row whose rowid
+# does not change is still overwritten in place: one NotExists, no Delete.
+@setup after_update_trigger
+snapshot update-with-after-trigger {
+    UPDATE a SET v = v + 1 WHERE k > 0;
+}
+
 # TODO: Uncomment when subquery in UPDATE SET is supported
 # # UPDATE with subquery - computed update value
 # @setup schema

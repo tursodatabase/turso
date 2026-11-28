@@ -23,7 +23,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4                 p5  comment
-   0  Init             0  36   0                      0  Start at 36
+   0  Init             0  34   0                      0  Start at 34
    1  OpenEphemeral    0   1   0                      0  cursor=0 is_table=true
    2  OpenRead         1   2   0  k(5,B,B,B,B,B)      0  table=products, root=2, iDb=0
    3  Rewind           1  19   0                      0  Rewind table products
@@ -43,9 +43,9 @@ addr  opcode          p1  p2  p3  p4                 p5  comment
   17    Insert         0  11   2  ephemeral_scratch   6  intkey=r[2] data=r[11]
   18  Next             1   4   0                      1
   19  OpenWrite        1   2   0                      0  root=2; iDb=0
-  20  Rewind           0  35   0                      0  Rewind table ephemeral(ephemeral_scratch)
+  20  Rewind           0  33   0                      0  Rewind table ephemeral(ephemeral_scratch)
   21    RowId          0  12   0                      0  r[12]=ephemeral(ephemeral_scratch).rowid
-  22    NotExists      1  34  12                      0
+  22    NotExists      1  32  12                      0
   23    Null           0  13   0                      0  r[13]=NULL
   24    ColumnRange    1   1  14  2                   0  r[14..15]=products.name..price
   25    RealAffinity  15   0   0                      0
@@ -54,12 +54,10 @@ addr  opcode          p1  p2  p3  p4                 p5  comment
   28    Column         1   4  17                      0  r[17]=products.category
   29    Affinity      13   5   0                      0  r[13..18] = D, B, E, D, B
   30    MakeRecord    13   5  19                      0  r[19]=mkrec(r[13..17])
-  31    NotExists      1  34  12                      0
-  32    Delete         1   0   0  products            0
-  33    Insert         1  19  12  products           11  intkey=r[12] data=r[19]
-  34  Next             0  21   0                      1
-  35  Halt             0   0   0                      0
-  36  Transaction      0   2  10                      0  iDb=0 tx_mode=Write
-  37  Integer          1   7   0                      0  r[7]=1
-  38  Integer          5  10   0                      0  r[10]=5
-  39  Goto             0   1   0                      0
+  31    Insert         1  19  12  products            8  intkey=r[12] data=r[19]
+  32  Next             0  21   0                      1
+  33  Halt             0   0   0                      0
+  34  Transaction      0   2  10                      0  iDb=0 tx_mode=Write
+  35  Integer          1   7   0                      0  r[7]=1
+  36  Integer          5  10   0                      0  r[10]=5
+  37  Goto             0   1   0                      0

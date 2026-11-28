@@ -2545,7 +2545,7 @@ fn emit_update_insns<'a>(
                 record_reg,
             );
 
-            if not_exists_check_required {
+            if updates_rowid {
                 program.emit_insn(Insn::NotExists {
                     cursor: target_table_cursor_id,
                     rowid_reg: beg,
@@ -2591,8 +2591,8 @@ fn emit_update_insns<'a>(
             // Insert instruction to update the cell. We need to first delete the current cell
             // and later insert the updated record.
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
-            let needs_delete = not_exists_check_required
-                || connection.mv_store_for_db(update_database_id).is_some();
+            let needs_delete =
+                updates_rowid || connection.mv_store_for_db(update_database_id).is_some();
             // Like SQLite, only an unchanged-column read for the new record counts:
             // other table-column reads, such as the old value for a partial index,
             // can sit in a branch that some rows skip.
@@ -2613,7 +2613,7 @@ fn emit_update_insns<'a>(
                 cursor: target_table_cursor_id,
                 key_reg: effective_rowid_reg,
                 record_reg,
-                flag: if not_exists_check_required {
+                flag: if updates_rowid {
                     // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
                     // so to insert a new user-provided rowid, we need to seek to the correct place.
                     InsertFlags::new()
