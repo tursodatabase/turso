@@ -29,7 +29,7 @@ turso_parser = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 turso_pg_catalog = { workspace = true }
 turso_pg_parser = { workspace = true }
-turso_sqlite = { workspace = true }
+turso_dialect_definitions = { workspace = true }
 
 [dev-dependencies]
 turso_core = { workspace = true, features = ["io_memory_yield", "test_helper"] }

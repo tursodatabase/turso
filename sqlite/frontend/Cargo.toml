@@ -15,7 +15,7 @@ fts = ["turso_core/fts"]
 
 [dependencies]
 turso_core = { path = "../../core", version = "0.9.0-pre.6", default-features = false, features = ["fs"] }
-turso_parser = { workspace = true }
+turso_dialect_definitions = { workspace = true }
 
 [dev-dependencies]
 turso_core = { workspace = true, features = ["allocation_metric", "test_helper"] }
