@@ -2955,6 +2955,50 @@ test to-json-takes-one-argument {
 expect error {
 }
 
+test row-to-json-of-a-subquery-with-two-columns-of-one-name {
+    SELECT row_to_json(q), to_jsonb(q), to_json(q.*) FROM (SELECT 1 AS a, 'x' AS a, 2 AS b) q;
+}
+expect {
+    {"a":1,"a":"x","b":2}|{"a": "x", "b": 2}|{"a":1,"a":"x","b":2}
+}
+
+test to-json-of-a-subquery-that-selects-star-from-two-columns-of-one-name {
+    SELECT to_json(q2) FROM (SELECT * FROM (SELECT 1 AS a, 2 AS a) q) q2;
+    SELECT to_json(q2) FROM (SELECT q.*, 3 AS a FROM (SELECT 1 AS a, 2 AS a) q) q2;
+}
+expect {
+    {"a":1,"a":2}
+    {"a":1,"a":2,"a":3}
+}
+
+test row-to-json-of-a-column-alias-list-with-one-name-twice {
+    SELECT row_to_json(q) FROM (VALUES (1, 2, 3)) q(a, a, b);
+}
+expect {
+    {"a":1,"a":2,"b":3}
+}
+
+test to-json-of-a-cte-with-two-columns-of-one-name {
+    WITH c(x, x) AS (SELECT 1, 2) SELECT to_json(c) FROM c;
+}
+expect {
+    {"x":1,"x":2}
+}
+
+test to-json-of-the-row-of-an-outer-subquery-with-two-columns-of-one-name {
+    SELECT (SELECT to_json(q)) FROM (SELECT 1 AS a, 'x' AS a) q;
+}
+expect {
+    {"a":1,"a":"x"}
+}
+
+test to-json-of-a-subquery-keeps-a-column-name-with-a-colon {
+    SELECT to_json(q) FROM (SELECT 1 AS a, 2 AS "a:1", 3 AS a) q;
+}
+expect {
+    {"a":1,"a:1":2,"a":3}
+}
+
 test row-to-json-of-a-row-takes-at-most-two-arguments {
     CREATE TABLE row_to_json_arguments (id int);
     INSERT INTO row_to_json_arguments VALUES (1);

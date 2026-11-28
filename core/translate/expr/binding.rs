@@ -713,12 +713,18 @@ fn named_row(
             // A table inside a parenthesized join.
             None => RowPresence::Unknown,
         };
+        let table = index.map(|index| &joined[index].table);
         let columns = star
             .into_iter()
             .map(|column| {
                 let name = column
                     .alias
                     .expect("a column of a qualified star has a name");
+                // A subquery renames the later of two columns with the same
+                // name. The row has the name that the query gave the column.
+                let name = table
+                    .and_then(|table| name_in_query(table, &name))
+                    .unwrap_or(name);
                 (name, Box::new(column.expr))
             })
             .collect();
@@ -746,9 +752,9 @@ fn named_row(
         if column.hidden() {
             continue;
         }
-        let name = column
-            .name
-            .clone()
+        let name = table
+            .column_name_in_query(index)
+            .map(str::to_string)
             .unwrap_or_else(|| format!("column{}", index + 1));
         columns.push((
             name,
@@ -762,6 +768,16 @@ fn named_row(
         tables.mark_column_used(internal_id, index);
     }
     Ok(Some(RowArgument { columns, presence }))
+}
+
+/// The name that the query gave the column of `table` that has the name
+/// `name`. None when `table` has no column of that name.
+fn name_in_query(table: &Table, name: &str) -> Option<String> {
+    let index = table
+        .columns()
+        .iter()
+        .position(|column| column.name.as_deref() == Some(name))?;
+    table.column_name_in_query(index).map(str::to_string)
 }
 
 /// Whether an outer join can leave out the row of the table at `index` of

@@ -5214,6 +5214,7 @@ impl TryClone for FromClauseSubquery {
             plan: self.plan.clone(),
             columns: self.columns.try_clone()?,
             column_types: self.column_types.clone(),
+            renamed_columns: self.renamed_columns.clone(),
             parenthesized_join_columns: self.parenthesized_join_columns.clone(),
             result_columns_start_reg: self.result_columns_start_reg,
             materialized_cursor_id: self.materialized_cursor_id,
@@ -5230,6 +5231,7 @@ impl TryClone for RecursiveCteInput {
             name: self.name.clone(),
             columns: self.columns.try_clone()?,
             column_types: self.column_types.clone(),
+            renamed_columns: self.renamed_columns.clone(),
         })
     }
 }
@@ -5564,6 +5566,22 @@ impl Table {
                     .is_some_and(|n| n.eq_ignore_ascii_case(name))
             }),
         }
+    }
+
+    /// The name that the query gave column `index`. It differs from the name
+    /// of the column when the column is one of two columns of a subquery with
+    /// the same name: the later one is renamed, to `a:1` for `a`.
+    pub(crate) fn column_name_in_query(&self, index: usize) -> Option<&str> {
+        let renamed_columns = match self {
+            Self::FromClauseSubquery(subquery) => subquery.renamed_columns.as_slice(),
+            Self::RecursiveCteInput(input) => input.renamed_columns.as_slice(),
+            Self::BTree(_) | Self::Virtual(_) => &[],
+        };
+        renamed_columns
+            .iter()
+            .find(|renamed| renamed.index == index)
+            .map(|renamed| renamed.name_in_query.as_str())
+            .or_else(|| self.columns()[index].name.as_deref())
     }
 
     pub(crate) fn parenthesized_join_columns(&self) -> Option<&[ParenthesizedJoinColumn]> {
@@ -6909,6 +6927,10 @@ pub struct FromClauseSubquery {
     /// Computing it on each reference would walk every nested subquery again,
     /// which takes exponential time in the nesting depth.
     pub(crate) column_types: Vec<ExprType>,
+    /// The columns whose name is not the name that the query gave them. It
+    /// is empty for a parenthesized join, whose `parenthesized_join_columns`
+    /// keep the names.
+    pub(crate) renamed_columns: Vec<RenamedColumn>,
     /// Source names for a parenthesized join. SQLite stores these in
     /// `ExprList_item.zEName` when `selectExpander` handles `SF_NestedFrom`.
     ///
@@ -7017,6 +7039,19 @@ pub struct RecursiveCteInput {
     /// The type of each column: the type the CTE's first SELECT gives it, as in
     /// PostgreSQL.
     pub(crate) column_types: Vec<ExprType>,
+    /// The columns whose name is not the name that the query gave them.
+    pub(crate) renamed_columns: Vec<RenamedColumn>,
+}
+
+/// A column of a subquery whose name is not the name that the query gave it.
+/// Of two columns with the same name, the later one gets a suffix: the second
+/// `a` is `a:1`.
+#[derive(Debug, Clone)]
+pub(crate) struct RenamedColumn {
+    /// The position of the column among the columns of the subquery.
+    pub(crate) index: usize,
+    /// The name that the query gave the column.
+    pub(crate) name_in_query: String,
 }
 
 #[derive(Debug, Clone, Copy)]
