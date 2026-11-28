@@ -280,3 +280,40 @@ impl<const N: usize> Drop for DisjointWrites<'_, N> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Double, Numeric};
+
+    #[test]
+    fn writes_apply_the_rule_even_on_an_early_return() {
+        let mut registers = Registers::new(3);
+        let result = write_nan_then_fail(&mut registers);
+        assert!(result.is_err());
+        for index in [0, 2] {
+            assert!(registers[index].is_null());
+        }
+    }
+
+    fn write_nan_then_fail(registers: &mut Registers) -> Result<(), ()> {
+        let mut writes = registers.write_disjoint([0, 2]).unwrap();
+        *writes[0] = Register::Value(Value::from_f64(f64::NAN));
+        writes[1].set_numeric(Numeric::Float(Double::new(f64::NAN)));
+        Err(())
+    }
+
+    #[test]
+    fn aggregate_scratch_keeps_nan_until_the_result_is_published() {
+        let mut registers = Registers::new(2);
+        *registers.write(0) = Register::Aggregate(crate::types::AggContext::Builtin(
+            crate::alloc::try_vec![Value::from_f64(f64::NAN)].unwrap(),
+        ));
+        let Register::Aggregate(crate::types::AggContext::Builtin(payload)) = &registers[0] else {
+            unreachable!()
+        };
+        assert!(payload[0].is_nan());
+        registers.set_value(1, payload[0].clone());
+        assert!(registers[1].is_null());
+    }
+}

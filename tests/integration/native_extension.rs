@@ -17,6 +17,93 @@ use turso_ext::{ConstraintOp, ResultCode, VTabCursor, VTabModule, VTable};
 use turso_sqlite::SqliteDialect;
 
 #[test]
+fn native_nan_results_are_null_before_sql_consumes_them() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "raw_nan".into(),
+                    FunctionArity::Exact(0),
+                    false,
+                    RawNan,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "typed_nan".into(),
+                    FunctionArity::Exact(0),
+                    false,
+                    TypedNan,
+                )
+                .unwrap(),
+            ),
+    );
+    assert_eq!(
+        conn.prepare("SELECT raw_nan() IS NULL, typed_nan() IS NULL, coalesce(abs(raw_nan()), 7)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::from_i64(7)
+        ]]
+    );
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE INDEX t_x ON t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (raw_nan()), (typed_nan())")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT count(*) FROM t INDEXED BY t_x WHERE x IS NULL")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2)]]
+    );
+    conn.execute("DELETE FROM t WHERE x IS NULL").unwrap();
+    assert_eq!(
+        conn.prepare("PRAGMA integrity_check")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawNan;
+impl ScalarFunction for RawNan {
+    type Call = Self;
+    fn create_call(&self) -> Result<Self> {
+        Ok(*self)
+    }
+}
+impl ScalarCall for RawNan {
+    type Output = Value;
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, _args: &[Register]) -> IOResultOr<Value> {
+        Ok(IOResult::Done(Value::Numeric(Numeric::Float(
+            turso_core::Double::new(f64::NAN),
+        ))))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TypedNan;
+impl ScalarFunction for TypedNan {
+    type Call = Self;
+    fn create_call(&self) -> Result<Self> {
+        Ok(*self)
+    }
+}
+impl ScalarCall for TypedNan {
+    type Output = f64;
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, _args: &[Register]) -> IOResultOr<f64> {
+        Ok(IOResult::Done(f64::NAN))
+    }
+}
+
+#[test]
 fn native_scalar_accepts_only_declared_argument_counts() {
     for arity in [
         FunctionArity::OneOf(&[]),
