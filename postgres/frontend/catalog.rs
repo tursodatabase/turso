@@ -524,6 +524,11 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    // FIXME(registered-types): float4 and float8 are the REAL of the engine and have no registered type, so their input, casts and operators do not read NaN. PostgreSQL keeps NaN in both types. Answer true when float4 and float8 are registered types.
+    fn nan_is_a_value(&self) -> bool {
+        false
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }
