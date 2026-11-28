@@ -395,6 +395,7 @@ pub enum OpenDbAsyncPhase {
     /// has no table roots and has not replayed its logical log, and recovery
     /// rebuilds the schema from the schema rows.
     RunningLoadSteps,
+    RefreshingMvccStats,
     Done,
 }
 
@@ -445,13 +446,35 @@ pub(crate) enum DbHeaderReadState {
 
 /// Resumable pager initialization for opens, connections, and attachments.
 /// Reads the page layout and authenticates encryption before building the pager.
-/// A read transaction then protects the page-1 read used to determine the
-/// autovacuum mode. Each I/O read can yield without blocking.
+/// Uses the published MVCC header when available, or reads page 1 in a
+/// read transaction. Each I/O read can yield without blocking.
 pub(crate) enum InitState {
     /// Verifies credentials and reads page 1 on cold opens to authenticate its layout.
     AuthenticateHeader(HeaderAuthenticationState),
     /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
     ReadPage1 { pager: Box<Pager> },
+}
+
+pub(crate) struct InitializedPager {
+    pub(crate) pager: Pager,
+    default_cache_size: i32,
+}
+
+impl InitializedPager {
+    fn new(pager: Pager, header: &DatabaseHeader) -> Self {
+        let mode = if header.vacuum_mode_largest_root_page.get() == 0 {
+            AutoVacuumMode::None
+        } else if header.incremental_vacuum_enabled.get() == 0 {
+            AutoVacuumMode::Full
+        } else {
+            AutoVacuumMode::Incremental
+        };
+        pager.set_auto_vacuum_mode(mode);
+        Self {
+            pager,
+            default_cache_size: header.default_page_cache_size.get(),
+        }
+    }
 }
 
 impl Default for InitState {
@@ -554,38 +577,6 @@ impl Default for HeaderValidationState {
     }
 }
 
-/// How `Database::_connect` loads the connection's ANALYZE stats.
-///
-/// A new connection starts from a clone of the shared schema, which carries
-/// no `sqlite_stat1` contents until some connection has loaded them, and the
-/// planner uses those stats for its cost estimates. `_connect` therefore
-/// refreshes them. The refresh is a `SELECT` over `sqlite_stat1`, and that
-/// statement can have to wait: on page I/O, or on another transaction when
-/// it speculatively reads a version whose writer is still preparing. Two
-/// states exist because there are two kinds of caller for that wait:
-///
-/// - `Blocking`: the caller may block, so `_connect` runs the scan to
-///   completion right here by pumping `io.step()`. This is the public
-///   `connect` family for embedded users, where whatever the scan waits for
-///   can make progress on its own, and the internal open-time and MVCC
-///   bootstrap connections, for which the refresh is a no-op because the
-///   database is not initialized yet.
-/// - `Deferred`: the caller must not block, so `_connect` returns the bare
-///   connection and the caller drives the same scan through
-///   `refresh_analyze_stats_nonblock`, handing every wait to its own
-///   scheduler. This is `connect_async`, for hosts that run every connection
-///   cooperatively on one thread: there an explicit yield from the scan is a
-///   request to run *other* connections, which `io.step()` can never satisfy,
-///   so `Blocking` would spin forever.
-///
-/// Stats loading is never skipped outright; `Deferred` only moves it to the
-/// caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatsRefresh {
-    Blocking,
-    Deferred,
-}
-
 /// Settings for a single connection, passed to [`Database::connect`] and
 /// [`Database::connect_async`].
 #[derive(Clone)]
@@ -635,11 +626,26 @@ pub struct ConnectAsyncState {
     opts: Option<ConnectOpts>,
     init: InitState,
     database: Option<Arc<Database>>,
+    use_shared_stats: bool,
 }
 
 impl ConnectAsyncState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use the shared schema's ANALYZE stats on MVCC connections. This avoids
+    /// opening a read transaction during connection startup to rescan sqlite_stat1.
+    pub fn with_shared_stats() -> Self {
+        let mut state = Self::new();
+        state.use_shared_stats = true;
+        state
+    }
+
+    fn reset(&mut self) {
+        let use_shared_stats = self.use_shared_stats;
+        *self = Self::new();
+        self.use_shared_stats = use_shared_stats;
     }
 }
 
@@ -677,6 +683,7 @@ pub struct OpenDbAsyncState {
     mvcc_convert_stmt: Option<crate::Statement>,
     /// The loader of `RunningLoadSteps`, held across yields.
     schema_loader: Option<SchemaLoader>,
+    mvcc_stats_refresh: Option<Box<RefreshAnalyzeStatsState>>,
     conn: Option<Arc<Connection>>,
 }
 
@@ -704,6 +711,7 @@ impl OpenDbAsyncState {
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
             mvcc_convert_stmt: None,
             schema_loader: None,
+            mvcc_stats_refresh: None,
         }
     }
 }
@@ -727,6 +735,7 @@ impl OpenDbAsyncState {
         self.mvcc_convert_stmt = None;
         self.mvcc_bootstrap_state = mvcc::database::BootstrapState::default();
         self.schema_loader = None;
+        self.mvcc_stats_refresh = None;
         self.mvcc_bootstrap_conn = None;
         self.conn = None;
         self.pager = None;
@@ -1831,7 +1840,6 @@ impl Database {
                         ConnectionContext::default(),
                         false,
                         Some(pager.clone()),
-                        StatsRefresh::Blocking,
                     )?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
@@ -1961,7 +1969,6 @@ impl Database {
                                 ConnectionContext::default(),
                                 true,
                                 Some(pager.clone()),
-                                StatsRefresh::Blocking,
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -1995,7 +2002,27 @@ impl Database {
                     });
                     return_if_io!(loader.run(conn));
                     let loader = state.schema_loader.take().expect("set above");
-                    db.replace_schema(loader.into_schema());
+                    let schema = loader.into_schema();
+                    db.replace_schema(schema.clone());
+                    *conn.schema.write() = schema;
+                    state.phase = OpenDbAsyncPhase::RefreshingMvccStats;
+                }
+
+                OpenDbAsyncPhase::RefreshingMvccStats => {
+                    let db = state.db.as_ref().expect("database is open");
+                    let conn = state.conn.as_ref().expect("open connection is available");
+                    // Load the shared stats before the database can be used by a checkpoint.
+                    if db.mvcc_enabled() {
+                        let refresh = state.mvcc_stats_refresh.get_or_insert_with(Box::default);
+                        match refresh_analyze_stats_nonblock(conn, refresh) {
+                            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                            Ok(IOResult::Done(())) => {}
+                            Err(err) => {
+                                tracing::warn!("Failed to refresh analyze stats on open: {err}")
+                            }
+                        }
+                    }
+                    state.mvcc_stats_refresh = None;
 
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
@@ -2040,6 +2067,14 @@ impl Database {
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
     ) -> Result<Pager> {
+        Ok(self.init_pager_blocking(encryption_key, page_codec)?.pager)
+    }
+
+    fn init_pager_blocking(
+        &self,
+        encryption_key: Option<&EncryptionKey>,
+        page_codec: Option<Arc<dyn PageCodec>>,
+    ) -> Result<InitializedPager> {
         let mut st = InitState::default();
         let result = self
             .io
@@ -2053,13 +2088,13 @@ impl Database {
     /// Necessary Pager initialization, so that we are prepared to read from
     /// Page 1. For encrypted databases, the encryption key must be provided to
     /// properly decrypt page 1. Non-blocking: drives header authentication
-    /// and the page-1 autovacuum read through their IO.
+    /// and, when necessary, the page-1 read through their IO.
     pub(crate) fn _init_nonblock(
         &self,
         st: &mut InitState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
-    ) -> IOResultOr<Pager> {
+    ) -> IOResultOr<InitializedPager> {
         loop {
             match st {
                 InitState::AuthenticateHeader(header_st) => {
@@ -2070,6 +2105,18 @@ impl Database {
                         true
                     ));
                     let pager = self.init_pager(header)?;
+
+                    // The MVCC store already has the committed page-1 settings.
+                    // A new pager can use them without pinning the WAL during I/O.
+                    if self.initialized() && page_codec.is_none() {
+                        if let Some(header) = self
+                            .get_mv_store()
+                            .as_ref()
+                            .and_then(|store| store.global_header())
+                        {
+                            return Ok(IOResult::Done(InitializedPager::new(pager, &header)));
+                        }
+                    }
 
                     // Start a read transaction before reading page 1 to prevent a concurrent
                     // checkpoint from truncating the WAL underneath bootstrap. Under heavy
@@ -2096,11 +2143,11 @@ impl Database {
                     };
                 }
                 InitState::ReadPage1 { pager } => {
-                    // Read page 1 within the read transaction to determine the
-                    // autovacuum mode. The read tx stays open across an IO
+                    // Read page 1 within the read transaction to get the
+                    // connection defaults. The read tx stays open across an IO
                     // yield here (re-entry resumes the read); we only end it
                     // once the read completes or errors.
-                    let mode = match HeaderRef::from_pager(pager) {
+                    let header = match HeaderRef::from_pager(pager) {
                         Ok(IOResult::Done(header_ref)) => {
                             let header = header_ref.borrow();
                             let validate_codec_header = || -> Result<()> {
@@ -2145,15 +2192,7 @@ impl Database {
                                 pager.end_read_tx();
                                 return Err(err.into());
                             }
-                            if header.vacuum_mode_largest_root_page.get() > 0 {
-                                if header.incremental_vacuum_enabled.get() > 0 {
-                                    AutoVacuumMode::Incremental
-                                } else {
-                                    AutoVacuumMode::Full
-                                }
-                            } else {
-                                AutoVacuumMode::None
-                            }
+                            *header
                         }
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Err(err) => {
@@ -2163,12 +2202,11 @@ impl Database {
                     };
 
                     pager.end_read_tx();
-                    pager.set_auto_vacuum_mode(mode);
 
                     let InitState::ReadPage1 { pager, .. } = std::mem::take(st) else {
                         unreachable!("state is ReadPage1");
                     };
-                    return Ok(IOResult::Done(*pager));
+                    return Ok(IOResult::Done(InitializedPager::new(*pager, &header)));
                 }
             }
         }
@@ -2195,8 +2233,9 @@ impl Database {
                     // `_init` does not modify `open_flags` (the autovacuum
                     // override happens later in `Validate`), so capturing
                     // `is_readonly` across the `_init` yields is stable.
-                    let pager =
+                    let initialized =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
+                    let pager = initialized.pager;
                     let log_exists =
                         journal_mode::logical_log_exists(std::path::Path::new(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
@@ -2678,7 +2717,6 @@ impl Database {
                 ConnectionContext::default(),
                 true,
                 None,
-                StatsRefresh::Blocking,
             )?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
@@ -2823,7 +2861,7 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        self._connect(opts, context, false, None, StatsRefresh::Blocking)
+        self._connect(opts, context, false, None)
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2876,35 +2914,36 @@ impl Database {
                         .opts
                         .as_ref()
                         .expect("initial connect options are set");
-                    let pager = return_if_io!(self._init_nonblock(
+                    let initialized = return_if_io!(self._init_nonblock(
                         &mut state.init,
                         opts.encryption_key.as_ref(),
                         opts.page_codec.as_ref()
                     ));
                     let opts = state.opts.take().expect("initial connect options are set");
-                    let conn = self._connect(
-                        opts,
-                        ConnectionContext::default(),
+                    let conn = self.new_connection(
+                        self.resolve_session_role(&opts.role)?,
                         false,
-                        Some(Arc::new(pager)),
-                        StatsRefresh::Deferred,
+                        Arc::new(initialized.pager),
+                        opts.encryption_key,
+                        initialized.default_cache_size,
+                        ConnectionContext::default(),
                     )?;
                     state.conn = Some(conn.clone());
                     conn
                 }
             };
-            match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
-                Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                Ok(IOResult::Done(())) => {}
-                Err(err) => {
-                    tracing::warn!("Failed to refresh analyze stats on connect: {err}");
+            if !state.use_shared_stats || !self.mvcc_enabled() {
+                match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Ok(IOResult::Done(())) => {}
+                    Err(err) => tracing::warn!("Failed to refresh analyze stats on connect: {err}"),
                 }
             }
-            *state = ConnectAsyncState::default();
+            state.reset();
             Ok(IOResult::Done(conn))
         })();
         if result.is_err() {
-            *state = ConnectAsyncState::default();
+            state.reset();
         }
         result
     }
@@ -2916,7 +2955,6 @@ impl Database {
         context: ConnectionContext,
         is_mvcc_bootstrap_connection: bool,
         pager: Option<Arc<Pager>>,
-        stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         let ConnectOpts {
             encryption_key,
@@ -2936,22 +2974,21 @@ impl Database {
         if let Some(page_codec) = page_codec.as_deref() {
             self.validate_page_codec(Some(page_codec))?;
         }
-        let pager = if let Some(pager) = pager {
-            pager
+        let (pager, default_cache_size) = if let Some(pager) = pager {
+            let default_cache_size = pager
+                .io
+                .block(|| pager.with_header(|header| header.default_page_cache_size))
+                .unwrap_or_default()
+                .get();
+            (pager, default_cache_size)
         } else {
-            // Pass encryption key to _init so it can set up encryption context
-            // before reading page 1. This is required for reopening encrypted databases.
-            Arc::new(self._init(encryption_key.as_ref(), page_codec.clone())?)
+            let initialized = self.init_pager_blocking(encryption_key.as_ref(), page_codec)?;
+            (Arc::new(initialized.pager), initialized.default_cache_size)
         };
         turso_assert!(
             pager.is_authenticated(),
             "connection initialization must authenticate its pager"
         );
-        let default_cache_size = pager
-            .io
-            .block(|| pager.with_header(|header| header.default_page_cache_size))
-            .unwrap_or_default()
-            .get();
         let role = self.resolve_session_role(&opts.role)?;
         let conn = self.new_connection(
             role,
@@ -2961,9 +2998,7 @@ impl Database {
             default_cache_size,
             context,
         )?;
-        if stats == StatsRefresh::Blocking {
-            refresh_analyze_stats(&conn);
-        }
+        refresh_analyze_stats(&conn);
         Ok(conn)
     }
 

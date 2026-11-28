@@ -1385,6 +1385,19 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
     );
     writer.set_yield_injector(None);
 
+    let mut cached = turso_core::ConnectAsyncState::with_shared_stats();
+    let turso_core::IOResult::Done(shared_stats_conn) = database
+        .connect_async(ConnectOpts::new(SessionRole::Superuser), &mut cached)
+        .unwrap()
+    else {
+        panic!("a connection using shared stats must finish while ANALYZE is parked");
+    };
+    assert!(shared_stats_conn
+        .current_schema()
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "t1")
+        .is_some());
+
     // While the writer is parked, connect_async must keep handing the wait
     // back instead of completing or spinning. (`connect()` never returns here.)
     let mut state = turso_core::ConnectAsyncState::new();
@@ -1443,6 +1456,44 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
         "connect_async should load the committed ANALYZE stats: {:?}",
         schema.analyze_stats
     );
+}
+
+#[test]
+fn connect_async_with_shared_stats_after_cold_open() {
+    const KEY: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    for encrypted in [false, true] {
+        let mut fixture = if encrypted {
+            MvccTestDbNoConn::new_encrypted(KEY)
+        } else {
+            MvccTestDbNoConn::new_with_random_db()
+        };
+        let writer = fixture.connect();
+        writer
+            .execute("CREATE TABLE analyzed(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        writer
+            .execute("INSERT INTO analyzed VALUES (1), (2)")
+            .unwrap();
+        writer.execute("ANALYZE").unwrap();
+        writer.close().unwrap();
+        drop(writer);
+        fixture.restart();
+
+        let database = fixture.get_db();
+        let key = encrypted.then(|| turso_core::EncryptionKey::from_hex_string(KEY).unwrap());
+        let opts = ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key);
+        let mut state = turso_core::ConnectAsyncState::with_shared_stats();
+        let turso_core::IOResult::Done(conn) = database.connect_async(opts, &mut state).unwrap()
+        else {
+            panic!("warm open with shared stats must finish without I/O (encrypted={encrypted})");
+        };
+        assert!(conn
+            .current_schema()
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "analyzed")
+            .is_some());
+        assert!(database.wal_read_slots_with_readers().is_empty());
+    }
 }
 
 /// Abandoning a connect whose stats refresh is parked on another transaction

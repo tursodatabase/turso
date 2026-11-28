@@ -10529,6 +10529,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
+    pub(crate) fn global_header(&self) -> Option<DatabaseHeader> {
+        *self.global_header.read()
+    }
+
     /// The schema cookie in `global_header`, if a header has been loaded.
     pub(crate) fn global_schema_cookie(&self) -> Option<u32> {
         self.global_header
