@@ -1,0 +1,156 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/12553:
+# When window planning pushes an unaliased expression (another window function
+# or an aggregate) into an internal window_subquery_* column with name None,
+# ResultSetColumn::name() must fall back to implicit_column_name so SELECT *,
+# table.*, CTEs, views, column lookups, and CREATE TABLE AS keep every column.
+
+setup w_table {
+    CREATE TABLE w(v);
+    INSERT INTO w VALUES (10), (20);
+}
+
+@setup w_table
+test star-from-subquery-two-unaliased-window-functions {
+    SELECT * FROM (SELECT lead(v) OVER (), lag(v) OVER () FROM w);
+}
+expect {
+    20|
+    |10
+}
+
+@setup w_table
+test star-from-subquery-row-number-and-rank {
+    SELECT * FROM (SELECT row_number() OVER (), rank() OVER () FROM w);
+}
+expect {
+    1|1
+    2|1
+}
+
+@setup w_table
+test star-from-subquery-column-and-two-unaliased-windows {
+    SELECT * FROM (SELECT v, lead(v) OVER (), lag(v) OVER () FROM w);
+}
+expect {
+    10|20|
+    20||10
+}
+
+@setup w_table
+test star-from-subquery-three-unaliased-windows {
+    SELECT * FROM (SELECT lead(v) OVER (), lag(v) OVER (), row_number() OVER (ORDER BY v) FROM w);
+}
+expect {
+    20||1
+    |10|2
+}
+
+@setup w_table
+test star-from-subquery-duplicate-inner-window {
+    SELECT * FROM (SELECT lead(v) OVER (), lag(v) OVER (), lag(v) OVER () FROM w);
+}
+expect {
+    20||
+    |10|10
+}
+
+@setup w_table
+test star-from-subquery-aggregate-and-window {
+    SELECT * FROM (SELECT count(*), row_number() OVER () FROM w);
+}
+expect {
+    2|1
+}
+
+@setup w_table
+test star-from-subquery-group-by-aggregates-and-window {
+    SELECT * FROM (SELECT v, count(*), sum(v), row_number() OVER (ORDER BY v) FROM w GROUP BY v);
+}
+expect {
+    10|1|10|1
+    20|1|20|2
+}
+
+@setup w_table
+test star-from-subquery-aggregate-in-window-order-by {
+    SELECT * FROM (SELECT count(*), row_number() OVER (ORDER BY count(*)) FROM w);
+}
+expect {
+    2|1
+}
+
+@setup w_table
+test table-star-from-subquery-two-unaliased-windows {
+    SELECT s.* FROM (SELECT lead(v) OVER (), lag(v) OVER () FROM w) s;
+}
+expect {
+    20|
+    |10
+}
+
+@setup w_table
+test cte-star-two-unaliased-windows {
+    WITH c AS (SELECT lead(v) OVER (), lag(v) OVER () FROM w)
+    SELECT * FROM c;
+}
+expect {
+    20|
+    |10
+}
+
+@setup w_table
+test view-star-two-unaliased-windows {
+    CREATE VIEW vw AS SELECT lead(v) OVER (), lag(v) OVER () FROM w;
+    SELECT * FROM vw;
+}
+expect {
+    20|
+    |10
+}
+
+@setup w_table
+test nested-subquery-star-two-unaliased-windows {
+    SELECT * FROM (SELECT * FROM (SELECT lead(v) OVER (), lag(v) OVER () FROM w));
+}
+expect {
+    20|
+    |10
+}
+
+@setup w_table
+test compound-subquery-star-two-unaliased-windows {
+    SELECT * FROM (
+        SELECT lead(v) OVER (), lag(v) OVER () FROM w
+        UNION ALL
+        SELECT 1, 2
+    );
+}
+expect {
+    20|
+    |10
+    1|2
+}
+
+@setup w_table
+test select-pushed-window-column-by-implicit-name {
+    SELECT "lag(v) OVER ()" FROM (SELECT lead(v) OVER (), lag(v) OVER () FROM w);
+}
+expect {
+
+    10
+}
+
+@setup w_table
+test ctas-two-unaliased-windows-column-names {
+    CREATE TABLE out AS SELECT lead(v) OVER (), lag(v) OVER () FROM w;
+    SELECT name FROM pragma_table_info('out') ORDER BY cid;
+    SELECT * FROM out;
+}
+expect {
+    lead(v) OVER ()
+    lag(v) OVER ()
+    20|
+    |10
+}
