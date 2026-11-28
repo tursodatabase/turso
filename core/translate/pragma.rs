@@ -17,6 +17,7 @@ use crate::function::Func;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::pragma::pragma_for;
 use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
+use crate::storage::encryption::{CipherMode, EncryptionKey, EncryptionSetting};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
@@ -226,6 +227,17 @@ fn emit_table_list_rows_for_schema(
             false,
         );
     }
+}
+
+/// Returns true for `PRAGMA cipher` and `PRAGMA hexkey`, with or without a value.
+pub(crate) fn is_encryption_pragma(stmt: &ast::Stmt) -> bool {
+    let ast::Stmt::Pragma { name, .. } = stmt else {
+        return false;
+    };
+    matches!(
+        parse_pragma_name(name.name.as_str()),
+        Some(PragmaName::EncryptionKey | PragmaName::EncryptionCipher)
+    )
 }
 
 /// SQLite matches PRAGMA names without regard to case.
@@ -671,9 +683,30 @@ fn update_pragma(
             program,
         ),
         PragmaName::EncryptionKey | PragmaName::EncryptionCipher => {
-            Err(LimboError::InvalidArgument(
-                "encryption must be configured when opening the database".into(),
-            ))
+            // Refuse the assignment when it is prepared, and apply it when it runs.
+            connection.check_encryption_pragma(database_id)?;
+            let setting = match pragma {
+                PragmaName::EncryptionCipher => {
+                    let value = parse_string(&value).map_err(|_| {
+                        LimboError::InvalidArgument(
+                            "PRAGMA cipher expects the cipher name as a string in single quotes"
+                                .into(),
+                        )
+                    })?;
+                    EncryptionSetting::Cipher(CipherMode::try_from(value.as_str())?)
+                }
+                _ => {
+                    // The error of parse_string shows the value, which is the key.
+                    let value = parse_string(&value).map_err(|_| {
+                        LimboError::InvalidArgument(
+                            "PRAGMA hexkey expects the key as a string in single quotes".into(),
+                        )
+                    })?;
+                    EncryptionSetting::Key(EncryptionKey::from_hex_string(&value)?)
+                }
+            };
+            program.emit_insn(Insn::SetEncryption { setting });
+            Ok(TransactionMode::None)
         }
         PragmaName::Synchronous => {
             use crate::SyncMode;
@@ -1719,7 +1752,7 @@ fn query_pragma(
         }
         PragmaName::EncryptionKey => {
             let msg = {
-                if connection.encryption_key.is_some() {
+                if connection.encryption_key.get().is_some() {
                     "encryption key is set for this session"
                 } else {
                     "encryption key is not set for this session"

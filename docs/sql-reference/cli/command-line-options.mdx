@@ -141,6 +141,11 @@ existing MVCC database with recovery-only log frames, run
 `PRAGMA wal_checkpoint(TRUNCATE)` on it. Enabling portable changes affects new
 transactions; it does not rewrite existing log frames.
 
+The server runs the SQL of all clients of a database on one connection, so it
+refuses `PRAGMA cipher = ...` and `PRAGMA hexkey = ...` from its clients. To serve
+an encrypted database, use `--sync-encryption-cipher` and
+`--sync-encryption-key-file`.
+
 ### `--sync-encryption-cipher <CIPHER>` and `--sync-encryption-key-file <PATH>`
 
 Serve encrypted databases with the sample sync server. Both options are required

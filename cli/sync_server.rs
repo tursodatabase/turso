@@ -109,6 +109,10 @@ impl TursoSyncServer {
             "encrypted sync requires matching --sync-encryption-cipher and --sync-encryption-key-file");
         conn.wal_auto_actions_disable();
         conn.set_portable_logical_changes_enabled(true);
+        // All clients share the connection. One client must not encrypt the
+        // database with its own key, or start a setup that refuses the
+        // statements of all clients until the second value comes.
+        conn.disable_encryption_pragmas();
 
         Ok(Self {
             address,
@@ -394,7 +398,7 @@ impl TursoSyncServer {
         let req: PipelineReqBody = serde_json::from_slice(body)
             .map_err(|e| anyhow!("Failed to parse pipeline request: {}", e))?;
 
-        debug!("Pipeline request: {:?}", req);
+        debug!("Pipeline request: {}", log_text(&format!("{req:?}")));
 
         let conn = db.conn.lock().expect("database connection lock poisoned");
 
@@ -442,12 +446,12 @@ impl TursoSyncServer {
             }
         };
 
-        debug!("Executing SQL: {}", sql);
+        debug!("Executing SQL: {}", log_text(&sql));
 
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to prepare statement: {}", e);
+                error!("Failed to prepare statement: {}", error_log_text(&sql, &e));
                 return StreamResult::Error {
                     error: Error {
                         message: e.to_string(),
@@ -505,7 +509,7 @@ impl TursoSyncServer {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to execute statement: {}", e);
+                    error!("Failed to execute statement: {}", error_log_text(&sql, &e));
                     StreamResult::Error {
                         error: Error {
                             message: e.to_string(),
@@ -531,7 +535,7 @@ impl TursoSyncServer {
                     }),
                 },
                 Err(e) => {
-                    error!("Failed to execute statement: {}", e);
+                    error!("Failed to execute statement: {}", error_log_text(&sql, &e));
                     StreamResult::Error {
                         error: Error {
                             message: e.to_string(),
@@ -562,7 +566,11 @@ impl TursoSyncServer {
                         step_errors.push(None);
                     }
                     Err(e) => {
-                        error!("Batch step {} failed: {}", step_idx, e);
+                        error!(
+                            "Batch step {} failed: {}",
+                            step_idx,
+                            error_log_text(step.stmt.sql.as_deref().unwrap_or_default(), &e)
+                        );
                         step_results.push(None);
                         step_errors.push(Some(Error {
                             message: e.to_string(),
@@ -625,7 +633,7 @@ impl TursoSyncServer {
             .as_ref()
             .ok_or_else(|| anyhow!("No SQL in batch step"))?;
 
-        debug!("Executing batch step SQL: {}", sql);
+        debug!("Executing batch step SQL: {}", log_text(sql));
 
         let mut stmt = conn.prepare(sql)?;
 
@@ -1738,6 +1746,8 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
     );
     conn.set_portable_logical_changes_enabled(true);
     conn.wal_auto_actions_disable();
+    // See TursoSyncServer::new.
+    conn.disable_encryption_pragmas();
     Ok(Arc::new(DbHandle {
         conn: Mutex::new(conn),
         path: path_str,
@@ -1783,6 +1793,31 @@ fn convert_core_to_value(value: CoreValue) -> Value {
     }
 }
 
+/// The text that a log message shows in place of text that can hold an
+/// encryption key.
+const HIDDEN_TEXT: &str = "<hidden because it can contain an encryption key>";
+
+/// Returns `text` for a log message, or a placeholder when `text` can hold
+/// an encryption key, such as a request with `PRAGMA hexkey = '...'`.
+fn log_text(text: &str) -> &str {
+    if turso_core::may_hold_encryption_key(text) {
+        HIDDEN_TEXT
+    } else {
+        text
+    }
+}
+
+/// Returns `error`, the error of the statement `sql`, for a log message, or
+/// a placeholder when `sql` can hold an encryption key. An error can quote
+/// the statement, as in `near "'<key>'": syntax error`.
+fn error_log_text(sql: &str, error: &dyn std::fmt::Display) -> String {
+    if turso_core::may_hold_encryption_key(sql) {
+        HIDDEN_TEXT.to_string()
+    } else {
+        error.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use turso_core::EncryptionKey;
@@ -1791,6 +1826,163 @@ mod tests {
     const MVCC_TX_TRAILER_SIZE: usize = 8;
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn requests_that_can_hold_an_encryption_key_are_hidden_in_logs() {
+        assert!(!log_text("PRAGMA hexkey = 'abcd'").contains("abcd"));
+        assert_eq!(log_text("SELECT 1"), "SELECT 1");
+    }
+
+    /// Collects the log output of a test.
+    #[derive(Clone, Default)]
+    struct LogOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogOutput {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogOutput {
+        type Writer = LogOutput;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn pipeline_request(target: &str, requests: serde_json::Value) -> String {
+        let body = serde_json::json!({ "requests": requests }).to_string();
+        format!(
+            "POST {target}/v2/pipeline HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The error of a statement can quote the statement, as in
+    /// `near "'<key>'": syntax error`. So the logs do not show the error of a
+    /// statement that can hold a key, in execute requests and in batch steps.
+    #[test]
+    fn logs_hide_the_errors_of_statements_that_can_hold_a_key() {
+        const KEY: &str = "8d71289cf871b1d2357a560fe943995adcaf1400668e4dda5fd35b20101d8b47";
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir_server(dir.path());
+        // The PRAGMA has no "=", so it does not prepare.
+        let typo = format!("PRAGMA hexkey '{KEY}'");
+        // The table-valued form prepares, and fails when it runs.
+        let table_valued = format!("SELECT * FROM pragma_hexkey('{KEY}')");
+        let execute = |sql: &str, want_rows: bool| {
+            serde_json::json!([
+                { "type": "execute", "stmt": { "sql": sql, "want_rows": want_rows } }
+            ])
+        };
+        let batch = |sql: &str| {
+            serde_json::json!([
+                { "type": "batch", "batch": { "steps": [{ "stmt": { "sql": sql } }] } }
+            ])
+        };
+        let output = LogOutput::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(output.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for requests in [
+                execute(&typo, true),
+                execute(&table_valued, true),
+                execute(&table_valued, false),
+                batch(&typo),
+                batch(&table_valued),
+            ] {
+                let request = pipeline_request("/db/keys", requests);
+                let response = server.handle_request(request.as_bytes()).unwrap();
+                assert_eq!(response.status, 200);
+                // The client still gets the full error of its own statement.
+                assert!(String::from_utf8_lossy(&response.body).contains(KEY));
+            }
+        });
+        let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        for message in [
+            "Failed to prepare statement",
+            "Failed to execute statement",
+            "Batch step 0 failed",
+        ] {
+            assert!(logs.contains(message), "{message} not logged:\n{logs}");
+        }
+        assert!(!logs.contains(KEY), "{logs}");
+    }
+
+    /// The server runs the SQL of all clients of a database on one
+    /// connection. So a client must not encrypt a new database with a key
+    /// that the server does not have, or leave the connection waiting for the
+    /// second encryption value, which refuses the requests of all clients.
+    #[test]
+    fn clients_cannot_run_the_encryption_pragmas() {
+        for directory in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let server = if directory {
+                let mut server = dir_server(dir.path());
+                if let DbSource::Dir { config, .. } = &mut server.source {
+                    config.db_opts = DatabaseOpts::new().with_encryption(true);
+                }
+                server
+            } else {
+                let path = dir.path().join("source.db");
+                let db = Database::open_file_with_flags(
+                    Arc::new(turso_core::PlatformIO::new().unwrap()),
+                    path.to_str().unwrap(),
+                    OpenFlags::Create,
+                    DatabaseOpts::new().with_encryption(true),
+                    None,
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let conn = db
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
+                TursoSyncServer::new(
+                    "127.0.0.1:0".into(),
+                    path.to_string_lossy().into_owned(),
+                    conn,
+                    Arc::new(AtomicUsize::new(0)),
+                    TEST_WORKERS,
+                    None,
+                )
+                .unwrap()
+            };
+            let target = if directory { "/db/new" } else { "" };
+            let execute = |sql: &str| {
+                let requests = serde_json::json!([{ "type": "execute", "stmt": { "sql": sql } }]);
+                let request = pipeline_request(target, requests);
+                let response = server.handle_request(request.as_bytes()).unwrap();
+                assert_eq!(response.status, 200);
+                let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                response["results"][0].clone()
+            };
+            for sql in [
+                "PRAGMA cipher = 'aegis256'",
+                "PRAGMA hexkey = '8d71289cf871b1d2357a560fe943995adcaf1400668e4dda5fd35b20101d8b47'",
+            ] {
+                let result = execute(sql);
+                assert_eq!(result["type"], "error", "{sql}: {result}");
+                let message = result["error"]["message"].as_str().unwrap();
+                assert!(message.contains("this connection does not accept them"), "{message}");
+            }
+            // No value waits for the other one, so other statements run.
+            assert_eq!(execute("CREATE TABLE t(x)")["type"], "ok");
+            let Ok(handle) = server.resolve_db(directory.then_some("new")) else {
+                panic!("the database must stay open");
+            };
+            let conn = handle.conn.lock().unwrap();
+            assert_eq!(conn.get_encryption_cipher_mode(), None);
+        }
+    }
 
     #[test]
     fn server_rejects_encryption_without_a_key_before_opening() {

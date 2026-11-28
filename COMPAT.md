@@ -300,8 +300,8 @@ PRAGMAs that exist only in Turso and have no SQLite equivalent. Visible via `PRA
 |-----------------------------------------|--------------------------------------------------------------------------------------------------|
 | PRAGMA capture_data_changes_conn        | Configure per-connection Change Data Capture. Returns `(mode, table, version)`; default `off`.   |
 | PRAGMA unstable_capture_data_changes_conn | Unstable alias of `capture_data_changes_conn`; same shape and behavior, name may change.       |
-| PRAGMA cipher                           | Reports the immutable open-time encryption cipher. Assignments are rejected.     |
-| PRAGMA hexkey                           | Reports whether the connection has a key, without returning key material. Assignments are rejected. |
+| PRAGMA cipher                           | Encryption-at-rest cipher. An assignment, paired with `hexkey`, encrypts a new, empty database; the read form reports the active cipher. |
+| PRAGMA hexkey                           | Encryption-at-rest key. An assignment, paired with `cipher`, encrypts a new, empty database; the read form reports whether the connection has a key, without key material. |
 | PRAGMA data_sync_retry                  | Retry policy for disk sync failures (boolean).                                                   |
 | PRAGMA list_types                       | Introspect Turso's type system. Returns `(type, parent, encode, decode, default, operators)`.    |
 | PRAGMA mvcc_checkpoint_threshold        | MVCC checkpoint tuning. |

@@ -19267,6 +19267,19 @@ pub fn op_max_pgcnt(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_set_encryption(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    connection: &Arc<Connection>,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SetEncryption { setting }, insn);
+    connection.set_encryption_pragma(setting.clone())?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// State machine for PRAGMA journal_mode changes
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OpJournalModeSubState {

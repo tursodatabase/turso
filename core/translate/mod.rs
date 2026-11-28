@@ -90,7 +90,10 @@ pub fn translate(
     input: &str,
     origin: crate::statement::StatementOrigin,
 ) -> Result<Program> {
-    tracing::trace!("querying {}", input);
+    tracing::trace!("querying {}", crate::util::redact_encryption_key_sql(input));
+    if matches!(origin, crate::statement::StatementOrigin::Root) {
+        connection.check_encryption_setup_complete(pragma::is_encryption_pragma(&stmt))?;
+    }
     let change_cnt_on = matches!(
         stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }

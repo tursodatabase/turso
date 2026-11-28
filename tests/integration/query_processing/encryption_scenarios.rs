@@ -446,6 +446,12 @@ fn s03_encryption_assignments_fail_during_preparation() {
             db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
                 .unwrap()
         };
+        // The encryption PRAGMAs can encrypt a new plaintext database that has
+        // one connection. A second connection makes them fail.
+        let _peer = (!encrypted).then(|| {
+            db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap()
+        });
         let before = connection.get_encryption_cipher_mode();
         for sql in [
             format!("PRAGMA cipher = '{}'", CipherMode::Aes256Gcm),

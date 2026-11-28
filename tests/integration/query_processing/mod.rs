@@ -13,6 +13,7 @@ mod test_vacuum_into_mvcc;
 mod test_write_path;
 
 mod encryption;
+mod encryption_pragma;
 mod encryption_races;
 mod test_expr_index;
 mod test_multi_thread;

@@ -641,7 +641,18 @@ $ openssl rand -hex 32
 2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d
 ```
 
-Supply both the cipher and key when opening a new or existing encrypted database:
+To create an encrypted database, open a new database file and set the cipher and key before any other statement:
+
+```shell
+$ cargo run -- --experimental-encryption database.db
+
+PRAGMA cipher = 'aegis256'; -- or 'aes256gcm'
+PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
+```
+
+The PRAGMAs encrypt only a new, empty database that no other connection uses, outside a transaction, and without MVCC. In other cases they return an error and change nothing. After the first of the two PRAGMAs, the connection refuses other statements until the second one is set. See [PRAGMA hexkey](sql-reference/pragmas.mdx#hexkey) for all the conditions.
+
+Alternatively, supply both the cipher and key in a URI. This is the only way to open an existing encrypted database:
 
 ```shell
 $ cargo run -- --experimental-encryption \
@@ -650,7 +661,7 @@ $ cargo run -- --experimental-encryption \
 
 This URI can expose the key through process arguments, shell history, and command-line recording; it is not a protected secret-input channel.
 
-Encryption cannot be enabled or changed after open. Assignments to `PRAGMA cipher` and `PRAGMA hexkey` are rejected during preparation. The encrypted page size is selected in core `OpenOptions::page_size` (4096 by default for new databases); page size and reserved bytes cannot change after open. Every open, connection, and attachment must authenticate its own credentials, including cached opens and empty databases before their first write. Existing encrypted files remain readable with their original cipher and key.
+Encryption cannot be enabled or changed after a database has pages. The encrypted page size is selected in core `OpenOptions::page_size` or with `PRAGMA page_size` before the encryption PRAGMAs (4096 by default for new databases); page size and reserved bytes cannot change after that. Every open, connection, and attachment must authenticate its own credentials, including cached opens and empty databases before their first write. Existing encrypted files remain readable with their original cipher and key.
 
 Use an attachment's own `cipher` and `hexkey` URI parameters. `ATTACH ... KEY` rejects non-NULL values before opening a target; use URI credentials instead. `KEY NULL` is accepted. Serialize concurrent opens of a fresh target until ATTACH completes. In-place VACUUM supports an encrypted main database, but rejects encrypted attached databases. VACUUM INTO produces plaintext. External restore hooks reject built-in encrypted databases. Sync encryption is not supported.
 

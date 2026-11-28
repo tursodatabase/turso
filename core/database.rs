@@ -487,6 +487,8 @@ impl Default for HeaderAuthenticationState {
 
 pub(crate) struct AuthenticatedHeader {
     database: Arc<SharedPagerState>,
+    /// The database encryption that the header was authenticated for.
+    cipher: CipherMode,
     page_size: PageSize,
     reserved_space: Option<u8>,
     io_ctx: IOContext,
@@ -502,6 +504,7 @@ impl AuthenticatedHeader {
                 "authenticated header belongs to another database".into(),
             ));
         }
+        database.check_authenticated_cipher(self.cipher)?;
         Ok((self.page_size, self.reserved_space, self.io_ctx))
     }
 }
@@ -732,6 +735,7 @@ impl OpenDbAsyncState {
         self.pager = None;
         self.db = None;
         self.building_db = None;
+        self.encryption_key = None;
         if let HeaderValidationState::Start { init, .. } = &mut self.header_validation_state {
             init.cancel();
         }
@@ -1998,12 +2002,16 @@ impl Database {
                     db.replace_schema(loader.into_schema());
 
                     state.phase = OpenDbAsyncPhase::Done;
-                    return Ok(IOResult::Done(
-                        state
-                            .db
-                            .take()
-                            .expect("db must be initialized in Init phase"),
-                    ));
+                    let db = state
+                        .db
+                        .take()
+                        .expect("db must be initialized in Init phase");
+                    // A caller can keep the state after the open, as the SDK
+                    // kit does. Release the connection, pager and key of the
+                    // open now, like a blocking open that drops its state, so
+                    // the caller does not keep a hidden connection open.
+                    state.clear_open_resources();
+                    return Ok(IOResult::Done(db));
                 }
 
                 OpenDbAsyncPhase::Done => {
@@ -2585,7 +2593,10 @@ impl Database {
         }
     }
 
-    pub(crate) fn encryption_cipher(&self) -> CipherMode {
+    /// The cipher of the database, or `CipherMode::None` when it is not
+    /// encrypted. The open options set it, or `PRAGMA cipher` and
+    /// `PRAGMA hexkey` on a new, empty database. It does not change after that.
+    pub fn encryption_cipher(&self) -> CipherMode {
         self.pager_state.encryption_cipher()
     }
 
@@ -3083,7 +3094,10 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key,
+            encryption_key: encryption_key.map_or_else(OnceLock::new, OnceLock::from),
+            pending_encryption: Mutex::new(crate::connection::PendingEncryption::default()),
+            encryption_setup_pending: AtomicBool::new(false),
+            encryption_pragmas_disabled: AtomicBool::new(false),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
@@ -3732,6 +3746,7 @@ impl Database {
                             io_ctx.set_encryption(context);
                             return Ok(IOResult::Done(AuthenticatedHeader {
                                 database: self.pager_state.clone(),
+                                cipher,
                                 page_size,
                                 reserved_space: Some(cipher.metadata_size() as u8),
                                 io_ctx,
@@ -3852,6 +3867,7 @@ impl Database {
                     }
                     return Ok(IOResult::Done(AuthenticatedHeader {
                         database: self.pager_state.clone(),
+                        cipher,
                         page_size,
                         reserved_space,
                         io_ctx,
@@ -3878,6 +3894,7 @@ impl Database {
                     );
                     return Ok(IOResult::Done(AuthenticatedHeader {
                         database,
+                        cipher,
                         page_size: header.page_size,
                         reserved_space: Some(header.reserved_space),
                         io_ctx,
@@ -4350,6 +4367,60 @@ mod database_tests {
             assert_eq!(target.pager_state.page_size(), original_size);
             assert_eq!(target.encryption_cipher(), original_cipher);
         }
+    }
+
+    /// PRAGMA cipher and PRAGMA hexkey can make a new database encrypted
+    /// while another connection is opening. A header authenticated for the
+    /// plaintext database before that change must not give a pager.
+    #[test]
+    fn plaintext_header_is_refused_after_the_database_becomes_encrypted() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open(
+            io.clone(),
+            ":memory:header-before-encryption",
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
+                .db_opts(DatabaseOpts::new().with_encryption(true)),
+        )
+        .unwrap();
+        let mut state = super::HeaderAuthenticationState::default();
+        let header = crate::util::IOExt::block(io.as_ref(), || {
+            db.read_authenticated_header(&mut state, None, None, true)
+        })
+        .unwrap();
+
+        let key = EncryptionKey::new_256([1; 32]);
+        db.pager_state
+            .encrypt_for_test(crate::CipherMode::Aegis256, &key);
+
+        let error = db.init_pager(header).err().unwrap();
+        assert!(error.to_string().contains("encryption changed"), "{error}");
+        assert!(db._init(None, None).is_err());
+        assert!(db._init(Some(&key), None).is_ok());
+    }
+
+    /// A caller that keeps its open state after the open, as the SDK kit
+    /// does, must not keep a connection or a pager of the database.
+    #[test]
+    fn completed_async_open_keeps_no_connection() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let path = ":memory:kept-open-state";
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let options = OpenOptions::new(Arc::new(DialectThatCannotParse))
+            .storage(Arc::new(DatabaseFile::new(file)))
+            .flags(OpenFlags::Create);
+        let mut state = OpenDbAsyncState::new();
+        let db = loop {
+            match Database::open_async(&mut state, io.clone(), path, &options).unwrap() {
+                IOResult::Done(db) => break db,
+                IOResult::IO(completion) => completion.wait(&*io).unwrap(),
+            }
+        };
+        assert_eq!(
+            db.n_connections.load(crate::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(Arc::strong_count(&db.pager_state), 1);
+        drop(state);
     }
 
     #[cfg(feature = "fs")]

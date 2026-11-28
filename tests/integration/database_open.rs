@@ -1301,6 +1301,33 @@ fn page_codec_connection_rejects_builtin_encryption_settings() {
 
 #[cfg(feature = "fs")]
 #[test]
+fn page_codec_database_refuses_encryption_pragmas() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("codec-encryption-pragmas.db");
+    let path = path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
+    let db = open_with_page_codec_with_opts_result(
+        io,
+        path,
+        codec.clone(),
+        DatabaseOpts::new().with_encryption(true),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(codec))
+        .unwrap();
+    for sql in [
+        "PRAGMA cipher = 'aegis256'".to_string(),
+        format!("PRAGMA hexkey = '{}'", "00".repeat(32)),
+    ] {
+        let err = conn.execute(&sql).unwrap_err().to_string();
+        assert!(err.contains("external page codec"), "{err}");
+    }
+}
+
+#[cfg(feature = "fs")]
+#[test]
 fn page_codec_vacuum_preserves_encoded_database() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let path = temp_dir.path().join("codec-vacuum.db");

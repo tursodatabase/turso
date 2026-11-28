@@ -2920,6 +2920,26 @@ pub fn insn_to_row(
             0,
             format!("ensure turso_cdc_version({cdc_table_name}, {version}); set cdc={cdc_mode}"),
         ),
+        Insn::SetEncryption { setting } => {
+            // Never show the key.
+            let assignment = match setting {
+                crate::storage::encryption::EncryptionSetting::Cipher(cipher) => {
+                    format!("cipher={cipher}")
+                }
+                crate::storage::encryption::EncryptionSetting::Key(_) => {
+                    "hexkey=<hidden>".to_string()
+                }
+            };
+            (
+                "SetEncryption",
+                0,
+                0,
+                0,
+                Value::build_text(assignment.clone()),
+                0,
+                format!("set encryption {assignment}"),
+            )
+        }
     }
 }
 

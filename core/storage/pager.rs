@@ -21,7 +21,7 @@ use crate::sync::atomic::{
     AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use crate::sync::Arc;
-use crate::sync::{Mutex, RwLock};
+use crate::sync::{Mutex, OnceLock, RwLock};
 use crate::types::IOResultOr;
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
@@ -56,7 +56,9 @@ use super::sqlite3_ondisk::{
 };
 use super::sqlite3_ondisk::{read_varint, read_varint_len, split_varint};
 use super::wal::{CheckpointMode, WalAutoActions};
-use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey, SQLITE_HEADER};
+use crate::storage::encryption::{
+    encryption_pragma_refused, CipherMode, EncryptionContext, EncryptionKey, SQLITE_HEADER,
+};
 
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
@@ -1578,12 +1580,15 @@ impl Savepoint {
 }
 
 pub struct SharedPagerState {
+    /// Serializes the first write of page 1, changes to the initial page 1 of
+    /// a new database, the change of a new database to encrypted, and the
+    /// check that installs an authenticated header on a pager.
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
-    // Encryption
-    encryption_cipher: CipherMode,
-    /// Encrypted sample for checking keys before the first write and on cached opens.
-    encryption_verifier: Option<Box<[u8]>>,
+    /// The encryption of the database. It is set when the database is opened
+    /// with encryption options, or one time by `PRAGMA cipher` and
+    /// `PRAGMA hexkey` before page 1 exists. It does not change after that.
+    encryption: OnceLock<EncryptionIdentity>,
     page_size: AtomicU32,
 }
 
@@ -1604,46 +1609,66 @@ impl SharedPagerState {
                 .page_size
                 .get()
         });
-        let encryption_verifier = if cipher != CipherMode::None {
-            let page = default_page1(Some(&cipher));
-            let contents = page.get_contents();
-            let context = EncryptionContext::new(
+        let encryption = match cipher {
+            CipherMode::None => OnceLock::new(),
+            cipher => OnceLock::from(EncryptionIdentity::new(
                 cipher,
                 key.expect("encrypted pager initialization requires a key"),
-                contents.as_ptr().len(),
-            )?;
-            Some(
-                context
-                    .encrypt_page(contents.as_ptr(), 1)?
-                    .into_boxed_slice(),
-            )
-        } else {
-            None
+            )?),
         };
         Ok(Self {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
-            encryption_cipher: cipher,
-            encryption_verifier,
+            encryption,
             page_size: AtomicU32::new(page_size),
         })
     }
 
     pub(crate) fn encryption_cipher(&self) -> CipherMode {
-        self.encryption_cipher
+        self.encryption
+            .get()
+            .map_or(CipherMode::None, |identity| identity.cipher)
+    }
+
+    /// Makes the database encrypted without the checks of
+    /// [Pager::encrypt_new_database], like a connection on another thread
+    /// that does it while a header is being authenticated.
+    #[cfg(test)]
+    pub(crate) fn encrypt_for_test(&self, cipher: CipherMode, key: &EncryptionKey) {
+        let _lock = self.init_lock.lock();
+        let page_1 = default_page1_with_size(Some(&cipher), self.page_size().unwrap_or_default());
+        self.set_encryption(EncryptionIdentity::new(cipher, key).unwrap(), page_1);
     }
 
     pub(crate) fn verify_encryption_key(&self, key: &EncryptionKey) -> Result<EncryptionContext> {
         // The key is not stored in shared database state, so verify it by decrypting the sample.
-        let sample = self
-            .encryption_verifier
-            .as_deref()
+        let identity = self
+            .encryption
+            .get()
             .expect("encrypted database has a verifier");
-        let context = EncryptionContext::new(self.encryption_cipher, key, sample.len())?;
-        context.decrypt_page(sample, 1).map_err(|_| {
+        let context = EncryptionContext::new(identity.cipher, key, identity.verifier.len())?;
+        context.decrypt_page(&identity.verifier, 1).map_err(|_| {
             LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
         })?;
         Ok(context)
+    }
+
+    /// Checks that the database encryption is still `cipher`, the encryption
+    /// that a header was authenticated for.
+    ///
+    /// `PRAGMA cipher` and `PRAGMA hexkey` can make a new database encrypted
+    /// while a connection is opening. The check holds `init_lock`, which that
+    /// change also holds, so a connection never gets a pager whose header was
+    /// authenticated for a plaintext database that is now encrypted.
+    pub(crate) fn check_authenticated_cipher(&self, cipher: CipherMode) -> Result<()> {
+        let _lock = self.init_lock.lock();
+        if self.encryption_cipher() != cipher {
+            return Err(LimboError::InvalidArgument(
+                "the database encryption changed while the connection was opening; connect again"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn page_size(&self) -> Option<PageSize> {
@@ -1683,6 +1708,16 @@ impl SharedPagerState {
             crate::thread::yield_now();
             crate::sync::encryption_schedule_point(false);
         }
+    }
+
+    /// Makes a new database encrypted and replaces its initial page 1 with
+    /// `page_1`, which has the reserved space of the cipher. The caller holds
+    /// `init_lock` and has checked that page 1 does not exist and that no
+    /// other pager uses the database.
+    fn set_encryption(&self, identity: EncryptionIdentity, page_1: PageRef) {
+        let result = self.encryption.set(identity);
+        turso_assert!(result.is_ok(), "database encryption is set only one time");
+        self.set_initial_page_1(Some(page_1));
     }
 
     pub(crate) fn is_init_locked(&self) -> bool {
@@ -3210,6 +3245,9 @@ impl Pager {
 
     /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
+        // Under the lock, because PRAGMA cipher and PRAGMA hexkey can make a
+        // new database encrypted.
+        let _lock = self.shared.init_lock.lock();
         if self.encryption_cipher() != CipherMode::None {
             if self.get_page_size_unchecked() == size {
                 return Ok(());
@@ -3218,7 +3256,6 @@ impl Pager {
                 "encrypted database page size is fixed when opening the database".into(),
             ));
         }
-        let _lock = self.shared.init_lock.lock();
         if self.db_initialized() {
             return Ok(());
         }
@@ -3238,22 +3275,7 @@ impl Pager {
         };
         header.page_size = size;
 
-        let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
-        {
-            let inner = page.get();
-            inner.set_buffer(Arc::new(Buffer::new_temporary(size.get() as usize)));
-        }
-
-        page.get_contents().write_database_header(&header);
-        page.set_loaded();
-        page.clear_wal_tag();
-
-        btree_init_page(
-            &page,
-            PageType::TableLeaf,
-            DatabaseHeader::SIZE,
-            (size.get() - header.reserved_space as u32) as usize,
-        );
+        let page = initial_page1_with_header(&header);
 
         self.shared.set_initial_page_1(Some(page));
         self.set_page_size(size);
@@ -6414,8 +6436,117 @@ impl Pager {
     }
 
     pub(crate) fn is_authenticated(&self) -> bool {
+        // A pager of an encrypted database needs its codec too: a pager that
+        // was authenticated before the database became encrypted has none.
         self.shared.encryption_cipher() == CipherMode::None
-            || self.encryption_verified.load(Ordering::Acquire)
+            || (self.encryption_verified.load(Ordering::Acquire) && self.is_encryption_ctx_set())
+    }
+
+    /// Makes the new database of this pager encrypted with `cipher` and
+    /// `key`. `PRAGMA cipher` and `PRAGMA hexkey` call it when both values
+    /// are known.
+    ///
+    /// It returns an error and changes nothing unless the database is
+    /// plaintext, page 1 does not exist, and this pager is the only pager of
+    /// the database. Thus no other pager holds plaintext pages of the database
+    /// or can write a plaintext page 1 into it.
+    pub(crate) fn encrypt_new_database(
+        &self,
+        cipher: CipherMode,
+        key: &EncryptionKey,
+    ) -> Result<()> {
+        let _lock = self.shared.init_lock.lock();
+        self.check_can_encrypt_new_database()?;
+        self.check_cipher_fits_page_size(cipher)?;
+        // Do each step that can fail before the first change.
+        let context =
+            EncryptionContext::new(cipher, key, self.get_page_size_unchecked().get() as usize)?;
+        let identity = EncryptionIdentity::new(cipher, key)?;
+        let Some(page_1) = self.shared.initial_page_1() else {
+            return Err(encryption_pragma_refused("the database is not empty"));
+        };
+        let mut header = *bytemuck::from_bytes::<DatabaseHeader>(
+            &page_1.get_contents().as_ptr()[..DatabaseHeader::SIZE],
+        );
+        // Keep the header values set before the first write, such as the
+        // page size and the journal version, and give the cipher its space.
+        header.reserved_space = cipher.metadata_size() as u8;
+        let page_1 = initial_page1_with_header(&header);
+
+        self.shared.set_encryption(identity, page_1);
+        self.set_reserved_space(header.reserved_space);
+        {
+            let mut io_ctx = self.io_ctx.write();
+            io_ctx.set_encryption(context);
+            if let Some(wal) = self.wal.as_ref() {
+                wal.set_io_context(io_ctx.clone());
+            }
+        }
+        // No page is dirty, so this only drops pages that have the plaintext layout.
+        self.clear_page_cache(false);
+        self.set_schema_cookie(None);
+        Ok(())
+    }
+
+    /// Checks the conditions of [Pager::encrypt_new_database]. Without
+    /// `init_lock`, the result can be out of date, so that function checks
+    /// again under the lock.
+    pub(crate) fn check_can_encrypt_new_database(&self) -> Result<()> {
+        if !self.is_encryption_enabled() {
+            return Err(LimboError::InvalidArgument(
+                "encryption is an opt in feature".into(),
+            ));
+        }
+        if self.encryption_cipher() != CipherMode::None {
+            return Err(encryption_pragma_refused(
+                "the database is already encrypted",
+            ));
+        }
+        if self.has_external_page_codec() {
+            return Err(encryption_pragma_refused(
+                "the database uses an external page codec",
+            ));
+        }
+        if self.db_initialized()
+            || self.allocating_page1()
+            || self.db_file.size()? != 0
+            || self
+                .wal
+                .as_ref()
+                .is_some_and(|wal| wal.get_max_frame_in_wal() > 0)
+        {
+            return Err(encryption_pragma_refused("the database is not empty"));
+        }
+        if !self.dirty_pages.read().is_empty() {
+            return Err(encryption_pragma_refused(
+                "the database has changes that are not written yet",
+            ));
+        }
+        // The database holds a reference to the shared state, each pager holds
+        // one, and so does each connection or ATTACH that is still opening.
+        // Two references mean that this pager is the only user of the database.
+        if Arc::strong_count(&self.shared) != 2 {
+            return Err(encryption_pragma_refused(
+                "other connections use the database",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks that a page keeps at least [PageSize::MIN_USABLE_SPACE] usable
+    /// bytes after the bytes that `cipher` reserves, as the file format
+    /// requires. Only the AEGIS-256 ciphers on 512-byte pages fail.
+    pub(crate) fn check_cipher_fits_page_size(&self, cipher: CipherMode) -> Result<()> {
+        let page_size = self.get_page_size_unchecked();
+        let reserved_space = cipher.metadata_size() as u8;
+        if !page_size.has_valid_reserved_space(reserved_space) {
+            return Err(LimboError::InvalidArgument(format!(
+                "cipher {cipher} reserves {reserved_space} bytes in each page, which leaves less than {} usable bytes in a page of {} bytes",
+                PageSize::MIN_USABLE_SPACE,
+                page_size.get()
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn encryption_cipher(&self) -> CipherMode {
@@ -6495,16 +6626,22 @@ pub(crate) fn default_page1_with_size(cipher: Option<&CipherMode>, size: PageSiz
         default_header.reserved_space = reserved_space_bytes;
     }
 
+    initial_page1_with_header(&default_header)
+}
+
+/// Builds the page 1 of a new database: `header` followed by an empty
+/// `sqlite_schema` table leaf that ends where the reserved space starts.
+fn initial_page1_with_header(header: &DatabaseHeader) -> PageRef {
     let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
 
     {
         let inner = page.get();
         inner.set_buffer(Arc::new(Buffer::new_temporary(
-            default_header.page_size.get() as usize,
+            header.page_size.get() as usize
         )));
     }
 
-    page.get_contents().write_database_header(&default_header);
+    page.get_contents().write_database_header(header);
     page.set_loaded();
     page.clear_wal_tag();
 
@@ -6512,10 +6649,31 @@ pub(crate) fn default_page1_with_size(cipher: Option<&CipherMode>, size: PageSiz
         &page,
         PageType::TableLeaf,
         DatabaseHeader::SIZE, // offset of 100 bytes
-        (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
+        (header.page_size.get() - header.reserved_space as u32) as usize,
     );
 
     page
+}
+
+/// The cipher of an encrypted database and a sample to check keys with.
+struct EncryptionIdentity {
+    cipher: CipherMode,
+    /// Encrypted sample for checking keys before the first write and on cached opens.
+    verifier: Box<[u8]>,
+}
+
+impl EncryptionIdentity {
+    fn new(cipher: CipherMode, key: &EncryptionKey) -> Result<Self> {
+        let page = default_page1(Some(&cipher));
+        let contents = page.get_contents();
+        let context = EncryptionContext::new(cipher, key, contents.as_ptr().len())?;
+        Ok(Self {
+            cipher,
+            verifier: context
+                .encrypt_page(contents.as_ptr(), 1)?
+                .into_boxed_slice(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

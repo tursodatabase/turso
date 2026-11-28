@@ -215,7 +215,7 @@ pub use turso_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
-pub use util::{database_path_from_uri, IOExt};
+pub use util::{database_path_from_uri, may_hold_encryption_key, IOExt};
 pub use vdbe::array::{
     array_contains_all, array_values_from_any, parse_text_array_of_texts, text_array_literal,
 };
