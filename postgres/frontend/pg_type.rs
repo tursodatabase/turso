@@ -22,7 +22,7 @@ pub(crate) use oid::{check_oid_range, oid_input};
 pub(crate) use regclass::{parse_regclass, RegClassInput};
 pub(crate) use regtype::{regtype_oid_of_text, regtype_text};
 pub(crate) use uuid::{canonical_uuid, random_uuid_text};
-pub(crate) use vector::vector_text;
+pub(crate) use vector::{int2vector_value, oidvector_value, vector_text};
 
 use crate::error::sqlstate_error;
 use crate::session::relation_lookup_namespaces;

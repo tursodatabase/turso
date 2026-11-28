@@ -123,6 +123,26 @@ fn encode(elements: Vec<Value>) -> Result<Value> {
     .encode()
 }
 
+/// The int2vector of `elements`, for a row of a catalog.
+pub(crate) fn int2vector_value(elements: &[i64]) -> Value {
+    vector_value(elements)
+}
+
+/// The oidvector of `elements`, for a row of a catalog.
+pub(crate) fn oidvector_value(elements: &[i64]) -> Value {
+    vector_value(elements)
+}
+
+fn vector_value(elements: &[i64]) -> Value {
+    encode(
+        elements
+            .iter()
+            .map(|element| Value::from_i64(*element))
+            .collect(),
+    )
+    .expect("an array of integers is stored")
+}
+
 /// The text of a stored vector: its elements separated by spaces.
 pub(crate) fn vector_text(blob: &[u8]) -> Option<String> {
     let array = ArrayValue::decode(blob).ok()?;

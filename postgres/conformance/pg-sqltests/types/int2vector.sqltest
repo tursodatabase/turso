@@ -174,3 +174,24 @@ test a-vector-is-not-cast-to-the-other-vector {
 }
 @sqlstate 42846
 expect error {}
+
+test pg-index-has-the-columns-of-an-index-as-a-vector {
+    CREATE TABLE p (a int, b int, PRIMARY KEY (a, b));
+    SELECT indkey, indkey::int2[], indkey[0], indkey[1], indkey::text
+    FROM pg_index WHERE indrelid = 'p'::regclass;
+}
+expect {
+    1 2|[0:1]={1,2}|1|2|1 2
+}
+
+test a-vector-of-a-catalog-is-compared-with-text-as-a-vector {
+    CREATE TABLE p (a int, b int, PRIMARY KEY (a, b));
+    SELECT proname FROM pg_proc WHERE proname = 'format_type' AND proargtypes = '26 23';
+    SELECT count(*) FROM pg_index WHERE indrelid = 'p'::regclass AND indkey = '1 2';
+    SELECT count(*) FROM pg_index WHERE indrelid = 'p'::regclass AND indkey = '2 1';
+}
+expect {
+    format_type
+    1
+    0
+}

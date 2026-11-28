@@ -1581,7 +1581,7 @@ impl SnapshotRows for PgProcTable {
             pronargs INTEGER,
             pronargdefaults INTEGER,
             prorettype INTEGER,
-            proargtypes TEXT,
+            proargtypes OIDVECTOR,
             proallargtypes TEXT,
             proargmodes TEXT,
             proargnames TEXT,
@@ -1603,12 +1603,6 @@ impl SnapshotRows for PgProcTable {
         crate::procs::PROCS
             .iter()
             .map(|proc| {
-                let arg_types = proc
-                    .arg_types
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
                 vec![
                     Value::from_i64(proc.oid),
                     Value::build_text(proc.name),
@@ -1628,7 +1622,7 @@ impl SnapshotRows for PgProcTable {
                     Value::from_i64(proc.arg_types.len() as i64),
                     Value::from_i64(0),
                     Value::from_i64(proc.result),
-                    Value::build_text(arg_types),
+                    crate::pg_type::oidvector_value(proc.arg_types),
                     Value::Null,
                     Value::Null,
                     Value::Null,
@@ -2284,7 +2278,7 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indnullsnotdistinct BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indnullsnotdistinct BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey INT2VECTOR, indcollation OIDVECTOR, indclass OIDVECTOR, indoption INT2VECTOR, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
@@ -2301,18 +2295,17 @@ impl SnapshotRows for PgIndexTable {
 
         for index in catalog_indexes(conn, &schema) {
             let indnatts = index.columns.len() as i64;
-            let indkey: String = index
+            let indkey: Vec<i64> = index
                 .columns
                 .iter()
                 .map(|column| {
                     if column.expression.is_some() {
-                        "0".to_string()
+                        0
                     } else {
-                        (column.position + 1).to_string()
+                        column.position as i64 + 1
                     }
                 })
-                .collect::<Vec<_>>()
-                .join(" ");
+                .collect();
 
             let indpred = index
                 .where_clause
@@ -2351,7 +2344,7 @@ impl SnapshotRows for PgIndexTable {
                 Value::from_i64(1),                        // indisready
                 Value::from_i64(1),                        // indislive
                 Value::from_i64(0),                        // indisreplident
-                Value::build_text(indkey),                 // indkey
+                crate::pg_type::int2vector_value(&indkey), // indkey
                 Value::Null,                               // indcollation
                 Value::Null,                               // indclass
                 Value::Null,                               // indoption
@@ -2929,7 +2922,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr INT2VECTOR, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_statistic_ext",
@@ -3862,8 +3855,7 @@ impl IndexRow {
                 .as_int()
                 .expect("catalog index uniqueness is an integer")
                 == CATALOG_BOOLEAN_TRUE,
-            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN])
-                .map(str::to_owned),
+            column_numbers: catalog_vector_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
         }
     }
 }
@@ -3886,6 +3878,16 @@ impl ColumnDefaultRow {
                 .as_int()
                 .expect("catalog column numbers are integers"),
         }
+    }
+}
+
+fn catalog_vector_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Blob(blob) => Some(
+            crate::pg_type::vector_text(blob).expect("a catalog column list is a stored vector"),
+        ),
+        _ => unreachable!("catalog column lists are vectors or null"),
     }
 }
 
