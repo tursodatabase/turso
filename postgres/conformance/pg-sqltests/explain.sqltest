@@ -12,6 +12,18 @@ setup explain_table {
     INSERT INTO t VALUES (1), (2);
 }
 
+setup uuid_index_table {
+    CREATE TABLE ux (id int PRIMARY KEY, u uuid);
+    INSERT INTO ux VALUES (1, '11111111-1111-1111-1111-111111111111'), (2, '22222222-2222-2222-2222-222222222222');
+    CREATE INDEX ux_u ON ux (u);
+}
+
+setup date_index_table {
+    CREATE TABLE dx (id int PRIMARY KEY, d date);
+    INSERT INTO dx VALUES (1, '2020-01-01'), (2, '2021-06-15');
+    CREATE INDEX dx_d ON dx (d);
+}
+
 setup dml_items {
     CREATE TABLE items (id int primary key, value int);
     INSERT INTO items VALUES (1, 10);
@@ -23,6 +35,26 @@ test explain-select {
 }
 expect {
     1|0|0|SCAN t
+}
+
+@setup uuid_index_table
+test explain-uses-the-index-of-a-uuid-column-for-a-cast-to-uuid {
+    EXPLAIN SELECT id FROM ux WHERE u = '22222222-2222-2222-2222-222222222222'::uuid;
+    SELECT id FROM ux WHERE u = '22222222-2222-2222-2222-222222222222'::uuid;
+}
+expect {
+    1|0|0|SEARCH ux USING COVERING INDEX ux_u (u=?)
+    2
+}
+
+@setup date_index_table
+test explain-uses-the-index-of-a-date-column-for-a-cast-to-date {
+    EXPLAIN SELECT id FROM dx WHERE d = '2021-06-15'::date;
+    SELECT id FROM dx WHERE d = '2021-06-15'::date;
+}
+expect {
+    1|0|0|SEARCH dx USING COVERING INDEX dx_d (d=?)
+    2
 }
 
 @setup dml_items
