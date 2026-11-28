@@ -985,6 +985,11 @@ impl ProgramBuilder {
         self.materialized_ctes.get(&cte_id)
     }
 
+    /// The ids of the CTEs materialized so far.
+    pub fn materialized_cte_ids(&self) -> Vec<usize> {
+        self.materialized_ctes.keys().copied().collect()
+    }
+
     /// Register a materialized CTE so that subsequent references can share it via OpenDup.
     pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
         self.materialized_ctes.insert(cte_id, info);

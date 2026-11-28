@@ -57,6 +57,684 @@ expect {
     1
 }
 
+# SQLite computes a CTE once for the statement when the statement reads it more
+# than once and SQLite cannot merge the CTE's query into the query that reads
+# it, as for a query without a FROM clause. Every read then sees the same
+# random() value, also when the reads are in subqueries or compound arms.
+test cte-random-same-value-in-subquery {
+    WITH c(x) AS (SELECT random())
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+}
+expect {
+    1
+}
+
+test cte-random-same-value-in-scalar-subquery {
+    WITH c(x) AS (SELECT random())
+    SELECT count(*) FROM c WHERE x = (SELECT max(x) FROM c);
+}
+expect {
+    1
+}
+
+test cte-random-same-value-in-compound-subqueries {
+    WITH c(x) AS (SELECT random())
+    SELECT count(*) FROM c
+    WHERE x = (SELECT x FROM c UNION SELECT x FROM c)
+      AND EXISTS (SELECT x FROM c INTERSECT SELECT x FROM c);
+}
+expect {
+    1
+}
+
+# Each read of a CTE plans its body again, and a WITH clause inside the body
+# gets its own CTEs for each read. Here SQLite merges d into both reading
+# queries, so each read of d reads its own c.
+test cte-random-in-nested-with-is-computed-for-each-read-of-outer-cte {
+    WITH d AS (WITH c(x) AS (SELECT random()) SELECT x FROM c)
+    SELECT count(*) FROM d WHERE x IN (SELECT x FROM d);
+}
+expect {
+    0
+}
+
+test cte-random-same-value-in-compound-arms {
+    WITH c(x) AS (SELECT random())
+    SELECT x FROM c EXCEPT SELECT x FROM c;
+}
+expect {
+}
+
+test cte-random-same-value-in-union-arms {
+    SELECT count(*) FROM (
+        WITH c(x) AS (SELECT random())
+        SELECT x FROM c UNION SELECT x FROM c
+    );
+}
+expect {
+    1
+}
+
+test cte-random-same-value-in-another-cte {
+    WITH c(x) AS (SELECT random()), d(y) AS (SELECT x FROM c)
+    SELECT count(*) FROM c, d WHERE c.x = d.y;
+}
+expect {
+    1
+}
+
+test cte-random-same-value-in-recursive-cte-arms {
+    WITH RECURSIVE r(n, x) AS (
+        WITH c(x) AS (SELECT random())
+        SELECT 1, x FROM c
+        UNION ALL
+        SELECT n + 1, c.x FROM r, c WHERE n < 3
+    )
+    SELECT count(DISTINCT x) FROM r;
+}
+expect {
+    1
+}
+
+test cte-random-same-value-in-values {
+    WITH c(x) AS (SELECT random())
+    VALUES ((SELECT x FROM c) = (SELECT x FROM c));
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test cte-random-same-value-in-insert-values {
+    CREATE TABLE t(a, b);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t VALUES ((SELECT x FROM c), (SELECT x FROM c));
+    SELECT a = b FROM t;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test cte-random-same-value-in-insert-select-union-arms {
+    CREATE TABLE t(a);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t SELECT x FROM c UNION SELECT x FROM c;
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test cte-random-same-value-in-update-set {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (0);
+    WITH c(x) AS (SELECT random())
+    UPDATE t SET a = (SELECT x FROM c) = (SELECT x FROM c);
+    SELECT a FROM t;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test cte-random-same-value-in-delete-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    WITH c(x) AS (SELECT random())
+    DELETE FROM t WHERE (SELECT x FROM c) <> (SELECT x FROM c);
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+# A RETURNING subquery runs after the write. Unless a read before the write
+# materialized the CTE, it computes the CTE again and sees the written rows.
+test cte-returning-reads-cte-after-delete {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 0), (2, 0);
+    WITH c(x) AS (SELECT DISTINCT a FROM t)
+    DELETE FROM t WHERE a = (SELECT max(x) FROM c) RETURNING (SELECT count(*) FROM c);
+    WITH c(x) AS (SELECT a FROM t LIMIT 5)
+    DELETE FROM t WHERE a = (SELECT max(x) FROM c) RETURNING (SELECT count(*) FROM c);
+}
+expect {
+    1
+    0
+}
+
+test cte-returning-reads-cte-after-update {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 0), (2, 0);
+    WITH c(x) AS (SELECT sum(a) FROM t)
+    UPDATE t SET a = (SELECT x FROM c) WHERE a = 1 RETURNING a, (SELECT x FROM c);
+}
+expect {
+    3|5
+}
+
+test cte-random-returning-reads-cte-after-update {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 0), (2, 0);
+    WITH c(x) AS (SELECT random())
+    UPDATE t SET b = (SELECT x FROM c) RETURNING b = (SELECT x FROM c);
+}
+expect {
+    0
+    0
+}
+
+# A RETURNING subquery runs again for each written row only when its own FROM
+# clause names the written table. A read of the table through a CTE does not
+# count, so the subquery runs once, after the first row is written.
+test cte-returning-reads-written-table-through-cte-once {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    WITH c(x) AS (SELECT b FROM t)
+    UPDATE t SET b = b * 10 RETURNING b, (SELECT sum(x) FROM c);
+    WITH c(x) AS (SELECT b FROM t)
+    DELETE FROM t RETURNING a, (SELECT count(*) FROM c);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    WITH c(x) AS (SELECT b FROM t)
+    INSERT INTO t VALUES (4, 4), (5, 5) RETURNING (SELECT sum(x) FROM c);
+}
+expect {
+    10|15
+    20|15
+    30|15
+    1|2
+    2|2
+    3|2
+    10
+    10
+}
+
+# Two reads before the write share one materialized result, and the RETURNING
+# subquery reuses it.
+test cte-returning-reuses-cte-materialized-before-delete {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 0), (2, 0);
+    WITH c(x) AS (SELECT DISTINCT a FROM t)
+    DELETE FROM t WHERE a = (SELECT max(x) FROM c) AND b < (SELECT count(*) FROM c)
+    RETURNING (SELECT count(*) FROM c);
+    WITH c(x) AS MATERIALIZED (SELECT DISTINCT a FROM t)
+    DELETE FROM t WHERE a = (SELECT max(x) FROM c) RETURNING (SELECT count(*) FROM c);
+}
+expect {
+    2
+    1
+}
+
+# SQLite computes an IN subquery from a copy of it, and the copy counts one more
+# read of each CTE that it reads. So a single read in an IN subquery stores the
+# CTE before the write, and RETURNING reuses it, also a correlated RETURNING
+# subquery. A single read in another subquery does not store the CTE, and
+# RETURNING computes it again after the first row is written.
+test cte-returning-reuses-cte-stored-by-in-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT DISTINCT a FROM t)
+    UPDATE t SET a = a * 10 WHERE a IN (SELECT x FROM c) RETURNING (SELECT sum(x) FROM c);
+    WITH c(x) AS (SELECT DISTINCT a FROM t)
+    UPDATE t SET a = a / 10 WHERE a IN (SELECT x FROM c) RETURNING (SELECT sum(x) FROM c WHERE x <> a);
+    WITH c(x) AS (SELECT DISTINCT a FROM t)
+    DELETE FROM t WHERE a NOT IN (SELECT x FROM c WHERE x > 1) RETURNING (SELECT sum(x) FROM c);
+}
+expect {
+    6
+    6
+    6
+    60
+    60
+    60
+    6
+}
+
+test cte-returning-computes-cte-again-after-other-subquery-read {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT DISTINCT a FROM t)
+    UPDATE t SET a = a * 10 WHERE EXISTS (SELECT 1 FROM c WHERE x = a) RETURNING (SELECT sum(x) FROM c);
+}
+expect {
+    15
+    15
+    15
+}
+
+# SQLite stores a CTE that UPDATE ... FROM reads before the write. A correlated
+# RETURNING subquery reuses it.
+test cte-correlated-returning-reuses-cte-read-by-update-from {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT DISTINCT a FROM t)
+    UPDATE t SET a = a * 10 FROM c WHERE a = x RETURNING (SELECT sum(x) FROM c WHERE x <> a);
+}
+expect {
+    6
+    6
+    6
+}
+
+# A correlated IN subquery reads the CTE stored for the statement, so every row
+# of the outer query sees the same random() value.
+test cte-random-same-value-in-correlated-in-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (12), (13), (14), (15), (16);
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    SELECT count(*) IN (0, 16) FROM t WHERE 1 IN (SELECT x FROM c WHERE a = a);
+}
+expect {
+    1
+}
+
+# SQLite resolves the RETURNING list twice, which counts each of its reads of a
+# CTE twice, so the reads of all RETURNING subqueries of a statement share one
+# result, even a single correlated read for every written row.
+test cte-random-same-value-in-delete-returning-subqueries {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10);
+    WITH c(x) AS (SELECT random())
+    DELETE FROM t WHERE a = 1 RETURNING (SELECT x FROM c) = (SELECT x FROM c);
+}
+expect {
+    1
+}
+
+test cte-random-same-value-in-update-returning-subqueries {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10);
+    WITH c(x) AS (SELECT random())
+    UPDATE t SET b = 2 WHERE a = 1 RETURNING (SELECT x FROM c) = (SELECT x FROM c);
+}
+expect {
+    1
+}
+
+test cte-random-same-value-in-insert-returning-subqueries {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t SELECT 1, 2 RETURNING (SELECT x FROM c) = (SELECT x FROM c);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t VALUES (2, 2) RETURNING (SELECT x FROM c) = (SELECT x FROM c);
+}
+expect {
+    1
+    1
+}
+
+test cte-random-same-value-in-correlated-returning-subqueries {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20);
+    WITH c(x) AS (SELECT random())
+    DELETE FROM t RETURNING a, (SELECT x FROM c WHERE a > 0) = (SELECT x FROM c);
+}
+expect {
+    1|1
+    2|1
+}
+
+# The CTE is computed at the first written row, after that row is deleted, and
+# every later row reads that result.
+test cte-correlated-returning-subquery-reads-one-result-for-every-row {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    WITH c(x) AS (SELECT count(*) FROM t)
+    DELETE FROM t RETURNING a, (SELECT x FROM c WHERE a > 0);
+}
+expect {
+    1|2
+    2|2
+    3|2
+}
+
+# The reads in DO UPDATE share one result, whether they are in the SET values
+# or the WHERE clause. They do not share one with the reads in RETURNING.
+test cte-random-same-value-in-upsert-do-update-subqueries {
+    CREATE TABLE u(k PRIMARY KEY, v);
+    INSERT INTO u VALUES (1, 0);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = ((SELECT x FROM c) = (SELECT x FROM c));
+    SELECT v FROM u;
+    WITH c(x) AS (SELECT random())
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = 5 WHERE (SELECT x FROM c) = (SELECT x FROM c);
+    SELECT v FROM u;
+    WITH c(x) AS (SELECT random())
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = (SELECT x FROM c) RETURNING (SELECT x FROM c) = v;
+}
+expect {
+    1
+    5
+    0
+}
+
+# SET adds the value that WHERE requires to be 0, so v stays 1 when both read
+# one result.
+test cte-random-upsert-where-and-set-share-one-result {
+    CREATE TABLE u(k PRIMARY KEY, v);
+    INSERT INTO u VALUES (1, 1);
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT x FROM c) WHERE (SELECT x FROM c) = 0;
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT x FROM c) WHERE (SELECT x FROM c) = 0;
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT x FROM c) WHERE (SELECT x FROM c) = 0;
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT x FROM c) WHERE (SELECT x FROM c) = 0;
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT x FROM c) WHERE (SELECT x FROM c) = 0;
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT x FROM c) WHERE (SELECT x FROM c) = 0;
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT x FROM c) WHERE (SELECT x FROM c) = 0;
+    WITH c(x) AS (SELECT abs(random()) % 2)
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT x FROM c) WHERE (SELECT x FROM c) = 0;
+    SELECT v FROM u;
+}
+expect {
+    1
+}
+
+# The SELECT of an INSERT reads the INSERT's CTEs under the same ids as RETURNING
+# and DO UPDATE, so they reuse a result that the SELECT stored.
+test cte-random-insert-select-returning-reuses-stored-result {
+    CREATE TABLE t(a, b);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t SELECT x, 1 FROM c WHERE x IN (SELECT x FROM c) RETURNING a = (SELECT x FROM c);
+}
+expect {
+    1
+}
+
+test cte-random-insert-compound-select-returning-reuses-stored-result {
+    CREATE TABLE t(a, b);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t SELECT x, 1 FROM c UNION ALL SELECT x, 2 FROM c RETURNING a = (SELECT x FROM c);
+}
+expect {
+    1
+    1
+}
+
+test cte-random-insert-select-do-update-reuses-stored-result {
+    CREATE TABLE t(a PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 1);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t SELECT 1, x FROM c WHERE x IN (SELECT x FROM c)
+    ON CONFLICT(a) DO UPDATE SET b = excluded.b = (SELECT x FROM c);
+    SELECT b FROM t;
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t SELECT 1, x FROM c WHERE x IN (SELECT x FROM c)
+    ON CONFLICT(a) DO UPDATE SET b = excluded.b = (SELECT x FROM c WHERE t.b IS NOT NULL);
+    SELECT b FROM t;
+}
+expect {
+    1
+    1
+}
+
+# A single read in the SELECT is merged into it, so it stores nothing, and
+# RETURNING and DO UPDATE compute the CTE again.
+test cte-random-insert-select-single-read-is-not-reused {
+    CREATE TABLE t(a PRIMARY KEY, b);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t SELECT x, 1 FROM c RETURNING a = (SELECT x FROM c);
+    DELETE FROM t;
+    INSERT INTO t VALUES (1, 1);
+    WITH c(x) AS (SELECT random())
+    INSERT INTO t SELECT 1, x FROM c WHERE true
+    ON CONFLICT(a) DO UPDATE SET b = excluded.b = (SELECT x FROM c);
+    SELECT b FROM t;
+}
+expect {
+    0
+    0
+}
+
+# These CTE bodies cannot be merged into the reading query either: an aggregate,
+# DISTINCT, OFFSET, VALUES and a compound other than UNION ALL.
+test cte-random-same-value-in-subquery-for-bodies-sqlite-cannot-merge {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT random() FROM t GROUP BY a)
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+    WITH c(x) AS (SELECT DISTINCT random() FROM t)
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 2 OFFSET 1)
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+    WITH c(x) AS (VALUES (random()))
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t UNION SELECT random() FROM t)
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+}
+expect {
+    3
+    3
+    2
+    1
+    6
+}
+
+# SQLite merges a CTE that reads a table into each query that reads it, so each
+# read computes random() again for every row.
+test cte-random-recomputed-in-subquery-when-sqlite-merges-cte {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT random() FROM t)
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t)
+    SELECT count(*) FROM (SELECT x FROM c UNION SELECT x FROM c);
+}
+expect {
+    0
+    6
+}
+
+# The query that reads the CTE has no WHERE clause, aggregate or DISTINCT, so
+# SQLite merges the CTE body into it and computes random() again there.
+test cte-random-limit-recomputed-when-sqlite-merges-cte {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 3)
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 3)
+    SELECT x IN (SELECT x FROM c) FROM c;
+}
+expect {
+    0
+    0
+    0
+    0
+}
+
+# SQLite does not merge a CTE with a LIMIT into an arm of a compound SELECT,
+# a query with a LIMIT (a scalar subquery gets LIMIT 1), a WHERE clause, an
+# aggregate, DISTINCT or a join, so these reads share one result. It merges a
+# FROM clause subquery or a CTE that reads the CTE into the outer query first,
+# so the join decides there. It does not merge a compound CTE into an aggregate.
+test cte-random-limit-same-value-where-sqlite-does-not-merge {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 1)
+    SELECT count(*) FROM (SELECT x FROM c UNION SELECT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 2)
+    SELECT count(*) FROM (SELECT x FROM c UNION SELECT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 1)
+    SELECT count(*) FROM c WHERE x = (SELECT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 1)
+    SELECT (SELECT x FROM c) = (SELECT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 1)
+    SELECT (SELECT max(x) FROM c) = (SELECT DISTINCT x FROM c);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 3)
+    SELECT count(*) FROM (SELECT x FROM c) a, (SELECT x FROM c) b WHERE a.x = b.x;
+    WITH c(x) AS (SELECT random() FROM t LIMIT 2), d(y) AS (SELECT x FROM c)
+    SELECT count(*) FROM c, d WHERE c.x = d.y;
+    WITH c(x) AS (SELECT random() FROM t UNION ALL SELECT random() FROM t)
+    SELECT (SELECT max(x) FROM c) = (SELECT max(x) FROM c);
+}
+expect {
+    1
+    2
+    1
+    1
+    1
+    3
+    2
+    1
+}
+
+# A read that SQLite merges computes the CTE again. It does not reuse the result
+# that a read SQLite does not merge stores, or that an outer query stores.
+test cte-random-merged-read-does-not-reuse-stored-result {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT random() FROM t LIMIT 1)
+    SELECT x = (SELECT x FROM c) FROM c;
+    WITH c(x) AS (SELECT random() FROM t LIMIT 2)
+    SELECT count(*) FROM (SELECT x, row_number() OVER () FROM c) a JOIN c b ON a.x = b.x;
+    WITH c(x) AS (SELECT random() FROM t)
+    SELECT (SELECT count(*) FROM c AS d WHERE d.x = c.x) FROM c;
+}
+expect {
+    0
+    0
+    0
+    0
+    0
+}
+
+# NOT MATERIALIZED makes SQLite compute the CTE again for each read.
+test cte-random-not-materialized-recomputed-in-subquery {
+    WITH c(x) AS NOT MATERIALIZED (SELECT random())
+    SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+}
+expect {
+    0
+}
+
+# The outer query stores the CTE, because it reads it twice with its nested
+# queries. A correlated subquery and a FROM clause subquery run after that and
+# reuse the stored result, also when the CTE is NOT MATERIALIZED and SQLite
+# merges the FROM clause subquery into the outer query.
+test cte-random-stored-by-outer-query-reused-by-nested-read {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c AS (SELECT random() AS x FROM t LIMIT 2)
+    SELECT count(*) FROM c WHERE EXISTS (SELECT 1 FROM c d WHERE d.x = c.x);
+    WITH c AS (SELECT random() AS x FROM t UNION ALL SELECT random() FROM t)
+    SELECT count(*) FROM c, (SELECT x AS y FROM c) d WHERE c.x = d.y;
+    WITH c(x) AS NOT MATERIALIZED (SELECT random())
+    SELECT count(*) FROM c, (SELECT x FROM c) d WHERE c.x = d.x;
+}
+expect {
+    2
+    6
+    1
+}
+
+# The correlated SET subquery reads the CTE merged into it, so it sees the rows
+# that earlier updates of the statement wrote. Only a MATERIALIZED CTE is
+# computed once, before the first update.
+@cross-check-integrity
+test cte-update-set-subquery-reads-rows-written-by-the-update {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(m) AS (SELECT a FROM t)
+    UPDATE t SET a = a + (SELECT count(*) FROM c WHERE m > t.a)
+    WHERE a <= (SELECT max(m) FROM c);
+    SELECT a FROM t ORDER BY rowid;
+    DELETE FROM t;
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(m) AS (SELECT a FROM t)
+    UPDATE t SET a = a + (SELECT count(*) FROM c WHERE m > t.a)
+        + (SELECT count(*) FROM c WHERE m < t.a);
+    SELECT a FROM t ORDER BY rowid;
+    DELETE FROM t;
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(m) AS MATERIALIZED (SELECT a FROM t)
+    UPDATE t SET a = a + (SELECT count(*) FROM c WHERE m > t.a)
+    WHERE a <= (SELECT max(m) FROM c);
+    SELECT a FROM t ORDER BY rowid;
+}
+expect {
+    3
+    4
+    4
+    3
+    4
+    4
+    3
+    3
+    3
+}
+
+# The CTE body has an ORDER BY but no LIMIT, so SQLite can merge it into both
+# subqueries. The correlated SET subquery then reads the rows that earlier
+# updates of the statement wrote.
+@cross-check-integrity
+test cte-update-set-subquery-reads-ordered-cte-merged-into-it {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT a FROM t ORDER BY a)
+    UPDATE t SET a = coalesce((SELECT abs(x) FROM c WHERE x > t.a ORDER BY x LIMIT 1), 0) + 10
+    WHERE a IN (SELECT x FROM c);
+    SELECT a FROM t ORDER BY rowid;
+}
+expect {
+    12
+    13
+    22
+}
+
+# The body of d reads the CTE c of the same WITH clause twice. Both reads use
+# one plan of c, so they must read one stored result.
+test cte-read-twice-in-body-of-another-cte {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT a FROM t), d(y) AS (SELECT count(*) FROM c, c AS c2)
+    SELECT * FROM d;
+    WITH c(x) AS (SELECT a FROM t), d(y) AS (SELECT count(*) FROM c, (SELECT x FROM c) AS c2)
+    SELECT * FROM d;
+    WITH b(x) AS (SELECT a FROM t), c(x) AS (SELECT x FROM b), d(y) AS (SELECT count(*) FROM c, c AS c2)
+    SELECT * FROM d;
+    WITH c(x) AS NOT MATERIALIZED (SELECT a FROM t), d(y) AS (SELECT count(*) FROM c, c AS c2)
+    SELECT * FROM d;
+    WITH c(x) AS (SELECT a FROM t)
+    SELECT (WITH d(y) AS (SELECT count(*) FROM c, c AS c2) SELECT y FROM d);
+    WITH RECURSIVE r(x) AS NOT MATERIALIZED (SELECT 1 UNION ALL SELECT x + 1 FROM r WHERE x < 3),
+    d(y) AS (SELECT count(*) FROM r, (SELECT x FROM r) AS r2)
+    SELECT * FROM d;
+}
+expect {
+    9
+    9
+    9
+    9
+    9
+    9
+}
+
+# The body of d reads c in two subqueries. SQLite merges c into each of them,
+# so each computes c again. The reads use one plan of c, with the same
+# cursors, so a correlated read in the body must read the result that the outer
+# read stored.
+test cte-random-read-in-two-subqueries-of-another-cte {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT random() FROM t),
+    d(y) AS (SELECT (SELECT max(x) FROM c) = (SELECT max(x) FROM c))
+    SELECT y FROM d;
+    WITH c(x) AS (SELECT a FROM t),
+    d(y) AS (SELECT count(*) FROM c AS p WHERE EXISTS (SELECT 1 FROM c AS q WHERE q.x = p.x))
+    SELECT y FROM d;
+}
+expect {
+    0
+    3
+}
+
 test cte-chain {
     WITH a AS (SELECT 1 as x), b AS (SELECT x FROM a), c AS (SELECT x FROM b), d AS (SELECT x FROM c) SELECT * FROM d;
 }

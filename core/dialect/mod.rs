@@ -555,6 +555,18 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether every read of a CTE that a statement reads more than once reads
+    /// one result, computed once for the statement.
+    ///
+    /// PostgreSQL computes such a CTE once unless it is `NOT MATERIALIZED` and
+    /// calls no volatile function (`SS_process_ctes` in subselect.c), and then
+    /// each read gives the same rows. SQLite computes the CTE again for a read
+    /// that its query flattener merges into the reading query, and for each
+    /// read of a `NOT MATERIALIZED` CTE.
+    fn stores_cte_read_more_than_once(&self) -> bool {
+        false
+    }
+
     /// How an ORDER BY or DISTINCT ON term is matched to the output columns.
     fn sort_term_matching(&self) -> SortTermMatching {
         SortTermMatching::Sqlite

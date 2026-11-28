@@ -2516,7 +2516,7 @@ pub struct With {
 }
 
 /// CTE materialization
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Materialized {
     /// No hint

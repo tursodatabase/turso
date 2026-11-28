@@ -7012,11 +7012,16 @@ pub struct RecursiveCteInput {
 pub struct FromClauseSubqueryCteMetadata {
     /// Identity shared by all references to the same CTE definition.
     pub id: usize,
-    /// True when more than one read in the same query tree can reuse one
-    /// materialized result for this CTE.
+    /// True when this read shares one materialized result with the other
+    /// reads of this CTE in the statement.
     pub shared_materialization: bool,
-    /// True for explicit WITH ... AS MATERIALIZED.
-    pub materialize_hint: bool,
+    /// The `MATERIALIZED` or `NOT MATERIALIZED` keyword of the CTE.
+    pub materialized: crate::ast::Materialized,
+    /// True when this read uses the plan of the CTE body that an outer query
+    /// reference holds, instead of a plan of its own. All such reads of that
+    /// reference have the same table and cursor ids, so two of them cannot
+    /// each compute the CTE.
+    pub uses_outer_reference_plan: bool,
 }
 
 impl FromClauseSubquery {
@@ -7024,8 +7029,10 @@ impl FromClauseSubquery {
         self.cte.map(|cte| cte.id)
     }
 
+    /// True for explicit WITH ... AS MATERIALIZED.
     pub fn materialize_hint(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.materialize_hint)
+        self.cte
+            .is_some_and(|cte| cte.materialized == crate::ast::Materialized::Yes)
     }
 
     pub fn shared_materialization(&self) -> bool {
@@ -7042,6 +7049,14 @@ impl FromClauseSubquery {
     /// table-backed materialization that can be scanned or probed later.
     pub fn requires_table_materialization(&self) -> bool {
         self.shared_materialization() || self.materialize_hint()
+    }
+
+    /// The CTE id under which this read stores its result for, or reuses the
+    /// result of, the other reads of the CTE. `None` for a read that computes
+    /// the CTE on its own.
+    pub fn stored_result_cte_id(&self) -> Option<usize> {
+        self.cte_id()
+            .filter(|_| self.requires_table_materialization())
     }
 
     /// Only simple single-reference SELECT subqueries can safely use their

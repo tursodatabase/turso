@@ -1,0 +1,22 @@
+# Common table expressions through the PostgreSQL frontend.
+
+@database :memory:
+
+# PostgreSQL computes a CTE that a statement reads more than once a single
+# time, also when SQLite would merge its query into each reading query, and
+# also for NOT MATERIALIZED when its query calls a volatile function.
+test cte-read-twice-is-computed-once {
+    CREATE TABLE cte_rows (a int);
+    INSERT INTO cte_rows VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT random() FROM cte_rows) SELECT count(*) FROM c a JOIN c b ON a.x = b.x;
+    WITH c(x) AS (SELECT random() FROM cte_rows) SELECT count(*) FROM c WHERE x IN (SELECT x FROM c);
+    WITH c(x) AS NOT MATERIALIZED (SELECT random() FROM cte_rows) SELECT count(*) FROM c a JOIN c b ON a.x = b.x;
+    WITH c(x) AS (SELECT random() FROM cte_rows) SELECT count(*) FROM (SELECT x FROM c UNION SELECT x FROM c) u;
+    DROP TABLE cte_rows;
+}
+expect {
+    3
+    3
+    3
+    3
+}

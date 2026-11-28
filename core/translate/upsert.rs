@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::ast::{self, TriggerEvent, TriggerTime, Upsert};
+use crate::ast::{self, TableInternalId, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::{
     compute_generated_columns, emit_row_from_cursor, sets_custom_type_column,
@@ -52,8 +52,8 @@ use crate::{
         },
         insert::Insertion,
         plan::{
-            ColumnUsedMask, EvalAt, OuterQueryReference, ResultSetColumn, SubqueryOrigin,
-            TableReferences,
+            ColumnUsedMask, EvalAt, NonFromClauseSubquery, OuterQueryReference, ResultSetColumn,
+            SubqueryOrigin, TableReferences,
         },
         subquery::{
             emit_non_from_clause_subquery, plan_subqueries_from_returning,
@@ -673,10 +673,13 @@ pub fn emit_upsert(
     let decoded_column_types: Option<Vec<Option<Box<ast::Type>>>> = decoded_current_start
         .map(|_| column_custom_type_names(table.columns(), is_strict, resolver.schema()));
 
-    // WHERE on target row
-    if let Some(pred) = where_clause.as_mut() {
+    for expr in where_clause
+        .iter_mut()
+        .map(|pred| pred.as_mut())
+        .chain(sets.iter_mut().map(|set| set.expr.as_mut()))
+    {
         rewrite_expr_to_registers(
-            pred,
+            expr,
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
@@ -688,16 +691,31 @@ pub fn emit_upsert(
             decoded_column_types.as_deref(),
             &layout,
         )?;
+    }
+    // The subqueries of the WHERE clause and of the SET values are planned
+    // together, because SQLite counts their reads of a CTE together. As in
+    // UPDATE, they are planned before the SET clauses are split, so that
+    // `SET (a, b) = (SELECT ...)` knows how many values the subquery gives.
+    let mut do_update_subqueries = plan_do_update_subqueries(
+        program,
+        resolver,
+        connection,
+        table_references,
+        table_alias,
+        where_clause.as_mut().map(|pred| pred.as_mut()),
+        sets.iter_mut().map(|set| set.expr.as_mut()),
+        &ctx.source_stored_cte_ids,
+    )?;
+
+    // WHERE on target row
+    if let Some(pred) = where_clause.as_mut() {
         emit_do_update_subqueries(
             program,
             resolver,
-            connection,
-            table_references,
-            table_alias,
+            do_update_subqueries.as_mut(),
+            SubqueryOrigin::DmlWhere,
             insertion,
             excluded_decoded_start,
-            std::iter::once(pred.as_mut()),
-            SubqueryOrigin::DmlWhere,
             current_start,
             ctx.conflict_rowid_reg,
             &layout,
@@ -728,34 +746,14 @@ pub fn emit_upsert(
         }),
     )?;
 
-    // Apply SET; capture rowid change if any. As in UPDATE, the subqueries are
-    // planned before the SET clauses are split, so that `SET (a, b) = (SELECT ...)`
-    // knows how many values the subquery gives.
-    for set in sets.iter_mut() {
-        rewrite_expr_to_registers(
-            &mut set.expr,
-            table,
-            expr_current_start,
-            ctx.conflict_rowid_reg,
-            Some(table.get_name()),
-            table_alias,
-            Some(insertion),
-            true,
-            excluded_decoded_start,
-            decoded_column_types.as_deref(),
-            &layout,
-        )?;
-    }
+    // Apply SET; capture rowid change if any.
     emit_do_update_subqueries(
         program,
         resolver,
-        connection,
-        table_references,
-        table_alias,
+        do_update_subqueries.as_mut(),
+        SubqueryOrigin::DmlSet,
         insertion,
         excluded_decoded_start,
-        sets.iter_mut().map(|set| set.expr.as_mut()),
-        SubqueryOrigin::DmlSet,
         current_start,
         ctx.conflict_rowid_reg,
         &layout,
@@ -1822,29 +1820,33 @@ pub fn emit_upsert(
     Ok(())
 }
 
-/// Plans and emits the subqueries in DO UPDATE SET values or in its WHERE
-/// clause, leaving each expression to read the results from registers. A
-/// subquery sees the conflicting row as it was before the update. As in SQLite,
-/// a subquery that reads that row or `excluded` runs for every conflicting row,
-/// and any other runs once, at the first conflict.
+/// The subqueries of DO UPDATE, planned together so that their reads of a CTE
+/// can share one stored result, and the tables they can read.
+struct DoUpdateSubqueries {
+    /// The target table, named by its alias, and `excluded` as an outer table.
+    table_references: TableReferences,
+    excluded_id: TableInternalId,
+    subqueries: Vec<NonFromClauseSubquery>,
+}
+
+/// Plans the subqueries in the WHERE clause and the SET values of DO UPDATE.
+/// Returns `None` when there are none. A subquery sees the conflicting row as
+/// it was before the update.
 #[allow(clippy::too_many_arguments)]
-fn emit_do_update_subqueries<'a>(
+fn plan_do_update_subqueries<'a>(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    resolver: &Resolver,
     connection: &Arc<Connection>,
     table_references: &TableReferences,
     table_alias: Option<&str>,
-    insertion: &Insertion,
-    excluded_decoded_start: Option<usize>,
-    exprs: impl Iterator<Item = &'a mut ast::Expr>,
-    origin: SubqueryOrigin,
-    current_start: usize,
-    rowid_reg: usize,
-    layout: &ColumnLayout,
-) -> crate::Result<()> {
-    let exprs: Vec<&mut ast::Expr> = exprs.filter(|e| expr_contains_subquery(e)).collect();
-    if exprs.is_empty() {
-        return Ok(());
+    where_clause: Option<&'a mut ast::Expr>,
+    sets: impl Iterator<Item = &'a mut ast::Expr>,
+    stored_cte_ids: &[usize],
+) -> crate::Result<Option<DoUpdateSubqueries>> {
+    let where_clause = where_clause.filter(|expr| expr_contains_subquery(expr));
+    let sets: Vec<&mut ast::Expr> = sets.filter(|expr| expr_contains_subquery(expr)).collect();
+    if where_clause.is_none() && sets.is_empty() {
+        return Ok(None);
     }
     // DO UPDATE names the target by its alias when the INSERT gives one, where
     // RETURNING names it by the table's name.
@@ -1882,17 +1884,53 @@ fn emit_do_update_subqueries<'a>(
         program,
         &mut subqueries,
         &mut table_references,
-        exprs.into_iter(),
-        origin,
+        where_clause,
+        sets.into_iter(),
+        stored_cte_ids,
         resolver,
         connection,
     )?;
+    Ok(Some(DoUpdateSubqueries {
+        table_references,
+        excluded_id,
+        subqueries,
+    }))
+}
 
+/// Emits the planned subqueries of the WHERE clause or of the SET values of DO
+/// UPDATE, as `origin` says, leaving each expression to read the results from
+/// registers. As in SQLite, a subquery that reads the conflicting row or
+/// `excluded` runs for every conflicting row, and any other runs once, at the
+/// first conflict.
+#[allow(clippy::too_many_arguments)]
+fn emit_do_update_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    do_update_subqueries: Option<&mut DoUpdateSubqueries>,
+    origin: SubqueryOrigin,
+    insertion: &Insertion,
+    excluded_decoded_start: Option<usize>,
+    current_start: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> crate::Result<()> {
+    let Some(do_update_subqueries) = do_update_subqueries else {
+        return Ok(());
+    };
     // Only a correlated subquery reads the conflicting row or `excluded`.
+    let DoUpdateSubqueries {
+        table_references,
+        excluded_id,
+        subqueries,
+    } = do_update_subqueries;
+    let mut subqueries: Vec<&mut NonFromClauseSubquery> = subqueries
+        .iter_mut()
+        .filter(|subquery| subquery.origin == origin)
+        .collect();
     let cache_state = if subqueries.iter().any(|subquery| subquery.correlated) {
         let cache_state = seed_returning_row_image_in_cache(
             program,
-            &table_references,
+            table_references,
             current_start,
             rowid_reg,
             resolver,
@@ -1903,7 +1941,7 @@ fn emit_do_update_subqueries<'a>(
         resolver.cache_expr_reg(
             Cow::Owned(ast::Expr::RowId {
                 database: None,
-                table: excluded_id,
+                table: *excluded_id,
             }),
             insertion.key_register(),
             false,
@@ -1920,7 +1958,7 @@ fn emit_do_update_subqueries<'a>(
             };
             let expr = ast::Expr::Column {
                 database: None,
-                table: excluded_id,
+                table: *excluded_id,
                 column: i,
                 is_rowid_alias: column.is_rowid_alias(),
             };
