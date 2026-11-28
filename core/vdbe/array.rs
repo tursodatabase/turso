@@ -1,22 +1,17 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use super::array_value::{encode_array, DEFAULT_LOWER_BOUND};
+use super::array_value::{encode_array, ArrayValue, ArrayView, DEFAULT_LOWER_BOUND};
 use crate::dialect::Dialect;
 use crate::numeric::Numeric;
-use crate::types::{Value, ValueIterator};
+use crate::types::Value;
 use crate::Result;
 
 /// Extract values from a record-format array blob.
 /// Returns Err if the blob is not a valid record.
 /// Uses zero-copy iteration over the blob bytes — no Vec<u8> allocation.
 pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
-    let iter = ValueIterator::new(blob)?;
-    let mut values = Vec::with_capacity(iter.size_hint().0);
-    for value in iter {
-        values.push(value?.to_owned()?);
-    }
-    Ok(values)
+    Ok(ArrayValue::decode(blob)?.elements)
 }
 
 /// Extract elements from any Value that represents an array.
@@ -172,10 +167,10 @@ fn parse_pg_text_array(text: &str, unquoted: UnquotedElements) -> Option<Vec<Val
 /// - Numeric elements → unquoted
 /// - Blob elements → as `dialect` writes them
 pub(crate) fn serialize_array_from_blob(blob: &[u8], dialect: &dyn Dialect) -> Result<String> {
-    let iter = ValueIterator::new(blob)?;
+    let view = ArrayView::parse(blob)?;
     let mut result = String::from("{");
     let mut first = true;
-    for vref in iter {
+    for vref in view.elements() {
         let vref = vref?;
         if !first {
             result.push(',');
@@ -265,8 +260,8 @@ fn write_pg_text_element(result: &mut String, s: &str) {
 pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     match val {
         Value::Null => None,
-        Value::Blob(b) => match ValueIterator::new(b) {
-            Ok(iter) => Some(iter.count() as i64),
+        Value::Blob(b) => match ArrayView::parse(b) {
+            Ok(view) => Some(view.elements().count() as i64),
             Err(_) => None,
         },
         Value::Text(t) => parse_text_array(t.as_str()).map(|v| v.len() as i64),
@@ -386,8 +381,8 @@ fn array_find_streaming(
     blob: &[u8],
     predicate: impl Fn(crate::ValueRef<'_>) -> bool,
 ) -> Option<usize> {
-    let iter = ValueIterator::new(blob).ok()?;
-    for (i, vref) in iter.enumerate() {
+    let view = ArrayView::parse(blob).ok()?;
+    for (i, vref) in view.elements().enumerate() {
         let vref = vref.ok()?;
         if predicate(vref) {
             return Some(i);
@@ -509,10 +504,10 @@ pub(crate) fn exec_array_to_string(
 
     // Fast path: stream from blob without materializing Vec<Value>
     if let Value::Blob(blob) = arr {
-        if let Ok(iter) = ValueIterator::new(blob) {
+        if let Ok(view) = ArrayView::parse(blob) {
             let mut result = String::new();
             let mut first = true;
-            for vref in iter {
+            for vref in view.elements() {
                 let Ok(vref) = vref else {
                     return Value::Null;
                 };

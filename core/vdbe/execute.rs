@@ -151,7 +151,7 @@ use super::{
         array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
         parse_text_array, serialize_array_from_blob,
     },
-    array_value::{encode_array, DEFAULT_LOWER_BOUND},
+    array_value::{encode_array, ArrayView, DEFAULT_LOWER_BOUND},
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
         IntegrityCkData, IvmSumKind, RegisterOrLiteral, SorterOpenData,
@@ -2836,8 +2836,8 @@ pub fn op_array_encode(
             // Validate blob is a well-formed record using streaming iterator
             // (no Vec<Value> allocation). Rejects empty blobs and invalid records.
             let valid = !b.is_empty()
-                && ValueIterator::new(b)
-                    .map(|iter| iter.into_iter().all(|r| r.is_ok()))
+                && ArrayView::parse(b)
+                    .map(|view| view.elements().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
                 return crate::error::cold_return(Err(
@@ -3035,8 +3035,9 @@ pub fn op_array_element(
     };
 
     let result = match arr_val {
-        Value::Blob(blob) => match ValueIterator::new(blob) {
-            Ok(mut iter) => iter
+        Value::Blob(blob) => match ArrayView::parse(blob) {
+            Ok(view) => view
+                .elements()
                 .nth(idx)
                 .transpose()?
                 .map(|vref| vref.to_owned())
