@@ -1,15 +1,48 @@
+use std::cmp::Ordering;
+
+/// A REAL value. It is a NaN only in a binary whose frontend has NaN as a value.
+///
+/// Values are totally ordered: NaN equals NaN and is greater than every
+/// number, and -0 equals 0.
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NonNan(f64);
 
 impl NonNan {
-    pub const fn new(value: f64) -> Option<Self> {
-        if value.is_nan() {
+    /// `None` for a NaN where NaN is not a value.
+    #[inline]
+    pub fn new(value: f64) -> Option<Self> {
+        if value.is_nan() && !crate::dialect::linked::nan_is_a_value() {
             return None;
         }
 
         Some(NonNan(value))
+    }
+}
+
+impl PartialEq for NonNan {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for NonNan {}
+
+impl PartialOrd for NonNan {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NonNan {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.0.is_nan(), other.0.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal),
+        }
     }
 }
 

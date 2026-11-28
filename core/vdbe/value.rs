@@ -1159,11 +1159,7 @@ impl Value {
             _ => unreachable!("Unexpected mathematical unary function {:?}", function),
         };
 
-        if result.is_nan() {
-            Value::Null
-        } else {
-            Value::from_f64(result)
-        }
+        Value::from_f64(result)
     }
 
     pub fn exec_math_binary(
@@ -1205,11 +1201,7 @@ impl Value {
             _ => unreachable!("Unexpected mathematical binary function {:?}", function),
         };
 
-        Ok(if result.is_nan() {
-            Value::Null
-        } else {
-            Value::from_f64(result)
-        })
+        Ok(Value::from_f64(result))
     }
 
     /// Mirrors SQLite's logFunc: log(X) calls log10 directly, and log(B,X)

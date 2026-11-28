@@ -9622,12 +9622,12 @@ fn add_to_infinity_count(
 }
 
 /// The sum of the infinite inputs counted by `add_to_infinity_count`: +Inf,
-/// -Inf, or NULL (NaN) when there are both. `None` when there are none.
+/// -Inf, or NaN when there are both. `None` when there are none.
 fn sum_of_infinite_inputs(pos_inf: &Value, neg_inf: &Value) -> Option<Value> {
     let has_pos_inf = pos_inf.as_int().unwrap_or(0) > 0;
     let has_neg_inf = neg_inf.as_int().unwrap_or(0) > 0;
     match (has_pos_inf, has_neg_inf) {
-        (true, true) => Some(Value::Null),
+        (true, true) => Some(Value::from_f64(f64::NAN)),
         (true, false) => Some(Value::from_f64(f64::INFINITY)),
         (false, true) => Some(Value::from_f64(f64::NEG_INFINITY)),
         (false, false) => None,

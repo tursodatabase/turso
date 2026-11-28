@@ -804,7 +804,7 @@ impl<V: AsValueRef> AsValueRef for &V {
 }
 
 impl Value {
-    pub const fn from_f64(f: f64) -> Self {
+    pub fn from_f64(f: f64) -> Self {
         match NonNan::new(f) {
             Some(nn) => Self::Numeric(Numeric::Float(nn)),
             None => Self::Null,
