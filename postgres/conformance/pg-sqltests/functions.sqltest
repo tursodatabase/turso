@@ -2763,6 +2763,25 @@ expect {
     7|1.50|true|"2024-01-02T03:04:05+00:00"|"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"|[1,2]|{"a": 2, "b": 1}
 }
 
+test to-json-writes-a-regclass-and-a-regtype-as-their-names {
+    SELECT to_json('pg_class'::regclass), to_json('int4'::regtype), to_jsonb('character varying'::regtype),
+           to_json(0::regclass), to_json(99999::regtype),
+           array_to_json(ARRAY['pg_class'::regclass]), to_json(ARRAY['int4'::regtype, 'text'::regtype]);
+}
+expect {
+    "pg_class"|"integer"|"character varying"|"-"|"99999"|["pg_class"]|["integer","text"]
+}
+
+test to-json-of-regclass-regtype-and-bytea-columns-and-their-row {
+    CREATE TABLE to_json_reg_columns (id int, c regclass, t regtype, b bytea);
+    INSERT INTO to_json_reg_columns VALUES (1, 'to_json_reg_columns', 'int4', '\x00ff');
+    SELECT to_json(c), to_json(t), to_json(b), to_json(to_json_reg_columns), to_jsonb(to_json_reg_columns)
+    FROM to_json_reg_columns;
+}
+expect {
+    "to_json_reg_columns"|"integer"|"\\\\x00ff"|{"id":1,"c":"to_json_reg_columns","t":"integer","b":"\\\\x00ff"}|{"b": "\\\\x00ff", "c": "to_json_reg_columns", "t": "integer", "id": 1}
+}
+
 test to-jsonb-writes-the-jsonb-output-format {
     CREATE TABLE to_jsonb_documents (j json);
     INSERT INTO to_jsonb_documents VALUES ('{"b": 1,  "a":2, "aa": [1,{"y":1,"x":2.50}], "b": 3}');

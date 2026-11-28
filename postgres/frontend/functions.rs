@@ -1,7 +1,9 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
-use crate::catalog::role_name_by_oid;
+use crate::catalog::{regclass_text, role_name_by_oid};
 use crate::error::{sqlstate_error, sqlstate_error_with_hint};
-use crate::pg_type::{built_in_type_named, lookup_type_name, type_input, NamedTypeKind};
+use crate::pg_type::{
+    built_in_type_named, lookup_type_name, regtype_text, type_input, NamedTypeKind,
+};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
 use std::collections::HashSet;
@@ -69,20 +71,23 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
                 "array_to_json",
                 FunctionArity::OneOf(&[1, 2]),
                 true,
-                |_, args| exec_array_to_json(args),
+                |context, args| exec_array_to_json(context.connection, args),
             )
             .receiving_argument_types(),
         )
         .extension_function(
-            pg_scalar_function("to_json", FunctionArity::Exact(1), true, |_, args| {
-                exec_to_json(args)
+            pg_scalar_function("to_json", FunctionArity::Exact(1), true, |context, args| {
+                exec_to_json(context.connection, args)
             })
             .receiving_argument_types(),
         )
         .extension_function(
-            pg_scalar_function("to_jsonb", FunctionArity::Exact(1), true, |_, args| {
-                exec_to_jsonb(args)
-            })
+            pg_scalar_function(
+                "to_jsonb",
+                FunctionArity::Exact(1),
+                true,
+                |context, args| exec_to_jsonb(context.connection, args),
+            )
             .receiving_argument_types(),
         )
         // FIXME(pg-record): PostgreSQL has no function of this name. It exists
@@ -95,7 +100,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
                 PG_RECORD_TO_JSON_FUNCTION,
                 FunctionArity::Variadic,
                 true,
-                |_, args| exec_record_to_json(args),
+                |context, args| exec_record_to_json(context.connection, args),
             )
             .receiving_argument_types(),
         )
@@ -1800,7 +1805,7 @@ fn json_contains(json: &JsonNode, template: &JsonNode) -> bool {
 /// their type names, such as `boolean[]`, because an element's stored value
 /// doesn't tell its type: a boolean is stored as 1, and a bytea like a nested
 /// array, as a blob.
-fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
+fn exec_array_to_json(connection: &Connection, args: &[Register]) -> Result<Option<Json>> {
     let (args, types) = args.split_at(args.len() / 2);
     let array = args[0].get_value();
     let Some(pretty) = pretty_argument(args.get(1).map(Register::get_value))? else {
@@ -1815,6 +1820,7 @@ fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
     let element = JsonElement::of_type(element_type);
     let mut json = String::new();
     write_json_array(
+        connection,
         array,
         &JsonArrayLayout {
             element,
@@ -1921,7 +1927,7 @@ fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
 /// comma when `pretty` is true. Each value is written by its type, as
 /// to_json() writes it. The result is NULL when `present` is NULL: an outer
 /// join left the row out. After the arguments come their type names.
-fn exec_record_to_json(args: &[Register]) -> Result<Option<Json>> {
+fn exec_record_to_json(connection: &Connection, args: &[Register]) -> Result<Option<Json>> {
     let (args, types) = args.split_at(args.len() / 2);
     let Some(pretty) = pretty_argument(Some(args[0].get_value()))? else {
         return Ok(None);
@@ -1942,7 +1948,12 @@ fn exec_record_to_json(args: &[Register]) -> Result<Option<Json>> {
         json.push(':');
         match field[1].get_value() {
             Value::Null => json.push_str("null"),
-            value => write_json_of_type(value, &field_type[1].get_value().to_string(), &mut json)?,
+            value => write_json_of_type(
+                connection,
+                value,
+                &field_type[1].get_value().to_string(),
+                &mut json,
+            )?,
         }
     }
     json.push('}');
@@ -1952,7 +1963,7 @@ fn exec_record_to_json(args: &[Register]) -> Result<Option<Json>> {
 /// `to_json(value)`: the value as JSON, written by its type as array_to_json
 /// writes an element, and an array as array_to_json writes it. After the
 /// argument comes its type name, because a stored value doesn't tell its type.
-fn exec_to_json(args: &[Register]) -> Result<Option<Json>> {
+fn exec_to_json(connection: &Connection, args: &[Register]) -> Result<Option<Json>> {
     let [value, type_name] = args else {
         unreachable!("to_json takes one argument and its type name");
     };
@@ -1961,14 +1972,19 @@ fn exec_to_json(args: &[Register]) -> Result<Option<Json>> {
         return Ok(None);
     }
     let mut json = String::new();
-    write_json_of_type(value, &type_name.get_value().to_string(), &mut json)?;
+    write_json_of_type(
+        connection,
+        value,
+        &type_name.get_value().to_string(),
+        &mut json,
+    )?;
     Ok(Some(Json(json)))
 }
 
 /// `to_jsonb(value)`: the JSON that to_json gives, as a jsonb value. jsonb
 /// keeps one field of each name, orders the fields, and writes numbers as
 /// numeric does, so `to_jsonb(1e20::float8)` is `100000000000000000000`.
-fn exec_to_jsonb(args: &[Register]) -> Result<Option<Jsonb>> {
+fn exec_to_jsonb(connection: &Connection, args: &[Register]) -> Result<Option<Jsonb>> {
     let [value, type_name] = args else {
         unreachable!("to_jsonb takes one argument and its type name");
     };
@@ -1977,7 +1993,12 @@ fn exec_to_jsonb(args: &[Register]) -> Result<Option<Jsonb>> {
         return Ok(None);
     }
     let mut json = String::new();
-    write_json_of_type(value, &type_name.get_value().to_string(), &mut json)?;
+    write_json_of_type(
+        connection,
+        value,
+        &type_name.get_value().to_string(),
+        &mut json,
+    )?;
     Ok(Some(Jsonb(jsonb_text(&json)?)))
 }
 
@@ -1992,7 +2013,12 @@ pub(crate) fn jsonb_text(json: &str) -> Result<String> {
 /// Writes `value`, whose type is `type_name`, as JSON. An array type such as
 /// `integer[]` gives a JSON array. When the type is not known, a blob that
 /// holds an array is written as an array too.
-fn write_json_of_type(value: &Value, type_name: &str, json: &mut String) -> Result<()> {
+fn write_json_of_type(
+    connection: &Connection,
+    value: &Value,
+    type_name: &str,
+    json: &mut String,
+) -> Result<()> {
     let element_type = type_name.trim_end_matches("[]");
     let dimensions = (type_name.len() - element_type.len()) / 2;
     let element = JsonElement::of_type(element_type);
@@ -2002,9 +2028,9 @@ fn write_json_of_type(value: &Value, type_name: &str, json: &mut String) -> Resu
             dimensions,
             separator: ",",
         };
-        return write_json_array(value, &layout, json);
+        return write_json_array(connection, value, &layout, json);
     }
-    write_json_element(value, element, json)
+    write_json_element(connection, value, element, json)
 }
 
 /// Writes the jsonb value `node` as PostgreSQL's jsonb_out writes it: a space
@@ -2091,6 +2117,11 @@ enum JsonElement {
     Jsonb,
     /// `"\\x0102"`: the bytes in hex, as a string.
     Bytea,
+    /// The name of the relation that has the value as its oid, as a JSON
+    /// string.
+    RegClass,
+    /// The name of the type that has the value as its oid, as a JSON string.
+    RegType,
     /// A JSON string with a `T` between the date and the time.
     Timestamp,
     /// Like Timestamp, followed by the UTC offset `+00:00`.
@@ -2103,7 +2134,7 @@ enum JsonElement {
 }
 
 impl JsonElement {
-    // FIXME(pg-catalog): PostgreSQL also picks how to_json writes a value by type oid (json_categorize_type), so the named arms stay. The last arm stands in for the cast to json in pg_cast of a type that has one, and for the typoutput function in pg_type of the others. A pg_cast and pg_type lookup replaces that arm.
+    // FIXME(pg-catalog): PostgreSQL also picks how to_json writes a value by type oid (json_categorize_type), so the named arms stay, except those of regclass and regtype. These two arms and the last arm stand in for the cast to json in pg_cast of a type that has one, and for the typoutput function in pg_type of the others. A pg_cast and pg_type lookup replaces them.
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
@@ -2114,6 +2145,8 @@ impl JsonElement {
             "jsonb" => Self::Jsonb,
             // A cast to bytea is a cast to blob, so a blob is a bytea.
             "bytea" | "blob" => Self::Bytea,
+            "regclass" => Self::RegClass,
+            "regtype" => Self::RegType,
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::Timestamptz,
             "anyarray" | "any" | "unknown" | "null" => Self::Unknown,
@@ -2122,11 +2155,17 @@ impl JsonElement {
     }
 }
 
-fn write_json_array(array: &Value, layout: &JsonArrayLayout, json: &mut String) -> Result<()> {
-    write_json_array_level(array, layout, layout.separator, 1, json)
+fn write_json_array(
+    connection: &Connection,
+    array: &Value,
+    layout: &JsonArrayLayout,
+    json: &mut String,
+) -> Result<()> {
+    write_json_array_level(connection, array, layout, layout.separator, 1, json)
 }
 
 fn write_json_array_level(
+    connection: &Connection,
     array: &Value,
     layout: &JsonArrayLayout,
     separator: &str,
@@ -2145,16 +2184,31 @@ fn write_json_array_level(
         match element {
             Value::Null => json.push_str("null"),
             // Only the outermost level gets line feeds, as in PostgreSQL.
-            _ if inner_level => write_json_array_level(element, layout, ",", level + 1, json)?,
-            _ => write_json_element(element, layout.element, json)?,
+            _ if inner_level => {
+                write_json_array_level(connection, element, layout, ",", level + 1, json)?
+            }
+            _ => write_json_element(connection, element, layout.element, json)?,
         }
     }
     json.push(']');
     Ok(())
 }
 
-fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) -> Result<()> {
+fn write_json_element(
+    connection: &Connection,
+    element: &Value,
+    kind: JsonElement,
+    json: &mut String,
+) -> Result<()> {
     match (kind, element) {
+        // A regclass and a regtype are stored as the oid and written as the
+        // name, as their output functions write them.
+        (JsonElement::RegClass, Value::Numeric(Numeric::Integer(oid))) => {
+            write_json_string(&regclass_text(connection, *oid), json)
+        }
+        (JsonElement::RegType, Value::Numeric(Numeric::Integer(oid))) => {
+            write_json_string(&regtype_text(connection, *oid), json)
+        }
         (JsonElement::Boolean, Value::Numeric(Numeric::Integer(0))) => json.push_str("false"),
         (JsonElement::Boolean, Value::Numeric(_)) => json.push_str("true"),
         (JsonElement::Json, Value::Text(text)) => json.push_str(text.as_str()),
@@ -3162,8 +3216,23 @@ mod tests {
             dimensions: 1,
             separator: ",",
         };
+        let (io, db) = crate::open_database(
+            ":memory:",
+            None,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap();
+        drop(io);
+        let connection = crate::PgConnection::connect(&db).unwrap();
         let mut json = String::new();
-        write_json_array(&Value::Blob(record.as_blob().clone()), &layout, &mut json).unwrap();
+        write_json_array(
+            connection.inner(),
+            &Value::Blob(record.as_blob().clone()),
+            &layout,
+            &mut json,
+        )
+        .unwrap();
         assert_eq!(json, r#"["Infinity","-Infinity",1.5]"#);
     }
 
