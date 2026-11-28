@@ -1,0 +1,18 @@
+[package]
+name = "turso_dialect_definitions"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dialect definitions that the Turso frontends share"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+turso_core = { path = "../core", version = "0.9.0-pre.6", default-features = false, features = ["fs"] }
+turso_parser = { workspace = true }
+
+[lints]
+workspace = true

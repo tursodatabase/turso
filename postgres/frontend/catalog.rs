@@ -114,7 +114,7 @@ impl Dialect for PostgresDialect {
     }
 
     fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
-        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+        turso_dialect_definitions::SqliteDialect.parameter_marker_ranges(sql)
     }
 
     fn validate_attach(&self) -> Result<()> {
@@ -126,7 +126,7 @@ impl Dialect for PostgresDialect {
     }
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(turso_sqlite::SqliteDialect)
+        Arc::new(turso_dialect_definitions::SqliteDialect)
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
