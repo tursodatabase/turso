@@ -294,6 +294,12 @@ SELECT COUNT(*) FROM employees
 HAVING (SELECT COUNT(*) FROM departments WHERE departments.id = employees.department_id) > 0;
 ```
 
+At least one result column of such a query must contain an aggregate function that the query computes, as in SQLite. An aggregate in a subquery's result column that reads only columns of the enclosing query belongs to the enclosing query, so it does not count for the subquery. An aggregate directly inside a subquery of a result column counts when its arguments read only columns of the outer query, as in `SELECT (SELECT max(t.x)) FROM t HAVING 1`. Unlike SQLite, such an aggregate two or more subqueries down does not count. Otherwise the query fails with `HAVING clause on a non-aggregate query`, even when HAVING itself contains an aggregate.
+
+```sql
+SELECT max(salary) FROM employees HAVING COUNT(*) >= 5;
+```
+
 ### GROUP BY with Expressions
 
 ```sql

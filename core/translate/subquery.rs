@@ -273,6 +273,11 @@ pub fn plan_subqueries_from_select_plan(
         }
         None => Vec::new(),
     };
+    // Planning a subquery rewrites it in the result columns, so an aggregate
+    // whose argument holds a subquery no longer equals its `original_expr`
+    // afterwards. Look for the aggregates before planning.
+    let result_columns_compute_aggregates =
+        has_having_without_group_by(plan) && result_columns_compute_aggregates(plan);
     let mut cse_map: Vec<(ast::Expr, ast::Expr)> = Vec::new();
     let mut same_query_map: Vec<(ast::Expr, TableInternalId, SubqueryOrigin)> = Vec::new();
     // WHERE
@@ -341,6 +346,7 @@ pub fn plan_subqueries_from_select_plan(
     }
 
     // Result columns
+    let aggregates_moved_before_result_columns = resolver.count_aggregates_moved_from_subqueries();
     {
         crate::stack::trace_stack!("select_result_columns");
         plan_subqueries_with_outer_query_access(
@@ -358,6 +364,19 @@ pub fn plan_subqueries_from_select_plan(
             &shared_subqueries,
         )?;
     }
+
+    // A subquery in a result column that holds an aggregate of this query's
+    // columns makes this query an aggregate query, like an aggregate in the
+    // result column itself. Only a subquery one level down moves such an
+    // aggregate up to this query. One further down computes the aggregate in
+    // its own plan, which would give a wrong result here, so that case raises
+    // the error instead.
+    validate_having_without_group_by(
+        plan,
+        resolver,
+        result_columns_compute_aggregates,
+        resolver.count_aggregates_moved_from_subqueries() > aggregates_moved_before_result_columns,
+    )?;
 
     // ORDER BY
     {
@@ -413,6 +432,109 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.non_from_clause_subqueries,
     )?;
     Ok(())
+}
+
+/// Whether the query has HAVING and no GROUP BY.
+pub(crate) fn has_having_without_group_by(plan: &SelectPlan) -> bool {
+    plan.group_by
+        .as_ref()
+        .is_some_and(|group_by| group_by.exprs.is_empty() && group_by.having.is_some())
+}
+
+/// Return the error SQLite returns for HAVING without GROUP BY in a query that
+/// is certainly not an aggregate query, before its subqueries are planned.
+///
+/// SQLite checks HAVING before it reads ORDER BY, so this runs before ORDER BY
+/// is parsed. A query whose subqueries may move aggregates up to it is checked
+/// again by [validate_having_without_group_by] once they are planned.
+pub(crate) fn validate_having_without_group_by_before_subqueries(
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<()> {
+    if !has_having_without_group_by(plan) {
+        return Ok(());
+    }
+    let may_be_aggregate_query = if resolver
+        .catalog
+        .dialect
+        .having_aggregates_make_query_aggregate()
+    {
+        !plan.aggregates.is_empty()
+            || plan
+                .result_columns
+                .iter()
+                .map(|rc| &rc.expr)
+                .chain(plan.group_by.iter().flat_map(|g| g.having.iter().flatten()))
+                .any(expr_contains_subquery)
+    } else {
+        result_columns_compute_aggregates(plan)
+            || plan
+                .result_columns
+                .iter()
+                .any(|rc| expr_contains_subquery(&rc.expr))
+    };
+    if !may_be_aggregate_query {
+        crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+    }
+    Ok(())
+}
+
+/// Return the error SQLite returns for HAVING without GROUP BY in a query that
+/// is not an aggregate query.
+///
+/// SQLite counts only the aggregates of the result columns that this query
+/// computes, so `SELECT 1 FROM t HAVING max(x) > 0` fails, and so does a
+/// subquery whose result-column aggregate belongs to the enclosing query.
+/// `result_columns_compute_aggregates` tells whether the result columns hold
+/// such aggregates, and `result_column_subqueries_move_aggregates` whether
+/// subqueries in the result columns move aggregates up to this query.
+/// See [crate::dialect::Dialect::having_aggregates_make_query_aggregate] for
+/// the aggregates that the PostgreSQL dialect counts.
+fn validate_having_without_group_by(
+    plan: &SelectPlan,
+    resolver: &Resolver,
+    result_columns_compute_aggregates: bool,
+    result_column_subqueries_move_aggregates: bool,
+) -> Result<()> {
+    if !has_having_without_group_by(plan) {
+        return Ok(());
+    }
+    let is_aggregate_query = if resolver
+        .catalog
+        .dialect
+        .having_aggregates_make_query_aggregate()
+    {
+        !plan.aggregates.is_empty() || resolver.count_aggregates_moved_from_subqueries() > 0
+    } else {
+        result_column_subqueries_move_aggregates || result_columns_compute_aggregates
+    };
+    if !is_aggregate_query {
+        crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+    }
+    Ok(())
+}
+
+/// Whether a result column contains an aggregate that this query computes,
+/// not one that a subquery moved up to the enclosing query.
+fn result_columns_compute_aggregates(plan: &SelectPlan) -> bool {
+    let mut found = false;
+    for rc in plan
+        .result_columns
+        .iter()
+        .filter(|rc| rc.contains_aggregates)
+    {
+        let _ = walk_expr(&rc.expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+            if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        });
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 /// Compute query plans for subqueries in a LIMIT/OFFSET pair.

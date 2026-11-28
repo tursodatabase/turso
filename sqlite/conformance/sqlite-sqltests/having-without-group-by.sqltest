@@ -304,3 +304,211 @@ test result-column-with-max-and-indexed-expression {
 expect {
     2222
 }
+
+setup aggregate-query {
+    CREATE TABLE t(id INT PRIMARY KEY, x INT, y INT);
+    INSERT INTO t VALUES (1, 1, 100), (2, 2, 200);
+}
+
+# Like SQLite, a query without GROUP BY is an aggregate query only when a result
+# column contains an aggregate. An aggregate in HAVING alone does not make it one.
+@setup aggregate-query
+test having-aggregate-without-aggregate-result-column-errors {
+    SELECT x FROM t HAVING count(*) > 0;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup aggregate-query
+test having-max-with-constant-result-column-errors {
+    SELECT 1 FROM t HAVING max(y) > 0;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+# An aggregate of this query's columns inside a subquery of a result column
+# makes the query an aggregate query, like SQLite's NC_HasAgg on the outer
+# name context.
+@setup aggregate-query
+test having-outer-aggregate-in-scalar-subquery {
+    SELECT (SELECT max(t.y)) FROM t HAVING count(*) > 0;
+}
+expect {
+    200
+}
+
+@setup aggregate-query
+test having-true-with-outer-aggregate-in-scalar-subquery {
+    SELECT (SELECT max(t.y)) FROM t HAVING 1;
+}
+expect {
+    200
+}
+
+@setup aggregate-query
+test having-false-with-outer-aggregate-in-scalar-subquery {
+    SELECT (SELECT max(t.y)) FROM t HAVING 0;
+}
+expect {
+}
+
+@setup aggregate-query
+test having-bare-column-with-outer-aggregate-in-scalar-subquery {
+    SELECT (SELECT max(t.y)), x FROM t HAVING x > 1;
+}
+expect {
+    200|2
+}
+
+@setup aggregate-query
+test having-outer-aggregate-in-exists {
+    SELECT EXISTS (SELECT max(t.y)) FROM t HAVING 1;
+}
+expect {
+    1
+}
+
+@setup aggregate-query
+test having-outer-aggregate-in-in-subquery {
+    SELECT 200 IN (SELECT max(t.y)) FROM t HAVING 1;
+}
+expect {
+    1
+}
+
+@setup aggregate-query
+test having-subquery-without-outer-aggregate-errors {
+    SELECT (SELECT 1) FROM t HAVING 1;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup aggregate-query
+test having-subquery-with-own-and-outer-aggregates {
+    SELECT (SELECT max(t.y) + max(id) FROM t AS u) FROM t HAVING 1;
+}
+expect {
+    202
+}
+
+@setup aggregate-query
+test having-subquery-with-only-own-aggregate-errors {
+    SELECT (SELECT max(u.y) FROM t AS u) FROM t HAVING 1;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+# SQLite also counts an aggregate of this query's columns two subqueries down,
+# or inside the WHERE of an EXISTS subquery. Turso moves an aggregate up only
+# one subquery level and would compute this one in the innermost subquery,
+# giving a wrong result (100 instead of 200 for the first case), so it raises the
+# error instead.
+@setup aggregate-query
+@skip-if sqlite "Turso raises an error instead of computing an aggregate two subqueries down"
+test having-outer-aggregate-two-subqueries-down-errors {
+    SELECT (SELECT (SELECT max(t.y))) FROM t HAVING count(*) > 0;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup aggregate-query
+@skip-if sqlite "Turso raises an error instead of computing an aggregate two subqueries down"
+test having-outer-aggregate-two-subqueries-down-with-from-errors {
+    SELECT (SELECT (SELECT max(t.y) FROM t AS u LIMIT 1)) FROM t HAVING count(*) > 0;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup aggregate-query
+@skip-if sqlite "Turso raises an error instead of computing an aggregate two subqueries down"
+test having-outer-aggregate-in-exists-where-errors {
+    SELECT EXISTS (SELECT 1 WHERE (SELECT max(t.y)) > 0) FROM t HAVING count(*) > 0;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup aggregate-query
+test having-aggregate-of-middle-subquery-errors {
+    SELECT (SELECT (SELECT max(t.y + u.y)) FROM t AS u) FROM t HAVING count(*) > 0;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+# An aggregate in a subquery's result column that reads only the enclosing
+# query's columns belongs to the enclosing query. It does not make the
+# subquery an aggregate query, even when its HAVING has an aggregate.
+@setup aggregate-query
+test having-subquery-with-only-enclosing-query-aggregate-in-result-errors {
+    SELECT (SELECT max(t.x) FROM t AS u HAVING count(*) > 0) FROM t;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup aggregate-query
+test having-subquery-with-enclosing-and-own-aggregates-in-result {
+    SELECT (SELECT max(t.x) + count(*) FROM t AS u HAVING count(*) > 0) FROM t;
+}
+expect {
+    4
+}
+
+# A subquery in an aggregate's argument, FILTER clause or ORDER BY clause does
+# not hide the aggregate from the check that the query is an aggregate query.
+@setup aggregate-query
+test having-aggregate-with-subquery-argument {
+    SELECT count((SELECT 1)), sum(x IN (SELECT 1)), max(EXISTS (SELECT 1)) FROM t HAVING 1;
+}
+expect {
+    2|1|1
+}
+
+@setup aggregate-query
+test having-aggregate-with-subquery-in-filter {
+    SELECT count(*) FILTER (WHERE x IN (SELECT 2)) FROM t HAVING 1;
+}
+expect {
+    1
+}
+
+@setup aggregate-query
+test having-aggregate-with-subquery-in-order-by {
+    SELECT group_concat(x ORDER BY (SELECT 1)) FROM t HAVING 1;
+}
+expect {
+    1,2
+}
+
+# SQLite checks HAVING before ORDER BY, so an aggregate in the ORDER BY of a
+# query that is not an aggregate query gets the HAVING error.
+@setup aggregate-query
+test having-non-aggregate-query-with-order-by-aggregate-errors {
+    SELECT 1 FROM t HAVING 1 ORDER BY max(x);
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup aggregate-query
+test having-non-aggregate-query-with-subquery-and-order-by-aggregate-errors {
+    SELECT (SELECT 1) FROM t HAVING 1 ORDER BY max(x);
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup aggregate-query
+test having-subquery-aggregate-query-with-order-by-aggregate {
+    SELECT (SELECT max(t.x)) FROM t HAVING 1 ORDER BY max(x);
+}
+expect {
+    2
+}

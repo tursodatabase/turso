@@ -587,6 +587,20 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether an aggregate in HAVING makes a query without GROUP BY an
+    /// aggregate query.
+    ///
+    /// SQLite counts only the aggregates in the result columns, and raises
+    /// "HAVING clause on a non-aggregate query" for
+    /// `SELECT 1 FROM t HAVING max(x) > 0`. PostgreSQL makes every query with
+    /// HAVING an aggregate query. When this returns true, Turso counts the
+    /// aggregates in the result columns and HAVING, and in their subqueries,
+    /// but not the aggregates in ORDER BY. A query with no such aggregate
+    /// still raises the error.
+    fn having_aggregates_make_query_aggregate(&self) -> bool {
+        false
+    }
+
     /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
     /// a table that has rows.
     ///
