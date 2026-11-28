@@ -199,7 +199,8 @@ fn emit_check_of_child(
             }
         }
 
-        program.emit_string8(child.table.name.clone(), result_base);
+        // SQLite shows the name as the CREATE TABLE statement wrote it.
+        program.emit_string8(child.table.declared_name.clone(), result_base);
         program.emit_insn(Insn::Copy {
             src_reg: rowid_reg,
             dst_reg: result_base + 1,

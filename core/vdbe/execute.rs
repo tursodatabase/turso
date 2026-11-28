@@ -17160,6 +17160,9 @@ pub fn op_rename_table(
             // name its schema row has.
             let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
             let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
+            // The declared name of an automatic index has the new table name
+            // as the statement wrote it.
+            let declared_to = crate::namespace::mangle_name(*namespace, to.as_str());
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
@@ -17168,6 +17171,12 @@ pub fn op_rename_table(
                     &mangled_from,
                     &mangled_to,
                 ) {
+                    index.declared_name = crate::util::renamed_automatic_index_name(
+                        &index.name,
+                        &mangled_from,
+                        &declared_to,
+                    )
+                    .expect("the index is an automatic index of the table");
                     index.name = name;
                 }
             });
@@ -17190,6 +17199,7 @@ pub fn op_rename_table(
                         && normalize_ident(&fk.parent_table) == normalized_from
                     {
                         fk.parent_table.clone_from(&normalized_to);
+                        fk.parent_table_declared.clone_from(to);
                     }
                 }
 
@@ -17219,7 +17229,6 @@ pub fn op_rename_table(
         #[cfg(feature = "conn_raw_api")]
         schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.insert_table(*namespace, normalized_to.to_owned(), table);
-
         let references_renamed_table = |fk: &ForeignKey| {
             fk.parent_namespace == *namespace
                 && normalize_ident(&fk.parent_table) == normalized_from
@@ -17241,6 +17250,7 @@ pub fn op_rename_table(
                     if references_renamed_table(fk_arc) {
                         let fk = Arc::make_mut(fk_arc);
                         fk.parent_table.clone_from(&normalized_to);
+                        fk.parent_table_declared.clone_from(to);
                     }
                 }
             }

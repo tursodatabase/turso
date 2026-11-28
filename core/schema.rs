@@ -33,6 +33,9 @@ use smallvec::SmallVec;
 #[derive(Debug, Clone)]
 pub struct View {
     pub name: String,
+    /// The name as the CREATE VIEW statement wrote it, without the prefix
+    /// of the namespace. `PRAGMA table_list` shows this name, as SQLite does.
+    pub declared_name: String,
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
@@ -42,6 +45,7 @@ pub struct View {
 impl View {
     fn new(
         name: String,
+        declared_name: String,
         sql: String,
         select_stmt: ast::Select,
         columns: Vec<Column>,
@@ -49,6 +53,7 @@ impl View {
     ) -> Self {
         Self {
             name,
+            declared_name,
             sql,
             select_stmt,
             columns,
@@ -3970,10 +3975,13 @@ impl Schema {
         {
             let view_name = self.demangle_name(&view_key).1.to_string();
             if let Some(Cmd::Stmt(Stmt::CreateView {
-                columns, select, ..
+                view_name: declared_name,
+                columns,
+                select,
+                ..
             })) = crate::dialect::parse_statement(dialect, &sql)?
             {
-                self.populate_view(namespace, view_name, sql, &columns, select)?;
+                self.populate_view(namespace, view_name, &declared_name, sql, &columns, select)?;
                 continue;
             }
 
@@ -4032,7 +4040,12 @@ impl Schema {
                     "materialized view {view_name} has an empty schema definition"
                 ))
             })?;
-            let Cmd::Stmt(Stmt::CreateMaterializedView { select, .. }) = cmd else {
+            let Cmd::Stmt(Stmt::CreateMaterializedView {
+                view_name: declared_name,
+                select,
+                ..
+            }) = cmd
+            else {
                 return Err(LimboError::Corrupt(format!(
                     "materialized view {view_name} has a non-view schema definition"
                 )));
@@ -4086,7 +4099,10 @@ impl Schema {
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
-                declared_name: view_name.clone(),
+                declared_name: self
+                    .demangle_name(declared_name.name.as_str())
+                    .1
+                    .to_string(),
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
@@ -4119,14 +4135,20 @@ impl Schema {
         &mut self,
         namespace: NamespaceId,
         name: String,
+        declared_name: &ast::QualifiedName,
         sql: String,
         column_names: &[ast::IndexedColumn],
         select: ast::Select,
     ) -> Result<()> {
         let mut columns = view::extract_view_columns(namespace, &select, self)?;
         columns.rename_columns(column_names);
+        let declared_name = self
+            .demangle_name(declared_name.name.as_str())
+            .1
+            .to_string();
         let view = View::new(
             name,
+            declared_name,
             sql,
             select,
             columns.flat_columns()?,
@@ -4608,7 +4630,7 @@ impl Schema {
                             );
                         }
                         Stmt::CreateView {
-                            view_name: _,
+                            view_name: declared_name,
                             columns: column_names,
                             select,
                             ..
@@ -4624,6 +4646,7 @@ impl Schema {
                                 self.populate_view(
                                     namespace,
                                     view_name,
+                                    &declared_name,
                                     sql.to_string(),
                                     &column_names,
                                     select,
@@ -4833,7 +4856,7 @@ impl Schema {
                 }
                 out.try_push(FkCheckItem {
                     fkid,
-                    parent_table: fk.parent_table.clone(),
+                    parent_table: fk.parent_table_declared.clone(),
                     child_pos: child_pos.into_boxed_slice(),
                     parent: FkCheckParent::Missing,
                 })?;
@@ -4845,7 +4868,7 @@ impl Schema {
             };
             out.try_push(FkCheckItem {
                 fkid,
-                parent_table: fk.parent_table.clone(),
+                parent_table: fk.parent_table_declared.clone(),
                 child_pos: resolved.child_pos,
                 parent,
             })?;
@@ -5152,6 +5175,7 @@ impl TryClone for View {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.try_clone()?,
@@ -5254,6 +5278,7 @@ impl TryClone for Index {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             table_name: self.table_name.clone(),
             root_page: self.root_page,
             columns: self.columns.try_clone()?,
@@ -7544,6 +7569,10 @@ pub fn create_table(
                     let (parent_namespace, parent_table) =
                         demangle_name(supports_namespaces, &mangled_parent_table);
                     let parent_table = parent_table.to_string();
+                    let parent_table_declared =
+                        demangle_name(supports_namespaces, clause.tbl_name.as_str())
+                            .1
+                            .to_string();
                     let parent_columns: Box<[String]> = clause
                         .columns
                         .iter()
@@ -7573,6 +7602,7 @@ pub fn create_table(
                     let fk = ForeignKey {
                         constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                         parent_table,
+                        parent_table_declared,
                         parent_namespace,
                         parent_columns,
                         child_columns,
@@ -8067,6 +8097,10 @@ pub struct ForeignKey {
     pub child_columns: Box<[String]>,
     /// Referenced (parent) table
     pub parent_table: String,
+    /// The name of the parent table as the REFERENCES clause wrote it,
+    /// without the prefix of its namespace. `PRAGMA foreign_key_list` and
+    /// `PRAGMA foreign_key_check` show this name, as SQLite does.
+    pub parent_table_declared: String,
     /// The namespace of the parent table, within the child's database.
     pub parent_namespace: NamespaceId,
     /// Parent-side referenced columns. Empty means "use parent's PRIMARY KEY".
@@ -8128,6 +8162,9 @@ impl ForeignKey {
         Ok(ForeignKey {
             constraint_name: constraint.name.as_ref().map(|n| n.as_str().to_owned()),
             parent_table: parent_table.to_string(),
+            parent_table_declared: demangle_name(supports_namespaces, clause.tbl_name.as_str())
+                .1
+                .to_string(),
             parent_namespace,
             parent_columns: clause
                 .columns
@@ -8205,6 +8242,7 @@ pub struct ResolvedFkRef {
 #[derive(Debug)]
 pub struct FkCheckItem {
     pub fkid: usize,
+    /// The name of the parent table as the REFERENCES clause wrote it.
     pub parent_table: String,
     pub child_pos: BoxedSlice<usize>,
     pub parent: FkCheckParent,
@@ -9000,6 +9038,12 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
 #[derive(Debug, Clone)]
 pub struct Index {
     pub name: String,
+    /// The name as the CREATE INDEX statement wrote it. An automatic index
+    /// has the name that SQLite gives it, which has the table name as the
+    /// CREATE TABLE statement wrote it. `PRAGMA index_list` and ANALYZE
+    /// show this name, as SQLite does. An index that no statement created
+    /// has the same name here as in `name`.
+    pub declared_name: String,
     pub table_name: String,
     pub root_page: i64,
     pub columns: Vec<IndexColumn>,
@@ -9130,6 +9174,13 @@ impl IndexColumn {
     }
 }
 
+/// The name that SQLite gives automatic index `name` of `table`: the name
+/// with the table name as the CREATE TABLE statement wrote it.
+fn declared_automatic_index_name(name: &str, table: &BTreeTable) -> String {
+    crate::util::renamed_automatic_index_name(name, &table.name, &table.declared_name)
+        .unwrap_or_else(|| name.to_string())
+}
+
 impl Index {
     pub fn from_sql(
         dialect: &dyn crate::dialect::Dialect,
@@ -9173,6 +9224,7 @@ impl Index {
                     let descriptor = module.attach(dialect, &configuration)?;
                     Ok(Index {
                         name: index_name,
+                        declared_name: idx_name.name.as_str().to_string(),
                         table_name: normalize_ident(tbl_name.as_str()),
                         root_page,
                         columns: index_columns,
@@ -9187,6 +9239,7 @@ impl Index {
                 } else {
                     Ok(Index {
                         name: index_name,
+                        declared_name: idx_name.name.as_str().to_string(),
                         table_name: normalize_ident(tbl_name.as_str()),
                         root_page,
                         columns: index_columns,
@@ -9261,8 +9314,10 @@ impl Index {
 
         assert!(primary_keys.len() == column_count);
 
+        let name = normalize_ident(index_name.as_str());
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            declared_name: declared_automatic_index_name(&name, table),
+            name,
             table_name: table.name.clone(),
             root_page,
             columns: primary_keys,
@@ -9315,8 +9370,10 @@ impl Index {
                 .expect("unique index columns vector was preallocated");
         }
 
+        let name = normalize_ident(index_name.as_str());
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            declared_name: declared_automatic_index_name(&name, table),
+            name,
             table_name: table.name.clone(),
             root_page,
             columns: unique_cols,

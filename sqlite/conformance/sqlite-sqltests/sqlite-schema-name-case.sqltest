@@ -92,3 +92,70 @@ expect {
     1|2
     table|NewName
 }
+
+# The PRAGMAs that list tables and indexes give each name as the CREATE
+# statement wrote it, so that a lookup of the name in sqlite_schema finds
+# the row.
+test pragma-lists-keep-name-case {
+    CREATE TABLE "MixedCase" (a PRIMARY KEY, b UNIQUE, c);
+    CREATE INDEX "MyIdx" ON mixedcase (c);
+    CREATE VIEW "MyView" AS SELECT 1;
+    SELECT name FROM pragma_table_list WHERE schema = 'main' ORDER BY name;
+    SELECT name FROM pragma_table_list('MIXEDCASE');
+    SELECT il.name, m.name FROM pragma_index_list('mixedcase') il
+        LEFT JOIN sqlite_schema m ON m.name = il.name ORDER BY il.name;
+}
+expect {
+    MixedCase
+    MyView
+    sqlite_schema
+    MixedCase
+    MyIdx|MyIdx
+    sqlite_autoindex_MixedCase_1|sqlite_autoindex_MixedCase_1
+    sqlite_autoindex_MixedCase_2|sqlite_autoindex_MixedCase_2
+}
+
+test pragma-lists-keep-name-case-after-rename-and-rollback {
+    CREATE TABLE "MixedCase" (a UNIQUE, b);
+    CREATE INDEX "MyIdx" ON mixedcase (b);
+    BEGIN;
+    ALTER TABLE mixedcase RENAME TO "Other";
+    ROLLBACK;
+    SELECT name FROM pragma_table_list('mixedcase');
+    SELECT name FROM pragma_index_list('mixedcase') ORDER BY name;
+    ALTER TABLE mixedcase RENAME TO "NewName";
+    ALTER TABLE newname ADD COLUMN c;
+    SELECT name FROM pragma_table_list('newname');
+    SELECT name FROM pragma_index_list('newname') ORDER BY name;
+    DROP INDEX myidx;
+    CREATE INDEX myidx ON newname (b);
+    SELECT name FROM pragma_index_list('newname') ORDER BY name;
+}
+expect {
+    MixedCase
+    MyIdx
+    sqlite_autoindex_MixedCase_1
+    NewName
+    MyIdx
+    sqlite_autoindex_NewName_1
+    myidx
+    sqlite_autoindex_NewName_1
+}
+
+# The parent table of a foreign key has the name that the REFERENCES clause
+# wrote.
+test pragma-foreign-key-lists-keep-name-case {
+    CREATE TABLE "Parent" (a PRIMARY KEY);
+    CREATE TABLE "Child" (x REFERENCES parent(a), y REFERENCES "Parent"(a), z REFERENCES PARENT(a));
+    INSERT INTO child VALUES (1, 1, 1);
+    SELECT "table", "from" FROM pragma_foreign_key_list('child') ORDER BY "from";
+    SELECT "table", parent, fkid FROM pragma_foreign_key_check ORDER BY fkid;
+}
+expect {
+    parent|x
+    Parent|y
+    PARENT|z
+    Child|PARENT|0
+    Child|Parent|1
+    Child|parent|2
+}

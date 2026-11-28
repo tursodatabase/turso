@@ -2239,6 +2239,7 @@ fn materialized_subquery_ephemeral_index(
     Ok(Arc::new(Index {
         // Match the runtime autoindex naming so EQP and bytecode make it clear
         // that this is a synthetic probe/index-on-temp-table path.
+        declared_name: format!("ephemeral_subquery_{}", rhs_table.internal_id),
         name: format!("ephemeral_subquery_{}", rhs_table.internal_id),
         columns: index_columns,
         unique: false,

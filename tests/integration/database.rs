@@ -371,16 +371,36 @@ fn test_drop_objects_of_file_with_lowercase_schema_names() {
         .unwrap();
     drop(sqlite);
 
+    const TABLE_LIST_NAMES: &str = "SELECT name FROM pragma_table_list \
+         WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY 1";
+    const INDEX_LIST_NAMES: &str = "SELECT name FROM pragma_index_list('MixedCase') ORDER BY 1";
+    let s = |v: &str| v.to_string();
+    // Like SQLite, the PRAGMAs give the names as the CREATE statements wrote
+    // them, not the lowercase names of the rows.
+    let sqlite_table_names = sqlite_rows(&path, TABLE_LIST_NAMES);
+    let sqlite_index_names = sqlite_rows(&path, INDEX_LIST_NAMES);
+    assert_eq!(sqlite_table_names, vec!["MixedCase", "MyView", "Other"]);
+    assert_eq!(
+        sqlite_index_names,
+        vec!["MyIdx", "sqlite_autoindex_MixedCase_1"]
+    );
     {
         let db = crate::common::TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
+        for (query, sqlite_names) in [
+            (TABLE_LIST_NAMES, &sqlite_table_names),
+            (INDEX_LIST_NAMES, &sqlite_index_names),
+        ] {
+            let rows: Vec<(String,)> = conn.exec_rows(query);
+            let names: Vec<String> = rows.into_iter().map(|(name,)| name).collect();
+            assert_eq!(&names, sqlite_names);
+        }
         conn.execute("CREATE INDEX NewIdx ON MIXEDCASE(a)").unwrap();
         conn.execute("DROP INDEX MYIDX").unwrap();
         conn.execute("DROP VIEW MyView").unwrap();
         conn.execute("DROP TRIGGER MyTrig").unwrap();
     }
 
-    let s = |v: &str| v.to_string();
     assert_eq!(
         sqlite_schema_rows(&path),
         vec![
@@ -404,6 +424,28 @@ fn test_drop_objects_of_file_with_lowercase_schema_names() {
     }
     assert_eq!(sqlite_schema_rows(&path), vec![]);
     assert_eq!(sqlite_integrity_check(&path), "ok");
+}
+
+/// The text rows of `query`, read by SQLite, with the columns joined by `|`.
+fn sqlite_rows(path: &std::path::Path, query: &str) -> Vec<String> {
+    let sqlite = rusqlite::Connection::open(path).unwrap();
+    let mut stmt = sqlite.prepare(query).unwrap();
+    let columns = stmt.column_count();
+    stmt.query_map([], |row| {
+        let mut values = Vec::new();
+        for column in 0..columns {
+            let value: rusqlite::types::Value = row.get(column)?;
+            values.push(match value {
+                rusqlite::types::Value::Text(text) => text,
+                rusqlite::types::Value::Integer(integer) => integer.to_string(),
+                other => format!("{other:?}"),
+            });
+        }
+        Ok(values.join("|"))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
 }
 
 /// Regression test: TursoConnection.close() must finalize outstanding statements
