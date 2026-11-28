@@ -11070,13 +11070,39 @@ fn reject_column_aliases(
 }
 
 // FIXME(pg-catalog): This guesses from the shape of the second argument whether substring() resolves to the pg_proc entry substring(text, text), which takes a regular expression, instead of substring(text, integer). Function resolution in pg_proc on a typed expression tree replaces this.
+fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Sval(_)),
+            ..
+        })) => true,
+        Some(Node::TypeCast(cast)) => cast.type_name.as_ref().is_some_and(|t| {
+            extract_key_columns(&t.names).is_ok_and(|names| {
+                names.last().is_some_and(|name| {
+                    matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "text" | "varchar" | "bpchar" | "char" | "name"
+                    )
+                })
+            })
+        }),
+        Some(Node::AExpr(expr)) => expr
+            .name
+            .iter()
+            .any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
+        _ => false,
+    }
+}
+
 /// Whether the function `name` takes a record, so that an argument may be the
-/// row of a table.
+/// row of a table. The frontend's dialect uses the same list for
+/// `Dialect::takes_row_arguments`.
 // FIXME(pg-catalog): This hand-codes the functions of pg_proc whose parameter
 // is a record or anyelement and that tursopg can give a row: to_json,
 // to_jsonb and row_to_json. A record type and function resolution in pg_proc
 // replace this list.
-fn takes_record(name: &str) -> bool {
+pub fn takes_record(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "to_json" | "to_jsonb" | "row_to_json"
@@ -11122,31 +11148,6 @@ fn is_untyped_literal(node: &pg_query::protobuf::Node) -> bool {
             ..
         }))
     )
-}
-
-fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
-    use pg_query::protobuf::node::Node;
-    match &node.node {
-        Some(Node::AConst(pg_query::protobuf::AConst {
-            val: Some(pg_query::protobuf::a_const::Val::Sval(_)),
-            ..
-        })) => true,
-        Some(Node::TypeCast(cast)) => cast.type_name.as_ref().is_some_and(|t| {
-            extract_key_columns(&t.names).is_ok_and(|names| {
-                names.last().is_some_and(|name| {
-                    matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "text" | "varchar" | "bpchar" | "char" | "name"
-                    )
-                })
-            })
-        }),
-        Some(Node::AExpr(expr)) => expr
-            .name
-            .iter()
-            .any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
-        _ => false,
-    }
 }
 
 /// The error PostgreSQL reports for `f(*)` when the function named by

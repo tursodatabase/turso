@@ -539,7 +539,7 @@ impl Dialect for PostgresDialect {
     /// to_json(), to_jsonb() and row_to_json() take a record, which can be the
     /// row of a table.
     fn takes_row_arguments(&self, name: &str) -> bool {
-        matches!(name, "to_json" | "to_jsonb" | "row_to_json")
+        turso_pg_parser::translator::takes_record(name)
     }
 
     fn expand_row_arguments(
