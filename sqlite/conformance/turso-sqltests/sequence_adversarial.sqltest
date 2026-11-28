@@ -405,3 +405,82 @@ test currval-after-drop-then-recreate-uses-new-sequence-currval {
 expect error {
     currval of sequence "c" is not yet defined in this session
 }
+
+# A rollback that undoes DROP SEQUENCE brings back the dropped sequence and
+# this connection's currval of it, as in PostgreSQL. The sequence created in
+# its place is a different sequence, so its nextval does not set that currval.
+test currval-after-rolled-back-drop-and-recreate {
+    CREATE SEQUENCE c START 42;
+    SELECT nextval('c');
+    BEGIN;
+    DROP SEQUENCE c;
+    CREATE SEQUENCE c;
+    SELECT nextval('c');
+    ROLLBACK;
+    SELECT currval('c');
+    SELECT nextval('c');
+}
+expect {
+    42
+    1
+    42
+    43
+}
+
+test currval-after-rolled-back-drop-and-recreate-of-an-unused-sequence {
+    CREATE SEQUENCE c START 42;
+    BEGIN;
+    DROP SEQUENCE c;
+    CREATE SEQUENCE c;
+    SELECT nextval('c');
+    ROLLBACK;
+    SELECT currval('c');
+}
+expect error {
+    currval of sequence "c" is not yet defined in this session
+}
+
+test currval-after-drop-and-recreate-rolled-back-to-a-savepoint {
+    CREATE SEQUENCE c START 42;
+    SELECT nextval('c');
+    BEGIN;
+    SAVEPOINT sp;
+    DROP SEQUENCE c;
+    CREATE SEQUENCE c;
+    SELECT nextval('c');
+    ROLLBACK TO sp;
+    SELECT currval('c');
+    COMMIT;
+    SELECT currval('c');
+}
+expect {
+    42
+    1
+    42
+    42
+}
+
+test currval-of-a-recreated-sequence-after-a-rolled-back-create {
+    BEGIN;
+    CREATE SEQUENCE c;
+    SELECT nextval('c');
+    ROLLBACK;
+    CREATE SEQUENCE c;
+    SELECT currval('c');
+}
+expect error {
+    currval of sequence "c" is not yet defined in this session
+}
+
+# nextval is not undone by a rollback, and neither is the currval it sets.
+test currval-set-in-a-rolled-back-transaction-is-kept {
+    CREATE SEQUENCE c START 42;
+    BEGIN;
+    SELECT nextval('c');
+    ROLLBACK;
+    SELECT currval('c');
+}
+expect {
+    42
+    42
+}

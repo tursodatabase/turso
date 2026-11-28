@@ -23,6 +23,10 @@ pub struct ReparseSchemaInner {
     /// Held for the whole reparse so a concurrent reparse on this connection
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
+    /// The sequences of the schema being replaced. A sequence read again from
+    /// disk with the same name and definition keeps its `Sequence::id`, so
+    /// the connection's `currval` of it is kept.
+    previous_sequences: SequencesByNamespace,
     phase: ReparsePhase,
 }
 
@@ -116,6 +120,7 @@ impl Connection {
         fresh.schema_version = cookie;
 
         fresh.copy_table_valued_functions(&self.schema.read());
+        let previous_sequences = self.schema.read().sequences_by_namespace();
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -141,6 +146,7 @@ impl Connection {
         }
         Ok(ReparseSchemaInner {
             _guard: guard,
+            previous_sequences,
             phase: ReparsePhase::RunLoadSteps { loader },
         })
     }
@@ -173,7 +179,8 @@ impl Connection {
                     ) else {
                         unreachable!("phase is RunLoadSteps");
                     };
-                    let fresh = loader.into_schema();
+                    let mut fresh = loader.into_schema();
+                    Schema::try_make_mut(&mut fresh)?.keep_sequence_ids(&inner.previous_sequences);
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,

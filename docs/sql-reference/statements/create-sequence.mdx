@@ -76,6 +76,8 @@ If a transaction calls `nextval()` and rolls back, that value may be generated a
 
 Returns the last value returned by `nextval()` in the current connection. Raises an error if `nextval()` has not been called on this sequence in the current session.
 
+The value belongs to one sequence, not to its name. A sequence dropped and created again under the same name has no `currval()` until `nextval()` is called on it. A rollback that undoes the `DROP SEQUENCE` brings back the value of the dropped sequence. A rollback does not undo `nextval()`, so it keeps the `currval()` that `nextval()` set.
+
 ```sql
 CREATE SEQUENCE my_seq;
 SELECT nextval('my_seq');
