@@ -6355,6 +6355,20 @@ impl BTreeTable {
             }
 
             if column.unique() {
+                if let Some(name) = self
+                    .unique_sets
+                    .iter()
+                    .find(|set| {
+                        set.is_inline
+                            && !set.is_primary_key
+                            && set.columns.len() == 1
+                            && set.columns[0].name.eq_ignore_ascii_case(column_name)
+                    })
+                    .and_then(|set| set.constraint_name.as_ref())
+                {
+                    sql.push_str(" CONSTRAINT ");
+                    sql.push_str(&quote_ident(name));
+                }
                 sql.push_str(" UNIQUE");
                 push_on_conflict_clause(&mut sql, self.inline_unique_conflict_clause(column_name));
             }
