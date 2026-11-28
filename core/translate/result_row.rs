@@ -348,53 +348,57 @@ pub fn emit_columns_to_destination(
             queue,
             seen_rows,
         } => {
-            let seen_row = seen_rows.as_ref().map(|(cursor_id, index)| {
+            // The record of the row is the row of a rowid-table queue and the
+            // last column of the key of an ordered queue, whose key is the
+            // sort columns, a sequence number and that record, as in SQLite.
+            let (row_record_reg, queue_key_start_reg, row_record_name) = match queue {
+                RecursiveCteQueue::Fifo { table } => {
+                    (program.alloc_register(), 0, Some(table.name.clone()))
+                }
+                RecursiveCteQueue::Ordered { index, .. } => {
+                    let queue_key_start_reg = program.alloc_registers(index.columns.len());
+                    (
+                        queue_key_start_reg + index.columns.len() - 1,
+                        queue_key_start_reg,
+                        None,
+                    )
+                }
+            };
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(start_reg),
+                count: to_u32(num_columns),
+                dest_reg: to_u32(row_record_reg),
+                index_name: seen_rows
+                    .as_ref()
+                    .map(|(_, index)| index.name.clone())
+                    .or(row_record_name),
+                affinity_str: None,
+            });
+            let skip_seen_row = seen_rows.as_ref().map(|(cursor_id, _)| {
                 let skip_seen_row = program.allocate_label();
-                // Build the probe record once and reuse it for the insert,
-                // and for the queue insert when the queue is a rowid table.
-                // The failed Found leaves the cursor at the insertion point
-                // (both run the same eq-only GE seek), so the insert can skip
-                // its own descent via USE_SEEK, as SQLite does.
-                let record_reg = program.alloc_register();
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(start_reg),
-                    count: to_u32(num_columns),
-                    dest_reg: to_u32(record_reg),
-                    index_name: Some(index.name.clone()),
-                    affinity_str: None,
-                });
+                // The record of the row is also the probe record and the key
+                // of the index of seen rows. The failed Found leaves the
+                // cursor at the insertion point (both run the same eq-only GE
+                // seek), so the insert can skip its own descent via USE_SEEK,
+                // as SQLite does.
                 program.emit_insn(Insn::Found {
                     cursor_id: *cursor_id,
                     target_pc: skip_seen_row,
-                    record_reg,
+                    record_reg: row_record_reg,
                     num_regs: 0,
                 });
                 program.emit_insn(Insn::IdxInsert {
                     cursor_id: *cursor_id,
-                    record_reg,
+                    record_reg: row_record_reg,
                     unpacked_start: Some(start_reg),
                     unpacked_count: Some(to_u32(num_columns)),
                     flags: IdxInsertFlags::new().no_op_duplicate().use_seek(true),
                 });
-                (skip_seen_row, record_reg)
+                skip_seen_row
             });
 
             match queue {
                 RecursiveCteQueue::Fifo { table } => {
-                    let record_reg = match seen_row {
-                        Some((_, record_reg)) => record_reg,
-                        None => {
-                            let record_reg = program.alloc_register();
-                            program.emit_insn(Insn::MakeRecord {
-                                start_reg: to_u32(start_reg),
-                                count: to_u32(num_columns),
-                                dest_reg: to_u32(record_reg),
-                                index_name: Some(table.name.clone()),
-                                affinity_str: None,
-                            });
-                            record_reg
-                        }
-                    };
                     let rowid_reg = program.alloc_register();
                     program.emit_insn(Insn::NewRowid {
                         cursor: *cursor_id,
@@ -404,19 +408,13 @@ pub fn emit_columns_to_destination(
                     program.emit_insn(Insn::Insert {
                         cursor: *cursor_id,
                         key_reg: rowid_reg,
-                        record_reg,
+                        record_reg: row_record_reg,
                         flag: InsertFlags::new().is_ephemeral_table_insert(),
                         table_name: table.name.clone(),
                     });
                 }
                 RecursiveCteQueue::Ordered { index, sort_keys } => {
-                    let sort_key_column_count = sort_keys
-                        .iter()
-                        .map(|key| 1 + usize::from(key.nulls_override.is_some()))
-                        .sum::<usize>();
-                    let queue_row_start_reg =
-                        program.alloc_registers(sort_key_column_count + 1 + num_columns);
-                    let mut queue_key_reg = queue_row_start_reg;
+                    let mut queue_key_reg = queue_key_start_reg;
                     for key in sort_keys {
                         if let Some(nulls) = key.nulls_override {
                             let nulls_last = matches!(nulls, ast::NullsOrder::Last);
@@ -443,19 +441,19 @@ pub fn emit_columns_to_destination(
                         });
                         queue_key_reg += 1;
                     }
+                    turso_assert_eq!(
+                        queue_key_reg + 1,
+                        row_record_reg,
+                        "the sort keys of a recursive CTE queue fill the key up to the sequence number"
+                    );
                     program.emit_insn(Insn::Sequence {
                         cursor_id: *cursor_id,
-                        target_reg: queue_row_start_reg + sort_key_column_count,
-                    });
-                    program.emit_insn(Insn::Copy {
-                        src_reg: start_reg,
-                        dst_reg: queue_row_start_reg + sort_key_column_count + 1,
-                        extra_amount: num_columns - 1,
+                        target_reg: queue_key_reg,
                     });
                     let record_reg = program.alloc_register();
                     program.emit_insn(Insn::MakeRecord {
-                        start_reg: to_u32(queue_row_start_reg),
-                        count: to_u32(sort_key_column_count + 1 + num_columns),
+                        start_reg: to_u32(queue_key_start_reg),
+                        count: to_u32(index.columns.len()),
                         dest_reg: to_u32(record_reg),
                         index_name: Some(index.name.clone()),
                         affinity_str: None,
@@ -470,7 +468,7 @@ pub fn emit_columns_to_destination(
                 }
             }
 
-            if let Some((skip_seen_row, _)) = seen_row {
+            if let Some(skip_seen_row) = skip_seen_row {
                 program.preassign_label_to_next_insn(skip_seen_row);
             }
         }

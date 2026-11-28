@@ -212,3 +212,20 @@ snapshot union-subquery-aggregation {
 snapshot union-order-by-literals {
     SELECT 1 UNION SELECT 2 ORDER BY 1;
 }
+
+# Recursive CTE with ORDER BY: the queue key ends with the record of the row.
+# Taking a row reads that record with one Column and deletes the entry at the
+# cursor; the result columns are read after the OFFSET test (#12327)
+snapshot recursive-cte-order-by-limit-offset {
+    WITH RECURSIVE t(a, b) AS (
+        SELECT 1, 'x' UNION ALL SELECT a + 1, b FROM t WHERE a < 5 ORDER BY 1 DESC LIMIT 3 OFFSET 1
+    ) SELECT a, b FROM t;
+}
+
+# Recursive CTE with UNION and ORDER BY: one record of the row is the key of
+# the index of seen rows and the last column of the queue key
+snapshot recursive-cte-union-order-by {
+    WITH RECURSIVE t(a) AS (
+        SELECT 1 UNION SELECT a + 1 FROM t WHERE a < 5 ORDER BY 1
+    ) SELECT a FROM t;
+}
