@@ -63,6 +63,8 @@ pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
 mod completions;
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
+mod encrypted_temp_file;
 pub use clock::Clock;
 pub use completions::*;
 
@@ -312,62 +314,120 @@ pub trait File: Send + Sync {
     }
 }
 
+/// The size of the blocks in which a temporary file of a spilled sorter, hash table or change
+/// log encrypts its content. See [`TempFile::with_options`].
+pub(crate) const TEMP_FILE_ENCRYPTION_BLOCK_SIZE: usize = 4096;
+
+/// Where a temporary file goes, and the cipher of its content if it is on disk. Every
+/// temporary file of a statement is made from these options, so that no caller can write rows
+/// to disk without a decision about their encryption. See [`TempFile::with_options`].
+#[derive(Debug, Clone, Copy)]
+pub struct TempFileOptions {
+    /// Where the file goes.
+    pub temp_store: crate::TempStore,
+    /// The cipher of the content if the file is on disk, or None to write the content in
+    /// plaintext. A connection sets it when one of its databases is encrypted.
+    pub cipher: Option<crate::CipherMode>,
+}
+
 pub struct TempFile {
     pub(crate) file: Arc<dyn File>,
+    /// A write to `file` must start at a multiple of this number of bytes. It is 1, except
+    /// when `file` encrypts its content in blocks.
+    write_alignment: u64,
+    /// The end of the last range that [`TempFile::reserve`] set aside.
+    reserved_end: crate::sync::atomic::AtomicU64,
+}
+
+/// A range of a temporary file that [`TempFile::reserve`] set aside for one write. Only
+/// `reserve` makes one, so that a spill cannot write at an offset where the file does not
+/// let a write start.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TempFileRange {
+    offset: u64,
+    len: usize,
+}
+
+impl TempFileRange {
+    /// The offset at which the range starts.
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
 }
 
 impl TempFile {
-    pub fn new(io: &Arc<dyn IO>) -> Result<Self> {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            Ok(TempFile {
-                file: Arc::new(DiskTempFile::new(io.clone())),
-            })
+    /// Creates a temporary file for `options.temp_store`. The file is in memory for
+    /// [`crate::TempStore::Memory`], in builds without the `fs` feature and in WASM, and on disk
+    /// otherwise. If the file is on disk and `options.cipher` is set, the file encrypts its
+    /// content in blocks of `block_size` bytes with a new random key, and each write must start
+    /// at a block boundary (see [`TempFile::reserve`]). A file in memory is not encrypted,
+    /// because its content does not go to disk.
+    pub(crate) fn with_options(
+        io: &Arc<dyn IO>,
+        options: TempFileOptions,
+        block_size: usize,
+    ) -> Result<Self> {
+        #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+        if !matches!(options.temp_store, crate::TempStore::Memory) {
+            let file: Arc<dyn File> = Arc::new(DiskTempFile::new(io.clone()));
+            return Ok(match options.cipher {
+                Some(cipher) => TempFile {
+                    file: Arc::new(encrypted_temp_file::EncryptedTempFile::new(
+                        file, cipher, block_size,
+                    )),
+                    write_alignment: block_size as u64,
+                    reserved_end: crate::sync::atomic::AtomicU64::new(0),
+                },
+                None => TempFile::from_file(file),
+            });
         }
-        // on WASM in browser we do not support temp files (as we pre-register db files in advance and can't easily create a new one)
-        // so, for now, we use in-memory IO for tempfiles in WASM
-        #[cfg(target_family = "wasm")]
-        {
-            use crate::MemoryIO;
-
-            let memory_io = Arc::new(MemoryIO::new());
-            let memory_file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-            Ok(TempFile { file: memory_file })
-        }
+        // On WASM in a browser, temp files are not supported (database files are registered in
+        // advance, and a new one cannot easily be created), so temp files are in memory there.
+        let _ = (io, options, block_size);
+        let memory_io = Arc::new(MemoryIO::new());
+        let memory_file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
+        Ok(TempFile::from_file(memory_file))
     }
 
-    /// Creates a TempFile respecting the temp_store setting.
-    /// When temp_store is Memory, uses in-memory storage.
-    /// When temp_store is Default or File, uses file-based storage when
-    /// available. In `no-fs` builds, temp storage always falls back to memory.
-    pub fn with_temp_store(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            #[cfg(not(feature = "fs"))]
-            {
-                let _ = (io, temp_store);
-                let memory_io = Arc::new(MemoryIO::new());
-                let memory_file =
-                    memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-                Ok(TempFile { file: memory_file })
-            }
-            #[cfg(feature = "fs")]
-            {
-                if matches!(temp_store, crate::TempStore::Memory) {
-                    let memory_io = Arc::new(MemoryIO::new());
-                    let memory_file =
-                        memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-                    return Ok(TempFile { file: memory_file });
-                }
-                // Fall through to file-based for Default and File modes
-                Self::new(io)
-            }
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            // WASM always uses memory, ignore temp_store setting
-            let _ = temp_store;
-            Self::new(io)
+    /// Sets aside `len` bytes after the ranges that were set aside before, at an offset where a
+    /// write can start. A spill writes each of its buffers into such a range with
+    /// [`TempFile::write_range`]. Thus the writes to an encrypted file start at block
+    /// boundaries, and the spill does not need to know the block size.
+    pub(crate) fn reserve(&self, len: usize) -> TempFileRange {
+        let mut offset = 0;
+        // The closure always returns Some, so the update cannot fail.
+        let _ = self.reserved_end.fetch_update(
+            crate::sync::atomic::Ordering::AcqRel,
+            crate::sync::atomic::Ordering::Acquire,
+            |end| {
+                offset = end.next_multiple_of(self.write_alignment);
+                Some(offset + len as u64)
+            },
+        );
+        TempFileRange { offset, len }
+    }
+
+    /// Writes `buffer` into `range`, which [`TempFile::reserve`] of this file set aside.
+    /// `buffer` fills the range.
+    pub(crate) fn write_range(
+        &self,
+        range: TempFileRange,
+        buffer: Arc<Buffer>,
+        c: Completion,
+    ) -> Result<Completion> {
+        crate::turso_assert_eq!(
+            buffer.len(),
+            range.len,
+            "a spill write must fill the range that was reserved for it"
+        );
+        self.file.pwrite(range.offset, buffer, c)
+    }
+
+    fn from_file(file: Arc<dyn File>) -> Self {
+        Self {
+            file,
+            write_alignment: 1,
+            reserved_end: crate::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -384,13 +444,13 @@ impl core::ops::Deref for TempFile {
 /// a temp database's file only when the pager first writes a page
 /// (`pager_write_pagelist`). Most ephemeral tables, sorters and hash tables
 /// fit in memory and never write, so they never touch the file system.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
 struct DiskTempFile {
     io: Arc<dyn IO>,
     created: crate::sync::OnceLock<CreatedTempFile>,
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
 struct CreatedTempFile {
     file: Arc<dyn File>,
     /// Removes the directory when dropped. Declared after `file` so the file
@@ -399,7 +459,7 @@ struct CreatedTempFile {
     dir: tempfile::TempDir,
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
 impl DiskTempFile {
     fn new(io: Arc<dyn IO>) -> Self {
         Self {
@@ -425,7 +485,7 @@ impl DiskTempFile {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
 impl File for DiskTempFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         self.file()?.lock_file(exclusive)
@@ -492,6 +552,26 @@ mod temp_file_tests {
 
         drop(temp_file);
         assert!(!temp_dir.exists());
+    }
+
+    /// The ranges of a file that encrypts its content start at block boundaries. The ranges
+    /// of a plain file follow each other with no gaps.
+    #[test]
+    fn reserve_starts_each_range_where_a_write_can_start() {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform IO must initialize"));
+        let file = |cipher| {
+            let options = TempFileOptions {
+                temp_store: crate::TempStore::File,
+                cipher,
+            };
+            TempFile::with_options(&io, options, 4096).unwrap()
+        };
+        let offsets = |file: TempFile| [10, 4096, 1].map(|len| file.reserve(len).offset());
+        assert_eq!(offsets(file(None)), [0, 10, 4106]);
+        assert_eq!(
+            offsets(file(Some(crate::CipherMode::Aes256Gcm))),
+            [0, 4096, 8192]
+        );
     }
 }
 

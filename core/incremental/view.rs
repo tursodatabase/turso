@@ -1,14 +1,16 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::ast;
 use crate::ast::{Cmd, Stmt};
-use crate::io::{Buffer, Completion, File, TempFile, IO};
+use crate::io::{
+    Buffer, Completion, File, TempFile, TempFileOptions, IO, TEMP_FILE_ENCRYPTION_BLOCK_SIZE,
+};
 use crate::namespace::NamespaceId;
 use crate::schema::view::{extract_view_columns, ViewColumnSchema};
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, Value};
-use crate::{turso_assert, LimboError, Result, TempStore};
+use crate::{turso_assert, LimboError, Result};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// Version of the materialized-view storage format embedded in every hidden
@@ -205,7 +207,6 @@ struct SharedChangeLog {
     event_count: AtomicUsize,
     io: Arc<dyn IO>,
     temp_file: Mutex<Option<TempFile>>,
-    next_spill_offset: Mutex<u64>,
     pending_spill: Mutex<Option<PendingSpill>>,
 }
 
@@ -222,7 +223,6 @@ impl SharedChangeLog {
             event_count: AtomicUsize::new(0),
             io,
             temp_file: Mutex::new(None),
-            next_spill_offset: Mutex::new(0),
             pending_spill: Mutex::new(None),
         }
     }
@@ -254,9 +254,9 @@ impl SharedChangeLog {
         table_id: TableChangeId,
         key: i64,
         values: crate::alloc::Vec<Value>,
-        temp_store: TempStore,
+        temp_files: TempFileOptions,
     ) -> Result<bool> {
-        self.record_change(table_id, key, values, 1, temp_store)
+        self.record_change(table_id, key, values, 1, temp_files)
     }
 
     fn record_delete(
@@ -264,9 +264,9 @@ impl SharedChangeLog {
         table_id: TableChangeId,
         key: i64,
         values: crate::alloc::Vec<Value>,
-        temp_store: TempStore,
+        temp_files: TempFileOptions,
     ) -> Result<bool> {
-        self.record_change(table_id, key, values, -1, temp_store)
+        self.record_change(table_id, key, values, -1, temp_files)
     }
 
     /// Append one change event to the log. Returns `true` when the in-memory
@@ -274,14 +274,15 @@ impl SharedChangeLog {
     /// file is now in flight; the caller must wait for it (`finish_spill`)
     /// before recording anything else, since only one spill can be in flight
     /// at a time. The event is appended either way: recording never returns
-    /// IO and never needs to be repeated.
+    /// IO and never needs to be repeated. `temp_files` says where a spill goes,
+    /// and whether the spill file encrypts its content.
     fn record_change(
         &self,
         table_id: TableChangeId,
         key: i64,
         values: crate::alloc::Vec<Value>,
         weight: isize,
-        temp_store: TempStore,
+        temp_files: TempFileOptions,
     ) -> Result<bool> {
         turso_assert!(
             self.pending_spill.lock().is_none(),
@@ -303,7 +304,7 @@ impl SharedChangeLog {
             }
         }
 
-        self.start_spill(temp_store)?;
+        self.start_spill(temp_files)?;
         Ok(true)
     }
 
@@ -335,7 +336,7 @@ impl SharedChangeLog {
         Ok(IOResult::Done(()))
     }
 
-    fn start_spill(&self, temp_store: TempStore) -> Result<()> {
+    fn start_spill(&self, temp_files: TempFileOptions) -> Result<()> {
         let (buffer, table_ids, rows) = {
             let changes = self.changes.lock();
             (
@@ -351,25 +352,22 @@ impl SharedChangeLog {
             )
         };
         let len = buffer.len();
-        let offset = {
-            let mut next = self.next_spill_offset.lock();
-            let offset = *next;
-            *next = next.saturating_add(len as u64);
-            offset
-        };
-        let file = {
+        let (completion, offset) = {
             let mut temp_file = self.temp_file.lock();
             if temp_file.is_none() {
-                *temp_file = Some(TempFile::with_temp_store(&self.io, temp_store)?);
+                *temp_file = Some(TempFile::with_options(
+                    &self.io,
+                    temp_files,
+                    TEMP_FILE_ENCRYPTION_BLOCK_SIZE,
+                )?);
             }
-            temp_file
-                .as_ref()
-                .expect("temp file initialized above")
-                .file
-                .clone()
+            let temp_file = temp_file.as_ref().expect("temp file initialized above");
+            let range = temp_file.reserve(len);
+            let completion = Completion::new_write(|_| {});
+            let completion =
+                temp_file.write_range(range, Arc::new(Buffer::new(buffer)), completion)?;
+            (completion, range.offset())
         };
-        let completion = Completion::new_write(|_| {});
-        let completion = file.pwrite(offset, Arc::new(Buffer::new(buffer)), completion)?;
         *self.pending_spill.lock() = Some(PendingSpill {
             completion,
             segment: SpillSegment {
@@ -532,7 +530,6 @@ impl TransactionChanges {
         self.change_log.subscriptions.lock().clear();
         self.change_log.pending_spill.lock().take();
         self.change_log.temp_file.lock().take();
-        *self.change_log.next_spill_offset.lock() = 0;
         *self.change_log.revision.lock() = 0;
     }
 
@@ -571,12 +568,12 @@ impl TransactionChanges {
         view_names: &[String],
         key: i64,
         values: crate::alloc::Vec<Value>,
-        temp_store: TempStore,
+        temp_files: TempFileOptions,
     ) -> Result<bool> {
         let table_id = TableChangeId::RootPage(table.root_page);
         self.change_log.subscribe_views(view_names, &table_id);
         self.change_log
-            .record_insert(table_id, key, values, temp_store)
+            .record_insert(table_id, key, values, temp_files)
     }
 
     /// Record a deletion once and subscribe every dependent view. See
@@ -587,12 +584,12 @@ impl TransactionChanges {
         view_names: &[String],
         key: i64,
         values: crate::alloc::Vec<Value>,
-        temp_store: TempStore,
+        temp_files: TempFileOptions,
     ) -> Result<bool> {
         let table_id = TableChangeId::RootPage(table.root_page);
         self.change_log.subscribe_views(view_names, &table_id);
         self.change_log
-            .record_delete(table_id, key, values, temp_store)
+            .record_delete(table_id, key, values, temp_files)
     }
 
     /// Record an arbitrary signed contribution once and subscribe every
@@ -606,7 +603,7 @@ impl TransactionChanges {
         key: i64,
         values: crate::alloc::Vec<Value>,
         weight: isize,
-        temp_store: TempStore,
+        temp_files: TempFileOptions,
     ) -> Result<bool> {
         if weight == 0 {
             return Ok(false);
@@ -614,7 +611,7 @@ impl TransactionChanges {
         let table_id = TableChangeId::RootPage(table.root_page);
         self.change_log.subscribe_views(view_names, &table_id);
         self.change_log
-            .record_change(table_id, key, values, weight, temp_store)
+            .record_change(table_id, key, values, weight, temp_files)
     }
 
     /// Wait for a spill that `insert`/`delete`/`change` started. The caller
@@ -655,7 +652,7 @@ impl crate::Connection {
             rowid,
             values.into_iter().try_collect()?,
             weight,
-            self.get_temp_store(),
+            self.temp_file_options(),
         )?;
         if spill_started {
             use crate::IOExt;
@@ -742,6 +739,13 @@ mod tests {
         BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
     use crate::sync::Arc;
+    use crate::{CipherMode, TempStore};
+
+    /// Temp files in memory, which are not encrypted.
+    const IN_MEMORY: TempFileOptions = TempFileOptions {
+        temp_store: TempStore::Memory,
+        cipher: None,
+    };
 
     #[test]
     fn hidden_state_ownership_parses_aggregate_suffixes() {
@@ -776,7 +780,7 @@ mod tests {
             &views,
             7,
             vec![Value::from_i64(7), Value::build_text("Ada")],
-            TempStore::Memory,
+            IN_MEMORY,
         );
         assert!(matches!(result, Ok(false)));
 
@@ -804,7 +808,7 @@ mod tests {
         let values = vec![Value::from_i64(7), Value::build_text("Ada")];
 
         assert!(matches!(
-            states.change(&table, &views, 7, values.clone(), 3, TempStore::Memory,),
+            states.change(&table, &views, 7, values.clone(), 3, IN_MEMORY,),
             Ok(false)
         ));
         let captured = states.get("downstream").unwrap().table_delta(&table);
@@ -830,7 +834,7 @@ mod tests {
                 &views,
                 1,
                 vec![Value::from_i64(1), Value::build_text("Ada")],
-                TempStore::Memory,
+                IN_MEMORY,
             ),
             Ok(false)
         ));
@@ -840,7 +844,7 @@ mod tests {
                 &views,
                 10,
                 vec![Value::from_i64(10), Value::from_i64(1), Value::from_i64(50)],
-                TempStore::Memory,
+                IN_MEMORY,
             ),
             Ok(false)
         ));
@@ -850,7 +854,7 @@ mod tests {
                 &views,
                 1,
                 vec![Value::from_i64(1), Value::build_text("Ada")],
-                TempStore::Memory,
+                IN_MEMORY,
             ),
             Ok(false)
         ));
@@ -936,7 +940,7 @@ mod tests {
             Value::Blob(vec![b'x'; CHANGE_LOG_SPILL_THRESHOLD]),
         ];
         let spill_started = states
-            .delete(&table, &views, 1, old_large, TempStore::Memory)
+            .delete(&table, &views, 1, old_large, IN_MEMORY)
             .unwrap();
         assert!(spill_started, "the delete half did not start a spill");
         loop {
@@ -951,7 +955,7 @@ mod tests {
             Value::Blob(vec![b'y'; CHANGE_LOG_SPILL_THRESHOLD]),
         ];
         let spill_started = states
-            .insert(&table, &views, 1, new_large, TempStore::Memory)
+            .insert(&table, &views, 1, new_large, IN_MEMORY)
             .unwrap();
         assert!(spill_started, "the insert half did not start a spill");
         loop {
@@ -996,7 +1000,7 @@ mod tests {
 
         let first = vec![Value::from_i64(1), Value::build_text("first")];
         assert!(matches!(
-            states.insert(&table, &views, 1, first, TempStore::Memory),
+            states.insert(&table, &views, 1, first, IN_MEMORY),
             Ok(false)
         ));
 
@@ -1004,9 +1008,7 @@ mod tests {
             Value::from_i64(2),
             Value::Blob(vec![b'x'; CHANGE_LOG_SPILL_THRESHOLD]),
         ];
-        let spill_started = states
-            .insert(&table, &views, 2, large, TempStore::Memory)
-            .unwrap();
+        let spill_started = states.insert(&table, &views, 2, large, IN_MEMORY).unwrap();
         assert!(spill_started, "large capture did not start a spill");
 
         // The statement that captured both rows fails before the spill is
@@ -1032,10 +1034,71 @@ mod tests {
                     Value::from_i64(3),
                     Value::Blob(vec![b'y'; CHANGE_LOG_SPILL_THRESHOLD]),
                 ],
-                TempStore::Memory,
+                IN_MEMORY,
             )
             .unwrap();
         assert!(spill_started);
+    }
+
+    /// Changes that spill to an encrypted temp file read back unchanged. Each spill starts at
+    /// a block boundary of the file.
+    #[test]
+    fn spilled_changes_read_back_from_an_encrypted_temp_file() {
+        let schema = create_test_schema();
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, "customers")
+            .unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let states = TransactionChanges::with_io(io.clone());
+        let views = vec!["v".to_string()];
+        let row = |rowid: i64, byte: u8| {
+            vec![
+                Value::from_i64(rowid),
+                Value::Blob(vec![byte; CHANGE_LOG_SPILL_THRESHOLD]),
+            ]
+        };
+        for (rowid, byte) in [(1, b'x'), (2, b'y')] {
+            let spill_started = states
+                .insert(
+                    &table,
+                    &views,
+                    rowid,
+                    row(rowid, byte),
+                    TempFileOptions {
+                        temp_store: TempStore::Default,
+                        cipher: Some(CipherMode::Aegis256),
+                    },
+                )
+                .unwrap();
+            assert!(spill_started, "row {rowid} did not start a spill");
+            loop {
+                match states.finish_spill().unwrap() {
+                    IOResult::Done(()) => break,
+                    IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
+                }
+            }
+        }
+        {
+            let changes = states.change_log.changes.lock();
+            assert_eq!(changes.spilled.len(), 2);
+            assert_eq!(
+                changes.spilled[1].offset % TEMP_FILE_ENCRYPTION_BLOCK_SIZE as u64,
+                0
+            );
+        }
+
+        let state = states.get("v").unwrap();
+        let mut cursor = crate::incremental::vdbe_maintenance::DeltaCursor::new(
+            state.table_delta(&table),
+            table.columns().len(),
+        );
+        assert!(matches!(cursor.rewind(), Ok(IOResult::Done(true))));
+        for (rowid, byte) in [(1, b'x'), (2, b'y')] {
+            assert_eq!(cursor.rowid(), rowid);
+            assert_eq!(cursor.column(1), row(rowid, byte)[1]);
+            let has_next = matches!(cursor.next(), Ok(IOResult::Done(true)));
+            assert_eq!(has_next, rowid == 1);
+        }
     }
 
     // Helper function to create a test schema with multiple tables

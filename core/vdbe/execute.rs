@@ -10160,7 +10160,6 @@ pub fn op_sorter_open(
         collations.push(*coll);
         nulls_orders.push(*nulls);
     }
-    let temp_store = connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
@@ -10168,7 +10167,7 @@ pub fn op_sorter_open(
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
-        temp_store,
+        connection.temp_file_options(),
     )?;
     let cursors = &mut state.cursors;
     cursors
@@ -12576,7 +12575,7 @@ pub fn op_insert(
                         key,
                         values,
                         weight,
-                        connection.get_temp_store(),
+                        connection.temp_file_options(),
                     )?
                 } else {
                     connection.transaction_changes.delete(
@@ -12584,7 +12583,7 @@ pub fn op_insert(
                         &route.dependent_views,
                         key,
                         values,
-                        connection.get_temp_store(),
+                        connection.temp_file_options(),
                     )?
                 };
                 state.active_op_state.insert().sub_state = if spill_started {
@@ -12650,7 +12649,7 @@ pub fn op_insert(
                         key,
                         values,
                         weight,
-                        connection.get_temp_store(),
+                        connection.temp_file_options(),
                     )?
                 } else {
                     connection.transaction_changes.insert(
@@ -12658,7 +12657,7 @@ pub fn op_insert(
                         &route.dependent_views,
                         key,
                         values,
-                        connection.get_temp_store(),
+                        connection.temp_file_options(),
                     )?
                 };
                 if spill_started {
@@ -12832,7 +12831,7 @@ pub fn op_delete(
                         key,
                         values,
                         weight,
-                        connection.get_temp_store(),
+                        connection.temp_file_options(),
                     )?
                 } else {
                     connection.transaction_changes.delete(
@@ -12840,7 +12839,7 @@ pub fn op_delete(
                         &route.dependent_views,
                         key,
                         values,
-                        connection.get_temp_store(),
+                        connection.temp_file_options(),
                     )?
                 };
                 if spill_started {
@@ -16375,8 +16374,9 @@ pub fn op_open_ephemeral(
             );
             let conn = connection.clone();
             let io = conn.pager.load().io.clone();
-            let temp_store = conn.get_temp_store();
-            let temp_file = TempFile::with_temp_store(&io, temp_store)?;
+            // The pager writes whole pages, so an encrypted file uses blocks of one page.
+            let temp_file =
+                TempFile::with_options(&io, conn.temp_file_options(), page_size.get() as usize)?;
             let db_file: Arc<dyn DatabaseStorage> =
                 Arc::new(DatabaseFile::new(temp_file.file.clone()));
             let db_file_io: Arc<dyn crate::IO> = io;
@@ -18310,7 +18310,7 @@ pub fn op_hash_build(
             mem_budget,
             num_keys: data.num_keys,
             collations: data.collations.try_to_vec()?,
-            temp_store,
+            temp_files: connection.temp_file_options(),
             track_matched: data.track_matched,
             partition_count: None,
         };
@@ -18419,7 +18419,7 @@ pub fn op_hash_distinct(
             mem_budget,
             num_keys: data.num_keys,
             collations: data.collations.try_to_vec()?,
-            temp_store,
+            temp_files: connection.temp_file_options(),
             track_matched: false,
             partition_count: None,
         };
@@ -20417,7 +20417,6 @@ mod tests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()
         };

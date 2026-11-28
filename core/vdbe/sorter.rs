@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::alloc::vec;
 use crate::alloc::*;
-use crate::io::TempFile;
+use crate::io::{TempFile, TempFileOptions, TempFileRange, TEMP_FILE_ENCRYPTION_BLOCK_SIZE};
 use crate::types::{cmp_in_column, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
@@ -174,8 +174,6 @@ pub struct Sorter {
     io: Arc<dyn IO>,
     /// The temporary file for chunks.
     temp_file: Option<TempFile>,
-    /// Offset where the next chunk will be placed in the `temp_file`
-    next_chunk_offset: usize,
     /// State machine for [Sorter::sort]
     sort_state: SortState,
     /// State machine for [Sorter::insert]
@@ -184,8 +182,8 @@ pub struct Sorter {
     init_chunk_heap_state: InitChunkHeapState,
     /// Pending IO completion along with the chunk index that needs to be retried after IO completes.
     pending_completion: Option<(Completion, usize)>,
-    /// Temp storage mode (memory vs file) for spilled data
-    temp_store: crate::TempStore,
+    /// Where spilled chunks go, and the cipher of their file if it is on disk.
+    temp_files: TempFileOptions,
 }
 
 impl Sorter {
@@ -197,7 +195,7 @@ impl Sorter {
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
-        temp_store: crate::TempStore,
+        temp_files: TempFileOptions,
     ) -> Result<Self> {
         turso_assert_eq!(order.len(), collations.len());
         let index_key_info = order
@@ -224,12 +222,11 @@ impl Sorter {
             max_payload_size_in_buffer: 0,
             io,
             temp_file: None,
-            next_chunk_offset: 0,
             sort_state: SortState::Start,
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
             pending_completion: None,
-            temp_store,
+            temp_files,
         };
         Ok(this)
     }
@@ -514,15 +511,15 @@ impl Sorter {
         self.records
             .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
 
-        let chunk_file = match &self.temp_file {
-            Some(temp_file) => temp_file.file.clone(),
-            None => {
-                let temp_file = TempFile::with_temp_store(&self.io, self.temp_store)?;
-                let chunk_file = temp_file.file.clone();
-                self.temp_file = Some(temp_file);
-                chunk_file
-            }
-        };
+        if self.temp_file.is_none() {
+            self.temp_file = Some(TempFile::with_options(
+                &self.io,
+                self.temp_files,
+                TEMP_FILE_ENCRYPTION_BLOCK_SIZE,
+            )?);
+        }
+        let temp_file = self.temp_file.as_ref().expect("temp file created above");
+        let chunk_file = temp_file.file.clone();
 
         // Make sure the chunk buffer size can fit the largest record and its size varint.
         let chunk_buffer_size = self
@@ -542,8 +539,15 @@ impl Sorter {
             chunk_size += size_len + record_size;
         }
 
-        let mut chunk = SortedChunk::new(chunk_file, self.next_chunk_offset, chunk_buffer_size)?;
-        let c = chunk.write(&self.records, record_size_lengths, chunk_size)?;
+        let range = temp_file.reserve(chunk_size);
+        let mut chunk = SortedChunk::new(chunk_file, range.offset(), chunk_buffer_size)?;
+        let c = chunk.write(
+            temp_file,
+            range,
+            &self.records,
+            record_size_lengths,
+            chunk_size,
+        )?;
         self.chunks.try_push(chunk)?;
 
         self.records.clear();
@@ -551,8 +555,6 @@ impl Sorter {
 
         self.current_buffer_size = 0;
         self.max_payload_size_in_buffer = 0;
-        // increase offset start for next chunk
-        self.next_chunk_offset += chunk_size;
 
         Ok(Some(c))
     }
@@ -628,10 +630,10 @@ enum ChunkNextResult {
 }
 
 impl SortedChunk {
-    fn new(file: Arc<dyn File>, start_offset: usize, buffer_size: usize) -> Result<Self> {
+    fn new(file: Arc<dyn File>, start_offset: u64, buffer_size: usize) -> Result<Self> {
         Ok(Self {
             file,
-            start_offset: start_offset as u64,
+            start_offset,
             chunk_size: 0,
             buffer: Arc::new(RwLock::new(try_vec![0; buffer_size]?)),
             buffer_len: Arc::new(atomic::AtomicUsize::new(0)),
@@ -814,8 +816,11 @@ impl SortedChunk {
         Ok(Some(c))
     }
 
+    /// Writes `records` into `range` of `temp_file`, where the chunk starts.
     fn write(
         &mut self,
+        temp_file: &TempFile,
+        range: TempFileRange,
         records: &[NonNull<ArenaSortableRecord>],
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
@@ -858,7 +863,7 @@ impl SortedChunk {
         });
 
         let c = Completion::new_write(write_complete);
-        let c = self.file.pwrite(self.start_offset, buffer_ref, c)?;
+        let c = temp_file.write_range(range, buffer_ref, c)?;
         Ok(c)
     }
 }
@@ -1105,6 +1110,7 @@ mod tests {
     use crate::translate::collate::CollationSeq;
     use crate::types::{ImmutableRecord, Value, ValueRef, ValueType};
     use crate::util::IOExt;
+    use crate::CipherMode;
     use crate::PlatformIO;
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
@@ -1241,7 +1247,10 @@ mod tests {
         let io = Arc::new(PlatformIO::new().unwrap());
 
         let attempts = 8;
-        for _ in 0..attempts {
+        for attempt in 0..attempts {
+            // Every second attempt spills to an encrypted file, whose chunks start at block
+            // boundaries and whose reads decrypt whole blocks.
+            let cipher = (attempt % 2 == 1).then_some(CipherMode::Aegis256);
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
                 try_vec![CollationSeq::BINARY].unwrap(),
@@ -1249,7 +1258,10 @@ mod tests {
                 256,
                 64,
                 io.clone(),
-                crate::TempStore::Default,
+                TempFileOptions {
+                    temp_store: crate::TempStore::Default,
+                    cipher,
+                },
             )
             .unwrap();
 
@@ -1302,7 +1314,7 @@ mod tests {
             max_buffer_size,
             min_read_buffer_size,
             io.clone(),
-            crate::TempStore::Default,
+            plaintext_files(crate::TempStore::Default),
         )
         .unwrap();
 
@@ -1363,7 +1375,7 @@ mod tests {
                 2000 * 1024,
                 4096,
                 io.clone(),
-                crate::TempStore::File,
+                plaintext_files(crate::TempStore::File),
             )
             .unwrap();
             let payload = try_vec![0; 800_000].unwrap();
@@ -1417,7 +1429,7 @@ mod tests {
             2048,
             64,
             io.clone(),
-            crate::TempStore::File,
+            plaintext_files(crate::TempStore::File),
         )
         .unwrap();
         let values = try_vec![Value::Blob(try_vec![0; 1000].unwrap())].unwrap();
@@ -1509,7 +1521,7 @@ mod tests {
             1 << 20,
             64,
             io.clone(),
-            crate::TempStore::Default,
+            plaintext_files(crate::TempStore::Default),
         )
         .unwrap();
 
@@ -1550,7 +1562,7 @@ mod tests {
             256,
             64,
             io.clone(),
-            crate::TempStore::Default,
+            plaintext_files(crate::TempStore::Default),
         )
         .unwrap();
 
@@ -1599,7 +1611,7 @@ mod tests {
             256,
             64,
             io.clone(),
-            crate::TempStore::Default,
+            plaintext_files(crate::TempStore::Default),
         )
         .unwrap();
 
@@ -1693,5 +1705,13 @@ mod tests {
                 ValueRef::Null,
             ],
         );
+    }
+
+    /// Options for spill files whose content is not encrypted.
+    fn plaintext_files(temp_store: crate::TempStore) -> TempFileOptions {
+        TempFileOptions {
+            temp_store,
+            cipher: None,
+        }
     }
 }

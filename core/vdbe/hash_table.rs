@@ -4,7 +4,7 @@ use crate::turso_assert;
 use crate::types::IOResultOr;
 use crate::{
     error::LimboError,
-    io::{Buffer, Completion, TempFile, IO},
+    io::{Buffer, Completion, TempFile, TempFileOptions, IO, TEMP_FILE_ENCRYPTION_BLOCK_SIZE},
     io_yield_one, return_if_io,
     storage::sqlite3_ondisk::{read_varint, read_varint_partial, varint_len, write_varint_to_vec},
     sync::{
@@ -656,14 +656,18 @@ pub struct HashTableConfig {
     pub num_keys: usize,
     /// Collation sequences for each join key.
     pub collations: Vec<CollationSeq>,
-    /// Only spill to a file when != TempStore::Memory
-    pub temp_store: crate::TempStore,
+    /// Where spilled partitions go, and the cipher of their files. The partitions spill to a
+    /// file on disk only when the store is not TempStore::Memory.
+    pub temp_files: TempFileOptions,
     /// Whether to track which entries have been matched during probing (for FULL OUTER JOIN).
     pub track_matched: bool,
     /// Optional override for the number of partitions (must be power of two).
     pub partition_count: Option<usize>,
 }
 
+/// Only tests use default options, so that every other hash table states where its spilled
+/// partitions go and whether they are encrypted.
+#[cfg(test)]
 impl Default for HashTableConfig {
     fn default() -> Self {
         Self {
@@ -671,7 +675,10 @@ impl Default for HashTableConfig {
             mem_budget: DEFAULT_MEM_BUDGET,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: TempFileOptions {
+                temp_store: crate::TempStore::Default,
+                cipher: None,
+            },
             track_matched: false,
             partition_count: None,
         }
@@ -684,8 +691,6 @@ struct SpillState {
     partition_buffers: Vec<PartitionBuffer>,
     /// Spilled partitions metadata, tracks what's on disk
     partitions: Vec<SpilledPartition>,
-    /// Current file offset for next spill write
-    next_spill_offset: u64,
     /// Temporary file for spilled data.
     temp_file: TempFile,
     /// Partitioning strategy for this spill.
@@ -753,7 +758,7 @@ struct DistinctKeyRead {
 impl SpillState {
     fn new(
         io: &Arc<dyn IO>,
-        temp_store: crate::TempStore,
+        temp_files: TempFileOptions,
         partitioning: Partitioning,
     ) -> Result<Self> {
         Ok(SpillState {
@@ -761,8 +766,7 @@ impl SpillState {
                 .map(|_| PartitionBuffer::new())
                 .try_collect()?,
             partitions: vec![],
-            next_spill_offset: 0,
-            temp_file: TempFile::with_temp_store(io, temp_store)?,
+            temp_file: TempFile::with_options(io, temp_files, TEMP_FILE_ENCRYPTION_BLOCK_SIZE)?,
             partitioning,
             distinct_key_places: (0..partitioning.count)
                 .map(|_| HashMap::default())
@@ -791,8 +795,6 @@ struct ProbeSpillState {
     partition_buffers: Vec<PartitionBuffer>,
     /// Spilled probe partition metadata.
     partitions: Vec<SpilledPartition>,
-    /// Current file offset for next probe spill write.
-    next_spill_offset: u64,
     /// Separate temp file for probe-side spills.
     temp_file: TempFile,
     /// Same partitioning as build side, so partition indices correspond.
@@ -806,7 +808,7 @@ struct ProbeSpillState {
 impl ProbeSpillState {
     fn new(
         io: &Arc<dyn IO>,
-        temp_store: crate::TempStore,
+        temp_files: TempFileOptions,
         partitioning: Partitioning,
         mem_budget: usize,
     ) -> Result<Self> {
@@ -815,8 +817,7 @@ impl ProbeSpillState {
                 .map(|_| PartitionBuffer::new())
                 .try_collect()?,
             partitions: vec![],
-            next_spill_offset: 0,
-            temp_file: TempFile::with_temp_store(io, temp_store)?,
+            temp_file: TempFile::with_options(io, temp_files, TEMP_FILE_ENCRYPTION_BLOCK_SIZE)?,
             partitioning,
             mem_used: 0,
             mem_budget,
@@ -921,8 +922,8 @@ pub struct HashTable {
     loaded_partitions_lru: RefCell<VecDeque<usize>>,
     /// Memory used by resident (loaded or in-memory) partitions
     loaded_partitions_mem: usize,
-    /// Temp storage mode (memory vs file) for spilled data
-    temp_store: crate::TempStore,
+    /// Where spilled partitions go, and the cipher of their files if they are on disk.
+    temp_files: TempFileOptions,
     /// Whether to track matched entries (for FULL OUTER JOIN).
     track_matched: bool,
     /// Parallel to `buckets`: one `Vec<bool>` per bucket tracking which entries were matched.
@@ -1021,7 +1022,7 @@ impl HashTable {
             loaded_partitions_lru: VecDeque::new().into(),
             loaded_partitions_mem: 0,
             non_empty_buckets: vec![],
-            temp_store: config.temp_store,
+            temp_files: config.temp_files,
             track_matched: config.track_matched,
             matched_bits,
             unmatched_scan_bucket: 0,
@@ -1134,7 +1135,7 @@ impl HashTable {
                 // Move all existing bucket entries into partition buffers
                 let partition_count = self.choose_partition_count(entry_size);
                 let partitioning = Partitioning::new(partition_count);
-                self.spill_state = Some(SpillState::new(&self.io, self.temp_store, partitioning)?);
+                self.spill_state = Some(SpillState::new(&self.io, self.temp_files, partitioning)?);
                 self.redistribute_to_partitions()?;
                 self.state = HashTableState::Spilled;
             };
@@ -1294,7 +1295,7 @@ impl HashTable {
             if self.spill_state.is_none() {
                 let partition_count = self.choose_partition_count(entry_size);
                 let partitioning = Partitioning::new(partition_count);
-                self.spill_state = Some(SpillState::new(&self.io, self.temp_store, partitioning)?);
+                self.spill_state = Some(SpillState::new(&self.io, self.temp_files, partitioning)?);
                 self.redistribute_to_partitions()?;
                 self.record_distinct_key_places()?;
                 self.state = HashTableState::Spilled;
@@ -1535,7 +1536,8 @@ impl HashTable {
         let mut data = Vec::new();
         data.try_reserve_exact(total_size)?;
 
-        let file_offset = spill_state.next_spill_offset;
+        let range = spill_state.temp_file.reserve(total_size);
+        let file_offset = range.offset();
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
             write_varint_to_vec(entry_size as u64, &mut data);
             record_distinct_key_on_disk(
@@ -1609,12 +1611,12 @@ impl HashTable {
         });
 
         let completion = Completion::new_write(write_complete);
-        let file = spill_state.temp_file.file.clone();
-        let completion = file.pwrite(file_offset, buffer_ref, completion)?;
+        let completion = spill_state
+            .temp_file
+            .write_range(range, buffer_ref, completion)?;
 
         // Update state
         self.mem_used -= mem_freed;
-        spill_state.next_spill_offset += data_size as u64;
         Ok(Some(completion))
     }
 
@@ -1684,7 +1686,8 @@ impl HashTable {
         // filled with zeros that the entries then overwrite.
         let mut data = Vec::new();
         data.try_reserve_exact(total_size)?;
-        let base_file_offset = spill_state.next_spill_offset;
+        let range = spill_state.temp_file.reserve(total_size);
+        let base_file_offset = range.offset();
 
         // Track where each partition's data starts in the buffer
         let mut partition_offsets = Vec::try_with_capacity_ext(metas.len())?;
@@ -1787,12 +1790,12 @@ impl HashTable {
         });
 
         let completion = Completion::new_write(write_complete);
-        let file = spill_state.temp_file.file.clone();
-        let completion = file.pwrite(base_file_offset, buffer_ref, completion)?;
+        let completion = spill_state
+            .temp_file
+            .write_range(range, buffer_ref, completion)?;
 
         // Update state
         self.mem_used -= total_mem_freed;
-        spill_state.next_spill_offset += total_size as u64;
         Ok(Some(completion))
     }
 
@@ -2786,7 +2789,7 @@ impl HashTable {
         if self.probe_spill_state.is_none() {
             self.probe_spill_state = Some(ProbeSpillState::new(
                 &self.io,
-                self.temp_store,
+                self.temp_files,
                 partitioning,
                 self.mem_budget / 2,
             )?);
@@ -2880,7 +2883,8 @@ impl HashTable {
         turso_assert!(data.len() == total_size, "serialized size mismatch");
         let buffer = Buffer::new(data);
 
-        let file_offset = probe_state.next_spill_offset;
+        let range = probe_state.temp_file.reserve(total_size);
+        let file_offset = range.offset();
         let num_entries = partition.entries.len();
         let mem_freed = partition.mem_used;
 
@@ -2916,11 +2920,11 @@ impl HashTable {
         });
 
         let completion = Completion::new_write(write_complete);
-        let file = probe_state.temp_file.file.clone();
-        let completion = file.pwrite(file_offset, buffer_ref, completion)?;
+        let completion = probe_state
+            .temp_file
+            .write_range(range, buffer_ref, completion)?;
 
         probe_state.mem_used -= mem_freed;
-        probe_state.next_spill_offset += total_size as u64;
         let _ = io;
         Ok(Some(completion))
     }
@@ -3363,6 +3367,12 @@ mod hashtests {
     use crate::io::Buffer;
     use crate::MemoryIO;
 
+    /// Spill files on disk whose content is not encrypted.
+    const PLAINTEXT_FILES: TempFileOptions = TempFileOptions {
+        temp_store: crate::TempStore::Default,
+        cipher: None,
+    };
+
     #[test]
     fn test_hash_table_rejects_custom_collations() {
         unsafe extern "C" fn equal(
@@ -3509,7 +3519,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -3555,7 +3565,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -3587,7 +3597,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -3762,7 +3772,7 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: Some(64),
         };
@@ -3783,7 +3793,7 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -3807,7 +3817,7 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: Some(16),
         };
@@ -3860,13 +3870,14 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: Some(16),
         };
         let mut ht = HashTable::new(config, io.clone()).unwrap();
         let partitioning = Partitioning::new(16);
-        let temp_file = TempFile::with_temp_store(&io, crate::TempStore::Default).unwrap();
+        let temp_file =
+            TempFile::with_options(&io, PLAINTEXT_FILES, TEMP_FILE_ENCRYPTION_BLOCK_SIZE).unwrap();
 
         let mut partition = SpilledPartition::new(0);
         partition.add_chunk(0, 0, 0).unwrap();
@@ -3877,7 +3888,6 @@ mod hashtests {
                 .try_collect()
                 .unwrap(),
             partitions: vec![partition],
-            next_spill_offset: 0,
             temp_file,
             partitioning,
             distinct_key_places: (0..partitioning.count)
@@ -3901,7 +3911,7 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: Some(16),
         };
@@ -3912,13 +3922,15 @@ mod hashtests {
         entry.serialize(&mut buf).unwrap();
         let truncated = &buf[..buf.len() - 1];
 
-        let temp_file = TempFile::with_temp_store(&io, crate::TempStore::Default).unwrap();
+        let temp_file =
+            TempFile::with_options(&io, PLAINTEXT_FILES, TEMP_FILE_ENCRYPTION_BLOCK_SIZE).unwrap();
         let write_buf = Buffer::new_temporary(truncated.len());
         write_buf.as_mut_slice().copy_from_slice(truncated);
         let write_buf = Arc::new(write_buf);
+        let range = temp_file.reserve(truncated.len());
+        assert_eq!(range.offset(), 0);
         let completion = temp_file
-            .file
-            .pwrite(0, write_buf, Completion::new_write(|_| {}))
+            .write_range(range, write_buf, Completion::new_write(|_| {}))
             .unwrap();
         assert!(completion.finished(), "memory write should complete");
 
@@ -3932,7 +3944,6 @@ mod hashtests {
                 .try_collect()
                 .unwrap(),
             partitions: vec![partition],
-            next_spill_offset: truncated.len() as u64,
             temp_file,
             partitioning,
             distinct_key_places: (0..partitioning.count)
@@ -4113,7 +4124,7 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             ..Default::default()
         };
@@ -4148,13 +4159,27 @@ mod hashtests {
 
     #[test]
     fn test_insert_distinct_finds_keys_spilled_after_partition_load() {
+        check_insert_distinct_finds_spilled_keys(None);
+    }
+
+    /// Keys in an encrypted spill file are found like keys in a plain one: by partition
+    /// loads, and by reads of single keys.
+    #[test]
+    fn test_insert_distinct_finds_keys_in_encrypted_spill_file() {
+        check_insert_distinct_finds_spilled_keys(Some(crate::CipherMode::Aes256Gcm));
+    }
+
+    fn check_insert_distinct_finds_spilled_keys(temp_file_cipher: Option<crate::CipherMode>) {
         let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
             mem_budget: 4 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: TempFileOptions {
+                temp_store: crate::TempStore::Default,
+                cipher: temp_file_cipher,
+            },
             track_matched: false,
             partition_count: Some(4),
         };
@@ -4197,7 +4222,7 @@ mod hashtests {
             mem_budget: 4 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::NOCASE],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: Some(4),
         };
@@ -4245,7 +4270,7 @@ mod hashtests {
             mem_budget: 4 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: Some(4),
         };
@@ -4291,7 +4316,7 @@ mod hashtests {
             mem_budget: 4 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: Some(4),
         };
@@ -4388,7 +4413,7 @@ mod hashtests {
             mem_budget: 8 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -4432,7 +4457,7 @@ mod hashtests {
             mem_budget: 8 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -4482,7 +4507,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -4536,7 +4561,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -4568,7 +4593,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 2,
             collations: vec![CollationSeq::BINARY, CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -4613,7 +4638,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -4649,7 +4674,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             partition_count: None,
         };
@@ -4798,12 +4823,24 @@ mod hashtests {
         build_keys: &[(i64, Vec<Value>)], // (rowid, key_values)
         payload: bool,
     ) -> HashTable {
+        make_spilled_ht_with_cipher(io, build_keys, payload, None)
+    }
+
+    fn make_spilled_ht_with_cipher(
+        io: Arc<dyn IO>,
+        build_keys: &[(i64, Vec<Value>)], // (rowid, key_values)
+        payload: bool,
+        temp_file_cipher: Option<crate::CipherMode>,
+    ) -> HashTable {
         let config = HashTableConfig {
             initial_buckets: 4,
             mem_budget: 1024, // tiny, forces spill
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: TempFileOptions {
+                temp_store: crate::TempStore::Default,
+                cipher: temp_file_cipher,
+            },
             track_matched: false,
             ..Default::default()
         };
@@ -4882,12 +4919,22 @@ mod hashtests {
 
     #[test]
     fn test_grace_basic() {
+        check_grace_basic(None);
+    }
+
+    /// The build and probe partitions in encrypted spill files give the same matches.
+    #[test]
+    fn test_grace_basic_with_encrypted_spill_files() {
+        check_grace_basic(Some(crate::CipherMode::Aegis256));
+    }
+
+    fn check_grace_basic(temp_file_cipher: Option<crate::CipherMode>) {
         let io = Arc::new(MemoryIO::new());
         let build_keys: Vec<(i64, Vec<Value>)> = (0..200)
             .map(|i| (i, vec![Value::from_i64(i)]))
             .try_collect()
             .unwrap();
-        let mut ht = make_spilled_ht_with_payload(io, &build_keys, true);
+        let mut ht = make_spilled_ht_with_cipher(io, &build_keys, true, temp_file_cipher);
         assert!(ht.has_spilled(), "should have spilled");
 
         // Buffer probe rows for keys that map to spilled partitions
@@ -4929,7 +4976,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: false,
             ..Default::default()
         };
@@ -5135,7 +5182,7 @@ mod hashtests {
             mem_budget: 4096,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: true,
             partition_count: Some(4),
         };
@@ -5281,7 +5328,7 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
+            temp_files: PLAINTEXT_FILES,
             track_matched: true,
             partition_count: Some(16),
         };

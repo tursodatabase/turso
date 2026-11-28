@@ -478,6 +478,12 @@ impl Connection {
                         )
                         .into());
                     }
+                    // A URI with only one of the two parameters fails below, with its own
+                    // error.
+                    let uri = crate::util::OpenOptions::parse(path)?;
+                    if uri.cipher.is_some() && uri.hexkey.is_some() {
+                        self.prepare_temp_database_for_encrypted_attach()?;
+                    }
 
                     let db_opts = DatabaseOpts::new()
                         .with_views(self.db.experimental_views_enabled())

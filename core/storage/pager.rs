@@ -3218,6 +3218,14 @@ impl Pager {
                 "encrypted database page size is fixed when opening the database".into(),
             ));
         }
+        self.replace_initial_page_size(size)
+    }
+
+    /// Makes page 1 of an empty database again in memory, with page size `size`, for all of its
+    /// pagers. Does nothing once page 1 exists. Unlike [`Pager::set_initial_page_size`], it
+    /// also changes the page size of an encrypted database, so the caller decides whether the
+    /// database can take a new page size. Only the empty TEMP database of a connection can.
+    pub(crate) fn replace_initial_page_size(&self, size: PageSize) -> Result<()> {
         let _lock = self.shared.init_lock.lock();
         if self.db_initialized() {
             return Ok(());
@@ -3256,7 +3264,9 @@ impl Pager {
         );
 
         self.shared.set_initial_page_1(Some(page));
-        self.set_page_size(size);
+        // Not set_page_size, which asserts that an encrypted database keeps its page size: the
+        // callers make that check, and let only the empty TEMP database take a new one.
+        self.shared.page_size.store(size.get(), Ordering::SeqCst);
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
