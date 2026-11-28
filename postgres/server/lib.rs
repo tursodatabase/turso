@@ -11,13 +11,14 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    split_statements, sql_parse_error, sqlstate_error, type_input, PgConnection,
-    StatementResultKind, TransactionState,
+    float_value, shortest_float8, split_statements, sql_parse_error, sqlstate_error, type_input,
+    PgConnection, StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_BINARY_REPRESENTATION,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
 };
 use turso_pg_parser::ParseResult;
 
@@ -743,6 +744,7 @@ enum BinaryEncoding {
     Int2,
     Int4,
     Int8,
+    Float4,
     Float8,
     Bytea,
     /// Four bytes, the oid as an unsigned number: regclass and regtype.
@@ -758,6 +760,7 @@ impl BinaryEncoding {
             Type::INT2 => Some(Self::Int2),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
+            Type::FLOAT4 => Some(Self::Float4),
             Type::FLOAT8 => Some(Self::Float8),
             Type::BYTEA => Some(Self::Bytea),
             Type::REGCLASS | Type::REGTYPE => Some(Self::OidAlias),
@@ -1008,7 +1011,8 @@ fn bind_portal_parameters(
 /// FIXME(pg-catalog): This refuses a binary parameter of unknown type because Turso cannot work out its type from the query. A typed expression tree replaces this refusal.
 /// Reads parameter `$n` sent in binary format as `pg_type`, the type Parse
 /// declared for it. A type whose binary format is its text is read as in text
-/// format. A parameter whose type Parse left out or left unspecified (OID 0)
+/// format; numbers are big-endian, and a bool is one byte that is true when
+/// nonzero. A parameter whose type Parse left out or left unspecified (OID 0)
 /// has type `unknown` and is refused: PostgreSQL works out its type from the
 /// query, and tursopg cannot.
 fn binary_parameter_value(
@@ -1017,18 +1021,47 @@ fn binary_parameter_value(
     n: usize,
     connection: &Arc<turso_core::Connection>,
 ) -> PgWireResult<Value> {
-    match BinaryEncoding::of(pg_type) {
-        Some(BinaryEncoding::Text) => pg_bytes_to_value(bytes, pg_type, Some(connection)),
-        Some(BinaryEncoding::Bytea) => Ok(Value::from_blob(bytes.to_vec())),
-        Some(
-            BinaryEncoding::Bool
-            | BinaryEncoding::Int2
-            | BinaryEncoding::Int4
-            | BinaryEncoding::Int8
-            | BinaryEncoding::Float8
-            | BinaryEncoding::OidAlias,
-        )
-        | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
+    let not_supported = || binary_not_supported(&format!("parameter ${n}"), pg_type);
+    let Some(encoding) = BinaryEncoding::of(pg_type) else {
+        return Err(not_supported());
+    };
+    let value = match encoding {
+        BinaryEncoding::Text => return pg_bytes_to_value(bytes, pg_type, Some(connection)),
+        BinaryEncoding::Bytea => Value::from_blob(bytes.to_vec()),
+        BinaryEncoding::Bool => Value::from_i64(i64::from(fixed_width::<1>(bytes, n)? != [0])),
+        BinaryEncoding::Int2 => Value::from_i64(i16::from_be_bytes(fixed_width(bytes, n)?).into()),
+        BinaryEncoding::Int4 => Value::from_i64(i32::from_be_bytes(fixed_width(bytes, n)?).into()),
+        BinaryEncoding::Int8 => Value::from_i64(i64::from_be_bytes(fixed_width(bytes, n)?)),
+        BinaryEncoding::Float4 => {
+            float_parameter_value(shortest_float8(f32::from_be_bytes(fixed_width(bytes, n)?)))?
+        }
+        BinaryEncoding::Float8 => {
+            float_parameter_value(f64::from_be_bytes(fixed_width(bytes, n)?))?
+        }
+        BinaryEncoding::OidAlias => return Err(not_supported()),
+    };
+    Ok(value)
+}
+
+/// The bytes of binary parameter `$n`, whose type is `N` bytes wide, with
+/// the errors PostgreSQL gives for a value of another length.
+fn fixed_width<const N: usize>(bytes: &[u8], n: usize) -> PgWireResult<[u8; N]> {
+    match bytes.len().cmp(&N) {
+        // PostgreSQL reads a one-byte type with pq_getmsgbyte, which has its
+        // own message, and a wider type with pq_copymsgbytes.
+        std::cmp::Ordering::Less if N == 1 => Err(wire_error(
+            SQLSTATE_PROTOCOL_VIOLATION,
+            "no data left in message".to_owned(),
+        )),
+        std::cmp::Ordering::Less => Err(wire_error(
+            SQLSTATE_PROTOCOL_VIOLATION,
+            "insufficient data left in message".to_owned(),
+        )),
+        std::cmp::Ordering::Greater => Err(wire_error(
+            SQLSTATE_INVALID_BINARY_REPRESENTATION,
+            format!("incorrect binary data format in bind parameter {n}"),
+        )),
+        std::cmp::Ordering::Equal => Ok(bytes.try_into().expect("the length is N")),
     }
 }
 
@@ -1057,7 +1090,7 @@ fn pg_bytes_to_value(
                     "invalid float parameter: {e}"
                 ))))
             })?;
-            Ok(Value::from_f64(f))
+            float_parameter_value(f)
         }
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
@@ -1077,9 +1110,11 @@ fn pg_bytes_to_value(
         // UNKNOWN: try to infer type from text content (numeric-looking values
         // should be bound as numbers so comparisons with COUNT/SUM etc. work)
         Type::UNKNOWN => {
+            // NaN stays text: Turso cannot hold a NaN float, and
+            // `Value::from_f64` would turn it into NULL.
             if let Ok(i) = text.parse::<i64>() {
                 Ok(Value::from_i64(i))
-            } else if let Ok(f) = text.parse::<f64>() {
+            } else if let Some(f) = text.parse::<f64>().ok().filter(|f| !f.is_nan()) {
                 Ok(Value::from_f64(f))
             } else if text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("t") {
                 Ok(Value::from_i64(1))
@@ -1092,6 +1127,11 @@ fn pg_bytes_to_value(
         // TEXT, VARCHAR, and all other types → text
         _ => Ok(Value::from_text(text.to_owned())),
     }
+}
+
+/// The value of a parameter of float or numeric type that reads as `f`.
+fn float_parameter_value(f: f64) -> PgWireResult<Value> {
+    float_value(f).map_err(|error| pg_error(error.into()))
 }
 
 /// Decode a hex string into bytes.
@@ -1165,7 +1205,7 @@ fn encode_binary(
     connection: &Arc<turso_core::Connection>,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, OidAlias, Text};
+    use BinaryEncoding::{Bool, Bytea, Float4, Float8, Int2, Int4, Int8, OidAlias, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
@@ -1181,6 +1221,8 @@ fn encode_binary(
             Err(_) => return Err(binary_value_not_supported(pg_type)),
         },
         (Int8, Value::Numeric(Integer(i))) => encoder.encode_field(i),
+        (Float4, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f32)),
+        (Float4, Value::Numeric(Float(f))) => encoder.encode_field(&(f64::from(*f) as f32)),
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
@@ -1195,8 +1237,8 @@ fn encode_binary(
         },
         (Bool | Int2 | Int4 | Int8 | OidAlias, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea | OidAlias, Value::Text(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8 | OidAlias, Value::Blob(_)) => {
+        | (Bool | Int2 | Int4 | Int8 | Float4 | Float8 | Bytea | OidAlias, Value::Text(_))
+        | (Bool | Int2 | Int4 | Int8 | Float4 | Float8 | OidAlias, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1787,26 +1829,123 @@ mod tests {
         );
         let error = codes(vec![0, 2], 2).unwrap_err();
         assert_eq!(sqlstate(error), SQLSTATE_INVALID_PARAMETER_VALUE);
+    }
 
+    #[test]
+    fn binary_parameters_are_read_as_postgresql_reads_them() {
+        let conn = memory_connection();
         // Parameter types declared in Parse, the binary bytes, and the value
-        // bound, or None for a refused parameter.
+        // bound or the SQLSTATE of the error.
         for (declared, bytes, expected) in [
             (
                 vec![Some(Type::TEXT)],
                 &b"42"[..],
-                Some(Value::from_text("42")),
+                Ok(Value::from_text("42")),
             ),
             // Type OID 0: PostgreSQL reads `SELECT $1::int4` with these bytes
             // as 42.
-            (vec![None], b"\0\0\0\x2a", None),
+            (
+                vec![None],
+                b"\0\0\0\x2a",
+                Err(SQLSTATE_FEATURE_NOT_SUPPORTED),
+            ),
             (
                 vec![Some(Type::BYTEA)],
                 b"\\x41",
-                Some(Value::from_blob(b"\\x41".to_vec())),
+                Ok(Value::from_blob(b"\\x41".to_vec())),
             ),
-            (vec![Some(Type::INT8)], b"\0\0\0\0\0\0\0\x2a", None),
-            (vec![Some(Type::TIMESTAMPTZ)], b"\0\0\0\0\0\0\0\0", None),
-            (vec![], b"42", None),
+            (vec![Some(Type::BOOL)], b"\x01", Ok(Value::from_i64(1))),
+            (vec![Some(Type::BOOL)], b"\x02", Ok(Value::from_i64(1))),
+            (vec![Some(Type::BOOL)], b"\0", Ok(Value::from_i64(0))),
+            (
+                vec![Some(Type::INT2)],
+                b"\x80\0",
+                Ok(Value::from_i64(-32768)),
+            ),
+            (
+                vec![Some(Type::INT4)],
+                b"\0\0\0\x2a",
+                Ok(Value::from_i64(42)),
+            ),
+            (
+                vec![Some(Type::INT4)],
+                b"\xff\xff\xff\xd6",
+                Ok(Value::from_i64(-42)),
+            ),
+            (
+                vec![Some(Type::INT8)],
+                b"\0\x20\0\0\0\0\0\x01",
+                Ok(Value::from_i64(9007199254740993)),
+            ),
+            (
+                vec![Some(Type::FLOAT4)],
+                b"\x3f\x8c\xcc\xcd",
+                Ok(Value::from_f64(1.1)),
+            ),
+            (
+                vec![Some(Type::FLOAT4)],
+                b"\x7f\x80\0\0",
+                Ok(Value::from_f64(f64::INFINITY)),
+            ),
+            (
+                vec![Some(Type::FLOAT8)],
+                b"\xc0\x02\0\0\0\0\0\0",
+                Ok(Value::from_f64(-2.25)),
+            ),
+            (
+                vec![Some(Type::FLOAT8)],
+                b"\xff\xf0\0\0\0\0\0\0",
+                Ok(Value::from_f64(f64::NEG_INFINITY)),
+            ),
+            // Turso cannot hold NaN, of any bit pattern, so it is refused
+            // instead of being bound as NULL.
+            (
+                vec![Some(Type::FLOAT8)],
+                b"\x7f\xf8\0\0\0\0\0\0",
+                Err(SQLSTATE_FEATURE_NOT_SUPPORTED),
+            ),
+            (
+                vec![Some(Type::FLOAT8)],
+                b"\xff\xf0\0\0\0\0\0\x01",
+                Err(SQLSTATE_FEATURE_NOT_SUPPORTED),
+            ),
+            (
+                vec![Some(Type::FLOAT4)],
+                b"\x7f\xc0\0\0",
+                Err(SQLSTATE_FEATURE_NOT_SUPPORTED),
+            ),
+            (
+                vec![Some(Type::FLOAT4)],
+                b"\xff\x80\0\x01",
+                Err(SQLSTATE_FEATURE_NOT_SUPPORTED),
+            ),
+            // A value longer than its type, then one shorter.
+            (
+                vec![Some(Type::INT2)],
+                b"\0\0\0\x2a",
+                Err(SQLSTATE_INVALID_BINARY_REPRESENTATION),
+            ),
+            (
+                vec![Some(Type::BOOL)],
+                b"\x01\0",
+                Err(SQLSTATE_INVALID_BINARY_REPRESENTATION),
+            ),
+            (
+                vec![Some(Type::INT4)],
+                b"\0\x2a",
+                Err(SQLSTATE_PROTOCOL_VIOLATION),
+            ),
+            (
+                vec![Some(Type::BOOL)],
+                b"",
+                Err(SQLSTATE_PROTOCOL_VIOLATION),
+            ),
+            (
+                vec![Some(Type::TIMESTAMPTZ)],
+                b"\0\0\0\0\0\0\0\0",
+                Err(SQLSTATE_FEATURE_NOT_SUPPORTED),
+            ),
+            (vec![], b"42", Err(SQLSTATE_FEATURE_NOT_SUPPORTED)),
         ] {
             let mut portal = Portal::<String>::default();
             portal.statement =
@@ -1815,8 +1954,8 @@ mod tests {
             portal.parameters = vec![Some(bytes.to_vec().into())];
             let mut stmt = conn.prepare("SELECT $1").unwrap();
             match (bind_portal_parameters(&mut stmt, &portal), expected) {
-                (Ok(()), Some(value)) => assert_eq!(stmt.run_collect_rows().unwrap(), [[value]]),
-                (Err(error), None) => assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED),
+                (Ok(()), Ok(value)) => assert_eq!(stmt.run_collect_rows().unwrap(), [[value]]),
+                (Err(error), Err(expected)) => assert_eq!(sqlstate(error), expected, "{bytes:?}"),
                 (result, expected) => panic!("{bytes:?}: {result:?}, expected {expected:?}"),
             }
         }
@@ -2410,6 +2549,16 @@ mod tests {
 
         let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC, None).unwrap();
         assert_eq!(val, Value::from_f64(1.23));
+
+        // Turso cannot hold NaN, so it is refused instead of being bound as NULL.
+        for (text, pg_type) in [
+            (&b"NaN"[..], Type::FLOAT8),
+            (b"nan", Type::FLOAT4),
+            (b"NaN", Type::NUMERIC),
+        ] {
+            let error = pg_bytes_to_value(text, &pg_type, None).unwrap_err();
+            assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED);
+        }
     }
 
     #[test]
@@ -2598,6 +2747,16 @@ mod tests {
         // UNKNOWN type should keep text for non-numeric strings
         let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN, None).unwrap();
         assert!(matches!(val, Value::Text(_)));
+
+        // NaN cannot be a Turso float, so it stays the text sent, not NULL
+        for nan in ["NaN", "nan", "-NaN"] {
+            let val = pg_bytes_to_value(nan.as_bytes(), &Type::UNKNOWN, None).unwrap();
+            assert_eq!(val, Value::from_text(nan.to_owned()), "{nan}");
+        }
+
+        // Infinity is still inferred as a float
+        let val = pg_bytes_to_value(b"Infinity", &Type::UNKNOWN, None).unwrap();
+        assert_eq!(val, Value::from_f64(f64::INFINITY));
     }
 
     /// Known gap: PostgreSQL 18 describes `1.5::numeric` as numeric (oid
