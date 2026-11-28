@@ -476,7 +476,7 @@ fn emit_membership_insert(
         cursor: cursors.table,
         key_reg: id_reg,
         record_reg,
-        flag: InsertFlags::new().skip_last_rowid(),
+        flag: InsertFlags::new(),
         table_name: AUTH_MEMBERS_TABLE_NAME.to_string(),
     });
     emit_role_member_index_insert(program, cursors, membership, id_reg);

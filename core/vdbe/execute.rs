@@ -12265,6 +12265,14 @@ pub fn op_insert(
         insn
     );
     check_db_write_allowed(program, state, Some(*cursor_id))?;
+    // A cursor opened with OpenEphemeral, OpenAutoindex or OpenDup writes to an
+    // ephemeral B-tree, so the emitter does not have to set the flag for it.
+    let is_ephemeral = flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+        || program
+            .prepared()
+            .explain
+            .ephemeral_cursors
+            .contains(cursor_id);
 
     loop {
         match state.active_op_state.insert().sub_state {
@@ -12400,8 +12408,11 @@ pub fn op_insert(
                 // The noop check is fundamentally incompatible with the MVCC
                 // Delete+Insert update pattern.
                 state.active_op_state.insert().is_noop_update = false;
-                let may_be_noop_update = flag.has(InsertFlags::SKIP_LAST_ROWID)
+                // An INSERT never overwrites a row in place, so it skips this check. Any
+                // other write to a table, such as UPDATE, can.
+                let may_be_noop_update = !flag.has(InsertFlags::SET_LAST_ROWID)
                     && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    && !is_ephemeral
                     && {
                         let cursor = get_cursor!(state, *cursor_id);
                         let cursor = cursor.as_btree_mut();
@@ -12479,14 +12490,6 @@ pub fn op_insert(
                 // instead of page 1.
                 let is_schema_root = root_page == 1
                     || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
-                // A cursor opened with OpenEphemeral, OpenAutoindex or OpenDup writes to an
-                // ephemeral B-tree, so the emitter does not have to set the flag for it.
-                let is_ephemeral = flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
-                    || program
-                        .prepared()
-                        .explain
-                        .ephemeral_cursors
-                        .contains(cursor_id);
                 if !is_schema_root && !is_ephemeral {
                     state.active_op_state.insert().sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
@@ -12507,7 +12510,7 @@ pub fn op_insert(
                     cursor.has_rowid()
                 };
                 if has_rowid {
-                    if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
+                    if flag.has(InsertFlags::SET_LAST_ROWID) {
                         let rowid = match &state.registers[*key_reg].get_value() {
                             Value::Numeric(Numeric::Integer(i)) => *i,
                             _ => unreachable!("expected integer key"),

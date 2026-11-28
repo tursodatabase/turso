@@ -766,11 +766,7 @@ fn emit_deduplicating_set_op(
             cursor: state_cursor_id,
             key_reg: c_srid_reg,
             record_reg: c_state_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
+            flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
             table_name: state_table_name.clone(),
         });
 
@@ -894,11 +890,7 @@ fn emit_deduplicating_set_op(
             cursor: append_cursor_id,
             key_reg: a_srid_reg,
             record_reg: a_state_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
+            flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
             table_name: append_table_name.clone(),
         });
         program.emit_insn(Insn::MakeRecord {
@@ -992,11 +984,7 @@ fn emit_deduplicating_set_op(
             cursor: append_cursor_id,
             key_reg: a_srid_reg,
             record_reg: a_state_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
+            flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
             table_name: append_table_name.clone(),
         });
 

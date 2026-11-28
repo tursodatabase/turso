@@ -61,7 +61,7 @@ addr  opcode         p1  p2  p3  p4        p5  comment
   44  IdxDelete       1  16   2             1
   45  IdxInsert       1   1   9             2  key=r[1]
   46  MakeRecord      4   3  18             0  r[18]=mkrec(r[4..6])
-  47  Insert          0  18   3  parent     8  intkey=r[3] data=r[18]
+  47  Insert          0  18   3  parent     0  intkey=r[3] data=r[18]
   48  Halt            0   0   0             0
   49  Transaction     0   2   2             0  iDb=0 tx_mode=Write
   50  Integer         1   2   0             0  r[2]=1

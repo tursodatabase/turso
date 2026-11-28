@@ -37,7 +37,7 @@ addr  opcode            p1  p2  p3  p4              p5  comment
   17    Column           1   0   7                   0  r[7]=idx_products_category.category
   18    Affinity         3   5   0                   0  r[3..8] = D, B, E, D, B
   19    MakeRecord       3   5  12                   0  r[12]=mkrec(r[3..7])
-  20    Insert           0  12   2  products         8  intkey=r[2] data=r[12]
+  20    Insert           0  12   2  products         0  intkey=r[2] data=r[12]
   21  Next               1   5   0                   0
   22  Halt               0   0   0                   0
   23  Transaction        0   2  10                   0  iDb=0 tx_mode=Write

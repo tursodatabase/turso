@@ -46,7 +46,7 @@ addr  opcode           p1  p2  p3  p4            p5  comment
   29    NoConflict      1  31  18  1              0  key=r[18..18]
   30    Halt         1555   0   0  w.z            0
   31    MakeRecord     11   3  15                 0  r[15]=mkrec(r[11..13])
-  32    Insert          1  15  10  w              0  intkey=r[10] data=r[15]
+  32    Insert          1  15  10  w              8  intkey=r[10] data=r[15]
   33    Goto            0  34   0                 0
   34  Next              2  20   0                 0
   35  Close             2   0   0                 0

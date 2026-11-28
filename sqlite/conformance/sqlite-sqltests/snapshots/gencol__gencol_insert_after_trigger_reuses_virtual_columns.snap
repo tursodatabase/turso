@@ -26,7 +26,7 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
    9  Copy          5  10   0                       0  r[10]=r[5]
   10  Multiply     10  11   6                       0  r[6]=r[10]*r[11]
   11  MakeRecord    3   2   7                       0  r[7]=mkrec(r[3..4])
-  12  Insert        0   7   2  t                    0  intkey=r[2] data=r[7]
+  12  Insert        0   7   2  t                    8  intkey=r[2] data=r[7]
   13  ResetOnce    15   0   0                       0  clear once flags before 15
   14  Program       5  15   2  trigger subprogram   0  subprogram=trigger subprogram
   15  Goto          0  16   0                       0
@@ -41,7 +41,7 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
    3  Variable      2   4   0                       0  r[4]=parameter(2)
    4  NewRowid      0   2   0                       0  r[2]=rowid
    5  MakeRecord    3   2   5                       0  r[5]=mkrec(r[3..4])
-   6  Insert        0   5   2  log                  0  intkey=r[2] data=r[5]
+   6  Insert        0   5   2  log                  8  intkey=r[2] data=r[5]
    7  Goto          0   8   0                       0
    8  Goto          0   9   0                       0
    9  ResetCount    0   0   0                       0

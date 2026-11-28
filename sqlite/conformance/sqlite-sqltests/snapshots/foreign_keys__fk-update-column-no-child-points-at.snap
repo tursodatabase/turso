@@ -25,7 +25,7 @@ addr  opcode       p1  p2  p3  p4      p5  comment
    8  Add           6   7   5           0  r[5]=r[6]+r[7]
    9  Affinity      3   3   0           0  r[3..6] = D, D, D
   10  MakeRecord    3   3   8           0  r[8]=mkrec(r[3..5])
-  11  Insert        0   8   2  parent   8  intkey=r[2] data=r[8]
+  11  Insert        0   8   2  parent   0  intkey=r[2] data=r[8]
   12  Halt          0   0   0           0
   13  Transaction   0   2   2           0  iDb=0 tx_mode=Write
   14  Integer       1   1   0           0  r[1]=1

@@ -53,7 +53,7 @@ addr  opcode            p1  p2  p3  p4                         p5  comment
   31    NotExists        1  33  11                              0
   32    Halt          1555   0   0  order_archive.id            0
   33    MakeRecord      12   6  18                              0  r[18]=mkrec(r[12..17])
-  34    Insert           1  18  11  order_archive               0  intkey=r[11] data=r[18]
+  34    Insert           1  18  11  order_archive               8  intkey=r[11] data=r[18]
   35    Goto             0  36   0                              0
   36  Goto               0  13   0                              0
   37  Goto               0  38   0                              0

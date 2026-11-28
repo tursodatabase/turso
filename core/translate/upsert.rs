@@ -1570,10 +1570,7 @@ pub fn emit_upsert(
             cursor: ctx.cursor_id,
             key_reg: rnew,
             record_reg,
-            flag: InsertFlags::new()
-                .require_seek()
-                .update_rowid_change()
-                .skip_last_rowid(),
+            flag: InsertFlags::new().require_seek().update_rowid_change(),
             table_name: table.get_name().to_string(),
         });
 
@@ -1630,7 +1627,7 @@ pub fn emit_upsert(
             cursor: ctx.cursor_id,
             key_reg: ctx.conflict_rowid_reg,
             record_reg,
-            flag: InsertFlags::new().skip_last_rowid(),
+            flag: InsertFlags::new(),
             table_name: table.get_name().to_string(),
         });
         cdc_before_rec

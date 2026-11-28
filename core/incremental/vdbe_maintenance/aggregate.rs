@@ -711,11 +711,7 @@ fn emit_group_aggregate_rows(
         cursor: state_cursor_id,
         key_reg: state_rowid_reg,
         record_reg: state_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
+        flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
         table_name: state_table_name.clone(),
     });
 
@@ -908,11 +904,7 @@ fn emit_group_aggregate_rows(
             cursor: state_cursor_id,
             key_reg: state_rowid_reg,
             record_reg: state_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
+            flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
             table_name: state_table_name.clone(),
         });
 

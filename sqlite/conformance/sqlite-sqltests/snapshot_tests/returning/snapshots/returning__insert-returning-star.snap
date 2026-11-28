@@ -46,7 +46,7 @@ addr  opcode           p1  p2  p3  p4     p5  comment
   29    Copy            6  12   0          0  r[12]=r[6]
   30    MakeRecord     11   2  13          0  r[13]=mkrec(r[11..12]); for idx_t1_name
   31    IdxInsert       0  13  11          2  key=r[13]
-  32    Insert          2  10   6  t1      0  intkey=r[6] data=r[10]
+  32    Insert          2  10   6  t1      8  intkey=r[6] data=r[10]
   33    Copy            6  14   0          0  r[14]=r[6]
   34    Copy            8  15   0          0  r[15]=r[8]
   35    Copy            9  16   0          0  r[16]=r[9]

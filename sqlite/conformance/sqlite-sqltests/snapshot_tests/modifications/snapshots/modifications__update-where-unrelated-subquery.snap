@@ -53,7 +53,7 @@ addr  opcode          p1  p2  p3  p4                 p5  comment
   27    MakeRecord     8   5  15                      0  r[15]=mkrec(r[8..12])
   28    NotExists      1  31   7                      0
   29    Delete         1   0   0  products            0
-  30    Insert         1  15   7  products           11  intkey=r[7] data=r[15]
+  30    Insert         1  15   7  products            3  intkey=r[7] data=r[15]
   31  Next             0  18   0                      1
   32  Halt             0   0   0                      0
   33  Transaction      0   2  10                      0  iDb=0 tx_mode=Write

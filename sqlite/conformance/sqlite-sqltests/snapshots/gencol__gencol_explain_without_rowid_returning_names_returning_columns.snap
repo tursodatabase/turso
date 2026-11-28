@@ -29,7 +29,7 @@ addr  opcode           p1  p2  p3  p4   p5  comment
   12  NoConflict        1  14  10  1     0  key=r[10..10]
   13  Halt           1555   0   0  w.z   0
   14  MakeRecord        3   3   7        0  r[7]=mkrec(r[3..5])
-  15  Insert            1   7   2  w     0  intkey=r[2] data=r[7]
+  15  Insert            1   7   2  w     8  intkey=r[2] data=r[7]
   16  Copy              4  11   0        0  r[11]=r[4]
   17  Copy              6  12   0        0  r[12]=r[6]
   18  Copy              5  13   0        0  r[13]=r[5]

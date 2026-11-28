@@ -297,11 +297,7 @@ pub(super) fn emit_add_to_member(
         cursor: table.table_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
+        flag: InsertFlags(InsertFlags::REQUIRE_SEEK | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT),
         table_name: table.table_name.clone(),
     });
     // An existing row keeps its index entry.

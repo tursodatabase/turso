@@ -40,7 +40,7 @@ addr  opcode         p1  p2  p3  p4              p5  comment
   21  Copy            2  10   0                   0  r[10]=r[2]
   22  MakeRecord      9   2  11                   0  r[11]=mkrec(r[9..10]); for idx_products_category
   23  IdxInsert       0  11   9                   2  key=r[11]
-  24  Insert          1   8   2  products         0  intkey=r[2] data=r[8]
+  24  Insert          1   8   2  products         8  intkey=r[2] data=r[8]
   25  Goto            0  26   0                   0
   26  Goto            0  27   0                   0
   27  Halt            0   0   0                   0

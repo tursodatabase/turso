@@ -492,9 +492,7 @@ fn emit_replace_current_row(
         cursor: cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new()
-            .skip_last_rowid()
-            .skip_all_change_counts(),
+        flag: InsertFlags::new().skip_all_change_counts(),
         table_name: table_name.to_string(),
     });
 }

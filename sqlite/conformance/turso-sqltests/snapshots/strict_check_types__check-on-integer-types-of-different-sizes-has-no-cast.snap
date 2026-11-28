@@ -40,7 +40,7 @@ addr  opcode           p1  p2  p3  p4                p5  comment
   23  If                6  25   0                     0  if r[6] goto 25
   24  Halt            275   0   0  a >= 0 AND a < b   0
   25  MakeRecord        3   2   5                     0  r[5]=mkrec(r[3..4])
-  26  Insert            0   5   2  t                  0  intkey=r[2] data=r[5]
+  26  Insert            0   5   2  t                  8  intkey=r[2] data=r[5]
   27  Goto              0  28   0                     0
   28  Goto              0  29   0                     0
   29  Halt              0   0   0                     0
