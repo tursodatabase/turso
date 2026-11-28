@@ -15,6 +15,10 @@ const MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_hold_read_tx_child_process";
 const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
+const MULTIPROCESS_BACKFILLED_WRITER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_backfilled_writer_child_process";
+const MULTIPROCESS_CHECKPOINT_BLOCKER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_checkpoint_blocker_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -878,6 +882,327 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
         header_before,
         "disk-scan read-only reopen should preserve committed rows"
     );
+}
+
+/// Child half of `subprocess_readonly_checkpoint_never_writes_backfilled_wal`: write
+/// frames, backfill all of them with a PASSIVE checkpoint, then hold the database open
+/// (keeping the WAL file on disk) until released.
+#[test]
+fn multiprocess_backfilled_writer_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.wal_auto_actions_disable();
+    commit_new_pages(&conn, 8);
+    assert!(wal_max_frame(&conn) > 0);
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+}
+
+/// A checkpoint on a read-only connection never writes. The writer lives in a child
+/// process, so the parent opens a genuinely separate read-only `Database`; the WAL holds
+/// frames that are all backfilled. No mode may fail or report busy, and neither the WAL file
+/// nor the DB file may change.
+#[test]
+fn subprocess_readonly_checkpoint_never_writes_backfilled_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("readonly-checkpoint-backfilled.db");
+    let wal_path = dir.path().join("readonly-checkpoint-backfilled.db-wal");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_BACKFILLED_WRITER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(wal_len > 0, "the child must leave frames in the WAL file");
+    let db_bytes = std::fs::read(&db_path).unwrap();
+
+    let db = open_multiprocess_db_with_flags(io, db_path_str, OpenFlags::ReadOnly).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert!(
+        conn.pager.load().is_read_only(),
+        "the parent connection must be read-only"
+    );
+    assert!(
+        wal_max_frame(&conn) > 0,
+        "the read-only connection must see the child's frames"
+    );
+
+    let modes = [
+        (
+            "PASSIVE",
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        ),
+        ("FULL", CheckpointMode::Full),
+        ("RESTART", CheckpointMode::Restart),
+        (
+            "TRUNCATE",
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        ),
+    ];
+    for (name, mode) in modes {
+        let result = conn.checkpoint(mode).unwrap_or_else(|err| {
+            panic!("{name}: a read-only checkpoint must neither fail nor report busy: {err:?}")
+        });
+        assert!(
+            result.everything_backfilled(),
+            "{name}: every frame is backfilled: {result:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            wal_len,
+            "{name} must not change the WAL file"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            db_bytes,
+            "{name} must not change the DB file"
+        );
+    }
+
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "the writer child should exit cleanly after release"
+    );
+}
+
+/// Child half of the `subprocess_readonly_checkpoint_*_blocker` tests. It holds the
+/// database open with `TURSO_MULTIPROCESS_BLOCKER`:
+/// - `reader`: frames exist, a read transaction pinned before the last of them is open.
+/// - `writer`: every frame is backfilled, and a write transaction without writes is open.
+#[test]
+fn multiprocess_checkpoint_blocker_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let blocker = std::env::var("TURSO_MULTIPROCESS_BLOCKER").unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.wal_auto_actions_disable();
+    match blocker.as_str() {
+        "reader" => {
+            commit_new_pages(&conn, 4);
+            let reader = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            let reader_pager = reader.pager.load();
+            let wal = reader_pager.wal.as_ref().unwrap();
+            wal.begin_read_tx().unwrap();
+            commit_new_pages(&conn, 4);
+            std::fs::write(&ready_file, b"ready").unwrap();
+            wait_for_file(&release_file);
+            wal.end_read_tx();
+        }
+        "writer" => {
+            commit_new_pages(&conn, 8);
+            let checkpoint = run_checkpoint(
+                &conn,
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+            );
+            assert!(checkpoint.everything_backfilled());
+            let pager = conn.pager.load();
+            pager.begin_read_tx().unwrap();
+            pager
+                .io
+                .block(|| pager.begin_write_tx(conn.wal_auto_actions()))
+                .unwrap();
+            std::fs::write(&ready_file, b"ready").unwrap();
+            wait_for_file(&release_file);
+            pager.rollback_tx(&conn);
+        }
+        other => panic!("unknown blocker {other}"),
+    }
+}
+
+/// Spawns the blocker child, waits until it is ready, and opens a read-only connection
+/// in this process. Returns the child, the release file, the DB and WAL paths, and the
+/// connection with its database; the temp dir lives as long as the first element.
+#[allow(clippy::type_complexity)]
+fn open_readonly_beside_blocker(
+    blocker: &str,
+) -> (
+    tempfile::TempDir,
+    std::process::Child,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Arc<Database>,
+    Arc<Connection>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("readonly-checkpoint-blocker.db");
+    let wal_path = dir.path().join("readonly-checkpoint-blocker.db-wal");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_CHECKPOINT_BLOCKER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_BLOCKER", blocker)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+    let db = open_multiprocess_db_with_flags(io, db_path_str, OpenFlags::ReadOnly).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert!(
+        conn.pager.load().is_read_only(),
+        "the parent connection must be read-only"
+    );
+    assert!(
+        wal_max_frame(&conn) > 0,
+        "the read-only connection must see the child's frames"
+    );
+    (dir, child, release_file, db_path, wal_path, db, conn)
+}
+
+fn release_and_wait(mut child: std::process::Child, release_file: &std::path::Path) {
+    std::fs::write(release_file, b"release").unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "the blocker child should exit cleanly after release"
+    );
+}
+
+/// A PASSIVE checkpoint on a read-only connection is never busy because of frames it
+/// cannot backfill, also while another process pins a snapshot below the last frame:
+/// it reports the WAL frames and the backfill count unchanged. FULL, RESTART and TRUNCATE
+/// would have to backfill into the read-only DB file, so they are busy. Nothing is written.
+#[test]
+fn subprocess_readonly_checkpoint_pinned_reader_passive_not_busy() {
+    let (_dir, child, release_file, db_path, wal_path, _db, conn) =
+        open_readonly_beside_blocker("reader");
+    let max_frame = wal_max_frame(&conn);
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+    let db_bytes = std::fs::read(&db_path).unwrap();
+
+    let result = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap_or_else(|err| {
+            panic!("PASSIVE must not be busy on a read-only connection: {err:?}")
+        });
+    assert_eq!(result.wal_max_frame, max_frame, "{result:?}");
+    assert_eq!(result.wal_total_backfilled, 0, "{result:?}");
+    assert_eq!(result.wal_checkpoint_backfilled, 0, "{result:?}");
+
+    for (name, mode) in [
+        ("FULL", CheckpointMode::Full),
+        ("RESTART", CheckpointMode::Restart),
+        (
+            "TRUNCATE",
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        ),
+    ] {
+        let err = conn.checkpoint(mode).unwrap_err();
+        assert!(
+            matches!(err, LimboError::Busy),
+            "{name} has frames to backfill and must be busy: {err:?}"
+        );
+    }
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+    assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
+    release_and_wait(child, &release_file);
+}
+
+/// A FULL, RESTART or TRUNCATE checkpoint on a read-only connection takes the writer
+/// lock like a read-write one, so another process holding a write transaction makes it
+/// busy even though every frame is backfilled. PASSIVE does not take the writer lock.
+/// Nothing is written.
+#[test]
+fn subprocess_readonly_checkpoint_live_writer_blocks_restart_and_truncate() {
+    let (_dir, child, release_file, db_path, wal_path, _db, conn) =
+        open_readonly_beside_blocker("writer");
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(wal_len > 0, "the child must leave frames in the WAL file");
+    let db_bytes = std::fs::read(&db_path).unwrap();
+
+    for (name, mode) in [
+        ("FULL", CheckpointMode::Full),
+        ("RESTART", CheckpointMode::Restart),
+        (
+            "TRUNCATE",
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        ),
+    ] {
+        let err = conn.checkpoint(mode).unwrap_err();
+        assert!(
+            matches!(err, LimboError::Busy),
+            "{name} must be busy while another process holds the write lock: {err:?}"
+        );
+    }
+    let result = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap_or_else(|err| panic!("PASSIVE must not need the writer lock: {err:?}"));
+    assert!(result.everything_backfilled(), "{result:?}");
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+    assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
+    release_and_wait(child, &release_file);
 }
 
 #[test]

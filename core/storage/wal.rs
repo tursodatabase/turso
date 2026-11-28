@@ -746,9 +746,6 @@ pub trait Wal: Debug + Send + Sync {
     /// Return a handle to the underlying File.
     fn wal_file(&self) -> Result<Arc<dyn File>>;
 
-    /// Whether the WAL file on disk is already 0 bytes. False if the size is unknown.
-    fn is_file_empty(&self) -> bool;
-
     /// Write a bunch of frames to the WAL.
     /// db_size is the database size in pages after the transaction finishes.
     /// db_size is set  -> last frame written in transaction
@@ -4699,12 +4696,6 @@ impl Wal for WalFile {
         self.coordination.wal_file()
     }
 
-    fn is_file_empty(&self) -> bool {
-        self.coordination
-            .wal_file()
-            .is_ok_and(|file| wal_file_is_empty(file.as_ref()))
-    }
-
     /// Use pwritev to append many frames to the log at once.
     ///
     /// # Safety:
@@ -5053,6 +5044,13 @@ impl WalFile {
                     } = mode
                     {
                         max_frame = max_frame.min(upper_bound);
+                    }
+                    if pager.is_read_only() {
+                        // A read-only connection takes the same locks as a read-write one,
+                        // so it is busy in the same cases, but it never backfills: the DB
+                        // file is not written. With frames left, FULL/RESTART/TRUNCATE
+                        // end up busy in `DetermineResult`, PASSIVE reports them as is.
+                        max_frame = nbackfills;
                     }
 
                     {

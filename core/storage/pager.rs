@@ -3211,6 +3211,10 @@ impl Pager {
         self.ephemeral.store(true, Ordering::Relaxed);
     }
 
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn mark_read_only(&self) {
         self.read_only.store(true, Ordering::Relaxed);
     }
@@ -5297,7 +5301,17 @@ impl Pager {
                         }
                     });
                     let mut state = self.checkpoint_state.write();
-                    if matches!(mode, CheckpointMode::Truncate { .. })
+                    if self.is_read_only() {
+                        // A read-only connection backfilled nothing and holds no write
+                        // access to the files: no phase that syncs or truncates the DB file
+                        // or truncates the WAL may run, it could cut a writer's frames.
+                        // Its page cache stays: nothing it holds became stale, and another
+                        // process may have restarted the WAL, so the cached pages can be
+                        // the only valid copy of the snapshot this connection reads.
+                        state.phase = CheckpointPhase::Finalize {
+                            clear_page_cache: false,
+                        };
+                    } else if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
                         && res.should_truncate()
                     {
@@ -5333,15 +5347,12 @@ impl Pager {
 
                     if should_skip_truncate_db_file {
                         let mut state = self.checkpoint_state.write();
-                        let wrote_db = state
-                            .result
-                            .as_ref()
-                            .is_some_and(|r| r.wal_checkpoint_backfilled > 0 || r.db_truncate_sent);
-                        if self.truncate_needs_db_sync(sync_mode, wrote_db) {
+                        if sync_mode == crate::SyncMode::Off {
+                            // Skip DB sync, proceed to WAL truncation
+                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
+                        } else {
                             // Sync DB first, then SyncDbFile will transition to TruncateWalFile
                             state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
-                        } else {
-                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
                         }
                         continue;
                     }
@@ -5357,14 +5368,10 @@ impl Pager {
                             // and go on to the WAL truncation.
                             Err(CacheError::Pinned { .. }) => {
                                 let mut state = self.checkpoint_state.write();
-                                let wrote_db = state
-                                    .result
-                                    .as_ref()
-                                    .is_some_and(|r| r.wal_checkpoint_backfilled > 0);
-                                state.phase = if self.truncate_needs_db_sync(sync_mode, wrote_db) {
-                                    CheckpointPhase::SyncDbFile { clear_page_cache }
-                                } else {
+                                state.phase = if sync_mode == crate::SyncMode::Off {
                                     CheckpointPhase::TruncateWalFile { clear_page_cache }
+                                } else {
+                                    CheckpointPhase::SyncDbFile { clear_page_cache }
                                 };
                                 continue;
                             }
@@ -5397,15 +5404,12 @@ impl Pager {
                     if should_skip_db_truncate {
                         // No DB truncation needed (or unsupported size pre-check), move to next phase.
                         let mut state = self.checkpoint_state.write();
-                        let wrote_db = state
-                            .result
-                            .as_ref()
-                            .is_some_and(|r| r.wal_checkpoint_backfilled > 0 || r.db_truncate_sent);
-                        if self.truncate_needs_db_sync(sync_mode, wrote_db) {
+                        if sync_mode == crate::SyncMode::Off {
+                            // Skip DB sync, proceed to WAL truncation
+                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
+                        } else {
                             // Sync DB first, then SyncDbFile will transition to TruncateWalFile
                             state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
-                        } else {
-                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
                         }
                         continue;
                     }
@@ -5650,22 +5654,6 @@ impl Pager {
                 }
             }
         }
-    }
-
-    /// Whether TRUNCATE must sync the DB file before it truncates the WAL.
-    /// The sync is skipped only when all hold: the connection is read-only, this run
-    /// wrote nothing to the DB file, and the WAL file is already empty. An empty WAL
-    /// has no frames whose DB copies must become durable first, and the sync would
-    /// only fail on a read-only handle. A non-empty WAL file keeps the sync, since an
-    /// earlier failed checkpoint may have reset the WAL counters after backfilling.
-    fn truncate_needs_db_sync(&self, sync_mode: crate::SyncMode, wrote_db: bool) -> bool {
-        if sync_mode == crate::SyncMode::Off {
-            return false;
-        }
-        let skippable = !wrote_db
-            && self.read_only.load(Ordering::Relaxed)
-            && self.wal.as_ref().is_some_and(|wal| wal.is_file_empty());
-        !skippable
     }
 
     #[cfg(feature = "simulator")]
