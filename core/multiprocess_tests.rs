@@ -1158,6 +1158,48 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 }
 
 #[test]
+fn rolled_back_write_keeps_reads_working_when_shared_frame_index_overflowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rollback-overflowed-frame-index.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    commit_new_pages(&conn, 1);
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    authority.mark_frame_index_overflowed_for_tests();
+    commit_user_version(&conn, 1);
+    let header_before = read_header(&conn);
+
+    let pager = conn.pager.load();
+    pager.begin_read_tx().unwrap();
+    pager
+        .io
+        .block(|| pager.begin_write_tx(conn.wal_auto_actions()))
+        .unwrap();
+    pager
+        .io
+        .block(|| pager.with_header_mut(|header| header.user_version = 2.into()))
+        .unwrap();
+    conn.set_tx_state(TransactionState::Write {
+        schema_did_change: false,
+    });
+    pager.rollback_tx(&conn);
+    conn.set_tx_state(TransactionState::None);
+    assert!(
+        authority.frame_index_overflowed(),
+        "the rollback must leave readers on the local frame cache"
+    );
+
+    assert_eq!(read_header(&conn), header_before);
+    commit_user_version(&conn, 3);
+    assert_eq!(read_header(&conn), (header_before.0, 3));
+}
+
+#[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(DialectThatCannotParse)).unwrap();
