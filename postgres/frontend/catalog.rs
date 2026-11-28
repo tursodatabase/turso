@@ -1184,7 +1184,7 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(attnum),                            // attnum
                     Value::from_i64(i64::from(col.array_dimensions())), // attndims
                     Value::from_i64(-1),                                // attcacheoff
-                    Value::from_i64(-1),                                // atttypmod
+                    Value::from_i64(attribute_typmod(col)),             // atttypmod
                     Value::from_i64(1),                                 // attbyval
                     Value::build_text(storage),                         // attstorage
                     Value::Text("i".into()),                            // attalign (int)
@@ -1287,7 +1287,7 @@ fn simple_attribute_row(
         Value::from_i64(position as i64 + 1),
         Value::from_i64(i64::from(column.array_dimensions())),
         Value::from_i64(-1),
-        Value::from_i64(-1),
+        Value::from_i64(attribute_typmod(column)),
         Value::from_i64(1),
         Value::build_text("p"),
         Value::build_text("i"),
@@ -1306,6 +1306,38 @@ fn simple_attribute_row(
         Value::Null,
         Value::Null,
     ]
+}
+
+/// FIXME(pg-catalog): This hand-codes how varchartypmodin and numerictypmodin pack a modifier, and which types have one. A lookup of the typmodin function in pg_type replaces it.
+/// The type modifier of a column, which is -1 when the type has none.
+fn attribute_typmod(column: &turso_core::schema::Column) -> i64 {
+    const VARHDRSZ: i64 = 4;
+    const NUMERIC_SCALE_MASK: i64 = 0x7ff;
+    let parameters: Option<Vec<i64>> = column
+        .ty_params
+        .iter()
+        .map(|parameter| type_parameter_value(parameter))
+        .collect();
+    match (sqlite_type_to_pg_oid(&column.ty_str), parameters.as_deref()) {
+        (1043, Some(&[length])) => length + VARHDRSZ,
+        (1700, Some(&[precision, scale])) => {
+            ((precision << 16) | (scale & NUMERIC_SCALE_MASK)) + VARHDRSZ
+        }
+        _ => -1,
+    }
+}
+
+/// The value of a type parameter, which the schema holds as a number or, after
+/// the table SQL is read again, as a number with a sign.
+fn type_parameter_value(parameter: &ast::Expr) -> Option<i64> {
+    match parameter {
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => text.parse().ok(),
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+            type_parameter_value(inner).map(|value| -value)
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => type_parameter_value(inner),
+        _ => None,
+    }
 }
 
 /// Resolves declared column types for table, view and index attributes.
