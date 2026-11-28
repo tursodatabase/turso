@@ -2803,3 +2803,18 @@ test matview-distinct-on-is-rejected {
 expect error {
     materialized views with DISTINCT ON are not yet supported
 }
+
+# The state table's primary-key index is reported by its automatic index name.
+test matview-state-index-list-reports-autoindex-name {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE MATERIALIZED VIEW v AS
+    SELECT val, COUNT(*) as cnt
+    FROM t
+    GROUP BY val;
+    SELECT il.name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v__n%_1'
+    FROM sqlite_schema s, pragma_index_list(s.name) il
+    WHERE s.type = 'table' AND s.name LIKE '__turso_internal_dbsp_state_v%';
+}
+expect {
+    1
+}

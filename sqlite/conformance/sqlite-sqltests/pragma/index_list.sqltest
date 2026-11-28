@@ -186,3 +186,31 @@ expect {
     0|sqlite_autoindex_w_2|1|u|0
     1|sqlite_autoindex_w_1|1|pk|0
 }
+
+@cross-check-integrity
+test pragma-index-list-mixed-case-names {
+    CREATE TABLE "Pk6"(a, b UNIQUE);
+    CREATE INDEX "Ix" ON pk6(a);
+    SELECT name, origin FROM pragma_index_list('PK6') ORDER BY name;
+    ALTER TABLE pk6 RENAME TO "NewT";
+    SELECT name, origin FROM pragma_index_list('newt') ORDER BY name;
+    SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+}
+expect {
+    Ix|c
+    sqlite_autoindex_Pk6_1|u
+    Ix|c
+    sqlite_autoindex_NewT_1|u
+    Ix
+    sqlite_autoindex_NewT_1
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test pragma-index-list-without-rowid-mixed-case-name {
+    CREATE TABLE "Wr"(k PRIMARY KEY, v) WITHOUT ROWID;
+    PRAGMA index_list(wr);
+}
+expect {
+    0|sqlite_autoindex_Wr_1|1|pk|0
+}

@@ -1240,6 +1240,8 @@ pub fn translate_create_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     let mangled_tbl_name = resolver.mangle_name(namespace, &normalized_tbl_name);
+    // sqlite_schema keeps the name as the user wrote it; lookups ignore case.
+    let stored_tbl_name = resolver.mangle_name(namespace, tbl_name.name.as_str());
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
@@ -1625,7 +1627,7 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    let escaped_tbl_name = escape_sql_string_literal(&mangled_tbl_name);
+    let escaped_tbl_name = escape_sql_string_literal(&stored_tbl_name);
     let mut parse_schema_where_clause = String::with_capacity(
         "tbl_name = '' AND type != 'trigger'".len()
             + escaped_tbl_name.len()
