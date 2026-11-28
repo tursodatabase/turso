@@ -45,6 +45,9 @@ Renaming a table updates all references to the table in:
 - CHECK constraints
 - Views that reference the table
 
+As in SQLite, the stored schema keeps the letter case of the new name, so
+`ALTER TABLE t RENAME TO "Clients"` stores `Clients`.
+
 <Info>
 The new table name must not collide with an existing table, view, or index name in the same database.
 </Info>

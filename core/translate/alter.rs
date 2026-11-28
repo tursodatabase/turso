@@ -1345,7 +1345,14 @@ pub fn translate_alter_table(
 
             // Under a dialect whose relation names are unique across kinds,
             // a name any relation has is taken, as for CREATE.
-            schema::relation_name_is_taken(resolver, namespace, &normalized_new_name, false)?;
+            schema::relation_name_is_taken(
+                resolver,
+                namespace,
+                RelationKind::Table,
+                new_name,
+                false,
+                true,
+            )?;
             // Views whose SQL failed to load are absent from the schema maps
             // but their rows are still in sqlite_schema, so the name is taken.
             let new_name_taken = resolver.with_schema(database_id, |s| {

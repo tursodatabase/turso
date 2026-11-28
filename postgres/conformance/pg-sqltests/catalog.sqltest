@@ -2745,6 +2745,384 @@ expect error {
     relation "zz_rn_view" already exists
 }
 
+# A table, view or materialized view has a row type of its name in its
+# schema, so its name is taken for types, and a type's name is taken for it.
+test a-type-may-not-share-its-name-with-a-table {
+    CREATE TABLE zz_ty_table (a int);
+    CREATE TYPE zz_ty_table AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "zz_ty_table" already exists
+}
+
+test a-type-may-not-share-its-name-with-a-view {
+    CREATE VIEW zz_ty_view AS SELECT 1 AS a;
+    CREATE TYPE zz_ty_view AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "zz_ty_view" already exists
+}
+
+test a-type-may-not-share-its-quoted-name-with-a-view {
+    CREATE VIEW "ZZ_TY_VIEW" AS SELECT 1 AS a;
+    CREATE TYPE "ZZ_TY_VIEW" AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "ZZ_TY_VIEW" already exists
+}
+
+test a-domain-may-not-share-its-quoted-name-with-a-view {
+    CREATE VIEW "ZZ_DOM_VIEW" AS SELECT 1 AS a;
+    CREATE DOMAIN "ZZ_DOM_VIEW" AS int;
+}
+@sqlstate 42710
+expect error {
+    type "ZZ_DOM_VIEW" already exists
+}
+
+test a-domain-may-not-share-its-name-with-a-table {
+    CREATE TABLE zz_dom_table (a int);
+    CREATE DOMAIN zz_dom_table AS int;
+}
+@sqlstate 42710
+expect error {
+    type "zz_dom_table" already exists
+}
+
+test a-table-may-not-share-its-name-with-a-type {
+    CREATE TYPE zz_tbl_type AS ENUM ('a');
+    CREATE TABLE zz_tbl_type (a int);
+}
+@sqlstate 42710
+expect error {
+    type "zz_tbl_type" already exists
+}
+
+test create-table-if-not-exists-does-not-skip-a-type-of-that-name {
+    CREATE DOMAIN zz_tbl_domain AS int;
+    CREATE TABLE IF NOT EXISTS zz_tbl_domain (a int);
+}
+@sqlstate 42710
+expect error {
+    type "zz_tbl_domain" already exists
+}
+
+test create-table-as-may-not-take-a-types-name {
+    CREATE TYPE zz_ctas_type AS ENUM ('a');
+    CREATE TABLE zz_ctas_type AS SELECT 1 AS a;
+}
+@sqlstate 42710
+expect error {
+    type "zz_ctas_type" already exists
+}
+
+test a-view-may-not-share-its-name-with-a-type {
+    CREATE TYPE zz_view_type AS ENUM ('a');
+    CREATE VIEW zz_view_type AS SELECT 1 AS a;
+}
+@sqlstate 42710
+expect error {
+    type "zz_view_type" already exists
+}
+
+# A table keeps the letter case of its quoted name.
+test a-type-may-not-share-its-quoted-name-with-a-table {
+    CREATE TABLE "Zz_Ty_Quoted" (a int);
+    CREATE TYPE "Zz_Ty_Quoted" AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "Zz_Ty_Quoted" already exists
+}
+
+# A type keeps the letter case of its quoted name.
+test a-quoted-table-named-like-the-same-quoted-type {
+    CREATE TYPE "Zz_Tbl_Quoted" AS ENUM ('sad', 'happy');
+    CREATE TABLE "Zz_Tbl_Quoted" (a int);
+}
+@sqlstate 42710
+expect error {
+    type "Zz_Tbl_Quoted" already exists
+}
+
+test a-quoted-view-named-like-the-same-quoted-domain {
+    CREATE DOMAIN "Zz_View_Quoted" AS int;
+    CREATE VIEW "Zz_View_Quoted" AS SELECT 1 AS a;
+}
+@sqlstate 42710
+expect error {
+    type "Zz_View_Quoted" already exists
+}
+
+test a-quoted-type-keeps-its-case-in-pg-type {
+    CREATE TYPE "Zz_Ty_Case" AS ENUM ('a');
+    CREATE DOMAIN "Zz_Dom_Case" AS int;
+    SELECT typname FROM pg_type WHERE lower(typname) IN ('zz_ty_case', 'zz_dom_case') ORDER BY 1;
+}
+expect {
+    Zz_Dom_Case
+    Zz_Ty_Case
+}
+
+# The name of a type that needs quotes is stored without them.
+test a-table-named-like-a-type-whose-name-has-a-space {
+    CREATE TYPE "zz ty space" AS ENUM ('a');
+    CREATE TABLE "zz ty space" (a int);
+}
+@sqlstate 42710
+expect error {
+    type "zz ty space" already exists
+}
+
+test a-view-named-like-a-domain-whose-name-is-a-keyword {
+    CREATE DOMAIN "order" AS int;
+    CREATE VIEW "order" AS SELECT 1 AS a;
+}
+@sqlstate 42710
+expect error {
+    type "order" already exists
+}
+
+test a-type-named-like-a-type-whose-name-has-a-space {
+    CREATE TYPE "zz dup space" AS ENUM ('a');
+    CREATE TYPE "zz dup space" AS ENUM ('b');
+}
+@sqlstate 42710
+expect error {
+    type "?zz dup space"? already exists
+}
+
+test a-quoted-type-name-has-no-quotes-in-pg-type {
+    CREATE TYPE "Zz Ty Space" AS ENUM ('a');
+    CREATE TYPE "select" AS ENUM ('a');
+    CREATE DOMAIN "Zz Dom Space" AS int;
+    SELECT typname FROM pg_type
+    WHERE lower(typname) IN ('zz ty space', 'select', 'zz dom space') ORDER BY lower(typname);
+}
+expect {
+    select
+    Zz Dom Space
+    Zz Ty Space
+}
+
+# Quotes and brackets in a type's name are part of the name.
+test a-type-name-that-starts-with-a-quote-keeps-it {
+    CREATE TYPE "[zz_qb]" AS ENUM ('a');
+    CREATE DOMAIN """zz_qd""" AS int;
+    CREATE TYPE "`zz_qt`" AS ENUM ('a');
+    CREATE TABLE zz_qb (a int);
+    CREATE TABLE zz_qd (a int);
+    CREATE VIEW zz_qt AS SELECT 1 AS a;
+    SELECT typname FROM pg_type
+    WHERE typname IN ('[zz_qb]', '"zz_qd"', '`zz_qt`') ORDER BY typname;
+}
+expect {
+    "zz_qd"
+    [zz_qb]
+    `zz_qt`
+}
+
+test a-relation-name-that-starts-with-a-quote-is-not-a-type-name {
+    CREATE TYPE zz_qr AS ENUM ('a');
+    CREATE TABLE "[zz_qr]" (a int);
+    CREATE TABLE """zz_qr""" (a int);
+    CREATE VIEW "`zz_qr`" AS SELECT 1 AS a;
+    CREATE SEQUENCE "'zz_qr'";
+    CREATE TABLE "[zz_qr" (a int);
+    CREATE TABLE zz_qr_old (a int);
+    ALTER TABLE zz_qr_old RENAME TO "[zz_qr]x";
+    SELECT count(*) FROM pg_class WHERE relname LIKE '%zz_qr%';
+}
+expect {
+    6
+}
+
+test a-relation-named-like-a-type-whose-name-has-quotes {
+    CREATE DOMAIN """zz_qq""" AS int;
+    CREATE TABLE """zz_qq""" (a int);
+}
+@sqlstate 42710
+expect error {
+    type ""zz_qq"" already exists
+}
+
+test a-type-whose-name-starts-with-a-quote-can-be-dropped {
+    CREATE TYPE "[zz_qx]" AS ENUM ('a');
+    CREATE TYPE zz_qx AS ENUM ('a');
+    DROP TYPE "[zz_qx]";
+    CREATE DOMAIN """zz_qy""" AS int;
+    DROP DOMAIN """zz_qy""";
+    SELECT typname FROM pg_type WHERE typname IN ('[zz_qx]', 'zz_qx', '"zz_qy"');
+}
+expect {
+    zz_qx
+}
+
+# A table keeps the letter case of the name that RENAME TO gives it.
+test a-renamed-table-keeps-the-letter-case-of-its-new-name {
+    CREATE TABLE zz_rn_case_old (a int);
+    ALTER TABLE zz_rn_case_old RENAME TO "Zz_Rn_Case";
+    SELECT relname FROM pg_class WHERE lower(relname) = 'zz_rn_case';
+}
+expect {
+    Zz_Rn_Case
+}
+
+test a-type-may-not-take-the-mixed-case-name-of-a-renamed-table {
+    CREATE TABLE zz_rn_type_old (a int);
+    ALTER TABLE zz_rn_type_old RENAME TO "Zz_Rn_Type";
+    CREATE TYPE "Zz_Rn_Type" AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "Zz_Rn_Type" already exists
+}
+
+# A sequence has no row type, but CREATE SEQUENCE checks the type names too.
+test a-sequence-may-not-share-its-name-with-a-type {
+    CREATE TYPE zz_seq_type AS ENUM ('a');
+    CREATE SEQUENCE zz_seq_type;
+}
+@sqlstate 42710
+expect error {
+    type "zz_seq_type" already exists
+}
+
+test a-type-may-share-its-name-with-a-sequence {
+    CREATE SEQUENCE zz_type_seq;
+    CREATE TYPE zz_type_seq AS ENUM ('a');
+    SELECT 'a'::zz_type_seq, nextval('zz_type_seq');
+}
+expect {
+    a|1
+}
+
+test a-type-and-an-index-may-share-a-name {
+    CREATE TABLE zz_idx_table (a int);
+    CREATE INDEX zz_idx_first ON zz_idx_table (a);
+    CREATE TYPE zz_idx_first AS ENUM ('a');
+    CREATE TYPE zz_idx_second AS ENUM ('a');
+    CREATE INDEX zz_idx_second ON zz_idx_table (a);
+    SELECT relname FROM pg_class WHERE relname LIKE 'zz_idx_%' ORDER BY relname;
+}
+expect {
+    zz_idx_first
+    zz_idx_second
+    zz_idx_table
+}
+
+test rename-onto-a-types-name-is-an-error {
+    CREATE TYPE zz_rn_type AS ENUM ('a');
+    CREATE TABLE zz_rn_table3 (a int);
+    ALTER TABLE zz_rn_table3 RENAME TO zz_rn_type;
+}
+@sqlstate 42710
+expect error {
+    type "zz_rn_type" already exists
+}
+
+# Built-in types are in pg_catalog, not in public.
+test a-table-may-take-the-name-of-a-built-in-type {
+    CREATE TABLE text (a int);
+    SELECT relname FROM pg_class WHERE relname = 'text';
+}
+expect {
+    text
+}
+
+test a-table-in-another-schema-may-take-a-public-types-name {
+    CREATE TYPE zz_sp_type AS ENUM ('a');
+    CREATE SCHEMA zz_sp_schema;
+    SET search_path = zz_sp_schema;
+    CREATE TABLE zz_sp_type (a int);
+    CREATE TABLE public.zz_sp_other (b int);
+    SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'zz_sp_type';
+}
+expect {
+    zz_sp_schema
+}
+
+# pg_dump empties search_path and names the schema of every object.
+test a-type-named-with-public-is-created-with-an-empty-search-path {
+    SELECT pg_catalog.set_config('search_path', '', false);
+    CREATE TYPE public.zz_dump_mood AS ENUM ('sad', 'happy');
+    CREATE DOMAIN public.zz_dump_positive AS integer CHECK (VALUE > 0);
+    CREATE TABLE public.zz_dump_t (m public.zz_dump_mood, p public.zz_dump_positive);
+    INSERT INTO public.zz_dump_t VALUES ('happy', 3);
+    SELECT m, p FROM public.zz_dump_t;
+}
+expect {
+
+    happy|3
+}
+
+test a-type-named-with-public-is-created-in-public {
+    CREATE SCHEMA zz_qual_schema;
+    SET search_path = zz_qual_schema;
+    CREATE TYPE public.zz_qual_enum AS ENUM ('a');
+    CREATE DOMAIN public.zz_qual_domain AS int;
+    SELECT t.typname, n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE t.typname LIKE 'zz_qual_%' ORDER BY 1;
+}
+expect {
+    zz_qual_domain|public
+    zz_qual_enum|public
+}
+
+test a-type-named-with-public-may-not-take-a-public-tables-name {
+    CREATE SCHEMA zz_qual_schema2;
+    SET search_path = zz_qual_schema2;
+    CREATE TABLE public.zz_qual_table (a int);
+    CREATE TYPE public.zz_qual_table AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "zz_qual_table" already exists
+}
+
+# PostgreSQL creates a type named without a schema in the first schema of
+# search_path that exists.
+test a-type-goes-to-the-first-schema-of-search-path-that-exists {
+    SET search_path = zz_no_such_schema, "$user", public;
+    CREATE TABLE zz_after_missing (a int);
+    CREATE TYPE zz_after_missing AS ENUM ('a');
+}
+@sqlstate 42710
+expect error {
+    type "zz_after_missing" already exists
+}
+
+test a-type-without-a-schema-to-create-in {
+    SET search_path = zz_no_such_schema;
+    CREATE TYPE zz_nowhere AS ENUM ('a');
+}
+@sqlstate 3F000
+expect error {
+    no schema has been selected to create in
+}
+
+test a-domain-without-a-schema-to-create-in {
+    SET search_path = zz_no_such_schema;
+    CREATE DOMAIN zz_nowhere AS int;
+}
+@sqlstate 3F000
+expect error {
+    no schema has been selected to create in
+}
+
+test a-repeated-type-name-is-a-duplicate-object {
+    CREATE TYPE zz_twice AS ENUM ('a');
+    CREATE DOMAIN zz_twice AS int;
+}
+@sqlstate 42710
+expect error {
+    type "?zz_twice"? already exists
+}
+
 test constraint-oids-are-not-relation-oids {
     CREATE TABLE zz_con_t (a int PRIMARY KEY, b int UNIQUE);
     CREATE TABLE zz_con_u (a int);

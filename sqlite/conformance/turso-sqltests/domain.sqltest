@@ -1818,3 +1818,42 @@ expect {
     2|8
     3|8
 }
+
+# A quoted name is stored without its quotes, so a column can name the type.
+@requires custom_types "uses CREATE DOMAIN"
+test domain-quoted-name-with-a-space {
+    CREATE DOMAIN "pos int" AS integer CHECK (value > 0);
+    CREATE TABLE t1(a "pos int") STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT a FROM t1;
+}
+expect {
+    5
+}
+
+@requires custom_types "uses CREATE TYPE"
+test type-quoted-name-with-a-space {
+    CREATE TYPE "my text" BASE text;
+    CREATE TABLE t1(a "my text") STRICT;
+    INSERT INTO t1 VALUES ('x');
+    SELECT a, sql FROM t1, __turso_internal_types WHERE name = 'my text';
+}
+expect {
+    x|CREATE TYPE "my text" BASE text
+}
+
+# DROP finds a type by its quoted name and deletes its row.
+@requires custom_types "uses CREATE TYPE and CREATE DOMAIN"
+test drop-type-with-a-quoted-name {
+    CREATE TYPE "my text" BASE text;
+    CREATE TYPE "[x]" BASE text;
+    CREATE TYPE x BASE text;
+    CREATE DOMAIN "pos int" AS integer;
+    DROP TYPE "my text";
+    DROP TYPE "[x]";
+    DROP DOMAIN "pos int";
+    SELECT name FROM __turso_internal_types;
+}
+expect {
+    x
+}

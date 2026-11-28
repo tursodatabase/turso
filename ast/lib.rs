@@ -212,6 +212,10 @@ pub enum Stmt {
     CreateType {
         /// `IF NOT EXISTS`
         if_not_exists: bool,
+        /// The namespace that the statement names for the type, if any.
+        /// Without one, the type goes in the namespace that CREATE puts an
+        /// unqualified object in.
+        namespace: Option<Name>,
         /// type name
         type_name: String,
         /// type body
@@ -239,6 +243,10 @@ pub enum Stmt {
     CreateDomain {
         /// `IF NOT EXISTS`
         if_not_exists: bool,
+        /// The namespace that the statement names for the domain, if any.
+        /// Without one, the domain goes in the namespace that CREATE puts an
+        /// unqualified object in.
+        namespace: Option<Name>,
         /// domain name
         domain_name: String,
         /// base type (primitive or another domain/custom type)

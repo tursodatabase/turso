@@ -470,6 +470,71 @@ fn failed_drop_of_several_relations_drops_none() {
 }
 
 #[test]
+fn only_create_hints_that_a_relation_has_a_type_of_its_name() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TYPE ty AS ENUM ('a')").unwrap();
+    conn.execute("CREATE TABLE t1 (a int)").unwrap();
+
+    let error = conn.execute("CREATE TABLE ty (a int)").unwrap_err();
+    assert_eq!(error.sqlstate, "42710", "{error}");
+    assert_eq!(
+        error.hint.as_deref(),
+        Some(
+            "A relation has an associated type of the same name, so you must use a name that \
+             doesn't conflict with any existing type."
+        )
+    );
+    let error = conn.execute("ALTER TABLE t1 RENAME TO ty").unwrap_err();
+    assert_eq!(error.sqlstate, "42710", "{error}");
+    assert_eq!(error.message, "type \"ty\" already exists");
+    assert_eq!(error.hint, None);
+}
+
+#[test]
+fn types_and_renamed_tables_keep_the_letter_case_of_their_names_after_reopening() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TYPE \"Mood\" AS ENUM ('a')").unwrap();
+    conn.execute("CREATE TABLE b (a int)").unwrap();
+    conn.execute("ALTER TABLE b RENAME TO \"Fc\"").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    let conn = db.connect_postgres();
+    let names = |sql: &str| -> Vec<String> {
+        conn.query(sql)
+            .unwrap()
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].to_string())
+            .collect()
+    };
+    assert_eq!(
+        names("SELECT typname FROM pg_type WHERE lower(typname) = 'mood'"),
+        vec!["Mood"]
+    );
+    assert_eq!(
+        names("SELECT relname FROM pg_class WHERE lower(relname) = 'fc'"),
+        vec!["Fc"]
+    );
+    let error = conn.execute("CREATE TABLE \"Mood\" (a int)").unwrap_err();
+    assert_eq!(error.sqlstate, "42710", "{error}");
+    let error = conn.execute("CREATE TABLE mood (a int)").unwrap_err();
+    assert_eq!(error.sqlstate, "0A000", "{error}");
+    let error = conn
+        .execute("CREATE TYPE \"Fc\" AS ENUM ('a')")
+        .unwrap_err();
+    assert_eq!(error.sqlstate, "42710", "{error}");
+    let error = conn.execute("CREATE TYPE fc AS ENUM ('a')").unwrap_err();
+    assert_eq!(error.sqlstate, "0A000", "{error}");
+}
+
+#[test]
 fn refused_drop_leaves_the_sequence_and_the_other_default_working() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();

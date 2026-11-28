@@ -33,6 +33,8 @@ use smallvec::SmallVec;
 #[derive(Debug, Clone)]
 pub struct View {
     pub name: String,
+    /// The name as the CREATE VIEW statement spells it, in its letter case.
+    pub declared_name: String,
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
@@ -42,6 +44,7 @@ pub struct View {
 impl View {
     fn new(
         name: String,
+        declared_name: String,
         sql: String,
         select_stmt: ast::Select,
         columns: Vec<Column>,
@@ -49,6 +52,7 @@ impl View {
     ) -> Self {
         Self {
             name,
+            declared_name,
             sql,
             select_stmt,
             columns,
@@ -2500,7 +2504,13 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def = TypeDef::from_create_type(&type_name, &body, sql.to_string())?;
+                // The parser keeps the quotes of the name token, and a type's
+                // name is the name without them.
+                let type_def = TypeDef::from_create_type(
+                    &crate::util::dequote(&type_name),
+                    &body,
+                    sql.to_string(),
+                )?;
                 self.type_registry
                     .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
@@ -2513,7 +2523,7 @@ impl Schema {
                 ..
             }))) => {
                 let type_def = TypeDef::from_domain(
-                    &domain_name,
+                    &crate::util::dequote(&domain_name),
                     &base_type,
                     not_null,
                     &constraints,
@@ -3970,10 +3980,20 @@ impl Schema {
         {
             let view_name = self.demangle_name(&view_key).1.to_string();
             if let Some(Cmd::Stmt(Stmt::CreateView {
-                columns, select, ..
+                view_name: declared_view_name,
+                columns,
+                select,
+                ..
             })) = crate::dialect::parse_statement(dialect, &sql)?
             {
-                self.populate_view(namespace, view_name, sql, &columns, select)?;
+                self.populate_view(
+                    namespace,
+                    view_name,
+                    declared_view_name.name.as_str(),
+                    sql,
+                    &columns,
+                    select,
+                )?;
                 continue;
             }
 
@@ -4115,18 +4135,22 @@ impl Schema {
     }
 
     /// Builds an ordinary view after its source relations and namespaces are known.
+    /// `declared_name` is the name as the stored CREATE VIEW statement spells it.
     fn populate_view(
         &mut self,
         namespace: NamespaceId,
         name: String,
+        declared_name: &str,
         sql: String,
         column_names: &[ast::IndexedColumn],
         select: ast::Select,
     ) -> Result<()> {
         let mut columns = view::extract_view_columns(namespace, &select, self)?;
         columns.rename_columns(column_names);
+        let declared_name = self.demangle_name(declared_name).1.to_string();
         let view = View::new(
             name,
+            declared_name,
             sql,
             select,
             columns.flat_columns()?,
@@ -4604,7 +4628,7 @@ impl Schema {
                                 .insert(name.to_string(), (namespace, sql.to_string(), root_page));
                         }
                         Stmt::CreateView {
-                            view_name: _,
+                            view_name: declared_view_name,
                             columns: column_names,
                             select,
                             ..
@@ -4618,6 +4642,7 @@ impl Schema {
                                 self.populate_view(
                                     namespace,
                                     view_name,
+                                    declared_view_name.name.as_str(),
                                     sql.to_string(),
                                     &column_names,
                                     select,
@@ -5144,6 +5169,7 @@ impl TryClone for View {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.try_clone()?,

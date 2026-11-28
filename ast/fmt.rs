@@ -686,6 +686,7 @@ impl WriteSql for Stmt {
             Self::Grant(grant) => grant.write_sql(s, context),
             Self::CreateType {
                 if_not_exists,
+                namespace,
                 type_name,
                 body,
             } => {
@@ -695,6 +696,10 @@ impl WriteSql for Stmt {
                     s.keyword("IF")?;
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
+                }
+                if let Some(namespace) = namespace {
+                    namespace.write_sql(s, context)?;
+                    s.punct(".")?;
                 }
                 s.text(type_name)?;
                 match body {
@@ -768,6 +773,7 @@ impl WriteSql for Stmt {
             }
             Self::CreateDomain {
                 if_not_exists,
+                namespace,
                 domain_name,
                 base_type,
                 default,
@@ -780,6 +786,10 @@ impl WriteSql for Stmt {
                     s.keyword("IF")?;
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
+                }
+                if let Some(namespace) = namespace {
+                    namespace.write_sql(s, context)?;
+                    s.punct(".")?;
                 }
                 s.text(domain_name)?;
                 s.keyword("AS")?;

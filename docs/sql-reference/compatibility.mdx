@@ -106,6 +106,24 @@ as one operation, including its schema elements or cascading drops.
 An error or cancellation before commit rolls back the whole operation.
 Cancellation after commit does not undo the changes.
 
+The PostgreSQL frontend keeps the types of `CREATE TYPE ... AS ENUM` and
+`CREATE DOMAIN` in the public schema. As in PostgreSQL, a type cannot have the
+name of a table, view or materialized view of public, and a table, view,
+materialized view or sequence of public cannot have the name of a type. An index
+can. `CREATE TYPE` and `CREATE DOMAIN` with a name that has no schema fail
+with SQLSTATE 0A000 (feature_not_supported) when the first schema of
+`search_path` that exists is not public, because PostgreSQL creates the type in
+that schema. Here `pg_catalog` and `pg_temp` count when `search_path` names
+them, and `"$user"` counts when a schema has the name of the current role.
+A name such as `public.mood` creates the type in public whatever `search_path`
+is.
+
+Types and relations keep the letter case of their names, but the PostgreSQL
+frontend finds them by a name in any letter case. So two types, or a type and a
+relation, whose names differ only in letter case, such as a table `"Mood"` and
+a type `mood`, are not supported: the second `CREATE` fails with SQLSTATE
+0A000.
+
 ## See Also
 
 - [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features

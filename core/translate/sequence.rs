@@ -22,7 +22,7 @@ use crate::ast;
 use crate::bail_parse_error;
 use crate::namespace::{NamespaceId, NamespaceRef, MANGLED_NAME_PREFIX};
 use crate::schema::{
-    BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
+    BTreeTable, RelationKind, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::storage::pager::CreateBTreeFlags;
@@ -1066,7 +1066,14 @@ pub fn translate_create_sequence(
         );
     }
 
-    if schema::relation_name_is_taken(resolver, namespace, &normalized_name, if_not_exists)? {
+    if schema::relation_name_is_taken(
+        resolver,
+        namespace,
+        RelationKind::Sequence,
+        seq_name.name.as_str(),
+        if_not_exists,
+        false,
+    )? {
         return Ok(());
     }
     // Check if sequence already exists

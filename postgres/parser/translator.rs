@@ -1819,11 +1819,11 @@ impl PostgreSQLTranslator {
             }),
             ObjectType::ObjectType => Ok(ast::Stmt::DropType {
                 if_exists: drop.missing_ok,
-                type_name: qualified_name.name.as_str().to_string(),
+                type_name: type_token(qualified_name.name.as_str()),
             }),
             ObjectType::ObjectDomain => Ok(ast::Stmt::DropDomain {
                 if_exists: drop.missing_ok,
-                domain_name: qualified_name.name.as_str().to_string(),
+                domain_name: type_token(qualified_name.name.as_str()),
             }),
             ObjectType::ObjectSequence => Ok(ast::Stmt::DropSequence {
                 if_exists: drop.missing_ok,
@@ -6079,7 +6079,7 @@ impl PostgreSQLTranslator {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
-        let domain_name = object_name(&domain.domainname, is_default_schema, "type")?;
+        let (namespace, domain_name) = created_type_name(&domain.domainname)?;
 
         // Extract base type from type_name and map PG type names to Turso names
         let type_name_node = domain
@@ -6172,7 +6172,8 @@ impl PostgreSQLTranslator {
 
         Ok(ast::Stmt::CreateDomain {
             if_not_exists: false,
-            domain_name,
+            namespace,
+            domain_name: type_token(domain_name),
             base_type,
             default,
             not_null,
@@ -7845,7 +7846,7 @@ fn translate_create_enum(
 ) -> Result<ast::Stmt, ParseError> {
     use pg_query::protobuf::node::Node;
 
-    let type_name = object_name(&enum_stmt.type_name, is_default_schema, "type")?;
+    let (namespace, type_name) = created_type_name(&enum_stmt.type_name)?;
 
     // check_enum_labels checks the labels once the type's name is known to be
     // free, as PostgreSQL does.
@@ -7903,7 +7904,8 @@ fn translate_create_enum(
 
     Ok(ast::Stmt::CreateType {
         if_not_exists: false,
-        type_name,
+        namespace,
+        type_name: type_token(type_name),
         body: ast::CreateTypeBody::CustomType {
             params: vec![ast::TypeParam {
                 name: "value".into(),
@@ -7920,6 +7922,26 @@ fn translate_create_enum(
             default: None,
         },
     })
+}
+
+/// The name of the type that CREATE TYPE or CREATE DOMAIN makes, and the
+/// schema that the statement names for it, if any. The engine resolves an
+/// unqualified name against search_path, as for a relation.
+fn created_type_name(
+    names: &[pg_query::protobuf::Node],
+) -> Result<(Option<ast::Name>, String), ParseError> {
+    let name = object_name(names, is_default_schema, "type")?;
+    let namespace = match extract_key_columns(names)?.as_slice() {
+        [schema, _] => Some(exact_name(schema_qualifier(schema)?)),
+        _ => None,
+    };
+    Ok((namespace, name))
+}
+
+/// The token that the engine takes for the type named `name`: the name, in
+/// quotes when it needs them, as the SQLite parser gives the name of a type.
+fn type_token(name: impl Into<String>) -> String {
+    exact_name(name).as_ident()
 }
 
 #[allow(clippy::vec_box)]

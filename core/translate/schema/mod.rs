@@ -23,8 +23,8 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, RelationKind, Schema, SchemaObjectType, StructDef, Table, Type,
+    TypeDef, TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1279,7 +1279,14 @@ pub fn translate_create_table(
         );
     }
 
-    if relation_name_is_taken(resolver, namespace, &normalized_tbl_name, if_not_exists)? {
+    if relation_name_is_taken(
+        resolver,
+        namespace,
+        RelationKind::Table,
+        tbl_name.name.as_str(),
+        if_not_exists,
+        false,
+    )? {
         return Ok(());
     }
     // Check for name conflicts with existing schema objects
@@ -2764,26 +2771,33 @@ pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuild
 }
 
 /// Whether a relation of `namespace` already has `name`, in a dialect whose
-/// relation names are unique per schema across kinds. Ok(true) when
+/// relation names are unique per schema across kinds. `name` is the name
+/// as the statement gives it, before case folding. Ok(true) when
 /// `if_not_exists` makes the statement skip; an error when the name is
-/// taken and the statement has no IF NOT EXISTS; Ok(false) when the name
-/// is free, or the dialect keeps its own, kind-specific rules.
+/// taken and the statement has no IF NOT EXISTS, or when the dialect does
+/// not let a relation of kind `kind`, made by CREATE or, when `renaming`,
+/// by ALTER TABLE ... RENAME TO, take the name of a type; Ok(false) when
+/// the name is free, or the dialect keeps its own, kind-specific rules.
 pub(crate) fn relation_name_is_taken(
     resolver: &Resolver,
     namespace: NamespaceRef,
+    kind: RelationKind,
     name: &str,
     if_not_exists: bool,
+    renaming: bool,
 ) -> Result<bool> {
-    if !resolver
-        .catalog
-        .dialect
-        .relation_names_unique_across_kinds()
-    {
+    let dialect = &resolver.catalog.dialect;
+    if !dialect.relation_names_unique_across_kinds() {
         return Ok(false);
     }
     let taken = resolver.with_schema(namespace.database_id, |schema| {
-        schema.relation_kind(namespace.id, name).is_some()
-    });
+        if schema.relation_kind(namespace.id, name).is_some() {
+            return Ok(true);
+        }
+        dialect
+            .check_relation_name_against_types(schema, namespace, kind, name, renaming)
+            .map(|()| false)
+    })?;
     if !taken {
         return Ok(false);
     }
@@ -2794,6 +2808,7 @@ pub(crate) fn relation_name_is_taken(
 }
 
 pub fn translate_create_type(
+    namespace: Option<&ast::Name>,
     type_name: &str,
     body: &ast::CreateTypeBody,
     if_not_exists: bool,
@@ -2801,7 +2816,13 @@ pub fn translate_create_type(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    // The parsers give the name token, with its quotes. The type registry
+    // finds a type by its token, and the type's name is the token without
+    // quotes.
+    let type_token = type_name;
+    let type_name = &crate::util::dequote(type_token);
     let normalized_name = normalize_ident(type_name);
+    let registry_key = type_registry_key(type_token);
 
     // Reject names that shadow SQLite base types
     let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
@@ -2811,11 +2832,12 @@ pub fn translate_create_type(
     if is_base_type {
         bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
     }
+    check_type_name_against_relations(namespace, type_name, resolver)?;
 
     // Check if type already exists
     if resolver
         .schema()
-        .get_type_def_unchecked(&normalized_name)
+        .get_type_def_unchecked(type_token)
         .is_some()
     {
         if if_not_exists {
@@ -2823,7 +2845,7 @@ pub fn translate_create_type(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
-    check_name_not_cast_to("type", &normalized_name, resolver)?;
+    check_name_not_cast_to("type", &normalized_name, &registry_key, resolver)?;
 
     // Validate encode/coerce/decode expressions for safety (only for custom types)
     if let ast::CreateTypeBody::CustomType {
@@ -2850,14 +2872,15 @@ pub fn translate_create_type(
             .plain_value_type(&normalized_name, type_def.value_input_type())?;
         // A CAST to the type from its own DECODE would run that DECODE again
         // without end.
-        if type_def_uses_type(&type_def, &type_registry_key(&normalized_name))? {
+        if type_def_uses_type(&type_def, &registry_key)? {
             bail_parse_error!("cannot create type {normalized_name}: it casts to itself");
         }
         check_decode_type(&type_def, resolver)?;
     }
 
-    // Build canonical SQL (without IF NOT EXISTS) for persistence
-    let sql = build_create_type_sql(&normalized_name, body);
+    // Build canonical SQL (without IF NOT EXISTS) for persistence. The type
+    // keeps the letter case of its name there, as a table does.
+    let sql = build_create_type_sql(type_name, body);
 
     persist_type_definition(normalized_name, sql, resolver, connection, program)
 }
@@ -2991,6 +3014,7 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_create_domain(
+    namespace: Option<&ast::Name>,
     domain_name: &str,
     base_type: &str,
     not_null: bool,
@@ -3001,7 +3025,13 @@ pub fn translate_create_domain(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    // The parsers give the name token, with its quotes. The type registry
+    // finds a type by its token, and the domain's name is the token without
+    // quotes.
+    let domain_token = domain_name;
+    let domain_name = &crate::util::dequote(domain_token);
     let normalized_name = normalize_ident(domain_name);
+    let registry_key = type_registry_key(domain_token);
 
     // Reject names that shadow SQLite base types
     let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
@@ -3011,11 +3041,12 @@ pub fn translate_create_domain(
     if is_base_type {
         bail_parse_error!("cannot create domain \"{normalized_name}\": name is a built-in type");
     }
+    check_type_name_against_relations(namespace, domain_name, resolver)?;
 
     // Check if type/domain already exists
     if resolver
         .schema()
-        .get_type_def_unchecked(&normalized_name)
+        .get_type_def_unchecked(domain_token)
         .is_some()
     {
         if if_not_exists {
@@ -3023,7 +3054,7 @@ pub fn translate_create_domain(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
-    check_name_not_cast_to("domain", &normalized_name, resolver)?;
+    check_name_not_cast_to("domain", &normalized_name, &registry_key, resolver)?;
 
     // Validate base type exists — must be a primitive or a registered type
     let base_normalized = normalize_ident(base_type);
@@ -3056,7 +3087,6 @@ pub fn translate_create_domain(
     }
     // A CAST to the domain from its own CHECK or DEFAULT would run that
     // expression again without end.
-    let registry_key = type_registry_key(&normalized_name);
     for expr in constraints
         .iter()
         .map(|c| c.check.as_ref())
@@ -3069,7 +3099,10 @@ pub fn translate_create_domain(
 
     // Build the CREATE DOMAIN SQL for persistence
     let sql = {
-        let mut s = format!("CREATE DOMAIN {normalized_name} AS {base_type}");
+        let mut s = format!(
+            "CREATE DOMAIN {} AS {base_type}",
+            crate::util::quote_identifier(domain_name)
+        );
         if let Some(ref def) = default {
             s.push_str(&format!(" DEFAULT {def}"));
         }
@@ -3088,14 +3121,39 @@ pub fn translate_create_domain(
     persist_type_definition(normalized_name, sql, resolver, connection, program)
 }
 
+/// Checks with the dialect that a new type named `name` can be created in
+/// the namespace that CREATE puts it in: `namespace` when the statement
+/// names one.
+fn check_type_name_against_relations(
+    namespace: Option<&ast::Name>,
+    name: &str,
+    resolver: &Resolver,
+) -> Result<()> {
+    let namespace = resolver.resolve_namespace_for_create(&ast::QualifiedName {
+        namespace: namespace.cloned(),
+        name: ast::Name::exact(name.to_string()),
+        alias: None,
+    })?;
+    resolver.with_schema(namespace.database_id, |schema| {
+        resolver
+            .catalog
+            .dialect
+            .check_type_name_against_relations(schema, namespace, name)
+    })
+}
+
 /// Refuse a new type or domain whose name an existing type or stored
 /// expression already casts to. That CAST follows SQLite's rules for the name
 /// (`CAST(x AS b)` gives a NUMERIC), and creating the type would change the
 /// values it gives, such as those stored in an index.
-fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver) -> Result<()> {
-    let registry_key = type_registry_key(normalized_name);
+fn check_name_not_cast_to(
+    kind: &str,
+    normalized_name: &str,
+    registry_key: &str,
+    resolver: &Resolver,
+) -> Result<()> {
     if let Some(name) =
-        find_in_any_database(resolver, |schema| find_type_using(schema, &registry_key))?
+        find_in_any_database(resolver, |schema| find_type_using(schema, registry_key))?
     {
         bail_parse_error!(
             "cannot create {kind} {normalized_name}: type {name} already casts to it; \
@@ -3103,7 +3161,7 @@ fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver
         );
     }
     if let Some(owner) = find_in_any_database(resolver, |schema| {
-        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), registry_key)
     })? {
         bail_parse_error!("cannot create {kind} {normalized_name}: {owner} already casts to it");
     }
@@ -3118,11 +3176,14 @@ pub fn translate_drop_type(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let normalized_name = normalize_ident(type_name);
+    // The parsers give the name token, with its quotes. The type registry
+    // finds a type by its token, and the row of the type has the name
+    // without quotes.
+    let normalized_name = normalize_ident(&crate::util::dequote(type_name));
     let kind = if is_domain_drop { "domain" } else { "type" };
 
     // Check if type exists
-    let type_def = resolver.schema().get_type_def_unchecked(&normalized_name);
+    let type_def = resolver.schema().get_type_def_unchecked(type_name);
     if type_def.is_none() {
         if if_exists {
             return Ok(());
@@ -3173,7 +3234,7 @@ pub fn translate_drop_type(
     // Remove from in-memory schema
     program.emit_insn(Insn::DropType {
         db: MAIN_DB_ID,
-        type_name: normalized_name,
+        type_name: type_name.to_string(),
     });
 
     program.emit_insn(Insn::SetCookie {
