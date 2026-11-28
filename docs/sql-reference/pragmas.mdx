@@ -147,7 +147,8 @@ Returns the same columns as `table_info` plus a `hidden` column (0 for normal co
 
 ### table_list
 
-Returns one row for each table and view in the database.
+Returns one row for each table and view in the database. `name` has the case that the
+`CREATE` statement gave the name.
 
 ```sql
 PRAGMA table_list;
@@ -158,7 +159,8 @@ PRAGMA table_list;
 
 ### index_list
 
-Returns one row for each index on the named table.
+Returns one row for each index on the named table. `name` has the case that the `CREATE`
+statement gave the name.
 
 ```sql
 PRAGMA index_list(table-name);
@@ -203,7 +205,7 @@ numbers the constraints, `seq` is the position of the column within that constra
 `from` and `to` are the child and parent columns. `on_update` and `on_delete` are
 `NO ACTION` unless the constraint declares an action, and `match` is always `NONE`.
 Constraints are reported newest declaration first, so a table-level `FOREIGN KEY` clause
-written last has `id` 0.
+written last has `id` 0. `table` is the parent table as the `REFERENCES` clause wrote it.
 
 ```sql
 PRAGMA foreign_key_list(child);
@@ -231,8 +233,8 @@ PRAGMA foreign_key_check(child);
 -- child | 3     | parent | 0
 ```
 
-table is the child table, rowid is the broken row, parent is the table the key points at, and
-fkid is the id that foreign_key_list gives the key. A row that breaks two keys is returned
+table is the child table, rowid is the broken row, parent is the table the key points at, as the
+`REFERENCES` clause wrote it, and fkid is the id that foreign_key_list gives the key. A row that breaks two keys is returned
 twice. A row with a NULL in the key is skipped. The result is the same whether foreign_keys is
 on or off.
 

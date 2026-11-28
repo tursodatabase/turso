@@ -10,3 +10,52 @@ expect raw {
 CREATE TABLE t1 (a);
 CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
 }
+
+# The schema rows keep the case that CREATE gave the names. Like sqlite3,
+# .schema matches lower(tbl_name) with LIKE, which ignores case, or with
+# GLOB when the pattern has a GLOB wildcard.
+@backend cli
+test schema-finds-table-without-regard-to-case {
+    CREATE TABLE Foo(a);
+    CREATE TABLE bar(b);
+    .schema foo
+}
+expect raw {
+CREATE TABLE Foo (a);
+}
+
+@backend cli
+test schema-like-pattern-ignores-case {
+    CREATE TABLE Foo(a);
+    CREATE TABLE Fob(b);
+    CREATE TABLE bar(c);
+    .schema FO%
+}
+expect raw {
+CREATE TABLE Foo (a);
+CREATE TABLE Fob (b);
+}
+
+@backend cli
+test schema-glob-pattern-matches-lowercase-name {
+    CREATE TABLE Foo(a);
+    CREATE TABLE bar(b);
+    .schema f?o
+}
+expect raw {
+CREATE TABLE Foo (a);
+}
+
+# Like sqlite3, .indexes matches the table name with LIKE.
+@backend cli
+@skip-if sqlite "sqlite3 prints the index names in columns"
+test indexes-find-table-without-regard-to-case {
+    CREATE TABLE Foo(a);
+    CREATE INDEX FooA ON Foo(a);
+    CREATE TABLE bar(b);
+    CREATE INDEX foo_like ON bar(b);
+    .indexes foo
+}
+expect raw {
+FooA
+}

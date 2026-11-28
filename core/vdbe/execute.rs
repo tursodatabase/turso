@@ -11148,21 +11148,30 @@ pub fn op_function(
                     // Only the renamed table's own automatic indexes embed its
                     // name. Another table can share the prefix (`t` and `t_x`),
                     // so its `sqlite_autoindex_t_x_1` must stay untouched.
+                    // The old name comes from the statement, so compare it
+                    // with the `name` and `tbl_name` columns without case,
+                    // as SQLite does (`tbl_name=%Q COLLATE nocase` in
+                    // alter.c). Like SQLite, store the new name as the
+                    // statement wrote it.
                     let renamed_autoindex = if normalize_ident(&tbl_name) == rename_from {
-                        crate::util::renamed_automatic_index_name(&name, &rename_from, &rename_to)
+                        crate::util::renamed_automatic_index_name(
+                            &normalize_ident(&name),
+                            &rename_from,
+                            original_rename_to.as_str(),
+                        )
                     } else {
                         None
                     };
                     let new_name = if let Some(index_name) = renamed_autoindex {
                         index_name
-                    } else if name == rename_from {
-                        rename_to.clone()
+                    } else if normalize_ident(&name) == rename_from {
+                        original_rename_to.to_string()
                     } else {
                         name
                     };
 
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                    let new_tbl_name = if normalize_ident(&tbl_name) == rename_from {
+                        original_rename_to.to_string()
                     } else {
                         tbl_name
                     };
@@ -15635,10 +15644,12 @@ pub fn op_init_cdc_version(
             return Ok(InsnFunctionStepResult::Step);
         }
 
+        // The user names the CDC table, and table names do not depend on
+        // case.
         let stmt = prepare_cdc_internal(
             &conn,
             format!(
-                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}' COLLATE NOCASE",
             ),
         )?;
         *state.active_op_state.init_cdc_version() = Some(Box::new(OpInitCdcVersionInner {
@@ -15731,10 +15742,15 @@ fn drive_init_cdc_version(
                     } else {
                         *version
                     };
+                    // Each spelling of the table name gets its own row. A
+                    // new spelling takes the version that the table has
+                    // under another spelling, because table names do not
+                    // depend on case. Without this, a table that has a
+                    // version would look like a legacy v1 table.
                     inner.stmt = prepare_cdc_internal(
                         conn,
                         format!(
-                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
+                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', coalesce((SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}' COLLATE NOCASE), '{version_to_insert}'))",
                         ),
                     )?;
                     inner.phase = OpInitCdcVersionPhase::InsertVersion;
@@ -17144,6 +17160,9 @@ pub fn op_rename_table(
             // name its schema row has.
             let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
             let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
+            // The declared name of an automatic index has the new table name
+            // as the statement wrote it.
+            let declared_to = crate::namespace::mangle_name(*namespace, to.as_str());
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
@@ -17152,6 +17171,12 @@ pub fn op_rename_table(
                     &mangled_from,
                     &mangled_to,
                 ) {
+                    index.declared_name = crate::util::renamed_automatic_index_name(
+                        &index.name,
+                        &mangled_from,
+                        &declared_to,
+                    )
+                    .expect("the index is an automatic index of the table");
                     index.name = name;
                 }
             });
@@ -17174,6 +17199,7 @@ pub fn op_rename_table(
                         && normalize_ident(&fk.parent_table) == normalized_from
                     {
                         fk.parent_table.clone_from(&normalized_to);
+                        fk.parent_table_declared.clone_from(to);
                     }
                 }
 
@@ -17190,7 +17216,9 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
-                normalized_to.clone_into(&mut btree.declared_name);
+                // The declared name keeps the case that the statement gave
+                // the new name, as the schema row does.
+                to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -17201,7 +17229,6 @@ pub fn op_rename_table(
         #[cfg(feature = "conn_raw_api")]
         schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.insert_table(*namespace, normalized_to.to_owned(), table);
-
         let references_renamed_table = |fk: &ForeignKey| {
             fk.parent_namespace == *namespace
                 && normalize_ident(&fk.parent_table) == normalized_from
@@ -17223,6 +17250,7 @@ pub fn op_rename_table(
                     if references_renamed_table(fk_arc) {
                         let fk = Arc::make_mut(fk_arc);
                         fk.parent_table.clone_from(&normalized_to);
+                        fk.parent_table_declared.clone_from(to);
                     }
                 }
             }

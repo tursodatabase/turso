@@ -93,7 +93,7 @@ The PostgreSQL frontend exposes primary keys through its system catalogs, includ
 
 #### AUTOINCREMENT
 
-The `AUTOINCREMENT` keyword can only be used with `INTEGER PRIMARY KEY`. It prevents the reuse of rowid values from previously deleted rows by maintaining a counter in the `sqlite_sequence` system table.
+The `AUTOINCREMENT` keyword can only be used with `INTEGER PRIMARY KEY`. It prevents the reuse of rowid values from previously deleted rows by maintaining a counter in the `sqlite_sequence` system table. The `name` column of `sqlite_sequence` has the table name with the case that `CREATE TABLE` gave it.
 
 ```sql
 CREATE TABLE events (

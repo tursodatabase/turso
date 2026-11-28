@@ -1,0 +1,54 @@
+@database :memory:
+@skip-file-if sqlite "change data capture is a turso-specific feature"
+
+# The PRAGMA can name the CDC table in a case that differs from the name in
+# sqlite_schema. The table must keep its version, or the changes get the v1
+# column layout in a v2 table.
+test cdc-table-name-in-new-case-keeps-version {
+    PRAGMA capture_data_changes_conn('full,mycdc');
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    PRAGMA capture_data_changes_conn('off');
+    PRAGMA capture_data_changes_conn('full,MYCDC');
+    INSERT INTO t VALUES (2, 3);
+    SELECT * FROM turso_cdc_version ORDER BY table_name;
+    SELECT change_id, change_type, table_name, id FROM mycdc WHERE change_id > 2;
+}
+expect {
+    MYCDC|v2
+    mycdc|v2
+    3|1|t|2
+    4|2||
+}
+
+# A CDC table that has no version row is a legacy v1 table, in each case
+# of its name.
+test cdc-legacy-table-name-in-new-case-is-v1 {
+    CREATE TABLE "MyCdc" (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    PRAGMA capture_data_changes_conn('full,mycdc');
+    INSERT INTO t VALUES (2, 3);
+    SELECT * FROM turso_cdc_version;
+    SELECT change_id, change_type, table_name, id FROM mycdc;
+}
+expect {
+    mycdc|v1
+    1|1|t|2
+}
+
+# DROP TABLE removes the version row of each spelling. A new table with
+# the same name must not take the version of the dropped table.
+test cdc-drop-table-removes-version-rows-of-each-case {
+    PRAGMA capture_data_changes_conn('full,MyCdc');
+    PRAGMA capture_data_changes_conn('off');
+    PRAGMA capture_data_changes_conn('full,MYCDC');
+    PRAGMA capture_data_changes_conn('off');
+    DROP TABLE mycdc;
+    SELECT count(*) FROM turso_cdc_version;
+    CREATE TABLE mycdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
+    PRAGMA capture_data_changes_conn('full,mycdc');
+    SELECT * FROM turso_cdc_version;
+}
+expect {
+    0
+    mycdc|v1
+}

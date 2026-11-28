@@ -148,6 +148,15 @@ fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
     }
 }
 
+/// The name of `table` in PRAGMA table_list. SQLite shows the name as the
+/// CREATE statement wrote it.
+fn table_list_name(table: &Table) -> &str {
+    match table {
+        Table::BTree(table) => &table.declared_name,
+        _ => table.get_name(),
+    }
+}
+
 fn emit_table_list_rows_for_schema(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -184,7 +193,7 @@ fn emit_table_list_rows_for_schema(
             };
             emit_table_row(
                 program,
-                table.get_name(),
+                table_list_name(&table),
                 "table",
                 table.columns().len(),
                 wr,
@@ -193,7 +202,7 @@ fn emit_table_list_rows_for_schema(
         } else if let Some(view) = schema.get_view(namespace, &lookup_name) {
             emit_table_row(
                 program,
-                &view.name,
+                &view.declared_name,
                 "view",
                 view.columns.len(),
                 false,
@@ -209,7 +218,7 @@ fn emit_table_list_rows_for_schema(
         };
         emit_table_row(
             program,
-            &bt.name,
+            &bt.declared_name,
             "table",
             bt.columns().len(),
             !bt.has_rowid,
@@ -219,7 +228,7 @@ fn emit_table_list_rows_for_schema(
     for (_, view) in schema.views(namespace) {
         emit_table_row(
             program,
-            &view.name,
+            &view.declared_name,
             "view",
             view.columns.len(),
             false,
@@ -1277,7 +1286,9 @@ fn query_pragma(
                             };
 
                             program.emit_int(seq as i64, base_reg);
-                            program.emit_string8(index.name.clone(), base_reg + 1);
+                            // SQLite shows the name as the CREATE
+                            // statement wrote it.
+                            program.emit_string8(index.declared_name.clone(), base_reg + 1);
                             program.emit_int(index.unique as i64, base_reg + 2);
                             program.emit_string8(origin.to_string(), base_reg + 3);
                             program.emit_int(index.where_clause.is_some() as i64, base_reg + 4);
@@ -1366,7 +1377,7 @@ fn query_pragma(
 
                             program.emit_int(id as i64, base_reg);
                             program.emit_int(idx as i64, base_reg + 1);
-                            program.emit_string8(fk.parent_table.clone(), base_reg + 2);
+                            program.emit_string8(fk.parent_table_declared.clone(), base_reg + 2);
                             program.emit_string8(child_column.clone(), base_reg + 3);
                             program.emit_string8(parent_column.to_string(), base_reg + 4);
                             program.emit_string8(

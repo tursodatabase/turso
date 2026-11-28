@@ -1,6 +1,7 @@
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::emit_jump_if_other_spelling;
 
 use crate::ast;
 use crate::{
@@ -287,15 +288,28 @@ pub fn translate_analyze(
             dest: tbl_col_reg,
             default: None,
         });
-        let mangled_table_name = resolver.mangle_name(namespace, &target_table.name);
+        // The rows of sqlite_stat1 have the names of tables and indexes as
+        // the CREATE statements wrote them, as in SQLite. A row that an
+        // older Turso version wrote has the normalized names, so the deletes
+        // find the rows of both spellings.
+        let mangled_table_name = resolver.mangle_name(namespace, &target_table.declared_name);
+        let normalized_table_name = resolver.mangle_name(namespace, &target_table.name);
         let target_tbl_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: mangled_table_name.clone(),
+            value: normalized_table_name.clone(),
             dest: target_tbl_reg,
         });
         program.mark_last_insn_constant();
 
         let skip_label = program.allocate_label();
+        let table_matches_label = program.allocate_label();
+        emit_jump_if_other_spelling(
+            program,
+            tbl_col_reg,
+            &mangled_table_name,
+            &normalized_table_name,
+            table_matches_label,
+        );
         program.emit_insn(Insn::Ne {
             lhs: tbl_col_reg,
             rhs: target_tbl_reg,
@@ -303,6 +317,7 @@ pub fn translate_analyze(
             flags: Default::default(),
             collation: CollationSeq::for_internal_values(),
         });
+        program.preassign_label_to_next_insn(table_matches_label);
 
         if let Some(idx) = target_index.clone() {
             let idx_col_reg = program.alloc_register();
@@ -318,6 +333,14 @@ pub fn translate_analyze(
                 dest: target_idx_reg,
             });
             program.mark_last_insn_constant();
+            let index_matches_label = program.allocate_label();
+            emit_jump_if_other_spelling(
+                program,
+                idx_col_reg,
+                &idx.declared_name,
+                &idx.name,
+                index_matches_label,
+            );
             program.emit_insn(Insn::Ne {
                 lhs: idx_col_reg,
                 rhs: target_idx_reg,
@@ -325,6 +348,7 @@ pub fn translate_analyze(
                 flags: Default::default(),
                 collation: CollationSeq::for_internal_values(),
             });
+            program.preassign_label_to_next_insn(index_matches_label);
             let rowid_reg = program.alloc_register();
             program.emit_insn(Insn::RowId {
                 cursor_id: stat_cursor,
@@ -644,7 +668,7 @@ fn emit_index_stats(
     });
     program.mark_last_insn_constant();
     program.emit_insn(Insn::String8 {
-        value: index.name.to_string(),
+        value: index.declared_name.clone(),
         dest: record_start + 1,
     });
     program.mark_last_insn_constant();

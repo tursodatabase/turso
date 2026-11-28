@@ -98,14 +98,17 @@ employees
 
 ### .schema
 
-Display the CREATE statement for a table, or all tables if no argument is given.
+Display the CREATE statements of the tables whose names match PATTERN, with their indexes and triggers, or of all tables if no argument is given. As in SQLite, PATTERN is a `LIKE` pattern, or a `GLOB` pattern when it contains `*`, `?` or `[`. A `LIKE` pattern matches without regard to case. A `GLOB` pattern matches the name in lowercase.
 
 ```
-.schema [TABLE]
+.schema [PATTERN]
 ```
 
 ```
 tursodb> .schema employees
+CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT);
+
+tursodb> .schema EMP%
 CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT);
 
 tursodb> .schema
@@ -115,10 +118,10 @@ CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
 
 ### .indexes
 
-Show index names, optionally filtered by table.
+Show index names, optionally only those of the tables whose names match PATTERN. As in SQLite, PATTERN is a `LIKE` pattern, which matches without regard to case.
 
 ```
-.indexes [TABLE]
+.indexes [PATTERN]
 ```
 
 ```sql

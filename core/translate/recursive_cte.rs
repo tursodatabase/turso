@@ -272,6 +272,7 @@ fn open_recursive_cte_cursors(
                 ))?;
             }
             let index = Arc::new(Index {
+                declared_name: queue_name.clone(),
                 name: queue_name,
                 table_name: String::new(),
                 root_page: 0,
@@ -315,6 +316,7 @@ fn open_recursive_cte_cursors(
             })?;
         }
         let seen_row_index = Arc::new(Index {
+            declared_name: format!("recursive-distinct-{}", recursive_cte.name),
             name: format!("recursive-distinct-{}", recursive_cte.name),
             table_name: String::new(),
             root_page: 0,

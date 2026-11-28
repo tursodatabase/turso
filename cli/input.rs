@@ -382,7 +382,7 @@ pub const AFTER_HELP_MSG: &str = r#"Usage Examples:
    .listvfs
 
 15. To show names of indexes:
-   .indexes ?TABLE?
+   .indexes ?PATTERN?
 
 16. To turn on column headers in list mode:
    .headers on

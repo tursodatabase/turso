@@ -4227,7 +4227,23 @@ impl Connection {
                     }
                     match sub {
                         SyncRowStep::Start => {
-                            let sequence_name = autoincrement_sequence_name(&rows[*idx].0);
+                            // The row has the table name as CREATE TABLE
+                            // wrote it, or the normalized name when an older
+                            // Turso version wrote the row. The sequence has
+                            // the normalized name. A row with another
+                            // spelling names no table, as in SQLite.
+                            let row_name = &rows[*idx].0;
+                            let normalized_name = crate::util::normalize_ident(row_name);
+                            let names_table = *row_name == normalized_name
+                                || self.with_schema(MAIN_DB_ID, |s| {
+                                    s.declared_table_row_name(&normalized_name).as_ref()
+                                        == Some(row_name)
+                                });
+                            if !names_table {
+                                *idx += 1;
+                                continue;
+                            }
+                            let sequence_name = autoincrement_sequence_name(&normalized_name);
                             let backing_table_name = sequence_backing_table_name(&sequence_name);
                             let has_backing = self.with_schema(MAIN_DB_ID, |s| {
                                 s.get_btree_table(NamespaceId::ROOT, &backing_table_name)

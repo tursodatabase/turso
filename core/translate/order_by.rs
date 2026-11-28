@@ -173,6 +173,7 @@ impl EmitOrderBy {
                 ))?;
             }
             let index = Arc::new(Index {
+                declared_name: index_name.clone(),
                 name: index_name,
                 table_name: String::new(),
                 ephemeral: true,

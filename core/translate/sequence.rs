@@ -776,6 +776,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     resolver: &Resolver,
     database_id: usize,
     autoinc_table_name: &str,
+    normalized_table_name: &str,
     value_reg: usize,
 ) -> Result<bool> {
     let Some(sseq_table) = resolver.with_schema(database_id, |s| {
@@ -783,11 +784,12 @@ pub(crate) fn emit_sqlite_sequence_sync(
     }) else {
         return Ok(false);
     };
-    emit_sqlite_sequence_row_write(
+    emit_sqlite_sequence_row_write_of_table(
         program,
         sseq_table,
         database_id,
         autoinc_table_name,
+        normalized_table_name,
         value_reg,
     );
     Ok(true)
@@ -875,6 +877,28 @@ pub fn emit_sqlite_sequence_row_write(
     name: &str,
     value_reg: usize,
 ) {
+    emit_sqlite_sequence_row_write_of_table(
+        program,
+        sseq_table,
+        database_id,
+        name,
+        name,
+        value_reg,
+    );
+}
+
+/// As [`emit_sqlite_sequence_row_write`], for the row of an AUTOINCREMENT
+/// table. `name` is the table name as CREATE TABLE wrote it. The write also
+/// deletes the rows named `normalized_name`, which older Turso versions
+/// wrote.
+fn emit_sqlite_sequence_row_write_of_table(
+    program: &mut ProgramBuilder,
+    sseq_table: Arc<BTreeTable>,
+    database_id: usize,
+    name: &str,
+    normalized_name: &str,
+    value_reg: usize,
+) {
     let sseq_root = sseq_table.root_page;
     let sseq_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sseq_table));
 
@@ -886,7 +910,7 @@ pub fn emit_sqlite_sequence_row_write(
 
     let name_reg = program.emit_string8_new_reg(name.to_string());
 
-    // Delete every existing row matching `name`.
+    // Delete every existing row matching `name` or `normalized_name`.
     let insert_label = program.allocate_label();
     let loop_top_label = program.allocate_label();
     let skip_delete_label = program.allocate_label();
@@ -897,6 +921,14 @@ pub fn emit_sqlite_sequence_row_write(
     program.preassign_label_to_next_insn(loop_top_label);
     let col_name_reg = program.alloc_register();
     program.emit_column_or_rowid(sseq_cursor, 0, col_name_reg);
+    let delete_label = program.allocate_label();
+    crate::translate::emitter::emit_jump_if_other_spelling(
+        program,
+        col_name_reg,
+        normalized_name,
+        name,
+        delete_label,
+    );
     program.emit_insn(Insn::Ne {
         lhs: col_name_reg,
         rhs: name_reg,
@@ -904,6 +936,7 @@ pub fn emit_sqlite_sequence_row_write(
         flags: CmpInsFlags::default().jump_if_null(),
         collation: CollationSeq::for_internal_values(),
     });
+    program.preassign_label_to_next_insn(delete_label);
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
@@ -976,7 +1009,20 @@ pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
     let Some(table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
         return Ok(());
     };
-    emit_sqlite_sequence_sync(program, resolver, database_id, table_name, value_reg)?;
+    // The row of sqlite_sequence has the table name as the CREATE TABLE
+    // statement wrote it, as in SQLite. The name of the sequence has the
+    // normalized name.
+    let declared_table_name = resolver
+        .with_schema(database_id, |s| s.declared_table_row_name(table_name))
+        .unwrap_or_else(|| table_name.to_string());
+    emit_sqlite_sequence_sync(
+        program,
+        resolver,
+        database_id,
+        &declared_table_name,
+        table_name,
+        value_reg,
+    )?;
     Ok(())
 }
 

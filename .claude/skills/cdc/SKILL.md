@@ -12,6 +12,7 @@ CDC is per connection: `PRAGMA capture_data_changes_conn(...)` makes each write 
 - v2 columns: change_id, change_time, change_txn_id, change_type, table_name, id, before, after, updates. v2 is the current version.
 - change_type is 1 (insert), 0 (update), -1 (delete), 2 (COMMIT record, v2 only).
 - The version of each CDC table is a row in the `turso_cdc_version` table (columns table_name, version).
+- `turso_cdc_version` has one row for each spelling of the table name that the pragma got (`mycdc`, `MYCDC`). A new spelling takes the version of a row that matches without case. `DROP TABLE` removes the rows of all spellings.
 - When the pragma is enabled and the CDC table already exists without a version row, the version is set to v1. A new CDC table gets the requested version (v2 by default).
 - Writes to the CDC table and to `turso_cdc_version` are not captured.
 

@@ -714,6 +714,7 @@ fn allocate_window_minmax(
             .expect("min/max window calls must have one argument");
         let collation = ExprContext::new(Some(table_references), resolver).expr_collation(arg)?;
         let index = Arc::new(Index {
+            declared_name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
             name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
             table_name: String::new(),
             root_page: 0,

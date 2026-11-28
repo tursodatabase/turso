@@ -1,0 +1,33 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires-file materialized_views "requires materialized view support"
+
+# The row of a materialized view keeps the case that CREATE gave the name.
+# The view must still find its state tables, whose names are lowercase.
+test matview-with-mixed-case-name-keeps-state {
+    CREATE TABLE src (a, b);
+    INSERT INTO src VALUES (1, 1), (2, 1), (3, 2);
+    CREATE MATERIALIZED VIEW MatV AS SELECT b, count(*) FROM src GROUP BY b;
+    SELECT * FROM matv ORDER BY b;
+    INSERT INTO src VALUES (4, 2);
+    SELECT * FROM MATV ORDER BY b;
+    SELECT type, name FROM sqlite_schema WHERE type = 'view';
+}
+expect {
+    1|2
+    2|1
+    1|2
+    2|2
+    view|MatV
+}
+
+test drop-matview-with-mixed-case-name {
+    CREATE TABLE src (a, b);
+    CREATE MATERIALIZED VIEW MatV AS SELECT b, count(*) FROM src GROUP BY b;
+    DROP VIEW matv;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '%matv%';
+}
+expect {
+    0
+}

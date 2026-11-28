@@ -249,6 +249,9 @@ pub struct CreateIndex<'a> {
     pub written_name: &'a ast::Name,
     pub table: &'a str,
     pub written_table: &'a ast::Name,
+    /// The name of the table as its CREATE statement wrote it. The row of
+    /// the index stores it in tbl_name, as in SQLite.
+    pub declared_table: &'a str,
     pub statement: &'a ast::Stmt,
     pub root_reg: usize,
 }
@@ -422,6 +425,7 @@ pub struct DropColumn<'a> {
 
 /// A new trigger on `table`. A trigger of the temp database can be on a
 /// table of another database, so the table comes with its own database.
+/// `name` and `table` are the names as the statement wrote them.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateTrigger<'a> {
     pub namespace: NamespaceId,

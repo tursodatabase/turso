@@ -1542,6 +1542,7 @@ mod tests {
             &joined_tables,
             "item",
             VecDeque::from([Arc::new(Index {
+                declared_name: "idx_item_id".to_string(),
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
@@ -1689,6 +1690,7 @@ mod tests {
             &joined_tables,
             "item",
             VecDeque::from([Arc::new(Index {
+                declared_name: "idx_item_a".to_string(),
                 name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
@@ -1805,6 +1807,7 @@ mod tests {
             &joined_tables,
             "item",
             VecDeque::from([Arc::new(Index {
+                declared_name: "idx_item_id_kind".to_string(),
                 name: "idx_item_id_kind".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
@@ -1990,6 +1993,7 @@ mod tests {
             &joined_tables,
             "item",
             VecDeque::from([Arc::new(Index {
+                declared_name: "idx_item_id".to_string(),
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,

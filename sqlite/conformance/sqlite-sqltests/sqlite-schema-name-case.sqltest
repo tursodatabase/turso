@@ -1,0 +1,229 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/12600
+#
+# SQLite stores the name of a schema object in sqlite_schema with the case
+# that the CREATE statement gave it. Name lookups in SQL ignore case, but
+# code that looks up an object by its exact name in sqlite_schema needs the
+# original case.
+
+@cross-check-integrity
+test schema-rows-keep-name-case {
+    CREATE TABLE "MixedCase_Table" ("Id" INTEGER PRIMARY KEY, "SomeCol" TEXT UNIQUE);
+    CREATE INDEX "MyIdx" ON mixedcase_table ("SomeCol");
+    CREATE VIEW "MyView" AS SELECT 1;
+    CREATE TRIGGER "MyTrig" AFTER INSERT ON MIXEDCASE_TABLE BEGIN SELECT 1; END;
+    CREATE TABLE Unquoted (x);
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY rowid;
+}
+expect {
+    table|MixedCase_Table|MixedCase_Table
+    index|sqlite_autoindex_MixedCase_Table_1|MixedCase_Table
+    index|MyIdx|MixedCase_Table
+    view|MyView|MyView
+    trigger|MyTrig|MIXEDCASE_TABLE
+    table|Unquoted|Unquoted
+}
+
+test temp-schema-rows-keep-name-case {
+    CREATE TABLE Base (x);
+    CREATE TEMP TABLE "TempTable" (x PRIMARY KEY);
+    CREATE TEMP TRIGGER "TempTrig" AFTER INSERT ON base BEGIN SELECT 1; END;
+    SELECT type, name, tbl_name FROM temp.sqlite_schema ORDER BY rowid;
+}
+expect {
+    table|TempTable|TempTable
+    index|sqlite_autoindex_TempTable_1|TempTable
+    trigger|TempTrig|base
+}
+
+test exact-name-lookup-in-schema-finds-table {
+    CREATE TABLE "MixedCase_Table" ("Id" INTEGER PRIMARY KEY);
+    SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'MixedCase_Table';
+}
+expect {
+    MixedCase_Table
+}
+
+@cross-check-integrity
+test drop-objects-with-other-case-removes-rows {
+    CREATE TABLE "MixedCase_Table" (a UNIQUE, b);
+    CREATE INDEX "MyIdx" ON "MixedCase_Table" (b);
+    CREATE VIEW "MyView" AS SELECT a FROM "MixedCase_Table";
+    CREATE TRIGGER "MyTrig" AFTER INSERT ON "MixedCase_Table" BEGIN SELECT 1; END;
+    CREATE TEMP TRIGGER "TempTrig" AFTER INSERT ON "MixedCase_Table" BEGIN SELECT 1; END;
+    INSERT INTO mixedcase_table VALUES (1, 2);
+    SELECT * FROM myview;
+    DROP INDEX myidx;
+    DROP VIEW myview;
+    DROP TRIGGER mytrig;
+    DROP TRIGGER temptrig;
+    SELECT type, name FROM sqlite_schema ORDER BY rowid;
+    SELECT count(*) FROM temp.sqlite_schema;
+    DROP TABLE mixedcase_table;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    1
+    table|MixedCase_Table
+    index|sqlite_autoindex_MixedCase_Table_1
+    0
+    0
+}
+
+@cross-check-integrity
+test rename-table-keeps-new-name-case {
+    CREATE TABLE "Foo" (a UNIQUE);
+    CREATE INDEX "FooIdx" ON foo (a);
+    CREATE TABLE "Foo_x" (b UNIQUE);
+    ALTER TABLE foo RENAME TO "NewName";
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY rowid;
+    ALTER TABLE NEWNAME ADD COLUMN b;
+    INSERT INTO newname VALUES (1, 2);
+    SELECT * FROM NewName;
+    SELECT type, name FROM sqlite_schema WHERE name = 'NewName';
+}
+expect {
+    table|NewName|NewName
+    index|sqlite_autoindex_NewName_1|NewName
+    index|FooIdx|NewName
+    table|Foo_x|Foo_x
+    index|sqlite_autoindex_Foo_x_1|Foo_x
+    1|2
+    table|NewName
+}
+
+# The PRAGMAs that list tables and indexes give each name as the CREATE
+# statement wrote it, so that a lookup of the name in sqlite_schema finds
+# the row.
+test pragma-lists-keep-name-case {
+    CREATE TABLE "MixedCase" (a PRIMARY KEY, b UNIQUE, c);
+    CREATE INDEX "MyIdx" ON mixedcase (c);
+    CREATE VIEW "MyView" AS SELECT 1;
+    SELECT name FROM pragma_table_list WHERE schema = 'main' ORDER BY name;
+    SELECT name FROM pragma_table_list('MIXEDCASE');
+    SELECT il.name, m.name FROM pragma_index_list('mixedcase') il
+        LEFT JOIN sqlite_schema m ON m.name = il.name ORDER BY il.name;
+}
+expect {
+    MixedCase
+    MyView
+    sqlite_schema
+    MixedCase
+    MyIdx|MyIdx
+    sqlite_autoindex_MixedCase_1|sqlite_autoindex_MixedCase_1
+    sqlite_autoindex_MixedCase_2|sqlite_autoindex_MixedCase_2
+}
+
+test pragma-lists-keep-name-case-after-rename-and-rollback {
+    CREATE TABLE "MixedCase" (a UNIQUE, b);
+    CREATE INDEX "MyIdx" ON mixedcase (b);
+    BEGIN;
+    ALTER TABLE mixedcase RENAME TO "Other";
+    ROLLBACK;
+    SELECT name FROM pragma_table_list('mixedcase');
+    SELECT name FROM pragma_index_list('mixedcase') ORDER BY name;
+    ALTER TABLE mixedcase RENAME TO "NewName";
+    ALTER TABLE newname ADD COLUMN c;
+    SELECT name FROM pragma_table_list('newname');
+    SELECT name FROM pragma_index_list('newname') ORDER BY name;
+    DROP INDEX myidx;
+    CREATE INDEX myidx ON newname (b);
+    SELECT name FROM pragma_index_list('newname') ORDER BY name;
+}
+expect {
+    MixedCase
+    MyIdx
+    sqlite_autoindex_MixedCase_1
+    NewName
+    MyIdx
+    sqlite_autoindex_NewName_1
+    myidx
+    sqlite_autoindex_NewName_1
+}
+
+# The parent table of a foreign key has the name that the REFERENCES clause
+# wrote.
+test pragma-foreign-key-lists-keep-name-case {
+    CREATE TABLE "Parent" (a PRIMARY KEY);
+    CREATE TABLE "Child" (x REFERENCES parent(a), y REFERENCES "Parent"(a), z REFERENCES PARENT(a));
+    INSERT INTO child VALUES (1, 1, 1);
+    SELECT "table", "from" FROM pragma_foreign_key_list('child') ORDER BY "from";
+    SELECT "table", parent, fkid FROM pragma_foreign_key_check ORDER BY fkid;
+}
+expect {
+    parent|x
+    Parent|y
+    PARENT|z
+    Child|PARENT|0
+    Child|Parent|1
+    Child|parent|2
+}
+
+# The row of an AUTOINCREMENT table in sqlite_sequence has the table name as
+# CREATE TABLE wrote it, as the row in sqlite_schema has it.
+test sqlite-sequence-keeps-name-case {
+    CREATE TABLE "MixedCase" (a INTEGER PRIMARY KEY AUTOINCREMENT, b);
+    INSERT INTO mixedcase (b) VALUES (1), (2), (3);
+    DELETE FROM MIXEDCASE;
+    INSERT INTO mixedcase (b) VALUES (4);
+    SELECT m.name, s.seq FROM sqlite_schema m JOIN sqlite_sequence s ON s.name = m.name;
+    ALTER TABLE mixedcase RENAME TO "NewName";
+    INSERT INTO newname (b) VALUES (5);
+    SELECT a FROM newname ORDER BY a;
+    SELECT * FROM sqlite_sequence;
+    DROP TABLE NEWNAME;
+    SELECT count(*) FROM sqlite_sequence;
+}
+expect {
+    MixedCase|4
+    4
+    5
+    NewName|5
+    0
+}
+
+# The rows of sqlite_stat1 have the names of tables and indexes as the CREATE
+# statements wrote them, as the rows in sqlite_schema have them. A second
+# ANALYZE replaces the rows.
+test sqlite-stat1-keeps-name-case {
+    CREATE TABLE "MixedCase" (a INTEGER PRIMARY KEY, b);
+    CREATE INDEX "MyIdx" ON mixedcase (b);
+    CREATE TABLE "NoIndex" (a);
+    INSERT INTO mixedcase VALUES (1, 1), (2, 2);
+    INSERT INTO noindex VALUES (1);
+    ANALYZE;
+    SELECT m.name, s.stat FROM sqlite_schema m JOIN sqlite_stat1 s ON s.idx = m.name;
+    INSERT INTO mixedcase VALUES (3, 3);
+    ANALYZE mixedcase;
+    ANALYZE MYIDX;
+    SELECT * FROM sqlite_stat1 ORDER BY tbl;
+}
+expect {
+    MyIdx|2 1
+    MixedCase|MyIdx|3 1
+    NoIndex||1
+}
+
+# A row of sqlite_sequence or sqlite_stat1 whose name differs in case from
+# the name that CREATE wrote is not a row of the table. ALTER TABLE RENAME
+# and ANALYZE leave it.
+test sqlite-sequence-and-stat1-keep-rows-of-other-case {
+    CREATE TABLE "MixedCase" (a INTEGER PRIMARY KEY AUTOINCREMENT, b);
+    CREATE INDEX "MyIdx" ON mixedcase (b);
+    INSERT INTO mixedcase (b) VALUES (1);
+    INSERT INTO sqlite_sequence VALUES ('MIXEDCASE', 500);
+    ANALYZE;
+    INSERT INTO sqlite_stat1 VALUES ('MIXEDCASE', 'MYIDX', '9 9');
+    INSERT INTO mixedcase (b) VALUES (2);
+    ANALYZE mixedcase;
+    SELECT * FROM sqlite_stat1 ORDER BY tbl;
+    ALTER TABLE mixedcase RENAME TO "NewName";
+    SELECT * FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    MIXEDCASE|MYIDX|9 9
+    MixedCase|MyIdx|2 1
+    MIXEDCASE|500
+    NewName|2
+}

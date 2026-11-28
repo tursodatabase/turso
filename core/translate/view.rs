@@ -236,7 +236,10 @@ pub fn translate_create_materialized_view(
     // engine tables, so their sqlite_schema rows are written here and not by
     // the catalog.
     let sqlite_schema_cursor_id = cmd_context.sqlite_schema_cursor(program);
-    let mut parse_schema_names = vec![escape_sql_string_literal(&view_key)];
+    // The row of the view has the name as the statement wrote it.
+    let mut parse_schema_names = vec![escape_sql_string_literal(
+        &resolver.mangle_name(namespace, view_name.name.as_str()),
+    )];
     for hidden in &hidden_tables {
         let table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
@@ -430,8 +433,9 @@ pub fn translate_create_view(
     )?;
 
     // Parse schema to load the new view
+    // The row of the view has the name as the statement wrote it.
     let escaped_view_name =
-        escape_sql_string_literal(&resolver.mangle_name(namespace, &normalized_view_name));
+        escape_sql_string_literal(&resolver.mangle_name(namespace, view_name.name.as_str()));
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),

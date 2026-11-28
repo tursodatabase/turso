@@ -113,6 +113,7 @@ pub fn create_dbsp_state_index(
         })?;
     }
     Ok(Index {
+        declared_name: "dbsp_state_pk".to_string(),
         name: "dbsp_state_pk".to_string(),
         table_name: state_table.name.clone(),
         root_page,

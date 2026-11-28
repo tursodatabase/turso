@@ -1860,8 +1860,11 @@ fn open_autoincrement_state(
         db: ctx.namespace.database_id,
     });
 
+    // A new row of sqlite_sequence gets the table name as the CREATE TABLE
+    // statement wrote it, as in SQLite. The read of an existing row replaces
+    // this name with the name that the row has.
     let table_name_reg =
-        program.emit_string8_new_reg(resolver.mangle_name(ctx.namespace, &ctx.table.name));
+        program.emit_string8_new_reg(resolver.mangle_name(ctx.namespace, &ctx.table.declared_name));
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 

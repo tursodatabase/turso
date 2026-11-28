@@ -150,7 +150,6 @@ pub fn translate_create_trigger(
         when_clause,
         commands,
     );
-    let mangled_trigger_name = resolver.mangle_name(namespace, &normalized_trigger_name);
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
         let table_db_name = tbl_name
@@ -257,9 +256,9 @@ pub fn translate_create_trigger(
         &cmd_context,
         &CatalogCmd::CreateTrigger(CreateTrigger {
             namespace: namespace.id,
-            name: &normalized_trigger_name,
+            name: trigger_name.name.as_str(),
             table_namespace: target_table_namespace,
-            table: &normalized_table_name,
+            table: tbl_name.name.as_str(),
             sql: &sql,
         }),
     )?;
@@ -274,7 +273,9 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
-    let escaped_trigger_name = escape_sql_string_literal(&mangled_trigger_name);
+    // The row of the trigger has the name as the statement wrote it.
+    let escaped_trigger_name =
+        escape_sql_string_literal(&resolver.mangle_name(namespace, trigger_name.name.as_str()));
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(
