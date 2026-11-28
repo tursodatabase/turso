@@ -7,8 +7,8 @@ use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
-        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Table,
-        ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
+        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, RenamedColumn,
+        Table, ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
         collate::{expr_text_collation, CollationSeq},
@@ -1468,6 +1468,21 @@ pub(super) fn expand_table_star(
     table_name: &str,
     long_names: bool,
 ) -> crate::Result<()> {
+    if !append_table_star(table_references, out_columns, table_name, long_names)? {
+        crate::bail_parse_error!("no such table: {}", table_name);
+    }
+    Ok(())
+}
+
+/// Appends the columns of `<table_name>.*` to `out_columns`, as
+/// [expand_table_star] does, and returns false when no table of the query
+/// has that name.
+pub(crate) fn append_table_star(
+    table_references: &mut TableReferences,
+    out_columns: &mut Vec<ResultSetColumn>,
+    table_name: &str,
+    long_names: bool,
+) -> crate::Result<bool> {
     let normalized_name = crate::util::normalize_ident(table_name);
     let tables = table_references.joined_tables();
 
@@ -1524,7 +1539,7 @@ pub(super) fn expand_table_star(
         }
     }
     if matching_columns.is_empty() {
-        crate::bail_parse_error!("no such table: {}", table_name);
+        return Ok(false);
     }
 
     let mut used_columns = Vec::new();
@@ -1563,7 +1578,7 @@ pub(super) fn expand_table_star(
     for (table_id, column_index) in used_columns {
         table_references.mark_column_used(table_id, column_index);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The name SQLite gives the FROM item `table` in `<tbl>.*` and in the saved
@@ -3440,22 +3455,7 @@ pub(super) fn query_output_columns(
     explicit_columns: Option<&[String]>,
     resolver: &Resolver,
 ) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
-    let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
-        Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => left
-            .first()
-            .map(|(select, _)| (&select.result_columns[..], &select.table_references))
-            .unwrap_or((&right_most.result_columns, &right_most.table_references)),
-        Plan::RecursiveCte(recursive_cte) => (
-            recursive_cte.initial_query.select_result_columns(),
-            recursive_cte.initial_query.select_table_references(),
-        ),
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot define query output columns")
-        }
-    };
+    let (result_columns, table_references) = naming_select(plan);
 
     let compound_arms = match plan {
         Plan::CompoundSelect {
@@ -3530,16 +3530,97 @@ pub(super) fn query_output_columns(
     Ok((columns, column_types))
 }
 
+/// The columns of a subquery in FROM, with their types and the columns whose
+/// name is not the name that the query gave them.
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
     resolver: &Resolver,
-) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
+) -> Result<(
+    alloc::Vec<Column>,
+    alloc::Vec<ExprType>,
+    alloc::Vec<RenamedColumn>,
+)> {
     let (mut columns, column_types) = query_output_columns(plan, explicit_columns, resolver)?;
+    let names_in_query = output_column_names_in_query(plan, explicit_columns, &columns);
     make_column_names_unique(&mut columns);
-    Ok((columns, column_types))
+    let renamed_columns = names_in_query
+        .into_iter()
+        .zip(&columns)
+        .enumerate()
+        .filter(|(_, (name_in_query, column))| *name_in_query != column.name)
+        .filter_map(|(index, (name_in_query, _))| {
+            Some(RenamedColumn {
+                index,
+                name_in_query: name_in_query?,
+            })
+        })
+        .try_collect::<alloc::Vec<_>>()?;
+    Ok((columns, column_types, renamed_columns))
 }
 
+/// The name that the query `plan` gave each of its output columns, which
+/// `columns` are before their names are made unique. A column that reads a
+/// renamed column of a subquery under its new name, as `SELECT *` does, has
+/// the name that the subquery gave it: the new name is not a name of the
+/// query.
+fn output_column_names_in_query(
+    plan: &Plan,
+    explicit_columns: Option<&[String]>,
+    columns: &[Column],
+) -> Vec<Option<String>> {
+    let (result_columns, table_references) = naming_select(plan);
+    columns
+        .iter()
+        .zip(result_columns)
+        .enumerate()
+        .map(|(index, (column, result_column))| {
+            if explicit_columns.is_some_and(|names| index < names.len()) {
+                return column.name.clone();
+            }
+            let Expr::Column {
+                table,
+                column: source_index,
+                ..
+            } = &result_column.expr
+            else {
+                return column.name.clone();
+            };
+            let Some((_, source)) = table_references.find_table_by_internal_id(*table) else {
+                return column.name.clone();
+            };
+            if source.columns()[*source_index].name == column.name {
+                source.column_name_in_query(*source_index).map(String::from)
+            } else {
+                column.name.clone()
+            }
+        })
+        .collect()
+}
+
+/// The result columns that give the output columns of `plan` their names,
+/// and the tables that the result columns read: those of the first SELECT.
+fn naming_select(plan: &Plan) -> (&[ResultSetColumn], &TableReferences) {
+    match plan {
+        Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .first()
+            .map(|(select, _)| (&select.result_columns[..], &select.table_references))
+            .unwrap_or((&right_most.result_columns, &right_most.table_references)),
+        Plan::RecursiveCte(recursive_cte) => (
+            recursive_cte.initial_query.select_result_columns(),
+            recursive_cte.initial_query.select_table_references(),
+        ),
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot define query output columns")
+        }
+    }
+}
+
+/// Gives a column whose name an earlier column has a name with a suffix, as
+/// SQLite does: the second `a` is `a:1`.
 fn make_column_names_unique(columns: &mut [Column]) {
     let mut used_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     for column in columns {
@@ -3595,13 +3676,15 @@ impl JoinedTable {
         resolver: &Resolver,
     ) -> Result<Self> {
         let plan = Plan::Select(Box::new(plan));
-        let (columns, column_types) = subquery_output_columns(&plan, None, resolver)?;
+        let (columns, column_types, renamed_columns) =
+            subquery_output_columns(&plan, None, resolver)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
             column_types,
+            renamed_columns,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -3641,7 +3724,8 @@ impl JoinedTable {
         materialize_hint: bool,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let (columns, column_types) = subquery_output_columns(&plan, explicit_columns, resolver)?;
+        let (columns, column_types, renamed_columns) =
+            subquery_output_columns(&plan, explicit_columns, resolver)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3656,6 +3740,7 @@ impl JoinedTable {
             plan: Box::new(plan),
             columns,
             column_types,
+            renamed_columns,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -3686,7 +3771,7 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let (mut columns, column_types) =
+        let (mut columns, column_types, renamed_columns) =
             subquery_output_columns(query, explicit_columns, resolver)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
@@ -3699,6 +3784,7 @@ impl JoinedTable {
             name: identifier.clone(),
             columns,
             column_types,
+            renamed_columns,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),

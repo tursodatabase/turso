@@ -687,6 +687,7 @@ pub fn emit_upsert(
             excluded_decoded_start,
             decoded_column_types.as_deref(),
             &layout,
+            resolver.catalog.dialect.as_ref(),
         )?;
         emit_do_update_subqueries(
             program,
@@ -744,6 +745,7 @@ pub fn emit_upsert(
             excluded_decoded_start,
             decoded_column_types.as_deref(),
             &layout,
+            resolver.catalog.dialect.as_ref(),
         )?;
     }
     emit_do_update_subqueries(
@@ -2176,6 +2178,7 @@ fn rewrite_expr_to_registers(
     excluded_decoded_start: Option<usize>,
     decoded_column_types: Option<&[Option<Box<ast::Type>>]>,
     layout: &ColumnLayout,
+    dialect: &dyn crate::dialect::Dialect,
 ) -> crate::Result<WalkControl> {
     use ast::Expr;
     let table_name_norm = table_name.map(normalize_ident);
@@ -2197,9 +2200,30 @@ fn rewrite_expr_to_registers(
         }
     };
 
+    // The namespace of the target row: its alias, or else the table name.
+    let is_target_namespace = |ns: &str| match table_alias {
+        Some(alias) => ns.eq_ignore_ascii_case(alias),
+        None => table_name_norm
+            .as_ref()
+            .is_some_and(|tn| ns.eq_ignore_ascii_case(tn)),
+    };
+
     walk_expr_mut(
         e,
         &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
+            // The row of the target or of `excluded`, as an argument of a
+            // function that takes rows. The column references of the expansion
+            // are rewritten below, as the walk goes on into it.
+            if let Some(expansion) = upsert_row_expansion(
+                expr,
+                table,
+                dialect,
+                &is_target_namespace,
+                allow_excluded && insertion.is_some(),
+            )? {
+                *expr = expansion;
+                return Ok(WalkControl::Continue);
+            }
             match expr {
                 Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                     let ns = normalize_ident(ns.as_str());
@@ -2208,13 +2232,7 @@ fn rewrite_expr_to_registers(
                     // the DO UPDATE scope.  It also shadows the special
                     // `excluded` pseudo-table when the alias is literally
                     // named `excluded` (SQLite's name-resolution rule).
-                    let is_target_namespace = if let Some(alias) = table_alias {
-                        ns.eq_ignore_ascii_case(alias)
-                    } else {
-                        table_name_norm
-                            .as_ref()
-                            .is_some_and(|tn| ns.eq_ignore_ascii_case(tn))
-                    };
+                    let is_target_namespace = is_target_namespace(&ns);
                     // Handle EXCLUDED.* if enabled
                     if allow_excluded && ns.eq_ignore_ascii_case("excluded") && !is_target_namespace
                     {
@@ -2276,4 +2294,69 @@ fn rewrite_expr_to_registers(
             Ok(WalkControl::Continue)
         },
     )
+}
+
+/// What the dialect says a call stands for when `expr` calls a function that
+/// takes rows (see [crate::Dialect::takes_row_arguments]) and an argument
+/// names the target row or the `excluded` row of ON CONFLICT DO UPDATE: `t`,
+/// `t.*`, `excluded` or `excluded.*`. Each column of the row is a qualified
+/// column reference, which the caller then rewrites to its register.
+fn upsert_row_expansion(
+    expr: &ast::Expr,
+    table: &Table,
+    dialect: &dyn crate::dialect::Dialect,
+    is_target_namespace: &dyn Fn(&str) -> bool,
+    allow_excluded: bool,
+) -> crate::Result<Option<ast::Expr>> {
+    use ast::Expr;
+    let Expr::FunctionCall { name, args, .. } = expr else {
+        return Ok(None);
+    };
+    if !dialect.takes_row_arguments(name.as_str()) {
+        return Ok(None);
+    }
+    let row = |arg: &ast::Expr| -> Option<crate::dialect::RowArgument> {
+        let (namespace, is_star) = match arg {
+            Expr::Qualified(namespace, column) if column.as_str() == "*" => (namespace, true),
+            Expr::Id(namespace) => (namespace, false),
+            _ => return None,
+        };
+        let normalized = normalize_ident(namespace.as_str());
+        // A column of the target row comes before a row of that name.
+        if !is_star
+            && (table.get_column_by_name(&normalized).is_some()
+                || ROWID_STRS
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&normalized)))
+        {
+            return None;
+        }
+        let is_target = is_target_namespace(&normalized);
+        let is_excluded = allow_excluded && !is_target && normalized == "excluded";
+        if !is_target && !is_excluded {
+            return None;
+        }
+        let columns = table
+            .columns()
+            .iter()
+            .filter(|column| !column.hidden())
+            .filter_map(|column| {
+                let column_name = column.name.clone()?;
+                let reference =
+                    Expr::Qualified(namespace.clone(), ast::Name::exact(column_name.clone()));
+                Some((column_name, Box::new(reference)))
+            })
+            .collect();
+        Some(crate::dialect::RowArgument {
+            columns,
+            presence: crate::dialect::RowPresence::Always,
+        })
+    };
+    let rows: Vec<_> = args.iter().map(|arg| row(arg)).collect();
+    if rows.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    dialect
+        .expand_row_arguments(name.as_str(), args, rows)
+        .map(Some)
 }

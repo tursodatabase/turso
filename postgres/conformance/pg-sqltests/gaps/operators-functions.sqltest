@@ -303,32 +303,6 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-39: jsonb -> key output
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "type:jsonb"
-test jsonb-arrow-key-output {
-    SELECT j -> 'a' FROM t WHERE id = 1;
-}
-expect {
-    {"b": 1}
-}
-expect @tursopg {
-    {"b":1}
-}
-
-# B-40: jsonb ->> key output
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "type:jsonb"
-test jsonb-double-arrow-key-output {
-    SELECT j ->> 'a', j ->> 'n' FROM t WHERE id = 1;
-}
-expect {
-    {"b": 1}|1
-}
-expect @tursopg {
-    {"b":1}|1
-}
-
 # B-41: jsonb -> int index
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test jsonb-int-index {
@@ -419,19 +393,6 @@ test jsonb-on-missing-key-non-object {
 }
 expect {
     |
-}
-
-# B-52: jsonb ->> object returns PG-formatted text
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "type:jsonb"
-test jsonb-object-returns-pg-formatted-text {
-    SELECT j ->> 'a' FROM t WHERE id = 1;
-}
-expect {
-    {"b": 1}
-}
-expect @tursopg {
-    {"b":1}
 }
 
 # B-53: jsonb -> array element ->> of string
@@ -578,42 +539,6 @@ expect {
     [1, 2, 3, 4]
 }
 @sqlstate 42601
-expect @tursopg error {}
-
-# B-67: to_json(scalar)
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "function:to_json"
-test to-json-scalar {
-    SELECT to_json(s), to_jsonb(n) FROM t WHERE id = 1;
-}
-expect {
-    "abc"|10
-}
-@sqlstate 42883
-expect @tursopg error {}
-
-# B-68: row_to_json / to_json(row)
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "function:row_to_json"
-test row-to-json-to-json-row {
-    SELECT row_to_json(t) FROM t WHERE id = 2;
-}
-expect {
-    {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
-}
-@sqlstate 42703
-expect @tursopg error {}
-
-# B-69: to_json(t.*) of table alias
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "function:to_json"
-test to-json-t-of-table-alias {
-    SELECT to_json(x.*) FROM t x WHERE id = 2;
-}
-expect {
-    {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
-}
-@sqlstate 0A000
 expect @tursopg error {}
 
 # B-70: array_to_json
@@ -1026,7 +951,7 @@ test jsonb-set-operators {
 expect {
     {"a": 2}|{"a": 1, "b": 2}|{"b": 2}
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # B-123: jsonb_typeof / jsonb_array_length
@@ -1213,7 +1138,7 @@ expect {
 expect @tursopg error {}
 
 # B-128: jsonb || concatenates two objects
-# B-122 also uses ||. After a fix, the output still differs because of A-45.
+# B-122 also uses ||. tursopg concatenates the text of the two values.
 @compat-gap "operator:jsonb || jsonb"
 test jsonb-concatenates-two-objects {
     SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb;
@@ -1222,11 +1147,11 @@ expect {
     {"a": 1, "b": 2}
 }
 expect @tursopg {
-    {"a":1}{"b":2}
+    {"a": 1}{"b": 2}
 }
 
 # B-129: jsonb - removes a key
-# B-122 also uses -. After a fix, the output still differs because of A-45.
+# B-122 also uses -.
 @compat-gap "operator:jsonb - text"
 test jsonb-removes-a-key {
     SELECT '{"a":1,"b":2}'::jsonb - 'a';
@@ -1234,8 +1159,9 @@ test jsonb-removes-a-key {
 expect {
     {"b": 2}
 }
-expect @tursopg {
-    0
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: jsonb - text
 }
 
 # B-130: 16 nested scalar subqueries

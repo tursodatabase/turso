@@ -8,6 +8,7 @@ mod bytea;
 mod bytea_functions;
 mod integer;
 mod integer_operators;
+mod json;
 mod oid;
 mod oid_alias;
 mod regclass;
@@ -141,8 +142,7 @@ pub(crate) static BUILT_IN_TYPES: [BuiltInType; 22] = built_in_types! {
     // FIXME(registered-types): text is the TEXT of the engine and has no registered type, so core cannot name the type of a text value to the dialect. A text type registered in the frontend, with its INPUT, replaces this.
     (25, "text", "S", true, -1, false, "i", "x", 1009, ",", Support::NotRegistered(FormatName::Plain("text"))),
     (26, "oid", "N", true, 4, true, "i", "p", 1028, ",", Support::Registered(&oid::Oid)),
-    // FIXME(registered-types): json: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A json type registered in the frontend, with its INPUT, replaces this.
-    (114, "json", "U", false, -1, false, "i", "x", 199, ",", Support::NotRegistered(FormatName::Plain("json"))),
+    (114, "json", "U", false, -1, false, "i", "x", 199, ",", Support::Registered(&json::Json)),
     // FIXME(registered-types): cidr: the frontend uses the type that core registers, which does not check its text. A cidr type registered in the frontend, with its INPUT, replaces this.
     (650, "cidr", "I", false, -1, false, "i", "m", 651, ",", Support::NotRegistered(FormatName::Plain("cidr"))),
     // FIXME(registered-types): float4 is stored as the REAL of the engine, so it keeps the digits of a float8. A float4 type registered in the frontend, with its INPUT, replaces this.
@@ -166,8 +166,7 @@ pub(crate) static BUILT_IN_TYPES: [BuiltInType; 22] = built_in_types! {
     (2205, "regclass", "N", false, 4, true, "i", "p", 2210, ",", Support::Registered(&oid_alias::OidAlias::RegClass)),
     (2206, "regtype", "N", false, 4, true, "i", "p", 2211, ",", Support::Registered(&oid_alias::OidAlias::RegType)),
     (2950, "uuid", "U", false, 16, false, "c", "p", 2951, ",", Support::Registered(&uuid::Uuid)),
-    // FIXME(registered-types): jsonb: the frontend uses the type that core registers, which reads text in its ENCODE and has no INPUT. A jsonb type registered in the frontend, with its INPUT, replaces this.
-    (3802, "jsonb", "U", false, -1, false, "i", "x", 3807, ",", Support::NotRegistered(FormatName::Plain("jsonb"))),
+    (3802, "jsonb", "U", false, -1, false, "i", "x", 3807, ",", Support::Registered(&json::Jsonb)),
 };
 
 impl BuiltInType {

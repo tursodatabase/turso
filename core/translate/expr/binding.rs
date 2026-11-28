@@ -1,12 +1,14 @@
 use super::*;
+use crate::dialect::{RowArgument, RowPresence};
 use crate::namespace::NamespaceRef;
 use crate::schema::{
     SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
 };
 use crate::translate::catalog::CatalogContext;
 use crate::translate::plan::{
-    is_schema_table, merge_columns, resolve_unqualified_column_except, unqualified_column_sources,
-    ColumnLookup, OuterQueryReference, ResolvedColumn,
+    alias_or_stored_name, append_table_star, is_schema_table, merge_columns,
+    resolve_unqualified_column_except, unqualified_column_sources, ColumnLookup, JoinType,
+    JoinedTable, OuterQueryReference, ResolvedColumn,
 };
 
 /// The precedence of binding identifiers to columns.
@@ -147,6 +149,13 @@ pub fn bind_and_rewrite_expr_except<'a>(
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+            // The arguments are not bound yet, so a table name is still an Id.
+            if let Some(expansion) =
+                row_argument_expansion(expr, referenced_tables.as_deref_mut(), resolver, excluded)?
+            {
+                *expr = expansion;
+                return Ok(WalkControl::Continue);
+            }
             match expr {
                 Expr::Id(id) => {
                     crate::stack::trace_stack!("bind_id");
@@ -631,6 +640,174 @@ pub fn bind_and_rewrite_expr_except<'a>(
     )?;
     read_literal_operands(top_level_expr, referenced_tables.as_deref(), resolver)?;
     check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
+}
+
+/// What the dialect says a call stands for when `expr` is a call of a function
+/// that takes rows (see [`crate::Dialect::takes_row_arguments`]) and an
+/// argument names a row. None for any other expression.
+fn row_argument_expansion(
+    expr: &ast::Expr,
+    tables: Option<&mut TableReferences>,
+    resolver: &Resolver<'_>,
+    excluded: &[TableInternalId],
+) -> Result<Option<ast::Expr>> {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        return Ok(None);
+    };
+    let dialect = &resolver.catalog.dialect;
+    if !dialect.takes_row_arguments(name.as_str()) {
+        return Ok(None);
+    }
+    let Some(tables) = tables else {
+        return Ok(None);
+    };
+    let rows = args
+        .iter()
+        .map(|arg| named_row(arg, tables, excluded))
+        .collect::<Result<Vec<_>>>()?;
+    if rows.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    dialect
+        .expand_row_arguments(name.as_str(), args, rows)
+        .map(Some)
+}
+
+/// The row that `arg` names: the row of table `t` for `t.*`, and for `t` when
+/// no column of the query has that name. A table of the query is found as
+/// `SELECT t.*` finds it, so a name that two tables have is ambiguous. The
+/// tables of the queries around it come after.
+fn named_row(
+    arg: &ast::Expr,
+    tables: &mut TableReferences,
+    excluded: &[TableInternalId],
+) -> Result<Option<RowArgument>> {
+    let (identifier, is_star) = match arg {
+        Expr::Qualified(table, column) if column.as_str() == "*" => (table, true),
+        Expr::Id(table) => (table, false),
+        _ => return Ok(None),
+    };
+    let identifier = normalize_ident(identifier.as_str());
+    if !is_star
+        && (resolve_unqualified_column_except(tables.joined_tables(), &identifier, excluded)?
+            .is_some()
+            || resolve_unqualified_outer_column(tables, &identifier)?.is_some())
+    {
+        return Ok(None);
+    }
+    let excluded_has_name = tables
+        .joined_tables()
+        .iter()
+        .any(|table| excluded.contains(&table.internal_id) && table.identifier == identifier);
+    let mut star = Vec::new();
+    if !excluded_has_name && append_table_star(tables, &mut star, &identifier, false)? {
+        let joined = tables.joined_tables();
+        let index = joined
+            .iter()
+            .position(|table| alias_or_stored_name(table) == identifier);
+        let presence = match index {
+            Some(index) if may_be_null_extended(joined, index) => {
+                row_presence(&joined[index].table, joined[index].internal_id)
+            }
+            Some(_) => RowPresence::Always,
+            // A table inside a parenthesized join.
+            None => RowPresence::Unknown,
+        };
+        let table = index.map(|index| &joined[index].table);
+        let columns = star
+            .into_iter()
+            .map(|column| {
+                let name = column
+                    .alias
+                    .expect("a column of a qualified star has a name");
+                // A subquery renames the later of two columns with the same
+                // name. The row has the name that the query gave the column.
+                let name = table
+                    .and_then(|table| name_in_query(table, &name))
+                    .unwrap_or(name);
+                (name, Box::new(column.expr))
+            })
+            .collect();
+        return Ok(Some(RowArgument { columns, presence }));
+    }
+    let Some(outer) = tables
+        .outer_query_refs()
+        .iter()
+        .find(|table| table.identifier == identifier)
+    else {
+        if is_star {
+            crate::bail_parse_error!("no such table: {}", identifier);
+        }
+        return Ok(None);
+    };
+    let (internal_id, table) = (outer.internal_id, outer.table.clone());
+    let presence = match &outer.join_info {
+        Some(join) if matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter) => {
+            row_presence(&table, internal_id)
+        }
+        _ => RowPresence::Always,
+    };
+    let mut columns = Vec::new();
+    for (index, column) in table.columns().iter().enumerate() {
+        if column.hidden() {
+            continue;
+        }
+        let name = table
+            .column_name_in_query(index)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("column{}", index + 1));
+        columns.push((
+            name,
+            Box::new(Expr::Column {
+                database: None,
+                table: internal_id,
+                column: index,
+                is_rowid_alias: column.is_rowid_alias(),
+            }),
+        ));
+        tables.mark_column_used(internal_id, index);
+    }
+    Ok(Some(RowArgument { columns, presence }))
+}
+
+/// The name that the query gave the column of `table` that has the name
+/// `name`. None when `table` has no column of that name.
+fn name_in_query(table: &Table, name: &str) -> Option<String> {
+    let index = table
+        .columns()
+        .iter()
+        .position(|column| column.name.as_deref() == Some(name))?;
+    table.column_name_in_query(index).map(str::to_string)
+}
+
+/// Whether an outer join can leave out the row of the table at `index` of
+/// `tables`: the table is the right side of a LEFT or FULL JOIN, or the left
+/// side of a later RIGHT or FULL JOIN.
+fn may_be_null_extended(tables: &[JoinedTable], index: usize) -> bool {
+    let join_type = |table: &JoinedTable| table.join_info.as_ref().map(|join| join.join_type);
+    matches!(
+        join_type(&tables[index]),
+        Some(JoinType::LeftOuter | JoinType::FullOuter)
+    ) || tables[index + 1..].iter().any(|table| {
+        matches!(
+            join_type(table),
+            Some(JoinType::RightOuter | JoinType::FullOuter)
+        )
+    })
+}
+
+/// How to tell that the row of `table`, which an outer join can leave out, is
+/// missing: its rowid is NULL then.
+fn row_presence(table: &Table, internal_id: TableInternalId) -> RowPresence {
+    match table {
+        Table::BTree(btree) if btree.has_rowid => {
+            RowPresence::NullWhenMissing(Box::new(Expr::RowId {
+                database: None,
+                table: internal_id,
+            }))
+        }
+        _ => RowPresence::Unknown,
+    }
 }
 
 /// Fails when `expr` uses an operator that no function of its operands' types

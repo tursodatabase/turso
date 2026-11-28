@@ -81,8 +81,9 @@ impl ExternalFunc {
         self
     }
 
-    /// FIXME(pg-catalog): HACK. Its only callers are pg_timestamp_plus_interval (index 0) and
-    /// date_trunc (index 1) in postgres/frontend/functions.rs. PostgreSQL takes
+    /// FIXME(pg-catalog): HACK. Its only callers are pg_timestamp_plus_interval (index 0),
+    /// date_trunc (index 1), and jsonb_field, jsonb_extract_path and
+    /// jsonb_extract_path_op (index 0) in postgres/frontend/functions.rs. PostgreSQL takes
     /// a result type from prorettype in pg_proc or oprresult in pg_operator,
     /// not from an argument. A pg_proc and pg_operator lookup replaces it;
     /// remove it then.

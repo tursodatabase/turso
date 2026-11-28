@@ -1,0 +1,26 @@
+# The jsonb type: how its input reads text and how its output writes a
+# value. An object keeps one field of each name, the last one, and its fields
+# are written in the order of jsonb: by the length of their names and then by
+# their bytes, with a space after each comma and colon.
+
+@database :memory:
+
+test jsonb-literal-key-order-whitespace {
+    SELECT '{"b": 2,  "a":1, "aa": [1,  2]}'::jsonb;
+}
+expect {
+    {"a": 1, "b": 2, "aa": [1, 2]}
+}
+
+test jsonb-duplicate-keys-keep-last {
+    SELECT '{"a":1,"a":2}'::jsonb;
+}
+expect {
+    {"a": 2}
+}
+
+test invalid-jsonb-literal {
+    SELECT 'not json'::jsonb;
+}
+@sqlstate 22P02
+expect error {}

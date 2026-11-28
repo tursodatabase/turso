@@ -536,6 +536,21 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// to_json(), to_jsonb() and row_to_json() take a record, which can be the
+    /// row of a table.
+    fn takes_row_arguments(&self, name: &str) -> bool {
+        turso_pg_parser::translator::takes_record(name)
+    }
+
+    fn expand_row_arguments(
+        &self,
+        name: &str,
+        args: &[Box<ast::Expr>],
+        rows: Vec<Option<turso_core::dialect::RowArgument>>,
+    ) -> turso_core::Result<ast::Expr> {
+        crate::functions::expand_record_call(name, args, rows)
+    }
+
     fn text_input_types_refuse_other_kinds(&self) -> bool {
         true
     }

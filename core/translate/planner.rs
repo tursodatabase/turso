@@ -2203,6 +2203,8 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver)
         }
         subquery.columns[column_index].name = Some(column_name);
     }
+    // The columns have new names now, which `join_columns` describes.
+    subquery.renamed_columns.clear();
     subquery.parenthesized_join_columns = Some(join_columns);
     Ok(())
 }

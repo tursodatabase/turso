@@ -46,6 +46,30 @@ use crate::{
 };
 use std::{cell::Cell, ops::Range, sync::Arc};
 
+/// The row of a table that an argument of a function call names. See
+/// [`Dialect::takes_row_arguments`].
+pub struct RowArgument {
+    /// The columns of the row, each with its name and the expression that
+    /// reads it.
+    pub columns: Vec<(String, Box<ast::Expr>)>,
+    /// How to tell that the row is missing: an outer join found no row for
+    /// the table, so the row is NULL, which a row whose columns are all NULL
+    /// is not.
+    pub presence: RowPresence,
+}
+
+/// Whether the row of a [`RowArgument`] can be missing, and how to tell.
+pub enum RowPresence {
+    /// The row is always there: no outer join can leave it out.
+    Always,
+    /// The row can be missing, and this expression is NULL exactly when it
+    /// is: the rowid of the table.
+    NullWhenMissing(Box<ast::Expr>),
+    /// The row can be missing, and nothing tells when: the table has no
+    /// rowid, as a subquery or a view in FROM has none.
+    Unknown,
+}
+
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
@@ -602,6 +626,36 @@ pub trait Dialect: Send + Sync + 'static {
     /// PostgreSQL accepts them. SQLite raises an error.
     fn allows_qualified_columns_in_index_terms(&self) -> bool {
         false
+    }
+
+    /// Whether an argument of a call of function `name` may stand for the
+    /// row of a table of the query: `t.*`, which reaches the engine as
+    /// `Expr::Qualified(t, *)`, or `t` when no column has that name. For
+    /// such a call the engine finds the columns of each row that an argument
+    /// names, and [`Dialect::expand_row_arguments`] says what the call
+    /// stands for.
+    ///
+    /// PostgreSQL passes the row of a table as one value of a record type,
+    /// as in `to_json(t)`. SQLite has no row values, so the default is false.
+    fn takes_row_arguments(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
+    /// The expression that a call of function `name` with `args` stands for
+    /// when at least one argument names a row. `rows` has one entry for each
+    /// argument: the name and the value of each column of the row that the
+    /// argument names, or None for an argument that names no row. The engine
+    /// calls it only for a function that [`Dialect::takes_row_arguments`]
+    /// accepts.
+    fn expand_row_arguments(
+        &self,
+        name: &str,
+        args: &[Box<ast::Expr>],
+        rows: Vec<Option<RowArgument>>,
+    ) -> Result<ast::Expr> {
+        let _ = (args, rows);
+        unreachable!("{name} takes no row arguments in this dialect")
     }
 
     /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, json and inet to numbers, booleans and bytea. It decides a CAST only when `apply_cast` gives `CastDecision::EngineRules`, which the PostgreSQL frontend gives for the types of its `ENGINE_RULE_TYPES`. It also decides what such a column stores, which no cast table covers. Rows for these types in the frontend's cast table replace the CAST half.

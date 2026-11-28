@@ -7,6 +7,16 @@
 
 @database :memory:
 
+setup t_b_n_ts_j_jb_arr_u_with_rows {
+    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
+    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+}
+
+setup t_id_s_n_arr_ia_j_ok_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
+    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
+}
+
 test quote-ident-plain-lowercase {
     SELECT quote_ident('abc');
 }
@@ -2712,6 +2722,331 @@ test array-to-json-result-is-json {
 }
 expect {
     [[1,2]]|2
+}
+
+test array-to-json-writes-int-and-numeric-values-as-numbers {
+    CREATE TABLE array_to_json_numbers (ia int[], n numeric(5, 2));
+    INSERT INTO array_to_json_numbers VALUES ('{1,2}', 1.50);
+    SELECT array_to_json(ia), array_to_json(ARRAY[n]) FROM array_to_json_numbers;
+}
+expect {
+    [1,2]|[1.50]
+}
+
+test array-to-json-writes-jsonb-in-the-jsonb-output-format {
+    CREATE TABLE array_to_json_jsonb (jb jsonb);
+    INSERT INTO array_to_json_jsonb VALUES ('{"b": 1, "a": [1,{"yy":1,"x":2.50}]}');
+    SELECT array_to_json(array_agg(jb)) FROM array_to_json_jsonb;
+}
+expect {
+    [{"a": [1, {"x": 2.50, "yy": 1}], "b": 1}]
+}
+
+test to-json-writes-each-type-as-postgresql-does {
+    SELECT to_json(1), to_json(true), to_json('a "b"\'::text), to_json(1e20::float8),
+           to_json('Infinity'::float8), to_json('2024-01-02'::date),
+           to_json('2024-01-02 03:04:05.5'::timestamp), to_json('abc'::bytea),
+           to_json(ARRAY[[true], [false]]), to_json(ARRAY['a', NULL]);
+}
+expect {
+    1|true|"a \"b\"\\\\"|1e+20|"Infinity"|"2024-01-02"|"2024-01-02T03:04:05.5"|"\\\\x616263"|[[true],[false]]|["a",null]
+}
+
+test to-json-of-columns {
+    CREATE TABLE to_json_columns (id int, i int, n numeric(5, 2), b boolean, ts timestamptz, u uuid, ia int[], jb jsonb);
+    INSERT INTO to_json_columns VALUES
+        (1, 7, 1.50, true, '2024-01-02 03:04:05', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{1,2}', '{"b": 1, "a": 2}');
+    SELECT to_json(i), to_json(n), to_json(b), to_json(ts), to_json(u), to_json(ia), to_json(jb)
+    FROM to_json_columns;
+}
+expect {
+    7|1.50|true|"2024-01-02T03:04:05+00:00"|"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"|[1,2]|{"a": 2, "b": 1}
+}
+
+test to-json-writes-a-regclass-and-a-regtype-as-their-names {
+    SELECT to_json('pg_class'::regclass), to_json('int4'::regtype), to_jsonb('character varying'::regtype),
+           to_json(0::regclass), to_json(99999::regtype),
+           array_to_json(ARRAY['pg_class'::regclass]), to_json(ARRAY['int4'::regtype, 'text'::regtype]);
+}
+expect {
+    "pg_class"|"integer"|"character varying"|"-"|"99999"|["pg_class"]|["integer","text"]
+}
+
+test to-json-of-regclass-regtype-and-bytea-columns-and-their-row {
+    CREATE TABLE to_json_reg_columns (id int, c regclass, t regtype, b bytea);
+    INSERT INTO to_json_reg_columns VALUES (1, 'to_json_reg_columns', 'int4', '\x00ff');
+    SELECT to_json(c), to_json(t), to_json(b), to_json(to_json_reg_columns), to_jsonb(to_json_reg_columns)
+    FROM to_json_reg_columns;
+}
+expect {
+    "to_json_reg_columns"|"integer"|"\\\\x00ff"|{"id":1,"c":"to_json_reg_columns","t":"integer","b":"\\\\x00ff"}|{"b": "\\\\x00ff", "c": "to_json_reg_columns", "t": "integer", "id": 1}
+}
+
+test to-jsonb-writes-the-jsonb-output-format {
+    CREATE TABLE to_jsonb_documents (j json);
+    INSERT INTO to_jsonb_documents VALUES ('{"b": 1,  "a":2, "aa": [1,{"y":1,"x":2.50}], "b": 3}');
+    SELECT to_jsonb(j), to_jsonb(1e20::float8), to_jsonb(ARRAY[1, 2]), to_jsonb('x'::text), to_jsonb(1.1::real)
+    FROM to_jsonb_documents;
+}
+expect {
+    {"a": 2, "b": 3, "aa": [1, {"x": 2.50, "y": 1}]}|100000000000000000000|[1, 2]|"x"|1.1
+}
+
+test to-json-and-to-jsonb-of-a-typed-null-are-null {
+    SELECT to_json(NULL::int) IS NULL, to_jsonb(NULL::text) IS NULL;
+}
+expect {
+    t|t
+}
+
+test to-json-result-is-json-and-to-jsonb-result-is-jsonb {
+    SELECT to_json(ARRAY[1, 2]) -> 1, to_jsonb(ARRAY['a', 'b']) ->> 0, to_json(to_json(1));
+}
+expect {
+    2|a|1
+}
+
+test to-json-of-a-null-without-a-type {
+    SELECT to_json(NULL);
+}
+@sqlstate 42804
+expect error {
+    could not determine polymorphic type because input has type unknown
+}
+
+test to-jsonb-of-a-null-without-a-type {
+    SELECT to_jsonb(NULL);
+}
+@sqlstate 42804
+expect error {
+    could not determine polymorphic type because input has type unknown
+}
+
+test to-json-of-a-cast-to-json-and-jsonb {
+    SELECT to_json('{"b":1}'::json), to_jsonb('{"b": 1, "a": 2}'::jsonb);
+}
+expect {
+    {"b":1}|{"a": 2, "b": 1}
+}
+
+test to-json-of-a-literal-without-a-type {
+    SELECT to_json('abc');
+}
+@sqlstate 42804
+expect error {
+    could not determine polymorphic type because input has type unknown
+}
+
+test to-json-of-a-json-column-keeps-its-text {
+    CREATE TABLE to_json_spaces (j json);
+    INSERT INTO to_json_spaces VALUES ('{"b": 1,  "a":2}');
+    SELECT j, to_json(j) FROM to_json_spaces;
+}
+expect {
+    {"b": 1,  "a":2}|{"b": 1,  "a":2}
+}
+
+test to-json-of-the-row-of-a-table {
+    CREATE TABLE to_json_rows (id int, s text, n int, arr text[], j jsonb, ok boolean, "we""ird" text);
+    INSERT INTO to_json_rows VALUES (2, 'Abd', NULL, '{c}', '{"b":2,"a":1}', false, 'x');
+    SELECT to_json(to_json_rows), to_json(r.*), row_to_json(r)
+    FROM to_json_rows, to_json_rows AS r;
+}
+expect {
+    {"id":2,"s":"Abd","n":null,"arr":["c"],"j":{"a": 1, "b": 2},"ok":false,"we\\"ird":"x"}|{"id":2,"s":"Abd","n":null,"arr":["c"],"j":{"a": 1, "b": 2},"ok":false,"we\\"ird":"x"}|{"id":2,"s":"Abd","n":null,"arr":["c"],"j":{"a": 1, "b": 2},"ok":false,"we\\"ird":"x"}
+}
+
+test to-jsonb-of-the-row-of-a-table {
+    CREATE TABLE to_jsonb_rows (id int, s text, aa int[]);
+    INSERT INTO to_jsonb_rows VALUES (1, 'a', '{1,2}');
+    SELECT to_jsonb(to_jsonb_rows) FROM to_jsonb_rows;
+}
+expect {
+    {"s": "a", "aa": [1, 2], "id": 1}
+}
+
+test row-to-json-pretty-puts-a-line-feed-after-each-comma {
+    CREATE TABLE row_to_json_pretty (id int, s text);
+    INSERT INTO row_to_json_pretty VALUES (1, 'a');
+    SELECT replace(row_to_json(row_to_json_pretty, true)::text, chr(10), '|'),
+           row_to_json(row_to_json_pretty, NULL) IS NULL
+    FROM row_to_json_pretty;
+}
+expect {
+    {"id":1,| "s":"a"}|t
+}
+
+test to-json-of-a-name-that-is-a-column-and-a-table-is-the-column {
+    SELECT to_json(s) FROM (SELECT 1 AS s) s;
+}
+expect {
+    1
+}
+
+test to-json-of-the-row-of-a-subquery-and-of-an-outer-query {
+    CREATE TABLE to_json_scopes (id int, s text);
+    INSERT INTO to_json_scopes VALUES (1, 'a');
+    SELECT (SELECT to_json(to_json_scopes) FROM (SELECT 1 AS z) q),
+           (SELECT to_json(sub) FROM (SELECT id, s AS label FROM to_json_scopes) sub)
+    FROM to_json_scopes;
+}
+expect {
+    {"id":1,"s":"a"}|{"id":1,"label":"a"}
+}
+
+test to-json-of-a-row-that-an-outer-join-leaves-out-is-null {
+    CREATE TABLE to_json_outer (id int, v text);
+    INSERT INTO to_json_outer VALUES (1, NULL);
+    SELECT to_json(b) IS NULL, to_jsonb(b) IS NULL, row_to_json(b) IS NULL, to_json(b.*) IS NULL,
+           (SELECT to_json(b)) IS NULL
+    FROM to_json_outer a LEFT JOIN to_json_outer b ON false;
+}
+expect {
+    t|t|t|t|t
+}
+
+test to-json-of-a-row-of-nulls-that-an-outer-join-finds {
+    CREATE TABLE to_json_nulls (id int, v text);
+    INSERT INTO to_json_nulls VALUES (NULL, NULL);
+    SELECT to_json(b) FROM to_json_nulls a LEFT JOIN to_json_nulls b ON true;
+}
+expect {
+    {"id":null,"v":null}
+}
+
+test to-jsonb-of-the-rows-of-on-conflict-do-update {
+    CREATE TABLE to_jsonb_upsert (id int PRIMARY KEY, n int, j jsonb);
+    INSERT INTO to_jsonb_upsert VALUES (1, 1, NULL);
+    INSERT INTO to_jsonb_upsert VALUES (1, 5, NULL)
+        ON CONFLICT (id) DO UPDATE SET j = to_jsonb(excluded);
+    SELECT j FROM to_jsonb_upsert;
+    INSERT INTO to_jsonb_upsert VALUES (1, 6, NULL)
+        ON CONFLICT (id) DO UPDATE SET j = to_jsonb(to_jsonb_upsert);
+    SELECT j FROM to_jsonb_upsert;
+    INSERT INTO to_jsonb_upsert AS t VALUES (1, 7, NULL)
+        ON CONFLICT (id) DO UPDATE SET j = to_json(excluded.*) WHERE to_jsonb(t) IS NOT NULL;
+    SELECT j FROM to_jsonb_upsert;
+}
+expect {
+    {"j": null, "n": 5, "id": 1}
+    {"j": {"j": null, "n": 5, "id": 1}, "n": 1, "id": 1}
+    {"j": null, "n": 7, "id": 1}
+}
+
+test row-to-json-of-a-number {
+    SELECT row_to_json(1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test to-json-of-the-row-of-a-missing-table {
+    CREATE TABLE to_json_missing (id int);
+    SELECT to_json(nosuch.*) FROM to_json_missing;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test to-json-takes-one-argument {
+    SELECT to_json(1, 2);
+}
+@sqlstate 42883
+expect error {
+}
+
+test row-to-json-of-a-subquery-with-two-columns-of-one-name {
+    SELECT row_to_json(q), to_jsonb(q), to_json(q.*) FROM (SELECT 1 AS a, 'x' AS a, 2 AS b) q;
+}
+expect {
+    {"a":1,"a":"x","b":2}|{"a": "x", "b": 2}|{"a":1,"a":"x","b":2}
+}
+
+test to-json-of-a-subquery-that-selects-star-from-two-columns-of-one-name {
+    SELECT to_json(q2) FROM (SELECT * FROM (SELECT 1 AS a, 2 AS a) q) q2;
+    SELECT to_json(q2) FROM (SELECT q.*, 3 AS a FROM (SELECT 1 AS a, 2 AS a) q) q2;
+}
+expect {
+    {"a":1,"a":2}
+    {"a":1,"a":2,"a":3}
+}
+
+test row-to-json-of-a-column-alias-list-with-one-name-twice {
+    SELECT row_to_json(q) FROM (VALUES (1, 2, 3)) q(a, a, b);
+}
+expect {
+    {"a":1,"a":2,"b":3}
+}
+
+test to-json-of-a-cte-with-two-columns-of-one-name {
+    WITH c(x, x) AS (SELECT 1, 2) SELECT to_json(c) FROM c;
+}
+expect {
+    {"x":1,"x":2}
+}
+
+test to-json-of-the-row-of-an-outer-subquery-with-two-columns-of-one-name {
+    SELECT (SELECT to_json(q)) FROM (SELECT 1 AS a, 'x' AS a) q;
+}
+expect {
+    {"a":1,"a":"x"}
+}
+
+test to-json-of-a-subquery-keeps-a-column-name-with-a-colon {
+    SELECT to_json(q) FROM (SELECT 1 AS a, 2 AS "a:1", 3 AS a) q;
+}
+expect {
+    {"a":1,"a:1":2,"a":3}
+}
+
+test row-to-json-of-a-row-takes-at-most-two-arguments {
+    CREATE TABLE row_to_json_arguments (id int);
+    INSERT INTO row_to_json_arguments VALUES (1);
+    SELECT row_to_json(row_to_json_arguments, true, true) FROM row_to_json_arguments;
+}
+@sqlstate 42883
+expect error {
+}
+
+test to-jsonb-of-a-row-takes-one-argument {
+    CREATE TABLE to_jsonb_arguments (id int);
+    INSERT INTO to_jsonb_arguments VALUES (1);
+    SELECT to_jsonb(to_jsonb_arguments, true) FROM to_jsonb_arguments;
+}
+@sqlstate 42883
+expect error {
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test to-json-scalar {
+    SELECT to_json(s), to_jsonb(n) FROM t WHERE id = 1;
+}
+expect {
+    "abc"|10
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test row-to-json-to-json-row {
+    SELECT row_to_json(t) FROM t WHERE id = 2;
+}
+expect {
+    {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test to-json-t-of-table-alias {
+    SELECT to_json(x.*) FROM t x WHERE id = 2;
+}
+expect {
+    {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
+}
+
+@setup t_b_n_ts_j_jb_arr_u_with_rows
+test row-to-json-of-whole-row {
+    SELECT row_to_json(t) FROM t;
+}
+expect {
+    {"b":true,"n":1.50,"ts":"2026-10-08T12:00:00+00:00","j":{"x": 1},"jb":{"y": 2},"arr":["a"],"u":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
 }
 
 test table-function-argument-cannot-name-a-table-listed-after-it {

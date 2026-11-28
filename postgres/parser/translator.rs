@@ -11,15 +11,15 @@ use crate::names::{
 };
 use crate::policy_condition::written_condition;
 use crate::sqlstate::{
-    SQLSTATE_DUPLICATE_COLUMN, SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED,
-    SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_RECURSION,
-    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_PARAMETER,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
-    SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_DUPLICATE_COLUMN, SQLSTATE_DUPLICATE_OBJECT,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME,
+    SQLSTATE_INVALID_OBJECT_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_RECURSION, SQLSTATE_INVALID_SCHEMA_DEFINITION,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -4837,6 +4837,12 @@ impl PostgreSQLTranslator {
                 "substring() with a regular expression or SIMILAR pattern",
             ));
         }
+        if takes_anyelement(&func_name) && func_call.args.iter().any(is_untyped_literal) {
+            return Err(ParseError::sqlstate(
+                SQLSTATE_DATATYPE_MISMATCH,
+                "could not determine polymorphic type because input has type unknown",
+            ));
+        }
         if func_call.func_variadic {
             return Err(ParseError::not_supported("a VARIADIC function argument")
                 .with_hint("Pass the array elements as separate arguments."));
@@ -4869,11 +4875,19 @@ impl PostgreSQLTranslator {
             });
         }
 
-        // Translate function arguments
+        // Translate function arguments. `t.*` is the row of table t, which the
+        // functions of a record take; the engine finds its columns.
+        let takes_record = takes_record(&func_name);
         let args = func_call
             .args
             .iter()
-            .map(|arg| Ok(Box::new(self.translate_expr(arg)?)))
+            .map(|arg| match table_star(arg) {
+                Some(table) if takes_record => Ok(Box::new(ast::Expr::Qualified(
+                    exact_name(table),
+                    exact_name("*"),
+                ))),
+                _ => Ok(Box::new(self.translate_expr(arg)?)),
+            })
             .collect::<Result<Vec<_>, ParseError>>()?;
 
         let distinctness = if func_call.agg_distinct {
@@ -8153,6 +8167,11 @@ fn pg_type_name_to_ast_type(
         ("TIME", _) => "time",
         ("TIMESTAMP", _) => "timestamp",
         ("TIMESTAMPTZ", _) => "timestamptz",
+        // A json or jsonb value is checked and stored as a column of the type
+        // does, and the cast gives the value that type, which to_json() and
+        // the operators read.
+        ("JSON", false) => "json",
+        ("JSONB", false) => "jsonb",
         // For CAST expressions, map all text-like PG types to TEXT.
         (
             "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
@@ -11074,6 +11093,61 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
             .any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
         _ => false,
     }
+}
+
+/// Whether the function `name` takes a record, so that an argument may be the
+/// row of a table. The frontend's dialect uses the same list for
+/// `Dialect::takes_row_arguments`.
+// FIXME(pg-catalog): This hand-codes the functions of pg_proc whose parameter
+// is a record or anyelement and that tursopg can give a row: to_json,
+// to_jsonb and row_to_json. A record type and function resolution in pg_proc
+// replace this list.
+pub fn takes_record(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "to_json" | "to_jsonb" | "row_to_json"
+    )
+}
+
+/// The table `t` of a column reference `t.*`, or None for any other node.
+fn table_star(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::ColumnRef(column_ref)) = &node.node else {
+        return None;
+    };
+    match column_ref.fields.as_slice() {
+        [table, star] if matches!(star.node, Some(Node::AStar(_))) => match &table.node {
+            Some(Node::String(table)) => Some(table.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether the function `name` has one parameter of the type anyelement,
+/// whose type PostgreSQL takes from the argument.
+// FIXME(pg-catalog): This hand-codes the proargtypes of to_json and to_jsonb
+// in pg_proc, which are (anyelement). Function resolution in pg_proc, which
+// refuses an argument of the type unknown for a polymorphic parameter,
+// replaces this list.
+fn takes_anyelement(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "to_json" | "to_jsonb")
+}
+
+/// Whether `node` is a quoted literal or NULL without a type. PostgreSQL gives
+/// such a literal the type unknown until something decides its type.
+fn is_untyped_literal(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+    matches!(
+        &node.node,
+        Some(Node::AConst(pg_query::protobuf::AConst {
+            isnull: true,
+            ..
+        })) | Some(Node::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Sval(_)),
+            ..
+        }))
+    )
 }
 
 /// The error PostgreSQL reports for `f(*)` when the function named by
