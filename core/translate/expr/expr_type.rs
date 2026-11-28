@@ -679,9 +679,9 @@ fn base_table_column_type(
         ) {
             return None;
         }
-        return Some(column_type(
+        return Some(table_column_type(
+            table,
             table.get_column_at(column)?,
-            table.is_strict(),
             env.schema(),
         ));
     }
@@ -689,6 +689,19 @@ fn base_table_column_type(
         return env.self_table_column_type(column);
     }
     None
+}
+
+/// The type of a column of `table`, which for a virtual table is its declared registered type.
+fn table_column_type(table: &Table, column: &Column, schema: &Schema) -> ExprType {
+    if matches!(table, Table::Virtual(_)) {
+        if let Some(type_def) = schema.get_type_def_unchecked(&column.ty_str) {
+            return ExprType::Custom {
+                type_def: Arc::clone(type_def),
+                params: column.ty_params.clone(),
+            };
+        }
+    }
+    column_type(column, table.is_strict(), schema)
 }
 
 /// The type of a struct field or union variant, as declared in CREATE TYPE.
