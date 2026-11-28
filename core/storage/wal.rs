@@ -5245,7 +5245,16 @@ impl WalFile {
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy.into());
                     }
-                    if mode.should_restart_log() {
+                    if pager.is_read_only() {
+                        // A read-only connection cannot restart the log: begin_restart
+                        // resets the shared WAL index, but the WAL file keeps its frames
+                        // and nobody can write a new header. RESTART leaves the index
+                        // alone. TRUNCATE must empty the file, so it is busy while
+                        // the WAL holds frames.
+                        if matches!(mode, CheckpointMode::Truncate { .. }) && wal_max_frame > 0 {
+                            return Err(LimboError::Busy.into());
+                        }
+                    } else if mode.should_restart_log() {
                         turso_assert!(
                             matches!(
                                 *self.checkpoint_guard.read(),
@@ -5267,7 +5276,9 @@ impl WalFile {
                     // This ensures data durability: if a crash occurs after WAL truncation
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
-                    if mode.should_restart_log() {
+                    // A read-only connection never ran `begin_restart`, so it has no
+                    // read marks to release.
+                    if mode.should_restart_log() && !pager.is_read_only() {
                         Self::unlock_after_restart(&self.coordination, None);
                     }
                     let mut checkpoint_result = {

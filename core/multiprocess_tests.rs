@@ -921,8 +921,9 @@ fn multiprocess_backfilled_writer_child_process() {
 
 /// A checkpoint on a read-only connection never writes. The writer lives in a child
 /// process, so the parent opens a genuinely separate read-only `Database`; the WAL holds
-/// frames that are all backfilled. No mode may fail or report busy, and neither the WAL file
-/// nor the DB file may change.
+/// frames that are all backfilled. PASSIVE, FULL and RESTART may neither fail nor report
+/// busy, and none of them changes the WAL file, the DB file or the shared WAL frame count.
+/// TRUNCATE is covered by `subprocess_readonly_checkpoint_truncate_is_busy_with_frames`.
 #[test]
 fn subprocess_readonly_checkpoint_never_writes_backfilled_wal() {
     let dir = tempfile::tempdir().unwrap();
@@ -970,13 +971,8 @@ fn subprocess_readonly_checkpoint_never_writes_backfilled_wal() {
         ),
         ("FULL", CheckpointMode::Full),
         ("RESTART", CheckpointMode::Restart),
-        (
-            "TRUNCATE",
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        ),
     ];
+    let max_frame = wal_max_frame(&conn);
     for (name, mode) in modes {
         let result = conn.checkpoint(mode).unwrap_or_else(|err| {
             panic!("{name}: a read-only checkpoint must neither fail nor report busy: {err:?}")
@@ -984,6 +980,11 @@ fn subprocess_readonly_checkpoint_never_writes_backfilled_wal() {
         assert!(
             result.everything_backfilled(),
             "{name}: every frame is backfilled: {result:?}"
+        );
+        assert_eq!(
+            wal_max_frame(&conn),
+            max_frame,
+            "{name} must not reset the shared WAL index while the WAL file keeps its frames"
         );
         assert_eq!(
             std::fs::metadata(&wal_path).unwrap().len(),
@@ -1002,6 +1003,70 @@ fn subprocess_readonly_checkpoint_never_writes_backfilled_wal() {
         child.wait().unwrap().success(),
         "the writer child should exit cleanly after release"
     );
+}
+
+/// A read-only connection cannot truncate the WAL file, so TRUNCATE is busy while the WAL
+/// holds frames, also when every frame is backfilled. The busy checkpoint must leave the
+/// shared WAL index alone: a repeated call stays busy and still sees the frames the file
+/// holds. Nothing is written.
+#[test]
+fn subprocess_readonly_checkpoint_truncate_is_busy_with_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("readonly-truncate-busy.db");
+    let wal_path = dir.path().join("readonly-truncate-busy.db-wal");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_BACKFILLED_WRITER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(wal_len > 0, "the child must leave frames in the WAL file");
+    let db_bytes = std::fs::read(&db_path).unwrap();
+
+    let db = open_multiprocess_db_with_flags(io, db_path_str, OpenFlags::ReadOnly).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert!(
+        conn.pager.load().is_read_only(),
+        "the parent connection must be read-only"
+    );
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame > 0,
+        "the read-only connection must see the frames"
+    );
+
+    for call in 1..=2 {
+        let err = conn
+            .checkpoint(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, LimboError::Busy),
+            "call {call}: TRUNCATE cannot empty the WAL and must be busy: {err:?}"
+        );
+        assert_eq!(
+            wal_max_frame(&conn),
+            max_frame,
+            "call {call}: a busy TRUNCATE must keep the shared WAL frame count"
+        );
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+        assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
+    }
+    release_and_wait(child, &release_file);
 }
 
 /// Child half of the `subprocess_readonly_checkpoint_*_blocker` tests. It holds the
