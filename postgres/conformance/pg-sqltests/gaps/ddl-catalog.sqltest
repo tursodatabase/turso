@@ -394,6 +394,18 @@ expect {
     t|BASE TABLE
 }
 
+# TUR-70: the other views of the information schema
+@compat-gap "syntax:information-schema"
+test information-schema-table-constraints {
+    CREATE TABLE t (id int PRIMARY KEY);
+    SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 't' AND constraint_type = 'PRIMARY KEY';
+}
+expect {
+    t_pkey|PRIMARY KEY
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 # E-33: pg_class rows for non-public schema
 @setup schema_api_api_items_id
 test pg-class-rows-for-non-public-schema {
