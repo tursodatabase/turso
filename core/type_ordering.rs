@@ -26,10 +26,17 @@ pub enum TypeOrdering {
     /// Arrays whose elements are texts, such as `text[]`. An array in text
     /// form is read with texts for its elements, so `{1}` and `{1.0}` differ.
     TextArray,
+    /// Arrays whose type reads text itself, such as `int2vector`.
+    StoredArray,
 }
 
 impl TypeOrdering {
-    pub const ALL: [Self; 3] = [Self::Numeric, Self::Array, Self::TextArray];
+    pub const ALL: [Self; 4] = [
+        Self::Numeric,
+        Self::Array,
+        Self::TextArray,
+        Self::StoredArray,
+    ];
 
     /// The name EXPLAIN shows for the order.
     pub const fn name(self) -> &'static str {
@@ -37,7 +44,13 @@ impl TypeOrdering {
             Self::Numeric => "numeric",
             Self::Array => "array",
             Self::TextArray => "text_array",
+            Self::StoredArray => "stored_array",
         }
+    }
+
+    /// Whether the order reads a text operand itself.
+    pub const fn reads_text_operands(self) -> bool {
+        !matches!(self, Self::StoredArray)
     }
 
     pub fn compare(self, left: ValueRef, right: ValueRef) -> Ordering {
@@ -47,6 +60,9 @@ impl TypeOrdering {
                 .cmp(&ArraySortKey::of(right, parse_text_array_value)),
             Self::TextArray => ArraySortKey::of(left, parse_text_array_of_texts_value)
                 .cmp(&ArraySortKey::of(right, parse_text_array_of_texts_value)),
+            Self::StoredArray => {
+                ArraySortKey::of(left, no_array).cmp(&ArraySortKey::of(right, no_array))
+            }
         }
     }
 
@@ -66,8 +82,13 @@ impl TypeOrdering {
             Self::Numeric => numeric_hash(value, state),
             Self::Array => ArraySortKey::of(value, parse_text_array_value).hash(state),
             Self::TextArray => ArraySortKey::of(value, parse_text_array_of_texts_value).hash(state),
+            Self::StoredArray => ArraySortKey::of(value, no_array).hash(state),
         }
     }
+}
+
+fn no_array(_: &str) -> Option<ArrayValue> {
+    None
 }
 
 /// NULL first; then arrays, element by element, then shorter first, then by
@@ -258,6 +279,22 @@ mod tests {
                 &[array_with_bound(0, &[1, 2, 3])],
             ],
         );
+    }
+
+    #[test]
+    fn stored_array_order_does_not_read_text() {
+        assert_order(
+            TypeOrdering::StoredArray,
+            &[
+                &[Value::Null],
+                &[array_with_bound(0, &[-1])],
+                &[array_with_bound(0, &[1, 2])],
+                &[array_with_bound(0, &[3])],
+                &[array_with_bound(0, &[300])],
+                &[Value::from_text("1 2")],
+            ],
+        );
+        assert!(!TypeOrdering::StoredArray.reads_text_operands());
     }
 
     #[test]
