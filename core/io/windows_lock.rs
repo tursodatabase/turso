@@ -73,6 +73,10 @@ fn overlapped_at(offset: u64) -> OVERLAPPED {
 }
 
 fn open_lock_handle(path: &Path) -> Result<HANDLE> {
+    open_lock_handle_with_access(path, GENERIC_READ | GENERIC_WRITE)
+}
+
+fn open_lock_handle_with_access(path: &Path, access: u32) -> Result<HANDLE> {
     let path: Vec<u16> = path
         .as_os_str()
         .encode_wide()
@@ -81,7 +85,7 @@ fn open_lock_handle(path: &Path) -> Result<HANDLE> {
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -218,6 +222,19 @@ fn take_injected_unlock_failure(offset: u64) -> bool {
 struct ProcessFileLockEntry {
     handle: HANDLE,
     refcount: usize,
+    mode: ProcessLockMode,
+}
+
+/// How a process-wide file lock is taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessLockMode {
+    /// The lock `open_file` takes: an exclusive byte lock that is shared by
+    /// all same-process `OpenTime` holders, so duplicate opens keep working.
+    OpenTime,
+    /// Shared byte lock, shared with other same-process `Shared` holders.
+    Shared,
+    /// Explicit exclusive lock: fails if any same-process entry exists.
+    Exclusive,
 }
 
 unsafe impl Send for ProcessFileLockEntry {}
@@ -229,7 +246,8 @@ fn process_file_lock_registry() -> &'static ProcessFileLockRegistry {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A reference to this process's single open-time lock for one database file.
+/// A reference to this process's single advisory lock (shared or exclusive)
+/// for one database file.
 pub(crate) struct ProcessFileLockGuard {
     key: PathBuf,
 }
@@ -273,21 +291,41 @@ impl Drop for ProcessFileLockGuard {
     }
 }
 
-/// Acquire the per-process open-time lock for `path`.
+/// Acquire the per-process advisory lock for the resolved `key`
+/// (see `stable_lock_path`).
 ///
-/// Windows byte-range locks are per-handle, so all same-process opens share a
-/// single dedicated handle. The lock lives beyond the data range and therefore
-/// does not interfere with normal database I/O.
-pub(crate) fn acquire_process_file_lock(path: &str) -> Result<ProcessFileLockGuard> {
-    let key = stable_lock_path(Path::new(path));
+/// Windows byte-range locks are per-handle, so all same-process acquisitions
+/// share a single dedicated handle. The lock lives beyond the data range and
+/// therefore does not interfere with normal database I/O. `OpenTime` requests
+/// share with existing `OpenTime` entries and `Shared` with `Shared` ones;
+/// `Exclusive` fails if any entry exists, and any other mode mismatch fails,
+/// like `flock` between distinct file descriptors.
+pub(crate) fn acquire_process_file_lock(
+    key: &Path,
+    mode: ProcessLockMode,
+) -> Result<ProcessFileLockGuard> {
+    let conflict = || {
+        LimboError::LockingError("Failed locking file. File is locked by another process".into())
+    };
+    let key = key.to_path_buf();
     let mut registry = process_file_lock_registry().lock();
     if let Some(entry) = registry.get_mut(&key) {
+        if mode == ProcessLockMode::Exclusive || entry.mode != mode {
+            return Err(conflict());
+        }
         entry.refcount += 1;
         return Ok(ProcessFileLockGuard { key });
     }
 
-    let handle = open_lock_handle(&key)?;
-    match lock_range(handle, PROCESS_LOCK_OFFSET, true, true) {
+    let exclusive = mode != ProcessLockMode::Shared;
+    // LockFileEx needs read or write access. Only the open-time lock, taken by
+    // writable opens, keeps its old read-write handle.
+    let handle = if mode == ProcessLockMode::OpenTime {
+        open_lock_handle(&key)?
+    } else {
+        open_lock_handle_with_access(&key, GENERIC_READ)?
+    };
+    match lock_range(handle, PROCESS_LOCK_OFFSET, exclusive, true) {
         Err(err) => {
             unsafe {
                 CloseHandle(handle);
@@ -295,16 +333,21 @@ pub(crate) fn acquire_process_file_lock(path: &str) -> Result<ProcessFileLockGua
             Err(err)
         }
         Ok(true) => {
-            registry.insert(key.clone(), ProcessFileLockEntry { handle, refcount: 1 });
+            registry.insert(
+                key.clone(),
+                ProcessFileLockEntry {
+                    handle,
+                    refcount: 1,
+                    mode,
+                },
+            );
             Ok(ProcessFileLockGuard { key })
         }
         Ok(false) => {
             unsafe {
                 CloseHandle(handle);
             }
-            Err(LimboError::LockingError(
-                "Failed locking file. File is locked by another process".into(),
-            ))
+            Err(conflict())
         }
     }
 }
@@ -716,6 +759,45 @@ mod tests {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.0).expect("restore current directory");
         }
+    }
+
+    #[test]
+    fn process_file_lock_modes_share_and_conflict() {
+        let file = tempfile::NamedTempFile::new().expect("create lock file");
+        let key = stable_lock_path(file.path());
+        let acquire = |mode| acquire_process_file_lock(&key, mode);
+
+        let first = acquire(ProcessLockMode::Shared).expect("first shared lock");
+        let second = acquire(ProcessLockMode::Shared).expect("second shared lock");
+        assert!(matches!(
+            acquire(ProcessLockMode::Exclusive),
+            Err(LimboError::LockingError(_))
+        ));
+        assert!(acquire(ProcessLockMode::OpenTime).is_err());
+
+        drop(first);
+        assert!(acquire(ProcessLockMode::Exclusive).is_err());
+        drop(second);
+
+        // Explicit exclusive locks are not shared.
+        let exclusive = acquire(ProcessLockMode::Exclusive).expect("exclusive after release");
+        assert!(matches!(
+            acquire(ProcessLockMode::Exclusive),
+            Err(LimboError::LockingError(_))
+        ));
+        assert!(acquire(ProcessLockMode::Shared).is_err());
+        assert!(acquire(ProcessLockMode::OpenTime).is_err());
+        drop(exclusive);
+
+        // Open-time locks share with each other but conflict with Shared.
+        let open_a = acquire(ProcessLockMode::OpenTime).expect("first open-time lock");
+        let open_b = acquire(ProcessLockMode::OpenTime).expect("second open-time lock");
+        assert!(acquire(ProcessLockMode::Shared).is_err());
+        assert!(acquire(ProcessLockMode::Exclusive).is_err());
+        drop(open_a);
+        assert!(acquire(ProcessLockMode::Shared).is_err());
+        drop(open_b);
+        drop(acquire(ProcessLockMode::Shared).expect("shared after open-time release"));
     }
 
     fn shared_wal_test_state() -> (tempfile::NamedTempFile, PathBuf, Mutex<SharedWalLockState>) {
