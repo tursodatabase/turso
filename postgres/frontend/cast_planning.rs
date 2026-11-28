@@ -3,7 +3,7 @@
 //! FIXME(pg-catalog): This file is temporary. An expression does not carry its type, so this file reads the type of a cast operand from the type core gives it, which for a type that is not registered is only a name (`cast_rule`, `named_cast_type`), and it has no way to convert a value where the cast is but to rewrite the expression into a call of the function `pg_cast` (`conversion_call`). Once float4, float8 and text are registered types and the expression tree is typed, the engine asks the target type for the cast with the source type in hand, calls `resolve` and `convert` of casts.rs itself, and this file goes away.
 
 use crate::casts::{convert, resolve, CastType, CastType::*, Resolution};
-use crate::error::sqlstate_error;
+use crate::error::{sqlstate_error, sqlstate_error_with_hint};
 use crate::functions::format_type;
 use std::sync::Arc;
 use turso_core::ast;
@@ -22,13 +22,39 @@ pub(crate) fn apply_cast(
     let Some(cast) = table_cast(source, target, context)? else {
         return Ok(CastDecision::EngineRules);
     };
-    let operand = match resolve(cast.source, cast.target, cast.context)? {
+    let resolution = resolve(cast.source, cast.target, cast.context)?;
+    // FIXME(registered-types): The type of an integer that has no registered type is a guess, int4, and the bytes of a cast to bytea are the width of the source type. The guess is exact for a literal that fits in 32 bits, and is refused for any other. PostgreSQL types a literal by its value and a function by the prorettype of its pg_proc row, so `4294967296::bytea` is 8 bytes there. A typed expression tree replaces this.
+    if cast.target == Bytea
+        && cast.source.is_integer()
+        && cast.source_is_a_guess
+        && !is_int4_literal(operand)
+    {
+        return Err(sqlstate_error_with_hint(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "cannot cast an integer of unknown type to bytea",
+            "Cast the integer to smallint, integer or bigint first.",
+        ));
+    }
+    let operand = match resolution {
         Resolution::Convert if needs_conversion(cast.source, cast.target) => {
             conversion_call(operand, cast.source, cast.target)
         }
         _ => operand.clone(),
     };
     Ok(CastDecision::Applied(operand))
+}
+
+/// Whether `expr` is an integer written in the statement that PostgreSQL types
+/// integer, which is one that fits in 32 bits.
+fn is_int4_literal(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Parenthesized(inner) if inner.len() == 1 => is_int4_literal(&inner[0]),
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => is_int4_literal(inner),
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => {
+            text.parse::<i64>().is_ok_and(|n| i32::try_from(n).is_ok())
+        }
+        _ => false,
+    }
 }
 
 /// Fails as PostgreSQL does when the DEFAULT of the column `column_name` has a
@@ -64,6 +90,9 @@ struct TableCast {
     source: CastType,
     target: CastType,
     context: CastContext,
+    /// Whether `source` is the type that the engine gives an integer that has
+    /// no registered type, which is not the type PostgreSQL gives it.
+    source_is_a_guess: bool,
 }
 
 /// The cast from the type `source` gives to `target`, written in `context`,
@@ -80,11 +109,18 @@ fn table_cast(
     let CastRule::Table(target) = cast_rule(target, target_place)? else {
         return Ok(None);
     };
+    let mut source_is_a_guess = false;
     let (source, context) = match source() {
         // A string literal or a parameter takes the input of the target type.
         CastSource::Untyped => (Text, CastContext::Explicit),
         CastSource::Typed(source) => match cast_rule(&source, NamePlace::Value)? {
-            CastRule::Table(source) => (source, context),
+            CastRule::Table(cast_type) => {
+                source_is_a_guess = matches!(
+                    &source.identity,
+                    TypeIdentity::Name(name) if name.eq_ignore_ascii_case("integer")
+                );
+                (cast_type, context)
+            }
             CastRule::Engine => return Ok(None),
         },
         // FIXME(pg-catalog): Core cannot name the type of every expression, such as the result of most functions, so such a value is cast by the rules of the engine. `bool_cast` of pg_type/boolean.rs still decides its cast to boolean. A typed expression tree, where every expression has a registered type, removes this case.
@@ -94,6 +130,7 @@ fn table_cast(
         source,
         target,
         context,
+        source_is_a_guess,
     }))
 }
 

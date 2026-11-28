@@ -88,7 +88,7 @@ impl CastType {
         })
     }
 
-    fn is_integer(self) -> bool {
+    pub(crate) fn is_integer(self) -> bool {
         self.integer_type().is_some()
     }
 

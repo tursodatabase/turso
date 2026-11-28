@@ -313,6 +313,17 @@ impl Dialect for PostgresDialect {
         crate::operators::choose_list_operator(op, &operands())
     }
 
+    // FIXME(registered-types): PostgreSQL reads the literal as the type. Here the statement is not analyzed before this expression is compiled, so nothing read it, and it is refused. A typed expression tree that every context analyzes once reads it.
+    fn check_string_literal_comparison(&self, type_name: &str) -> Result<()> {
+        Err(crate::error::sqlstate_error_with_hint(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "a string literal compared with a value of type {type_name} is not supported here"
+            ),
+            format!("Write the literal as '...'::{type_name}."),
+        ))
+    }
+
     fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
         let names: Vec<&str> = operand_types.iter().map(String::as_str).collect();
         crate::functions::undefined_operator_of(op, &names)
