@@ -1,0 +1,140 @@
+@database :memory:
+
+# EXPLAIN QUERY PLAN for an IN seek on an index column that follows an equality
+# prefix. The leading number of each plan line is a program address, so the
+# expectations match it with \d+.
+
+setup schema {
+    CREATE TABLE ts (id INTEGER PRIMARY KEY, source TEXT, item_id INTEGER, note TEXT);
+    CREATE INDEX idx_ts ON ts(source, item_id);
+    CREATE TABLE t3c (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d TEXT);
+    CREATE INDEX idx_t3c ON t3c(a, b, c);
+}
+
+@setup schema
+test in-list-after-eq-prefix-seeks-both-columns {
+    EXPLAIN QUERY PLAN SELECT item_id FROM ts WHERE source = 'a' AND item_id IN (1, 2, 3);
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH ts USING COVERING INDEX idx_ts \(source=\? AND item_id=\?\)
+}
+
+@setup schema
+test in-list-after-eq-prefix-non-covering {
+    EXPLAIN QUERY PLAN SELECT note FROM ts WHERE source = 'a' AND item_id IN (1, 2, 3);
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH ts USING INDEX idx_ts \(source=\? AND item_id=\?\)
+}
+
+@setup schema
+test in-list-after-two-eq-prefix-columns {
+    EXPLAIN QUERY PLAN SELECT d FROM t3c WHERE a = 1 AND b = 2 AND c IN (5, 6);
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH t3c USING INDEX idx_t3c \(a=\? AND b=\? AND c=\?\)
+}
+
+@setup schema
+test in-list-on-first-index-column-has-no-prefix {
+    EXPLAIN QUERY PLAN SELECT note FROM ts WHERE source IN ('a', 'b');
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH ts USING INDEX idx_ts \(source=\?\)
+}
+
+# The cost model chooses between the IN seek and one seek on the prefix.
+setup many_rows_per_prefix {
+    CREATE TABLE big (id INTEGER PRIMARY KEY, source TEXT, item_id INTEGER);
+    CREATE INDEX idx_big ON big(source, item_id);
+    WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 2000)
+    INSERT INTO big SELECT x, 'a', x FROM n;
+    ANALYZE big;
+}
+
+# One prefix value holds every row: a few seeks beat reading them all.
+@setup many_rows_per_prefix
+test few-in-values-over-a-large-prefix-use-the-in-seek {
+    EXPLAIN QUERY PLAN SELECT item_id FROM big WHERE source = 'a' AND item_id IN (7, 700, 1400);
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH big USING COVERING INDEX idx_big \(source=\? AND item_id=\?\)
+}
+
+setup few_rows_per_prefix {
+    CREATE TABLE spread (id INTEGER PRIMARY KEY, source TEXT, item_id INTEGER);
+    CREATE INDEX idx_spread ON spread(source, item_id);
+    WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 2000)
+    INSERT INTO spread SELECT x, 's' || (x % 1000), x FROM n;
+    ANALYZE spread;
+}
+
+# The prefix holds two rows: sixty seeks cost more than reading both.
+@setup few_rows_per_prefix
+test long-in-list-over-a-small-prefix-keeps-the-prefix-seek {
+    EXPLAIN QUERY PLAN
+    SELECT item_id FROM spread
+    WHERE source = 's7' AND item_id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60);
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH spread USING COVERING INDEX idx_spread \(source=\?\)
+}
+
+# With stats the IN seek on (b) must be costed from sqlite_stat1 like the
+# prefixed one: 1500 rows per b value on (b), 30 rows per (a, b) on (a, b).
+setup in_seek_two_indexes_analyzed {
+    CREATE TABLE two_ix (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v TEXT);
+    CREATE INDEX two_ix_b ON two_ix(b);
+    CREATE INDEX two_ix_ab ON two_ix(a, b);
+    WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 5999)
+    INSERT INTO two_ix(a, b, v) SELECT x % 50, (x / 50) % 4, 'v' FROM n;
+    ANALYZE two_ix;
+}
+
+@setup in_seek_two_indexes_analyzed
+test in-seek-after-prefix-beats-in-seek-on-first-column-with-stats {
+    EXPLAIN QUERY PLAN SELECT v FROM two_ix WHERE a = 3 AND b IN (1, 2);
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH two_ix USING INDEX two_ix_ab \(a=\? AND b=\?\)
+}
+
+setup e_nonuniq_in_400 {
+    CREATE TABLE e_nonuniq (book_id INTEGER, platform_id INTEGER NOT NULL, product_id TEXT NOT NULL, writer TEXT);
+    CREATE INDEX e_nonuniq_idx ON e_nonuniq (platform_id, product_id);
+}
+
+@setup e_nonuniq_in_400
+test in-400-after-eq-prefix-on-non-unique-index {
+    EXPLAIN QUERY PLAN SELECT writer FROM e_nonuniq WHERE platform_id=2 AND product_id IN ('p1','p4','p7','p10','p13','p16','p19','p22','p25','p28','p31','p34','p37','p40','p43','p46','p49','p52','p55','p58','p61','p64','p67','p70','p73','p76','p79','p82','p85','p88','p91','p94','p97','p100','p103','p106','p109','p112','p115','p118','p121','p124','p127','p130','p133','p136','p139','p142','p145','p148','p151','p154','p157','p160','p163','p166','p169','p172','p175','p178','p181','p184','p187','p190','p193','p196','p199','p202','p205','p208','p211','p214','p217','p220','p223','p226','p229','p232','p235','p238','p241','p244','p247','p250','p253','p256','p259','p262','p265','p268','p271','p274','p277','p280','p283','p286','p289','p292','p295','p298','p301','p304','p307','p310','p313','p316','p319','p322','p325','p328','p331','p334','p337','p340','p343','p346','p349','p352','p355','p358','p361','p364','p367','p370','p373','p376','p379','p382','p385','p388','p391','p394','p397','p400','p403','p406','p409','p412','p415','p418','p421','p424','p427','p430','p433','p436','p439','p442','p445','p448','p451','p454','p457','p460','p463','p466','p469','p472','p475','p478','p481','p484','p487','p490','p493','p496','p499','p502','p505','p508','p511','p514','p517','p520','p523','p526','p529','p532','p535','p538','p541','p544','p547','p550','p553','p556','p559','p562','p565','p568','p571','p574','p577','p580','p583','p586','p589','p592','p595','p598','p601','p604','p607','p610','p613','p616','p619','p622','p625','p628','p631','p634','p637','p640','p643','p646','p649','p652','p655','p658','p661','p664','p667','p670','p673','p676','p679','p682','p685','p688','p691','p694','p697','p700','p703','p706','p709','p712','p715','p718','p721','p724','p727','p730','p733','p736','p739','p742','p745','p748','p751','p754','p757','p760','p763','p766','p769','p772','p775','p778','p781','p784','p787','p790','p793','p796','p799','p802','p805','p808','p811','p814','p817','p820','p823','p826','p829','p832','p835','p838','p841','p844','p847','p850','p853','p856','p859','p862','p865','p868','p871','p874','p877','p880','p883','p886','p889','p892','p895','p898','p901','p904','p907','p910','p913','p916','p919','p922','p925','p928','p931','p934','p937','p940','p943','p946','p949','p952','p955','p958','p961','p964','p967','p970','p973','p976','p979','p982','p985','p988','p991','p994','p997','p1000','p1003','p1006','p1009','p1012','p1015','p1018','p1021','p1024','p1027','p1030','p1033','p1036','p1039','p1042','p1045','p1048','p1051','p1054','p1057','p1060','p1063','p1066','p1069','p1072','p1075','p1078','p1081','p1084','p1087','p1090','p1093','p1096','p1099','p1102','p1105','p1108','p1111','p1114','p1117','p1120','p1123','p1126','p1129','p1132','p1135','p1138','p1141','p1144','p1147','p1150','p1153','p1156','p1159','p1162','p1165','p1168','p1171','p1174','p1177','p1180','p1183','p1186','p1189','p1192','p1195','p1198');
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH e_nonuniq USING INDEX e_nonuniq_idx \(platform_id=\? AND product_id=\?\)
+}
+
+setup e_uniq_in_400 {
+    CREATE TABLE e_uniq (book_id INTEGER, platform_id INTEGER NOT NULL, product_id TEXT NOT NULL, writer TEXT, UNIQUE (platform_id, product_id));
+}
+
+@setup e_uniq_in_400
+test in-400-after-eq-prefix-on-composite-unique {
+    EXPLAIN QUERY PLAN SELECT writer FROM e_uniq WHERE platform_id=2 AND product_id IN ('p1','p4','p7','p10','p13','p16','p19','p22','p25','p28','p31','p34','p37','p40','p43','p46','p49','p52','p55','p58','p61','p64','p67','p70','p73','p76','p79','p82','p85','p88','p91','p94','p97','p100','p103','p106','p109','p112','p115','p118','p121','p124','p127','p130','p133','p136','p139','p142','p145','p148','p151','p154','p157','p160','p163','p166','p169','p172','p175','p178','p181','p184','p187','p190','p193','p196','p199','p202','p205','p208','p211','p214','p217','p220','p223','p226','p229','p232','p235','p238','p241','p244','p247','p250','p253','p256','p259','p262','p265','p268','p271','p274','p277','p280','p283','p286','p289','p292','p295','p298','p301','p304','p307','p310','p313','p316','p319','p322','p325','p328','p331','p334','p337','p340','p343','p346','p349','p352','p355','p358','p361','p364','p367','p370','p373','p376','p379','p382','p385','p388','p391','p394','p397','p400','p403','p406','p409','p412','p415','p418','p421','p424','p427','p430','p433','p436','p439','p442','p445','p448','p451','p454','p457','p460','p463','p466','p469','p472','p475','p478','p481','p484','p487','p490','p493','p496','p499','p502','p505','p508','p511','p514','p517','p520','p523','p526','p529','p532','p535','p538','p541','p544','p547','p550','p553','p556','p559','p562','p565','p568','p571','p574','p577','p580','p583','p586','p589','p592','p595','p598','p601','p604','p607','p610','p613','p616','p619','p622','p625','p628','p631','p634','p637','p640','p643','p646','p649','p652','p655','p658','p661','p664','p667','p670','p673','p676','p679','p682','p685','p688','p691','p694','p697','p700','p703','p706','p709','p712','p715','p718','p721','p724','p727','p730','p733','p736','p739','p742','p745','p748','p751','p754','p757','p760','p763','p766','p769','p772','p775','p778','p781','p784','p787','p790','p793','p796','p799','p802','p805','p808','p811','p814','p817','p820','p823','p826','p829','p832','p835','p838','p841','p844','p847','p850','p853','p856','p859','p862','p865','p868','p871','p874','p877','p880','p883','p886','p889','p892','p895','p898','p901','p904','p907','p910','p913','p916','p919','p922','p925','p928','p931','p934','p937','p940','p943','p946','p949','p952','p955','p958','p961','p964','p967','p970','p973','p976','p979','p982','p985','p988','p991','p994','p997','p1000','p1003','p1006','p1009','p1012','p1015','p1018','p1021','p1024','p1027','p1030','p1033','p1036','p1039','p1042','p1045','p1048','p1051','p1054','p1057','p1060','p1063','p1066','p1069','p1072','p1075','p1078','p1081','p1084','p1087','p1090','p1093','p1096','p1099','p1102','p1105','p1108','p1111','p1114','p1117','p1120','p1123','p1126','p1129','p1132','p1135','p1138','p1141','p1144','p1147','p1150','p1153','p1156','p1159','p1162','p1165','p1168','p1171','p1174','p1177','p1180','p1183','p1186','p1189','p1192','p1195','p1198');
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH e_uniq USING INDEX sqlite_autoindex_e_uniq_1 \(platform_id=\? AND product_id=\?\)
+}
+
+# Without stats an IN seek replaces a seek on the same index, but not a cheaper
+# IN seek on another access path: two rowid probes beat 400 index probes.
+setup rowid_in_beats_long_index_in {
+    CREATE TABLE ri (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v TEXT);
+    CREATE INDEX ri_ab ON ri(a, b);
+}
+
+@setup rowid_in_beats_long_index_in
+test short-rowid-in-beats-long-in-on-unanalyzed-index {
+    EXPLAIN QUERY PLAN SELECT v FROM ri WHERE id IN (1, 2) AND a = 7 AND b IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,272,273,274,275,276,277,278,279,280,281,282,283,284,285,286,287,288,289,290,291,292,293,294,295,296,297,298,299,300,301,302,303,304,305,306,307,308,309,310,311,312,313,314,315,316,317,318,319,320,321,322,323,324,325,326,327,328,329,330,331,332,333,334,335,336,337,338,339,340,341,342,343,344,345,346,347,348,349,350,351,352,353,354,355,356,357,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,375,376,377,378,379,380,381,382,383,384,385,386,387,388,389,390,391,392,393,394,395,396,397,398,399,400);
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH ri USING INTEGER PRIMARY KEY \(rowid=\?\)
+}

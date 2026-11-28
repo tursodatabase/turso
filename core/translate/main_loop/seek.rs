@@ -21,6 +21,61 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .collect()
 }
 
+/// Evaluates the seek key expression `expr` into `reg`. The key lives in a
+/// register that may be reused, so constants are not hoisted out of the loop.
+pub(super) fn translate_seek_key_expr(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    resolver: &Resolver<'_>,
+    expr: &ast::Expr,
+    reg: usize,
+) -> Result<()> {
+    translate_expr_no_constant_opt(
+        program,
+        Some(tables),
+        expr,
+        reg,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )?;
+    Ok(())
+}
+
+/// Jumps to `target_pc` when the seek key in `reg` is NULL, because `=` never
+/// matches NULL. Nothing is emitted for an expression that cannot be NULL.
+pub(super) fn emit_seek_key_null_exit(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    resolver: &Resolver<'_>,
+    expr: &ast::Expr,
+    reg: usize,
+    target_pc: BranchOffset,
+) {
+    if !expr.is_nonnull(
+        &TableMetadata::new(Some(tables)),
+        &TypeEnv::new(Some(tables), resolver),
+    ) {
+        program.emit_insn(Insn::IsNull { reg, target_pc });
+    }
+}
+
+/// Applies `affinities` to the `count` seek keys in `start_reg..`. Nothing is
+/// emitted when no key needs a conversion.
+pub(super) fn emit_seek_key_affinity(
+    program: &mut ProgramBuilder,
+    start_reg: usize,
+    count: usize,
+    affinities: String,
+) {
+    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
+        program.emit_insn(Insn::Affinity {
+            start_reg,
+            count: std::num::NonZeroUsize::new(count).expect("a seek key has a component"),
+            affinities,
+        });
+    }
+}
+
 /// Converts the seek keys in `start_reg..` to the values the index holds.
 /// `keys` are the keys' expressions, or None for a key that is not one, such
 /// as a value read from a subquery. `in_list_affinity` is the comparison
@@ -277,27 +332,26 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             let reg = self.start_reg + i;
             match key {
                 SeekKeyComponent::Expr(expr) => {
-                    translate_expr_no_constant_opt(
+                    translate_seek_key_expr(
                         self.program,
-                        Some(self.tables),
+                        self.tables,
+                        &self.t_ctx.resolver,
                         expr,
                         reg,
-                        &self.t_ctx.resolver,
-                        NoConstantOptReason::RegisterReuse,
                     )?;
                     // A NULL key can never satisfy `=`, so the loop is done as
                     // soon as one shows up. `IS` matches NULL instead: keep the
                     // NULL in the seek register and let the index comparison
                     // find the rows whose key component is NULL.
-                    if !expr.is_nonnull(
-                        &TableMetadata::new(Some(self.tables)),
-                        &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
-                    ) && !self.seek_def.is_null_matching_key_component(i)
-                    {
-                        self.program.emit_insn(Insn::IsNull {
+                    if !self.seek_def.is_null_matching_key_component(i) {
+                        emit_seek_key_null_exit(
+                            self.program,
+                            self.tables,
+                            &self.t_ctx.resolver,
+                            expr,
                             reg,
-                            target_pc: self.loop_end,
-                        });
+                            self.loop_end,
+                        );
                     }
                 }
                 SeekKeyComponent::Null => self.program.emit_null(reg, None),
@@ -340,13 +394,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 &self.t_ctx.resolver,
             )?;
             let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
-            if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
-                self.program.emit_insn(Insn::Affinity {
-                    start_reg: self.start_reg,
-                    count: std::num::NonZeroUsize::new(num_regs).unwrap(),
-                    affinities,
-                });
-            }
+            emit_seek_key_affinity(self.program, self.start_reg, num_regs, affinities);
             if use_bloom_filter {
                 turso_assert!(
                     idx.ephemeral,
@@ -448,13 +496,12 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let last_reg = self.start_reg + self.seek_def.prefix.len();
         match &self.seek_def.end.last_component {
             SeekKeyComponent::Expr(expr) => {
-                translate_expr_no_constant_opt(
+                translate_seek_key_expr(
                     self.program,
-                    Some(self.tables),
+                    self.tables,
+                    &self.t_ctx.resolver,
                     expr,
                     last_reg,
-                    &self.t_ctx.resolver,
-                    NoConstantOptReason::RegisterReuse,
                 )?;
                 if let Some(idx) = self.seek_index {
                     encode_seek_keys_for_custom_types(
@@ -468,23 +515,16 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         &self.t_ctx.resolver,
                     )?;
                     let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
-                    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
-                        self.program.emit_insn(Insn::Affinity {
-                            start_reg: self.start_reg,
-                            count: std::num::NonZeroUsize::new(num_regs).unwrap(),
-                            affinities,
-                        });
-                    }
+                    emit_seek_key_affinity(self.program, self.start_reg, num_regs, affinities);
                 }
-                if !expr.is_nonnull(
-                    &TableMetadata::new(Some(self.tables)),
-                    &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
-                ) {
-                    self.program.emit_insn(Insn::IsNull {
-                        reg: last_reg,
-                        target_pc: self.loop_end,
-                    });
-                }
+                emit_seek_key_null_exit(
+                    self.program,
+                    self.tables,
+                    &self.t_ctx.resolver,
+                    expr,
+                    last_reg,
+                    self.loop_end,
+                );
             }
             SeekKeyComponent::Null => self.program.emit_null(last_reg, None),
             SeekKeyComponent::None => {}
