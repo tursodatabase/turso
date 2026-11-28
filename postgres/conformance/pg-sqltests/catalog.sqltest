@@ -3022,3 +3022,17 @@ expect {
     public|x_y_idx1
     public|x_y_idx2
 }
+
+test pg-attribute-array-columns-have-array-type-and-dimensions {
+    CREATE TABLE arrays (a text[], b int[][], c jsonb[], d int);
+    SELECT a.attname, a.atttypid, a.attndims, format_type(a.atttypid, a.atttypmod)
+    FROM pg_attribute a
+    WHERE a.attrelid = 'arrays'::regclass AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    a|1009|1|text[]
+    b|1007|2|integer[]
+    c|3807|1|jsonb[]
+    d|23|0|integer
+}
