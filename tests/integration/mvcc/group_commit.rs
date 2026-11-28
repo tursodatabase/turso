@@ -640,6 +640,137 @@ fn step_until_done(stmt: &mut Statement) {
     panic!("statement never finished")
 }
 
+/// The leader's `log_tx` for another transaction fails after that transaction
+/// has already rolled back. The failed ticket must not stay in the retry set,
+/// or every later commit parks.
+#[test]
+fn failed_log_tx_for_dropped_waiter_does_not_stall_later_commits() {
+    use std::sync::Mutex;
+    use turso_core::mvcc::persistent_storage::DurableStorage;
+    use turso_core::{DatabaseOpts, OpenFlags, OpenOptions, IO};
+
+    use super::busy_log_storage::BusyOnLogTxStorage;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = Arc::new(turso_core::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = Arc::new(turso_core::io::PlatformIO::new().unwrap());
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let inner: Arc<dyn DurableStorage> = Arc::new(
+        turso_core::mvcc::persistent_storage::Storage::new(log_file, io.clone(), None),
+    );
+    let storage = BusyOnLogTxStorage::new(inner);
+    let db = Database::open(
+        io,
+        &path_str,
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+
+    let setup = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let waiter = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let leader = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    waiter.execute("BEGIN CONCURRENT").unwrap();
+    leader.execute("BEGIN CONCURRENT").unwrap();
+    waiter.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    leader.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+
+    let store = db.get_mv_store().clone().unwrap();
+    assert!(store.lock_commits_for_testing());
+
+    let mut commit_waiter = waiter.prepare("COMMIT").unwrap();
+    let mut commit_leader = leader.prepare("COMMIT").unwrap();
+    assert!(matches!(commit_waiter.step().unwrap(), StepResult::IO));
+    assert!(matches!(commit_leader.step().unwrap(), StepResult::IO));
+    assert_eq!(store.waiting_commit_count_for_testing(), 2);
+
+    let waiter_commit = Arc::new(Mutex::new(Some(commit_waiter)));
+    let drop_waiter = Arc::clone(&waiter_commit);
+    storage.arm_before_busy(move || {
+        drop(drop_waiter.lock().unwrap().take());
+    });
+
+    store.unlock_commits_for_testing();
+    let mut saw_busy = false;
+    for _ in 0..20 {
+        match commit_leader.step() {
+            Ok(StepResult::Busy) => {
+                saw_busy = true;
+                break;
+            }
+            Ok(StepResult::IO | StepResult::Yield) => {}
+            other => panic!("leader COMMIT ended with {other:?}"),
+        }
+    }
+    assert!(saw_busy, "leader log_tx should return Busy");
+    drop(commit_leader);
+
+    let later = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    later.execute("BEGIN CONCURRENT").unwrap();
+    later.execute("INSERT INTO t VALUES (3, 1)").unwrap();
+    let mut commit_later = later.prepare("COMMIT").unwrap();
+    let mut finished = false;
+    for _ in 0..50 {
+        match commit_later.step() {
+            Ok(StepResult::Done) => {
+                finished = true;
+                break;
+            }
+            Ok(StepResult::IO | StepResult::Yield) => {}
+            other => panic!("later COMMIT ended with {other:?}"),
+        }
+    }
+    assert!(
+        finished,
+        "a later commit stayed parked after the failed group write"
+    );
+    assert_eq!(
+        get_rows(&later, "SELECT pk FROM t ORDER BY pk"),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
 #[test]
 fn full_waiter_is_synced_when_group_leader_uses_sync_off() {
     let (_db, io, [mut leader, mut waiter]) =

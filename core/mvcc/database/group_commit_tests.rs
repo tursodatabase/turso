@@ -114,3 +114,75 @@ fn failed_mid_batch_leader_does_not_cover_retry_hole() {
         "T3 must still be retrying, not acked via the watermark"
     );
 }
+
+/// The owner drops after `take_work` and before `request_retry`. The retry
+/// set must stay empty, or every later ticket parks.
+#[test]
+fn dropped_claimed_ticket_is_not_a_retry_hole() {
+    let coordinator = CommitCoordinator::new();
+    let claimed = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
+    let later = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
+    let GroupWork::Lead { writing, rest } = coordinator.take_work() else {
+        panic!("expected the first commit to lead");
+    };
+    assert_eq!(writing.ticket, claimed);
+
+    assert!(
+        !coordinator.drop_pending(claimed),
+        "the leader already took the ticket out of the queue"
+    );
+    coordinator.request_retry(claimed);
+    coordinator.requeue(rest.into_iter());
+
+    match coordinator.take_work() {
+        GroupWork::Lead { writing, .. } => assert_eq!(writing.ticket, later),
+        GroupWork::SyncPrefix => panic!("sync without a written record"),
+        GroupWork::None => {
+            panic!("later commit stayed parked after the owner dropped the claimed ticket")
+        }
+    }
+}
+
+#[test]
+fn live_owner_retry_still_blocks_later_ticket() {
+    let coordinator = CommitCoordinator::new();
+    let claimed = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
+    let later = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
+    let GroupWork::Lead { writing, rest } = coordinator.take_work() else {
+        panic!("expected the first commit to lead");
+    };
+    assert_eq!(writing.ticket, claimed);
+    coordinator.request_retry(claimed);
+    coordinator.requeue(rest.into_iter());
+
+    assert!(
+        matches!(coordinator.take_work(), GroupWork::None),
+        "a live owner still has to take the retry before later commits run"
+    );
+    assert!(coordinator.take_retry(claimed));
+    match coordinator.take_work() {
+        GroupWork::Lead { writing, .. } => assert_eq!(writing.ticket, later),
+        GroupWork::SyncPrefix => panic!("sync without a written record"),
+        GroupWork::None => panic!("later commit stayed parked after the retry was taken"),
+    }
+}
+
+#[test]
+fn drop_after_retry_does_not_leave_a_hole() {
+    let coordinator = CommitCoordinator::new();
+    let claimed = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
+    let later = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
+    let GroupWork::Lead { writing, rest } = coordinator.take_work() else {
+        panic!("expected the first commit to lead");
+    };
+    assert_eq!(writing.ticket, claimed);
+    coordinator.request_retry(claimed);
+    assert!(!coordinator.drop_pending(claimed));
+    coordinator.requeue(rest.into_iter());
+
+    match coordinator.take_work() {
+        GroupWork::Lead { writing, .. } => assert_eq!(writing.ticket, later),
+        GroupWork::SyncPrefix => panic!("sync without a written record"),
+        GroupWork::None => panic!("drop after retry left a hole"),
+    }
+}
