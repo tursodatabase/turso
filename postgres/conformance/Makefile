@@ -1,12 +1,12 @@
 # Turso PostgreSQL conformance test Makefile
 #
-# The .sqltest corpora live here; the sqltest runner crate lives in testing/sqltest.
+# The .sqltest corpora live here; the runner crates live in testing/sqltest and testing/sqltest-pg.
 # The targets that run all tests also run testing/shared-sqltests, the corpus
 # for both the SQLite and the PostgreSQL frontends.
 
 # Paths
 ROOT_DIR := $(shell cd ../.. && pwd)
-RUNNER_DIR := $(ROOT_DIR)/testing/sqltest
+RUNNER_DIR := $(ROOT_DIR)/testing/sqltest-pg
 
 # Use release mode in CI, debug mode locally
 ifdef CI
@@ -27,7 +27,7 @@ TURSOPG := $(TARGET_ROOT)/$(TARGET_DIR)/tursopg
 PGDUMP_FUZZER := $(TARGET_ROOT)/$(FUZZER_TARGET_DIR)/pg-dump-fuzzer
 PGDUMP_PROFILE ?= compatible
 FUZZ_ARGS ?= --cases 100
-SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CARGO_PROFILE)
+SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest-pg $(CARGO_PROFILE)
 
 # Test corpora (relative to this directory)
 PG_TESTS := pg-sqltests

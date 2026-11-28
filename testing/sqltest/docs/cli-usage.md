@@ -6,11 +6,24 @@ This document describes the command-line interface for the test runner.
 
 ```bash
 # Build from source
-cargo build --release
+cargo build --release -p sqltest-sqlite -p sqltest-pg
 
-# The binary will be at:
-./target/release/sqltest
+# The binaries will be at:
+./target/release/sqltest      # SQLite frontend
+./target/release/sqltest-pg   # PostgreSQL frontend
 ```
+
+A runner binary links one SQL dialect. The two binaries take the same commands
+and options, and both accept the `cli`, `js`, `tursopg` and `postgres` backends.
+Each one adds the backend that runs its dialect in the runner process, and that
+backend is its default:
+
+| Binary | Own backend (default) |
+|--------|-----------------------|
+| `sqltest` | `rust` |
+| `sqltest-pg` | `tursopg-embedded` |
+
+Only `sqltest` has the `generate-db` command.
 
 ## Commands
 
@@ -30,7 +43,7 @@ sqltest run <PATHS>... [OPTIONS]
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--backend <NAME>` | | `rust` | Where the tests run: `rust`, `cli`, `js`, `tursopg`, or `postgres` (see [Backends](#backends)) |
+| `--backend <NAME>` | | `rust` for `sqltest`, `tursopg-embedded` for `sqltest-pg` | Where the tests run: `rust` (only `sqltest`), `tursopg-embedded` (only `sqltest-pg`), `cli`, `js`, `tursopg`, or `postgres` (see [Backends](#backends)) |
 | `--binary <PATH>` | | `tursodb` | Path to the tursodb CLI binary |
 | `--fail-fast` | | | Stop at the first failed test or error |
 | `--filter <PATTERN>` | `-f` | | Filter tests by name (glob pattern) |
@@ -47,6 +60,7 @@ sqltest run <PATHS>... [OPTIONS]
 | `cli` | A `tursodb` (or `sqlite3`) process that `--binary` names |
 | `js` | The Turso JavaScript bindings, in a Node.js process |
 | `tursopg` | A `tursopg` server that `--binary` names. The runner starts one server for each test database. |
+| `tursopg-embedded` | The PostgreSQL frontend, in the runner process. Only `sqltest-pg` has it. |
 | `postgres` | The real PostgreSQL server at `--postgres-dsn` |
 
 #### Examples

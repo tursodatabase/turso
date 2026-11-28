@@ -4,7 +4,7 @@
 use crate::connection::Connection;
 use crate::namespace::NamespaceId;
 use crate::schema::{
-    Schema, Sequence, SequencesByNamespace, StoredMaterializedView, TURSO_NAMESPACES_TABLE_NAME,
+    Schema, Sequence, SequencesByNamespace, StoredView, TURSO_NAMESPACES_TABLE_NAME,
     TURSO_TYPES_TABLE_NAME,
 };
 use crate::statement::StatementOrigin;
@@ -102,7 +102,7 @@ struct UnbuiltViewsAndIndexes {
     automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: HashMap<String, i64>,
     dbsp_state_index_roots: HashMap<String, i64>,
-    materialized_view_info: HashMap<String, StoredMaterializedView>,
+    materialized_view_info: HashMap<String, StoredView>,
 }
 
 impl SchemaLoad {

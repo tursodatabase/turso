@@ -63,6 +63,21 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
             return Ok(choice.unwrap_or_else(|| integer_operator_choice(op, &types)));
         }
     };
+    let as_oid;
+    let ty = if ty.oid == REGCLASS {
+        as_oid = Checked {
+            oid: OID,
+            cast_to: ast::Type {
+                name: "oid".to_string(),
+                size: None,
+                array_dimensions: 0,
+            },
+            engine: None,
+        };
+        &as_oid
+    } else {
+        ty
+    };
     // The engine reads a literal next to a value of another type as that
     // type already, with the input function of the type.
     if pg_type_category(ty.oid) != Some("N") {
@@ -208,8 +223,10 @@ fn integer_type(oid: i64) -> Option<IntegerType> {
 ///    type: each string literal is read as that type.
 /// 4. Otherwise the engine runs its own comparisons.
 ///
-/// Every type of `CHECKED_TYPES` has a row for `=` and `<>` with itself, so
-/// a common type never makes the operator undefined.
+/// Every type of `CHECKED_TYPES` but regclass has a row for `=` and `<>` with
+/// itself, and regclass takes the rows of oid, so a common type never makes the
+/// operator undefined. A string literal in a list with a regclass is read as a
+/// regclass, as PostgreSQL does, where `=` reads it as an oid.
 pub(crate) fn choose_list_operator(
     op: &str,
     operands: &[OperandType],
@@ -225,7 +242,9 @@ pub(crate) fn choose_list_operator(
     let Some(common) = common_type(&oids).filter(|_| values.len() > 1) else {
         return Ok(None);
     };
-    let takes_two = |row: &&Operator| row.name == op && row.left == common && row.right == common;
+    let row_type = if common == REGCLASS { OID } else { common };
+    let takes_two =
+        |row: &&Operator| row.name == op && row.left == row_type && row.right == row_type;
     let row = OPERATORS.iter().find(takes_two);
     let Some(ty) = types.iter().flatten().find(|ty| ty.oid == common) else {
         return Ok(Some(OperatorChoice::LeftToTheEngine));
@@ -242,6 +261,9 @@ pub(crate) fn choose_list_operator(
         .collect();
     let mut left_to_the_engine = literals.is_empty();
     for literal in literals {
+        if common == REGCLASS {
+            continue;
+        }
         if is_spelling_left_to_the_engine(literal, common) {
             left_to_the_engine = true;
         } else {
@@ -542,11 +564,14 @@ fn check_operator(op: &str, types: &[Option<i64>]) -> Result<()> {
 }
 
 /// FIXME(pg-catalog): `OPERATORS` has no rows for interval, time, bytea, json, jsonb, inet, arrays and enums, and for a comparison of date with timestamp or timestamptz (which tursopg refuses with 0A000), so an operand of those types is not checked. Once pg_operator has all 799 rows, every operand is checked and a type with no row is an error.
+/// FIXME(pg-catalog): The rule that regclass takes the operators of oid is hand-coded here and in `fits`, `choose_operator` and `choose_list_operator`, by the type's name. PostgreSQL has no `pg_operator` rows for regclass: it takes those of oid through the binary-coercible `pg_cast` row from regclass to oid. A lookup of the implicit casts of `pg_cast` from an operand type to a type that has rows replaces this, and the same lookup gives varchar the operators of text.
 /// The types whose operators are decided by the rows of `OPERATORS`. Varchar
-/// has no rows of its own: it takes the operators of text.
-const CHECKED_TYPES: [i64; 14] = [
+/// has no rows of its own: it takes the operators of text. Regclass has none
+/// either: it takes the operators of oid.
+const CHECKED_TYPES: [i64; 15] = [
     BOOL,
     OID,
+    REGCLASS,
     INT2,
     INT4,
     INT8,
@@ -566,7 +591,7 @@ const CHECKED_TYPES: [i64; 14] = [
 /// Whether an operand of type `operand` may be given to an operator that
 /// takes `expected`. `None` is an operand that fits any type.
 fn fits(operand: Option<i64>, expected: i64) -> bool {
-    if operand == Some(OID) || expected == OID {
+    if operand == Some(OID) || operand == Some(REGCLASS) || expected == OID {
         return fits_oid(operand, expected);
     }
     let expected = pg_type_category(expected);
@@ -577,8 +602,9 @@ fn fits(operand: Option<i64>, expected: i64) -> bool {
     }
 }
 
-/// An oid has the same typcategory as the integers but takes none of their
-/// operators, so it fits an operand that casts to oid implicitly.
+/// An oid and a regclass have the same typcategory as the integers but take
+/// none of their operators, so an operator that takes an oid fits an operand
+/// that casts to oid implicitly, and no other operator fits them.
 fn fits_oid(operand: Option<i64>, expected: i64) -> bool {
     expected == OID && operand.is_none_or(|operand| implicitly_casts(operand, OID))
 }
@@ -622,6 +648,7 @@ const INT2: i64 = 21;
 const INT4: i64 = 23;
 const TEXT: i64 = 25;
 const OID: i64 = 26;
+const REGCLASS: i64 = 2205;
 const FLOAT4: i64 = 700;
 const FLOAT8: i64 = 701;
 const DATE: i64 = 1082;
@@ -1085,8 +1112,12 @@ mod tests {
             }
         }
         for oid in CHECKED_TYPES {
+            // PostgreSQL has no operator rows for regclass: it takes the
+            // operators of oid through its implicit cast to oid. It has none
+            // for varchar either: varchar takes those of text.
+            // FIXME(pg-catalog): The implicit cast of varchar to text is not a row of `CASTS` yet, so this test cannot look it up and names the two types. With that row, the test requires an implicit cast to a type that has rows, and the names go away.
             assert!(
-                oid == VARCHAR || in_rows(oid),
+                oid == VARCHAR || oid == REGCLASS || in_rows(oid),
                 "no row takes type {oid}, which CHECKED_TYPES names"
             );
         }

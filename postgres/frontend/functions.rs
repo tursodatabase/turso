@@ -353,7 +353,10 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
-        "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
+        "pg_table_is_visible"(FunctionArity::Exact(1), false) => {
+            oid_arg(args, 0)?.and_then(|oid| exec_pg_table_is_visible(connection, oid))
+        },
+        "pg_function_is_visible" | "pg_type_is_visible"(
             FunctionArity::Exact(1), true
         ) => oid_arg(args, 0)?.map(exec_pg_is_visible),
         "pg_encoding_to_char"(FunctionArity::Exact(1), true) => {
@@ -434,7 +437,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
         ))?,
-        "pg_cast"(FunctionArity::Exact(3), true) => crate::cast_planning::exec_pg_cast(args)?,
+        "pg_cast"(FunctionArity::Exact(3), true) => crate::cast_planning::exec_pg_cast(connection, args)?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
@@ -475,6 +478,13 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
+        },
+        "gen_random_uuid"(FunctionArity::Exact(0), false) => {
+            let io = &connection.get_pager().io;
+            Uuid(crate::pg_type::random_uuid_text(
+                io.generate_random_number(),
+                io.generate_random_number(),
+            ))
         },
         // The time the transaction started, or the statement outside a
         // transaction.
@@ -952,6 +962,31 @@ pub(crate) fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> 
 
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
     role_name_by_oid(&connection_roles(conn), oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
+}
+
+fn exec_pg_table_is_visible(conn: &Connection, oid: i64) -> Option<Boolean> {
+    let schema = conn.current_schema();
+    let catalog = crate::classes::class_catalog(&schema)?;
+    let relation = catalog.get_by_oid(oid)?;
+    for name in crate::session::current_schemas(conn, true) {
+        let namespace = if name == "pg_catalog" {
+            turso_core::namespace::NamespaceId::ROOT
+        } else {
+            let Some(qualifier) = conn.qualifier(&name) else {
+                continue;
+            };
+            qualifier.target.id
+        };
+        if namespace == relation.relnamespace {
+            return Some(Boolean(true));
+        }
+        // Any earlier relation with the same SQL name hides this one, even
+        // when the earlier relation has a different kind.
+        if catalog.name_is_taken(namespace, &relation.relname) {
+            return Some(Boolean(false));
+        }
+    }
+    Some(Boolean(false))
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {
@@ -2177,20 +2212,15 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
-/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It prints unknown for an oid it does not list, where PostgreSQL prints the name of that pg_type row, and character for bpchar with typemod -1, where PostgreSQL prints bpchar. A lookup in a pg_type table replaces this.
+/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It lists the types that `format_type` prints in another form than their `typname`, such as integer for int4. The others print their `typname` from the pg_type table, which is not what PostgreSQL does for every one: it prints `time with time zone` for timetz. It prints character for bpchar with typemod -1, where PostgreSQL prints bpchar. A rule in pg_type for how `format_type` prints each type replaces this.
 /// The name of a type as `format_type` prints it.
 pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
         16 => "boolean".to_string(),
-        17 => "bytea".to_string(),
         18 => "\"char\"".to_string(),
-        19 => "name".to_string(),
         20 => "bigint".to_string(),
         21 => "smallint".to_string(),
         23 => "integer".to_string(),
-        25 => "text".to_string(),
-        26 => "oid".to_string(),
-        114 => "json".to_string(),
         700 => "real".to_string(),
         701 => "double precision".to_string(),
         1000 => "boolean[]".to_string(),
@@ -2211,11 +2241,9 @@ pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
                 "character varying".to_string()
             }
         }
-        1082 => "date".to_string(),
         1083 => "time without time zone".to_string(),
         1114 => "timestamp without time zone".to_string(),
         1184 => "timestamp with time zone".to_string(),
-        1186 => "interval".to_string(),
         1700 => {
             if typemod > 4 {
                 let precision = ((typemod - 4) >> 16) & 0xffff;
@@ -2225,12 +2253,14 @@ pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
                 "numeric".to_string()
             }
         }
-        2205 => "regclass".to_string(),
+        // These have no row in the pg_type table yet.
+        19 => "name".to_string(),
+        1186 => "interval".to_string(),
         2206 => "regtype".to_string(),
         2278 => "void".to_string(),
-        2950 => "uuid".to_string(),
-        3802 => "jsonb".to_string(),
-        _ => "unknown".to_string(),
+        _ => crate::catalog::pg_type_name(type_oid)
+            .unwrap_or("unknown")
+            .to_string(),
     }
 }
 
@@ -2462,17 +2492,6 @@ fn hand_written_input_error(
                 }
             }
             None
-        }
-        "uuid" => {
-            let hex: String = trimmed.chars().filter(|c| *c != '-').collect();
-            if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                Some((
-                    format!("invalid input syntax for type uuid: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            } else {
-                None
-            }
         }
         "date" => check_temporal_input(input, "date"),
         "timestamp" => check_temporal_input(input, "timestamp"),

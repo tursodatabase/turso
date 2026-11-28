@@ -2477,21 +2477,13 @@ impl Database {
                             let flags = self.open_flags;
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
-                                if !authority.frame_index_overflowed() {
-                                    WalFileShared::open_shared_from_authority_if_exists(
-                                        &self.io,
-                                        &self.wal_path,
-                                        flags,
-                                        authority,
-                                        &self.db_file,
-                                    )?
-                                } else {
-                                    WalFileShared::open_shared_if_exists(
-                                        &self.io,
-                                        &self.wal_path,
-                                        flags,
-                                    )?
-                                }
+                                WalFileShared::open_shared_from_authority_if_exists(
+                                    &self.io,
+                                    &self.wal_path,
+                                    flags,
+                                    authority,
+                                    &self.db_file,
+                                )?
                             } else {
                                 WalFileShared::open_shared_if_exists(
                                     &self.io,
@@ -2635,17 +2627,13 @@ impl Database {
             #[cfg(host_shared_wal)]
             {
                 if let Some(authority) = shared_authority.as_ref() {
-                    if !authority.frame_index_overflowed() {
-                        WalFileShared::open_shared_from_authority_if_exists(
-                            &self.io,
-                            &self.wal_path,
-                            flags,
-                            authority,
-                            &self.db_file,
-                        )?
-                    } else {
-                        WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
-                    }
+                    WalFileShared::open_shared_from_authority_if_exists(
+                        &self.io,
+                        &self.wal_path,
+                        flags,
+                        authority,
+                        &self.db_file,
+                    )?
                 } else {
                     WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
                 }
@@ -3121,6 +3109,7 @@ impl Database {
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             namespace_being_dropped: RwLock::new(None),
+            defer_fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             triggers_enabled: AtomicBool::new(true),
             writes_stored_values: AtomicBool::new(false),

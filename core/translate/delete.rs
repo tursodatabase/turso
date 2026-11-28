@@ -41,6 +41,9 @@ fn validate_delete(
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
+    if resolver.table_overlay(namespace, tbl_name).is_some() {
+        crate::bail_parse_error!("table {tbl_name} may not be modified");
+    }
     let table = match resolver.with_schema(namespace.database_id, |s| {
         s.get_table(namespace.id, tbl_name)
     }) {

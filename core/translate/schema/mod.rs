@@ -36,7 +36,7 @@ use crate::translate::expr::expr_type::{
     value_type, BuiltinType, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
-use crate::translate::fkeys::emit_fk_drop_table_check;
+use crate::translate::fkeys::{emit_fk_drop_child_table_check, emit_fk_drop_table_check};
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
@@ -2083,6 +2083,11 @@ pub fn translate_drop_table(
         })
     {
         emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
+    }
+    if connection.foreign_keys_enabled()
+        && resolver.with_schema(database_id, |s| s.has_child_fks(namespace.id, name))
+    {
+        emit_fk_drop_child_table_check(program, resolver, name, namespace)?;
     }
     // r1 and r2. The catalog may overwrite both while it deletes its rows.
     // r2 then gets the root page that `Destroy` moved, as in SQLite's

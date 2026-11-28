@@ -61,7 +61,7 @@ impl LoadStep for SchemaStateRows {
     fn next_query(&mut self, load: &mut SchemaLoad) -> turso_core::Result<Option<LoadQuery>> {
         let schema = load.schema();
         let next = match self.reading.as_ref().map(|reading| reading.table) {
-            None => classes::schema_state_query(schema).map(|sql| (Table::Classes, sql)),
+            None => classes::schema_state_query(schema)?.map(|sql| (Table::Classes, sql)),
             Some(Table::Classes) => {
                 roles::schema_state_query(schema).map(|sql| (Table::Roles, sql))
             }
@@ -95,7 +95,9 @@ impl LoadStep for SchemaStateRows {
     fn end_of_rows(&mut self, load: &mut SchemaLoad) -> turso_core::Result<()> {
         let TableRows { table, rows } = self.reading.as_ref().expect("rows belong to a statement");
         match table {
-            Table::Classes => self.classes = ClassCatalog::build(load.schema(), rows)?,
+            Table::Classes => {
+                self.classes = ClassCatalog::build(load.schema(), rows)?;
+            }
             Table::Roles => self.roles = RoleCatalog::new(rows, &[])?,
             Table::Memberships => self.roles.set_memberships(rows)?,
         }

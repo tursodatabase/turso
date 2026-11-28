@@ -1,14 +1,15 @@
-use super::pg_connection::{copy_text_columns, split_statements};
-use super::tursopg::database_path;
-use super::{BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend};
-use crate::backends::DefaultDatabaseResolver;
-use crate::parser::ast::{Backend, Capability, DatabaseConfig};
 use async_trait::async_trait;
+use sqltest::backends::pg_connection::{copy_text_columns, split_statements};
+use sqltest::backends::tursopg::database_path;
+use sqltest::backends::{
+    BackendError, DatabaseFileHandle, DatabaseInstance, DefaultDatabaseResolver, QueryResult,
+    SqlBackend,
+};
+use sqltest::parser::ast::{Backend, Capability, DatabaseConfig};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
-use turso_pg::types::Value;
 use turso_pg::{Connection, StatementResultKind, TextType};
 
 /// Backend that runs tests on turso_pg in this process, with no pgwire code.
@@ -185,11 +186,14 @@ fn run_statements(
                 let text_types: Vec<TextType> = (0..stmt.num_columns())
                     .map(|index| TextType::of_column(&stmt, index))
                     .collect();
+                let connection = stmt.connection().clone();
                 while let Some(row) = stmt.run_one_step_blocking(|| Ok(()), || Ok(()))? {
                     rows.push(
                         row.get_values()
                             .zip(&text_types)
-                            .map(|(value, text_type)| value_text(value, *text_type))
+                            .map(|(value, text_type)| {
+                                value_text(turso_pg::value_text(value, *text_type, &connection))
+                            })
                             .collect(),
                     );
                 }
@@ -215,9 +219,6 @@ fn run_statements(
 }
 
 /// The PostgreSQL text of a value, with NULL as an empty string.
-fn value_text(value: &Value, text_type: TextType) -> String {
-    match turso_pg::value_text(value, text_type) {
-        Some(text) => text.into_owned(),
-        None => String::new(),
-    }
+fn value_text(text: Option<std::borrow::Cow<'_, str>>) -> String {
+    text.map(std::borrow::Cow::into_owned).unwrap_or_default()
 }

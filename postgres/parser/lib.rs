@@ -3,6 +3,7 @@ pub mod copy;
 mod create_function;
 pub mod datetime_unit;
 pub mod functions;
+mod identifier_list;
 mod names;
 mod policy_condition;
 use pg_query::NodeEnum;
@@ -151,11 +152,56 @@ impl FunctionTypeUse {
     }
 }
 
+pub use identifier_list::split_identifier_string;
 pub use type_name::{parse_type_name, WrittenTypeName};
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     pg_query::parse(sql, pg_query::ParserOptions::DEFAULT).map_err(parse_error)
+}
+
+/// Parses a stored table definition without truncating engine relation names.
+pub fn parse_stored_table(sql: &str) -> Result<ParseResult, ParseError> {
+    let mut parsed = parse(sql)?;
+    for raw in &mut parsed.protobuf.stmts {
+        if let Some(node) = raw.stmt.as_mut() {
+            restore_stored_relation_names(sql, node)?;
+        }
+    }
+    Ok(parsed)
+}
+
+fn restore_stored_relation_names(
+    sql: &str,
+    node: &mut pg_query::protobuf::Node,
+) -> Result<(), ParseError> {
+    let (relation, children) = match &mut node.node {
+        Some(NodeEnum::CreateStmt(create)) => {
+            (create.relation.as_mut(), &mut create.table_elts[..])
+        }
+        Some(NodeEnum::ColumnDef(column)) => (None, &mut column.constraints[..]),
+        Some(NodeEnum::Constraint(constraint)) => (constraint.pktable.as_mut(), &mut [][..]),
+        _ => return Ok(()),
+    };
+    if let Some(relation) = relation {
+        // Namespace prefixes are added after PostgreSQL has checked the user
+        // name. Applying its identifier limit again can sever table/index and
+        // foreign-key references when loading a schema.
+        if relation.schemaname.is_empty()
+            && relation.relname.starts_with("__turso_ns")
+            && relation.location >= 0
+        {
+            let start = relation.location as usize;
+            let end = qualified_name_end(sql, start)?;
+            relation.relname = turso_ast::Name::from_string(&sql[start..end])
+                .as_str()
+                .to_string();
+        }
+    }
+    for child in children {
+        restore_stored_relation_names(sql, child)?;
+    }
+    Ok(())
 }
 
 /// The error for SQL that pg_query refuses. pg_query gives only the message
@@ -492,6 +538,189 @@ fn collect_foreign_key_tables(node: &pg_query::protobuf::Node, tables: &mut Vec<
     }
 }
 
+/// A string constant that is cast to regclass: `'t'::regclass`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RegClassConstant {
+    /// The byte offset of the string constant.
+    pub location: usize,
+    pub text: String,
+}
+
+/// The string constants that a statement stores with the type regclass,
+/// in the order they are written. PostgreSQL reads such a constant as an oid
+/// when it analyzes the statement, so a view, a default, a check or an index
+/// keeps the oid and not the name. Other statements are not stored, and give
+/// no constants.
+pub fn regclass_constants_to_resolve(parse_result: &ParseResult) -> Vec<RegClassConstant> {
+    let mut stored = StoredExpressions::default();
+    for stmt in &parse_result.protobuf.stmts {
+        if let Some(node) = stmt.stmt.as_ref().and_then(|stmt| stmt.node.as_ref()) {
+            collect_stored_expressions(node, &mut stored);
+        }
+    }
+    let mut constants: Vec<RegClassConstant> = stored
+        .expressions
+        .iter()
+        .flat_map(|expression| expression.nodes())
+        .filter_map(|(node, ..)| regclass_constant(node))
+        .chain(stored.defaults)
+        .collect();
+    constants.sort_by_key(|constant| constant.location);
+    constants
+}
+
+/// What a statement stores: the expressions it keeps, and the string
+/// constants that a column of type regclass takes as its default.
+#[derive(Default)]
+struct StoredExpressions<'a> {
+    expressions: Vec<&'a NodeEnum>,
+    defaults: Vec<RegClassConstant>,
+}
+
+/// The expressions that `node`, a statement or a part of one, stores.
+fn collect_stored_expressions<'a>(node: &'a NodeEnum, stored: &mut StoredExpressions<'a>) {
+    let nodes = |nodes: &'a [pg_query::protobuf::Node], stored: &mut StoredExpressions<'a>| {
+        for node in nodes {
+            if let Some(node) = &node.node {
+                collect_stored_expressions(node, stored);
+            }
+        }
+    };
+    match node {
+        NodeEnum::ViewStmt(_)
+        | NodeEnum::IndexStmt(_)
+        | NodeEnum::CreatePolicyStmt(_)
+        | NodeEnum::AlterPolicyStmt(_) => stored.expressions.push(node),
+        NodeEnum::CreateTableAsStmt(create) => {
+            if create.objtype == pg_query::protobuf::ObjectType::ObjectMatview as i32 {
+                stored.expressions.push(node);
+            }
+        }
+        NodeEnum::CreateStmt(create) => nodes(&create.table_elts, stored),
+        NodeEnum::AlterTableStmt(alter) => nodes(&alter.cmds, stored),
+        NodeEnum::AlterTableCmd(cmd) => {
+            if let Some(def) = cmd.def.as_deref().and_then(|def| def.node.as_ref()) {
+                collect_stored_expressions(def, stored);
+            }
+        }
+        NodeEnum::ColumnDef(column) => {
+            collect_default_constants(column.type_name.as_ref(), &column.constraints, stored);
+            nodes(&column.constraints, stored);
+        }
+        NodeEnum::CreateDomainStmt(domain) => {
+            collect_default_constants(domain.type_name.as_ref(), &domain.constraints, stored);
+            nodes(&domain.constraints, stored);
+        }
+        NodeEnum::Constraint(constraint) => {
+            if let Some(expr) = constraint.raw_expr.as_deref().and_then(|e| e.node.as_ref()) {
+                stored.expressions.push(expr);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The string constants that `constraints` give as the default of a column or
+/// a domain of type `type_name`. A string constant is read as that type.
+fn collect_default_constants(
+    type_name: Option<&pg_query::protobuf::TypeName>,
+    constraints: &[pg_query::protobuf::Node],
+    stored: &mut StoredExpressions,
+) {
+    if !type_name.is_some_and(is_regclass_type) {
+        return;
+    }
+    for constraint in constraints {
+        let Some(NodeEnum::Constraint(constraint)) = &constraint.node else {
+            continue;
+        };
+        if constraint.contype == pg_query::protobuf::ConstrType::ConstrDefault as i32 {
+            let default = constraint.raw_expr.as_deref().and_then(|e| e.node.as_ref());
+            stored.defaults.extend(default.and_then(string_constant));
+        }
+    }
+}
+
+fn is_regclass_type(type_name: &pg_query::protobuf::TypeName) -> bool {
+    let names: Vec<&str> = type_name
+        .names
+        .iter()
+        .filter_map(|name| match &name.node {
+            Some(NodeEnum::String(name)) => Some(name.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    matches!(names.as_slice(), ["regclass"] | ["pg_catalog", "regclass"])
+}
+
+fn string_constant(node: &NodeEnum) -> Option<RegClassConstant> {
+    use pg_query::protobuf::a_const::Val;
+
+    let NodeEnum::AConst(constant) = node else {
+        return None;
+    };
+    let Some(Val::Sval(text)) = constant.val.as_ref() else {
+        return None;
+    };
+    Some(RegClassConstant {
+        location: usize::try_from(constant.location).ok()?,
+        text: text.sval.clone(),
+    })
+}
+
+/// The constant of `node` when it is a string constant cast to regclass.
+fn regclass_constant(node: pg_query::NodeRef) -> Option<RegClassConstant> {
+    let pg_query::NodeRef::TypeCast(cast) = node else {
+        return None;
+    };
+    if !is_regclass_type(cast.type_name.as_ref()?) {
+        return None;
+    }
+    string_constant(cast.arg.as_ref()?.node.as_ref()?)
+}
+
+/// `sql` with the string constant that starts at byte offset `location`
+/// replaced by the constant `text`.
+pub fn replace_string_constant(
+    sql: &str,
+    location: usize,
+    text: &str,
+) -> Result<String, ParseError> {
+    use pg_query::protobuf::Token;
+
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
+    let mut tokens = scan
+        .tokens
+        .iter()
+        .skip_while(|token| (token.start as usize) < location)
+        .peekable();
+    let first = tokens
+        .next()
+        .filter(|token| {
+            token.start as usize == location
+                && (token.token == Token::Sconst as i32 || token.token == Token::Usconst as i32)
+        })
+        .ok_or_else(|| ParseError::internal_error("no string constant at the location"))?;
+    let mut end = first.end as usize;
+    // U&'...' UESCAPE '!' is one constant: the escape character is part of it.
+    if first.token == Token::Usconst as i32
+        && tokens
+            .next_if(|token| token.token == Token::Uescape as i32)
+            .is_some()
+    {
+        let escape = tokens
+            .next_if(|token| token.token == Token::Sconst as i32)
+            .ok_or_else(|| ParseError::internal_error("UESCAPE has no character"))?;
+        end = escape.end as usize;
+    }
+    Ok(format!(
+        "{}'{}'{}",
+        &sql[..location],
+        text.replace('\'', "''"),
+        &sql[end..]
+    ))
+}
+
 /// `sql` with the name that starts at byte offset `location`, which may
 /// have a schema in front of it, replaced by `name` alone.
 pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseError> {
@@ -644,6 +873,75 @@ mod tests {
         assert_eq!(
             name_create_table("CREATE TABLE public.t2(a INT)", "t2").unwrap(),
             "CREATE TABLE t2(a INT)"
+        );
+    }
+
+    #[test]
+    fn regclass_constants_to_resolve_are_found_in_the_statements_that_store_them() {
+        let constants = |sql: &str| {
+            regclass_constants_to_resolve(&parse(sql).unwrap())
+                .into_iter()
+                .map(|constant| (constant.location, constant.text))
+                .collect::<Vec<_>>()
+        };
+        let view = "CREATE VIEW w AS SELECT 't'::regclass, CAST('app.u' AS regclass), 'x'::text";
+        assert_eq!(
+            constants(view),
+            [
+                (view.find("'t'").unwrap(), "t".to_string()),
+                (view.find("'app.u'").unwrap(), "app.u".to_string()),
+            ]
+        );
+        let check = "CREATE TABLE r (c regclass, CHECK (c <> 't'::regclass))";
+        assert_eq!(
+            constants(check),
+            [(check.find("'t'").unwrap(), "t".to_string())]
+        );
+        let domain = "CREATE DOMAIN d AS regclass DEFAULT 't' CHECK (value <> 'u'::regclass)";
+        assert_eq!(
+            constants(domain),
+            [
+                (domain.find("'t'").unwrap(), "t".to_string()),
+                (domain.find("'u'").unwrap(), "u".to_string()),
+            ]
+        );
+        let default = "CREATE TABLE r (c regclass DEFAULT 't', d text DEFAULT 'u')";
+        assert_eq!(
+            constants(default),
+            [(default.find("'t'").unwrap(), "t".to_string())]
+        );
+        assert!(constants("SELECT 't'::regclass").is_empty());
+        assert!(constants("CREATE TABLE s AS SELECT 't'::regclass").is_empty());
+    }
+
+    #[test]
+    fn a_unicode_escape_string_constant_is_replaced_with_its_escape() {
+        for sql in [
+            "SELECT U&'pg_class'::regclass, 1",
+            "SELECT U&'pg_class' UESCAPE '!'::regclass, 1",
+        ] {
+            let constants =
+                regclass_constants_to_resolve(&parse(&format!("CREATE VIEW v AS {sql}")).unwrap());
+            let sql = format!("CREATE VIEW v AS {sql}");
+            let replaced = replace_string_constant(&sql, constants[0].location, "16384").unwrap();
+            assert_eq!(
+                replaced,
+                sql.replace(
+                    &sql[constants[0].location..sql.find("::").unwrap()],
+                    "'16384'"
+                )
+            );
+            parse(&replaced).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_string_constant_is_replaced_in_place() {
+        let sql = "SELECT 'a''b'::regclass, 1";
+        let location = sql.find("'a").unwrap();
+        assert_eq!(
+            replace_string_constant(sql, location, "16384").unwrap(),
+            "SELECT '16384'::regclass, 1"
         );
     }
 

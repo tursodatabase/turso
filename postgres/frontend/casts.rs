@@ -8,12 +8,14 @@
 //! Nothing here reads a statement: `resolve` and `convert` take the types as
 //! `CastType`. cast_planning.rs finds the `CastType` of an expression.
 
+use crate::catalog::{regclass_oid_of_text, regclass_text};
 use crate::error::sqlstate_error;
 use crate::functions::{built_in_input_error, float8_text};
 use crate::pg_type::{check_oid_range, type_input};
 use crate::text::{value_text, TextType};
+use std::sync::Arc;
 use turso_core::dialect::CastContext;
-use turso_core::{LimboError, Numeric, Result, Value};
+use turso_core::{Connection, LimboError, Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -30,6 +32,8 @@ pub(crate) enum CastType {
     Text,
     Bool,
     Oid,
+    RegClass,
+    Uuid,
     // FIXME(pg-catalog): bytea is not a registered type yet, so the engine casts it as before. It is listed here and in CASTS once bytea has a pg_type row.
     Timestamp,
     TimestampTz,
@@ -47,6 +51,8 @@ impl CastType {
             Self::Text => "text",
             Self::Bool => "bool",
             Self::Oid => "oid",
+            Self::RegClass => "regclass",
+            Self::Uuid => "uuid",
             Self::Timestamp => "timestamp",
             Self::TimestampTz => "timestamptz",
         }
@@ -68,6 +74,8 @@ impl CastType {
             "text" => Self::Text,
             "bool" => Self::Bool,
             "oid" => Self::Oid,
+            "regclass" => Self::RegClass,
+            "uuid" => Self::Uuid,
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::TimestampTz,
             _ => return None,
@@ -84,7 +92,7 @@ impl CastType {
             Self::Int2 => Some(i64::from(i16::MIN)),
             Self::Int4 => Some(i64::from(i32::MIN)),
             Self::Int8 => Some(i64::MIN),
-            Self::Oid => Some(0),
+            Self::Oid | Self::RegClass => Some(0),
             _ => None,
         }
     }
@@ -132,6 +140,14 @@ const CASTS: &[Cast] = &[
     cast(Int8, Oid, I),
     cast(Oid, Int4, A),
     cast(Oid, Int8, A),
+    cast(Int2, RegClass, I),
+    cast(Int4, RegClass, I),
+    cast(Int8, RegClass, I),
+    cast(Oid, RegClass, I),
+    cast(RegClass, Oid, I),
+    cast(RegClass, Int4, A),
+    cast(RegClass, Int8, A),
+    cast(Text, RegClass, I),
     cast(Int4, Bool, E),
     cast(Bool, Int4, E),
     cast(Bool, Text, A),
@@ -221,7 +237,12 @@ pub(crate) fn resolve(
     Err(sqlstate_error(sqlstate, message, None))
 }
 
-pub(crate) fn convert(value: &Value, source: CastType, target: CastType) -> Result<Value> {
+pub(crate) fn convert(
+    connection: &Arc<Connection>,
+    value: &Value,
+    source: CastType,
+    target: CastType,
+) -> Result<Value> {
     if let (Value::Text(text), CastType::Text, Some(read)) =
         (value, source, type_input(target.oid()))
     {
@@ -236,11 +257,21 @@ pub(crate) fn convert(value: &Value, source: CastType, target: CastType) -> Resu
     if target == Oid {
         return to_oid(value, source);
     }
+    if target == RegClass {
+        return to_regclass(connection, value, source);
+    }
     match target {
-        Text => to_text(value, source),
+        Text => to_text(connection, value, source),
         Bool => to_bool(value),
         _ => Ok(value.clone()),
     }
+}
+
+fn to_regclass(connection: &Arc<Connection>, value: &Value, source: CastType) -> Result<Value> {
+    let Value::Text(text) = value else {
+        return to_oid(value, source);
+    };
+    regclass_oid_of_text(connection, text.as_str()).map(Value::from_i64)
 }
 
 fn to_oid(value: &Value, source: CastType) -> Result<Value> {
@@ -257,7 +288,9 @@ fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value
         (Value::Text(text), CastType::Numeric) => {
             float_to_i64(parse_numeric(text.as_str())?.round(), target)?
         }
-        (Value::Numeric(Numeric::Integer(n)), Oid) if target == Int4 => i64::from(*n as u32 as i32),
+        (Value::Numeric(Numeric::Integer(n)), Oid | RegClass) if target == Int4 => {
+            i64::from(*n as u32 as i32)
+        }
         (Value::Numeric(Numeric::Integer(n)), _) => *n,
         // The server reads the text of a parameter with no type as a float
         // when it looks like one. As text it is not an integer.
@@ -398,21 +431,24 @@ fn parse_float(text: &str, target: CastType) -> Result<f64> {
         .map_err(|_| input_error(text, type_name))
 }
 
-fn to_text(value: &Value, source: CastType) -> Result<Value> {
+fn to_text(connection: &Arc<Connection>, value: &Value, source: CastType) -> Result<Value> {
     let text = match (value, source) {
         (Value::Numeric(Numeric::Integer(n)), CastType::Bool) => {
             if *n == 0 { "false" } else { "true" }.to_string()
         }
+        (Value::Numeric(Numeric::Integer(n)), CastType::RegClass) => regclass_text(connection, *n),
         (Value::Numeric(Numeric::Integer(n)), _) => n.to_string(),
         // FIXME(pg-catalog): A numeric without a type modifier is REAL, which is read as float8, so `1.0::numeric::text` is `1` where PostgreSQL gives `1.0`. A registered numeric type that needs no modifier gives the value its own output function.
         // FIXME(pg-catalog): Core types a float4 expression REAL, which is read as float8, so no float4 value gets here and `1e6::float4::text` is `1000000` where PostgreSQL gives `1e+06`. A registered float4 type gives the value its own output function.
         (Value::Numeric(Numeric::Float(f)), CastType::Float4 | CastType::Float8) => {
             float8_text(f64::from(*f))
         }
-        (Value::Text(_), CastType::TimestampTz) => match value_text(value, TextType::TimestampTz) {
-            Some(text) => text.into_owned(),
-            None => return Ok(value.clone()),
-        },
+        (Value::Text(_), CastType::TimestampTz) => {
+            match value_text(value, TextType::TimestampTz, connection) {
+                Some(text) => text.into_owned(),
+                None => return Ok(value.clone()),
+            }
+        }
         _ => return Ok(value.clone()),
     };
     Ok(Value::build_text(text))

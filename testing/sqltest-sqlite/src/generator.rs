@@ -3,8 +3,6 @@
 //! This module provides functionality to generate SQLite databases populated
 //! with fake user and product data for testing purposes.
 
-use crate::backends::DefaultDatabaseResolver;
-use crate::parser::ast::{DatabaseLocation, TestFile};
 use anyhow::{Context, Result};
 use fake::Dummy;
 use fake::Fake;
@@ -15,6 +13,8 @@ use fake::faker::phone_number::en::PhoneNumber;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use sqltest::backends::DefaultDatabaseResolver;
+use sqltest::parser::ast::{DatabaseLocation, TestFile};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use turso::{Builder, Connection};

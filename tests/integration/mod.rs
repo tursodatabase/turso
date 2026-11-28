@@ -56,6 +56,7 @@ mod stmt_journal;
 mod stmt_readonly;
 mod storage;
 mod suspended_statement_checkpoint;
+mod table_overlay;
 #[cfg(all(feature = "fs", not(target_family = "wasm")))]
 mod temp_file;
 mod transaction_errors;

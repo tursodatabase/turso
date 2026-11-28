@@ -265,6 +265,7 @@ fn build_plan_for_connection(
         connection.dialect().get_internal_dialect(),
         None,
         RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
     // Re-planning for maintenance must resolve the view's unqualified table
     // names the same way CREATE did: within the view's own database, never

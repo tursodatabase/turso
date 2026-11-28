@@ -62,7 +62,9 @@ members = [
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/query-result-oracle",
-    "testing/sqltest"
+    "testing/sqltest",
+    "testing/sqltest-sqlite",
+    "testing/sqltest-pg"
 ]
 
 default-members = [
@@ -108,7 +110,9 @@ default-members = [
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/query-result-oracle",
-    "testing/sqltest"
+    "testing/sqltest",
+    "testing/sqltest-sqlite",
+    "testing/sqltest-pg"
 ]
 
 [workspace.package]

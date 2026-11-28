@@ -1163,6 +1163,7 @@ mod tests {
             Arc::new(RowSecurityInSchemasWithState),
             None,
             role,
+            crate::statement::StatementOrigin::InternalHelper,
         );
         f(&mut resolver)
     }

@@ -200,6 +200,7 @@ impl CatalogRow for {struct_name} {{
 /// `{name}` as a built-in catalog, with the rows of [`{table_name}`].
 pub const {table_name}_CATALOG: BuiltinCatalog = BuiltinCatalog {{
     name: \"{name}\",
+    oid: {catalog_oid},
     create_sql: {struct_name}::CREATE_SQL,
     index_sql: {struct_name}::INDEX_SQL,
     rows: &CatalogRows::new(&{table_name}, {oid}, &[{key_columns}], {key_value}, {version:#010x}),

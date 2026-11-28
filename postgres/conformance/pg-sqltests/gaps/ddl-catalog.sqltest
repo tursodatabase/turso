@@ -250,29 +250,21 @@ expect {
 
 # E-19: 't'::regclass resolves
 @setup t_id
-@compat-gap "type:regclass"
 test t-regclass-resolves {
     SELECT 't'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 't');
 }
 expect {
     t
 }
-expect @tursopg {
-    f
-}
 
 # E-20: view in pg_class relkind v
 @setup t_id_view_v
-@compat-gap "syntax:catalog"
 test view-in-pg-class-relkind-v {
     SELECT relname, relkind FROM pg_class WHERE relname IN ('t', 'v') ORDER BY relname;
 }
 expect {
     t|r
     v|v
-}
-expect @tursopg {
-    t|r
 }
 
 # E-21: pg_views
@@ -289,16 +281,12 @@ expect @tursopg error {}
 
 # E-22: view columns in pg_attribute
 @setup t_id_view_v
-@compat-gap "syntax:catalog"
 test view-columns-in-pg-attribute {
     SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'v' AND a.attnum > 0;
 }
 expect {
     id|integer
 }
-expect @tursopg {
-}
-
 # E-23: pg_enum
 @setup type_mood
 @compat-gap "syntax:catalog"
@@ -373,7 +361,6 @@ expect @tursopg {
 
 # E-29: serial internal tables visible
 @setup t_id_serial
-@compat-gap "syntax:catalog"
 test serial-internal-tables-visible {
     SELECT relname, relkind FROM pg_class WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') ORDER BY relname;
 }
@@ -381,11 +368,6 @@ expect {
     t|r
     t_id_seq|S
     t_pkey|i
-}
-expect @tursopg {
-    __turso_internal_pk_index_t|i
-    t|r
-    t_id_seq|S
 }
 
 # E-30: format_type with typmod
@@ -1038,17 +1020,12 @@ expect {
 expect @tursopg error {}
 
 # E-100: pg_indexes names of PRIMARY KEY and UNIQUE indexes
-# The primary key index name has the same cause as E-29.
-@compat-gap "syntax:catalog"
 test pg-indexes-names-of-primary-key-and-unique-indexes {
     CREATE TABLE u (id text PRIMARY KEY, e text UNIQUE);
     SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('u_e_key', 'u_pkey');
 }
 expect {
     2
-}
-expect @tursopg {
-    0
 }
 
 # E-101: conkey of a two-column UNIQUE constraint as text
@@ -1107,16 +1084,11 @@ expect @tursopg {
 }
 
 # E-105: regclass cast of an unknown name
-# Fails because every regclass cast returns 0, see E-19.
-@compat-gap "type:regclass"
 test regclass-cast-of-an-unknown-name {
     SELECT 'nosuch'::regclass;
 }
 @sqlstate 42P01
 expect error {}
-expect @tursopg {
-    0
-}
 
 # E-106: pg_class row level security flags
 test pg-class-row-level-security-flags {

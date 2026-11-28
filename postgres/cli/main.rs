@@ -321,17 +321,34 @@ fn cmd_list_indexes(conn: &Connection, w: &mut dyn Write) -> bool {
 }
 
 fn cmd_list_views(conn: &Connection, w: &mut dyn Write) -> bool {
-    let sql = "SELECT relname FROM pg_class WHERE relkind = 'v' ORDER BY relname";
+    // Keep this query in step with psql's listTables("v", ...) query.
+    let sql = r#"SELECT n.nspname as "Schema",
+  c.relname as "Name",
+  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as "Type",
+  pg_catalog.pg_get_userbyid(c.relowner) as "Owner"
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('v','')
+      AND n.nspname <> 'pg_catalog'
+      AND n.nspname !~ '^pg_toast'
+      AND n.nspname <> 'information_schema'
+  AND pg_catalog.pg_table_is_visible(c.oid)
+ORDER BY 1,2;"#;
     match conn.query(sql) {
         Ok(Some(mut rows)) => {
             let mut table = Table::new();
             table.set_content_arrangement(ContentArrangement::Dynamic);
-            table.set_header(vec![Cell::new("View").add_attribute(Attribute::Bold)]);
-            let _ = rows.run_with_row_callback(|row| {
-                let name = row.get_value(0).to_string();
-                table.add_row(vec![Cell::new(&name)]);
+            table.set_header(
+                ["Schema", "Name", "Type", "Owner"]
+                    .map(|name| Cell::new(name).add_attribute(Attribute::Bold)),
+            );
+            if let Err(e) = rows.run_with_row_callback(|row| {
+                table.add_row((0..4).map(|column| Cell::new(row.get_value(column).to_string())));
                 Ok(())
-            });
+            }) {
+                write_pg_error(w, &e);
+                return false;
+            }
             if !table.is_empty() {
                 let _ = writeln!(w, "{table}");
             } else {

@@ -102,7 +102,7 @@ impl PgConnection {
 
 /// The columns of one row in COPY's text format, as they are written: the
 /// escapes and `\N` for NULL are kept.
-pub(super) fn copy_text_columns(line: Vec<u8>) -> Result<Vec<String>, BackendError> {
+pub fn copy_text_columns(line: Vec<u8>) -> Result<Vec<String>, BackendError> {
     let text = String::from_utf8(line).map_err(|e| BackendError::Execute(e.to_string()))?;
     let row = text
         .strip_suffix('\n')
@@ -110,7 +110,7 @@ pub(super) fn copy_text_columns(line: Vec<u8>) -> Result<Vec<String>, BackendErr
     Ok(row.split('\t').map(str::to_owned).collect())
 }
 
-pub(super) fn split_statements(sql: &str) -> Vec<String> {
+pub fn split_statements(sql: &str) -> Vec<String> {
     match pg_query::split_with_parser(sql) {
         // splitting statements removes their trailing semicolon, so we add it back
         Ok(statements) if !statements.is_empty() => statements

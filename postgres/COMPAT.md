@@ -42,6 +42,11 @@ a "... is not supported" error rather than running with different semantics.
 The few remaining cases that are accepted without their full meaning are
 called out as "silently ignored" in the notes of the tables below.
 
+ATTACH and DETACH are statements of the SQLite frontend. PostgreSQL has no
+such statements: its schemas are in one database. A PostgreSQL connection
+rejects them with SQLSTATE 0A000, in SQL and in the connection API, also when
+the experimental attach option is on.
+
 ## Core SQL baseline
 
 Basics not enumerated by the official feature matrix.
@@ -59,9 +64,9 @@ Basics not enumerated by the official feature matrix.
 | CREATE TABLE AS / SELECT INTO | 🟡 Partial | Schema derived from the SELECT; a result column whose type converts values (timestamptz, timestamp, date, time, uuid, json, numeric, boolean, a comparison or other condition, inet, domains, now()), is rejected with 0A000 because the copy would be a plain column; a copy of a varchar(n), smallint or integer column keeps the values but not the length or range check; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
 | ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, OWNER TO, ENABLE/DISABLE ROW LEVEL SECURITY work (RENAME TABLE, like CREATE INDEX, needs CREATE on the schema, which only a superuser has until GRANT exists); one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS (except for OWNER TO) and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
-| CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS. An index expression or a WHERE clause that uses `->` or `->>` fails with `0A000` |
+| CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS. An omitted name avoids every relation name in the table's schema, including constraint indexes. An index expression or a WHERE clause that uses `->` or `->>` fails with `0A000` |
 | CREATE VIEW | ✅ Supported | A table named without a schema is bound to the schema it is found in when the view is created, so the view keeps reading it when `search_path` changes; column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
-| COMMENT ON | 🟡 Partial | Stored in `pg_description` for tables, views, materialized views, indexes, sequences, table columns and schemas. Any other kind of object, a column of a view, a catalog relation such as `pg_class`, and the index of a PRIMARY KEY or UNIQUE constraint, is rejected with 0A000 |
+| COMMENT ON | 🟡 Partial | Stored in `pg_description` for tables, views, materialized views, indexes, sequences, table columns and schemas. Any other kind of object, a column of a view, a catalog relation such as `pg_class`, the index of a PRIMARY KEY or UNIQUE constraint, and a built-in object such as the schema `public`, is rejected with 0A000 |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
 | ALTER SEQUENCE | 🟡 Partial | OWNED BY { table.column \| NONE } works, which is how a serial column's sequence belongs to its table; the other options are rejected |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE 1 accepted, a larger CACHE rejected (Turso does not cache sequence values); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default, CHECK constraint, view or policy binds it to the schema it is in when the table, column, view or policy is created; a serial column's sequence is created in the table's schema |
@@ -73,7 +78,7 @@ Basics not enumerated by the official feature matrix.
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE and AND CHAIN are rejected. READ ONLY and READ WRITE are enforced, on BEGIN and on SET TRANSACTION; switching a READ ONLY transaction to READ WRITE after its first query is rejected with SQLSTATE 25001 like PostgreSQL. A statement error aborts the transaction but keeps its savepoints, so ROLLBACK TO recovers it; a failed COMMIT rolls the transaction back and returns the connection to idle |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
-| Casts (`expr::type`, CAST) | 🟡 Partial | Also `int4(x)`-style cast functions. Casts to and from int2, int4, int8, float4, float8, bool and text follow `pg_cast`, which lists them: a pair PostgreSQL has no cast for fails with 42846. A cast to uuid gives a value of the uuid type, and fails with 22P02 when the text is not a UUID. A value written to a column by INSERT, UPDATE, ON CONFLICT DO UPDATE, a default or a stored generated column is converted to the column type as an assignment cast, and fails with 42804 when PostgreSQL has no assignment cast. CREATE TABLE and ALTER TABLE ADD COLUMN refuse a column default with no assignment cast to the column type, with 42804 and PostgreSQL's message, which names a real or numeric column as double precision. ADD COLUMN writes a default of another type, converted, into the rows that exist. A value is converted before NOT NULL is checked. Floats round to an integer half to even. A numeric literal and a numeric with a type modifier round half away from zero, as in PostgreSQL. A numeric column without a type modifier and numeric arithmetic are REAL, so they round half to even: 4.5 in a `numeric` column cast or written to an integer is 4, where PostgreSQL gives 5. The range of the target is checked. A float8 cast or written to text is in PostgreSQL's form, such as `3` and `1e+20`. The casts of date, json, jsonb, uuid, bytea, inet, cidr, macaddr, oid and the reg types, arrays, enums and domains are not in `pg_cast` yet: the engine decides them by its own rules, which accept some casts PostgreSQL refuses (`types/cast-matrix.sqltest` has a gap test for each). A cast of another built-in type, such as point or xid, fails with 0A000. Not covered: bytea, which is not a registered type yet, so its casts are not in `pg_cast` and a text literal is not read as bytea input; casts to numeric, which is a REAL when it has no type modifier; float4, which is kept as the float8 with the same digits, so `0.1::float4::float8` is 0.1; `'NaN'`, which the engine's float cannot hold: a cast or a write that gives NaN fails with 0A000, where PostgreSQL stores NaN; a numeric without a type modifier cast to text, which is in the form of a float8, so `1.0::numeric::text` is `1`; a text too small for a float, such as `'1e-400'::float8`, which reads as 0; the `castfunc` of a `pg_cast` row, which is 0; implicit casts in expressions (operator and function arguments, CASE, UNION); and the date type, which is unsupported. |
+| Casts (`expr::type`, CAST) | 🟡 Partial | Also `int4(x)`-style cast functions. Casts to and from int2, int4, int8, float4, float8, bool and text follow `pg_cast`, which lists them: a pair PostgreSQL has no cast for fails with 42846. The same holds for uuid, which has no row in `pg_cast` because its casts go through text: text to uuid is an explicit cast that reads the text as `uuid_in` does, and fails with 22P02 when it is not a UUID, and uuid to text is an assignment cast. A value written to a column by INSERT, UPDATE, ON CONFLICT DO UPDATE, a default or a stored generated column is converted to the column type as an assignment cast, and fails with 42804 when PostgreSQL has no assignment cast. CREATE TABLE and ALTER TABLE ADD COLUMN refuse a column default with no assignment cast to the column type, with 42804 and PostgreSQL's message, which names a real or numeric column as double precision. ADD COLUMN writes a default of another type, converted, into the rows that exist. A value is converted before NOT NULL is checked. Floats round to an integer half to even. A numeric literal and a numeric with a type modifier round half away from zero, as in PostgreSQL. A numeric column without a type modifier and numeric arithmetic are REAL, so they round half to even: 4.5 in a `numeric` column cast or written to an integer is 4, where PostgreSQL gives 5. The range of the target is checked. A float8 cast or written to text is in PostgreSQL's form, such as `3` and `1e+20`. regclass casts from text by looking the name up as PostgreSQL does (schema, search path, quoting, digits as an oid) and to text by printing the name, with `42P01` for a relation that does not exist. It finds the relations that `pg_class` lists (tables, views, sequences and indexes under the name `pg_class` gives them, and the catalogs) and the other PostgreSQL catalog tables by their PostgreSQL oid. A catalog view that `pg_class` does not list does not exist here, so its name fails with `42P01`. A regclass column prints the name in a result and in COPY, as PostgreSQL does, and the binary format sends the oid; a binary regclass parameter is refused with 0A000. `regclass[]` and a column of another reg type are still integers, and so is a regclass that goes through an expression such as `min`, `max`, `CASE`, `||`, `concat`, `format` or an array constructor: the engine, not PostgreSQL's rules, gives the expression its type, so it can print the number where PostgreSQL prints the name (`||`, `concat`, `format`, arrays) or the name where PostgreSQL prints the oid (`min`, `max`). A regclass constant that a view, a default, a check, an index, a policy or a materialized view stores is read as the oid of its relation when the statement runs, as in PostgreSQL, so renaming the relation does not break it and a name with no relation fails the statement with `42P01`. This covers a string constant cast to regclass and a string default of a regclass column, and not a name that reaches regclass another way, such as the argument of `nextval`. A constant that names the table the same statement creates keeps its name, because the table has no oid yet. The object keeps no dependency on the relation, so `DROP TABLE` of that relation is not refused, and the oid then prints as a number. For the same reason pg_dump does not order a table before the table that its default names, so such a dump may not restore. A domain over regclass does not read or print relation names yet: a string default or a text value of the domain fails, and its values print as numbers. A quoted schema name in a regclass matches without regard to case. The casts of date, json, jsonb, bytea, inet, cidr, macaddr, the reg types other than regclass, arrays, enums and domains are not in `pg_cast` yet: the engine decides them by its own rules, which accept some casts PostgreSQL refuses (`types/cast-matrix.sqltest` has a gap test for each). A cast of another built-in type, such as point or xid, fails with 0A000. Not covered: bytea, which is not a registered type yet, so its casts are not in `pg_cast` and a text literal is not read as bytea input; casts to numeric, which is a REAL when it has no type modifier; float4, which is kept as the float8 with the same digits, so `0.1::float4::float8` is 0.1; `'NaN'`, which the engine's float cannot hold: a cast or a write that gives NaN fails with 0A000, where PostgreSQL stores NaN; a numeric without a type modifier cast to text, which is in the form of a float8, so `1.0::numeric::text` is `1`; a text too small for a float, such as `'1e-400'::float8`, which reads as 0; the `castfunc` of a `pg_cast` row, which is 0; implicit casts in expressions (operator and function arguments, CASE, UNION); and the date type, which is unsupported. |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
 | Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO [ESCAPE], `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC is rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. SIMILAR TO converts its pattern to a regex the way `similar_to_escape()` does. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE, and SIMILAR TO needs a string-literal pattern and ESCAPE. A comparison, an arithmetic or a bit operator fails with 42883 when `pg_operator` has no row for operands of these kinds of types: see `pg_operator` in the Backend section |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
@@ -89,19 +94,40 @@ The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_database`, `pg_roles` (built-in `postgres` superuser and `pg_database_owner`, and roles from `CREATE ROLE`), `pg_auth_members` (memberships from `GRANT role TO role`), `pg_proc`, `pg_am`,
 `pg_policy` (row-level security policies, with `polqual` and `polwithcheck`
 as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Present but
-always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
+always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
-`pg_description` is a stored table. It has the comments that `COMMENT ON`
-stored, and the default `standard public schema` comment for `public`, so
-pg_dump does not emit a command to clear that comment on restore. Dropping a
-relation, a column or a schema deletes its comments. The public schema reports
+`pg_class` is a virtual table with all 34 PostgreSQL 18 columns and a hidden
+`tableoid`. It combines user relation rows from a private physical table with
+built-in catalog rows from the running binary. DDL updates the physical rows
+in the same transaction, and schema loading rejects missing or orphaned user
+identities. Column counts, check counts, index presence and ACL display text
+are derived from the current schema and roles instead of stored a second time.
+Changes to built-in catalog definitions do not require file updates.
+Views report zero pages and an unknown row estimate (`reltuples = -1`). Stored
+relations report initial estimates; collected PostgreSQL planner statistics are
+not implemented.
+Catalog indexes are not implemented, so built-in catalogs report
+`relhasindex = false`; PostgreSQL reports true for its indexed catalogs.
+`pg_description` has the 3,675 built-in comments of PostgreSQL 18 and the
+comments that `COMMENT ON` stored. The built-in comments come from the running
+binary and are not stored in the database file, so a newer binary shows its own
+built-in comments. One of them is the `standard public schema` comment of
+`public`, so pg_dump does not emit a command to clear that comment on restore.
+`COMMENT ON` a built-in object, such as the schema `public`, is rejected with
+0A000, so a built-in comment cannot be changed or removed. A built-in comment names its object by the
+oid of PostgreSQL, and `pg_proc` has other oids, so `obj_description(oid)`
+without a catalog name can return the built-in comment of another object.
+The catalog does not have the comments that PostgreSQL's `initdb` adds after
+`postgres.bki`, such as those of the system views. Dropping a relation, a
+column or a schema deletes its comments. The public schema reports
 `pg_database_owner` as its owner, with CREATE and USAGE for that role and USAGE
 for PUBLIC. These are catalog defaults; role management is not implemented.
 `pg_depend` has the rows of each view's `_RETURN` rule: the rule is part of
 the view, and depends on each table and view that the view reads, as whole
-relations and not column by column. The rule is not in `pg_rewrite` and the
-view is not in `pg_class`. DROP reads these rows to find the views that depend
+relations and not column by column. The rule is in `pg_rewrite` and the
+view is in `pg_class` with `relhasrules` set. The rule action is SQL text,
+not a PostgreSQL query tree. DROP reads these rows to find the views that depend
 on what it drops.
 `pg_operator` has the rows of PostgreSQL 18, with PostgreSQL's oids, for the
 operators `=`, `<>`, `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/`, `%`, `&`, `|`,
@@ -211,6 +237,8 @@ forms; the first schema of `search_path` that exists), `current_schemas(boolean)
 `obj_description()`/`col_description()` read `pg_description`; `obj_description()`
 knows the catalogs `pg_class` and `pg_namespace` and returns NULL for any other.
 A call of either in a column DEFAULT, a CHECK constraint or an index, or with an aggregate or window function in an argument, is rejected with 0A000.
+`pg_table_is_visible(oid)` checks the current search path and name shadowing,
+including the implicit position of `pg_catalog`, and returns NULL for an unknown OID.
 DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
@@ -345,7 +373,7 @@ that pair, so Turso accepts a comparison that PostgreSQL rejects.
 | Arrays of compound types | ❌ Not supported | |
 | Array support | ✅ Supported | `type[]` columns, ARRAY[...] literals, subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays |
 | ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS] |
-| GUID/UUID data type | ✅ Supported | uuid columns, gen_random_uuid(), input validation, text casts |
+| GUID/UUID data type | ✅ Supported | uuid is a registered type stored as 16 bytes. Text is read as `uuid_in` reads it (braces, no hyphens, a hyphen after every four digits, upper case; no surrounding space) in a literal, a cast, a column, a parameter and `auth.uid()`, and is written in the canonical form. Values sort by their bytes. `gen_random_uuid()` returns a uuid. Gaps: `uuid LIKE` and `max(uuid)` run where PostgreSQL has no such operator or aggregate, and `uuid = jsonb` fails with 0A000 where PostgreSQL gives 42883; `uuid_column = text_column` is compared, because a uuid that a cast or most functions return is typed text |
 | macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |
 | Multiranges | ❌ Not supported | |
 | NULLs in Array | ✅ Supported | `ARRAY[1, NULL, 3]` round-trips |
@@ -834,3 +862,8 @@ Upgrade is not supported.
 Not applicable: the Turso Postgres frontend is Rust and builds on every
 platform Turso supports; PostgreSQL's platform/compiler feature entries do
 not carry over.
+
+Only implemented catalogs have relation identities in `pg_class`; empty
+compatibility placeholders do not. Catalog relation identities come from the running binary. They use
+PostgreSQL 18's OIDs in `pg_catalog`. Their attribute counts describe the columns
+that this frontend exposes, and `pg_attribute` lists those same columns.

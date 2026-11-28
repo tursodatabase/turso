@@ -27,8 +27,11 @@ use turso_core::{
 };
 use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
+use turso_pg_catalog::{CatalogTable, PgDescription};
 use turso_pg_parser::quote_identifier;
-use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR, SQLSTATE_UNDEFINED_TABLE,
+};
 
 use crate::error::{sql_parse_error, sqlstate_error};
 
@@ -52,8 +55,7 @@ const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 /// The first synthetic constraint oid. Constraints are not relations and
 /// have no stored oid, so theirs are positional; they start far above the
-/// catalog's relation oids and below the synthetic oids of rowid-key
-/// indexes, [`ROWID_PK_INDEX_OID_OFFSET`], so they meet neither.
+/// catalog's relation oids, so they never meet one.
 const CONSTRAINT_OID_START: i64 = 1 << 30;
 
 #[derive(Debug)]
@@ -115,6 +117,14 @@ impl Dialect for PostgresDialect {
         turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
     }
 
+    fn validate_attach(&self) -> Result<()> {
+        Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "ATTACH and DETACH are not supported by the PostgreSQL frontend",
+            None,
+        ))
+    }
+
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(turso_sqlite::SqliteDialect)
     }
@@ -142,14 +152,15 @@ impl Dialect for PostgresDialect {
             return Ok(table);
         };
 
-        let parse_result = turso_pg_parser::parse(raw_sql).map_err(sql_parse_error)?;
+        let parse_result = turso_pg_parser::parse_stored_table(raw_sql).map_err(sql_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
             .map_err(sql_parse_error)?;
         match stmt {
             turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
+                let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
+                Ok(table)
             }
             _ => Err(sqlstate_error(
                 SQLSTATE_INTERNAL_ERROR,
@@ -166,7 +177,7 @@ impl Dialect for PostgresDialect {
             return canonical_table_sql_ast(self, sql);
         };
 
-        let parse_result = turso_pg_parser::parse(raw_sql).map_err(sql_parse_error)?;
+        let parse_result = turso_pg_parser::parse_stored_table(raw_sql).map_err(sql_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
@@ -593,7 +604,8 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>)> 
             .tables(namespace)
             .map(|table| (namespace, table.get_name(), table))
             .filter(|(_, name, table)| {
-                !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
+                turso_core::schema::is_user_relation_name(RelationKind::Table, name)
+                    && matches!(table.as_ref(), Table::BTree(_))
             })
             .collect();
         namespace_tables.sort_by_key(|(_, name, _)| *name);
@@ -626,6 +638,9 @@ pub(crate) const PUBLIC_NAMESPACE_OID: i64 = 2200;
 const FIRST_USER_SCHEMA_OID: i64 = 16384;
 
 pub(crate) fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
+    if namespace.is_root() {
+        return 11;
+    }
     if schema.namespace_name(namespace) == Some("public") {
         return PUBLIC_NAMESPACE_OID;
     }
@@ -677,6 +692,7 @@ pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
+        "REGCLASS" => 2205,
         _ => return None,
     };
     Some(oid)
@@ -692,28 +708,6 @@ fn stored_relation_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> O
             .get_by_name(namespace, name)?
             .oid,
     )
-}
-
-/// The `pg_class.relowner` oid of relation `name`: its stored owner.
-fn relation_owner_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> i64 {
-    match crate::classes::relation_owner(schema, namespace, name) {
-        Some(owner) => role_oid(owner),
-        None => SUPERUSER_OID,
-    }
-}
-
-/// The `pg_class.relacl` of relation `name`: its stored access control list
-/// with the roles named, NULL until a `GRANT` touches it.
-fn relation_acl(conn: &Connection, schema: &Schema, namespace: NamespaceId, name: &str) -> Value {
-    match crate::classes::relation_acl(schema, namespace, name) {
-        Some(acl) => {
-            let roles = connection_roles(conn);
-            Value::build_text(acl.display_text(&|oid| {
-                role_name_by_oid(&roles, oid).unwrap_or_else(|| oid.to_string())
-            }))
-        }
-        None => Value::Null,
-    }
 }
 
 /// The name of the role that owns relation `name`, for the owner columns of
@@ -743,6 +737,104 @@ fn user_tables_with_oids(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>
         .collect()
 }
 
+/// The oid of the relation that a regclass input names, as pg_class lists it:
+/// a table, view, index, sequence or catalog. A catalog table that pg_class
+/// does not list has its PostgreSQL oid. Fails with 42P01 when there is no such
+/// relation, as it does for a catalog view that this frontend does not have.
+pub(crate) fn regclass_oid(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<i64> {
+    if schema.is_none_or(|schema| schema == "pg_catalog") {
+        let listed = conn.with_schema(MAIN_DB_ID, |schema| {
+            crate::classes::class_catalog(schema)?
+                .get_by_relname(NamespaceId::ROOT, name)
+                .map(|class| class.oid)
+        });
+        if let Some(oid) = listed {
+            return Ok(oid);
+        }
+        if let Some(oid) = catalog_oid_by_name(name) {
+            return Ok(oid);
+        }
+    }
+    for namespace in crate::session::relation_lookup_namespaces(conn, schema) {
+        if namespace.target.id.is_root() {
+            continue;
+        }
+        let found = conn.with_schema(namespace.database_id(), |schema| {
+            crate::classes::class_catalog(schema)?
+                .get_by_relname(namespace.target.id, name)
+                .map(|class| class.oid)
+        });
+        if let Some(oid) = found {
+            return Ok(oid);
+        }
+    }
+    let written = match schema {
+        Some(schema) => format!("{schema}.{name}"),
+        None => name.to_string(),
+    };
+    Err(sqlstate_error(
+        SQLSTATE_UNDEFINED_TABLE,
+        format!("relation \"{written}\" does not exist"),
+        None,
+    ))
+}
+
+/// The text of the regclass value `oid`: the name of the relation, with its
+/// schema when the relation is not on the search path, or the number when no
+/// relation has that oid. 0 is `-`.
+pub(crate) fn regclass_text(conn: &Connection, oid: i64) -> String {
+    if oid == 0 {
+        return "-".to_string();
+    }
+    let schema = conn.current_schema();
+    let Some(catalog) = crate::classes::class_catalog(&schema) else {
+        return oid.to_string();
+    };
+    let Some(relation) = catalog.get_by_oid(oid) else {
+        return match catalog_name_by_oid(oid) {
+            Some(name) => name.to_string(),
+            None => oid.to_string(),
+        };
+    };
+    if relation.relnamespace.is_root() {
+        return quote_identifier(&relation.relname);
+    }
+    let engine_name = relation.engine_name.as_deref().unwrap_or(&relation.relname);
+    relation_name(conn, &schema, relation.relnamespace, engine_name)
+}
+
+/// The oid that the text of a regclass names: digits are an oid, and anything
+/// else is the name of a relation, which must exist.
+pub(crate) fn regclass_oid_of_text(conn: &Arc<Connection>, text: &str) -> Result<i64> {
+    match crate::pg_type::parse_regclass(text)? {
+        crate::pg_type::RegClassInput::Oid(oid) => Ok(oid),
+        crate::pg_type::RegClassInput::Name { schema, name } => {
+            regclass_oid(conn, schema.as_deref(), &name)
+        }
+    }
+}
+
+/// The oid of the PostgreSQL catalog `name`, from the catalogs of
+/// turso_pg_catalog, for a catalog that pg_class does not list.
+fn catalog_oid_by_name(name: &str) -> Option<i64> {
+    turso_pg_catalog::BUILTIN_CATALOGS
+        .iter()
+        .find(|catalog| catalog.name == name)
+        .map(|catalog| i64::from(catalog.oid))
+}
+
+/// The name of the PostgreSQL catalog with the oid `oid`.
+fn catalog_name_by_oid(oid: i64) -> Option<&'static str> {
+    turso_pg_catalog::BUILTIN_CATALOGS
+        .iter()
+        .find(|catalog| i64::from(catalog.oid) == oid)
+        .map(|catalog| catalog.name)
+}
+
 /// Build a mapping from namespace and table name to OID for all user tables.
 fn table_oid_map(schema: &Schema) -> HashMap<(NamespaceId, String), i64> {
     let mut map = HashMap::default();
@@ -763,192 +855,136 @@ fn ref_act_to_char(act: &RefAct) -> &'static str {
     }
 }
 
-/// Virtual table implementation for pg_catalog.pg_class
-/// Maps SQLite's sqlite_master to PostgreSQL's pg_class system table
+// Each implemented virtual catalog is registered and given its pg_class
+// identity here. Empty compatibility modules use the separate path below.
+// The OIDs and kinds were checked against PostgreSQL 18 after initdb.
+macro_rules! builtin_catalogs {
+    ($(($oid:expr, $name:literal, $table:ident, $kind:ident, $shared:expr)),* $(,)?) => {
+        $(impl $table {
+            const CATALOG_OID: i64 = $oid;
+        })*
+
+        pub(crate) const BUILTIN_CATALOGS: &[(i64, &str, RelationKind, bool)] = &[
+            $(($table::CATALOG_OID, $name, RelationKind::$kind, $shared),)*
+            // catalog_table registers the virtual table for pg_description.
+            (PgDescription::OID as i64, PgDescription::NAME, RelationKind::Table, false),
+        ];
+
+        fn register_builtin_catalogs(mut options: OpenOptions) -> OpenOptions {
+            $(options = options.native_module(
+                $name, VTabKind::TableValuedFunction, SnapshotCatalog::<$table>(PhantomData)
+            );)*
+            options
+        }
+    };
+}
+
+builtin_catalogs! {
+    (2601, "pg_am", PgAmTable, Table, false),
+    (2604, "pg_attrdef", PgAttrdefTable, Table, false),
+    (1249, "pg_attribute", PgAttributeTable, Table, false),
+    (1261, "pg_auth_members", PgAuthMembersTable, Table, true),
+    (2605, "pg_cast", PgCastTable, Table, false),
+    (PG_CLASS_OID, "pg_class", PgClassTable, Table, false),
+    (2606, "pg_constraint", PgConstraintTable, Table, false),
+    (1262, "pg_database", PgDatabaseTable, Table, true),
+    (2608, "pg_depend", PgDependTable, Table, false),
+    (2610, "pg_index", PgIndexTable, Table, false),
+    (12043, "pg_indexes", PgIndexesTable, View, false),
+    (2612, "pg_language", PgLanguageTable, Table, false),
+    (PG_NAMESPACE_OID, "pg_namespace", PgNamespaceTable, Table, false),
+    (2617, "pg_operator", PgOperatorTable, Table, false),
+    (12018, "pg_policies", PgPoliciesTable, View, false),
+    (3256, "pg_policy", PgPolicyTable, Table, false),
+    (1255, "pg_proc", PgProcTable, Table, false),
+    (PG_REWRITE_OID, "pg_rewrite", PgRewriteTable, Table, false),
+    (12000, "pg_roles", PgRolesTable, View, false),
+    (2224, "pg_sequence", PgSequenceTable, Table, false),
+    (12048, "pg_sequences", PgSequencesTable, View, false),
+    (12104, "pg_settings", PgSettingsTable, View, false),
+    (12033, "pg_tables", PgTablesTable, View, false),
+    (1247, "pg_type", PgTypeTable, Table, false),
+}
+
+/// The exposed columns, excluding hidden implementation and system columns.
+pub(crate) fn builtin_catalog_columns(
+    schema: &Schema,
+    name: &str,
+) -> Vec<turso_core::schema::Column> {
+    let table = schema.get_table(NamespaceId::ROOT, name);
+    let fallback;
+    let columns = if let Some(table) = table.as_ref() {
+        table.columns()
+    } else {
+        // Stored catalogs do not exist when bootstrap statements are built.
+        let sql = match name {
+            PgDescription::NAME => PgDescription::CREATE_SQL,
+            "pg_class" => PgClassTable::SCHEMA,
+            _ => panic!("a registered catalog has a schema: {name}"),
+        };
+        fallback = PostgresDialect
+            .parse_table_sql(sql, 0)
+            .expect("catalog DDL is valid");
+        fallback.columns()
+    };
+    columns
+        .iter()
+        .filter(|column| !column.hidden())
+        .cloned()
+        .collect()
+}
+
+/// Combines stored user relations with catalog definitions from this binary.
 #[derive(Debug)]
 struct PgClassTable;
 
 impl SnapshotRows for PgClassTable {
-    // PostgreSQL pg_class columns (simplified subset)
-    const SCHEMA: &'static str = "CREATE TABLE pg_class (
-            oid INTEGER,
-            relname TEXT,
-            relnamespace INTEGER,
-            reltype INTEGER,
-            reloftype INTEGER,
-            relowner INTEGER,
-            relam INTEGER,
-            relfilenode INTEGER,
-            reltablespace INTEGER,
-            relpages INTEGER,
-            reltuples REAL,
-            relallvisible INTEGER,
-            reltoastrelid INTEGER,
-            relhasindex BOOLEAN,
-            relisshared BOOLEAN,
-            relpersistence TEXT,
-            relkind TEXT,
-            relnatts INTEGER,
-            relchecks INTEGER,
-            relhasrules BOOLEAN,
-            relhastriggers BOOLEAN,
-            relhassubclass BOOLEAN,
-            relrowsecurity BOOLEAN,
-            relforcerowsecurity BOOLEAN,
-            relispopulated BOOLEAN,
-            relreplident TEXT,
-            relispartition BOOLEAN,
-            relrewrite INTEGER,
-            relfrozenxid INTEGER,
-            relminmxid INTEGER,
-            relacl TEXT,
-            reloptions TEXT,
-            relpartbound TEXT,
-            tableoid INTEGER HIDDEN
-        )";
+    const SCHEMA: &'static str = "CREATE TABLE pg_class (\
+    oid INTEGER PRIMARY KEY, \
+    relname TEXT NOT NULL, \
+    relnamespace INTEGER NOT NULL, \
+    reltype INTEGER NOT NULL, \
+    reloftype INTEGER NOT NULL, \
+    relowner INTEGER NOT NULL, \
+    relam INTEGER NOT NULL, \
+    relfilenode INTEGER NOT NULL, \
+    reltablespace INTEGER NOT NULL, \
+    relpages INTEGER NOT NULL, \
+    reltuples REAL NOT NULL, \
+    relallvisible INTEGER NOT NULL, \
+    relallfrozen INTEGER NOT NULL, \
+    reltoastrelid INTEGER NOT NULL, \
+    relhasindex BOOLEAN NOT NULL, \
+    relisshared BOOLEAN NOT NULL, \
+    relpersistence TEXT NOT NULL, \
+    relkind TEXT NOT NULL, \
+    relnatts INTEGER NOT NULL, \
+    relchecks INTEGER NOT NULL, \
+    relhasrules BOOLEAN NOT NULL, \
+    relhastriggers BOOLEAN NOT NULL, \
+    relhassubclass BOOLEAN NOT NULL, \
+    relrowsecurity BOOLEAN NOT NULL, \
+    relforcerowsecurity BOOLEAN NOT NULL, \
+    relispopulated BOOLEAN NOT NULL, \
+    relreplident TEXT NOT NULL, \
+    relispartition BOOLEAN NOT NULL, \
+    relrewrite INTEGER NOT NULL, \
+    relfrozenxid INTEGER NOT NULL, \
+    relminmxid INTEGER NOT NULL, \
+    relacl TEXT, \
+    reloptions TEXT, \
+    relpartbound TEXT, \
+    tableoid INTEGER HIDDEN)";
     /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
-        let mut rows = Vec::new();
-
-        let tables = user_tables_with_oids(&schema);
-        let indexes = catalog_indexes(&schema);
-        let relkind = crate::classes::relkind_letter(RelationKind::Table);
-
-        for (namespace, name, table, table_oid) in tables.iter() {
-            let btree = match table.as_ref() {
-                Table::BTree(bt) => bt,
-                _ => continue,
-            };
-            let table_oid = *table_oid;
-            let relnatts = btree.columns().len() as i64;
-            let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
-            let relchecks = btree.check_constraints.len() as i64;
-            let relrowsecurity =
-                i64::from(crate::classes::table_rls_enabled(&schema, *namespace, name));
-
-            rows.push(vec![
-                Value::from_i64(table_oid),                                     // oid
-                Value::Text(btree.declared_name.clone().into()),                // relname
-                Value::from_i64(namespace_oid(&schema, *namespace)),            // relnamespace
-                Value::from_i64(0),                                             // reltype
-                Value::from_i64(0),                                             // reloftype
-                Value::from_i64(relation_owner_oid(&schema, *namespace, name)), // relowner
-                Value::from_i64(2),                                             // relam (heap)
-                Value::from_i64(0),                                             // relfilenode
-                Value::from_i64(0),                                             // reltablespace
-                Value::from_i64(1),                                             // relpages
-                Value::from_f64(0.0),                                           // reltuples
-                Value::from_i64(0),                                             // relallvisible
-                Value::from_i64(0),                                             // reltoastrelid
-                Value::from_i64(relhasindex),                                   // relhasindex
-                Value::from_i64(0),                                             // relisshared
-                Value::Text("p".into()),         // relpersistence (permanent)
-                Value::build_text(relkind),      // relkind (regular table)
-                Value::from_i64(relnatts),       // relnatts
-                Value::from_i64(relchecks),      // relchecks
-                Value::from_i64(0),              // relhasrules
-                Value::from_i64(0),              // relhastriggers
-                Value::from_i64(0),              // relhassubclass
-                Value::from_i64(relrowsecurity), // relrowsecurity
-                Value::from_i64(0),              // relforcerowsecurity
-                Value::from_i64(1),              // relispopulated
-                Value::Text("d".into()),         // relreplident
-                Value::from_i64(0),              // relispartition
-                Value::from_i64(0),              // relrewrite
-                Value::from_i64(0),              // relfrozenxid
-                Value::from_i64(0),              // relminmxid
-                relation_acl(conn, &schema, *namespace, name), // relacl
-                Value::Null,                     // reloptions
-                Value::Null,                     // relpartbound
-            ]);
-        }
-
-        // Add index rows (relkind='i')
-        let relkind = crate::classes::relkind_letter(RelationKind::Index);
-        for index in indexes {
-            let indnatts = index.columns.len() as i64;
-            rows.push(vec![
-                Value::from_i64(index.oid),                               // oid
-                Value::Text(index.name.into()),                           // relname
-                Value::from_i64(namespace_oid(&schema, index.namespace)), // relnamespace
-                Value::from_i64(0),                                       // reltype
-                Value::from_i64(0),                                       // reloftype
-                Value::from_i64(index.owner_oid),                         // relowner
-                Value::from_i64(403),                                     // relam (btree)
-                Value::from_i64(0),                                       // relfilenode
-                Value::from_i64(0),                                       // reltablespace
-                Value::from_i64(1),                                       // relpages
-                Value::from_f64(0.0),                                     // reltuples
-                Value::from_i64(0),                                       // relallvisible
-                Value::from_i64(0),                                       // reltoastrelid
-                Value::from_i64(0),                                       // relhasindex
-                Value::from_i64(0),                                       // relisshared
-                Value::Text("p".into()),                                  // relpersistence
-                Value::build_text(relkind),                               // relkind (index)
-                Value::from_i64(indnatts),                                // relnatts
-                Value::from_i64(0),                                       // relchecks
-                Value::from_i64(0),                                       // relhasrules
-                Value::from_i64(0),                                       // relhastriggers
-                Value::from_i64(0),                                       // relhassubclass
-                Value::from_i64(0),                                       // relrowsecurity
-                Value::from_i64(0),                                       // relforcerowsecurity
-                Value::from_i64(1),                                       // relispopulated
-                Value::Text("d".into()),                                  // relreplident
-                Value::from_i64(0),                                       // relispartition
-                Value::from_i64(0),                                       // relrewrite
-                Value::from_i64(0),                                       // relfrozenxid
-                Value::from_i64(0),                                       // relminmxid
-                Value::Null,                                              // relacl
-                Value::Null,                                              // reloptions
-                Value::Null,                                              // relpartbound
-            ]);
-        }
-        let relkind = crate::classes::relkind_letter(RelationKind::Sequence);
-        for (oid, namespace, sequence) in sequence_catalog_entries(&schema) {
-            rows.push(vec![
-                Value::from_i64(oid),
-                Value::build_text(sequence.name.clone()),
-                Value::from_i64(namespace_oid(&schema, namespace)),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(relation_owner_oid(&schema, namespace, &sequence.name)),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::from_f64(1.0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::build_text("p"),
-                Value::build_text(relkind),
-                Value::from_i64(3),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::build_text("n"),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                relation_acl(conn, &schema, namespace, &sequence.name),
-                Value::Null,
-                Value::Null,
-            ]);
-        }
-
-        rows
+        crate::classes::class_catalog(&schema)
+            .map_or_else(Vec::new, |catalog| catalog.rows(&schema))
     }
 }
 
@@ -967,7 +1003,7 @@ impl SnapshotRows for PgNamespaceTable {
         )";
     /// Fixed PostgreSQL OID of pg_namespace, which describes schemas.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(PG_NAMESPACE_OID);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -1097,7 +1133,7 @@ impl SnapshotRows for PgAttributeTable {
             attmissingval TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(1249);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 1000;
 
@@ -1109,10 +1145,7 @@ impl SnapshotRows for PgAttributeTable {
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = match schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    Some(td) if !td.is_builtin => user_type_oid(&td.name),
-                    _ => sqlite_type_to_pg_oid(&col.ty_str),
-                };
+                let type_oid = attribute_type_oid(&schema, col, table.is_strict());
                 let storage = if col.is_array() {
                     "x"
                 } else {
@@ -1161,7 +1194,117 @@ impl SnapshotRows for PgAttributeTable {
             }
         }
 
+        for rule in view_rules(&schema) {
+            for (position, column) in rule.view.columns.iter().enumerate() {
+                rows.push(simple_attribute_row(
+                    &schema,
+                    rule.view_oid,
+                    position,
+                    column,
+                ));
+            }
+        }
+        for index in catalog_indexes(conn, &schema) {
+            let classes = crate::classes::class_catalog(&schema).expect("indexes have classes");
+            let class = classes
+                .get_by_oid(index.table_oid)
+                .expect("an index has a table");
+            let table = schema
+                .get_btree_table(class.relnamespace, &class.relname)
+                .expect("an index has a table");
+            for (position, indexed) in index.columns.iter().enumerate() {
+                let mut column = if let Some(expression) = &indexed.expression {
+                    let sql = format!(
+                        "SELECT {expression} FROM {}",
+                        quote_identifier(&class.relname)
+                    );
+                    let (Some(ast::Cmd::Stmt(ast::Stmt::Select(select))), _) = PostgresDialect
+                        .parse_internal(&sql)
+                        .expect("index expressions are valid engine SQL")
+                    else {
+                        unreachable!("the statement is SELECT");
+                    };
+                    turso_core::schema::view::extract_view_columns(
+                        class.relnamespace,
+                        &select,
+                        &schema,
+                    )
+                    .expect("index expressions reference their table")
+                    .columns
+                    .remove(0)
+                    .column
+                } else {
+                    table.columns()[indexed.position].clone()
+                };
+                column.name = Some(indexed.name.clone());
+                // FIXME(pg-catalog): PostgreSQL index attributes have no NOT NULL
+                // constraint. A stored pg_attribute should own this flag.
+                column.set_notnull(false);
+                column.set_rowid_alias(false);
+                rows.push(simple_attribute_row(&schema, index.oid, position, &column));
+            }
+        }
+        let sequence = PostgresDialect.parse_table_sql("CREATE TABLE sequence_columns (last_value BIGINT, log_cnt BIGINT, is_called BOOLEAN)", 0).expect("sequence definition is valid");
+        for (oid, _, _) in sequence_catalog_entries(&schema) {
+            for (position, column) in sequence.columns().iter().enumerate() {
+                rows.push(simple_attribute_row(&schema, oid, position, column));
+            }
+        }
+        for &(oid, name, _, _) in BUILTIN_CATALOGS {
+            for (position, column) in builtin_catalog_columns(&schema, name).iter().enumerate() {
+                rows.push(simple_attribute_row(&schema, oid, position, column));
+            }
+        }
         rows
+    }
+}
+
+/// Attributes of catalog and view columns, which have no defaults or identity.
+fn simple_attribute_row(
+    schema: &Schema,
+    oid: i64,
+    position: usize,
+    column: &turso_core::schema::Column,
+) -> Vec<Value> {
+    vec![
+        Value::from_i64(oid),
+        Value::build_text(column.name.clone().unwrap_or_default()),
+        Value::from_i64(attribute_type_oid(schema, column, true)),
+        Value::from_i64(-1),
+        Value::from_i64(-1),
+        Value::from_i64(position as i64 + 1),
+        Value::from_i64(0),
+        Value::from_i64(-1),
+        Value::from_i64(-1),
+        Value::from_i64(1),
+        Value::build_text("p"),
+        Value::build_text("i"),
+        Value::build_text(""),
+        Value::from_i64(i64::from(column.notnull())),
+        Value::from_i64(0),
+        Value::from_i64(0),
+        Value::build_text(""),
+        Value::build_text(""),
+        Value::from_i64(0),
+        Value::from_i64(1),
+        Value::from_i64(0),
+        Value::from_i64(0),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+/// Resolves declared column types for table, view and index attributes.
+fn attribute_type_oid(
+    schema: &Schema,
+    column: &turso_core::schema::Column,
+    is_strict: bool,
+) -> i64 {
+    match schema.get_type_def(&column.ty_str, is_strict) {
+        Some(td) if !td.is_builtin => user_type_oid(&td.name),
+        _ => sqlite_type_to_pg_oid(&column.ty_str),
     }
 }
 
@@ -1176,6 +1319,16 @@ pub(crate) fn role_oid(id: RoleId) -> i64 {
         RoleId::SUPERUSER => SUPERUSER_OID,
         RoleId::PUBLIC => 0,
         _ => USER_ROLE_OID_START + id.get(),
+    }
+}
+
+/// The engine role ID corresponding to a PostgreSQL role OID.
+pub(crate) fn role_id_from_oid(oid: i64) -> Option<RoleId> {
+    match oid {
+        SUPERUSER_OID => Some(RoleId::SUPERUSER),
+        0 => Some(RoleId::PUBLIC),
+        oid if oid > USER_ROLE_OID_START => Some(RoleId::from_stored(oid - USER_ROLE_OID_START)),
+        _ => None,
     }
 }
 
@@ -1388,7 +1541,7 @@ impl SnapshotRows for PgProcTable {
             proacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(1255);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -1464,7 +1617,7 @@ impl SnapshotRows for PgDatabaseTable {
             datacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(1262);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -1516,7 +1669,7 @@ impl SnapshotRows for PgAmTable {
         )";
     /// Fixed PostgreSQL OID of pg_am, which lists table and index access methods.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2601);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -1672,7 +1825,7 @@ impl SnapshotRows for PgPolicyTable {
             tableoid INTEGER HIDDEN
         )";
     /// PostgreSQL's oid of pg_policy.
-    const TABLE_OID: Option<i64> = Some(3256);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1680,7 +1833,7 @@ impl SnapshotRows for PgPolicyTable {
     /// `pg_get_expr` returns as it is.
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
-        catalog_policies(&schema)
+        catalog_policies(conn, &schema)
             .into_iter()
             .map(|policy| {
                 let roles = policy
@@ -1729,7 +1882,7 @@ impl SnapshotRows for PgPoliciesTable {
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let role_catalog = schema_roles(&schema);
-        catalog_policies(&schema)
+        catalog_policies(conn, &schema)
             .into_iter()
             .map(|policy| {
                 let mut roles: Vec<String> = if policy.roles == [RoleId::PUBLIC] {
@@ -1786,7 +1939,7 @@ struct CatalogPolicy<'a> {
 }
 
 /// The policies of every table, ordered by table oid and then as created.
-fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
+fn catalog_policies<'a>(conn: &Connection, schema: &'a Schema) -> Vec<CatalogPolicy<'a>> {
     let Some(catalog) = crate::classes::class_catalog(schema) else {
         return Vec::new();
     };
@@ -1802,7 +1955,7 @@ fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
         // as CREATE POLICY wrote it, which PostgreSQL also reads.
         let condition_text = |condition: &Option<ast::Expr>, written: &Option<String>| {
             let condition = condition.as_ref()?;
-            crate::deparse::condition_text(condition, &table).or_else(|| written.clone())
+            crate::deparse::condition_text(conn, condition, &table).or_else(|| written.clone())
         };
         for (details, policy) in class.relpolicies.iter() {
             let roles = if policy.roles.contains(&RoleId::PUBLIC) {
@@ -1844,7 +1997,7 @@ impl SnapshotRows for PgIndexesTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        for index in catalog_indexes(&schema) {
+        for index in catalog_indexes(conn, &schema) {
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, index.namespace).to_string()),
                 Value::build_text(index.table_name.clone()),
@@ -1930,7 +2083,7 @@ struct PgTypeTable;
 
 impl SnapshotRows for PgTypeTable {
     const SCHEMA: &'static str = PG_TYPE_SQL;
-    const TABLE_OID: Option<i64> = Some(1247);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2073,7 +2226,7 @@ struct PgIndexTable;
 
 impl SnapshotRows for PgIndexTable {
     const SCHEMA: &'static str = PG_INDEX_SQL;
-    const TABLE_OID: Option<i64> = Some(2610);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2081,7 +2234,7 @@ impl SnapshotRows for PgIndexTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        for index in catalog_indexes(&schema) {
+        for index in catalog_indexes(conn, &schema) {
             let indnatts = index.columns.len() as i64;
             let indkey: String = index
                 .columns
@@ -2171,7 +2324,7 @@ impl SnapshotRows for PgConstraintTable {
     /// Fixed PostgreSQL OID of pg_constraint, which describes primary keys,
     /// unique constraints, foreign keys and checks.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2606);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2181,7 +2334,7 @@ impl SnapshotRows for PgConstraintTable {
 
         let tables = user_tables_sorted(&schema);
         let tbl_oid_map = table_oid_map(&schema);
-        let indexes = catalog_indexes(&schema);
+        let indexes = catalog_indexes(conn, &schema);
         let mut constraint_oid = CONSTRAINT_OID_START;
 
         for (namespace, table_name, table) in &tables {
@@ -2200,7 +2353,7 @@ impl SnapshotRows for PgConstraintTable {
                     .iter()
                     .find(|index| index.table_oid == table_oid && index.primary)
                     .expect("rowid primary keys have a catalog index");
-                let conname = primary_key_constraint_name(btree);
+                let conname = index.name.clone();
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -2252,11 +2405,6 @@ impl SnapshotRows for PgConstraintTable {
                     ConstraintKind::Unique
                 };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let conname = if primary {
-                    primary_key_constraint_name(btree)
-                } else {
-                    unique_constraint_name(btree, us)
-                };
 
                 // Build conkey: space-separated 1-based attnums
                 let conkey: String = col_names
@@ -2274,14 +2422,12 @@ impl SnapshotRows for PgConstraintTable {
                     .iter()
                     .map(|name| btree.get_column(name).expect("constraint columns exist").0)
                     .collect();
-                let conindid = indexes
+                let index = indexes
                     .iter()
                     .find(|index| {
                         index.table_oid == table_oid
                             && index.unique
-                            && index
-                                .name
-                                .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                            && index.for_constraint
                             && index.where_clause.is_none()
                             && index
                                 .columns
@@ -2294,8 +2440,9 @@ impl SnapshotRows for PgConstraintTable {
                                 .map(|column| column.position)
                                 .eq(positions.iter().copied())
                     })
-                    .expect("unique constraints have a catalog index")
-                    .oid;
+                    .expect("unique constraints have a catalog index");
+                let conindid = index.oid;
+                let conname = index.name.clone();
 
                 let contype: &'static str = contype.into();
                 rows.push(vec![
@@ -2447,7 +2594,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(check_condition_text(&chk.expr, btree)), // conbin
+                    Value::build_text(check_condition_text(conn, &chk.expr, btree)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2469,7 +2616,7 @@ impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
     /// Fixed PostgreSQL OID of pg_attrdef, which describes column default expressions.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2604);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2508,8 +2655,8 @@ impl SnapshotRows for PgAttrdefTable {
                 };
                 // A default with a form the printer does not know is shown
                 // as the engine's SQL.
-                let adbin = crate::deparse::default_text(&default, btree, &col.ty_str)
-                    .unwrap_or_else(|| render_expr(&default));
+                let adbin = crate::deparse::default_text(conn, &default, btree, &col.ty_str)
+                    .unwrap_or_else(|| render_expr(conn, &default));
                 rows.push(vec![
                     Value::from_i64(attrdef_oid),        // oid
                     Value::from_i64(table_oid),          // adrelid
@@ -2532,7 +2679,7 @@ impl SnapshotRows for PgSequenceTable {
         seqmax BIGINT, seqmin BIGINT, seqcache BIGINT, seqcycle BOOLEAN,
         tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2224);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
@@ -2655,6 +2802,7 @@ impl SnapshotRows for PgSequencesTable {
 }
 
 pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
+    options = register_builtin_catalogs(options);
     options = options.native_module(
         "unnest",
         VTabKind::TableValuedFunction,
@@ -2676,56 +2824,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             append_rows: crate::options::append_options,
         },
     );
-    options = options.native_module(
-        "pg_class",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgClassTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_namespace",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgNamespaceTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_attribute",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAttributeTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_roles",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgRolesTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_auth_members",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAuthMembersTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_am",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAmTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_proc",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgProcTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_database",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgDatabaseTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_tables",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgTablesTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_indexes",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgIndexesTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_information_schema_schemata",
         VTabKind::TableValuedFunction,
@@ -2739,26 +2838,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             create: PgGetTableDefTable::new,
         },
     );
-    options = options.native_module(
-        "pg_index",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgIndexTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_constraint",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgConstraintTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_type",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgTypeTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_attrdef",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAttrdefTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_input_error_info",
         VTabKind::TableValuedFunction,
@@ -2767,21 +2847,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             create: PgInputErrorInfoTable::new,
         },
     );
-    options = options.native_module(
-        "pg_sequence",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgSequenceTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_sequences",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgSequencesTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_settings",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgSettingsTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_extension",
         VTabKind::TableValuedFunction,
@@ -2794,16 +2860,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
-    options = options.native_module(
-        "pg_policy",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgPolicyTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_policies",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgPoliciesTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
@@ -2819,11 +2876,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)".to_string() },
     );
-    options = options.native_module(
-        "pg_rewrite",
-        VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
-    );
+
     options = options.native_module(
         "pg_foreign_table",
         VTabKind::TableValuedFunction,
@@ -2851,6 +2904,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
+    options = crate::catalog_table::register_catalog_tables(options);
     options = options.native_module(
         "pg_seclabels",
         VTabKind::TableValuedFunction,
@@ -2877,11 +2931,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
-    options = options.native_module(
-        "pg_depend",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgDependTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_tablespace",
         VTabKind::TableValuedFunction,
@@ -2904,11 +2954,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
-    options = options.native_module(
-        "pg_cast",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgCastTable>(PhantomData),
-    );
+
     options = options.native_module(
         "pg_transform",
         VTabKind::TableValuedFunction,
@@ -2920,16 +2966,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
-    options = options.native_module(
-        "pg_language",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgLanguageTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_operator",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgOperatorTable>(PhantomData),
-    );
+
     for (name, create_sql) in [
         (
             "pg_opclass",
@@ -3071,7 +3108,7 @@ impl SnapshotRows for PgLanguageTable {
         lanpltrusted BOOLEAN, lanplcallfoid INTEGER, laninline INTEGER,
         lanvalidator INTEGER, lanacl TEXT[], tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2612);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -3105,7 +3142,7 @@ impl SnapshotRows for PgOperatorTable {
         oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
         oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2617);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 200;
 
@@ -3147,7 +3184,7 @@ impl SnapshotRows for PgCastTable {
         oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
         castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2605);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -3286,7 +3323,7 @@ impl SnapshotRows for PgDependTable {
     )";
     /// Fixed PostgreSQL OID of pg_depend, which records dependencies between objects.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2608);
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -3552,9 +3589,38 @@ pub(crate) fn relation_dependents(
 /// Fixed PostgreSQL OID of pg_rewrite, which has the rewrite rules of views.
 const PG_REWRITE_OID: i64 = 2618;
 
-/// The `_RETURN` rule of a view, which pg_depend describes. pg_rewrite does
-/// not list the rules while pg_class does not list the views: pg_dump stops
-/// at a rule whose view it cannot find.
+#[derive(Debug)]
+struct PgRewriteTable;
+
+impl SnapshotRows for PgRewriteTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead BOOLEAN, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)";
+    const TABLE_OID: Option<i64> = Some(Self::CATALOG_OID);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 10;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        // FIXME(pg-rewrite): PostgreSQL's _RETURN is an enabled INSTEAD
+        // SELECT rule with no qualification (<>). The action is SQL here;
+        // a PostgreSQL query-tree representation would replace it.
+        view_rules(&conn.current_schema())
+            .into_iter()
+            .map(|rule| {
+                vec![
+                    Value::from_i64(rule.oid),
+                    Value::build_text("_RETURN"),
+                    Value::from_i64(rule.view_oid),
+                    Value::build_text("1"),
+                    Value::build_text("O"),
+                    Value::from_i64(1),
+                    Value::build_text("<>"),
+                    Value::build_text(rule.view.select_stmt.to_string()),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// The `_RETURN` rule of a view, also described by pg_depend.
 struct ViewRule<'a> {
     oid: i64,
     view_oid: i64,
@@ -3583,8 +3649,7 @@ fn view_rules(schema: &Schema) -> Vec<ViewRule<'_>> {
 }
 
 /// What is added to the oid of a view to make the oid of its `_RETURN` rule.
-/// The oids of relations stay below `CONSTRAINT_OID_START`, and the oids
-/// from `ROWID_PK_INDEX_OID_OFFSET` up to this offset are those of indexes.
+/// The oids of relations stay below `CONSTRAINT_OID_START`.
 const VIEW_RULE_OID_OFFSET: i64 = 3 << 30;
 
 fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
@@ -3652,7 +3717,7 @@ impl RelationRow {
     const OID_COLUMN: usize = 0;
     const NAMESPACE_OID_COLUMN: usize = 2;
     const ACCESS_METHOD_OID_COLUMN: usize = 6;
-    const KIND_COLUMN: usize = 16;
+    const KIND_COLUMN: usize = 17;
 
     fn from_row(row: &[Value]) -> Self {
         Self {
@@ -4409,7 +4474,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
             if constraint_oid == target_oid {
                 return Some(format!(
                     "CHECK ({})",
-                    check_condition_text(&chk.expr, btree)
+                    check_condition_text(conn, &chk.expr, btree)
                 ));
             }
             constraint_oid += 1;
@@ -4429,19 +4494,19 @@ pub(crate) fn relation_name(
     namespace: NamespaceId,
     name: &str,
 ) -> String {
-    let declared_name = schema
-        .get_btree_table(namespace, name)
-        .map_or_else(|| name.to_string(), |table| table.declared_name.clone());
-    let found = conn
-        .search_order()
-        .into_iter()
-        .filter(|qualifier| qualifier.target.database_id == MAIN_DB_ID)
-        .map(|qualifier| qualifier.target.id)
-        .find(|search_namespace| {
-            crate::classes::class_catalog(schema)
-                .is_some_and(|catalog| catalog.get_by_name(*search_namespace, name).is_some())
-        });
-    if found == Some(namespace) {
+    let class = crate::classes::class_catalog(schema)
+        .and_then(|catalog| catalog.get_by_name(namespace, name));
+    let declared_name = match class {
+        Some(class) => class.relname.clone(),
+        None => schema
+            .get_btree_table(namespace, name)
+            .map_or_else(|| name.to_string(), |table| table.declared_name.clone()),
+    };
+    // The name alone finds this relation when the exact lookup of the name
+    // does, as the cast to regclass does it.
+    if class
+        .is_some_and(|class| visible_relation_oid(conn, schema, &declared_name) == Some(class.oid))
+    {
         return quote_identifier(&declared_name);
     }
     format!(
@@ -4449,6 +4514,40 @@ pub(crate) fn relation_name(
         quote_identifier(schema_name_of(schema, namespace)),
         quote_identifier(&declared_name)
     )
+}
+
+/// The oid of the relation that the name `name`, written without a schema,
+/// finds: a catalog, since pg_catalog is searched first, or else the first
+/// relation of that name in the search path. Names are compared exactly.
+fn visible_relation_oid(conn: &Connection, schema: &Schema, name: &str) -> Option<i64> {
+    let catalog = crate::classes::class_catalog(schema)?;
+    if let Some(class) = catalog.get_by_relname(NamespaceId::ROOT, name) {
+        return Some(class.oid);
+    }
+    if let Some(oid) = catalog_oid_by_name(name) {
+        return Some(oid);
+    }
+    conn.search_order()
+        .into_iter()
+        .filter(|qualifier| qualifier.target.database_id == MAIN_DB_ID)
+        .map(|qualifier| qualifier.target.id)
+        .filter(|namespace| !namespace.is_root())
+        .find_map(|namespace| {
+            catalog
+                .classes()
+                .find(|class| class.relnamespace == namespace && is_named(class, name))
+                .map(|class| class.oid)
+        })
+}
+
+/// Whether the relation of `class` has the name `name`.
+fn is_named(class: &crate::classes::RelationClass, name: &str) -> bool {
+    // FIXME(pg-identifiers): The engine folds the name of a sequence to
+    // lowercase, so pg_class shows `ss` for `CREATE SEQUENCE "Ss"`, and the
+    // name written is not known. A sequence is found by its name in any case.
+    // PostgreSQL compares every name exactly.
+    class.relname == name
+        || (class.relkind == RelationKind::Sequence && class.relname == name.to_ascii_lowercase())
 }
 
 fn constraint_column_list<'a>(
@@ -4471,12 +4570,13 @@ fn constraint_column_list<'a>(
 /// The text of a CHECK condition of `table` as PostgreSQL's `pg_get_expr`
 /// prints it. A condition with a form the printer does not know is shown as
 /// the engine's SQL.
-fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
-    crate::deparse::condition_text(condition, table).unwrap_or_else(|| render_expr(condition))
+fn check_condition_text(conn: &Connection, condition: &ast::Expr, table: &BTreeTable) -> String {
+    crate::deparse::condition_text(conn, condition, table)
+        .unwrap_or_else(|| render_expr(conn, condition))
 }
 
-fn render_expr(expr: &ast::Expr) -> String {
-    let mut expr = expr.clone();
+fn render_expr(conn: &Connection, expr: &ast::Expr) -> String {
+    let mut expr = crate::deparse::name_regclass_constants(conn, expr);
     walk_expr_mut(&mut expr, &mut |expr| {
         // The translator compiles PostgreSQL's binary collations to BINARY.
         if let ast::Expr::Collate(_, collation) = expr {
@@ -4510,7 +4610,7 @@ fn render_expr(expr: &ast::Expr) -> String {
 /// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
 pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    catalog_indexes(&schema)
+    catalog_indexes(conn, &schema)
         .iter()
         .find(|index| index.oid == target_oid)
         .map(|index| index_definition(&schema, index))
@@ -4577,68 +4677,53 @@ struct CatalogIndex {
     namespace: NamespaceId,
     table_name: String,
     name: String,
-    owner_oid: i64,
     columns: Vec<CatalogIndexColumn>,
     unique: bool,
     primary: bool,
+    /// Whether the index belongs to a PRIMARY KEY or UNIQUE constraint.
+    for_constraint: bool,
     where_clause: Option<String>,
 }
 
-/// The `pg_index` entry of a rowid-alias primary key describes no stored
-/// index, so it has no class row and no allocated oid. Its oid is the
-/// table's plus this offset, which keeps it outside the range that oids are
-/// allocated from and stable across DDL.
-const ROWID_PK_INDEX_OID_OFFSET: i64 = 1 << 31;
-
-fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
-    let tables = user_tables_with_oids(schema);
-    // A relation name is unique within its schema.
-    let mut relation_names: HashSet<(NamespaceId, String)> = schema
-        .namespace_ids()
-        .flat_map(|namespace| {
-            schema
-                .table_names(namespace)
-                .map(str::to_owned)
-                .chain(schema.views(namespace).map(|(name, _)| name.to_owned()))
-                .chain(schema.indexes(namespace).map(|index| index.name.clone()))
-                .chain(schema.sequences_by_name(namespace).keys().cloned())
-                .map(move |name| (namespace, name))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+/// The indexes of the user tables, from their class rows, in the order of
+/// the tables. An index is named as its class row names it.
+fn catalog_indexes(conn: &Connection, schema: &Schema) -> Vec<CatalogIndex> {
+    let Some(classes) = crate::classes::class_catalog(schema) else {
+        return Vec::new();
+    };
     let mut indexes = Vec::new();
-    for (namespace, table_name, table, table_oid) in tables {
+    for (namespace, table_name, table, table_oid) in user_tables_with_oids(schema) {
         let Table::BTree(btree) = table.as_ref() else {
             continue;
         };
-        let table_owner_oid = relation_owner_oid(schema, namespace, table_name);
-        if let Some((position, column)) = btree.get_rowid_alias_column() {
-            let mut name = format!("__turso_internal_pk_index_{table_name}");
-            while !relation_names.insert((namespace, name.clone())) {
-                name.insert(0, '_');
-            }
-            indexes.push(CatalogIndex {
-                oid: table_oid + ROWID_PK_INDEX_OID_OFFSET,
-                table_oid,
-                namespace,
-                table_name: btree.declared_name.clone(),
-                name,
-                owner_oid: table_owner_oid,
-                columns: vec![CatalogIndexColumn {
-                    name: column.name.clone().expect("primary key columns have names"),
-                    position,
-                    expression: None,
-                    order: SortOrder::Asc,
-                }],
-                unique: true,
-                primary: true,
-                where_clause: None,
-            });
-        }
-        for index in schema
-            .get_indices(namespace, table_name)
-            .filter(|index| !index.ephemeral)
-        {
+        for class in classes.indexes_of(table_oid) {
+            let Some(engine_name) = &class.engine_name else {
+                let (position, column) = btree
+                    .get_rowid_alias_column()
+                    .expect("an index without a schema object belongs to a rowid table");
+                indexes.push(CatalogIndex {
+                    oid: class.oid,
+                    table_oid,
+                    namespace,
+                    table_name: btree.declared_name.clone(),
+                    name: class.relname.clone(),
+                    columns: vec![CatalogIndexColumn {
+                        name: column.name.clone().expect("primary key columns have names"),
+                        position,
+                        expression: None,
+                        order: SortOrder::Asc,
+                    }],
+                    unique: true,
+                    primary: true,
+                    for_constraint: true,
+                    where_clause: None,
+                });
+                continue;
+            };
+            let index = schema
+                .get_indices(namespace, table_name)
+                .find(|index| index.name.eq_ignore_ascii_case(engine_name))
+                .expect("every index class row has an index in the schema");
             let primary = btree.get_rowid_alias_column().is_none()
                 && index
                     .name
@@ -4651,15 +4736,11 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                         btree.get_column(name).expect("primary key columns exist").0
                     }));
             indexes.push(CatalogIndex {
-                oid: stored_relation_oid(schema, namespace, &index.name).unwrap_or(0),
+                oid: class.oid,
                 table_oid,
                 namespace,
                 table_name: btree.declared_name.clone(),
-                name: index.name.clone(),
-                owner_oid: match crate::classes::relation_owner(schema, namespace, &index.name) {
-                    Some(owner) => role_oid(owner),
-                    None => table_owner_oid,
-                },
+                name: class.relname.clone(),
                 columns: index
                     .columns
                     .iter()
@@ -4673,13 +4754,21 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                                 .expect("index columns have names")
                         },
                         position: column.pos_in_table,
-                        expression: column.expr.as_ref().map(ToString::to_string),
+                        expression: column.expr.as_ref().map(|expr| {
+                            crate::deparse::name_regclass_constants(conn, expr).to_string()
+                        }),
                         order: column.order,
                     })
                     .collect(),
                 unique: index.unique,
                 primary,
-                where_clause: index.where_clause.as_ref().map(ToString::to_string),
+                for_constraint: index
+                    .name
+                    .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX),
+                where_clause: index
+                    .where_clause
+                    .as_ref()
+                    .map(|expr| crate::deparse::name_regclass_constants(conn, expr).to_string()),
             });
         }
     }
@@ -4693,37 +4782,7 @@ struct CatalogIndexColumn {
     order: SortOrder,
 }
 
-/// The names of the PRIMARY KEY and UNIQUE constraints of `table`. PostgreSQL
-/// gives the index of each constraint the same name.
-pub(crate) fn key_constraint_names(table: &BTreeTable) -> Vec<String> {
-    let rowid_primary_key = table
-        .get_rowid_alias_column()
-        .map(|_| primary_key_constraint_name(table));
-    let unique_sets = table.unique_sets.iter().map(|set| {
-        if unique_set_is_primary_key(table, set) {
-            primary_key_constraint_name(table)
-        } else {
-            unique_constraint_name(table, set)
-        }
-    });
-    rowid_primary_key.into_iter().chain(unique_sets).collect()
-}
-
-fn primary_key_constraint_name(table: &BTreeTable) -> String {
-    table
-        .primary_key_constraint_name
-        .clone()
-        .unwrap_or_else(|| format!("{}_pkey", table.declared_name))
-}
-
-fn unique_constraint_name(table: &BTreeTable, set: &UniqueSet) -> String {
-    set.constraint_name.clone().unwrap_or_else(|| {
-        let columns: Vec<&str> = set.columns.iter().map(|c| c.name.as_str()).collect();
-        format!("{}_{}_key", table.declared_name, columns.join("_"))
-    })
-}
-
-fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
+pub(crate) fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
     table.get_rowid_alias_column().is_none()
         && set.columns.len() == table.primary_key_columns.len()
         && set
@@ -4754,6 +4813,54 @@ mod tests {
     }
 
     #[test]
+    fn builtin_catalog_column_changes_preserve_stored_relations() {
+        let db = crate::session::open_database_with_io(
+            Arc::new(turso_core::MemoryIO::new()),
+            "builtin-catalog-column-changes.db",
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute("CREATE TABLE kept (id int PRIMARY KEY)")
+            .unwrap();
+        let mut schema =
+            turso_core::alloc::TryClone::try_clone(conn.current_schema().as_ref()).unwrap();
+        let rows = conn
+            .prepare_engine_schema_statement(
+                &crate::classes::schema_state_query(&schema)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let oid = crate::classes::class_catalog(&schema)
+            .unwrap()
+            .classes()
+            .find(|class| class.relname == "kept")
+            .unwrap()
+            .oid;
+        // Simulate a new binary exposing fewer columns without changing the file.
+        let table = schema.table_mut(NamespaceId::ROOT, "pg_am").unwrap();
+        let Table::Virtual(table) = Arc::make_mut(table) else {
+            panic!("pg_am is virtual")
+        };
+        Arc::make_mut(table).columns[0].set_hidden(true);
+        let catalog = crate::classes::ClassCatalog::build(&schema, &rows).unwrap();
+        assert_eq!(catalog.get_by_oid(oid).unwrap().relname, "kept");
+        let am = catalog
+            .rows(&schema)
+            .into_iter()
+            .find(|row| row[0].as_int() == Some(2601))
+            .unwrap();
+        assert_eq!(
+            am[18].as_int(),
+            Some(builtin_catalog_columns(&schema, "pg_am").len() as i64)
+        );
+    }
+
+    #[test]
     fn dialect_parse_preserves_explain_command() {
         use turso_core::ast::{Cmd, EqpFormat};
 
@@ -4771,41 +4878,6 @@ mod tests {
                 "{cmd:?}"
             );
         }
-    }
-
-    #[test]
-    fn primary_key_index_prefixes_colliding_names() {
-        let mut schema = Schema::new();
-        let public = NamespaceId::new(1);
-        schema.add_namespace(public, "public");
-        for name in [
-            "t",
-            "__turso_internal_pk_index_t",
-            "___turso_internal_pk_index_t",
-        ] {
-            let columns = if name == "t" {
-                "id INTEGER PRIMARY KEY"
-            } else {
-                "value TEXT"
-            };
-            schema
-                .add_btree_table(
-                    public,
-                    Arc::new(
-                        BTreeTable::from_stored_sql(
-                            &PostgresDialect,
-                            &format!("CREATE TABLE {name} ({columns})"),
-                            2,
-                            false,
-                        )
-                        .unwrap(),
-                    ),
-                )
-                .unwrap();
-        }
-        let indexes = catalog_indexes(&schema);
-        assert_eq!(indexes.len(), 1);
-        assert_eq!(indexes[0].name, "____turso_internal_pk_index_t");
     }
 
     #[test]
@@ -4829,7 +4901,6 @@ mod tests {
     #[test]
     fn catalogs_registered_at_open_survive_schema_refresh() {
         let catalog_names = [
-            "pg_class",
             "pg_namespace",
             "pg_attribute",
             "pg_roles",
@@ -5080,54 +5151,55 @@ mod tests {
     }
 
     #[test]
-    fn catalogs_available_in_secondary_databases() {
+    fn postgres_rejects_attach_before_opening_the_target() {
+        for enabled in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("must-not-exist.db");
+            let db = crate::session::open_database_with_io(
+                Arc::new(turso_core::MemoryIO::new()),
+                ":memory:",
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_attach(enabled),
+            )
+            .unwrap();
+            let conn = connect_with_public(&db);
+            for sql in [
+                format!("ATTACH '{}' AS aux", path.display()),
+                "ATTACH ':memory:' AS aux".to_string(),
+            ] {
+                let error = conn
+                    .execute(&sql)
+                    .expect_err("PostgreSQL must reject ATTACH");
+                assert_eq!(
+                    crate::error::sqlstate(&error),
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    "{error}"
+                );
+                assert!(!path.exists());
+            }
+            let mut state = turso_core::attach::AttachDatabaseState::Start;
+            let error = match conn.attach_database(path.to_str().unwrap(), "aux", &mut state) {
+                Err(error) => error,
+                Ok(_) => panic!("the connection API must reject ATTACH before opening the file"),
+            };
+            assert_eq!(
+                crate::error::sqlstate(&error),
+                SQLSTATE_FEATURE_NOT_SUPPORTED
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn catalogs_available_in_temporary_databases() {
         let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let output_path = dir.path().join("vacuum.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        let opts = crate::DatabaseOpts::new()
-            .with_attach(true)
-            .with_vacuum(true)
-            .with_views(true);
         let db = crate::session::open_database_with_io(
-            io.clone(),
+            Arc::new(PlatformIO::new().unwrap()),
             dir.path().join("main.db").to_str().unwrap(),
             crate::OpenFlags::default(),
-            opts,
+            crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        // The relation catalog covers only the main database.
-        let err = conn.execute("CREATE TABLE aux.other (v INT)").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("relations in an attached database is not supported"),
-            "{err}"
-        );
-        assert_eq!(
-            conn.prepare("SELECT COUNT(*) FROM aux.pg_namespace")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(3)]]
-        );
-        let attached = crate::session::open_database_with_io(
-            io.clone(),
-            attached_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            opts,
-        )
-        .unwrap();
-        assert_eq!(
-            connect_with_public(&attached)
-                .prepare("SELECT COUNT(*) FROM pg_namespace")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(3)]]
-        );
         for temp_store in ["MEMORY", "FILE"] {
             let temp_conn = connect_with_public(&db);
             temp_conn
@@ -5142,221 +5214,6 @@ mod tests {
                 vec![vec![Value::from_i64(3)]]
             );
         }
-        conn.execute("CREATE VIEW catalog_names AS SELECT * FROM pg_namespace")
-            .unwrap();
-        conn.execute(format!("VACUUM INTO '{}'", output_path.display()))
-            .unwrap();
-        let output = crate::session::open_database_with_io(
-            io,
-            output_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            opts,
-        )
-        .unwrap();
-        assert_eq!(
-            connect_with_public(&output)
-                .prepare("SELECT COUNT(*) FROM catalog_names")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(3)]]
-        );
-    }
-
-    #[test]
-    fn indexes_of_an_attached_database_cannot_be_created_or_dropped() {
-        let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        let opts = crate::DatabaseOpts::new().with_attach(true);
-        // A file of the PostgreSQL dialect keeps its tables in schemas, which
-        // a statement cannot name through an attached database. A file of
-        // the SQLite dialect keeps them where `aux.other` finds them.
-        {
-            let attached = Database::open_file_with_flags(
-                io.clone(),
-                attached_path.to_str().unwrap(),
-                crate::OpenFlags::default(),
-                opts,
-                None,
-                Arc::new(SqliteDialect),
-            )
-            .unwrap();
-            let conn = attached
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
-            conn.execute("CREATE TABLE other (v INT, w INT)").unwrap();
-            conn.execute("CREATE INDEX other_v ON other (v)").unwrap();
-            conn.close().unwrap();
-        }
-        let db = crate::session::open_database_with_io(
-            io,
-            dir.path().join("main.db").to_str().unwrap(),
-            crate::OpenFlags::default(),
-            opts,
-        )
-        .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        // The relation catalog covers only the main database.
-        for sql in [
-            "CREATE INDEX other_w ON aux.other (w)",
-            "DROP INDEX aux.other_v",
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("relations in an attached database is not supported"),
-                "{sql}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn sequences_and_tables_of_an_attached_database_cannot_be_created_or_dropped() {
-        let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        // `aux.name` finds only objects that are in no schema, which a file
-        // made with the SQLite dialect has.
-        {
-            let attached = Database::open_file_with_flags(
-                io.clone(),
-                attached_path.to_str().unwrap(),
-                crate::OpenFlags::default(),
-                crate::DatabaseOpts::new().with_mvcc(true),
-                None,
-                Arc::new(SqliteDialect),
-            )
-            .unwrap();
-            let conn = attached
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
-                .unwrap();
-            conn.execute("CREATE SEQUENCE s").unwrap();
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        }
-        let db = crate::session::open_database_with_io(
-            io,
-            dir.path().join("main.db").to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_attach(true),
-        )
-        .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        for sql in [
-            "CREATE SEQUENCE aux.other",
-            "DROP SEQUENCE aux.s",
-            "DROP TABLE aux.t",
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("relations in an attached database is not supported"),
-                "{sql}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn owner_column_of_a_sequence_of_an_attached_database_cannot_be_changed() {
-        let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        {
-            let attached = Database::open_file_with_flags(
-                io.clone(),
-                attached_path.to_str().unwrap(),
-                crate::OpenFlags::default(),
-                crate::DatabaseOpts::new().with_mvcc(true),
-                None,
-                Arc::new(SqliteDialect),
-            )
-            .unwrap();
-            let conn = attached
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
-                .unwrap();
-            conn.execute("CREATE SEQUENCE s").unwrap();
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        }
-        let db = crate::session::open_database_with_io(
-            io,
-            dir.path().join("main.db").to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_attach(true),
-        )
-        .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        for sql in [
-            "ALTER SEQUENCE aux.s OWNED BY aux.t.v",
-            "ALTER SEQUENCE aux.s OWNED BY NONE",
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("relations in an attached database is not supported"),
-                "{sql}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn views_of_an_attached_database_cannot_be_created_or_dropped() {
-        let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
-        let io = Arc::new(PlatformIO::new().unwrap());
-        {
-            let attached = Database::open(
-                io.clone(),
-                attached_path.to_str().unwrap(),
-                turso_core::OpenOptions::new(Arc::new(turso_sqlite::SqliteDialect))
-                    .db_opts(crate::DatabaseOpts::new().with_mvcc(true)),
-            )
-            .unwrap();
-            let conn = attached
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("CREATE VIEW existing AS SELECT 1 AS one")
-                .unwrap();
-            conn.close().unwrap();
-        }
-        let db = crate::session::open_database_with_io(
-            io,
-            dir.path().join("main.db").to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_attach(true),
-        )
-        .unwrap();
-        let conn = connect_with_public(&db);
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        for sql in [
-            "CREATE VIEW aux.added AS SELECT 2 AS two",
-            "DROP VIEW aux.existing",
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("relations in an attached database is not supported"),
-                "{sql}: {err}"
-            );
-        }
-        assert_eq!(
-            conn.prepare("SELECT name FROM aux.sqlite_schema WHERE type = 'view'")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::build_text("existing")]]
-        );
     }
 
     #[test]
@@ -5709,7 +5566,7 @@ mod tests {
 
         // Test 1: Filter by relkind = 'r'
         let mut stmt = conn
-            .prepare("SELECT COUNT(*) FROM pg_class WHERE relkind = 'r'")
+            .prepare("SELECT COUNT(*) FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200")
             .unwrap();
         match stmt.step().unwrap() {
             StepResult::Row => {

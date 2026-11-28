@@ -2595,7 +2595,30 @@ fn add_schema_table(
             ast::Privilege::Select,
             Object::Table(table.name.clone()),
         )?;
-        Table::BTree(table.clone())
+        match resolver.table_overlay(namespace, &table.name) {
+            Some(overlay) => {
+                // The statement reads the overlay, and its cursor reads the
+                // stored table and its indexes with a statement of its own,
+                // so this statement cannot choose an index of the stored
+                // table. The planner ignores INDEXED BY on a virtual table.
+                if indexed.is_some() {
+                    crate::bail_parse_error!(
+                        "INDEXED BY and NOT INDEXED cannot be used on {}, which has an overlay",
+                        table_name.as_str()
+                    );
+                }
+                // Code that knows only the stored table, such as the binding
+                // of `main.t.c`, uses its columns for the overlay too.
+                if !overlay.has_columns_of(table) {
+                    crate::bail_parse_error!(
+                        "table {} does not have the columns of its overlay",
+                        table_name.as_str()
+                    );
+                }
+                Table::Virtual(overlay)
+            }
+            None => Table::BTree(table.clone()),
+        }
     } else {
         return Err(crate::LimboError::InvalidArgument(
             "Table type not supported".to_string(),

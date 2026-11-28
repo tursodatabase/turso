@@ -1,15 +1,15 @@
-use clap::{Parser, Subcommand};
+use crate::gap::GapReport;
+use crate::{
+    BackendError, DefaultDatabaseResolver, FileResult, Format, LoadedTests, OutputFormat,
+    ParseError, RunnerConfig, SnapshotUpdateMode, SqlBackend, TestRunner,
+    backends::cli::CliBackend, backends::js::JsBackend, backends::postgres::PostgresBackend,
+    backends::tursopg::TursopgBackend, create_output, find_all_pending_snapshots, load_test_files,
+    summarize, tcl_converter,
+};
+use async_trait::async_trait;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use miette::{NamedSource, Report};
 use owo_colors::OwoColorize;
-use sqltest::gap::GapReport;
-use sqltest::{
-    DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
-    OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
-    backends::cli::CliBackend, backends::js::JsBackend, backends::postgres::PostgresBackend,
-    backends::rust::RustBackend, backends::tursopg::TursopgBackend,
-    backends::tursopg_embedded::TursopgEmbeddedBackend, create_output, find_all_pending_snapshots,
-    generate_database, generate_integrity_fixture, load_test_files, summarize, tcl_converter,
-};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -36,12 +36,9 @@ enum Commands {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Backend to use: "rust" (native), "cli" (subprocess), "js" (JavaScript
-        /// bindings), "tursopg" (tursopg server over the PostgreSQL wire protocol),
-        /// "tursopg-embedded" (turso_pg in this process, without a server), or
-        /// "postgres" (the real PostgreSQL server at --postgres-dsn)
-        #[arg(long, default_value = "rust")]
-        backend: String,
+        /// Backend to use. The runner binary sets the help text and the default.
+        #[arg(long)]
+        backend: Option<String>,
 
         /// Path to tursodb binary (only used with --backend cli)
         #[arg(long, default_value = "tursodb")]
@@ -190,9 +187,113 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let cli = Cli::parse();
+/// What differs between the runner binaries: each binary links one SQL
+/// dialect, so the backends and database generators that need a dialect
+/// frontend come from the binary.
+#[async_trait(?Send)]
+pub trait Flavor {
+    /// The name of the runner binary.
+    fn bin_name(&self) -> &'static str;
+
+    /// The backends that only this flavor has.
+    fn extra_backends(&self) -> &'static [&'static str];
+
+    /// The backend that `run` uses without `--backend`.
+    fn default_backend(&self) -> &'static str;
+
+    /// Whether the binary has the `generate-db` command.
+    fn generates_databases(&self) -> bool {
+        false
+    }
+
+    /// Make the databases that the loaded tests name by `:default:` and by
+    /// fixture path, and return the resolver for them.
+    async fn prepare_databases(
+        &self,
+        _loaded: &LoadedTests,
+        _mvcc: bool,
+    ) -> Result<Option<Arc<dyn DefaultDatabaseResolver>>, ExitCode> {
+        Ok(None)
+    }
+
+    /// Run the tests on a backend of this flavor. Returns `None` when the
+    /// flavor has no backend with this name.
+    async fn run_backend(
+        &self,
+        _name: &str,
+        _run: BackendRun<'_>,
+    ) -> Option<Result<Vec<FileResult>, BackendError>> {
+        None
+    }
+
+    /// The `generate-db` debug command.
+    async fn generate_debug_databases(
+        &self,
+        _output_dir: PathBuf,
+        _user_count: usize,
+        _seed: u64,
+        _mvcc: bool,
+    ) -> ExitCode {
+        eprintln!("Error: this runner does not generate databases");
+        ExitCode::from(2)
+    }
+}
+
+/// One run of the loaded tests, ready for a backend.
+pub struct BackendRun<'a> {
+    pub resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
+    pub timeout: Duration,
+    pub mvcc: bool,
+    /// Open every new database as `:spec-model:` (`--spec-model`).
+    pub spec_model: bool,
+    config: RunnerConfig,
+    loaded: LoadedTests,
+    output: &'a mut Box<dyn OutputFormat>,
+}
+
+impl BackendRun<'_> {
+    pub async fn run<B: SqlBackend + 'static>(
+        self,
+        backend: B,
+    ) -> Result<Vec<FileResult>, BackendError> {
+        let output = self.output;
+        TestRunner::new(backend)
+            .with_config(self.config)
+            .run_loaded_tests(self.loaded, |result| {
+                output.write_test(result);
+                output.flush();
+            })
+            .await
+    }
+}
+
+/// The backends that every runner binary has.
+const COMMON_BACKENDS: &[&str] = &["cli", "js", "tursopg", "postgres"];
+
+fn backend_names(flavor: &dyn Flavor) -> Vec<&'static str> {
+    [flavor.extra_backends(), COMMON_BACKENDS].concat()
+}
+
+fn command_for(flavor: &dyn Flavor) -> clap::Command {
+    let backends = format!(
+        "Backend to use: {} (default: {})",
+        backend_names(flavor).join(", "),
+        flavor.default_backend()
+    );
+    let mut command = Cli::command()
+        .name(flavor.bin_name())
+        .mut_subcommand("run", |run| {
+            run.mut_arg("backend", |arg| arg.help(backends))
+        });
+    if !flavor.generates_databases() {
+        command = command.mut_subcommand("generate-db", |generate| generate.hide(true));
+    }
+    command
+}
+
+pub async fn run(flavor: &dyn Flavor) -> ExitCode {
+    let cli = Cli::from_arg_matches(&command_for(flavor).get_matches())
+        .unwrap_or_else(|error| error.exit());
 
     match cli.command {
         Commands::Run {
@@ -214,7 +315,9 @@ async fn main() -> ExitCode {
             fail_fast,
             compat_gaps,
         } => {
+            let backend = backend.unwrap_or_else(|| flavor.default_backend().to_string());
             run_tests(
+                flavor,
                 paths,
                 backend,
                 binary,
@@ -249,34 +352,17 @@ async fn main() -> ExitCode {
             user_count,
             seed,
             mvcc,
-        } => generate_debug_databases(output_dir, user_count, seed, mvcc).await,
-    }
-}
-
-/// Default seed for reproducible database generation
-const DEFAULT_SEED: u64 = 42;
-/// Default number of users to generate
-const DEFAULT_USER_COUNT: usize = 10000;
-fn collect_integrity_fixtures<'a>(
-    test_files: impl Iterator<Item = &'a sqltest::TestFile>,
-) -> Vec<String> {
-    let mut fixtures = std::collections::BTreeSet::new();
-    for file in test_files {
-        for db in &file.databases {
-            if let DatabaseLocation::Path(path) = &db.location {
-                for rel in INTEGRITY_FIXTURE_RELATIVE_PATHS {
-                    if path == Path::new(rel) {
-                        fixtures.insert((*rel).to_string());
-                    }
-                }
-            }
+        } => {
+            flavor
+                .generate_debug_databases(output_dir, user_count, seed, mvcc)
+                .await
         }
     }
-    fixtures.into_iter().collect()
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_tests(
+    flavor: &dyn Flavor,
     paths: Vec<PathBuf>,
     backend_type: String,
     binary: PathBuf,
@@ -354,7 +440,7 @@ async fn run_tests(
     };
 
     // Load and parse test files
-    let loaded = match load_test_files(&paths, &sqltest::gap::lint(compat_gaps)).await {
+    let loaded = match load_test_files(&paths, &crate::gap::lint(compat_gaps)).await {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("Error loading test files: {e}");
@@ -373,47 +459,10 @@ async fn run_tests(
         GapReport::default()
     };
 
-    let integrity_fixtures = collect_integrity_fixtures(loaded.test_files());
-    if !integrity_fixtures.is_empty() {
-        eprintln!("Generating integrity-check fixtures...");
-        for rel in integrity_fixtures {
-            // Resolve relative to the working directory, matching how the
-            // backends open relative @database paths from the test files.
-            let fixture_path = PathBuf::from(&rel);
-            if let Err(e) = generate_integrity_fixture(&fixture_path, &rel).await {
-                eprintln!(
-                    "Error generating integrity fixture '{}': {e}",
-                    fixture_path.display()
-                );
-                return ExitCode::from(1);
-            }
-        }
-    }
-
-    // Check if we need to generate default databases
-    let needs = DefaultDatabases::scan_needs(loaded.test_files());
-
-    // Generate default databases if needed
-    let default_dbs = if needs.any() {
-        eprintln!("Generating default databases...");
-        match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT, mvcc).await {
-            Ok(dbs) => dbs,
-            Err(e) => {
-                eprintln!("Error generating default databases: {e}");
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        None
+    let resolver = match flavor.prepare_databases(&loaded, mvcc).await {
+        Ok(resolver) => resolver,
+        Err(code) => return code,
     };
-
-    // Create backend with resolver if we have generated databases
-    let resolver = default_dbs.as_ref().map(|dbs| {
-        Arc::new(DefaultDatabasesResolver(
-            dbs.default_path.clone(),
-            dbs.no_rowid_alias_path.clone(),
-        ))
-    });
 
     // Create runner config
     let mut config = RunnerConfig::default()
@@ -442,21 +491,6 @@ async fn run_tests(
             let mut backend = CliBackend::new(&binary)
                 .with_timeout(Duration::from_secs(timeout))
                 .with_mvcc(mvcc);
-            if let Some(resolver) = resolver {
-                backend = backend.with_default_db_resolver(resolver);
-            }
-            let runner = TestRunner::new(backend).with_config(config);
-            runner
-                .run_loaded_tests(loaded, |result| {
-                    output.write_test(result);
-                    output.flush();
-                })
-                .await
-        }
-        "rust" => {
-            let mut backend = RustBackend::new()
-                .with_mvcc(mvcc)
-                .with_spec_model(spec_model);
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }
@@ -546,20 +580,6 @@ async fn run_tests(
                 })
                 .await
         }
-        "tursopg-embedded" => {
-            let mut backend =
-                TursopgEmbeddedBackend::new().with_timeout(Duration::from_secs(timeout));
-            if let Some(resolver) = resolver {
-                backend = backend.with_default_db_resolver(resolver);
-            }
-            let runner = TestRunner::new(backend).with_config(config);
-            runner
-                .run_loaded_tests(loaded, |result| {
-                    output.write_test(result);
-                    output.flush();
-                })
-                .await
-        }
         "postgres" => {
             let dsn = postgres_dsn.expect("--postgres-dsn is checked above");
             let backend = match PostgresBackend::connect(&dsn, Duration::from_secs(timeout)).await {
@@ -584,10 +604,25 @@ async fn run_tests(
             results
         }
         other => {
-            eprintln!(
-                "Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', 'tursopg', 'tursopg-embedded', or 'postgres'"
-            );
-            return ExitCode::from(2);
+            let run = BackendRun {
+                resolver,
+                timeout: Duration::from_secs(timeout),
+                mvcc,
+                spec_model,
+                config,
+                loaded,
+                output: &mut output,
+            };
+            match flavor.run_backend(other, run).await {
+                Some(results) => results,
+                None => {
+                    eprintln!(
+                        "Error: unknown backend '{other}'. Use one of: {}",
+                        backend_names(flavor).join(", ")
+                    );
+                    return ExitCode::from(2);
+                }
+            }
         }
     };
 
@@ -619,7 +654,7 @@ async fn run_tests(
 /// Prints the gap report of the test files as Markdown, for the `gaps`
 /// command. The tests are parsed but not run.
 async fn print_gaps(paths: Vec<PathBuf>) -> ExitCode {
-    let loaded = match load_test_files(&paths, &sqltest::gap::lint(true)).await {
+    let loaded = match load_test_files(&paths, &crate::gap::lint(true)).await {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("Error loading test files: {e}");
@@ -652,7 +687,7 @@ async fn print_gaps(paths: Vec<PathBuf>) -> ExitCode {
 async fn check_gap_removals(base: PathBuf, head: PathBuf) -> ExitCode {
     let mut trees = Vec::new();
     for (root, is_base) in [(&base, true), (&head, false)] {
-        match sqltest::gap_removals::load_tree(root, is_base).await {
+        match crate::gap_removals::load_tree(root, is_base).await {
             Ok(files) => trees.push(files),
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -660,7 +695,7 @@ async fn check_gap_removals(base: PathBuf, head: PathBuf) -> ExitCode {
             }
         }
     }
-    let errors = sqltest::gap_removals::removed_gaps(&trees[0], &trees[1]);
+    let errors = crate::gap_removals::removed_gaps(&trees[0], &trees[1]);
     for error in &errors {
         eprintln!("{} {error}", "Removed gap:".red().bold());
     }
@@ -671,21 +706,8 @@ async fn check_gap_removals(base: PathBuf, head: PathBuf) -> ExitCode {
     }
 }
 
-/// Simple resolver that holds the paths directly
-struct DefaultDatabasesResolver(Option<PathBuf>, Option<PathBuf>);
-
-impl sqltest::DefaultDatabaseResolver for DefaultDatabasesResolver {
-    fn resolve(&self, location: &sqltest::DatabaseLocation) -> Option<PathBuf> {
-        match location {
-            sqltest::DatabaseLocation::Default => self.0.clone(),
-            sqltest::DatabaseLocation::DefaultNoRowidAlias => self.1.clone(),
-            _ => None,
-        }
-    }
-}
-
 async fn check_files(paths: Vec<PathBuf>, compat_gaps: bool) -> ExitCode {
-    let lint = sqltest::gap::lint(compat_gaps);
+    let lint = crate::gap::lint(compat_gaps);
     let mut has_errors = false;
 
     // Check for pending snapshot files
@@ -764,9 +786,9 @@ async fn check_files(paths: Vec<PathBuf>, compat_gaps: bool) -> ExitCode {
     }
 }
 
-fn check_single_file(path: &PathBuf, lint: sqltest::parser::TestLint<'_>) -> bool {
+fn check_single_file(path: &PathBuf, lint: crate::parser::TestLint<'_>) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(content) => match sqltest::parser::parse_with_lint(&content, lint) {
+        Ok(content) => match crate::parser::parse_with_lint(&content, lint) {
             Ok(file) => {
                 let snapshots_str = if file.snapshots.is_empty() {
                     String::new()
@@ -1007,107 +1029,4 @@ fn convert_single_file(
     }
 
     (test_count, warning_count)
-}
-
-/// Generate test databases for debugging purposes.
-///
-/// This command creates the same databases that the test runner generates
-/// for tests using `:default:` and `:default-no-rowidalias:` database locations,
-/// but saves them to a specified directory instead of a temporary location.
-///
-/// **DEBUG ONLY**: This is intended for inspecting generated databases during
-/// debugging, not for normal test execution.
-async fn generate_debug_databases(
-    output_dir: PathBuf,
-    user_count: usize,
-    seed: u64,
-    mvcc: bool,
-) -> ExitCode {
-    eprintln!(
-        "{}",
-        "WARNING: This command is for debugging only!"
-            .yellow()
-            .bold()
-    );
-    eprintln!();
-
-    // Create output directory if it doesn't exist
-    if !output_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&output_dir) {
-            eprintln!(
-                "{}: Failed to create output directory {}: {}",
-                "Error".red().bold(),
-                output_dir.display(),
-                e
-            );
-            return ExitCode::from(1);
-        }
-    }
-
-    // Generate default database (INTEGER PRIMARY KEY - has rowid alias)
-    let default_db_path = output_dir.join("database.db");
-    eprintln!(
-        "Generating default database (INTEGER PRIMARY KEY) at {}...",
-        default_db_path.display()
-    );
-
-    let config = GeneratorConfig {
-        db_path: default_db_path.to_string_lossy().to_string(),
-        user_count,
-        seed,
-        no_rowid_alias: false,
-        mvcc,
-    };
-
-    if let Err(e) = generate_database(&config).await {
-        eprintln!(
-            "{}: Failed to generate default database: {}",
-            "Error".red().bold(),
-            e
-        );
-        return ExitCode::from(1);
-    }
-
-    eprintln!("  {} {}", "OK".green().bold(), default_db_path.display());
-
-    // Generate no-rowid-alias database (INT PRIMARY KEY - no rowid alias)
-    let no_rowid_db_path = output_dir.join("database-no-rowidalias.db");
-    eprintln!(
-        "Generating no-rowid-alias database (INT PRIMARY KEY) at {}...",
-        no_rowid_db_path.display()
-    );
-
-    let config = GeneratorConfig {
-        db_path: no_rowid_db_path.to_string_lossy().to_string(),
-        user_count,
-        seed,
-        no_rowid_alias: true,
-        mvcc,
-    };
-
-    if let Err(e) = generate_database(&config).await {
-        eprintln!(
-            "{}: Failed to generate no-rowid-alias database: {}",
-            "Error".red().bold(),
-            e
-        );
-        return ExitCode::from(1);
-    }
-
-    eprintln!("  {} {}", "OK".green().bold(), no_rowid_db_path.display());
-
-    // Print summary
-    eprintln!();
-    eprintln!(
-        "{}: Generated {} databases in {}",
-        "Done".green().bold(),
-        2,
-        output_dir.display()
-    );
-    eprintln!("  - database.db (INTEGER PRIMARY KEY, rowid alias enabled)");
-    eprintln!("  - database-no-rowidalias.db (INT PRIMARY KEY, no rowid alias)");
-    eprintln!();
-    eprintln!("Configuration: seed={seed}, user_count={user_count}, mvcc={mvcc}");
-
-    ExitCode::SUCCESS
 }
