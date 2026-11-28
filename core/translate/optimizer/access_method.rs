@@ -193,6 +193,10 @@ pub(super) struct ChosenInSeekCandidate {
     /// are not read in index order, so the sort cannot be skipped.
     pub(super) sort_penalty: Cost,
     pub(super) estimated_rows_per_outer_row: f64,
+    /// The index has no ANALYZE stats and an equality prefix, so the cost
+    /// comparison with the prefix seek does not apply (see
+    /// `choose_best_in_seek_candidate`).
+    pub(super) without_stats: bool,
 }
 
 /// Describes what a caller needs to read from a branch-local scan.
@@ -608,6 +612,7 @@ pub(super) fn choose_best_in_seek_candidate(
     let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
     let mut best_in_seek = None;
     let mut best_in_seek_cost = best_cost;
+    let mut best_in_seek_without_stats = false;
     let may_null_extend = table_references.outer_join_may_null_extend(rhs_table.internal_id);
 
     for candidate in rhs_constraints.candidates.iter() {
@@ -726,7 +731,24 @@ pub(super) fn choose_best_in_seek_candidate(
             } else {
                 Cost(0.0)
             };
-            if in_cost + sort_penalty >= best_in_seek_cost {
+            // SQLite weighs the IN seek against a seek on the equality prefix
+            // only when the index has sqlite_stat1 data: "If we do not have
+            // real sqlite_stat1 data, always prefer to use the index". Without
+            // stats our row estimates for the prefix are guesses, so do not
+            // reject the IN seek on them.
+            let without_stats = !eq_prefix.is_empty()
+                && candidate.index.as_ref().is_some_and(|index| {
+                    analyze_stats
+                        .table_stats(rhs_table.namespace.id, rhs_table.table.get_name())
+                        .is_none_or(|ts| !ts.index_stats.contains_key(&index.name))
+                });
+            let total_cost = in_cost + sort_penalty;
+            let beats_best = if without_stats {
+                !best_in_seek_without_stats || total_cost < best_in_seek_cost
+            } else {
+                !best_in_seek_without_stats && total_cost < best_in_seek_cost
+            };
+            if !beats_best {
                 continue;
             }
 
@@ -736,7 +758,8 @@ pub(super) fn choose_best_in_seek_candidate(
                 Affinity::Integer
             };
             let affinity = do_comparison_affinity(lhs_affinity, Affinity::None);
-            best_in_seek_cost = in_cost + sort_penalty;
+            best_in_seek_cost = total_cost;
+            best_in_seek_without_stats = without_stats;
             best_in_seek = Some(ChosenInSeekCandidate {
                 index: candidate.index.clone(),
                 affinity,
@@ -749,6 +772,7 @@ pub(super) fn choose_best_in_seek_candidate(
                 } else {
                     (estimated_values * rows_per_seek).max(1.0)
                 },
+                without_stats,
             });
         }
     }
@@ -778,7 +802,7 @@ fn consider_in_seek_access_method(
     params: &CostModelParams,
     best_cost: Cost,
     alternative_is_ordered: bool,
-) -> Result<Option<(AccessMethod, Cost)>> {
+) -> Result<Option<(AccessMethod, Cost, bool)>> {
     choose_best_in_seek_candidate(
         rhs_table,
         rhs_constraints,
@@ -794,7 +818,7 @@ fn consider_in_seek_access_method(
         BranchReadMode::FullRow,
         alternative_is_ordered,
     )?
-    .map(|chosen| -> Result<(AccessMethod, Cost)> {
+    .map(|chosen| -> Result<(AccessMethod, Cost, bool)> {
         let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
             &rhs_constraints.constraints,
             &chosen.prefix_refs,
@@ -813,6 +837,7 @@ fn consider_in_seek_access_method(
                 },
             },
             chosen.sort_penalty,
+            chosen.without_stats,
         ))
     })
     .transpose()
@@ -1172,7 +1197,7 @@ fn find_best_access_method_for_btree<'a>(
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
-        if let Some((in_seek_method, sort_penalty)) = consider_in_seek_access_method(
+        if let Some((in_seek_method, sort_penalty, without_stats)) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,
             lhs_mask,
@@ -1201,7 +1226,21 @@ fn find_best_access_method_for_btree<'a>(
             // method gives up the order of the btree access it replaces.
             let in_seek_cost =
                 cost_with_where_work(&in_seek_method, ready_where, input_cardinality, params);
-            if in_seek_cost + sort_penalty < best_cost_with_filters {
+            // Without stats, an IN seek replaces a seek on its own equality
+            // prefix whatever the estimates say, like SQLite does.
+            let replaces_prefix_seek = without_stats
+                && match (&in_seek_method.params, &best_access_method.params) {
+                    (
+                        AccessMethodParams::InSeek { index: Some(a), .. },
+                        AccessMethodParams::BTreeTable {
+                            index: Some(b),
+                            constraint_refs,
+                            ..
+                        },
+                    ) => Arc::ptr_eq(a, b) && !constraint_refs.is_empty(),
+                    _ => false,
+                };
+            if replaces_prefix_seek || in_seek_cost + sort_penalty < best_cost_with_filters {
                 best_access_method = in_seek_method;
                 best_cost_with_filters = in_seek_cost;
             }
