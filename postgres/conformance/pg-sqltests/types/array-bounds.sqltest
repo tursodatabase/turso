@@ -58,3 +58,47 @@ test arrays-with-other-bounds-are-distinct {
 expect {
     4|2
 }
+
+test array-bounds-are-kept-by-a-cast-of-the-elements {
+    SELECT '[0:1]={1,2}'::int[], '[3:4]={1,2}'::bigint[], '[0:1]={1,2}'::smallint[];
+}
+expect {
+    [0:1]={1,2}|[3:4]={1,2}|[0:1]={1,2}
+}
+
+test array-bounds-of-an-int-array-are-stored-in-a-column {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}'), ('{10,20,30}');
+    SELECT a FROM t ORDER BY a[1];
+}
+expect {
+    {10,20,30}
+    [0:2]={10,20,30}
+}
+
+test a-subscript-counts-from-the-lower-bound {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[0:2]={10,20,30}');
+    SELECT a[-1], a[0], a[1], a[2], a[3] FROM t;
+}
+expect {
+    |10|20|30|
+}
+
+test a-subscript-of-an-array-that-starts-at-one {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('{10,20,30}');
+    SELECT a[0], a[1], a[3], a[4] FROM t;
+}
+expect {
+    |10|30|
+}
+
+test a-subscript-reads-a-column-with-another-lower-bound {
+    CREATE TABLE t (a int[]);
+    INSERT INTO t VALUES ('[5:6]={1,2}');
+    SELECT a[4], a[5], a[6], a[7] FROM t;
+}
+expect {
+    |1|2|
+}

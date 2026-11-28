@@ -102,6 +102,15 @@ impl<'a> ArrayView<'a> {
     pub fn elements(&self) -> ValueIterator<'a> {
         self.elements.clone()
     }
+
+    pub fn position_of(&self, subscript: i64) -> Option<usize> {
+        position_of(self.lower_bound, subscript)
+    }
+}
+
+/// The index of the element with `subscript`, or None before the first element.
+pub fn position_of(lower_bound: i32, subscript: i64) -> Option<usize> {
+    usize::try_from(subscript.checked_sub(i64::from(lower_bound))?).ok()
 }
 
 #[cfg(test)]

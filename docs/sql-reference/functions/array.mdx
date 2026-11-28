@@ -82,7 +82,7 @@ SELECT string_to_array('a,NULL,b', ',', 'NULL');
 
 ### Subscript Operator []
 
-Access individual elements using zero-based indexing. Returns NULL for out-of-bounds or negative indices.
+Access individual elements by subscript. The first element has the lower bound of the array as its subscript, which is 1 unless the array has other bounds (see [Lower Bounds](#lower-bounds)). Returns NULL for a subscript outside the array.
 
 ```sql
 array_expr[index]
@@ -90,15 +90,15 @@ array_expr[index]
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, items TEXT[]) STRICT;
-INSERT INTO t VALUES (1, '["first", "second", "third"]');
+INSERT INTO t VALUES (1, ARRAY['first', 'second', 'third']);
 
-SELECT items[0], items[1], items[2] FROM t;
+SELECT items[1], items[2], items[3] FROM t;
 -- first|second|third
 
 SELECT items[100] FROM t;
 -- NULL
 
-SELECT items[-1] FROM t;
+SELECT items[0] FROM t;
 -- NULL
 ```
 
@@ -108,10 +108,10 @@ Subscripts can be chained for multi-dimensional arrays:
 CREATE TABLE m (id INTEGER PRIMARY KEY, matrix INTEGER[][]) STRICT;
 INSERT INTO m VALUES (1, ARRAY[ARRAY[1,2], ARRAY[3,4]]);
 
-SELECT matrix[0][1] FROM m;
+SELECT matrix[1][2] FROM m;
 -- 2
 
-SELECT matrix[1][0] FROM m;
+SELECT matrix[2][1] FROM m;
 -- 3
 ```
 
@@ -607,14 +607,14 @@ UPDATE table SET column[index] = value WHERE ...;
 CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
 INSERT INTO t VALUES (1, ARRAY['a','b','c']);
 
-UPDATE t SET tags[0] = 'X' WHERE id = 1;
+UPDATE t SET tags[1] = 'X' WHERE id = 1;
 SELECT tags FROM t;
--- ["X","b","c"]
+-- {X,b,c}
 
 -- Multiple subscripts in one UPDATE
-UPDATE t SET tags[0] = 'A', tags[2] = 'C' WHERE id = 1;
+UPDATE t SET tags[1] = 'A', tags[3] = 'C' WHERE id = 1;
 SELECT tags FROM t;
--- ["A","b","C"]
+-- {A,b,C}
 ```
 
 Out-of-bounds assignments are silently ignored (the array is unchanged).

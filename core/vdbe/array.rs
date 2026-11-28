@@ -311,6 +311,18 @@ pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     }
 }
 
+/// The subscript of the first element of an array value. None for NULL and
+/// for a value that is not an array.
+pub(crate) fn compute_array_lower_bound(val: &Value) -> Option<i64> {
+    match val {
+        Value::Blob(b) => ArrayView::parse(b)
+            .ok()
+            .map(|view| i64::from(view.lower_bound())),
+        Value::Text(t) => parse_text_array_value(t.as_str()).map(|a| i64::from(a.lower_bound)),
+        _ => None,
+    }
+}
+
 /// Compute the element count at array dimension `dim` (1-based). For `dim == 1`,
 /// returns the same value as [`compute_array_length`]. For `dim > 1`, the array
 /// is assumed to be uniform — each outer element is itself an array — and the

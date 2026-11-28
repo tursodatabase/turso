@@ -1,0 +1,29 @@
+@database :memory:
+@requires-file custom_types "array tests require custom types support"
+
+test array-element-counts-from-the-lower-bound {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a integer[]) STRICT;
+    INSERT INTO t VALUES (1, '[0:2]={10,20,30}');
+    SELECT array_element(a, -1), array_element(a, 0), array_element(a, 2), array_element(a, 3) FROM t;
+}
+expect {
+    |10|30|
+}
+
+test array-set-element-counts-from-the-lower-bound {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a integer[]) STRICT;
+    INSERT INTO t VALUES (1, '[0:2]={10,20,30}');
+    SELECT array_set_element(a, 0, 5), array_set_element(a, 2, 7), array_set_element(a, 3, 9), array_set_element(a, -1, 9) FROM t;
+}
+expect {
+    [0:2]={5,20,30}|[0:2]={10,20,7}|[0:2]={10,20,30}|[0:2]={10,20,30}
+}
+
+test array-set-element-keeps-an-array-that-starts-at-one {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a integer[]) STRICT;
+    INSERT INTO t VALUES (1, '{10,20,30}');
+    SELECT array_set_element(a, 1, 5), array_set_element(a, 0, 5) FROM t;
+}
+expect {
+    {5,20,30}|{10,20,30}
+}

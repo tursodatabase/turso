@@ -148,10 +148,10 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
-        parse_text_array_value, serialize_array_from_blob,
+        array_values_from_blob, compute_array_length, compute_array_lower_bound, exec_array_slice,
+        make_array_from_registers, parse_text_array_value, serialize_array_from_blob,
     },
-    array_value::{encode_array, ArrayValue, ArrayView, DEFAULT_LOWER_BOUND},
+    array_value::{encode_array, position_of, ArrayValue, ArrayView, DEFAULT_LOWER_BOUND},
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
         IntegrityCkData, IvmSumKind, RegisterOrLiteral, SorterOpenData,
@@ -3024,31 +3024,76 @@ pub fn op_array_element(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let idx = match state.registers[*index_reg].get_value() {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
-        _ => {
-            // Non-positive, non-integer, or NULL index → NULL result (PG convention: 1-based)
-            state.registers[*dest].set_null();
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
+    let Value::Numeric(Numeric::Integer(subscript)) = state.registers[*index_reg].get_value()
+    else {
+        state.registers[*dest].set_null();
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     };
 
     let result = match arr_val {
         Value::Blob(blob) => match ArrayView::parse(blob) {
-            Ok(view) => view
-                .elements()
-                .nth(idx)
-                .transpose()?
-                .map(|vref| vref.to_owned())
-                .transpose()?
-                .unwrap_or(Value::Null),
+            Ok(view) => match view.position_of(*subscript) {
+                Some(position) => view
+                    .elements()
+                    .nth(position)
+                    .transpose()?
+                    .map(|vref| vref.to_owned())
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+                None => Value::Null,
+            },
             Err(_) => Value::Null,
         },
         _ => Value::Null,
     };
 
     state.registers[*dest].set_value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Get the subscript of the first element of an array.
+pub fn op_array_lower_bound(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _connection: &Arc<Connection>,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(ArrayLowerBound { reg, dest }, insn);
+
+    match compute_array_lower_bound(state.registers[*reg].get_value()) {
+        Some(lower_bound) => state.registers[*dest].set_int(lower_bound),
+        None => state.registers[*dest].set_null(),
+    };
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Give an array the lower bound in a register.
+pub fn op_array_set_lower_bound(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _connection: &Arc<Connection>,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(ArraySetLowerBound { reg, bound_reg }, insn);
+
+    let (Value::Blob(blob), Value::Numeric(Numeric::Integer(bound))) = (
+        state.registers[*reg].get_value(),
+        state.registers[*bound_reg].get_value(),
+    ) else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let lower_bound = i32::try_from(*bound).map_err(|_| {
+        LimboError::InternalError(format!("array lower bound {bound} is out of range"))
+    })?;
+    let mut array = ArrayValue::decode(blob)?;
+    array.lower_bound = lower_bound;
+    state.registers[*reg].set_value(array.encode()?);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3368,14 +3413,11 @@ pub fn op_array_set_element(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let idx = match state.registers[*index_reg].get_value() {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
-        _ => {
-            // Invalid index (non-positive, non-integer): preserve original array (PG: 1-based)
-            state.registers[*dest].set_value(arr_val.clone());
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
+    let Value::Numeric(Numeric::Integer(subscript)) = state.registers[*index_reg].get_value()
+    else {
+        state.registers[*dest].set_value(arr_val.clone());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     };
 
     let new_val = state.registers[*value_reg].get_value().clone();
@@ -3385,13 +3427,15 @@ pub fn op_array_set_element(
             LimboError::InternalError("ArraySetElement: expected blob array".into()).into(),
         );
     };
-    let mut elements = array_values_from_blob(blob)?;
-    if idx >= elements.len() {
-        // Out-of-bounds: preserve original array unchanged
-        state.registers[*dest].set_blob(blob.clone())?;
-    } else {
-        elements[idx] = new_val;
-        state.registers[*dest].set_value(encode_array(DEFAULT_LOWER_BOUND, &elements)?);
+    let mut array = ArrayValue::decode(blob)?;
+    let position = position_of(array.lower_bound, *subscript)
+        .filter(|position| *position < array.elements.len());
+    match position {
+        Some(position) => {
+            array.elements[position] = new_val;
+            state.registers[*dest].set_value(array.encode()?);
+        }
+        None => state.registers[*dest].set_blob(blob.clone())?,
     }
 
     state.pc += 1;
