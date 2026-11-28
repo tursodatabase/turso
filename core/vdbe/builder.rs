@@ -1339,6 +1339,12 @@ impl ProgramBuilder {
         self.constant_spans.truncate(idx);
     }
 
+    /// Whether constant expressions stay where they are emitted, see
+    /// [Self::constants_in_place_start].
+    pub const fn constants_in_place(&self) -> bool {
+        self.constants_in_place_depth > 0
+    }
+
     /// Whether the register of a constant can be given to an equal constant.
     /// A subprogram does not move its constants to an init section (see
     /// [Self::epilogue]), and [Self::constants_in_place_start] keeps them
