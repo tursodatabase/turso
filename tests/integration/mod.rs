@@ -37,6 +37,7 @@ mod memory_yield;
 mod multiprocess;
 mod mvcc;
 mod native_extension;
+mod page1_allocation_race;
 mod pragma;
 mod query_processing;
 mod query_timeout;
