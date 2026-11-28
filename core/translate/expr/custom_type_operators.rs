@@ -6,11 +6,12 @@
 //! Nothing is written into the expression tree.
 
 use super::*;
+use crate::dialect::{ChosenOperator, Dialect, EngineType, OperandType, OperatorChoice};
 use crate::function::Deterministic;
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
-    same_type_def, sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType,
-    ExprType, TypeEnv,
+    dialect_operand_type, same_type_def, sqlite_operand_type, type_of, without_wrappers,
+    BuiltinType, ColumnCustomType, ExprType, TypeEnv,
 };
 
 /// The function that runs the operator expression `expr`, such as `a + b` or
@@ -38,6 +39,433 @@ pub(crate) fn check_custom_operator(expr: &ast::Expr, env: &TypeEnv) -> Result<(
         return Ok(());
     }
     find_operator_call(expr, &types, env).map(|_| ())
+}
+
+/// Asks the dialect to choose the operator of each operator in `expr` and
+/// wraps each string literal operand in a CAST to the type the chosen
+/// operator takes, as PostgreSQL reads `1 = '1'` as `1 = '1'::int4`. The
+/// operators are listed in [operator_uses]. This runs once the columns of
+/// `expr` are bound and before the optimizer sees the operators.
+pub(crate) fn read_literal_operands(
+    expr: &mut ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(());
+    }
+    let context = ExprContext::new(tables, resolver);
+    let dialect = resolver.catalog.dialect.as_ref();
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        let (mut operands, uses) = operator_uses(expr);
+        let mut types = vec![None; operands.len()];
+        {
+            let shared: Vec<&ast::Expr> = operands.iter().map(|operand| &**operand).collect();
+            let env = context.type_env();
+            for operator in &uses {
+                read_as_chosen_types(operator, &shared, &env, dialect, &mut types)?;
+            }
+        }
+        for (operand, ty) in operands.iter_mut().zip(types) {
+            let Some(ty) = ty else {
+                continue;
+            };
+            let literal = std::mem::replace(*operand, ast::Expr::Literal(ast::Literal::Null));
+            **operand = ast::Expr::Cast {
+                expr: Box::new(literal),
+                type_name: Some(ty),
+            };
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// Asks the dialect to choose the `=` of `lhs IN (SELECT rhs ...)`, where
+/// `rhs` is a column of the subquery and `rhs_type` its type. A string literal
+/// selected by the subquery is text, as in PostgreSQL, so it is not read as the
+/// type of `lhs`.
+pub(crate) fn check_in_subquery_operator(
+    lhs: &ast::Expr,
+    lhs_env: &TypeEnv,
+    rhs: &ast::Expr,
+    rhs_env: &TypeEnv,
+    rhs_type: ExprType,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(());
+    }
+    let lhs_type = type_of(lhs, lhs_env);
+    if matches!(lhs_type, ExprType::Null) || matches!(rhs_type, ExprType::Null) {
+        return Ok(());
+    }
+    let operand_types = || {
+        let rhs_operand = match dialect_operand_type(rhs, rhs_type.clone(), rhs_env) {
+            OperandType::StringLiteral(_) => OperandType::Engine {
+                ty: EngineType::Text,
+                array_dimensions: 0,
+            },
+            other => other,
+        };
+        vec![
+            dialect_operand_type(lhs, lhs_type.clone(), lhs_env),
+            rhs_operand,
+        ]
+    };
+    let choice = resolver
+        .catalog
+        .dialect
+        .choose_operator("=", &operand_types)?;
+    // FIXME(registered-types): Only the comparison of an expression with an
+    // expression is cast, so an operand of an IN subquery that the choice says
+    // to cast is refused. The comparison of two values has no single place
+    // that all comparisons go through yet. Once it has, the subquery's result
+    // column is cast there.
+    if let OperatorChoice::Chosen(chosen) = &choice {
+        if chosen.cast_operands.iter().any(|cast| *cast) {
+            return Err(LimboError::ParseError(format!(
+                "cannot compare type {lhs_type} with type {rhs_type}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Asks the dialect to choose `operator` and records, for each string literal
+/// among its operands, the type the dialect chose for it. The first type
+/// recorded for an operand stays.
+fn read_as_chosen_types(
+    operator: &OperatorUse,
+    operands: &[&ast::Expr],
+    env: &TypeEnv,
+    dialect: &dyn Dialect,
+    types: &mut [Option<ast::Type>],
+) -> Result<()> {
+    let operand_types = |slots: &[usize], null: OperandType| -> Vec<OperandType> {
+        slots
+            .iter()
+            .map(|&slot| operand_type(operands[slot], env, null.clone()))
+            .collect()
+    };
+    let choose_pair = |slots: &[usize]| {
+        dialect.choose_operator(operator.name, &|| {
+            operand_types(slots, OperandType::Unnamed)
+        })
+    };
+    match operator.kind {
+        UseKind::Each => {
+            let choice = choose_pair(&operator.operands)?;
+            record_chosen_types(choice, &operator.operands, operands, types);
+        }
+        UseKind::ListValues => {
+            // A NULL fits any type, like a parameter.
+            let choice = dialect.choose_list_operator(operator.name, &|| {
+                operand_types(&operator.operands, OperandType::Untyped)
+            })?;
+            match choice {
+                Some(choice) => record_chosen_types(choice, &operator.operands, operands, types),
+                None => {
+                    for &value in &operator.operands[1..] {
+                        let slots = [operator.operands[0], value];
+                        let choice = choose_pair(&slots)?;
+                        record_chosen_types(choice, &slots, operands, types);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What the dialect is told about `expr`: its type, `null` when it is NULL,
+/// and no type when it is a hidden column, which the engine compares with the
+/// argument itself.
+fn operand_type(expr: &ast::Expr, env: &TypeEnv, null: OperandType) -> OperandType {
+    if is_hidden_column(expr, env) {
+        return OperandType::Unnamed;
+    }
+    match type_of(expr, env) {
+        ExprType::Null => null,
+        ty => dialect_operand_type(expr, ty, env),
+    }
+}
+
+fn record_chosen_types(
+    choice: OperatorChoice,
+    slots: &[usize],
+    operands: &[&ast::Expr],
+    types: &mut [Option<ast::Type>],
+) {
+    let OperatorChoice::Chosen(chosen) = choice else {
+        return;
+    };
+    for (index, (&slot, ty)) in slots.iter().zip(chosen.operands).enumerate() {
+        let is_string_literal = matches!(
+            without_wrappers(operands[slot]),
+            ast::Expr::Literal(ast::Literal::String(_))
+        );
+        let is_cast = chosen.cast_operands.get(index).copied().unwrap_or(false);
+        if (is_string_literal || is_cast) && types[slot].is_none() {
+            types[slot] = Some(ty);
+        }
+    }
+}
+
+/// An operator that `expr` applies: its name and which of the operands of
+/// [operator_uses] it takes, one for a prefix operator and two otherwise.
+struct OperatorUse {
+    name: &'static str,
+    operands: Vec<usize>,
+    kind: UseKind,
+}
+
+enum UseKind {
+    /// The operator takes exactly the operands.
+    Each,
+    /// The first operand is compared with all the other operands as the
+    /// values of an IN list, which a dialect may read as one type.
+    ListValues,
+}
+
+/// The operands of `expr` and the operators it applies to them: the
+/// arithmetic, bit and comparison operators, the prefix `-` and `~`, the two
+/// comparisons of a BETWEEN, the `=` of each value of an IN list and of each
+/// WHEN of a CASE with a base, the `=` of NULLIF, a comparison of two row
+/// values as one comparison of each pair, and `IS [NOT] DISTINCT FROM` next
+/// to a string literal.
+///
+/// Every kind of expression is named, so a new one must say whether it
+/// applies an operator.
+fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>) {
+    match expr {
+        ast::Expr::Binary(lhs, op, rhs) => {
+            let name = comparison_symbol(op)
+                .or_else(|| binary_symbol(op))
+                .or_else(|| distinct_from_symbol(op, rhs));
+            let Some(name) = name else {
+                return (vec![lhs.as_mut(), rhs.as_mut()], Vec::new());
+            };
+            let row_values = match (lhs.as_ref(), rhs.as_ref()) {
+                (ast::Expr::Parenthesized(left), ast::Expr::Parenthesized(right)) => {
+                    left.len() > 1 && left.len() == right.len()
+                }
+                _ => false,
+            };
+            if !row_values {
+                return (
+                    vec![lhs.as_mut(), rhs.as_mut()],
+                    first_with_each(name, 1..2),
+                );
+            }
+            let (ast::Expr::Parenthesized(left), ast::Expr::Parenthesized(right)) =
+                (lhs.as_mut(), rhs.as_mut())
+            else {
+                unreachable!("both sides are row values")
+            };
+            let count = left.len();
+            let uses = (0..count)
+                .map(|i| OperatorUse {
+                    name,
+                    operands: vec![i, count + i],
+                    kind: UseKind::Each,
+                })
+                .collect();
+            let operands = left
+                .iter_mut()
+                .chain(right.iter_mut())
+                .map(|value| value.as_mut())
+                .collect();
+            (operands, uses)
+        }
+        ast::Expr::Unary(op, operand) => {
+            let uses = prefix_symbol(op)
+                .map(|name| {
+                    vec![OperatorUse {
+                        name,
+                        operands: vec![0],
+                        kind: UseKind::Each,
+                    }]
+                })
+                .unwrap_or_default();
+            (vec![operand.as_mut()], uses)
+        }
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            let mut uses = first_with_each(">=", 1..2);
+            uses.extend(first_with_each("<=", 2..3));
+            (vec![lhs.as_mut(), start.as_mut(), end.as_mut()], uses)
+        }
+        ast::Expr::InList { lhs, not, rhs } => {
+            let name = if *not { "<>" } else { "=" };
+            let row_len = match lhs.as_ref() {
+                ast::Expr::Parenthesized(left) if left.len() > 1 => Some(left.len()),
+                _ => None,
+            };
+            let are_rows_of_that_length = |row_len: usize| {
+                rhs.iter().all(|value| {
+                    matches!(value.as_ref(), ast::Expr::Parenthesized(row) if row.len() == row_len)
+                })
+            };
+            if let Some(row_len) = row_len.filter(|&len| are_rows_of_that_length(len)) {
+                let uses = (0..rhs.len())
+                    .flat_map(|row| {
+                        (0..row_len).map(move |i| OperatorUse {
+                            name,
+                            operands: vec![i, row_len + row * row_len + i],
+                            kind: UseKind::Each,
+                        })
+                    })
+                    .collect();
+                let ast::Expr::Parenthesized(left) = lhs.as_mut() else {
+                    unreachable!("the row value is parenthesized")
+                };
+                let mut operands: Vec<&mut ast::Expr> =
+                    left.iter_mut().map(|value| value.as_mut()).collect();
+                for value in rhs.iter_mut() {
+                    let ast::Expr::Parenthesized(row) = value.as_mut() else {
+                        unreachable!("every value is a row value")
+                    };
+                    operands.extend(row.iter_mut().map(|value| value.as_mut()));
+                }
+                return (operands, uses);
+            }
+            let (with_columns, without_columns): (Vec<usize>, Vec<usize>) =
+                (1..=rhs.len()).partition(|&slot| reads_a_column(&rhs[slot - 1]));
+            let mut uses = first_with_each(name, with_columns);
+            if !without_columns.is_empty() {
+                let mut operands = vec![0];
+                operands.extend(&without_columns);
+                uses.push(OperatorUse {
+                    name,
+                    operands,
+                    kind: UseKind::ListValues,
+                });
+            }
+            let operands = std::iter::once(lhs.as_mut())
+                .chain(rhs.iter_mut().map(|value| value.as_mut()))
+                .collect();
+            (operands, uses)
+        }
+        ast::Expr::Case {
+            base: Some(base),
+            when_then_pairs,
+            ..
+        } => {
+            let uses = first_with_each("=", 1..when_then_pairs.len() + 1);
+            let operands = std::iter::once(base.as_mut())
+                .chain(when_then_pairs.iter_mut().map(|(when, _)| when.as_mut()))
+                .collect();
+            (operands, uses)
+        }
+        ast::Expr::FunctionCall { name, args, .. }
+            if name.as_str().eq_ignore_ascii_case("nullif") && args.len() == 2 =>
+        {
+            let operands = args.iter_mut().map(|arg| arg.as_mut()).collect();
+            (operands, first_with_each("=", 1..2))
+        }
+        // The comparison with the values of a subquery is asked when the
+        // subquery is planned: see `in_subquery_collation`.
+        ast::Expr::InSelect { .. }
+        | ast::Expr::InTable { .. }
+        | ast::Expr::SubqueryResult { .. }
+        | ast::Expr::Case { base: None, .. }
+        | ast::Expr::FunctionCall { .. }
+        | ast::Expr::Cast { .. }
+        | ast::Expr::Collate(..)
+        | ast::Expr::Column { .. }
+        | ast::Expr::Default
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Exists(_)
+        | ast::Expr::FieldAccess { .. }
+        | ast::Expr::FunctionCallStar { .. }
+        | ast::Expr::Id(_)
+        | ast::Expr::IsNull(_)
+        | ast::Expr::Like { .. }
+        | ast::Expr::Literal(_)
+        | ast::Expr::MergedColumn(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::NotNull(_)
+        | ast::Expr::Parenthesized(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Raise(..)
+        | ast::Expr::Register { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Subquery(_)
+        | ast::Expr::Variable(_) => (Vec::new(), Vec::new()),
+        ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+    }
+}
+
+/// One use of `name` for the first operand and each operand in `others`.
+fn first_with_each(
+    name: &'static str,
+    others: impl IntoIterator<Item = usize>,
+) -> Vec<OperatorUse> {
+    others
+        .into_iter()
+        .map(|operand| OperatorUse {
+            name,
+            operands: vec![0, operand],
+            kind: UseKind::Each,
+        })
+        .collect()
+}
+
+/// Whether `expr` reads a column of the query, as an item of an IN list does
+/// that PostgreSQL compares with the left side alone.
+fn reads_a_column(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        found |= matches!(
+            expr,
+            ast::Expr::Column { .. }
+                | ast::Expr::RowId { .. }
+                | ast::Expr::MergedColumn(_)
+                | ast::Expr::Id(_)
+                | ast::Expr::Name(_)
+                | ast::Expr::Qualified(..)
+                | ast::Expr::DoublyQualified(..)
+        );
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+fn comparison_symbol(op: &ast::Operator) -> Option<&'static str> {
+    use ast::Operator;
+    Some(match op {
+        Operator::Equals => "=",
+        Operator::NotEquals => "<>",
+        Operator::Less => "<",
+        Operator::LessEquals => "<=",
+        Operator::Greater => ">",
+        Operator::GreaterEquals => ">=",
+        _ => return None,
+    })
+}
+
+/// `=` for `IS` and `IS NOT`, which is how `IS [NOT] DISTINCT FROM` reads. A
+/// truth test such as `x IS TRUE` compares nothing, so no operator is chosen.
+fn distinct_from_symbol(op: &ast::Operator, rhs: &ast::Expr) -> Option<&'static str> {
+    let is_distinct_from =
+        matches!(op, ast::Operator::Is | ast::Operator::IsNot) && truth_test_rhs(rhs).is_none();
+    is_distinct_from.then_some("=")
+}
+
+/// Whether `expr` is a hidden column, such as the argument of a table
+/// function, which the engine compares with the argument itself.
+fn is_hidden_column(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    let ast::Expr::Column { table, column, .. } = without_wrappers(expr) else {
+        return false;
+    };
+    env.tables()
+        .and_then(|tables| tables.find_table_by_internal_id(*table))
+        .and_then(|(_, table)| table.get_column_at(*column))
+        .is_some_and(|column| column.hidden())
 }
 
 /// The types of the operands of `expr`, in order, when it is an operator that
@@ -86,6 +514,9 @@ pub(super) fn find_operator_call(
     if custom_types.is_empty() {
         return Ok(None);
     }
+    if let Some(call) = call_the_dialect_chose(op, &operands, env)? {
+        return Ok(Some(call));
+    }
     let found = custom_types
         .iter()
         .flat_map(|ty| {
@@ -95,19 +526,65 @@ pub(super) fn find_operator_call(
         })
         .find(|(signature, ty)| accepts(signature, ty, &operands));
     let Some((signature, ty)) = found else {
-        match operands.as_slice() {
-            [operand] => {
-                crate::bail_parse_error!("operator does not exist: {op} {}", operand.type_name())
+        // FIXME(pg-catalog): This is a second table of operators, beside pg_operator, and it fails with a plain parse error where the PostgreSQL frontend must give 42883. For the PostgreSQL frontend, the pg_operator row decides whether the operator exists and which function runs it (its oprcode, once pg_proc has PostgreSQL's function oids), and this lookup is not asked.
+        let type_names: Vec<String> = operands.iter().map(Operand::type_name).collect();
+        return Err(match env.resolver() {
+            Some(resolver) => resolver
+                .catalog
+                .dialect
+                .undefined_operator_error(op, &type_names),
+            None => {
+                LimboError::ParseError(crate::dialect::undefined_operator_message(op, &type_names))
             }
-            [lhs, rhs] => crate::bail_parse_error!(
-                "operator does not exist: {} {op} {}",
-                lhs.type_name(),
-                rhs.type_name()
-            ),
-            _ => unreachable!("an operator has one or two operands"),
-        }
+        });
     };
     call_for(signature, ty, env)
+}
+
+/// The call of the function that the dialect names for `op` on `operands`,
+/// or `None` when the dialect names none.
+fn call_the_dialect_chose(
+    op: &'static str,
+    operands: &[Operand],
+    env: &TypeEnv,
+) -> Result<Option<OperatorCall>> {
+    let Some(resolver) = env.resolver() else {
+        return Ok(None);
+    };
+    let operand_types = || {
+        operands
+            .iter()
+            .map(|operand| dialect_operand_type(operand.expr, operand.expr_type.clone(), env))
+            .collect()
+    };
+    let choice = resolver
+        .catalog
+        .dialect
+        .choose_operator(op, &operand_types)?;
+    let OperatorChoice::Chosen(ChosenOperator {
+        function: Some(function),
+        ..
+    }) = choice
+    else {
+        return Ok(None);
+    };
+    let Some(func) = env.resolve_function(&function.name, operands.len())? else {
+        return Err(LimboError::InternalError(format!(
+            "function {} for operator {op} does not exist",
+            function.name
+        )));
+    };
+    if !func.is_deterministic() {
+        return Err(LimboError::InternalError(format!(
+            "function {} for operator {op} must be deterministic",
+            function.name
+        )));
+    }
+    Ok(Some(OperatorCall {
+        func,
+        encode: vec![None; operands.len()],
+        result: function.result,
+    }))
 }
 
 /// The symbol and operands of `expr` when it is an operator that custom types
@@ -183,6 +660,7 @@ struct Operand<'a> {
     is_blob: bool,
     /// The operand's type, as `type_of` gives it.
     expr_type: &'a ExprType,
+    expr: &'a ast::Expr,
 }
 
 impl<'a> Operand<'a> {
@@ -225,6 +703,7 @@ impl<'a> Operand<'a> {
             is_real,
             is_blob,
             expr_type,
+            expr,
         })
     }
 

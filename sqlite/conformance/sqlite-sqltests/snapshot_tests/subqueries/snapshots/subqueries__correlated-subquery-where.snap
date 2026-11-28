@@ -18,8 +18,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN products AS p
+|--MATERIALIZE scalar_subquery_t2
+|  `--SCAN products AS p2 USING INDEX idx_products_category
 `--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?)
-   `--SCAN products AS p2 USING INDEX idx_products_category
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4              p5  comment

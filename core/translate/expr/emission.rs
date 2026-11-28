@@ -1,5 +1,7 @@
 use super::*;
 use crate::alloc::TursoIteratorExt;
+use crate::schema::BTreeCharacteristics;
+use crate::vdbe::builder::CursorType;
 
 /// Emit literal values - shared between regular and RETURNING expression evaluation
 pub fn emit_literal(
@@ -176,9 +178,9 @@ pub fn process_returning_clause(
                     .expect("RETURNING clause must reference at least one table");
                 let internal_id = table.internal_id;
 
-                // Handle RETURNING * by expanding to all table columns
+                // Handle RETURNING * by expanding to the columns SELECT * shows.
                 // Use the shared internal_id for all columns
-                for (column_index, column) in table.columns().iter().enumerate() {
+                for (column_index, column) in table.columns_for_star() {
                     let column_expr = Expr::Column {
                         database: None,
                         table: internal_id,
@@ -213,6 +215,46 @@ pub struct ReturningBufferCtx {
     pub cursor_id: usize,
     /// Number of RETURNING columns (used for scan-back)
     pub num_columns: usize,
+}
+
+impl ReturningBufferCtx {
+    /// Opens the ephemeral table that buffers the RETURNING rows of a statement that
+    /// changes `table_name`. The table's columns are the RETURNING columns, in order,
+    /// because that is the record each buffered row holds.
+    pub(crate) fn open(
+        program: &mut ProgramBuilder,
+        table_name: &str,
+        result_columns: &[ResultSetColumn],
+        table_references: &TableReferences,
+    ) -> Result<Self> {
+        let columns = result_columns
+            .iter()
+            .map(|column| {
+                let name = column.name(table_references).map(String::from);
+                Column::new_default_text(name, String::new(), None)
+            })
+            .try_collect()?;
+        let buffer_table = Arc::new(BTreeTable::new(
+            0,
+            table_name.to_string(),
+            crate::alloc::vec![],
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: true,
+        });
+        Ok(Self {
+            cursor_id,
+            num_columns: result_columns.len(),
+        })
+    }
 }
 
 /// Emit the scan-back loop that reads all buffered RETURNING rows from the

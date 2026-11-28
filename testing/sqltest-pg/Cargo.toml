@@ -1,0 +1,23 @@
+[package]
+name = "sqltest-pg"
+version = "0.1.0"
+edition = "2024"
+description = "SQL test runner for the PostgreSQL frontend of Turso"
+license = "MIT"
+repository = "https://github.com/tursodatabase/turso"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sqltest-pg"
+path = "src/main.rs"
+
+[dependencies]
+sqltest = { path = "../sqltest" }
+async-trait = "0.1"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+# Turns on the SQL functions that the tursopg server also has.
+turso_core = { workspace = true, default-features = true, features = ["fs", "fts"] }
+turso_pg = { workspace = true }

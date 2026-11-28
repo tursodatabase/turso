@@ -59,7 +59,7 @@ pub use super::pager::{PageContent, PageInner};
 use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};
+use crate::io::{start_in_group, Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
@@ -599,10 +599,7 @@ pub fn begin_read_page(
         None
     });
     let c = Completion::new_read(buf, complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    db_file.read_page(page_idx, io_ctx, c)
+    start_in_group(group, c, |c| db_file.read_page(page_idx, io_ctx, c))
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -652,11 +649,10 @@ pub fn begin_write_btree_page(
         })
     };
     let c = Completion::new_write(write_complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
     let io_ctx = pager.io_ctx.read();
-    page_source.write_page(page_id, buffer, &io_ctx, c)
+    start_in_group(group, c, |c| {
+        page_source.write_page(page_id, buffer, &io_ctx, c)
+    })
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -748,13 +744,13 @@ pub fn write_pages_vectored(
                 done_cl.store(true, Ordering::Release);
             }
         });
-        group.add(&cmp);
         let io_ctx = pager.io_ctx.read();
         let bufs = std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY));
-        match pager
-            .db_file
-            .write_pages(start_id, page_sz, bufs, &io_ctx, cmp)
-        {
+        match start_in_group(Some(&mut *group), cmp, |c| {
+            pager
+                .db_file
+                .write_pages(start_id, page_sz, bufs, &io_ctx, c)
+        }) {
             Ok(c) => completions.push(c),
             Err(e) => {
                 // We failed to submit this run at all. Mark batch failed+done and cancel already-submitted.
@@ -1628,6 +1624,9 @@ impl BuildSharedWal {
                     self.phase = BuildSharedWalPhase::AwaitHeader(c);
                 }
                 BuildSharedWalPhase::AwaitHeader(c) => {
+                    if let Some(err) = c.get_error() {
+                        return Err(err.into());
+                    }
                     if !c.succeeded() {
                         io_yield_one!(c);
                     }
@@ -1655,6 +1654,9 @@ impl BuildSharedWal {
                     };
                 }
                 BuildSharedWalPhase::AwaitChunk { completion, offset } => {
+                    if let Some(err) = completion.get_error() {
+                        return Err(err.into());
+                    }
                     if !completion.succeeded() {
                         io_yield_one!(completion);
                     }
@@ -1746,8 +1748,7 @@ impl StreamingWalReader {
         let reader = self.clone();
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let _reader = reader.clone();
-            _reader.handle_header_read(res);
-            None
+            _reader.handle_header_read(res)
         });
         let c = Completion::new_read(header_buf, completion);
         self.file.pread(0, c)
@@ -1781,22 +1782,31 @@ impl StreamingWalReader {
         let completion: Box<ReadComplete> = Box::new(move |res| {
             tracing::debug!("WAL chunk read complete");
             let reader = me.clone();
-            reader.handle_chunk_read(res);
-            None
+            reader.handle_chunk_read(offset, res)
         });
         let c = Completion::new_read(buf, completion);
         let guard = self.file.pread(offset, c)?;
         Ok((read_size, guard))
     }
 
-    fn handle_header_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_header_read(
+        self: Arc<Self>,
+        res: Result<(Arc<Buffer>, i32), CompletionError>,
+    ) -> Option<CompletionError> {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
-            return;
+            return None;
         };
+        // The file is at least as long as the header, so a read that returns
+        // fewer bytes does not mean that the WAL has no header. If recovery
+        // treated it that way, the committed frames would not be visible and
+        // the next write would overwrite them.
         if bytes_read != WAL_HEADER_SIZE as i32 {
-            self.finalize_loading();
-            return;
+            return Some(CompletionError::ShortReadWalFrame {
+                offset: 0,
+                expected: WAL_HEADER_SIZE,
+                actual: bytes_read as usize,
+            });
         }
 
         let (page_sz, c1, c2, use_native, ok) = {
@@ -1840,7 +1850,7 @@ impl StreamingWalReader {
         if PageSize::new(page_sz).is_none() || !ok {
             *self.header.lock() = WalHeader::default();
             self.finalize_loading();
-            return;
+            return None;
         }
         {
             let mut st = self.state.write();
@@ -1853,14 +1863,28 @@ impl StreamingWalReader {
         self.off_atomic
             .store(WAL_HEADER_SIZE as u64, Ordering::Release);
         self.page_atomic.store(page_sz as u64, Ordering::Release);
+        None
     }
 
-    fn handle_chunk_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_chunk_read(
+        self: Arc<Self>,
+        offset: u64,
+        res: Result<(Arc<Buffer>, i32), CompletionError>,
+    ) -> Option<CompletionError> {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
-            return;
+            return None;
         };
-        let buf_slice = &buf.as_slice()[..bytes_read as usize];
+        // The requested bytes are all inside the file, so a read that returns
+        // fewer bytes does not show where the valid frames end.
+        if bytes_read as usize != buf.len() {
+            return Some(CompletionError::ShortReadWalFrame {
+                offset,
+                expected: buf.len(),
+                actual: bytes_read as usize,
+            });
+        }
+        let buf_slice = buf.as_slice();
         // Snapshot salts/endianness once to avoid per-frame header locks
         let (header_copy, use_native) = {
             let st = self.state.read();
@@ -1874,6 +1898,7 @@ impl StreamingWalReader {
         if consumed < buf_slice.len() || self.off_atomic.load(Ordering::Acquire) >= self.file_size {
             self.finalize_loading();
         }
+        None
     }
 
     // Processes frames from a buffer, returns bytes processed
@@ -2125,10 +2150,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
         PageTransform::None => complete,
     };
     let c = Completion::new_read(buf, complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    io.pread(offset, c)
+    start_in_group(group, c, |c| io.pread(offset, c))
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
@@ -2244,11 +2266,7 @@ pub fn begin_write_wal_header<F: File + ?Sized>(
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    let c = io.pwrite(0, buffer, c)?;
-    Ok(c)
+    start_in_group(group, c, |c| io.pwrite(0, buffer, c))
 }
 
 /// If the payload overflows the given limits, returns `Some(local_size)`, where `local_size` is
@@ -2580,6 +2598,39 @@ mod tests {
     #[case(&[0x80; 9])] // bits set without end
     fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
         assert!(read_varint(buf).is_err());
+    }
+
+    /// A page read whose submission fails must not leave an unfinished
+    /// child in its group: anything waiting on the group (for example
+    /// `drain_completions` in `balance_non_root`) would wait forever.
+    #[test]
+    fn failed_page_read_submission_finishes_its_group_child() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let file = io
+            .open_file("failed-read.db", crate::OpenFlags::Create, false)
+            .unwrap();
+        let db_file = crate::storage::database::DatabaseFile::new(file);
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(4096)
+            .expect("initialize buffer pool");
+        let page = Arc::new(crate::storage::pager::Page::new(0));
+        let mut group = CompletionGroup::new(|_| {});
+
+        // `DatabaseFile::read_page` rejects page 0 before submitting the read.
+        let result = begin_read_page(
+            &db_file,
+            buffer_pool,
+            page,
+            0,
+            false,
+            &IOContext::default(),
+            Some(&mut group),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(group.len(), 1);
+        assert!(group.completions().iter().all(|c| c.finished()));
     }
 
     #[test]

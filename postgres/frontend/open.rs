@@ -75,7 +75,7 @@ pub fn open_database_async(
                         state.phase = OpenPhase::Reloading;
                         continue;
                     };
-                    state.statement = Some(conn.prepare_engine_schema_statement(sql)?);
+                    state.statement = Some(conn.prepare_engine_schema_statement(&sql)?);
                 }
                 match state
                     .statement
@@ -125,7 +125,7 @@ pub struct OpenDatabaseState {
     db: Option<Arc<Database>>,
     conn: Option<Arc<Connection>>,
     statement: Option<Statement>,
-    queries: VecDeque<&'static str>,
+    queries: VecDeque<String>,
     reparse: ReparseSchemaState,
 }
 

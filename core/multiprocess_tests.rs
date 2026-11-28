@@ -1184,3 +1184,85 @@ fn read_header(conn: &Arc<Connection>) -> (u32, i32) {
     pager.end_read_tx();
     header
 }
+
+#[test]
+fn database_open_reads_main_file_when_wal_is_empty_but_tshm_claims_frames() {
+    reopen_after_wal_lost_frames("coordination-empty-wal-reopen.db", false, false);
+}
+
+#[test]
+fn database_open_reads_main_file_when_wal_is_empty_but_overflowed_tshm_claims_frames() {
+    reopen_after_wal_lost_frames("coordination-empty-wal-overflowed-reopen.db", true, false);
+}
+
+#[test]
+fn database_open_reads_wal_frames_that_remain_when_tshm_claims_more_frames() {
+    reopen_after_wal_lost_frames("coordination-short-wal-reopen.db", false, true);
+}
+
+/// Commits two transactions after a checkpoint, closes the database, truncates
+/// the WAL file to drop both transactions (or only the last one when
+/// `keep_first_commit` is set) while the -tshm file still describes them, and
+/// checks that a reopen reads only what the WAL file and the main file have.
+fn reopen_after_wal_lost_frames(file_name: &str, mark_overflowed: bool, keep_first_commit: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join(file_name);
+    let db_path_str = db_path.to_str().unwrap();
+    let wal_path = format!("{db_path_str}-wal");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn_a = db_a
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    commit_new_pages(&conn_a, 1);
+    commit_user_version(&conn_a, 1);
+    run_checkpoint(
+        &conn_a,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    let header_in_main_file = read_header(&conn_a);
+    commit_new_pages(&conn_a, 3);
+    let header_after_first_commit = read_header(&conn_a);
+    let frames_of_first_commit = wal_max_frame(&conn_a);
+    commit_user_version(&conn_a, 2);
+    assert!(wal_max_frame(&conn_a) > frames_of_first_commit);
+    assert_ne!(read_header(&conn_a), header_after_first_commit);
+    assert_ne!(header_after_first_commit, header_in_main_file);
+    if mark_overflowed {
+        db_a.shared_wal_coordination()
+            .unwrap()
+            .unwrap()
+            .mark_frame_index_overflowed_for_tests();
+    }
+
+    drop(conn_a);
+    drop(db_a);
+    remove_file_from_database_registry(db_path_str);
+
+    let (wal_len, expected_frames, expected_header) = if keep_first_commit {
+        let frame_size = (storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE + 4096) as u64;
+        (
+            storage::sqlite3_ondisk::WAL_HEADER_SIZE as u64 + frames_of_first_commit * frame_size,
+            frames_of_first_commit,
+            header_after_first_commit,
+        )
+    } else {
+        (0, 0, header_in_main_file)
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&wal_path)
+        .unwrap()
+        .set_len(wal_len)
+        .unwrap();
+
+    let db_b = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn_b = db_b
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(wal_max_frame(&conn_b), expected_frames);
+    assert_eq!(read_header(&conn_b), expected_header);
+}

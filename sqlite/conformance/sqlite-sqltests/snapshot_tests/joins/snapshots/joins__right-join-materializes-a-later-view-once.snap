@@ -18,8 +18,9 @@ info:
 QUERY PLAN
 |--SCAN later_view_left
 |--SCAN later_view_right
-|--SCAN later_view_value
+|--MATERIALIZE later_view_value
 |  `--SCAN CONSTANT ROW
+|--SCAN later_view_value
 `--RIGHT-JOIN later_view_right
    `--SCAN later_view_right
 

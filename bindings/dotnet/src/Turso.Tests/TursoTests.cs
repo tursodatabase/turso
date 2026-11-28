@@ -3,6 +3,7 @@ using System.Data.Common;
 using AwesomeAssertions;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Value;
+using Turso.Tests.Support;
 
 namespace Turso.Tests;
 
@@ -458,5 +459,67 @@ public class TursoTests
         {
             if (File.Exists(tempPath)) File.Delete(tempPath);
         }
+    }
+
+    [TestCase("")]
+    [TestCase("Encryption Cipher=;")]
+    public void TestEncryptionKeyWithoutCipherIsRejected(string cipherOption)
+    {
+        using var directory = new TemporaryDirectory();
+        var path = directory.File("key-without-cipher.db");
+        var hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        using var connection = new TursoConnection($"Data Source={path};{cipherOption}Encryption Key={hexkey}");
+
+        connection.Invoking(x => x.Open()).Should().Throw<InvalidOperationException>()
+            .WithMessage("Encryption Cipher is required when Encryption Key is specified.");
+        File.Exists(path).Should().BeFalse();
+    }
+
+    [TestCase("")]
+    [TestCase("Encryption Key=;")]
+    [TestCase("Encryption Key=\"   \";")]
+    public void TestEncryptionCipherWithoutKeyIsRejected(string keyOption)
+    {
+        using var directory = new TemporaryDirectory();
+        var path = directory.File("cipher-without-key.db");
+        using var connection = new TursoConnection($"Data Source={path};Encryption Cipher=aegis256;{keyOption}");
+
+        connection.Invoking(x => x.Open()).Should().Throw<InvalidOperationException>()
+            .WithMessage("Encryption Key is required when Encryption Cipher is specified.");
+        File.Exists(path).Should().BeFalse();
+    }
+
+    [TestCase("")]
+    [TestCase("Encryption Cipher=;Encryption Key=;")]
+    [TestCase("Encryption Cipher=\"   \";Encryption Key=\"   \";")]
+    public void TestBlankEncryptionOptionsOpenPlaintextDatabase(string options)
+    {
+        using var directory = new TemporaryDirectory();
+        var path = directory.File("plaintext.db");
+        using (var connection = new TursoConnection($"Data Source={path};{options}"))
+        {
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE t(x TEXT)");
+            connection.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+
+        var header = File.ReadAllBytes(path)[..16];
+        System.Text.Encoding.ASCII.GetString(header).Should().Be("SQLite format 3\0");
+    }
+
+    // The native code rejects these keys before it creates the database file.
+    [TestCase("")]
+    [TestCase("   ")]
+    [TestCase("zz")]
+    [TestCase("000102030405060708090a0b0c0d0e0f")]
+    public void TestOpenDatabaseWithEncryptionRejectsInvalidKey(string hexkey)
+    {
+        using var directory = new TemporaryDirectory();
+        var path = directory.File("invalid-key.db");
+
+        var open = () => TursoBindings.OpenDatabaseWithEncryption(path, TursoEncryptionCipher.Aegis256, hexkey);
+
+        open.Should().Throw<TursoException>();
+        File.Exists(path).Should().BeFalse();
     }
 }

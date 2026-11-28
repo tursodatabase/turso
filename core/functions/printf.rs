@@ -5,6 +5,7 @@ use std::str::Chars;
 
 use crate::numeric::{format_float, str_to_i64, Numeric};
 use crate::types::Value;
+use crate::vdbe::value::sqlite_text_prefix;
 use crate::vdbe::Register;
 
 #[derive(Default, Clone)]
@@ -185,20 +186,16 @@ fn coerce_to_f64(value: &Value) -> f64 {
     }
 }
 
-/// The part of `s` before the first NUL character. SQLite reads the format
-/// string and string arguments as C strings, so they end at the first NUL.
-fn until_nul(s: &str) -> &str {
-    s.find('\0').map_or(s, |end| &s[..end])
-}
-
 /// Coerce a Value to String for string specifiers.
 fn coerce_to_string(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Numeric(Numeric::Integer(i)) => i.to_string(),
         Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)),
-        Value::Text(t) => until_nul(t.as_str()).to_string(),
-        Value::Blob(b) => until_nul(&String::from_utf8_lossy(b)).to_string(),
+        // SQLite reads a string argument as a C string, so the string ends at
+        // the first NUL.
+        Value::Text(t) => sqlite_text_prefix(t.as_str()).to_string(),
+        Value::Blob(b) => sqlite_text_prefix(&String::from_utf8_lossy(b)).to_string(),
     }
 }
 
@@ -1371,7 +1368,9 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
         }
     };
 
-    let format_str = until_nul(format_str);
+    // SQLite reads the format string as a C string, so it ends at the first
+    // NUL.
+    let format_str = sqlite_text_prefix(format_str);
 
     let mut result = String::new();
     let mut args_index = 0;

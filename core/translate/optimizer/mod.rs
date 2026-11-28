@@ -1276,12 +1276,13 @@ fn simplify_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
                 ..
             } = &mut subquery.state
             {
-                if let Plan::Select(ref mut inner_plan) = inner_plan.as_mut() {
-                    if inner_plan.limit.is_none() {
-                        inner_plan.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
-                            "1".to_string(),
-                        ))));
-                    }
+                let limit = inner_plan
+                    .select_limit_mut()
+                    .expect("an EXISTS subquery is a SELECT");
+                if limit.is_none() {
+                    *limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
+                        "1".to_string(),
+                    ))));
                 }
             }
         }
@@ -5147,6 +5148,7 @@ mod tests {
             crate::sync::Arc::new(crate::dialect::cannot_parse::DialectThatCannotParse),
             None,
             crate::security::roles::RoleId::SUPERUSER,
+            crate::statement::StatementOrigin::InternalHelper,
         )
     }
 

@@ -117,6 +117,9 @@ jobs:
       - name: Bench scan_loop_benchmark
         if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run scan_loop_benchmark
+      - name: Bench seek_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run seek_benchmark
       - name: Bench select_star_benchmark
         if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run select_star_benchmark

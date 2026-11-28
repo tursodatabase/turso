@@ -200,6 +200,18 @@ impl EncryptionOpts {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Checks that the cipher name is known, that the key is valid hex, and that the key has the
+    /// size that the cipher needs. It does not check the key against a database.
+    ///
+    /// The open functions of [`Database`] call this before they open or create the database file,
+    /// so that invalid options do not leave a new, empty file. A caller that opens the file itself
+    /// and then gives the storage to [`Database::open_async`] must call it first.
+    pub fn validate(&self) -> Result<()> {
+        let cipher = CipherMode::try_from(self.cipher.as_str())?;
+        let key = EncryptionKey::from_hex_string(&self.hexkey)?;
+        cipher.check_key_size(&key)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1130,10 +1142,15 @@ impl Database {
                 "built-in encryption cannot be combined with an external page codec".to_string(),
             ));
         }
-        if options.encryption.is_some() && !options.db_opts.enable_encryption {
-            return Err(LimboError::InvalidArgument(
-                "encryption is an opt in feature".into(),
-            ));
+        if let Some(encryption) = &options.encryption {
+            if !options.db_opts.enable_encryption {
+                return Err(LimboError::InvalidArgument(
+                    "encryption is an opt in feature".into(),
+                ));
+            }
+            // The open parses the cipher and the key only after it has opened the file. Check
+            // them here, before the file is created, so that invalid options leave no empty file.
+            encryption.validate()?;
         }
         Ok(())
     }
@@ -2452,21 +2469,13 @@ impl Database {
                             let flags = self.open_flags;
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
-                                if !authority.frame_index_overflowed() {
-                                    WalFileShared::open_shared_from_authority_if_exists(
-                                        &self.io,
-                                        &self.wal_path,
-                                        flags,
-                                        authority,
-                                        &self.db_file,
-                                    )?
-                                } else {
-                                    WalFileShared::open_shared_if_exists(
-                                        &self.io,
-                                        &self.wal_path,
-                                        flags,
-                                    )?
-                                }
+                                WalFileShared::open_shared_from_authority_if_exists(
+                                    &self.io,
+                                    &self.wal_path,
+                                    flags,
+                                    authority,
+                                    &self.db_file,
+                                )?
                             } else {
                                 WalFileShared::open_shared_if_exists(
                                     &self.io,
@@ -2610,17 +2619,13 @@ impl Database {
             #[cfg(host_shared_wal)]
             {
                 if let Some(authority) = shared_authority.as_ref() {
-                    if !authority.frame_index_overflowed() {
-                        WalFileShared::open_shared_from_authority_if_exists(
-                            &self.io,
-                            &self.wal_path,
-                            flags,
-                            authority,
-                            &self.db_file,
-                        )?
-                    } else {
-                        WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
-                    }
+                    WalFileShared::open_shared_from_authority_if_exists(
+                        &self.io,
+                        &self.wal_path,
+                        flags,
+                        authority,
+                        &self.db_file,
+                    )?
                 } else {
                     WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
                 }
@@ -3096,6 +3101,7 @@ impl Database {
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             namespace_being_dropped: RwLock::new(None),
+            defer_fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             triggers_enabled: AtomicBool::new(true),
             writes_stored_values: AtomicBool::new(false),
@@ -4017,6 +4023,11 @@ impl Database {
     /// The SQL dialect this database was opened with.
     pub fn dialect(&self) -> Arc<dyn Dialect> {
         self.dialect.clone()
+    }
+
+    /// The SQL dialect this database was opened with, as a reference.
+    pub(crate) fn dialect_ref(&self) -> &dyn Dialect {
+        self.dialect.as_ref()
     }
 
     pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {

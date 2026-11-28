@@ -1573,7 +1573,6 @@ pub fn summarize(start: Instant, results: &[FileResult]) -> RunSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::rust::RustBackend;
 
     #[test]
     fn test_matches_filter_exact() {
@@ -1641,7 +1640,10 @@ expect {
         std::fs::write(dir.path().join("broken.sqltest"), broken).unwrap();
         std::fs::write(dir.path().join("passes.sqltest"), passes).unwrap();
         let config = RunnerConfig::default().with_fail_fast(true);
-        let runner = TestRunner::new(RustBackend::new()).with_config(config);
+        let runner = TestRunner::new(OneRowBackend {
+            backend_type: Backend::Rust,
+        })
+        .with_config(config);
 
         let results = runner
             .run_paths(&[dir.path().to_path_buf()], |_| {})
@@ -1689,7 +1691,10 @@ expect {
         let config = RunnerConfig::default()
             .with_max_jobs(1)
             .with_fail_fast(true);
-        let runner = TestRunner::new(RustBackend::new()).with_config(config);
+        let runner = TestRunner::new(OneRowBackend {
+            backend_type: Backend::Rust,
+        })
+        .with_config(config);
 
         let results = runner.run_loaded_tests(loaded, |_| {}).await.unwrap();
 

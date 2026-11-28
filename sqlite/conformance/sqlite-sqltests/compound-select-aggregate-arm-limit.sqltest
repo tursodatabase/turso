@@ -1,0 +1,57 @@
+@database :memory:
+
+# The arms of a compound SELECT share one LIMIT and one OFFSET counter. The
+# single row of an aggregate without GROUP BY must decrement both, as a row of
+# any other SELECT does. count(*) on a whole table and max() use their own
+# fast paths, so both are tested.
+
+setup two_rows {
+    CREATE TABLE t(id INTEGER);
+    INSERT INTO t VALUES(1), (2);
+}
+
+@setup two_rows
+test aggregate-arm-counts-against-limit {
+    SELECT count(*) FROM t UNION ALL SELECT 9 LIMIT 1;
+    SELECT max(id) FROM t UNION ALL SELECT 9 LIMIT 1;
+    SELECT sum(id) FROM t UNION ALL SELECT 9 UNION ALL SELECT 10 LIMIT 2;
+    SELECT 1 UNION ALL SELECT count(*) FROM t UNION ALL SELECT 10 LIMIT 2;
+}
+expect {
+    2
+    2
+    3
+    9
+    1
+    2
+}
+
+@setup two_rows
+test aggregate-arm-counts-against-offset {
+    SELECT count(*) FROM t UNION ALL SELECT 9 LIMIT 1 OFFSET 1;
+    SELECT max(id) FROM t UNION ALL SELECT 9 UNION ALL SELECT 10 LIMIT 2 OFFSET 1;
+    SELECT 1 UNION ALL SELECT count(*) FROM t UNION ALL SELECT 3 LIMIT 1 OFFSET 1;
+    SELECT 1 UNION ALL SELECT max(id) FROM t UNION ALL SELECT 3 LIMIT 1 OFFSET 1;
+}
+expect {
+    9
+    9
+    10
+    2
+    2
+}
+
+@setup two_rows
+test aggregate-limit-and-offset-without-compound {
+    SELECT count(*) FROM t LIMIT 1;
+    SELECT count(*) FROM t LIMIT -1;
+    SELECT count(*) FROM t LIMIT 0;
+    SELECT count(*) FROM t LIMIT 1 OFFSET 1;
+    SELECT max(id) FROM t LIMIT 1 OFFSET 1;
+    SELECT max(id) FROM t LIMIT 1 OFFSET 0;
+}
+expect {
+    2
+    2
+    2
+}

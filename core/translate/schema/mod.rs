@@ -36,7 +36,7 @@ use crate::translate::expr::expr_type::{
     value_type, BuiltinType, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
-use crate::translate::fkeys::emit_fk_drop_table_check;
+use crate::translate::fkeys::{emit_fk_drop_child_table_check, emit_fk_drop_table_check};
 use crate::translate::plan::{compound_column_affinities, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
@@ -465,6 +465,11 @@ fn resolve_func_return_type(
         }
         ResultType::Declared(ReturnType::Array) => Ok(CheckExprType::Any),
         ResultType::FirstArgument => Ok(first_argument()?.unwrap_or(CheckExprType::Any)),
+        ResultType::Argument(index) => Ok(args
+            .get(index)
+            .map(|arg| type_of(arg))
+            .transpose()?
+            .unwrap_or(CheckExprType::Any)),
         ResultType::OneOfTheArguments => common_check_type(args.iter().map(|arg| type_of(arg))),
         ResultType::OneOfTheIifValues => {
             common_check_type(iif_values(args).map(|arg| type_of(arg)))
@@ -1500,6 +1505,27 @@ pub fn translate_create_table(
         0,
         resolver.catalog.dialect.supports_namespaces(),
     )?;
+    // FIXME(pg-catalog): HACK. See refuse_timestamp_timestamptz_comparison_in_schema_expr.
+    for column in table.columns() {
+        if let crate::schema::GeneratedType::Virtual { expr, .. }
+        | crate::schema::GeneratedType::Stored { expr, .. } = column.generated_type()
+        {
+            crate::translate::collate::refuse_timestamp_timestamptz_comparison_in_schema_expr(
+                expr,
+                &table,
+                resolver,
+                crate::translate::collate::GENERATION_EXPRESSION_NOT_IMMUTABLE,
+            )?;
+        }
+    }
+    // The schema of the table's database does the same when it loads the
+    // table, so the catalog sees the table as a later statement will.
+    resolver.with_schema(database_id, |schema| {
+        table.resolve_types_and_domains(schema)
+    })?;
+    for column in table.columns() {
+        check_default_type(column, resolver)?;
+    }
     let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
@@ -1552,11 +1578,6 @@ pub fn translate_create_table(
     } else {
         TableText::Statement(input)
     };
-    // The schema of the table's database does the same when it loads the
-    // table, so the catalog sees the table as a later statement will.
-    resolver.with_schema(database_id, |schema| {
-        table.resolve_types_and_domains(schema)
-    })?;
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -1661,6 +1682,33 @@ pub fn translate_create_table(
     });
 
     Ok(())
+}
+
+/// Asks the dialect whether the DEFAULT of `column` can be written to it.
+pub(crate) fn check_default_type(column: &Column, resolver: &Resolver) -> Result<()> {
+    let Some(default) = column.default.as_deref() else {
+        return Ok(());
+    };
+    if column.ty_str.is_empty() {
+        return Ok(());
+    }
+    let source = || {
+        crate::translate::expr::expr_type::cast_source_of(
+            default,
+            &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+            resolver.schema(),
+        )
+    };
+    let column_type = crate::translate::expr::expr_type::type_ref_of_name(
+        &column.ty_str,
+        column.array_dimensions(),
+        resolver.schema(),
+    );
+    resolver.catalog.dialect.check_column_default(
+        column.name.as_deref().unwrap_or_default(),
+        &source,
+        &column_type,
+    )
 }
 
 /// Translates `CREATE SCHEMA name`: a new namespace of the main
@@ -2069,6 +2117,11 @@ pub fn translate_drop_table(
         })
     {
         emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
+    }
+    if connection.foreign_keys_enabled()
+        && resolver.with_schema(database_id, |s| s.has_child_fks(namespace.id, name))
+    {
+        emit_fk_drop_child_table_check(program, resolver, name, namespace)?;
     }
     // r1 and r2. The catalog may overwrite both while it deletes its rows.
     // r2 then gets the root page that `Destroy` moved, as in SQLite's
@@ -3253,6 +3306,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         stored_form_sorts_in_value_order: _,
         is_type_of_conditions: _,
         casts_to_numbers_and_booleans: _,
+        can_be_rowid_alias: _,
         sql: _,
         domain_checks,
         kind,

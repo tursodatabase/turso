@@ -234,7 +234,7 @@ avoid this window.
 | PRAGMA data_version              | ❌ No         |                                              |
 | PRAGMA database_list             | ✅ Yes        |                                              |
 | PRAGMA default_cache_size        | Not Needed | deprecated in SQLite                         |
-| PRAGMA defer_foreign_keys        | ❌ No         |                                              |
+| PRAGMA defer_foreign_keys        | ✅ Yes        |                                              |
 | PRAGMA empty_result_callbacks    | Not Needed | deprecated in SQLite                         |
 | PRAGMA encoding                  | ✅ Yes        |                                              |
 | PRAGMA foreign_key_check         | ✅ Yes        |                                              |
@@ -792,7 +792,7 @@ Modifiers:
 | sqlite3_libversion_number | ✅ Yes  | Returns 3050004 |
 | sqlite3_sourceid       | ❌ No      |         |
 | sqlite3_threadsafe     | ✅ Yes     | Returns 1 |
-| sqlite3_complete       | ❌ No      | Stub    |
+| sqlite3_complete       | ✅ Yes     |         |
 | sqlite3_interrupt      | ✅ Yes     |         |
 | sqlite3_sleep          | ❌ No      | Stub    |
 | sqlite3_randomness     | ❌ No      |         |

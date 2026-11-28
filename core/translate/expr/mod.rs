@@ -104,13 +104,14 @@ pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{
-    check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
+    check_custom_operator, check_in_subquery_operator, custom_operator_call,
+    emit_operator_call_on_registers, read_literal_operands,
 };
 pub(crate) use custom_types::read_untyped_operand_as;
 pub(crate) use custom_types::{
-    emit_constraint_values_decode, emit_conversion, emit_decode, emit_dml_expr_index_value,
-    emit_encode_for_comparison, emit_store_value, emit_trigger_decode_registers,
-    emit_untyped_operand_store, emit_user_facing_column_value,
+    emit_coerce_rowid, emit_constraint_values_decode, emit_conversion, emit_decode,
+    emit_dml_expr_index_value, emit_encode_for_comparison, emit_store_value,
+    emit_trigger_decode_registers, emit_untyped_operand_store, emit_user_facing_column_value,
 };
 pub(crate) use custom_types::{runs_custom_type_function, takes_input_of_type};
 pub use emission::{

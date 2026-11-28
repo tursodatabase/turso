@@ -3,9 +3,12 @@
 
 mod pgwire_text;
 
+use crate::catalog::regclass_text;
+use crate::pg_type::regtype_text;
 pub(crate) use pgwire_text::encode_bytea;
 use std::borrow::Cow;
-use turso_core::{ColumnTypeKind, Numeric, Value};
+use std::sync::Arc;
+use turso_core::{ColumnTypeKind, Connection, Numeric, Value};
 
 /// How the values of a column are written as PostgreSQL text. turso_pg stores
 /// a boolean as an integer and a timestamptz as text without its offset, so
@@ -18,6 +21,10 @@ pub enum TextType {
     Boolean,
     /// Text without an offset gets `+00`.
     TimestampTz,
+    /// An integer prints as the name of the relation that has it as oid.
+    RegClass,
+    /// An integer prints as the name of the type that has it as oid.
+    RegType,
 }
 
 impl TextType {
@@ -38,6 +45,8 @@ impl TextType {
                 |name| match (name.to_ascii_uppercase().as_str(), info.array_dimensions) {
                     ("BOOL" | "BOOLEAN", 0) => Some(TextType::Boolean),
                     ("TIMESTAMPTZ", 0) => Some(TextType::TimestampTz),
+                    ("REGCLASS", 0) => Some(TextType::RegClass),
+                    ("REGTYPE", 0) => Some(TextType::RegType),
                     _ => None,
                 },
             )
@@ -47,9 +56,19 @@ impl TextType {
 
 /// The PostgreSQL text of `value` in a column of type `text_type`, or `None`
 /// for NULL.
-pub fn value_text(value: &Value, text_type: TextType) -> Option<Cow<'_, str>> {
+pub fn value_text<'a>(
+    value: &'a Value,
+    text_type: TextType,
+    connection: &Arc<Connection>,
+) -> Option<Cow<'a, str>> {
     let text = match value {
         Value::Null => return None,
+        Value::Numeric(Numeric::Integer(i)) if text_type == TextType::RegClass => {
+            Cow::Owned(regclass_text(connection, *i))
+        }
+        Value::Numeric(Numeric::Integer(i)) if text_type == TextType::RegType => {
+            Cow::Owned(regtype_text(connection, *i))
+        }
         Value::Numeric(Numeric::Integer(i)) if text_type == TextType::Boolean => {
             Cow::Borrowed(pgwire_text::encode_bool(*i != 0))
         }

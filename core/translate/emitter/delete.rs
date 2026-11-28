@@ -3,7 +3,7 @@ use crate::ast::TriggerEvent;
 use crate::namespace::NamespaceRef;
 use crate::{
     emit_explain,
-    schema::{BTreeTable, ColumnLayout},
+    schema::{BTreeTable, ColumnLayout, ForeignKey, ResolvedFkRef},
     sync::Arc,
     translate::{
         emitter::{
@@ -31,7 +31,7 @@ use crate::{
         trigger_exec::{fire_trigger, TriggerContext},
     },
     vdbe::{
-        builder::{CursorKey, CursorType, DmlRowForm, ProgramBuilder},
+        builder::{CursorKey, DmlRowForm, ProgramBuilder},
         insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
@@ -74,19 +74,12 @@ fn emit_row_loop_delete(
     // All DML completes before any RETURNING rows are yielded to the caller.
     let returning_buffer = if !plan.result_columns.is_empty() {
         let table_ref = plan.table_references.joined_tables().first().unwrap();
-        let btree_table = table_ref
-            .table
-            .btree()
-            .expect("DELETE target must be a BTree table");
-        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: ret_cursor_id,
-            is_table: true,
-        });
-        Some(ReturningBufferCtx {
-            cursor_id: ret_cursor_id,
-            num_columns: plan.result_columns.len(),
-        })
+        Some(ReturningBufferCtx::open(
+            program,
+            table_ref.table.get_name(),
+            &plan.result_columns,
+            &plan.table_references,
+        )?)
     } else {
         None
     };
@@ -376,112 +369,143 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, child_table_name, None)
     })? {
-        if !fk_ref.fk.deferred {
+        if !resolver.fk_is_deferred(&fk_ref.fk) {
             continue;
         }
-        let child_positions: Vec<usize> = fk_ref
-            .fk
-            .child_columns
-            .iter()
-            .map(|cname| child_tbl.get_column(cname).unwrap().0)
-            .collect();
-        let child_key = emit_columns_and_dependencies(
+        emit_fk_child_decrement_for_key(
             program,
             child_tbl,
             child_cursor_id,
             child_rowid_reg,
-            child_positions.iter().copied(),
+            &fk_ref.fk,
+            Some(&fk_ref),
+            database_id,
             resolver,
         )?;
+    }
+    Ok(())
+}
 
-        // Fast path: if any FK column is NULL can't be a violation
-        let null_skip = program.allocate_label();
-        for &pos in &child_positions {
-            program.emit_insn(Insn::IsNull {
-                reg: child_key.to_column_reg(pos),
-                target_pc: null_skip,
-            });
-        }
+/// Subtracts one from the deferred counter when the key of `fk` in the
+/// current child row is not NULL and no parent row matches it. `fk_ref` is
+/// `None` when the parent table does not exist, so no parent row can match.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_fk_child_decrement_for_key(
+    program: &mut ProgramBuilder,
+    child_tbl: &BTreeTable,
+    child_cursor_id: usize,
+    child_rowid_reg: usize,
+    fk: &ForeignKey,
+    fk_ref: Option<&ResolvedFkRef>,
+    database_id: usize,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    let child_positions: Vec<usize> = fk
+        .child_columns
+        .iter()
+        .map(|cname| child_tbl.get_column(cname).unwrap().0)
+        .collect();
+    let child_key = emit_columns_and_dependencies(
+        program,
+        child_tbl,
+        child_cursor_id,
+        child_rowid_reg,
+        child_positions.iter().copied(),
+        resolver,
+    )?;
 
-        if fk_ref.parent_uses_rowid {
-            // Probe parent table by rowid
-            let parent_tbl = resolver
-                .with_schema(database_id, |s| {
-                    s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
-                })
-                .expect("parent btree");
-            let pcur = open_read_table(program, &parent_tbl, database_id);
+    // Fast path: if any FK column is NULL can't be a violation
+    let null_skip = program.allocate_label();
+    for &pos in &child_positions {
+        program.emit_insn(Insn::IsNull {
+            reg: child_key.to_column_reg(pos),
+            target_pc: null_skip,
+        });
+    }
 
-            let tmpi = program.alloc_register();
+    let Some(fk_ref) = fk_ref else {
+        emit_guarded_fk_decrement(program, null_skip, true);
+        program.preassign_label_to_next_insn(null_skip);
+        return Ok(());
+    };
+    if fk_ref.parent_uses_rowid {
+        // Probe parent table by rowid
+        let parent_tbl = resolver
+            .with_schema(database_id, |s| {
+                s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+            })
+            .expect("parent btree");
+        let pcur = open_read_table(program, &parent_tbl, database_id);
+
+        let tmpi = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: child_key.to_column_reg(child_positions[0]),
+            dst_reg: tmpi,
+            extra_amount: 0,
+        });
+        // A key that is not an integer cannot match a parent rowid, so the
+        // parent is missing, and NotExists jumps there too
+        let missing = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::MustBeInt {
+            reg: tmpi,
+            target_pc: Some(missing),
+        });
+
+        program.emit_insn(Insn::NotExists {
+            cursor: pcur,
+            rowid_reg: tmpi,
+            target_pc: missing,
+        });
+
+        // Parent FOUND, no decrement
+        program.emit_insn(Insn::Close { cursor_id: pcur });
+        program.emit_insn(Insn::Goto { target_pc: done });
+
+        // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
+        program.preassign_label_to_next_insn(missing);
+        program.emit_insn(Insn::Close { cursor_id: pcur });
+        emit_guarded_fk_decrement(program, done, true);
+        program.preassign_label_to_next_insn(done);
+    } else {
+        // Probe parent unique index
+        let parent_tbl = resolver
+            .with_schema(database_id, |s| {
+                s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+            })
+            .expect("parent btree");
+        let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
+        let icur = open_read_index(program, idx, database_id);
+
+        // Build probe from current child row
+        let n = fk_ref.fk.child_columns.len();
+        let probe = program.alloc_registers(n);
+        for (i, &pos) in child_positions.iter().enumerate() {
             program.emit_insn(Insn::Copy {
-                src_reg: child_key.to_column_reg(child_positions[0]),
-                dst_reg: tmpi,
+                src_reg: child_key.to_column_reg(pos),
+                dst_reg: probe + i,
                 extra_amount: 0,
             });
-            // A key that is not an integer cannot match a parent rowid, so the
-            // parent is missing, and NotExists jumps there too
-            let missing = program.allocate_label();
-            let done = program.allocate_label();
-            program.emit_insn(Insn::MustBeInt {
-                reg: tmpi,
-                target_pc: Some(missing),
-            });
-
-            program.emit_insn(Insn::NotExists {
-                cursor: pcur,
-                rowid_reg: tmpi,
-                target_pc: missing,
-            });
-
-            // Parent FOUND, no decrement
-            program.emit_insn(Insn::Close { cursor_id: pcur });
-            program.emit_insn(Insn::Goto { target_pc: done });
-
-            // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
-            program.preassign_label_to_next_insn(missing);
-            program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
-            program.preassign_label_to_next_insn(done);
-        } else {
-            // Probe parent unique index
-            let parent_tbl = resolver
-                .with_schema(database_id, |s| {
-                    s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
-                })
-                .expect("parent btree");
-            let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
-            let icur = open_read_index(program, idx, database_id);
-
-            // Build probe from current child row
-            let n = fk_ref.fk.child_columns.len();
-            let probe = program.alloc_registers(n);
-            for (i, &pos) in child_positions.iter().enumerate() {
-                program.emit_insn(Insn::Copy {
-                    src_reg: child_key.to_column_reg(pos),
-                    dst_reg: probe + i,
-                    extra_amount: 0,
-                });
-            }
-            program.emit_insn(Insn::Affinity {
-                start_reg: probe,
-                count: std::num::NonZeroUsize::new(n).unwrap(),
-                affinities: build_index_affinity_string(idx, &parent_tbl),
-            });
-
-            let ok = program.allocate_label();
-            program.emit_insn(Insn::Found {
-                cursor_id: icur,
-                target_pc: ok,
-                record_reg: probe,
-                num_regs: n,
-            });
-            program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
-            program.preassign_label_to_next_insn(ok);
-            program.emit_insn(Insn::Close { cursor_id: icur });
         }
-        program.preassign_label_to_next_insn(null_skip);
+        program.emit_insn(Insn::Affinity {
+            start_reg: probe,
+            count: std::num::NonZeroUsize::new(n).unwrap(),
+            affinities: build_index_affinity_string(idx, &parent_tbl),
+        });
+
+        let ok = program.allocate_label();
+        program.emit_insn(Insn::Found {
+            cursor_id: icur,
+            target_pc: ok,
+            record_reg: probe,
+            num_regs: n,
+        });
+        program.emit_insn(Insn::Close { cursor_id: icur });
+        emit_guarded_fk_decrement(program, ok, true);
+        program.preassign_label_to_next_insn(ok);
+        program.emit_insn(Insn::Close { cursor_id: icur });
     }
+    program.preassign_label_to_next_insn(null_skip);
     Ok(())
 }
 

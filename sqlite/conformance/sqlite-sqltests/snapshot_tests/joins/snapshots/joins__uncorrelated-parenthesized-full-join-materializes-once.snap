@@ -24,8 +24,9 @@ QUERY PLAN
 |--SCAN nested_once_outer
 `--CORRELATED SCALAR SUBQUERY 1
    |--SCAN (join-1)
-   |  |--SCAN nested_once_value
+   |  |--MATERIALIZE nested_once_value
    |  |  `--SCAN CONSTANT ROW
+   |  |--SCAN nested_once_value
    |  |--SCAN nested_once_empty LEFT-JOIN
    |  `--RIGHT-JOIN nested_once_empty
    |     `--SCAN nested_once_empty

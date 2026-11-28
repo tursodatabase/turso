@@ -1990,7 +1990,7 @@ test indexed-average-uses-outer-row-count {
           );
 }
 expect pattern {
-    (?s)SCAN one_indexed_avg_outer AS o.*CORRELATED SCALAR SUBQUERY.*SEARCH i USING INDEX indexed_avg_inner_k.*SCAN many_indexed_avg_outer AS o.*SEARCH scalar_subquery_.*SCAN indexed_avg_inner AS i USING INDEX indexed_avg_inner_k
+    (?s)SCAN one_indexed_avg_outer AS o.*CORRELATED SCALAR SUBQUERY.*SEARCH i USING INDEX indexed_avg_inner_k.*SCAN many_indexed_avg_outer AS o.*MATERIALIZE scalar_subquery_.*SCAN indexed_avg_inner AS i USING INDEX indexed_avg_inner_k.*SEARCH scalar_subquery_
 }
 
 # Two copies of the same aggregate need one grouped table.
@@ -2027,7 +2027,7 @@ test two-identical-averages-use-one-grouped-table {
           ) - 100;
 }
 expect pattern {
-    ^1\n[0-9]+\|0\|0\|SCAN two_avg_outer AS o\n[0-9]+\|0\|0\|SEARCH scalar_subquery_[^\n]*\n[0-9]+\|[0-9]+\|0\|SCAN two_avg_inner AS i\n[0-9]+\|[0-9]+\|0\|USE SORTER FOR GROUP BY$
+    ^1\n[0-9]+\|0\|0\|SCAN two_avg_outer AS o\n[0-9]+\|0\|0\|MATERIALIZE scalar_subquery_[^\n]*\n[0-9]+\|[1-9][0-9]*\|0\|SCAN two_avg_inner AS i\n[0-9]+\|[1-9][0-9]*\|0\|USE SORTER FOR GROUP BY\n[0-9]+\|0\|0\|SEARCH scalar_subquery_[^\n]*$
 }
 
 # A grouped table search reads its result from the index when the result is

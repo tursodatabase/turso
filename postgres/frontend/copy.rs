@@ -9,13 +9,20 @@
 //! - Empty field = empty string (not NULL)
 //! - Lines starting with `\.` = end of data
 
+use crate::error::sqlstate_error;
 use crate::session::relation_lookup_namespaces;
 use crate::text::{value_text, TextType};
-use turso_core::{LimboError, Result, Row};
+use std::sync::Arc;
+use turso_core::{Connection, LimboError, Result, Row};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_BAD_COPY_FILE_FORMAT, SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE, SQLSTATE_UNDEFINED_COLUMN,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
+};
 use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
 
 pub struct CopyTextEncoder {
     columns: Vec<TextType>,
+    connection: Arc<Connection>,
 }
 
 impl CopyTextEncoder {
@@ -23,7 +30,10 @@ impl CopyTextEncoder {
         let columns = (0..stmt.num_columns())
             .map(|index| TextType::of_column(stmt, index))
             .collect();
-        Self { columns }
+        Self {
+            columns,
+            connection: stmt.connection().clone(),
+        }
     }
 
     /// Append one COPY text record, including its trailing newline.
@@ -33,7 +43,7 @@ impl CopyTextEncoder {
             if index > 0 {
                 output.push(b'\t');
             }
-            match value_text(value, *text_type) {
+            match value_text(value, *text_type, &self.connection) {
                 None => output.extend_from_slice(b"\\N"),
                 Some(text) => escape_copy_text(text.as_bytes(), output),
             }
@@ -68,17 +78,11 @@ pub(crate) fn prepare_copy_to_stdout(
             if schema.get_view(ns, &spec.table).is_some()
                 || schema.is_materialized_view(ns, &spec.table)
             {
-                return Err(LimboError::ParseError(
-                    "COPY TO STDOUT requires a plain table".to_owned(),
-                ));
+                return Err(not_a_plain_table());
             }
             schema
                 .get_table(ns, &spec.table)
-                .map(|table| {
-                    table.btree().ok_or_else(|| {
-                        LimboError::ParseError("COPY TO STDOUT requires a plain table".to_owned())
-                    })
-                })
+                .map(|table| table.btree().ok_or_else(not_a_plain_table))
                 .transpose()
         })?;
         if let Some(table) = table {
@@ -87,7 +91,11 @@ pub(crate) fn prepare_copy_to_stdout(
         }
     }
     let (namespace, table) = found.ok_or_else(|| {
-        LimboError::ParseError(format!("COPY table '{}' does not exist", spec.table))
+        sqlstate_error(
+            SQLSTATE_UNDEFINED_TABLE,
+            format!("COPY table '{}' does not exist", spec.table),
+            None,
+        )
     })?;
     let columns = if spec.columns.is_empty() {
         table
@@ -99,7 +107,11 @@ pub(crate) fn prepare_copy_to_stdout(
     } else {
         for name in &spec.columns {
             let (_, column) = table.get_column(name).ok_or_else(|| {
-                LimboError::ParseError(format!("COPY column '{name}' does not exist"))
+                sqlstate_error(
+                    SQLSTATE_UNDEFINED_COLUMN,
+                    format!("COPY column '{name}' does not exist"),
+                    None,
+                )
             })?;
             column.ensure_not_generated("COPY", name)?;
         }
@@ -115,6 +127,16 @@ pub(crate) fn prepare_copy_to_stdout(
         quote_identifier(&namespace.name),
         quote_identifier(&spec.table)
     ))
+}
+
+/// The error of COPY TO STDOUT from a relation that is not a table, such
+/// as a view.
+fn not_a_plain_table() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_WRONG_OBJECT_TYPE,
+        "COPY TO STDOUT requires a plain table",
+        None,
+    )
 }
 
 /// A parsed row from COPY text format: each element is None for NULL, Some for a value.
@@ -147,12 +169,16 @@ pub fn parse_copy_text_format(
 
         let fields: Vec<&str> = line.split(delimiter).collect();
         if fields.len() != num_columns {
-            return Err(LimboError::ParseError(format!(
-                "COPY: line {}: expected {} columns, got {}",
-                line_num + 1,
-                num_columns,
-                fields.len()
-            )));
+            return Err(sqlstate_error(
+                SQLSTATE_BAD_COPY_FILE_FORMAT,
+                format!(
+                    "COPY: line {}: expected {} columns, got {}",
+                    line_num + 1,
+                    num_columns,
+                    fields.len()
+                ),
+                None,
+            ));
         }
 
         let row = fields
@@ -242,9 +268,11 @@ fn invalid_byte_sequence(bytes: &[u8]) -> LimboError {
         .map(|b| format!("0x{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ");
-    LimboError::ParseError(format!(
-        "invalid byte sequence for encoding \"UTF8\": {shown}"
-    ))
+    sqlstate_error(
+        SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE,
+        format!("invalid byte sequence for encoding \"UTF8\": {shown}"),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -310,7 +338,7 @@ mod tests {
             let result = parse_copy_text_format(data, '\t', "\\N", 1, false);
             let expected = format!("invalid byte sequence for encoding \"UTF8\": {bad_bytes}");
             assert!(
-                matches!(&result, Err(LimboError::ParseError(msg)) if *msg == expected),
+                matches!(&result, Err(LimboError::Dialect(error)) if error.message == expected),
                 "{data:?} gave {result:?}"
             );
         }

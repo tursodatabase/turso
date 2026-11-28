@@ -241,6 +241,21 @@ expect {
     gs_catalog_docs
 }
 
+test grant-select-on-stored-catalog-does-not-permit-writes {
+    CREATE ROLE gs_catalog_read_only;
+    GRANT SELECT ON pg_catalog.pg_class TO gs_catalog_read_only;
+    SET ROLE gs_catalog_read_only;
+    DELETE FROM pg_catalog.pg_class;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table pg_class
+}
+@sqlstate 42501
+expect @tursopg error {
+    cannot delete from pg_catalog table "pg_class"
+}
+
 test grant-select-on-information-schema-table {
     CREATE ROLE gs_schemata_reader;
     GRANT SELECT ON information_schema.schemata TO gs_schemata_reader;

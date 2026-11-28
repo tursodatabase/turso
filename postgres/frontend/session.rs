@@ -1,4 +1,3 @@
-use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::num::NonZero;
@@ -7,8 +6,10 @@ use std::sync::Arc;
 use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
-use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
-use crate::pg_type::type_exists;
+use crate::error::{
+    in_failed_sql_transaction_error, not_supported, sql_parse_error, sqlstate_error,
+};
+use crate::pg_type::{regtype_oid_of_text, type_exists, RegClassInput};
 use crate::roles::connection_roles;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
@@ -27,9 +28,11 @@ use turso_core::{DependentObject, NamespaceId};
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_DUPLICATE_SCHEMA, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE,
+    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_IO_ERROR, SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_FILE, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_TABLE,
 };
 use turso_pg_parser::translator::{
     check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
@@ -39,6 +42,7 @@ use turso_pg_parser::translator::{
     PostgreSQLTranslator, SerialSequence, TranslateResult,
 };
 use turso_pg_parser::ParseError;
+use turso_pg_parser::RegKind;
 
 use crate::copy::parse_copy_text_format;
 use turso_core::SessionRole;
@@ -74,8 +78,6 @@ pub fn tursopg_database_opts() -> turso_core::DatabaseOpts {
         .with_custom_types(true)
         .with_encryption(true)
         .with_index_method(true)
-        .with_autovacuum(true)
-        .with_attach(true)
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -324,10 +326,11 @@ pub(crate) fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
         .any(|table| table.btree().is_some() && !catalog::is_system_table_name(table.get_name()))
         || schema.views(turso_core::NamespaceId::ROOT).next().is_some();
     if has_tables_in_no_schema {
-        return Err(LimboError::ParseError(
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
             "the database keeps its tables in no schema, as an earlier version of tursopg or \
-             SQLite made it; this version does not open it"
-                .to_string(),
+             SQLite made it; this version does not open it",
+            None,
         ));
     }
     Ok(())
@@ -539,13 +542,13 @@ fn translate_statement<'a>(
     };
     let (sql, parse_result) = match rewritten_sql {
         Some(sql) => {
-            let parse_result =
-                turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+            let parse_result = turso_pg_parser::parse(&sql).map_err(sql_parse_error)?;
             (Cow::Owned(sql), parse_result)
         }
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
+    let (sql, parse_result) = resolve_reg_constants(&pg_conn.conn, sql, parse_result)?;
     let existing_generated = turso_pg_parser::alter_table_add_column_table(&parse_result)
         .and_then(|(schema, table)| {
             relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
@@ -1539,19 +1542,80 @@ fn name_foreign_key_tables<'a>(
     let mut sql = sql.into_owned();
     for table in tables.iter().rev() {
         let namespace = match table.schema.as_deref() {
-            Some(schema) => conn.qualifier(&schema.to_lowercase()).ok_or_else(|| {
-                LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
-            })?,
+            Some(schema) => conn
+                .qualifier(&schema.to_lowercase())
+                .ok_or_else(|| undefined_schema(schema))?,
             None => foreign_key_table_namespace(conn, &table.name, created.as_ref()).ok_or_else(
-                || LimboError::ParseError("no schema has been selected to create in".to_string()),
+                || {
+                    sqlstate_error(
+                        SQLSTATE_INVALID_SCHEMA_NAME,
+                        "no schema has been selected to create in",
+                        None,
+                    )
+                },
             )?,
         };
         sql = turso_pg_parser::name_at(&sql, table.location, &namespace.mangle_name(&table.name))
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(sql_parse_error)?;
     }
-    let parse_result =
-        turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let parse_result = turso_pg_parser::parse(&sql).map_err(sql_parse_error)?;
     Ok((Cow::Owned(sql), parse_result))
+}
+
+/// `sql` with each regclass or regtype constant that the statement stores
+/// replaced by the oid of its relation or type, as PostgreSQL does when it analyzes the
+/// statement: a view, a default or a check then keeps the relation or type when it is
+/// renamed, and a name with none fails the statement.
+fn resolve_reg_constants<'a>(
+    conn: &Arc<Connection>,
+    sql: Cow<'a, str>,
+    parse_result: turso_pg_parser::ParseResult,
+) -> Result<(Cow<'a, str>, turso_pg_parser::ParseResult)> {
+    let constants = turso_pg_parser::reg_constants_to_resolve(&parse_result);
+    if constants.is_empty() {
+        return Ok((sql, parse_result));
+    }
+    let created = created_table(conn, &parse_result);
+    let mut sql = sql.into_owned();
+    for constant in constants.iter().rev() {
+        // The table that the statement creates does not exist yet, so a
+        // constant that names it keeps its name.
+        if constant.kind == RegKind::Class
+            && names_created_table(conn, &constant.text, created.as_ref())
+        {
+            continue;
+        }
+        let oid = match constant.kind {
+            RegKind::Class => crate::catalog::regclass_oid_of_text(conn, &constant.text)?,
+            RegKind::Type => regtype_oid_of_text(conn, &constant.text)?,
+        };
+        sql = turso_pg_parser::replace_string_constant(&sql, constant.location, &oid.to_string())
+            .map_err(sql_parse_error)?;
+    }
+    let parse_result = turso_pg_parser::parse(&sql).map_err(sql_parse_error)?;
+    Ok((Cow::Owned(sql), parse_result))
+}
+
+/// Whether the regclass `text` names `created`, the table that the statement
+/// creates.
+fn names_created_table(
+    conn: &Arc<Connection>,
+    text: &str,
+    created: Option<&(Qualifier, String)>,
+) -> bool {
+    let Some((namespace, table)) = created else {
+        return false;
+    };
+    let Ok(RegClassInput::Name { schema, name }) = crate::pg_type::parse_regclass(text) else {
+        return false;
+    };
+    name == *table
+        && match schema {
+            Some(schema) => conn
+                .qualifier(&schema)
+                .is_some_and(|qualifier| qualifier.target.id == namespace.target.id),
+            None => true,
+        }
 }
 
 /// The schema and name of the table that a CREATE TABLE statement creates.
@@ -1601,7 +1665,7 @@ fn schema_error(error: LimboError) -> LimboError {
         return error;
     };
     match message.strip_prefix("no such database: ") {
-        Some(schema) => LimboError::ParseError(format!("schema \"{schema}\" does not exist")),
+        Some(schema) => undefined_schema(schema),
         None => error,
     }
 }
@@ -1645,7 +1709,8 @@ fn relation_name_is_taken(
             let ns = namespace.target.id;
             (
                 schema.get_table(ns, table).is_some() && !schema.is_materialized_view(ns, table),
-                schema.relation_kind(ns, name).is_some(),
+                crate::classes::class_catalog(schema)
+                    .is_some_and(|catalog| catalog.name_is_taken(ns, name)),
             )
         });
         taken = name_exists;
@@ -1704,7 +1769,7 @@ fn write_out_renamed_serial_columns<'a>(
         let stored_name = stored_sequence_name(conn, &sequence.schema, &sequence.name)?;
         let written_out =
             turso_pg_parser::write_out_serial_column(&sql, &sequence.column, &stored_name)
-                .map_err(|e| LimboError::ParseError(e.to_string()))?;
+                .map_err(sql_parse_error)?;
         sql = Cow::Owned(written_out);
     }
     Ok(sql)
@@ -1718,13 +1783,7 @@ fn stored_sequence_name(conn: &Arc<Connection>, schema: &str, name: &str) -> Res
     let namespace = relation_lookup_namespaces(conn, Some(schema))
         .into_iter()
         .next()
-        .ok_or_else(|| {
-            sqlstate_error(
-                SQLSTATE_INVALID_SCHEMA_NAME,
-                format!("schema \"{schema}\" does not exist"),
-                None,
-            )
-        })?;
+        .ok_or_else(|| undefined_schema(schema))?;
     Ok(if namespace.is_database() {
         format!("public.{name}")
     } else {
@@ -1892,9 +1951,11 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     let lower = sql.to_ascii_lowercase();
     for table_name in ["sqlite_master", "sqlite_schema"] {
         if lower.contains(table_name) {
-            return Err(LimboError::ParseError(format!(
-                "no such table: {table_name}"
-            )));
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_TABLE,
+                format!("no such table: {table_name}"),
+                None,
+            ));
         }
     }
     Ok(())
@@ -1940,8 +2001,7 @@ fn try_prepare_special(
 /// The engine error for an error of the translator.
 fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
     match error {
-        ParseError::ParseError(message) => LimboError::ParseError(message),
-        ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message, None),
+        ParseError::PgQuery(_) | ParseError::Sqlstate { .. } => sql_parse_error(error),
         ParseError::SchemaQualifiedName { ref schema, .. } => {
             match check_schema_exists(conn, schema) {
                 Err(missing_schema) => missing_schema,
@@ -2059,13 +2119,9 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
                     && !stmt.on_sequences
                     && matches!(schema.as_str(), "pg_catalog" | "information_schema")
                 {
-                    return Err(sqlstate_error(
-                        SQLSTATE_FEATURE_NOT_SUPPORTED,
-                        format!(
-                            "REVOKE on the system catalogs of schema {schema} is not supported"
-                        ),
-                        None,
-                    ));
+                    return Err(not_supported(format!(
+                        "REVOKE on the system catalogs of schema {schema}"
+                    )));
                 }
                 relations.extend(
                     schema_objects(conn, &schema)
@@ -2094,11 +2150,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
         for grantee in &stmt.roles {
             if let PgGrantee::Role(name) = grantee {
                 if catalog::role_oid_by_name(&roles, name).is_none() {
-                    return Err(sqlstate_error(
-                        SQLSTATE_UNDEFINED_OBJECT,
-                        format!("role \"{name}\" does not exist"),
-                        None,
-                    ));
+                    return Err(crate::auth_members::role_does_not_exist(name));
                 }
             }
         }
@@ -2122,11 +2174,16 @@ fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
     if catalog::namespace_exists(conn, schema) {
         return Ok(());
     }
-    Err(sqlstate_error(
+    Err(undefined_schema(schema))
+}
+
+/// PostgreSQL's error for a schema name that names no schema.
+pub(crate) fn undefined_schema(schema: &str) -> LimboError {
+    sqlstate_error(
         SQLSTATE_INVALID_SCHEMA_NAME,
         format!("schema \"{schema}\" does not exist"),
         None,
-    ))
+    )
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
@@ -2149,14 +2206,14 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                         .map(turso_pg_parser::quote_identifier)
                 })
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?
+                .ok_or_else(unsupported_set_value)?
                 .join(", "),
         ),
         (Some(Parameter::Custom(_)), PgSetTo::Values(values)) => match values.as_slice() {
             [PgSetValue::Identifier(value)
             | PgSetValue::StringLiteral(value)
             | PgSetValue::Number(value)] => quote(value),
-            [_] => return Err(LimboError::ParseError("incorrect format".to_string())),
+            [_] => return Err(unsupported_set_value()),
             _ => {
                 return Err(sqlstate_error(
                     SQLSTATE_INVALID_PARAMETER_VALUE,
@@ -2181,7 +2238,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     | PgSetValue::Number(s) => Ok(s.as_str()),
                     PgSetValue::Bool(true) => Ok("on"),
                     PgSetValue::Bool(false) => Ok("off"),
-                    _ => Err(LimboError::ParseError("incorrect format".to_string())),
+                    _ => Err(unsupported_set_value()),
                 })
                 .collect::<Result<Vec<_>>>()?;
             quote(&values.join(", "))
@@ -2191,11 +2248,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 PgSetTo::Default => "RESET",
                 PgSetTo::Values(_) | PgSetTo::Current => "SET",
             };
-            return Err(sqlstate_error(
-                SQLSTATE_FEATURE_NOT_SUPPORTED,
-                format!("{command} {name} is not supported"),
-                None,
-            ));
+            return Err(not_supported(format!("{command} {name}")));
         }
     };
     // Change the setting when the statement runs, not when it is prepared.
@@ -2216,13 +2269,7 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
         Some(Parameter::Custom(_)) => session_state(&pg_conn.conn)?
             .name_as_defined(name)
             .unwrap_or_else(|| name.clone()),
-        None => {
-            return Err(sqlstate_error(
-                SQLSTATE_FEATURE_NOT_SUPPORTED,
-                format!("SHOW {name} is not supported"),
-                None,
-            ))
-        }
+        None => return Err(not_supported(format!("SHOW {name}"))),
     };
     pg_conn.conn.prepare(format!(
         "SELECT current_setting('{}') AS {}",
@@ -2291,11 +2338,7 @@ pub(crate) fn set_role(
         Some(name) => {
             let roles = connection_roles(conn);
             let Some(role) = catalog::postgres_roles(&roles).find(|role| role.name == name) else {
-                return Err(sqlstate_error(
-                    SQLSTATE_UNDEFINED_OBJECT,
-                    format!("role \"{name}\" does not exist"),
-                    None,
-                ));
+                return Err(crate::auth_members::role_does_not_exist(name));
             };
             if !roles.can_set_role(conn.session_role(), role.id) {
                 return Err(LimboError::PermissionDenied(Box::new(
@@ -2354,6 +2397,12 @@ pub(crate) fn session_state(conn: &Connection) -> Result<&PgSessionState> {
     })
 }
 
+/// The error of a SET whose value is valid in PostgreSQL but not of a kind
+/// that tursopg stores for that parameter, such as a number in search_path.
+fn unsupported_set_value() -> LimboError {
+    sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, "incorrect format", None)
+}
+
 fn is_valid_custom_parameter_name(name: &str) -> bool {
     name.contains('.') && name.split('.').all(is_simple_identifier)
 }
@@ -2367,39 +2416,13 @@ fn is_simple_identifier(name: &str) -> bool {
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {
-    search_path_parser()
-        .parse(value)
-        .into_result()
-        .map_err(|_| {
-            LimboError::ParseError("invalid value for parameter \"search_path\"".to_string())
-        })
-}
-
-fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra::Err<EmptyErr>> {
-    let whitespace = any().filter(char::is_ascii_whitespace).repeated().ignored();
-    // Parse double-quoted names such as "My, Schema" or "a""b".
-    // Preserve case, commas, and spaces. Turn doubled quotes into one quote.
-    let quoted = just("\"\"")
-        .to('"')
-        .or(none_of('"'))
-        .repeated()
-        .collect::<String>()
-        .delimited_by(just('"'), just('"'));
-    // Parse names such as PUBLIC or $user, up to a comma or ASCII whitespace.
-    // Require at least one character, reject a leading quote, and lowercase ASCII letters.
-    let unquoted = any()
-        .filter(|c: &char| *c != ',' && !c.is_ascii_whitespace())
-        .repeated()
-        .at_least(1)
-        .to_slice()
-        .filter(|name: &&str| !name.starts_with('"'))
-        .map(str::to_ascii_lowercase);
-
-    quoted
-        .or(unquoted)
-        .separated_by(just(',').padded_by(whitespace))
-        .collect::<Vec<_>>()
-        .padded_by(whitespace)
+    turso_pg_parser::split_identifier_string(value, ',').ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "invalid value for parameter \"search_path\"",
+            None,
+        )
+    })
 }
 
 fn create_schema_commands(
@@ -2411,9 +2434,11 @@ fn create_schema_commands(
         if stmt.if_not_exists {
             return Ok(Vec::new());
         }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" already exists"
-        )));
+        return Err(sqlstate_error(
+            SQLSTATE_DUPLICATE_SCHEMA,
+            format!("schema \"{name}\" already exists"),
+            None,
+        ));
     }
     if name.starts_with("pg_") {
         return Err(sqlstate_error(
@@ -2425,8 +2450,10 @@ fn create_schema_commands(
     }
 
     if !stmt.elements.is_empty() && !conn.get_auto_commit() {
-        return Err(LimboError::ParseError(
-            "CREATE SCHEMA with schema elements cannot run inside a transaction block".to_string(),
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "CREATE SCHEMA with schema elements cannot run inside a transaction block",
+            None,
         ));
     }
 
@@ -2454,9 +2481,7 @@ fn drop_schema_commands(
         if stmt.if_exists {
             return Ok(Vec::new());
         }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" does not exist"
-        )));
+        return Err(undefined_schema(&name));
     }
 
     let objects = schema_objects(conn, &name);
@@ -2489,13 +2514,13 @@ fn drop_schema_commands(
                 schema: name.clone(),
             },
         }));
-    let delete_comment = conn.qualifier(&name).and_then(|namespace| {
-        crate::descriptions::delete_schema_comment_statement(
+    if let Some(namespace) = conn.qualifier(&name) {
+        let delete_comment = crate::descriptions::delete_schema_comment_statements(
             &conn.current_schema(),
             namespace.target.id,
-        )
-    });
-    commands.extend(delete_comment.map(engine_statement));
+        )?;
+        commands.extend(delete_comment.into_iter().map(engine_statement));
+    }
     commands.push(DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::DropSchema {
             name: ast::Name::exact(name.clone()),
@@ -2836,7 +2861,17 @@ fn prepare_copy_rows(
     column_count: usize,
 ) -> Result<(String, Vec<Vec<Option<String>>>)> {
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
-        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
+        // The SQLSTATEs that PostgreSQL gives a failed open of a file.
+        let sqlstate = match e.kind() {
+            std::io::ErrorKind::NotFound => SQLSTATE_UNDEFINED_FILE,
+            std::io::ErrorKind::PermissionDenied => SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            _ => SQLSTATE_IO_ERROR,
+        };
+        sqlstate_error(
+            sqlstate,
+            format!("COPY FROM: cannot read '{}': {}", stmt.filename, e),
+            None,
+        )
     })?;
 
     let table_name = match &stmt.schema_name {
@@ -2844,10 +2879,14 @@ fn prepare_copy_rows(
         None => format!("\"{}\"", stmt.table_name),
     };
     if column_count == 0 {
-        return Err(LimboError::ParseError(format!(
-            "COPY FROM: table '{}' not found or has no columns",
-            stmt.table_name
-        )));
+        return Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_TABLE,
+            format!(
+                "COPY FROM: table '{}' not found or has no columns",
+                stmt.table_name
+            ),
+            None,
+        ));
     }
 
     let (insert_cols, num_columns) = match &stmt.columns {
@@ -2880,7 +2919,7 @@ fn prepare_copy_insert(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
     let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     let cmd = parser
         .next_cmd()
-        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        .map_err(|e| sqlstate_error(SQLSTATE_INTERNAL_ERROR, e.to_string(), None))?;
     let Some(ast::Cmd::Stmt(mut stmt)) = cmd else {
         return Err(LimboError::InternalError(
             "COPY FROM builds no INSERT".into(),
@@ -2938,9 +2977,8 @@ fn prepare_copy_columns(
 
 #[cfg(test)]
 mod tests {
-    use super::{open_database_with_io, search_path_parser, PgConnection};
+    use super::{open_database_with_io, PgConnection};
     use crate::PostgresDialect;
-    use chumsky::Parser;
     use std::sync::Arc;
     use turso_core::{
         Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, SessionRole, Value,
@@ -3070,8 +3108,7 @@ mod tests {
             let db = Database::open(
                 Arc::new(MemoryIO::new()),
                 path,
-                OpenOptions::new(Arc::new(PostgresDialect))
-                    .db_opts(DatabaseOpts::new().with_attach(true)),
+                OpenOptions::new(Arc::new(PostgresDialect)),
             )
             .unwrap();
             let conn = PgConnection::connect(&db).unwrap();
@@ -3135,43 +3172,6 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("in no schema"), "{error}");
-    }
-
-    #[test]
-    fn search_path_parser_accepts_identifier_lists() {
-        for (input, expected) in [
-            ("", vec![]),
-            (" \t\n\r\u{c}", vec![]),
-            (" PUBLIC , \"MiXeD\" ", vec!["public", "MiXeD"]),
-            ("\"a,b\", \"a\"\"b\", $USER", vec!["a,b", "a\"b", "$user"]),
-            ("\"\"\"\"", vec!["\""]),
-            ("\"\", public", vec!["", "public"]),
-            ("public\"extra", vec!["public\"extra"]),
-            ("\u{b}PUBLIC\u{a0}", vec!["\u{b}public\u{a0}"]),
-        ] {
-            assert_eq!(
-                search_path_parser().parse(input).into_result().unwrap(),
-                expected,
-                "{input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn search_path_parser_rejects_invalid_identifier_lists() {
-        for input in [
-            ",public",
-            "public,",
-            "public, ",
-            "public,,main",
-            "one two",
-            "\"\"\"",
-            "\"unclosed",
-            "\"a\"b",
-            "\"a\" \"b\"",
-        ] {
-            assert!(search_path_parser().parse(input).has_errors(), "{input:?}");
-        }
     }
 
     fn test_connection() -> super::PgConnection {

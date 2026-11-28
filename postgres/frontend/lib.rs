@@ -1,7 +1,10 @@
 mod acl;
 mod auth_functions;
 mod auth_members;
+mod cast_planning;
+mod casts;
 mod catalog;
+mod catalog_table;
 mod classes;
 mod copy;
 mod deparse;
@@ -9,9 +12,11 @@ mod descriptions;
 mod error;
 mod functions;
 mod open;
+mod operators;
 mod options;
 mod pg_type;
 mod policies;
+mod procs;
 mod roles;
 mod schema_init;
 mod schema_state;
@@ -25,8 +30,8 @@ mod unnest;
 pub use catalog::PostgresDialect;
 pub use copy::CopyTextEncoder;
 pub use error::{sql_parse_error, sqlstate_error, Error, ErrorReport, Result};
-pub use functions::parse_pg_bool;
 pub use open::{open_database_async, OpenDatabaseState};
+pub use pg_type::type_input;
 pub use session::PgConnection as Connection;
 pub use session::{
     open_database, open_database_with_io, split_statements, tursopg_database_opts, PgConnection,

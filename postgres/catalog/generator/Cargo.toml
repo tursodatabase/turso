@@ -1,0 +1,19 @@
+[package]
+name = "turso_pg_catalog_gen"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generates the tables of turso_pg_catalog from PostgreSQL's postgres.bki"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+chumsky = { workspace = true }
+prettyplease = "0.2.34"
+proc-macro2 = "1.0.93"
+quote = "1.0.38"
+syn = { version = "2.0.96", features = ["full"] }

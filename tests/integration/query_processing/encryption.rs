@@ -213,6 +213,89 @@ fn attach_key_rejects_non_null_values_before_creating_a_file() -> anyhow::Result
     Ok(())
 }
 
+#[test]
+fn invalid_encryption_options_are_rejected_before_creating_a_file() -> anyhow::Result<()> {
+    let cases = [
+        (CIPHER_A, "", "Hex string must decode"),
+        (CIPHER_A, "   ", "Hex string must decode"),
+        (CIPHER_A, "zz", "Invalid hex string"),
+        // 16 bytes, but aegis256 needs a 32-byte key.
+        (
+            CIPHER_A,
+            "000102030405060708090a0b0c0d0e0f",
+            "Invalid key size",
+        ),
+        ("unknown-cipher", KEY_A, "Unknown cipher name"),
+    ];
+    for (index, (cipher, hexkey, expected)) in cases.into_iter().enumerate() {
+        let directory = tempfile::tempdir()?;
+        let encryption = EncryptionOpts {
+            cipher: cipher.into(),
+            hexkey: hexkey.into(),
+        };
+
+        let path = directory.path().join(format!("open-{index}.db"));
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let error = match Database::open(
+            io,
+            path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION))
+                .encryption(encryption.clone()),
+        ) {
+            Ok(_) => panic!("Database::open accepted cipher {cipher:?} with key {hexkey:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected), "{error}");
+        assert_no_database_files(&path);
+
+        let path = directory.path().join(format!("uri-{index}.db"));
+        let uri = format!(
+            "file:{}?cipher={cipher}&hexkey={}",
+            path.display(),
+            hexkey.replace(' ', "%20")
+        );
+        let error = match turso_core::Connection::from_uri(
+            &uri,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
+            Arc::new(SqliteDialect),
+        ) {
+            Ok(_) => panic!("Connection::from_uri accepted {uri}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected), "{error}");
+        assert_no_database_files(&path);
+
+        // The SDK kit, which most bindings use, opens the file before it calls core.
+        let path = directory.path().join(format!("sdk-kit-{index}.db"));
+        let database =
+            turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
+                path: path.to_str().unwrap().to_string(),
+                experimental_features: Some("encryption".to_string()),
+                async_io: false,
+                encryption: Some(encryption),
+                vfs: turso_sdk_kit::IoBackend::Default,
+                io: None,
+                db_file: None,
+                page_codec: None,
+                open_flags: OpenFlags::default(),
+            });
+        let error = match database.open() {
+            Ok(_) => panic!("the SDK kit accepted cipher {cipher:?} with key {hexkey:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected), "{error}");
+        assert_no_database_files(&path);
+    }
+    Ok(())
+}
+
+fn assert_no_database_files(path: &std::path::Path) {
+    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+    assert!(!path.exists(), "{} was created", path.display());
+    assert!(!wal.exists(), "{} was created", wal.display());
+}
+
 fn attach_matrix_options(cipher: Option<&str>, mvcc: bool, key: &str) -> OpenOptions {
     OpenOptions::new(Arc::new(SqliteDialect))
         .db_opts(

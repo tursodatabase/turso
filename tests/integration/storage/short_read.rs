@@ -234,3 +234,117 @@ fn test_zeroed_page_returns_corrupt_error() {
             .contains("Invalid page type: 0");
     }
 }
+
+#[test]
+fn test_wal_short_reads_fail_open_without_losing_rows() {
+    use crate::common::ExecRows;
+    use crate::queued_io::QueuedIo;
+    use std::sync::Arc;
+    use turso_core::{
+        Buffer, Completion, CompletionError, Database, IOResult, LimboError, OpenFlags,
+        OpenOptions, WalFileShared, IO,
+    };
+    use turso_sqlite::SqliteDialect;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.db");
+    let source = rusqlite::Connection::open(&source_path).unwrap();
+    source
+        .execute_batch(
+            "PRAGMA page_size=512;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE t(x);
+             PRAGMA wal_checkpoint(TRUNCATE);
+             INSERT INTO t VALUES (1);
+             INSERT INTO t VALUES (2);
+             INSERT INTO t VALUES (3);
+             INSERT INTO t VALUES (4);",
+        )
+        .unwrap();
+    let db_bytes = std::fs::read(&source_path).unwrap();
+    let wal_bytes = std::fs::read(dir.path().join("source.db-wal")).unwrap();
+
+    for limit in (1..=32).chain([33, 100, 535, 536, 600, 1100, 2143]) {
+        let io = Arc::new(QueuedIo::new());
+        let path = dir.path().join(format!("short-{limit}.db"));
+        let path = path.to_str().unwrap();
+        for (name, bytes) in [
+            (path.to_owned(), &db_bytes),
+            (format!("{path}-wal"), &wal_bytes),
+        ] {
+            let file = io.open_file(&name, OpenFlags::Create, false).unwrap();
+            let c = file
+                .pwrite(
+                    0,
+                    Arc::new(Buffer::new(bytes.clone())),
+                    Completion::new_write(|_| {}),
+                )
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+        io.limit_wal_reads(limit);
+        let recovery_io: Arc<dyn IO> = io.clone();
+        let mut recovery = WalFileShared::open_shared_if_exists_begin(
+            &recovery_io,
+            &format!("{path}-wal"),
+            OpenFlags::Create,
+        )
+        .unwrap();
+        let err = 'recovery: {
+            for _ in 0..100 {
+                match recovery.poll() {
+                    Err(err) => break 'recovery err,
+                    Ok(IOResult::Done(_)) => panic!("WAL read limit {limit}: recovery succeeded"),
+                    Ok(IOResult::IO(c)) => {
+                        while !c.finished() {
+                            io.step().unwrap();
+                        }
+                    }
+                }
+            }
+            panic!("WAL read limit {limit}: recovery did not finish");
+        };
+        assert!(
+            matches!(
+                *err,
+                LimboError::CompletionError(CompletionError::ShortReadWalFrame { .. })
+            ),
+            "WAL read limit {limit}: unexpected recovery error {err:?}"
+        );
+        match Database::open(io.clone(), path, OpenOptions::new(Arc::new(SqliteDialect))) {
+            Err(LimboError::CompletionError(CompletionError::ShortReadWalFrame { .. })) => {}
+            Err(err) => panic!("WAL read limit {limit}: unexpected open error {err:?}"),
+            Ok(db) => {
+                io.limit_wal_reads(usize::MAX);
+                let conn = db
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
+                let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+                panic!("WAL read limit {limit}: open succeeded with rows {rows:?}");
+            }
+        }
+        io.limit_wal_reads(usize::MAX);
+        let db =
+            Database::open(io.clone(), path, OpenOptions::new(Arc::new(SqliteDialect))).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+        assert_eq!(rows, vec![(1,), (2,), (3,), (4,)], "WAL read limit {limit}");
+        if limit == 600 {
+            conn.execute("INSERT INTO t VALUES (5)").unwrap();
+            drop(conn);
+            drop(db);
+            let db = Database::open(io, path, OpenOptions::new(Arc::new(SqliteDialect))).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+            assert_eq!(
+                rows,
+                vec![(1,), (2,), (3,), (4,), (5,)],
+                "rows after writing and reopening"
+            );
+        }
+    }
+}

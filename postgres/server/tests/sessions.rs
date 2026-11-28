@@ -70,6 +70,96 @@ fn schema_dropped_by_one_client_is_gone_for_another() {
     query_error(&mut client2, "SELECT count(*) FROM s.t");
 }
 
+#[test]
+fn time_zone_other_than_utc_is_refused_at_connection() {
+    let server = TestServer::start();
+    for startup in [
+        vec![("TimeZone", "America/New_York")],
+        vec![("options", "-c TimeZone=America/New_York")],
+        vec![("options", "--TimeZone=America/New_York")],
+        // PostgreSQL would run this one in New York.
+        vec![
+            ("TimeZone", "America/New_York"),
+            ("options", "-c TimeZone=UTC"),
+        ],
+    ] {
+        let error = server.connect_error(&startup);
+        assert!(error.contains("0A000"), "{startup:?}: {error}");
+        assert!(error.contains("America/New_York"), "{startup:?}: {error}");
+    }
+    for startup in [("TimeZone", "UTC"), ("options", "-c TimeZone=Etc/UTC")] {
+        let mut client = server.connect_with(&[startup]);
+        assert_eq!(query(&mut client, "SELECT 1"), ["1"]);
+    }
+}
+
+/// A refusal reaches the client with a workaround in the HINT field of the
+/// ErrorResponse, whether the translator or the frontend refused the
+/// statement.
+#[test]
+fn refusal_hint_reaches_the_client() {
+    let server = TestServer::start();
+    let mut client = server.connect();
+    for (sql, hint) in [
+        (
+            // Refused by the translator.
+            "CREATE OR REPLACE VIEW v AS SELECT 1 AS a",
+            "Run DROP VIEW and CREATE VIEW in one transaction.",
+        ),
+        (
+            // Refused by the frontend, after translation.
+            "SELECT date_trunc('month', DATE '2020-02-03')",
+            "Cast the value to timestamptz: date_trunc(unit, d::timestamptz).",
+        ),
+    ] {
+        let fields = error_fields(&mut client, sql);
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("0A000"),
+            "{sql}"
+        );
+        let sent = fields
+            .get(&b'H')
+            .unwrap_or_else(|| panic!("{sql}: no hint"));
+        assert!(sent.starts_with(hint), "{sql}: {sent}");
+    }
+}
+
+/// A computed bytea value is described as bytea, at the top level and when
+/// an outer query reads it from a subquery.
+#[test]
+fn computed_bytea_is_described_as_bytea() {
+    const BYTEA_OID: u32 = 17;
+    let server = TestServer::start();
+    let mut client = server.connect();
+    query(
+        &mut client,
+        "CREATE TABLE t1 (id int PRIMARY KEY, v varchar(5))",
+    );
+    assert_eq!(
+        column_type_oids(&mut client, "SELECT v::bytea AS x FROM t1"),
+        vec![BYTEA_OID]
+    );
+    assert_eq!(
+        column_type_oids(
+            &mut client,
+            "SELECT x FROM (SELECT v::bytea AS x FROM t1) s"
+        ),
+        vec![BYTEA_OID]
+    );
+    assert_eq!(
+        column_type_oids(&mut client, "SELECT v::bytea || v::bytea AS x FROM t1"),
+        vec![BYTEA_OID]
+    );
+    assert_eq!(
+        column_type_oids(
+            &mut client,
+            "SELECT x FROM (SELECT v::bytea || v::bytea AS x FROM t1) s"
+        ),
+        vec![BYTEA_OID]
+    );
+}
+
 struct TestServer {
     port: u16,
     _dir: TempDir,
@@ -103,6 +193,22 @@ impl TestServer {
     }
 
     fn connect(&self) -> PgConn {
+        self.connect_with(&[])
+    }
+
+    fn connect_with(&self, startup: &[(&str, &str)]) -> PgConn {
+        self.try_connect(startup).unwrap()
+    }
+
+    /// The error of a connection that the server refuses, with its SQLSTATE.
+    fn connect_error(&self, startup: &[(&str, &str)]) -> String {
+        format!(
+            "{:?}",
+            self.try_connect(startup).err().expect("expected a refusal")
+        )
+    }
+
+    fn try_connect(&self, startup: &[(&str, &str)]) -> turso_pg_client::Result<PgConn> {
         let params = ConnParams {
             host: "127.0.0.1".to_string(),
             port: self.port,
@@ -110,7 +216,7 @@ impl TestServer {
             password: None,
             database: "main".to_string(),
         };
-        PgConn::connect(&params, &[]).unwrap()
+        PgConn::connect(&params, startup)
     }
 }
 
@@ -139,4 +245,30 @@ fn query_error(client: &mut PgConn, sql: &str) -> String {
         }
     }
     panic!("{sql}: expected an error");
+}
+
+/// Runs `sql`, which must fail, and returns the fields of its ErrorResponse.
+fn error_fields(client: &mut PgConn, sql: &str) -> turso_pg_client::ErrorFields {
+    for event in client.simple_query(sql).unwrap() {
+        if let BackendEvent::ErrorResponse(fields) = event {
+            return fields;
+        }
+    }
+    panic!("{sql}: expected an error");
+}
+
+/// Runs `sql` and returns the type OIDs of its RowDescription.
+fn column_type_oids(client: &mut PgConn, sql: &str) -> Vec<u32> {
+    for event in client.simple_query(sql).unwrap() {
+        match event {
+            BackendEvent::RowDescription(columns) => {
+                return columns.iter().map(|column| column.type_oid).collect();
+            }
+            BackendEvent::ErrorResponse(fields) => {
+                panic!("{sql}: {}", error_message(&fields));
+            }
+            _ => {}
+        }
+    }
+    panic!("{sql}: no RowDescription");
 }

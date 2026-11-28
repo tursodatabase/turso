@@ -547,6 +547,42 @@ fn test_cdc_custom_table(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+fn test_cdc_switch_custom_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id,cdc_a')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id,cdc_b')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM cdc_a"));
+    assert_eq!(rows, vec![v2_row(1, "t", 1, None, None, None), v2_commit()]);
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM cdc_b"));
+    assert_eq!(rows, vec![v2_row(1, "t", 2, None, None, None), v2_commit()]);
+    conn.execute("PRAGMA capture_data_changes_conn('id,CDC_B')")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT table_name, version FROM turso_cdc_version ORDER BY table_name",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Text("cdc_a".to_string()),
+                Value::Text(CDC_VERSION_CURRENT.to_string()),
+            ],
+            vec![
+                Value::Text("cdc_b".to_string()),
+                Value::Text(CDC_VERSION_CURRENT.to_string()),
+            ],
+        ]
+    );
+}
+
 // TODO: cannot use mvcc because of indexes
 #[turso_macros::test()]
 fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
@@ -2242,6 +2278,114 @@ fn test_cdc_upsert_before_image_rowid_change(db: TempDatabase) {
                 None,
             ),
             v2_commit(),
+        ]
+    );
+}
+
+/// `UPDATE OR REPLACE` deletes the row whose UNIQUE value conflicts with the
+/// new row. That delete must be recorded before the UPDATE, as `INSERT OR
+/// REPLACE` does, so a consumer replaying the CDC table removes it too.
+#[turso_macros::test]
+fn test_cdc_update_or_replace_unique_conflict_records_delete(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE OR REPLACE t SET u = 'a' WHERE id = 2")
+        .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT * FROM t"),
+        vec![vec![Value::Integer(2), Value::Text("a".to_string())]]
+    );
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name, id, before FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Text("a".to_string())])),
+            ],
+            vec![
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(2),
+                Value::Blob(record([Value::Integer(2), Value::Text("b".to_string())])),
+            ],
+            vec![Value::Integer(2), Value::Null, Value::Null, Value::Null],
+        ]
+    );
+}
+
+/// `UPDATE OR REPLACE` that moves a row onto an existing rowid deletes the
+/// row that had that rowid. That delete must be recorded before the moved
+/// row's DELETE+INSERT.
+#[turso_macros::test]
+fn test_cdc_update_or_replace_rowid_conflict_records_delete(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE OR REPLACE t SET id = 1 WHERE id = 2")
+        .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT * FROM t"),
+        vec![vec![Value::Integer(1), Value::Text("b".to_string())]]
+    );
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name, id FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1)
+            ],
+            vec![
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(2)
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1)
+            ],
+            vec![Value::Integer(2), Value::Null, Value::Null],
+        ]
+    );
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT before FROM turso_cdc WHERE change_type = -1 ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Blob(record([
+                Value::Integer(1),
+                Value::Text("a".to_string())
+            ]))],
+            vec![Value::Blob(record([
+                Value::Integer(2),
+                Value::Text("b".to_string())
+            ]))],
         ]
     );
 }

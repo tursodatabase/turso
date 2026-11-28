@@ -461,6 +461,10 @@ impl Statement {
         }
     }
 
+    pub fn connection(&self) -> &Arc<Connection> {
+        self.inner.get_connection()
+    }
+
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
         self.inner.bind_at(index, value).map_err(Into::into)
     }
@@ -590,55 +594,5 @@ impl std::ops::Deref for Statement {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use turso_core::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SessionRole, IO};
-    use turso_sqlite::SqliteDialect;
-
-    #[test]
-    fn reset_reports_frontend_errors() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            ":memory:",
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.set_foreign_keys_enabled(true);
-        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
-            .unwrap();
-        conn.execute(
-            "CREATE TABLE child (pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-        )
-        .unwrap();
-        let mut stmt = Statement::new(
-            conn.prepare("INSERT INTO child VALUES (99) RETURNING pid")
-                .unwrap(),
-        );
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::Row => break,
-                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => io.step().unwrap(),
-                result => panic!("expected a row, got {result:?}"),
-            }
-        }
-        let error = stmt.reset().unwrap_err();
-        assert_eq!(error.sqlstate, "23503");
-        assert!(matches!(
-            error.core_error(),
-            LimboError::ForeignKeyConstraint(_)
-        ));
-        assert!(std::error::Error::source(&error).is_some());
     }
 }

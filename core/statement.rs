@@ -88,6 +88,17 @@ pub enum StatementStatusCounter {
 }
 
 impl StatementOrigin {
+    /// Whether the engine made the statement: a helper statement, a read of
+    /// the engine's own metadata or a schema write of the engine. Such a
+    /// statement is SQLite text, and it reads and writes the stored table
+    /// of a table with an overlay.
+    pub(crate) const fn is_engine(self) -> bool {
+        matches!(
+            self,
+            Self::InternalHelper | Self::EngineMetadataRead | Self::EngineSchemaWrite
+        )
+    }
+
     pub(crate) const fn needs_nested_guard(self) -> bool {
         matches!(self, Self::InternalHelper)
     }
@@ -821,6 +832,11 @@ impl Statement {
             && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
         {
             self.release_active_root_if_counted(!matches!(res, Ok(StepResult::Done)));
+        }
+
+        if matches!(res, Ok(StepResult::Done)) || res.is_err() {
+            self.program
+                .reset_defer_foreign_keys_after_statement(&self.connection);
         }
 
         // If the bytecode aborted between SequenceBeginInnerTx and

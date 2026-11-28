@@ -71,7 +71,7 @@ test todos-average-completion-hours {
 expect {
     39.25
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "function:left"

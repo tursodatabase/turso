@@ -454,6 +454,28 @@ PRAGMA foreign_keys = OFF;
 Foreign key enforcement is off by default for SQLite compatibility.
 Changing this setting is a no-op while a transaction or savepoint is open.
 
+### defer_foreign_keys
+
+Defers every foreign key check until the transaction commits, as if each foreign key
+were declared `DEFERRABLE INITIALLY DEFERRED`. `RESTRICT` actions are deferred too.
+
+```sql
+PRAGMA defer_foreign_keys;
+PRAGMA defer_foreign_keys = ON;
+PRAGMA defer_foreign_keys = OFF;
+```
+
+The setting is off by default and is turned off again when each transaction commits
+or rolls back. It is also turned off when a statement that reads the database, such as
+`SELECT * FROM t` or `PRAGMA journal_mode`, runs outside a transaction. A query
+without a `FROM` clause, such as `SELECT 1` or `VALUES(1)`, leaves it on. Unlike SQLite,
+a `SELECT` whose `FROM` clause reads no table also turns it off, for example
+`SELECT * FROM (VALUES(1), (2))`, `SELECT * FROM (SELECT 1)` and
+`WITH x AS (SELECT 1) SELECT * FROM x`.
+COMMIT still fails if violations remain. Turning the setting off forgets all violations
+counted so far in the transaction, including those of `DEFERRABLE INITIALLY DEFERRED`
+foreign keys.
+
 ### legacy_file_format
 
 Accepted and ignored. SQLite dropped the legacy file format and made this PRAGMA a
@@ -660,6 +682,8 @@ A checkpoint writes pages from the WAL file back to the database file.
 
 Inside a transaction, the checkpoint fails with `database table is locked` once the transaction has read or written the database. Right after `BEGIN`, before any read, it runs normally.
 
+In MVCC mode, `FULL`, `RESTART` and `TRUNCATE` all run as a `TRUNCATE` checkpoint. If another checkpoint is in progress, the checkpoint fails with a busy error (`SQLITE_BUSY`) in every mode, `PASSIVE` included, and does not change the logical log.
+
 ### wal_autocheckpoint
 
 Returns or sets how many pages the WAL can hold before a commit on this connection runs a checkpoint. The default is 1000 pages. Zero or a negative value turns automatic checkpoints off.
@@ -826,7 +850,7 @@ tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=YOUR_
 
 This URI can expose the key through process arguments, shell history, and command-line recording. It is not a protected secret-input channel.
 
-Every open and connection independently authenticates its credentials before shared schema or MVCC state is accessible. Missing keys, wrong keys, and cipher mismatches are rejected. Existing encrypted files retain their format and credentials. Choose an encrypted database's page size in core `OpenOptions::page_size` before opening it; the default for a new database is 4096. Page size and reserved bytes are immutable afterward.
+Every open and connection independently authenticates its credentials before shared schema or MVCC state is accessible. Missing keys, wrong keys, and cipher mismatches are rejected. An unknown cipher, or a key that is not valid hex or does not have the size that the cipher needs, is rejected before the database file is created. Existing encrypted files retain their format and credentials. Choose an encrypted database's page size in core `OpenOptions::page_size` before opening it; the default for a new database is 4096. Page size and reserved bytes are immutable afterward.
 
 Each encrypted attachment requires its own cipher/key URI. Non-NULL `ATTACH ... KEY` values are rejected before opening or creating the target. `KEY NULL` uses the URI credentials. Serialize other opens of a fresh target until ATTACH completes. In-place VACUUM preserves encryption for the main database and rejects encrypted attached databases. VACUUM INTO produces a plaintext destination.
 

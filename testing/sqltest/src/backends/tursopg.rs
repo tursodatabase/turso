@@ -153,7 +153,7 @@ impl SqlBackend for TursopgBackend {
 
 /// The path of the database that `config` names, and the temporary file that
 /// must stay alive while the database is in use.
-pub(super) fn database_path(
+pub fn database_path(
     config: &DatabaseConfig,
     default_db_resolver: Option<&dyn DefaultDatabaseResolver>,
 ) -> Result<(String, Option<NamedTempFile>), BackendError> {

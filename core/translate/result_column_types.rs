@@ -23,15 +23,10 @@ pub(crate) fn result_column_types(
                 return expression_type(ty, resolver.schema());
             }
             match &result_column.expr {
-                ast::Expr::Column { table, column, .. } => {
-                    match type_of(&result_column.expr, &env) {
-                        ty if ty.is_condition() && reads_subquery(*table, table_references) => {
-                            expression_type(&ty, resolver.schema())
-                        }
-                        _ => {
-                            table_column_type(*table, *column, table_references, resolver.schema())
-                        }
-                    }
+                ast::Expr::Column { table, column, .. }
+                    if !reads_subquery(*table, table_references) =>
+                {
+                    table_column_type(*table, *column, table_references, resolver.schema())
                 }
                 expr => expression_type(&type_of(expr, &env), resolver.schema()),
             }
@@ -70,7 +65,7 @@ fn table_column_type(
 }
 
 /// Any other expression reports the SQLite primitive behind its type: INTEGER,
-/// REAL, NUMERIC or TEXT, or nothing when the value may be anything. An
+/// REAL, NUMERIC, TEXT or BLOB, or nothing when the value may be anything. An
 /// expression of a custom type reports it the way a column of that type does.
 /// A condition, such as a comparison, reports the type the schema has for
 /// conditions, and INTEGER when the schema has none.
@@ -149,7 +144,8 @@ fn builtin_primitive(ty: BuiltinType) -> Option<&'static str> {
         | BuiltinType::Real
         | BuiltinType::Decimal
         | BuiltinType::Numeric
-        | BuiltinType::Text => Some(ty.sqlite_name()),
-        BuiltinType::Blob | BuiltinType::Any => None,
+        | BuiltinType::Text
+        | BuiltinType::Blob => Some(ty.sqlite_name()),
+        BuiltinType::Any => None,
     }
 }

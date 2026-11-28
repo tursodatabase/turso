@@ -183,6 +183,7 @@ fn emit_group_aggregate_rows(
         connection.dialect().get_internal_dialect(),
         None,
         RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
 
     turso_assert!(

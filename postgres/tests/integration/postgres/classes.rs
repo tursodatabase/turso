@@ -1,17 +1,17 @@
-//! The `__turso_internal_classes` relation catalog: created by the
+//! The `pg_class` relation catalog: created by the
 //! PostgreSQL frontend when it opens a database writable, maintained by
 //! every dialect in the same transaction as `sqlite_schema`.
 
 use std::sync::Arc;
 
 use crate::common::TempDatabase;
-use turso_core::{Connection, SessionRole, Value};
+use turso_core::{Connection, Numeric, SessionRole, Value};
 
-/// The class rows as `(oid, relname, relnamespace, relkind, relowner)`,
+/// User class rows as `(oid, relname, engine namespace, relkind, engine owner)`,
 /// ordered by oid.
 fn class_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, String, i64)> {
     let rows = conn
-        .prepare_engine_schema_statement("SELECT oid, relname, relnamespace, relkind, relowner FROM __turso_internal_classes ORDER BY oid")
+        .prepare_engine_schema_statement("SELECT oid, relname, relenginenamespace, relkind, CASE WHEN relowner=10 THEN 0 ELSE relowner-16384 END FROM __turso_internal_classes WHERE oid >= 16384 ORDER BY oid")
         .unwrap()
         .run_collect_rows()
         .unwrap();
@@ -47,7 +47,7 @@ fn postgres_async_open_initializes_the_postgres_catalog() {
     pg.execute("CREATE TABLE b (value text)").unwrap();
     assert_catalog_columns(&pg, "public");
     let rows = class_rows(pg.inner());
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3, "{rows:?}");
     assert!(rows.iter().all(|row| row.0 >= 16384));
     assert_ne!(rows[0].0, rows[1].0);
 }
@@ -76,7 +76,7 @@ fn postgres_async_open_initializes_catalog_across_io_yields() {
         .unwrap();
     pg.execute("CREATE TABLE b (value text)").unwrap();
     assert_catalog_columns(&pg, "public");
-    assert_eq!(class_rows(pg.inner()).len(), 2);
+    assert_eq!(class_rows(pg.inner()).len(), 3);
 }
 
 #[cfg(feature = "io_memory_yield")]
@@ -209,22 +209,21 @@ fn a_new_database_has_the_classes_table_and_ddl_maintains_it() {
     pg.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
         .unwrap();
     let rows = class_rows(&conn);
-    // The table and the automatic index of its UNIQUE constraint; the rowid
-    // alias primary key has no backing index.
-    assert_eq!(rows.len(), 2, "{rows:?}");
+    // The table, the index of its primary key, and the index of its UNIQUE
+    // constraint, named as PostgreSQL names them.
+    assert_eq!(rows.len(), 3, "{rows:?}");
     let (t_oid, _, t_namespace, t_kind, t_owner) = class_row(&conn, "t").unwrap();
     assert_eq!(t_oid, 16384);
     assert_eq!(t_namespace, 1, "public is namespace 1");
     assert_eq!(t_kind, "r");
     assert_eq!(t_owner, 0, "owned by the bootstrap superuser");
-    let autoindex = rows.iter().find(|row| row.3 == "i").unwrap();
-    assert!(autoindex.1.starts_with("sqlite_autoindex_"), "{rows:?}");
-    assert_eq!(autoindex.0, 16385);
+    assert_eq!(class_row(&conn, "t_pkey").unwrap().0, 16385);
+    assert_eq!(class_row(&conn, "t_name_key").unwrap().0, 16386);
 
     pg.execute("CREATE INDEX t_name ON t (name)").unwrap();
     assert_eq!(
         class_row(&conn, "t_name").unwrap(),
-        (16386, "t_name".to_string(), 1, "i".to_string(), 0)
+        (16387, "t_name".to_string(), 1, "i".to_string(), 0)
     );
 
     pg.execute("CREATE VIEW v AS SELECT id FROM t").unwrap();
@@ -247,6 +246,64 @@ fn a_new_database_has_the_classes_table_and_ddl_maintains_it() {
         vec![],
         "indexes are dropped with their table"
     );
+}
+
+#[turso_macros::test(mvcc)]
+fn the_index_of_a_constraint_is_named_after_the_constraint(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (a TEXT PRIMARY KEY, b INT, c INT, UNIQUE (b, c), UNIQUE (c))")
+        .unwrap();
+    pg.execute("CREATE TABLE named (id INTEGER CONSTRAINT my_key PRIMARY KEY)")
+        .unwrap();
+
+    let names: Vec<String> = class_rows(&conn).into_iter().map(|row| row.1).collect();
+    assert!(names.contains(&"t_pkey".to_string()), "{names:?}");
+    assert!(names.contains(&"t_b_c_key".to_string()), "{names:?}");
+    assert!(names.contains(&"t_c_key".to_string()), "{names:?}");
+    assert!(names.contains(&"my_key".to_string()), "{names:?}");
+    assert!(names
+        .iter()
+        .all(|name| !name.starts_with("sqlite_autoindex")));
+}
+
+#[turso_macros::test(mvcc)]
+fn a_table_with_an_integer_primary_key_has_a_row_for_the_index_of_its_key(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INT)")
+        .unwrap();
+    let (table_oid, ..) = class_row(&conn, "t").unwrap();
+    let (index_oid, _, _, kind, _) = class_row(&conn, "t_pkey").unwrap();
+    assert_eq!(kind, "i");
+    assert!(index_oid > table_oid);
+
+    pg.execute("ALTER TABLE t RENAME TO u").unwrap();
+    assert!(
+        class_row(&conn, "t_pkey").is_some(),
+        "{:?}",
+        class_rows(&conn)
+    );
+
+    pg.execute("DROP TABLE u").unwrap();
+    assert_eq!(class_rows(&conn), vec![]);
+}
+
+#[turso_macros::test(mvcc)]
+fn a_constraint_index_takes_the_next_free_name_when_its_name_is_used(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t_pkey (x INT)").unwrap();
+    pg.execute("CREATE INDEX t_pkey1 ON t_pkey (x)").unwrap();
+    pg.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    assert!(
+        class_row(&conn, "t_pkey2").is_some(),
+        "{:?}",
+        class_rows(&conn)
+    );
+    assert!(class_row(&conn, "t_pkey").unwrap().3 == "r");
 }
 
 #[test]
@@ -297,13 +354,16 @@ fn a_rename_keeps_the_oid_and_owner() {
     assert_eq!(class_row(&conn, "t"), None);
     let (u_oid, ..) = class_row(&conn, "u").unwrap();
     assert_eq!(u_oid, t_oid);
-    // The automatic index was renamed with its table, keeping its oid.
+    // PostgreSQL keeps the name of the index of a constraint when its table
+    // is renamed, and the index keeps working under the schema's new name.
     let autoindex_after = class_rows(&conn)
         .into_iter()
         .find(|row| row.3 == "i")
         .unwrap();
-    assert_eq!(autoindex_after.0, autoindex_before.0);
-    assert!(autoindex_after.1.contains("_u_"), "{autoindex_after:?}");
+    assert_eq!(autoindex_after, autoindex_before);
+    pg.execute("INSERT INTO u VALUES ('a')").unwrap();
+    pg.execute("DROP TABLE u").unwrap();
+    assert_eq!(class_rows(&conn), vec![]);
 }
 
 #[test]
@@ -577,7 +637,7 @@ fn relacl(conn: &turso_pg::Connection, relname: &str) -> Option<String> {
 fn stored_relacl(conn: &Arc<Connection>, relname: &str) -> Option<String> {
     let rows = conn
         .prepare(format!(
-            "SELECT relacl FROM __turso_internal_classes WHERE relname = '{relname}'"
+            "SELECT relprivileges FROM __turso_internal_classes WHERE relname = '{relname}'"
         ))
         .unwrap()
         .run_collect_rows()
@@ -606,6 +666,72 @@ fn stored_relownedbycolumn(conn: &Arc<Connection>, relname: &str) -> Option<Stri
         Value::Text(text) => Some(text.as_str().to_string()),
         other => panic!("relownedbycolumn is text or NULL, got {other:?}"),
     }
+}
+
+/// The stored values of the columns of `relname`'s class row that do not
+/// change when the relation is granted, renamed or given an owner, joined by
+/// commas.
+fn stored_pg_class_columns(conn: &Arc<Connection>, relname: &str) -> String {
+    let columns = "reltype, reloftype, relam, relfilenode, reltablespace, relpages, reltuples, \
+         relallvisible, reltoastrelid, relhasindex, relisshared, relpersistence, relkind, \
+         relnatts, relchecks, relhasrules, relhastriggers, relhassubclass, relforcerowsecurity, \
+         relispopulated, relreplident, relispartition, relrewrite, relfrozenxid, relminmxid, \
+         reloptions, relpartbound";
+    let rows = conn
+        .prepare(format!(
+            "SELECT {columns} FROM pg_class WHERE relname = '{relname}'"
+        ))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{relname} has one class row: {rows:?}");
+    rows[0]
+        .iter()
+        .map(|value| match value {
+            Value::Null => "NULL".to_string(),
+            Value::Text(text) => text.as_str().to_string(),
+            Value::Numeric(Numeric::Integer(number)) => number.to_string(),
+            Value::Numeric(Numeric::Float(number)) => f64::from(*number).to_string(),
+            other => panic!("unexpected column value {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[turso_macros::test(mvcc)]
+fn every_new_class_row_has_all_the_columns_of_pg_class(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (id serial, x int)").unwrap();
+    pg.execute("CREATE INDEX t_x ON t (x)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT x FROM t").unwrap();
+
+    let table = "0,0,2,0,0,0,-1,0,0,1,0,p,r,2,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
+    let index = "0,0,403,0,0,1,0,0,0,0,0,p,i,1,0,0,0,0,0,1,d,0,0,0,0,NULL,NULL";
+    let sequence = "0,0,0,0,0,1,1,0,0,0,0,p,S,3,0,0,0,0,0,1,n,0,0,0,0,NULL,NULL";
+    let view = "0,0,0,0,0,0,-1,0,0,0,0,p,v,1,0,1,0,0,0,1,n,0,0,0,0,NULL,NULL";
+    assert_eq!(stored_pg_class_columns(&conn, "t"), table);
+    assert_eq!(stored_pg_class_columns(&conn, "t_x"), index);
+    assert_eq!(stored_pg_class_columns(&conn, "t_id_seq"), sequence);
+    assert_eq!(stored_pg_class_columns(&conn, "v"), view);
+}
+
+#[turso_macros::test(mvcc)]
+fn rewriting_a_class_row_keeps_the_columns_it_does_not_change(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("CREATE TABLE t (id serial, x int)").unwrap();
+    let before = stored_pg_class_columns(&conn, "t");
+
+    pg.execute("GRANT SELECT ON t TO reader").unwrap();
+    pg.execute("ALTER TABLE t OWNER TO reader").unwrap();
+    pg.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    pg.execute("CREATE POLICY p ON t USING (true)").unwrap();
+    pg.execute("ALTER TABLE t RENAME TO u").unwrap();
+
+    assert_eq!(stored_pg_class_columns(&conn, "u"), before);
 }
 
 #[turso_macros::test(mvcc)]
@@ -934,4 +1060,734 @@ fn schema_is_read_again_while_a_role_is_set() {
     conn.inner().force_reparse_schema_without_publish().unwrap();
 
     conn.execute("SELECT x FROM t").unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn rename_cannot_take_a_constraint_index_name(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE source (id integer PRIMARY KEY, x integer UNIQUE)")
+        .unwrap();
+    let before = class_rows(pg.inner());
+    for name in ["source_pkey", "source_x_key"] {
+        let error = pg
+            .execute(format!("ALTER TABLE source RENAME TO {name}"))
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "42P07", "{error:?}");
+        assert_eq!(class_rows(pg.inner()), before);
+        pg.inner().force_reparse_schema_without_publish().unwrap();
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn an_explicit_primary_key_name_is_not_renamed_on_collision(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE t_pkey(x int)").unwrap();
+    for sql in [
+        "CREATE TABLE t(id int CONSTRAINT t_pkey PRIMARY KEY)",
+        "CREATE TABLE t(id text, CONSTRAINT t_pkey PRIMARY KEY(id))",
+    ] {
+        let error = pg.execute(sql).unwrap_err();
+        assert_eq!(error.sqlstate, "42P07", "{error:?}");
+        assert_eq!(class_rows(pg.inner()).len(), 1);
+    }
+    pg.execute("CREATE TABLE t(id int PRIMARY KEY)").unwrap();
+    assert!(class_row(pg.inner(), "t_pkey1").is_some());
+}
+
+#[turso_macros::test(mvcc)]
+fn constraint_names_cannot_collide_with_relations_in_the_same_statement(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    for sql in [
+        "CREATE TABLE t (x int CONSTRAINT t PRIMARY KEY)",
+        "CREATE TABLE t (x text CONSTRAINT t PRIMARY KEY)",
+        "CREATE TABLE t (x int CONSTRAINT t UNIQUE)",
+        "CREATE TABLE t (x int CONSTRAINT same UNIQUE, y int CONSTRAINT same UNIQUE)",
+        "CREATE TABLE t (x int CONSTRAINT same PRIMARY KEY, y int CONSTRAINT same UNIQUE)",
+    ] {
+        let error = pg.execute(sql).unwrap_err();
+        assert_eq!(error.sqlstate, "42P07", "{sql}: {error:?}");
+        assert!(class_rows(pg.inner()).is_empty(), "{sql}");
+        pg.inner().force_reparse_schema_without_publish().unwrap();
+    }
+    pg.execute("CREATE TABLE t (x int PRIMARY KEY, y int UNIQUE)")
+        .unwrap();
+    assert_eq!(class_rows(pg.inner()).len(), 3);
+}
+
+#[turso_macros::test(mvcc)]
+fn generated_constraint_index_names_fit_postgres_identifiers(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.inner().pragma_update("foreign_keys", "ON").unwrap();
+    pg.execute("CREATE TABLE abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij (x int PRIMARY KEY)")
+        .unwrap();
+    pg.execute(
+        "CREATE TABLE abcdefghijabcdefghijabcdefghij (abcdefghijabcdefghijabcdefghij int UNIQUE)",
+    )
+    .unwrap();
+    for name in [
+        "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefgh_pkey",
+        "abcdefghijabcdefghijabcdefghi_abcdefghijabcdefghijabcdefghi_key",
+    ] {
+        assert!(class_row(pg.inner(), name).is_some(), "missing {name}");
+    }
+    for (table, expected) in [
+        ("a".repeat(60), format!("{}_pkey", "a".repeat(58))),
+        (
+            format!("{}b", "a".repeat(59)),
+            format!("{}_pkey1", "a".repeat(57)),
+        ),
+        ("é".repeat(30), format!("{}_pkey", "é".repeat(29))),
+        (
+            format!("{}b", "é".repeat(29)),
+            format!("{}_pkey1", "é".repeat(28)),
+        ),
+    ] {
+        pg.execute(format!("CREATE TABLE \"{table}\" (x text PRIMARY KEY)"))
+            .unwrap();
+        assert!(
+            class_row(pg.inner(), &expected).is_some(),
+            "missing {expected}"
+        );
+        assert!(expected.len() <= 63);
+    }
+    pg.execute(format!(
+        "CREATE TABLE refs (a text REFERENCES \"{}\"(x), b text REFERENCES \"{}\"(x))",
+        "a".repeat(60),
+        "é".repeat(30)
+    ))
+    .unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    let error = pg
+        .execute("INSERT INTO refs VALUES ('missing', 'missing')")
+        .unwrap_err();
+    assert_eq!(error.sqlstate, "23503");
+}
+
+#[turso_macros::test(mvcc)]
+fn quoted_relation_names_survive_catalog_updates(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE \"MiXeD\" (id int PRIMARY KEY, x text, \"CoDe\" text UNIQUE)")
+        .unwrap();
+    pg.execute("CREATE INDEX \"IxX\" ON \"MiXeD\"(x)").unwrap();
+    pg.execute("CREATE VIEW \"ViEw\" AS SELECT x FROM \"MiXeD\"")
+        .unwrap();
+    let oid = class_row(pg.inner(), "MiXeD").unwrap().0;
+    for name in ["MiXeD_pkey", "MiXeD_CoDe_key", "IxX", "ViEw"] {
+        assert!(class_row(pg.inner(), name).is_some(), "missing {name}");
+    }
+    pg.execute("ALTER TABLE \"MiXeD\" RENAME TO \"NewName\"")
+        .unwrap();
+    assert_eq!(class_row(pg.inner(), "NewName").unwrap().0, oid);
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    assert_eq!(class_row(pg.inner(), "NewName").unwrap().0, oid);
+}
+
+#[turso_macros::test(mvcc)]
+fn views_have_class_rows_and_return_rules(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE t (a int, b text)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+    let rows = pg.prepare("SELECT c.relkind, c.relnatts, c.relhasrules, r.rulename, r.ev_type, r.ev_enabled, r.is_instead FROM pg_class c JOIN pg_rewrite r ON r.ev_class = c.oid WHERE c.relname = 'v'").unwrap().run_collect_rows().unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::build_text("v"),
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::build_text("_RETURN"),
+            Value::build_text("1"),
+            Value::build_text("O"),
+            Value::from_i64(1)
+        ]]
+    );
+    pg.execute("DROP VIEW v").unwrap();
+    assert!(pg
+        .prepare("SELECT * FROM pg_rewrite")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .is_empty());
+}
+#[turso_macros::test(mvcc)]
+fn ddl_updates_stored_class_columns(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = pg.inner();
+    pg.execute("CREATE TABLE counts (id int PRIMARY KEY, x int CHECK (x > 0))")
+        .unwrap();
+    let read = || {
+        conn.prepare_engine_schema_statement(
+            "SELECT relnatts, relhasindex, relchecks FROM pg_class WHERE relname = 'counts'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+    };
+    assert_eq!(
+        read(),
+        vec![vec![
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::from_i64(1)
+        ]]
+    );
+    pg.execute("ALTER TABLE counts ADD COLUMN y int").unwrap();
+    assert_eq!(
+        read(),
+        vec![vec![
+            Value::from_i64(3),
+            Value::from_i64(1),
+            Value::from_i64(1)
+        ]]
+    );
+    pg.execute("ALTER TABLE counts DROP COLUMN y").unwrap();
+    assert_eq!(
+        read(),
+        vec![vec![
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::from_i64(1)
+        ]]
+    );
+    pg.execute("CREATE TABLE no_index (a int)").unwrap();
+    pg.execute("CREATE INDEX ix ON no_index (a)").unwrap();
+    pg.execute("DROP INDEX ix").unwrap();
+    let rows = conn
+        .prepare_engine_schema_statement(
+            "SELECT relhasindex FROM pg_class WHERE relname='no_index'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn catalog_class_rows_match_the_exposed_attributes(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = pg.inner();
+    let rows = conn
+        .prepare_engine_schema_statement(
+            "SELECT oid, relnamespace FROM pg_class WHERE relname='pg_class'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1259), Value::from_i64(11)]]);
+    let rows = conn.prepare_engine_schema_statement("SELECT c.relname, c.relnatts, count(a.attnum) FROM main.pg_class c LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 WHERE c.oid<16384 GROUP BY c.oid, c.relname, c.relnatts HAVING c.relnatts<>count(a.attnum)").unwrap().run_collect_rows().unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
+}
+
+#[turso_macros::test(mvcc)]
+fn pg_class_scans_the_stored_rows(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let rows = pg
+        .prepare("SELECT oid, relnamespace FROM pg_class WHERE relname='pg_class'")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1259), Value::from_i64(11)]]);
+    pg.execute("CREATE TABLE visible (a int)").unwrap();
+    pg.execute("BEGIN").unwrap();
+    pg.execute("ALTER TABLE visible ADD COLUMN b text").unwrap();
+    let read = || {
+        pg.prepare("SELECT relnatts FROM pg_class WHERE relname='visible'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+    };
+    assert_eq!(read(), vec![vec![Value::from_i64(2)]]);
+    pg.execute("ROLLBACK").unwrap();
+    assert_eq!(read(), vec![vec![Value::from_i64(1)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn random_ddl_keeps_stored_classes_in_agreement_with_schema(db: TempDatabase) {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7919);
+    let pg = db.connect_postgres();
+    for step in 0..24 {
+        pg.execute("BEGIN").unwrap();
+        let primary = if rng.random_bool(0.5) {
+            "PRIMARY KEY"
+        } else {
+            ""
+        };
+        pg.execute(format!(
+            "CREATE TABLE t{step} (id int {primary}, x int UNIQUE CHECK (x > 0))"
+        ))
+        .unwrap();
+        pg.execute(format!("CREATE VIEW v{step} AS SELECT id FROM t{step}"))
+            .unwrap();
+        pg.execute(format!("CREATE SEQUENCE s{step}")).unwrap();
+        pg.execute(format!("CREATE INDEX ix{step} ON t{step} (x)"))
+            .unwrap();
+        if rng.random_bool(0.5) {
+            pg.execute(format!("DROP INDEX ix{step}")).unwrap();
+        }
+        pg.execute(format!("ALTER TABLE t{step} ADD COLUMN added text"))
+            .unwrap();
+        if rng.random_bool(0.5) {
+            pg.execute(format!("ALTER TABLE t{step} DROP COLUMN added"))
+                .unwrap();
+        }
+        pg.execute(format!("ALTER TABLE t{step} RENAME TO renamed{step}"))
+            .unwrap();
+        let mismatches = pg.prepare("SELECT c.relname FROM pg_class c LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 GROUP BY c.oid,c.relname,c.relnatts HAVING count(a.attnum)<>c.relnatts").unwrap().run_collect_rows().unwrap();
+        assert!(mismatches.is_empty(), "step {step}: {mismatches:?}");
+        pg.execute(if rng.random_bool(0.5) {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        })
+        .unwrap();
+        // Reload checks both identities and derived counts against Schema.
+        pg.inner().force_reparse_schema_without_publish().unwrap();
+    }
+}
+
+#[test]
+fn a_stored_class_without_a_relation_fails_schema_load() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE orphan (x int)").unwrap();
+    pg.inner()
+        .prepare_engine_schema_statement("DROP TABLE public.orphan")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    let error = pg
+        .inner()
+        .force_reparse_schema_without_publish()
+        .unwrap_err();
+    assert!(
+        matches!(error, turso_core::LimboError::Corrupt(_)),
+        "{error}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn changing_table_owner_updates_every_stored_index(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE ROLE new_owner").unwrap();
+    pg.execute("CREATE TABLE owned (id integer PRIMARY KEY, x integer UNIQUE)")
+        .unwrap();
+    pg.execute("CREATE INDEX owned_ix ON owned(x)").unwrap();
+    pg.execute("ALTER TABLE owned OWNER TO new_owner").unwrap();
+    let rows = class_rows(pg.inner());
+    let owner = class_row(pg.inner(), "owned").unwrap().4;
+    assert_ne!(owner, 0);
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|row| row.4 == owner), "{rows:?}");
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    assert_eq!(class_rows(pg.inner()), rows);
+}
+
+#[test]
+fn a_missing_rowid_primary_key_class_fails_schema_load() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE t (id int PRIMARY KEY, x int UNIQUE)")
+        .unwrap();
+    pg.inner()
+        .prepare_engine_schema_statement(
+            "DELETE FROM __turso_internal_classes WHERE relname='t_pkey'",
+        )
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    let error = pg
+        .inner()
+        .force_reparse_schema_without_publish()
+        .unwrap_err();
+    assert!(
+        matches!(error, turso_core::LimboError::Corrupt(_)),
+        "{error}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn user_tables_with_catalog_names_have_attributes(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE public.pg_class (id int PRIMARY KEY, x text)")
+        .unwrap();
+    let rows = pg
+        .prepare(
+            "SELECT c.relname, c.relnatts, count(a.attnum) FROM pg_catalog.pg_class c \
+         LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 \
+         WHERE c.relnamespace=2200 GROUP BY c.oid,c.relname,c.relnatts ORDER BY c.relname",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::build_text("pg_class"),
+                Value::from_i64(2),
+                Value::from_i64(2)
+            ],
+            vec![
+                Value::build_text("pg_class_pkey"),
+                Value::from_i64(1),
+                Value::from_i64(1)
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn pg_class_is_a_read_only_virtual_catalog(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    assert!(pg
+        .inner()
+        .current_schema()
+        .get_btree_table(turso_core::NamespaceId::ROOT, "pg_class")
+        .is_none());
+    assert_eq!(
+        pg.prepare("SELECT * FROM pg_catalog.pg_class")
+            .unwrap()
+            .num_columns(),
+        34
+    );
+    assert_eq!(
+        pg.prepare("SELECT tableoid FROM pg_class WHERE oid=1259")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1259)]]
+    );
+    for sql in [
+        "DELETE FROM pg_class",
+        "UPDATE pg_class SET relname='broken'",
+        "DROP TABLE pg_catalog.pg_class",
+        "ALTER TABLE pg_class ADD COLUMN broken int",
+        "TRUNCATE pg_class",
+    ] {
+        assert!(pg.execute(sql).is_err(), "{sql} must fail");
+    }
+    pg.execute("CREATE ROLE catalog_reader").unwrap();
+    pg.execute("SET ROLE catalog_reader").unwrap();
+    assert_eq!(
+        pg.prepare("SELECT relname FROM pg_catalog.pg_class WHERE oid=1259")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("pg_class")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn changing_a_star_views_width_is_rejected_before_writing(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE source (a int)").unwrap();
+    pg.execute("CREATE VIEW star_view AS SELECT * FROM source")
+        .unwrap();
+    let error = pg
+        .execute("ALTER TABLE source ADD COLUMN b int")
+        .unwrap_err();
+    assert_eq!(error.sqlstate, "0A000");
+    assert_eq!(
+        error.message,
+        "cannot alter table \"source\" because it would change the number of columns returned by view \"star_view\""
+    );
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("Drop view \"star_view\", alter table \"source\", and then recreate the view.")
+    );
+    assert_eq!(
+        pg.prepare("SELECT relnatts FROM pg_class WHERE relname IN ('source', 'star_view')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(1)]]
+    );
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    pg.execute("DROP VIEW star_view").unwrap();
+    pg.execute("ALTER TABLE source ADD COLUMN b int").unwrap();
+    pg.execute("CREATE VIEW star_view AS SELECT * FROM source")
+        .unwrap();
+    assert_eq!(
+        pg.prepare("SELECT * FROM star_view").unwrap().num_columns(),
+        2
+    );
+    pg.execute("CREATE VIEW dependent_view AS SELECT * FROM star_view")
+        .unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    assert_eq!(
+        pg.prepare("SELECT a, b FROM dependent_view")
+            .unwrap()
+            .num_columns(),
+        2
+    );
+    assert_eq!(
+        pg.prepare(
+            "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relname = 'dependent_view' AND a.attnum > 0 ORDER BY a.attnum"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::build_text("a")], vec![Value::build_text("b")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn joined_view_columns_survive_schema_load(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE SCHEMA other").unwrap();
+    pg.execute("CREATE TABLE t (a int, b int)").unwrap();
+    pg.execute("CREATE TABLE other.u (a int, c int)").unwrap();
+    pg.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    pg.execute("INSERT INTO other.u VALUES (1, 3)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT * FROM t JOIN other.u USING (a)")
+        .unwrap();
+    pg.execute("CREATE VIEW dependent AS SELECT * FROM v")
+        .unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    assert_eq!(
+        pg.prepare("SELECT * FROM dependent")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(2),
+            Value::from_i64(3)
+        ]]
+    );
+    assert_eq!(
+        pg.prepare("SELECT relnatts FROM pg_class WHERE relname IN ('v', 'dependent')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(3)], vec![Value::from_i64(3)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn stored_system_catalogs_reject_policy_and_owner_changes(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    for table in ["pg_class", "pg_description"] {
+        for sql in [
+            format!("CREATE POLICY p ON {table} USING (true)"),
+            format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"),
+            format!("ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"),
+            format!("ALTER TABLE {table} OWNER TO CURRENT_USER"),
+        ] {
+            let error = pg.execute(&sql).unwrap_err();
+            assert_eq!(
+                error.sqlstate,
+                if table == "pg_class" && sql.starts_with("CREATE POLICY") {
+                    "42809"
+                } else {
+                    "42501"
+                },
+                "{sql}: {error:?}"
+            );
+        }
+        if table == "pg_class" {
+            assert_eq!(
+                pg.execute(format!("DROP POLICY IF EXISTS p ON {table}"))
+                    .unwrap_err()
+                    .sqlstate,
+                "42809"
+            );
+        } else {
+            pg.execute(format!("DROP POLICY IF EXISTS p ON {table}"))
+                .unwrap();
+        }
+        pg.execute(format!("GRANT SELECT ON {table} TO PUBLIC"))
+            .unwrap();
+        for privilege in ["GRANT INSERT ON", "REVOKE SELECT ON"] {
+            let sql = if privilege.starts_with("GRANT") {
+                format!("{privilege} {table} TO PUBLIC")
+            } else {
+                format!("{privilege} {table} FROM PUBLIC")
+            };
+            let error = pg.execute(&sql).unwrap_err();
+            assert_eq!(error.sqlstate, "0A000", "{sql}: {error:?}");
+        }
+    }
+    pg.execute("CREATE TABLE public.pg_class (id int)").unwrap();
+    pg.execute("CREATE POLICY p ON public.pg_class USING (true)")
+        .unwrap();
+    pg.execute("ALTER TABLE public.pg_class ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    pg.execute("DROP POLICY p ON public.pg_class").unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn long_relation_names_survive_schema_reload(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.inner().pragma_update("foreign_keys", "ON").unwrap();
+    for name in ["a".repeat(60), "é".repeat(30)] {
+        pg.execute(format!("CREATE TABLE \"{name}\" (x text PRIMARY KEY)"))
+            .unwrap();
+        pg.execute(format!(
+            "CREATE TABLE refs (x text REFERENCES \"{name}\"(x))"
+        ))
+        .unwrap();
+        pg.inner().force_reparse_schema_without_publish().unwrap();
+        let error = pg
+            .execute("INSERT INTO refs VALUES ('missing')")
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "23503");
+        pg.execute(format!("INSERT INTO \"{name}\" VALUES ('present')"))
+            .unwrap();
+        pg.execute("INSERT INTO refs VALUES ('present')").unwrap();
+        pg.execute("DROP TABLE refs").unwrap();
+        pg.execute(format!("DROP TABLE \"{name}\"")).unwrap();
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn quoted_relation_names_keep_engine_lookup(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE \"MiXeD\" (id int, x text)")
+        .unwrap();
+    pg.execute("CREATE INDEX \"IxX\" ON \"MiXeD\"(x)").unwrap();
+    pg.execute("CREATE VIEW \"ViEw\" AS SELECT x FROM \"MiXeD\"")
+        .unwrap();
+    for name in ["MiXeD", "IxX", "ViEw"] {
+        assert!(class_row(pg.inner(), name).is_some(), "missing {name}");
+    }
+    let oid = class_row(pg.inner(), "MiXeD").unwrap().0;
+    pg.execute("ALTER TABLE \"MiXeD\" RENAME TO \"NewName\"")
+        .unwrap();
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    assert_eq!(class_row(pg.inner(), "NewName").unwrap().0, oid);
+    pg.execute("INSERT INTO \"NewName\" VALUES (1, 'x')")
+        .unwrap();
+    pg.execute("DROP VIEW \"ViEw\"").unwrap();
+    pg.execute("DROP TABLE \"NewName\"").unwrap();
+    assert!(class_rows(pg.inner()).is_empty());
+}
+
+#[turso_macros::test(mvcc)]
+fn virtual_catalog_lists_only_implemented_relations(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    assert_implemented_catalog_rows(pg.inner());
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    assert_implemented_catalog_rows(pg.inner());
+}
+
+fn assert_implemented_catalog_rows(conn: &Arc<Connection>) {
+    let stored_builtins = conn
+        .prepare_engine_schema_statement(
+            "SELECT count(*) FROM __turso_internal_classes WHERE oid < 16384",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(stored_builtins, vec![vec![Value::from_i64(0)]]);
+    let rows = conn
+        .prepare_engine_schema_statement(
+            "SELECT relname FROM pg_class WHERE oid < 16384 ORDER BY relname",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    let expected = [
+        "pg_am",
+        "pg_attrdef",
+        "pg_attribute",
+        "pg_auth_members",
+        "pg_cast",
+        "pg_class",
+        "pg_constraint",
+        "pg_database",
+        "pg_depend",
+        "pg_description",
+        "pg_index",
+        "pg_indexes",
+        "pg_language",
+        "pg_namespace",
+        "pg_operator",
+        "pg_policies",
+        "pg_policy",
+        "pg_proc",
+        "pg_rewrite",
+        "pg_roles",
+        "pg_sequence",
+        "pg_sequences",
+        "pg_settings",
+        "pg_tables",
+        "pg_type",
+    ];
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|name| vec![Value::from_text(name)])
+        .collect();
+    assert_eq!(rows, expected);
+}
+
+#[turso_macros::test(mvcc)]
+fn column_ddl_does_not_rewrite_relation_identity(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE derived (x int CHECK (x > 0))")
+        .unwrap();
+    let stored = || {
+        pg.inner()
+            .prepare_engine_schema_statement(
+                "SELECT * FROM __turso_internal_classes WHERE relname = 'derived'",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+    };
+    let before = stored();
+    pg.execute("ALTER TABLE derived ADD COLUMN y int").unwrap();
+    assert_eq!(
+        stored(),
+        before,
+        "column metadata belongs to the schema, not the identity row"
+    );
+    let read = || {
+        pg.prepare("SELECT relnatts, relchecks FROM pg_class WHERE relname = 'derived'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+    };
+    assert_eq!(read(), vec![vec![Value::from_i64(2), Value::from_i64(1)]]);
+    pg.inner().force_reparse_schema_without_publish().unwrap();
+    assert_eq!(read(), vec![vec![Value::from_i64(2), Value::from_i64(1)]]);
+}
+
+#[test]
+fn an_obsolete_relation_catalog_layout_is_refused_before_reading_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old-catalog.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Earlier layouts stored the engine namespace and ACL under these names.
+        conn.execute_batch(
+            "CREATE TABLE __turso_internal_classes (
+            oid INTEGER PRIMARY KEY, relname TEXT, relnamespace INTEGER,
+            relkind TEXT, relowner INTEGER, relownedby INTEGER, relacl TEXT,
+            relrowsecurity INTEGER, relpolicies TEXT, relownedbycolumn TEXT)",
+        )
+        .unwrap();
+    }
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let error = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("earlier version of tursopg"),
+        "{error}"
+    );
 }

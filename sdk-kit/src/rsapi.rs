@@ -1006,6 +1006,12 @@ impl TursoDatabase {
                                 .to_string(),
                         ));
                     }
+                    // Core checks the cipher and the key only in Database::open_async, after the
+                    // file below is opened. Check them first, so that invalid options do not
+                    // leave a new, empty database file.
+                    if let Some(encryption) = &self.config.encryption {
+                        encryption.validate()?;
+                    }
 
                     let mut open_flags = self.config.open_flags;
                     if opts.enable_multiprocess_wal {

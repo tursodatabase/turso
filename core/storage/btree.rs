@@ -2648,7 +2648,7 @@ impl BTreeCursor {
         Ok(IOResult::Done(outcome.result))
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn try_start_seek_on_current_table_leaf(
         &mut self,
         rowid: i64,
@@ -2662,7 +2662,21 @@ impl BTreeCursor {
         {
             return Ok(CurrentTableLeafSeek::SearchFromRoot);
         }
+        self.start_seek_on_current_table_leaf(rowid, seek_op)
+    }
 
+    /// The part of [Self::try_start_seek_on_current_table_leaf] after the
+    /// checks of the cursor state: it reads the cells of the current leaf.
+    ///
+    /// This function is not inlined, so that `seek` stays small. The checks
+    /// before it are inlined: a cursor that is not on a row fails them, and
+    /// a call for each such seek costs more than the checks.
+    #[inline(never)]
+    fn start_seek_on_current_table_leaf(
+        &mut self,
+        rowid: i64,
+        seek_op: SeekOp,
+    ) -> Result<CurrentTableLeafSeek> {
         let (seek, cell_count) = {
             let page = self.stack.top_ref();
             turso_debug_assert!(page.is_loaded(), "the current table leaf must be loaded");
@@ -5537,10 +5551,22 @@ impl BTreeCursor {
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    #[inline(always)]
     fn clear_overflow_pages(&mut self, first_overflow_page: Option<u32>) -> IOResultOr<()> {
         if first_overflow_page.is_none() && matches!(self.overflow_state, OverflowState::Start) {
             return Ok(IOResult::Done(()));
         }
+        self.free_overflow_pages(first_overflow_page)
+    }
+
+    /// The part of [Self::clear_overflow_pages] for a cell with overflow pages,
+    /// or for a free of overflow pages that is in progress.
+    ///
+    /// This function is not inlined. Most cells have no overflow pages, and
+    /// with this code inlined, each overwrite or delete of a cell saved and
+    /// restored the registers that only this code uses.
+    #[inline(never)]
+    fn free_overflow_pages(&mut self, first_overflow_page: Option<u32>) -> IOResultOr<()> {
         // `database_size` is invariant for the duration of this invocation, so
         // read the page-1 header at most once and reuse it for every overflow
         // page validation below instead of re-reading it per `ReadNext`.
@@ -6524,12 +6550,30 @@ impl BTreeCursor {
     /// written (`None` when unknown); peers backing incremental blob handles use it
     /// to expire exactly when their own row is hit (sqlite3's
     /// invalidateIncrblobCursors, btree.c:672).
+    #[inline(always)]
     fn drive_pending_peer_save(&mut self, written_rowid: Option<i64>) -> IOResultOr<()> {
+        // BTCF_Multiple fast path (sqlite3 btree.c:9348).
+        if self.pending_peer_save.is_none()
+            && matches!(self.state, CursorState::None)
+            && !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(IOResult::Done(()));
+        }
+        self.save_peer_positions(written_rowid)
+    }
+
+    /// The part of [Self::drive_pending_peer_save] after its fast check: the
+    /// cursor has peers, a save is in progress, or the cursor is in an
+    /// operation.
+    ///
+    /// This function is not inlined. Most cursors have no peers, and with this
+    /// code inlined, each write saved and restored the registers that only this
+    /// code uses.
+    #[inline(never)]
+    fn save_peer_positions(&mut self, written_rowid: Option<i64>) -> IOResultOr<()> {
         if self.pending_peer_save.is_none() && matches!(self.state, CursorState::None) {
-            // BTCF_Multiple fast path (sqlite3 btree.c:9348).
-            if !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed) {
-                return Ok(IOResult::Done(()));
-            }
+            // In this state, `drive_pending_peer_save` calls this function only
+            // when the cursor has peers.
             let dyn_ref: &dyn CursorTrait = self;
             let peers = self.pager.snapshot_peers_for_root(dyn_ref);
             if peers.is_empty() {
@@ -6600,10 +6644,23 @@ impl BTreeCursor {
     /// peer-deleted cursor is still recoverable via Rewind/Seek, whereas our
     /// Invalid is reserved for cursors that can never be repositioned.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    #[inline(always)]
     fn restore_context(&mut self) -> IOResultOr<()> {
         if !self.needs_restore() {
             return Ok(IOResult::Done(()));
         }
+        self.restore_saved_context()
+    }
+
+    /// The part of [Self::restore_context] for a cursor that has a saved
+    /// position to restore.
+    ///
+    /// This function is not inlined. The cursor operations call
+    /// [Self::restore_context] each time, and in most calls there is nothing to
+    /// restore. With this code inlined, each of these calls saved and restored
+    /// the registers that only this code uses.
+    #[inline(never)]
+    fn restore_saved_context(&mut self) -> IOResultOr<()> {
         if let CursorValidState::RequireAdvance(direction) = self.valid_state {
             return_if_io!(match direction {
                 // Avoid calling next()/prev() directly because they immediately call restore_context()

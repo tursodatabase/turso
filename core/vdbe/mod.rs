@@ -58,7 +58,7 @@ use crate::{
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
-        metrics::StatementMetrics,
+        metrics::{cursor_work, new_cursor_work_handle, CursorWorkHandle, StatementMetrics},
         vacuum::VacuumInPlaceOpContext,
     },
     ValueRef, WalAutoActions,
@@ -1178,6 +1178,9 @@ pub struct ProgramState {
     /// with `metrics()` or `with_metrics()`, or call `sync_step_counts`
     /// first.
     pub metrics: StatementMetrics,
+    /// Live work counters of the MVCC cursors that this statement opens. Read them with
+    /// `metrics()`. They are not in `metrics` itself.
+    pub(crate) cursor_work: CursorWorkHandle,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaApplyState,
@@ -1348,6 +1351,7 @@ impl ProgramState {
             active_op_state: ActiveOpStateSlot::default(),
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
+            cursor_work: new_cursor_work_handle(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaApplyState::NotStarted,
@@ -1754,7 +1758,10 @@ impl ProgramState {
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
         );
-        if has_active_subprogram || self.has_pending_counts() {
+        if has_active_subprogram
+            || self.has_pending_counts()
+            || !cursor_work(&self.cursor_work).is_zero()
+        {
             f(&self.metrics())
         } else {
             f(&self.metrics)
@@ -1764,6 +1771,9 @@ impl ProgramState {
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
         self.pending_counts().add_to(&mut metrics);
+        metrics
+            .cursor_work
+            .merge(&cursor_work(&self.cursor_work).get());
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
@@ -1773,6 +1783,7 @@ impl ProgramState {
     pub(crate) fn reset_metrics(&mut self) {
         self.sync_step_counts();
         self.metrics.reset();
+        cursor_work(&self.cursor_work).reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -2242,6 +2253,9 @@ pub struct PreparedProgram {
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
     /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
+    /// Whether the program reads or writes a database file, like SQLite's
+    /// `Vdbe.bIsReader`.
+    pub reads_database_file: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     pub table_references: TableReferences,
@@ -3301,6 +3315,21 @@ impl Program {
             }
         }
         Ok(res)
+    }
+
+    /// Like SQLite's `sqlite3VdbeHalt`, `PRAGMA defer_foreign_keys` turns off
+    /// when a statement that reads a database file ends and no transaction is
+    /// left open. That covers COMMIT, ROLLBACK, autocommit statements, and
+    /// statements such as `PRAGMA journal_mode` or EXPLAIN that start no
+    /// transaction.
+    pub(crate) fn reset_defer_foreign_keys_after_statement(&self, connection: &Connection) {
+        if self.reads_database_file
+            && !connection.is_nested_stmt()
+            && connection.auto_commit.load(Ordering::SeqCst)
+            && connection.get_tx_state() == TransactionState::None
+        {
+            connection.set_defer_foreign_keys(false);
+        }
     }
 
     fn commit_txn_wal(

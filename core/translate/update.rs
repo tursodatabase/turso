@@ -310,6 +310,9 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
+    if !is_internal_schema_change && resolver.table_overlay(namespace, table_name).is_some() {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
     // with a materialized view in a different database.
@@ -358,6 +361,11 @@ fn prepare_update_plan(
             "unsafe use of virtual table \"{}\"",
             body.tbl_name.name.as_str()
         );
+    }
+    // SQLite runs RETURNING on a virtual table as a BEFORE trigger, which it
+    // allows only for INSERT (sqlite3TriggersExist).
+    if table.virtual_table().is_some() && !body.returning.is_empty() {
+        bail_parse_error!("UPDATE RETURNING is not available on virtual tables");
     }
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
         bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");

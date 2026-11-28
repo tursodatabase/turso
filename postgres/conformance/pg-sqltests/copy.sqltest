@@ -124,12 +124,14 @@ expect {
 test copy-missing-table-errors {
     COPY missing TO STDOUT;
 }
+@sqlstate 42P01
 expect error {}
 
 @setup users
 test copy-missing-column-errors {
     COPY users (missing) TO STDOUT;
 }
+@sqlstate 42703
 expect error {}
 
 @setup users
@@ -143,6 +145,7 @@ test copy-view-errors {
     CREATE VIEW user_view AS SELECT id FROM users;
     COPY user_view TO STDOUT;
 }
+@sqlstate 42809
 expect error {}
 
 test copy-bytea-array-elements-as-hex {

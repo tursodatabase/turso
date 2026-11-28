@@ -17,6 +17,8 @@ tursodb [OPTIONS] [DATABASE] [SQL]
 | `DATABASE` | `:memory:` | Path to a SQLite database file. If omitted, an in-memory database is created |
 | `SQL` | — | SQL statement to execute. If provided, the shell runs the query and exits |
 
+`DATABASE` can also be a `file:` URI, such as `file:data.db?mode=ro`. A path that ends with `?key=value` parameters is also read as a URI. In such a path, all characters before the last `?`, including `%` and `#`, are part of the file name. For a URI, `tursodb` does not use the `--vfs` and `--readonly` options.
+
 ### Examples
 
 ```bash
@@ -118,6 +120,8 @@ tursodb --readonly production.db "INSERT INTO users VALUES (1, 'test');"
 ### `--mcp`
 
 Start a Model Context Protocol server instead of the interactive shell. This allows AI assistants and other MCP clients to interact with the database via JSON-RPC.
+
+The `open_database` tool of the server reads a database name as the `.open` command does, and opens the database with the options given on the command line, such as `--experimental-encryption`. Its messages show the name without the URI parameters, because they can hold the encryption key.
 
 ```bash
 tursodb --mcp mydata.db

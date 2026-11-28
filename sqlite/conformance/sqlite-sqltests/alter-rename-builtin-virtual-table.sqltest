@@ -1,0 +1,20 @@
+@database :memory:
+
+# SQLite refuses to rename a virtual table that every database has, such as
+# json_each or pragma_table_info: "table json_each may not be altered".
+# Turso emitted VRename for it, which is only for a table that
+# CREATE VIRTUAL TABLE made, and failed an assertion.
+
+test alter-rename-json-each-rejected {
+    ALTER TABLE json_each RENAME TO j;
+}
+expect error {
+    table json_each may not be altered
+}
+
+test alter-rename-pragma-table-rejected {
+    ALTER TABLE pragma_table_info RENAME TO p;
+}
+expect error {
+    table pragma_table_info may not be altered
+}

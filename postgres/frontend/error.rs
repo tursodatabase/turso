@@ -69,6 +69,31 @@ pub fn sqlstate_error(
     }))
 }
 
+/// PostgreSQL's `feature_not_supported` error, reading "`what` is not
+/// supported".
+pub fn not_supported(what: impl std::fmt::Display) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!("{what} is not supported"),
+        None,
+    )
+}
+
+/// Like `sqlstate_error`, with the HINT `hint`: how to get the same result in
+/// a way that tursopg supports.
+pub fn sqlstate_error_with_hint(
+    sqlstate: &'static str,
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: sqlstate,
+        message: message.into(),
+        detail: None,
+        hint: Some(hint.into()),
+    }))
+}
+
 const DROP_CASCADE_HINT: &str = "Use DROP ... CASCADE to drop the dependent objects too.";
 
 /// The error of a DROP of several objects that `error` refused because other
@@ -85,8 +110,6 @@ pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError 
     }))
 }
 
-/// The engine error for SQL that `turso_pg_parser::parse` refuses, which
-/// keeps the SQLSTATE that the parser gave it.
 /// The error of a DROP that names a relation of another kind than the one
 /// it drops, with the DROP statement that removes that kind.
 pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> LimboError {
@@ -101,11 +124,20 @@ pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> Limbo
     }))
 }
 
+/// The engine error for SQL that `turso_pg_parser` refuses, which keeps the
+/// SQLSTATE and the HINT that the parser gave it.
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
     match error {
-        turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
-            sqlstate_error(sqlstate, message, None)
-        }
+        turso_pg_parser::ParseError::Sqlstate {
+            sqlstate,
+            message,
+            hint,
+        } => LimboError::Dialect(Box::new(DialectError {
+            code: sqlstate,
+            message,
+            detail: None,
+            hint,
+        })),
         other => LimboError::ParseError(other.to_string()),
     }
 }
@@ -293,6 +325,9 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
             }
         },
         LimboError::ForeignKeyConstraint(_) => SQLSTATE_FK_VIOLATION,
+        LimboError::Constraint(msg) if msg.starts_with("invalid input for type boolean") => {
+            SQLSTATE_INVALID_TEXT_REPRESENTATION
+        }
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
         LimboError::LexerError(_) => SQLSTATE_SYNTAX_ERROR,
         LimboError::ParseError(msg) => parse_error_sqlstate(msg),
@@ -382,6 +417,13 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("cannot cast type ") {
         SQLSTATE_CANNOT_COERCE
+    } else if msg == turso_core::GENERATION_EXPRESSION_NOT_IMMUTABLE
+        || msg == turso_core::INDEX_EXPRESSION_NOT_IMMUTABLE
+        || msg == turso_core::INDEX_PREDICATE_NOT_IMMUTABLE
+    {
+        // FIXME(pg-catalog): HACK. Raised for a timestamp compared with a timestamptz in a
+        // schema expression; delete together with timestamp_compared_with_timestamptz.
+        SQLSTATE_INVALID_OBJECT_DEFINITION
     } else if msg.starts_with("cannot compare type ") {
         // tursopg refuses comparisons that PostgreSQL may run, and it does not know
         // which ones. PostgreSQL itself reports 42883 for some of these, so this
@@ -411,15 +453,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         && msg.ends_with("\" does not exist")
     {
         SQLSTATE_UNDEFINED_TABLE
-    } else if msg.starts_with("role \"") && msg.ends_with("\" does not exist") {
-        SQLSTATE_UNDEFINED_OBJECT
     } else if msg.starts_with('"')
         && (msg.contains("\" is not a") || msg.ends_with("\" is an index"))
     {
         SQLSTATE_WRONG_OBJECT_TYPE
-    } else if msg.starts_with("cannot change owner of sequence \"")
-        || msg.starts_with("cannot change ownership of identity sequence")
-    {
+    } else if msg.starts_with("cannot change ownership of identity sequence") {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg.starts_with("column \"") && msg.ends_with("\" does not exist") {
         SQLSTATE_UNDEFINED_COLUMN
@@ -433,9 +471,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg == "sequence must have same owner as table it is linked to" {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
-    } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
-        || msg == "no schema has been selected to create in"
-    {
+    } else if msg == "no schema has been selected to create in" {
         SQLSTATE_INVALID_SCHEMA_NAME
     } else if msg.contains("query_only mode") {
         SQLSTATE_READ_ONLY_SQL_TRANSACTION
@@ -503,8 +539,6 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 fn raise_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
-    } else if msg == "integer out of range for smallint" {
-        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else if msg == "value too long for varchar" {
         SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
     } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
@@ -595,6 +629,19 @@ fn object_name(object: &Object) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parser_hint_reaches_the_error_report() {
+        let error = sql_parse_error(turso_pg_parser::ParseError::Sqlstate {
+            sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message: "x is not supported".into(),
+            hint: Some("Use y.".into()),
+        });
+        let report = ErrorReport::from(&error);
+        assert_eq!(report.sqlstate, SQLSTATE_FEATURE_NOT_SUPPORTED);
+        assert_eq!(report.message, "x is not supported");
+        assert_eq!(report.hint.as_deref(), Some("Use y."));
+    }
 
     #[test]
     fn sqlstate_covers_errors_that_sql_alone_cannot_trigger() {
@@ -704,7 +751,7 @@ mod tests {
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
             (
-                "cannot change owner of sequence \"s\"",
+                "cannot change ownership of identity sequence",
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
             ),
             (
@@ -765,7 +812,6 @@ mod tests {
                 SQLSTATE_GENERATED_ALWAYS,
             ),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
-            ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
             (
                 "no schema has been selected to create in",
                 SQLSTATE_INVALID_SCHEMA_NAME,

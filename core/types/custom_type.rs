@@ -9,14 +9,22 @@ use super::StorageClass;
 use crate::ast;
 use crate::schema::{OperatorSignature, RangeOffsets};
 use crate::type_ordering::TypeOrdering;
-use crate::{Result, Value};
+use crate::{Connection, Result, Value};
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// A Rust function that converts `value`, which is never NULL. `params` are
 /// the values written after the type name, such as 10 and 2 in
 /// `numeric(10, 2)`, with NULL for one that is left out. Only a COERCE gets
 /// them. An ENCODE and a DECODE get none.
 pub type ConversionFn = fn(value: &Value, params: &[Value]) -> Result<Value>;
+
+/// A Rust function that reads `text` as a value of a type. `connection` is
+/// the connection that reads the text, for a type whose text names an object
+/// of the database, such as a relation. It is `None` where the caller has no
+/// connection, and then only a type that does not look at the database reads
+/// the text.
+pub type TextInput = fn(connection: Option<&Arc<Connection>>, text: &str) -> Result<Value>;
 
 /// How a type converts a value when it stores the value or reads it back.
 #[derive(Debug, Clone)]
@@ -93,6 +101,17 @@ pub trait Type: Debug + Send + Sync {
     /// blob.
     fn base(&self) -> &str;
 
+    /// INPUT: reads text as a value that a column of the type takes, as the
+    /// input function of a PostgreSQL type does (`typinput` in pg_type). A
+    /// dialect calls it where its rules read text as the type: for a string
+    /// literal, for a parameter with no type and for a cast from text. Core
+    /// does not call it.
+    ///
+    /// FIXME(pg-catalog): Only a type written in Rust has an INPUT. PostgreSQL's CREATE TYPE names the input function of a new type (`CREATE TYPE name (INPUT = function, OUTPUT = function, ...)`). When the PostgreSQL frontend supports that statement, the function it names is the INPUT of the type it creates: [UserType] gets an INPUT that calls it, and the frontend's lookup of the INPUT of a type (`typinput` of its pg_type row) finds it as it finds the INPUT of a built-in type. Do not add another way to read the text of a type.
+    fn input(&self) -> Option<TextInput> {
+        None
+    }
+
     /// ENCODE: turns a value that is written into the stored form.
     fn encode(&self) -> Option<Conversion> {
         None
@@ -156,6 +175,13 @@ pub trait Type: Debug + Send + Sync {
     /// PostgreSQL casts jsonb to the integer types, real, double precision,
     /// numeric and boolean.
     fn casts_to_numbers_and_booleans(&self) -> bool {
+        false
+    }
+
+    /// Whether a PRIMARY KEY of one column of the type is the rowid of its
+    /// table, as `INTEGER PRIMARY KEY` is. Such a type has BASE integer and
+    /// no ENCODE or DECODE, so the rowid is the value.
+    fn can_be_rowid_alias(&self) -> bool {
         false
     }
 

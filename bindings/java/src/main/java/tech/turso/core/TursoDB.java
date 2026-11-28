@@ -187,10 +187,15 @@ public final class TursoDB implements AutoCloseable {
   /**
    * Creates a TursoDB instance with encryption support.
    *
+   * <p>Give both {@code cipher} and {@code hexkey}, or neither of them (both null). If you give
+   * neither, the database is not encrypted.
+   *
    * @param url e.g. "jdbc:turso:fileName"
    * @param filePath e.g. path to file
    * @param cipher the encryption cipher to use
    * @param hexkey the hex-encoded encryption key
+   * @throws SQLException if only one of {@code cipher} and {@code hexkey} is given, if the key is
+   *     not valid for the cipher, or if the database cannot be opened
    */
   public static TursoDB createWithEncryption(
       String url, String filePath, TursoEncryptionCipher cipher, String hexkey)
@@ -202,10 +207,33 @@ public final class TursoDB implements AutoCloseable {
   private TursoDB(
       String url, String filePath, @Nullable TursoEncryptionCipher cipher, @Nullable String hexkey)
       throws SQLException {
+    validateEncryptionConfig(cipher, hexkey);
     this.url = url;
     this.filePath = filePath;
     load();
     open(0, cipher != null ? cipher.getValue() : null, hexkey);
+  }
+
+  /**
+   * Throws if only one of the cipher and the key is given. A null value counts as not given. The
+   * native code checks the key itself: it rejects a blank or invalid key before it creates the
+   * database file.
+   *
+   * <p>Without this check, a cipher without a key, or a key without a cipher, opens a plaintext
+   * database without an error.
+   */
+  private static void validateEncryptionConfig(
+      @Nullable TursoEncryptionCipher cipher, @Nullable String hexkey) throws SQLException {
+    if (cipher != null && hexkey == null) {
+      throw TursoExceptionUtils.buildTursoException(
+          TursoErrorCode.SQLITE_MISUSE.code,
+          "encryption key is required when an encryption cipher is specified");
+    }
+    if (cipher == null && hexkey != null) {
+      throw TursoExceptionUtils.buildTursoException(
+          TursoErrorCode.SQLITE_MISUSE.code,
+          "encryption cipher is required when an encryption key is specified");
+    }
   }
 
   // TODO: add support for JNI

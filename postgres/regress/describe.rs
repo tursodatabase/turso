@@ -19,22 +19,23 @@ pub(crate) fn run(
     name: &str,
     args: &[String],
     out: &mut String,
-) -> Result<()> {
+) -> Result<bool> {
     let pattern = args.first().map(String::as_str);
     match name {
         "d" | "d+" => match pattern {
-            Some(p) => describe_relation(session, p, name == "d+", out),
-            None => list_relations(session, out),
+            Some(p) => return describe_relation(session, p, name == "d+", out),
+            None => list_relations(session, out)?,
         },
-        "dD" | "dD+" => list_domains(session, pattern, out),
-        "dT" | "dT+" => list_types(session, pattern, out),
-        "sv" => show_view(session, pattern, out),
-        "sf" => show_function(session, pattern, out),
+        "dD" | "dD+" => list_domains(session, pattern, out)?,
+        "dT" | "dT+" => list_types(session, pattern, out)?,
+        "sv" => show_view(session, pattern, out)?,
+        "sf" => show_function(session, pattern, out)?,
         _ => {
             out.push_str(&format!("invalid command \\{name}\n"));
-            Ok(())
+            return Ok(false);
         }
     }
+    Ok(true)
 }
 
 /// Runs a catalog query, flattening rows to strings (NULL becomes "").
@@ -208,12 +209,14 @@ fn relkind_name(kind: &str) -> &'static str {
     }
 }
 
+/// Describes the relations that `pattern` names, as `\d` does. Returns false
+/// when there is none or the catalog query fails, as psql does.
 fn describe_relation(
     session: &mut Session,
     pattern: &str,
     verbose: bool,
     out: &mut String,
-) -> Result<()> {
+) -> Result<bool> {
     let (schema_re, name_re) = pattern_to_regex(pattern);
     let schema_cond = match &schema_re {
         Some(re) => format!("n.nspname OPERATOR(pg_catalog.~) '{}'", lit(re)),
@@ -228,11 +231,11 @@ fn describe_relation(
         lit(&name_re)
     );
     let Some(rels) = q(session, &sql, out)? else {
-        return Ok(());
+        return Ok(false);
     };
     if rels.is_empty() {
         out.push_str(&format!("Did not find any relation named \"{pattern}\".\n"));
-        return Ok(());
+        return Ok(false);
     }
     for rel in rels {
         let (oid, schema, name, kind) = (&rel[0], &rel[1], &rel[2], rel[3].as_str());
@@ -242,7 +245,7 @@ fn describe_relation(
             _ => describe_table(session, oid, schema, name, kind, verbose, out)?,
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn describe_table(

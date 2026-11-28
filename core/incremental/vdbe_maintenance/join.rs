@@ -543,6 +543,7 @@ pub(super) fn emit_inner_join(
         connection.dialect().get_internal_dialect(),
         None,
         RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
 
     let emit_eph_insert = |program: &mut ProgramBuilder| {
@@ -795,6 +796,7 @@ pub(super) fn emit_semi_or_anti_join(
         connection.dialect().get_internal_dialect(),
         None,
         RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
 
     let state_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
