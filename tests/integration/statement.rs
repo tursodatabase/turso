@@ -375,6 +375,22 @@ fn test_expanded_sql() {
 }
 
 #[test]
+fn a_bound_nan_is_null() {
+    let conn = open_test_connection().unwrap();
+    let mut stmt = conn.prepare("SELECT ?1, typeof(?1)").unwrap();
+    for bits in [0x7ff8_0000_0000_0000u64, 0xfff8_0000_0000_0001] {
+        stmt.bind_at(1.try_into().unwrap(), Value::from_f64(f64::from_bits(bits)))
+            .unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT NULL, typeof(NULL)");
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::Null, Value::build_text("null")]]
+        );
+        stmt.reset().unwrap();
+    }
+}
+
+#[test]
 fn test_tcl_style_parameter_names_bind_and_expand() {
     // The TCL binding passes namespace-qualified variables ($::x,
     // $ns::y) and array elements ($arr(k)) as parameter names. Each
