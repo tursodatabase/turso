@@ -43,7 +43,8 @@ impl TableRefIdCounter {
 use super::{
     affinity::{apply_integer_affinity, Affinity},
     explain::ExplainInfo,
-    BranchOffset, CursorID, Insn, InsnReference, PrepareContext, PreparedProgram, Program,
+    BranchOffset, CdcCommitSubroutine, CursorID, Insn, InsnReference, PrepareContext,
+    PreparedProgram, Program,
 };
 use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
@@ -380,6 +381,8 @@ pub struct ProgramBuilder {
     start_offset: BranchOffset,
     pub(crate) reg_result_cols_start: Option<usize>,
     pub resolve_type: ResolveType,
+    /// The bytecode that writes the CDC COMMIT record at the end of the statement.
+    pub(crate) cdc_commit_subroutine: Option<CdcCommitSubroutine>,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
     /// clauses don't suppress errors.
@@ -939,6 +942,7 @@ impl ProgramBuilder {
             emitted_function_call: false,
             trigger,
             resolve_type: ResolveType::Abort,
+            cdc_commit_subroutine: None,
             trigger_conflict_override: None,
             cursor_overrides: Vec::new(),
             id_register_overrides: HashMap::default(),
@@ -2249,6 +2253,10 @@ impl ProgramBuilder {
                 _ => {}
             }
         }
+        if let Some(subroutine) = &mut self.cdc_commit_subroutine {
+            resolve(&mut subroutine.start, "CdcCommitSubroutine")?;
+            resolve(&mut subroutine.fail_resume, "CdcCommitSubroutine")?;
+        }
         self.label_to_resolved_offset.clear();
         self.max_label_anchor = None;
         Ok(())
@@ -2814,6 +2822,7 @@ impl ProgramBuilder {
             is_subprogram: self.flags.is_subprogram(),
             has_materialized_views: self.has_materialized_views,
             resolve_type: self.resolve_type,
+            cdc_commit_subroutine: self.cdc_commit_subroutine,
             prepare_context,
             custom_collations,
             write_databases: self.write_databases,

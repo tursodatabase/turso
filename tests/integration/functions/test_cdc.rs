@@ -1825,6 +1825,201 @@ fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
     assert_ne!(rows[0][0], rows[1][0]);
 }
 
+/// The CDC rows as (change_id, change_txn_id, change_type, id), in change order.
+fn cdc_txn_rows(conn: &Arc<turso_core::Connection>) -> Vec<Vec<Value>> {
+    limbo_exec_rows(
+        conn,
+        "SELECT change_id, change_txn_id, change_type, id FROM turso_cdc ORDER BY change_id",
+    )
+}
+
+fn cdc_txn_row(
+    change_id: i64,
+    change_txn_id: i64,
+    change_type: i64,
+    id: Option<i64>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Integer(change_txn_id),
+        Value::Integer(change_type),
+        id.map_or(Value::Null, Value::Integer),
+    ]
+}
+
+/// Runs `failing_insert`, which fails with FAIL resolution after it inserts the row with id 2,
+/// and then inserts the row with id 3. Each of the two transactions must have its own
+/// change_txn_id and its own COMMIT record (https://github.com/tursodatabase/turso/issues/8653).
+fn assert_fail_commit_has_own_commit_record(db: &TempDatabase, schema: &str, failing_insert: &str) {
+    let conn = db.connect_limbo();
+    conn.prepare_execute_batch(schema).unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    assert!(conn.execute(failing_insert).is_err());
+    conn.execute("INSERT INTO t VALUES (3, 3)").unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT x FROM t ORDER BY x"),
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ]
+    );
+    assert_eq!(
+        cdc_txn_rows(&conn),
+        vec![
+            cdc_txn_row(1, 1, 1, Some(2)),
+            cdc_txn_row(2, 1, 2, None),
+            cdc_txn_row(3, 3, 1, Some(3)),
+            cdc_txn_row(4, 3, 2, None),
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_v2_insert_or_fail_writes_commit_record(db: TempDatabase) {
+    assert_fail_commit_has_own_commit_record(
+        &db,
+        "CREATE TABLE t(x INTEGER PRIMARY KEY, y); INSERT INTO t VALUES (1, 1);",
+        "INSERT OR FAIL INTO t VALUES (2, 2), (1, 1)",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_v2_column_on_conflict_fail_writes_commit_record(db: TempDatabase) {
+    assert_fail_commit_has_own_commit_record(
+        &db,
+        "CREATE TABLE t(x INTEGER PRIMARY KEY, y UNIQUE ON CONFLICT FAIL); INSERT INTO t VALUES (1, 1);",
+        "INSERT INTO t VALUES (2, 2), (4, 1)",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_v2_raise_fail_writes_commit_record(db: TempDatabase) {
+    assert_fail_commit_has_own_commit_record(
+        &db,
+        "CREATE TABLE t(x INTEGER PRIMARY KEY, y); INSERT INTO t VALUES (1, 1);
+         CREATE TRIGGER tr BEFORE INSERT ON t WHEN new.x = 9 BEGIN SELECT RAISE(FAIL, 'no'); END;",
+        "INSERT INTO t VALUES (2, 2), (9, 9)",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_v2_update_or_fail_writes_commit_record(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.prepare_execute_batch(
+        "CREATE TABLE t(x INTEGER PRIMARY KEY, y UNIQUE); INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    assert!(conn
+        .execute("UPDATE OR FAIL t SET y = 10 WHERE x != 2")
+        .is_err());
+    conn.execute("INSERT INTO t VALUES (4, 4)").unwrap();
+
+    assert_eq!(
+        cdc_txn_rows(&conn),
+        vec![
+            cdc_txn_row(1, 1, 0, Some(1)),
+            cdc_txn_row(2, 1, 2, None),
+            cdc_txn_row(3, 3, 1, Some(4)),
+            cdc_txn_row(4, 3, 2, None),
+        ]
+    );
+}
+
+/// The TEMP target table is not captured, but its trigger writes a captured row.
+#[turso_macros::test(mvcc)]
+fn test_cdc_v2_insert_or_fail_with_trigger_capture_writes_commit_record(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.prepare_execute_batch(
+        "CREATE TABLE log(v);
+         CREATE TEMP TABLE tt(x INTEGER PRIMARY KEY);
+         CREATE TEMP TRIGGER trg AFTER INSERT ON tt BEGIN INSERT INTO log VALUES (new.x); END;
+         INSERT INTO tt VALUES (1);",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT OR FAIL INTO tt VALUES (2), (1)")
+        .is_err());
+    conn.execute("INSERT INTO log VALUES (3)").unwrap();
+
+    assert_eq!(
+        cdc_txn_rows(&conn),
+        vec![
+            cdc_txn_row(1, 1, 1, Some(2)),
+            cdc_txn_row(2, 1, 2, None),
+            cdc_txn_row(3, 3, 1, Some(3)),
+            cdc_txn_row(4, 3, 2, None),
+        ]
+    );
+}
+
+/// Inside an explicit transaction FAIL commits nothing, and the COMMIT statement writes the
+/// one COMMIT record of the transaction.
+#[turso_macros::test(mvcc)]
+fn test_cdc_v2_insert_or_fail_in_explicit_transaction(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.prepare_execute_batch("CREATE TABLE t(x INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(conn
+        .execute("INSERT OR FAIL INTO t VALUES (2), (1)")
+        .is_err());
+    conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("INSERT INTO t VALUES (4)").unwrap();
+
+    assert_eq!(
+        cdc_txn_rows(&conn),
+        vec![
+            cdc_txn_row(1, 1, 1, Some(2)),
+            cdc_txn_row(2, 1, 1, Some(3)),
+            cdc_txn_row(3, 1, 2, None),
+            cdc_txn_row(4, 4, 1, Some(4)),
+            cdc_txn_row(5, 4, 2, None),
+        ]
+    );
+}
+
+/// Outside an explicit transaction, a statement that changes no rows writes a COMMIT record
+/// with change_txn_id -1. A FAIL error at the first row is such a statement, because FAIL
+/// commits. `UPDATE` and `DELETE` with a WHERE clause that is always false used to panic: they
+/// wrote the record with a CDC cursor that they had not opened.
+#[turso_macros::test(mvcc)]
+fn test_cdc_v2_statement_without_changes_writes_commit_record(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.prepare_execute_batch("CREATE TABLE t(x INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT OR FAIL INTO t VALUES (1), (2)")
+        .is_err());
+    conn.execute("INSERT INTO t SELECT 5 WHERE 0").unwrap();
+    conn.execute("UPDATE t SET x = 6 WHERE 0").unwrap();
+    conn.execute("DELETE FROM t WHERE 0").unwrap();
+    conn.execute("INSERT INTO t VALUES (3)").unwrap();
+
+    assert_eq!(
+        cdc_txn_rows(&conn),
+        vec![
+            cdc_txn_row(1, -1, 2, None),
+            cdc_txn_row(2, -1, 2, None),
+            cdc_txn_row(3, -1, 2, None),
+            cdc_txn_row(4, -1, 2, None),
+            cdc_txn_row(5, 5, 1, Some(3)),
+            cdc_txn_row(6, 5, 2, None),
+        ]
+    );
+}
+
 #[turso_macros::test]
 fn test_cdc_mvcc_failed_insert_then_empty_commit(db: TempDatabase) {
     let conn = db.connect_limbo();

@@ -1388,13 +1388,7 @@ fn emit_epilogue(
             cursor_id: meta.seq_cursor_id,
         });
     }
-    emit_cdc_autocommit_commit(
-        program,
-        resolver,
-        ctx.cdc_table
-            .as_ref()
-            .map(|(cdc_cursor_id, _)| *cdc_cursor_id),
-    )?;
+    emit_cdc_autocommit_commit(program, resolver, ctx.cdc_table.is_some())?;
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
     // FkCheck must come before the scan-back so that FK violations prevent

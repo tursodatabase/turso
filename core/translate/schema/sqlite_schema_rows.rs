@@ -425,8 +425,8 @@ fn emit_delete_index_row(
     });
 
     program.preassign_label_to_next_insn(loop_end_label);
-    if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
+    if cdc_table.is_some() {
+        emit_cdc_autocommit_commit(program, resolver, true)?;
     }
 
     Ok(())
@@ -558,8 +558,8 @@ fn emit_delete_rows_of_table(
     });
     program.preassign_label_to_next_insn(end_metadata_label);
     // end of loop on schema table
-    if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
+    if cdc_table.is_some() {
+        emit_cdc_autocommit_commit(program, resolver, true)?;
     }
     Ok(())
 }
@@ -1435,7 +1435,7 @@ pub fn emit_schema_entry(
             None,
             SQLITE_TABLEID,
         )?;
-        emit_cdc_autocommit_commit(program, resolver, Some(cdc_table_cursor_id))?;
+        emit_cdc_autocommit_commit(program, resolver, true)?;
     }
     Ok(())
 }

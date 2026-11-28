@@ -3792,6 +3792,9 @@ pub fn halt(
     on_error: Option<ResolveType>,
     constraint_info: Option<&ConstraintInfo>,
 ) -> InsnResult {
+    if let Some(error) = state.pending_fail_after_cdc_commit.take() {
+        return Err(error.into());
+    }
     state.halt_in_progress = true;
     let mv_store = state.mv_store(connection).cloned();
     let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
@@ -3865,13 +3868,16 @@ pub fn halt(
         }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
-        // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
         if program.resolve_type == ResolveType::Fail && can_autocommit_now {
-            // Check for immediate FK violations - FK errors don't respect ON CONFLICT
-            if connection.foreign_keys_enabled()
-                && state.get_fk_immediate_violations_during_stmt() > 0
-            {
-                return Err(state.immediate_foreign_key_error().into());
+            if let Some(fk_error) = state.foreign_key_error_for_fail(connection, true) {
+                return Err(fk_error.into());
+            }
+
+            // The subroutine returns to this Halt, which then finds the same
+            // error again.
+            let pc = state.pc;
+            if program.enter_cdc_commit_for_fail(state, |_| pc) {
+                return Ok(InsnFunctionStepResult::Step);
             }
 
             // Maintain materialized views with the kept rows and stage every
@@ -3980,13 +3986,12 @@ pub fn halt(
             let result =
                 program.commit_txn(connection, pager.clone(), state, mv_store.as_ref(), false);
             let result = state.done_or_suspend(result);
-            // Apply deferred CDC state and reset CDC txn ID after successful commit
+            // Apply deferred CDC state after successful commit
             if matches!(result, Ok(InsnFunctionStepResult::Done)) {
                 index_method_on_transaction_committed_all(state, connection);
                 if let Some(cdc_info) = state.pending_cdc_info.take() {
                     connection.set_capture_data_changes_info(cdc_info);
                 }
-                connection.set_cdc_transaction_id(-1);
             }
             result
         } else {
@@ -5640,8 +5645,6 @@ pub fn op_auto_commit(
         conn.clear_deferred_foreign_key_violations();
     }
 
-    // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
-    conn.set_cdc_transaction_id(-1);
     if matches!(tx_op, TxOp::Commit) {
         conn.index_methods_on_transaction_committed();
     }
