@@ -2,9 +2,11 @@
 
 # Regression test for https://github.com/tursodatabase/turso/issues/11402
 #
-# ALTER TABLE DROP COLUMN checks that the column exists before it checks that
-# another column would remain, as SQLite does: dropping a column that is not
-# there reports "no such column", also on a table with one column.
+# ALTER TABLE DROP COLUMN checks, in SQLite's order, that the column exists,
+# that it is not a PRIMARY KEY column or a column with its own UNIQUE, and only
+# then that another column would remain: dropping a column that is not there
+# reports "no such column", also on a table with one column. A column named
+# only in a table-level UNIQUE is refused after the column count.
 
 test drop-missing-column-from-one-column-table {
     CREATE TABLE t (a);
@@ -20,4 +22,60 @@ test drop-only-column-still-rejected {
 }
 expect error {
     cannot drop column "a": no other columns exist
+}
+
+test drop-only-primary-key-column {
+    CREATE TABLE t (a PRIMARY KEY);
+    ALTER TABLE t DROP COLUMN a;
+}
+expect error {
+    cannot drop PRIMARY KEY column: "a"
+}
+
+test drop-only-unique-column {
+    CREATE TABLE t (a UNIQUE);
+    ALTER TABLE t DROP COLUMN a;
+}
+expect error {
+    cannot drop UNIQUE column: "a"
+}
+
+test drop-column-of-a-table-primary-key {
+    CREATE TABLE t (a, b, PRIMARY KEY (a, b));
+    ALTER TABLE t DROP COLUMN a;
+}
+expect error {
+    cannot drop PRIMARY KEY column: "a"
+}
+
+test drop-only-column-named-in-a-table-unique {
+    CREATE TABLE t (a, UNIQUE (a));
+    ALTER TABLE t DROP COLUMN a;
+}
+expect error {
+    cannot drop column "a": no other columns exist
+}
+
+test drop-column-named-in-a-table-unique {
+    CREATE TABLE t (a, b, UNIQUE (a, b));
+    ALTER TABLE t DROP COLUMN a;
+}
+expect error {
+    error in table t after drop column: no such column: a
+}
+
+test drop-column-named-in-a-table-unique-with-capitals {
+    CREATE TABLE users (Email, Name, UNIQUE (Email));
+    ALTER TABLE users DROP COLUMN Email;
+}
+expect error {
+    error in table users after drop column: no such column: Email
+}
+
+test drop-column-named-in-a-table-unique-keeps-the-declared-spelling {
+    CREATE TABLE T (a, b, UNIQUE (a, b));
+    ALTER TABLE t DROP COLUMN A;
+}
+expect error {
+    error in table T after drop column: no such column: a
 }

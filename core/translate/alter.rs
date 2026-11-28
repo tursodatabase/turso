@@ -717,17 +717,11 @@ pub fn translate_alter_table(
                 column_name,
             )?;
 
-            // The column must exist before anything else is checked, as in
+            // The column must exist before the other DROP COLUMN checks, as in
             // SQLite: a PostgreSQL table can have no columns at all.
             let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
                 LimboError::ParseError(format!("no such column: \"{column_name}\""))
             })?;
-
-            if btree.columns().len() == 1 {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": no other columns exist"
-                )));
-            }
 
             // Column cannot be dropped if:
             // The column is a PRIMARY KEY or part of one.
@@ -740,25 +734,43 @@ pub fn translate_alter_table(
             // The column is used in the expression of a generated column.
             // The column appears in a trigger or view.
 
+            // In SQLite's order (sqlite3AlterDropColumn): a PRIMARY KEY column, then a column
+            // with its own UNIQUE, then the only column. A column named only in a table-level
+            // UNIQUE is not flagged, so SQLite finds it after the count, when it rewrites the
+            // table's CREATE statement.
             if column.primary_key() {
                 return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": PRIMARY KEY"
+                    "cannot drop PRIMARY KEY column: \"{column_name}\""
                 )));
             }
 
-            if column.unique()
-                || btree.unique_sets.iter().any(|set| {
-                    set.columns
-                        .iter()
-                        .any(|c| c.name == normalize_ident(column_name))
-                })
+            if column.unique() {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop UNIQUE column: \"{column_name}\""
+                )));
+            }
+
+            if btree.columns().len() == 1 {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\": no other columns exist"
+                )));
+            }
+
+            // SQLite's message for a table-level UNIQUE names the table as it was created and
+            // the column as the constraint spells it.
+            let col_normalized = normalize_ident(column_name);
+            if let Some(key) = btree
+                .unique_sets
+                .iter()
+                .flat_map(|set| &set.columns)
+                .find(|key| normalize_ident(&key.name) == col_normalized)
             {
                 return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": UNIQUE"
+                    "error in table {} after drop column: no such column: {}",
+                    btree.declared_name, key.name
                 )));
             }
 
-            let col_normalized = normalize_ident(column_name);
             for index in table_indexes.iter() {
                 // Referenced in regular index
                 let maybe_indexed_col = index

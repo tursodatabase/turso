@@ -201,13 +201,14 @@ A column cannot be dropped if any of the following conditions are true:
 | Condition | Error |
 |-----------|-------|
 | The column is a PRIMARY KEY or part of one | Cannot drop PRIMARY KEY column |
-| The column has a UNIQUE constraint | Cannot drop UNIQUE column |
+| The column has a UNIQUE constraint of its own | Cannot drop UNIQUE column |
 | The column is referenced by an index | Cannot drop indexed column |
 | The column is referenced in an expression index | Cannot drop column used in expression index |
 | The column is named in a partial index WHERE clause | Cannot drop column used in partial index |
 | The column is referenced in a CHECK constraint belonging to another column or the table | Cannot drop column used in CHECK constraint |
 | The column is referenced by a foreign key in another table | Cannot drop column used in foreign key |
 | The table has only one column | Cannot drop the last remaining column |
+| The column is named in a table-level UNIQUE constraint | Error in table after drop column: no such column |
 | The column appears in a trigger or view | Cannot drop column referenced by trigger or view |
 
 ### Examples
