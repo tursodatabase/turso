@@ -551,6 +551,45 @@ fn vector_index_rejected_update_rollback(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn vector_index_refuses_a_vector_whose_components_sum_to_nan(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e)")
+        .unwrap();
+    conn.execute("CREATE INDEX vi ON v USING toy_vector_sparse_ivf (e)")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT hex(vector32_sparse('[1,2,0]'))");
+    let rusqlite::types::Value::Text(finite) = &rows[0][0] else {
+        panic!("hex() returns text");
+    };
+    let insert = |id: i64, components: [f32; 2]| {
+        let bits: String = components
+            .iter()
+            .flat_map(|component| component.to_le_bytes())
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        conn.execute(format!(
+            "INSERT INTO v VALUES({id}, x'{bits}{}')",
+            &finite[16..]
+        ))
+    };
+    for components in [[f32::NAN, 2.0], [f32::INFINITY, f32::NEG_INFINITY]] {
+        let error = insert(1, components).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the sum of the components is NaN"),
+            "{error}"
+        );
+    }
+    insert(1, [f32::INFINITY, 2.0]).unwrap();
+    insert(2, [1.0, 2.0]).unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+        vec![row!["ok"]]
+    );
+}
+
+#[turso_macros::test]
 fn vector_argument_dependencies_own_row(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     for sql in [
