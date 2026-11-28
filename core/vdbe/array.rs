@@ -353,6 +353,33 @@ pub(crate) fn compute_array_length_at_dim(val: &Value, dim: i64) -> Option<i64> 
     compute_array_length_at_dim(&first, dim - 1)
 }
 
+/// The lower bound of array dimension `dim` (1-based). None for NULL, for a
+/// value that is not an array, for an empty array and for a `dim` that the
+/// array does not have.
+pub(crate) fn compute_array_lower_at_dim(val: &Value, dim: i64) -> Option<i64> {
+    array_dimension(val, dim).map(|(lower_bound, _)| lower_bound)
+}
+
+/// The upper bound of array dimension `dim`; None where
+/// [compute_array_lower_at_dim] is.
+pub(crate) fn compute_array_upper_at_dim(val: &Value, dim: i64) -> Option<i64> {
+    array_dimension(val, dim).map(|(lower_bound, length)| lower_bound + length - 1)
+}
+
+/// The lower bound and the length of dimension `dim`. Inner dimensions are
+/// read from the first element, as [compute_array_length_at_dim] does.
+fn array_dimension(val: &Value, dim: i64) -> Option<(i64, i64)> {
+    if dim < 1 || matches!(val, Value::Null) {
+        return None;
+    }
+    let array = array_from_any(val)?;
+    let first = array.elements.first()?;
+    if dim == 1 {
+        return Some((i64::from(array.lower_bound), array.elements.len() as i64));
+    }
+    array_dimension(first, dim - 1)
+}
+
 pub(crate) fn exec_array_append(arr: &Value, elem: &Value) -> Result<Value> {
     let Some(mut elements) = array_values_from_any(arr) else {
         return Ok(Value::Null);

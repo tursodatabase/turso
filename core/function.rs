@@ -1114,6 +1114,8 @@ pub enum ScalarFunc {
     ArraySetElement,
     // Array utility functions
     ArrayLength,
+    ArrayLower,
+    ArrayUpper,
     ArrayAppend,
     ArrayPrepend,
     ArrayCat,
@@ -1240,6 +1242,8 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
             | ScalarFunc::ArrayLength
+            | ScalarFunc::ArrayLower
+            | ScalarFunc::ArrayUpper
             | ScalarFunc::ArrayAppend
             | ScalarFunc::ArrayPrepend
             | ScalarFunc::ArrayCat
@@ -1312,6 +1316,8 @@ impl ScalarFunc {
             | Self::BooleanToInt
             | Self::DateDiff
             | Self::ArrayLength
+            | Self::ArrayLower
+            | Self::ArrayUpper
             | Self::ArrayPosition
             | Self::NextVal
             | Self::CurrVal
@@ -1500,6 +1506,8 @@ impl ScalarFunc {
             | Self::DateDiff
             | Self::ArrayElement
             | Self::ArrayLength
+            | Self::ArrayLower
+            | Self::ArrayUpper
             | Self::ArraySlice
             | Self::StringToArray
             | Self::ArrayToString
@@ -1636,6 +1644,8 @@ impl Display for ScalarFunc {
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
             Self::ArrayLength => "array_length",
+            Self::ArrayLower => "array_lower",
+            Self::ArrayUpper => "array_upper",
             Self::ArrayAppend => "array_append",
             Self::ArrayPrepend => "array_prepend",
             Self::ArrayCat => "array_cat",
@@ -1787,6 +1797,7 @@ impl ScalarFunc {
             Self::ArraySetElement => &[3],
             // Array functions
             Self::ArrayLength => &[1, 2],
+            Self::ArrayLower | Self::ArrayUpper => &[2],
             Self::ArrayAppend
             | Self::ArrayPrepend
             | Self::ArrayCat

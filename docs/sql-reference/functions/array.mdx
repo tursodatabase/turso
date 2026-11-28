@@ -176,9 +176,32 @@ SELECT array_length(ARRAY[1, 2, 3], 0);
 -- NULL (dimension < 1)
 ```
 
+### array_lower
+
+Returns the lower bound of a given dimension of an array: the subscript of its first element.
+
+```sql
+array_lower(array, dimension)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The array to measure |
+| `dimension` | INTEGER | 1-based dimension index |
+
+**Returns:** INTEGER -- the lower bound of `dimension`. NULL if the array is NULL or empty, or has no such dimension.
+
+```sql
+SELECT array_lower(ARRAY[10, 20, 30], 1);
+-- 1
+
+SELECT array_lower(CAST('[0:2]={10,20,30}' AS INTEGER[]), 1);
+-- 0
+```
+
 ### array_upper
 
-Returns the upper bound (inclusive) of a given dimension of an array.
+Returns the upper bound (inclusive) of a given dimension of an array: the subscript of its last element.
 
 ```sql
 array_upper(array, dimension)
@@ -189,9 +212,9 @@ array_upper(array, dimension)
 | `array` | BLOB/TEXT | The array to measure |
 | `dimension` | INTEGER | 1-based dimension index |
 
-**Returns:** INTEGER -- the upper bound of `dimension`. NULL with the same conditions as `array_length`.
+**Returns:** INTEGER -- the upper bound of `dimension`. NULL if the array is NULL or empty, or has no such dimension.
 
-Turso arrays are always 1-indexed, so `array_upper(arr, dim)` is equivalent to `array_length(arr, dim)` for every valid input. The function is provided for PostgreSQL compatibility.
+For an array that starts at 1, `array_upper(arr, dim)` is equal to `array_length(arr, dim)`.
 
 ```sql
 SELECT array_upper(ARRAY[10, 20, 30], 1);
@@ -202,6 +225,9 @@ SELECT array_upper(ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]], 2);
 
 SELECT array_upper(ARRAY[1, 2, 3], 2);
 -- NULL
+
+SELECT array_upper(CAST('[0:2]={10,20,30}' AS INTEGER[]), 1);
+-- 2
 ```
 
 ### array_append
