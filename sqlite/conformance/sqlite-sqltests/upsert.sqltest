@@ -1577,3 +1577,26 @@ expect {
     7|30|30|60
     30|1
 }
+
+@requires strict "uses STRICT tables"
+test upsert-excluded-reads-the-integer-primary-key-of-a-strict-table {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, v INT UNIQUE, w TEXT) STRICT;
+    INSERT INTO s VALUES (1, 10, 'a'), (2, 20, 'b');
+    INSERT INTO s VALUES (1, 11, 'c') ON CONFLICT(id) DO UPDATE SET w = excluded.w || excluded.v || excluded.id;
+    INSERT INTO s(v, w) VALUES (20, 'd') ON CONFLICT(v) DO UPDATE SET w = excluded.w || excluded.id || excluded.rowid;
+    SELECT * FROM s ORDER BY id;
+}
+expect {
+    1|10|c111
+    2|20|d33
+}
+
+test upsert-excluded-reads-the-generated-rowid {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, v INT UNIQUE, w TEXT);
+    INSERT INTO s VALUES (1, 10, 'a');
+    INSERT INTO s(v, w) VALUES (10, 'b') ON CONFLICT(v) DO UPDATE SET w = excluded.w || excluded.id || excluded.rowid;
+    SELECT * FROM s;
+}
+expect {
+    1|10|b22
+}

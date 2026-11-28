@@ -40,16 +40,16 @@ addr  opcode            p1  p2  p3  p4                         p5  comment
   18    Copy             6  15   0                              0  r[15]=r[6]
   19    Copy             7  16   0                              0  r[16]=r[7]
   20    Null             0  17   0                              0  r[17]=NULL
-  21    Affinity        12   6   0                              0  r[12..18] = D, D, D, D, E, B
-  22    NotNull         11  24   0                              0  r[11]!=NULL -> goto 24
-  23    Goto             0  26   0                              0
-  24    MustBeInt       11   0   0                              0
-  25    Goto             0  27   0                              0
-  26    NewRowid         1  11   0                              0  r[11]=rowid
-  27    HaltIfNull    1299   0  13  order_archive.user_id       0
-  28    HaltIfNull    1299   0  14  order_archive.product_id    0
-  29    HaltIfNull    1299   0  15  order_archive.quantity      0
-  30    HaltIfNull    1299   0  16  order_archive.total_price   0
+  21    NotNull         11  23   0                              0  r[11]!=NULL -> goto 23
+  22    Goto             0  25   0                              0
+  23    MustBeInt       11   0   0                              0
+  24    Goto             0  26   0                              0
+  25    NewRowid         1  11   0                              0  r[11]=rowid
+  26    HaltIfNull    1299   0  13  order_archive.user_id       0
+  27    HaltIfNull    1299   0  14  order_archive.product_id    0
+  28    HaltIfNull    1299   0  15  order_archive.quantity      0
+  29    HaltIfNull    1299   0  16  order_archive.total_price   0
+  30    Affinity        12   6   0                              0  r[12..18] = D, D, D, D, E, B
   31    NotExists        1  33  11                              0
   32    Halt          1555   0   0  order_archive.id            0
   33    MakeRecord      12   6  18                              0  r[18]=mkrec(r[12..17])

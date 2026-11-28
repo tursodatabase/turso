@@ -11,12 +11,13 @@ use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::sorter_insert;
 use crate::translate::plan::{
-    CompoundOrderByKey, EvalAt, Plan, QueryDestination, SelectPlan, SubqueryOrigin,
+    CompoundOrderByKey, EvalAt, Plan, QueryDestination, ResultSetColumn, SelectPlan, SubqueryOrigin,
 };
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
+use crate::vdbe::{BranchOffset, CursorID};
 use crate::{emit_explain, LimboError};
 use tracing::instrument;
 
@@ -25,12 +26,71 @@ use tracing::Level;
 /// Emits bytecode for a compound SELECT statement (UNION, INTERSECT, EXCEPT, UNION ALL).
 /// Returns the result column start register when in coroutine mode (for CTE subqueries),
 /// or None for top-level queries.
+///
+/// This function is on the stack one time for each level of nested compound
+/// subqueries. The work before and after the emission of the SELECTs is in
+/// functions that are not inlined, so that their values are not in this frame
+/// while the SELECTs are emitted.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: &mut Plan,
 ) -> crate::Result<Option<usize>> {
+    let emission = prepare_compound_select(program, resolver, plan)?;
+    let Plan::CompoundSelect {
+        left, right_most, ..
+    } = plan
+    else {
+        unreachable!()
+    };
+
+    program.with_scoped_result_cols_start(|program| {
+        emit_compound_select(
+            program,
+            left,
+            right_most,
+            &emission.limit,
+            &emission.offset,
+            &emission.right_most_ctx.resolver,
+            &emission.collations,
+            emission.limit_ctx,
+            emission.offset_reg,
+            emission.reg_result_cols_start,
+        )
+    })?;
+    finish_compound_select(program, plan, emission)
+}
+
+/// The values that [emit_program_for_compound_select] makes before it emits
+/// the SELECTs of a compound query, and reads after them.
+struct CompoundSelectEmission<'a> {
+    order_by: Option<Vec<CompoundOrderByKey>>,
+    limit: Option<Box<Expr>>,
+    offset: Option<Box<Expr>>,
+    right_most_ctx: Box<TranslateCtx<'a>>,
+    limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
+    /// The destination of the compound query. With ORDER BY, the SELECTs
+    /// write to a collection index, and the sorted rows go to this
+    /// destination.
+    real_query_destination: QueryDestination,
+    num_result_cols: usize,
+    collations: Vec<CollationSeq>,
+    collection_cursor: Option<CursorID>,
+    collection_index: Option<Arc<Index>>,
+    reg_result_cols_start: Option<usize>,
+    leftmost_result_columns: Vec<ResultSetColumn>,
+}
+
+/// Prepares the emission of the SELECTs of a compound query: the LIMIT and
+/// OFFSET counters, the destination of the SELECTs, and the result registers.
+#[inline(never)]
+fn prepare_compound_select<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver<'a>,
+    plan: &mut Plan,
+) -> crate::Result<Box<CompoundSelectEmission<'a>>> {
     let Plan::CompoundSelect {
         left,
         right_most,
@@ -45,12 +105,12 @@ pub fn emit_program_for_compound_select(
     let order_by_owned = order_by.clone();
     let limit_owned = limit.clone();
     let offset_owned = offset.clone();
-    let right_most_ctx = Box::new(TranslateCtx::new(
+    let right_most_ctx = TranslateCtx::new_boxed(
         program,
         resolver.fork_with_expr_cache(),
         right_most.table_references.joined_tables().len(),
         false,
-    ));
+    );
 
     emit_non_from_clause_subqueries_for_eval_at(
         program,
@@ -174,7 +234,9 @@ pub fn emit_program_for_compound_select(
         | QueryDestination::EphemeralTable { .. }
         | QueryDestination::RecursiveCteQueue { .. }
         | QueryDestination::EphemeralIndex { .. } => Some(program.alloc_registers(num_result_cols)),
-        QueryDestination::ResultRows => None,
+        QueryDestination::ResultRows
+        | QueryDestination::ExistsSubqueryResult { .. }
+        | QueryDestination::RowValueSubqueryResult { .. } => None,
         other => {
             return Err(LimboError::InternalError(format!(
                 "Unexpected query destination: {other:?} for compound select"
@@ -208,27 +270,44 @@ pub fn emit_program_for_compound_select(
     if has_order_by {
         set_select_plan_destination(plan, &query_destination);
     }
-    let Plan::CompoundSelect {
-        left, right_most, ..
-    } = plan
-    else {
-        unreachable!()
-    };
+    Ok(Box::new(CompoundSelectEmission {
+        order_by: order_by_owned,
+        limit: limit_owned,
+        offset: offset_owned,
+        right_most_ctx,
+        limit_ctx,
+        offset_reg,
+        real_query_destination,
+        num_result_cols,
+        collations,
+        collection_cursor,
+        collection_index,
+        reg_result_cols_start,
+        leftmost_result_columns,
+    }))
+}
 
-    program.with_scoped_result_cols_start(|program| {
-        emit_compound_select(
-            program,
-            left,
-            right_most,
-            &limit_owned,
-            &offset_owned,
-            &right_most_ctx.resolver,
-            &collations,
-            limit_ctx,
-            offset_reg,
-            reg_result_cols_start,
-        )
-    })?;
+/// Sorts the rows of a compound query that has ORDER BY, and sets the result
+/// columns of the program, after the SELECTs of the query are emitted.
+#[inline(never)]
+fn finish_compound_select(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    emission: Box<CompoundSelectEmission>,
+) -> crate::Result<Option<usize>> {
+    let CompoundSelectEmission {
+        order_by: order_by_owned,
+        limit: limit_owned,
+        offset: offset_owned,
+        right_most_ctx,
+        real_query_destination,
+        num_result_cols,
+        collection_cursor,
+        collection_index,
+        reg_result_cols_start,
+        leftmost_result_columns,
+        ..
+    } = *emission;
     program.pop_current_parent_explain();
 
     // Install the compound query's result columns. Emission of nested subqueries above may
@@ -270,8 +349,45 @@ pub fn emit_program_for_compound_select(
     Ok(program.reg_result_cols_start)
 }
 
-// Emits bytecode for a compound SELECT statement. This function processes the rightmost part of
-// the compound SELECT and handles the left parts recursively based on the compound operator type.
+/// What a compound operator emits after the term on its right.
+enum CompoundArmRows {
+    /// UNION ALL: the right term writes its rows to the destination of the operator.
+    UnionAll,
+    /// UNION or EXCEPT: both terms write to the index of `cursor_id`. `destination` is
+    /// where the rows of the index go afterwards, or None when the index is the
+    /// destination of the operator itself.
+    Dedupe {
+        cursor_id: usize,
+        index: Arc<Index>,
+        destination: Option<QueryDestination>,
+    },
+    /// INTERSECT: the left terms write to the index of `left_cursor_id`, the right term
+    /// to the index of `right_cursor_id`, and the rows found in both go to `destination`.
+    Intersect {
+        left_cursor_id: usize,
+        left_index: Arc<Index>,
+        right_cursor_id: usize,
+        destination: QueryDestination,
+    },
+}
+
+/// A compound operator whose right term is emitted after all the terms on its left.
+struct CompoundArm {
+    op: EqpCompoundOp,
+    /// The label after the bytecode of the operator.
+    end_label: BranchOffset,
+    /// The LIMIT and OFFSET that apply to the rows of the operator.
+    limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
+    rows: CompoundArmRows,
+}
+
+// Emits bytecode for a compound SELECT statement. The first term is emitted first, and it can
+// read a subquery that is itself a compound SELECT. A recursion with one call per term would emit
+// that subquery below one stack frame per term of this compound, so the depth of the stack would
+// be the sum of the term counts of the nested compounds. Thus a first loop sets the destinations
+// of the operators from the last to the first, the first term is emitted, and a second loop emits
+// the right term of each operator from the first to the last.
 #[allow(clippy::too_many_arguments)]
 fn emit_compound_select(
     program: &mut ProgramBuilder,
@@ -281,150 +397,77 @@ fn emit_compound_select(
     offset: &Option<Box<Expr>>,
     resolver: &Resolver,
     collations: &[CollationSeq],
-    limit_ctx: Option<LimitCtx>,
-    offset_reg: Option<usize>,
+    mut limit_ctx: Option<LimitCtx>,
+    mut offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
 ) -> crate::Result<()> {
-    let compound_select_end = program.allocate_label();
-    if let Some(limit_ctx) = &limit_ctx {
-        program.emit_insn(Insn::IfNot {
-            reg: limit_ctx.reg_limit,
-            target_pc: compound_select_end,
-            jump_if_null: false,
-        });
-    }
-    let mut right_most_ctx = Box::new(TranslateCtx::new(
-        program,
-        resolver.fork_with_expr_cache(),
-        right_most.table_references.joined_tables().len(),
-        false,
-    ));
-    right_most_ctx.reg_result_cols_start = reg_result_cols_start;
-    match left.split_last_mut() {
-        Some(((plan, operator), left)) => match operator {
+    let mut arms = crate::alloc::Vec::try_with_capacity_ext(left.len())?;
+    for term_idx in (1..=left.len()).rev() {
+        let end_label = program.allocate_label();
+        if let Some(limit_ctx) = &limit_ctx {
+            program.emit_insn(Insn::IfNot {
+                reg: limit_ctx.reg_limit,
+                target_pc: end_label,
+                jump_if_null: false,
+            });
+        }
+        let (terms_before, terms_after) = left.split_at_mut(term_idx);
+        let (plan, operator) = &mut terms_before[term_idx - 1];
+        let right = match terms_after.first_mut() {
+            Some((right, _)) => right,
+            None => &mut *right_most,
+        };
+        let (op, rows) = match operator {
             CompoundOperator::UnionAll => {
                 if matches!(
-                    right_most.query_destination,
+                    right.query_destination,
                     QueryDestination::EphemeralIndex { .. }
                         | QueryDestination::CoroutineYield { .. }
                         | QueryDestination::EphemeralTable { .. }
                         | QueryDestination::RecursiveCteQueue { .. }
                 ) {
-                    plan.query_destination = right_most.query_destination.clone();
+                    plan.query_destination = right.query_destination.clone();
                 }
-                emit_compound_select(
-                    program,
-                    left,
-                    plan,
-                    limit,
-                    offset,
-                    resolver,
-                    collations,
-                    limit_ctx,
-                    offset_reg,
-                    reg_result_cols_start,
-                )?;
-
-                let label_next_select = program.allocate_label();
-                if let Some(limit_ctx) = limit_ctx {
-                    program.emit_insn(Insn::IfNot {
-                        reg: limit_ctx.reg_limit,
-                        target_pc: label_next_select,
-                        jump_if_null: true,
-                    });
-                    right_most.limit.clone_from(limit);
-                    right_most_ctx.limit_ctx = Some(limit_ctx);
-                }
-                if offset_reg.is_some() {
-                    right_most.offset.clone_from(offset);
-                    right_most_ctx.reg_offset = offset_reg;
-                }
-
-                emit_explain!(
-                    program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::UnionAll,
-                        temp_btree: false,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
-                program.preassign_label_to_next_insn(label_next_select);
+                (EqpCompoundOp::UnionAll, CompoundArmRows::UnionAll)
             }
             CompoundOperator::Union => {
-                let union_destination = right_most.query_destination.clone();
+                let union_destination = right.query_destination.clone();
                 let affinity_str = match &union_destination {
                     QueryDestination::EphemeralIndex { affinity_str, .. } => affinity_str.clone(),
                     _ => None,
                 };
-                let reused_index = destination_index_for_dedupe(&union_destination, collations);
-                let new_dedupe_index = reused_index.is_none();
-                let dedupe_index = match reused_index {
-                    Some(index) => index,
-                    None => create_dedupe_index(program, right_most, collations)?,
-                };
-                plan.query_destination = QueryDestination::EphemeralIndex {
-                    cursor_id: dedupe_index.0,
-                    index: dedupe_index.1.clone(),
-                    affinity_str: affinity_str.clone(),
-                    is_delete: false,
-                };
-                emit_compound_select(
-                    program,
-                    left,
-                    plan,
-                    limit,
-                    offset,
-                    resolver,
+                let reused_index = destination_index_for_dedupe(
+                    &union_destination,
                     collations,
-                    None,
-                    None,
-                    reg_result_cols_start,
-                )?;
-
-                right_most.query_destination = QueryDestination::EphemeralIndex {
-                    cursor_id: dedupe_index.0,
-                    index: dedupe_index.1.clone(),
-                    affinity_str,
-                    is_delete: false,
-                };
-
-                emit_explain!(
-                    program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::Union,
-                        temp_btree: true,
-                    }
+                    limit_ctx.is_some() || offset_reg.is_some(),
                 );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
-
-                if new_dedupe_index {
-                    read_deduplicated_union_or_except_rows(
-                        program,
-                        dedupe_index.0,
-                        dedupe_index.1.as_ref(),
-                        limit_ctx,
-                        offset_reg,
-                        reg_result_cols_start,
-                        &union_destination,
-                    )?;
+                let new_dedupe_index = reused_index.is_none();
+                let (cursor_id, index) = match reused_index {
+                    Some(index) => index,
+                    None => create_dedupe_index(program, right, collations)?,
+                };
+                for term in [&mut *plan, &mut *right] {
+                    term.query_destination = QueryDestination::EphemeralIndex {
+                        cursor_id,
+                        index: index.clone(),
+                        affinity_str: affinity_str.clone(),
+                        is_delete: false,
+                    };
                 }
+                let rows = CompoundArmRows::Dedupe {
+                    cursor_id,
+                    index,
+                    destination: new_dedupe_index.then_some(union_destination),
+                };
+                (EqpCompoundOp::Union, rows)
             }
             CompoundOperator::Intersect => {
                 // For nested compound selects (e.g., A INTERSECT B UNION C), the outer UNION
-                // sets right_most.query_destination to its dedupe_index. We need to capture
+                // sets right.query_destination to its dedupe_index. We need to capture
                 // this BEFORE we overwrite it with our own indexes for the intersection.
-                let intersect_destination = right_most.query_destination.clone();
+                let intersect_destination = right.query_destination.clone();
 
-                let (left_cursor_id, left_index) =
-                    create_dedupe_index(program, right_most, collations)?;
+                let (left_cursor_id, left_index) = create_dedupe_index(program, right, collations)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
@@ -433,56 +476,32 @@ fn emit_compound_select(
                 };
 
                 let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, right_most, collations)?;
-                right_most.query_destination = QueryDestination::EphemeralIndex {
+                    create_dedupe_index(program, right, collations)?;
+                right.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
                     affinity_str: None,
                     is_delete: false,
                 };
-                emit_compound_select(
-                    program,
-                    left,
-                    plan,
-                    limit,
-                    offset,
-                    resolver,
-                    collations,
-                    None,
-                    None,
-                    reg_result_cols_start,
-                )?;
-
-                emit_explain!(
-                    program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::Intersect,
-                        temp_btree: true,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
-                read_intersect_rows(
-                    program,
+                let rows = CompoundArmRows::Intersect {
                     left_cursor_id,
-                    &left_index,
+                    left_index,
                     right_cursor_id,
-                    limit_ctx,
-                    offset_reg,
-                    reg_result_cols_start,
-                    &intersect_destination,
-                )?;
+                    destination: intersect_destination,
+                };
+                (EqpCompoundOp::Intersect, rows)
             }
             CompoundOperator::Except => {
-                let except_destination = right_most.query_destination.clone();
-                let reused_index = destination_index_for_dedupe(&except_destination, collations);
+                let except_destination = right.query_destination.clone();
+                let reused_index = destination_index_for_dedupe(
+                    &except_destination,
+                    collations,
+                    limit_ctx.is_some() || offset_reg.is_some(),
+                );
                 let new_index = reused_index.is_none();
                 let (cursor_id, index) = match reused_index {
                     Some(index) => index,
-                    None => create_dedupe_index(program, right_most, collations)?,
+                    None => create_dedupe_index(program, right, collations)?,
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
@@ -490,86 +509,209 @@ fn emit_compound_select(
                     affinity_str: None,
                     is_delete: false,
                 };
-                emit_compound_select(
-                    program,
-                    left,
-                    plan,
-                    limit,
-                    offset,
-                    resolver,
-                    collations,
-                    None,
-                    None,
-                    reg_result_cols_start,
-                )?;
-                right_most.query_destination = QueryDestination::EphemeralIndex {
+                right.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
                     index: index.clone(),
                     affinity_str: None,
                     is_delete: true,
                 };
-                emit_explain!(
+                let rows = CompoundArmRows::Dedupe {
+                    cursor_id,
+                    index,
+                    destination: new_index.then_some(except_destination),
+                };
+                (EqpCompoundOp::Except, rows)
+            }
+        };
+        arms.try_push(CompoundArm {
+            op,
+            end_label,
+            limit_ctx,
+            offset_reg,
+            rows,
+        })?;
+        // Only UNION ALL passes its LIMIT and OFFSET to the terms on its left. The other
+        // operators apply them when they read their rows from their index.
+        if op != EqpCompoundOp::UnionAll {
+            limit_ctx = None;
+            offset_reg = None;
+        }
+    }
+
+    let first_term_end = program.allocate_label();
+    if let Some(limit_ctx) = &limit_ctx {
+        program.emit_insn(Insn::IfNot {
+            reg: limit_ctx.reg_limit,
+            target_pc: first_term_end,
+            jump_if_null: false,
+        });
+    }
+    let first_term = match left.first_mut() {
+        Some((first_term, _)) => first_term,
+        None => &mut *right_most,
+    };
+    emit_compound_term(
+        program,
+        first_term,
+        EqpCompoundOp::LeftMost,
+        limit,
+        offset,
+        resolver,
+        limit_ctx,
+        offset_reg,
+        reg_result_cols_start,
+    )?;
+    program.preassign_label_to_next_insn(first_term_end);
+
+    for (term_idx, arm) in (1..).zip(arms.into_iter().rev()) {
+        let right = match left.get_mut(term_idx) {
+            Some((right, _)) => right,
+            None => &mut *right_most,
+        };
+        match arm.rows {
+            CompoundArmRows::UnionAll => {
+                let label_next_select = program.allocate_label();
+                if let Some(limit_ctx) = arm.limit_ctx {
+                    program.emit_insn(Insn::IfNot {
+                        reg: limit_ctx.reg_limit,
+                        target_pc: label_next_select,
+                        jump_if_null: true,
+                    });
+                }
+                emit_compound_term(
                     program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::Except,
-                        temp_btree: true,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
-                if new_index {
+                    right,
+                    arm.op,
+                    limit,
+                    offset,
+                    resolver,
+                    arm.limit_ctx,
+                    arm.offset_reg,
+                    reg_result_cols_start,
+                )?;
+                program.preassign_label_to_next_insn(label_next_select);
+            }
+            CompoundArmRows::Dedupe {
+                cursor_id,
+                index,
+                destination,
+            } => {
+                emit_compound_term(
+                    program,
+                    right,
+                    arm.op,
+                    limit,
+                    offset,
+                    resolver,
+                    None,
+                    None,
+                    reg_result_cols_start,
+                )?;
+                if let Some(destination) = destination {
                     read_deduplicated_union_or_except_rows(
                         program,
                         cursor_id,
                         &index,
-                        limit_ctx,
-                        offset_reg,
+                        arm.limit_ctx,
+                        arm.offset_reg,
                         reg_result_cols_start,
-                        &except_destination,
+                        &destination,
                     )?;
                 }
             }
-        },
-        None => {
-            if let Some(limit_ctx) = limit_ctx {
-                right_most_ctx.limit_ctx = Some(limit_ctx);
-                right_most.limit.clone_from(limit);
+            CompoundArmRows::Intersect {
+                left_cursor_id,
+                left_index,
+                right_cursor_id,
+                destination,
+            } => {
+                emit_compound_term(
+                    program,
+                    right,
+                    arm.op,
+                    limit,
+                    offset,
+                    resolver,
+                    None,
+                    None,
+                    reg_result_cols_start,
+                )?;
+                read_intersect_rows(
+                    program,
+                    left_cursor_id,
+                    &left_index,
+                    right_cursor_id,
+                    arm.limit_ctx,
+                    arm.offset_reg,
+                    reg_result_cols_start,
+                    &destination,
+                )?;
             }
-            if offset_reg.is_some() {
-                right_most.offset.clone_from(offset);
-                right_most_ctx.reg_offset = offset_reg;
-            }
-            emit_explain!(
-                program,
-                true,
-                EqpDetail::CompoundArm {
-                    op: EqpCompoundOp::LeftMost,
-                    temp_btree: false,
-                }
-            );
-            right_most_ctx.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-            emit_query(program, right_most, &mut right_most_ctx)?;
-            program.pop_current_parent_explain();
         }
+        program.preassign_label_to_next_insn(arm.end_label);
     }
 
-    program.preassign_label_to_next_insn(compound_select_end);
+    Ok(())
+}
 
+/// Emits the query of one term of a compound SELECT. `limit_ctx` and `offset_reg` are the
+/// LIMIT and OFFSET of the compound when the term applies them itself.
+#[allow(clippy::too_many_arguments)]
+fn emit_compound_term(
+    program: &mut ProgramBuilder,
+    term: &mut SelectPlan,
+    op: EqpCompoundOp,
+    limit: &Option<Box<Expr>>,
+    offset: &Option<Box<Expr>>,
+    resolver: &Resolver,
+    limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
+    reg_result_cols_start: Option<usize>,
+) -> crate::Result<()> {
+    let mut term_ctx = TranslateCtx::new_boxed(
+        program,
+        resolver.fork_with_expr_cache(),
+        term.table_references.joined_tables().len(),
+        false,
+    );
+    term_ctx.reg_result_cols_start = reg_result_cols_start;
+    if let Some(limit_ctx) = limit_ctx {
+        term_ctx.limit_ctx = Some(limit_ctx);
+        term.limit.clone_from(limit);
+    }
+    if offset_reg.is_some() {
+        term.offset.clone_from(offset);
+        term_ctx.reg_offset = offset_reg;
+    }
+    emit_explain!(
+        program,
+        true,
+        EqpDetail::CompoundArm {
+            op,
+            temp_btree: !matches!(op, EqpCompoundOp::UnionAll | EqpCompoundOp::LeftMost),
+        }
+    );
+    term_ctx.materialized_build_inputs =
+        emit_materialized_build_inputs(program, &term_ctx.resolver, term)?;
+    emit_query(program, term, &mut term_ctx)?;
+    program.pop_current_parent_explain();
     Ok(())
 }
 
 /// Returns the destination's index when the compound can remove duplicates in it
 /// directly: the index of an enclosing UNION or EXCEPT of the same compound, or the
 /// ephemeral index of an IN whose key collations are the compound's. An index that
-/// compares with other collations would merge or keep the wrong rows.
+/// compares with other collations would merge or keep the wrong rows. An operator with a
+/// LIMIT or OFFSET never writes into the destination's index, because it applies them while
+/// it reads its rows from its own index into the destination.
 fn destination_index_for_dedupe(
     destination: &QueryDestination,
     collations: &[CollationSeq],
+    has_limit_or_offset: bool,
 ) -> Option<(usize, Arc<Index>)> {
+    if has_limit_or_offset {
+        return None;
+    }
     match destination {
         QueryDestination::EphemeralIndex {
             cursor_id, index, ..

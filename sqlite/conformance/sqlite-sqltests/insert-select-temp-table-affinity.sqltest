@@ -1,0 +1,297 @@
+# INSERT ... SELECT from the table it writes to, or into a table with an insert trigger, goes through a temporary table. The target column affinity applies when the row is read back from it, before triggers see the row.
+
+@database :memory:
+
+test issue-2040-integer-column-direct {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (9.00), ('xthjqehemf'), (NULL);
+    SELECT min(x), typeof(min(x)) FROM t;
+}
+expect {
+    9|integer
+}
+
+test issue-2040-integer-column-through-temp-table {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (9.00), ('xthjqehemf'), (NULL);
+    INSERT INTO t SELECT x FROM t;
+    SELECT min(x), typeof(min(x)), count(*) FROM t;
+}
+expect {
+    9|integer|6
+}
+
+test issue-2041-text-column-direct {
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES (-3.90), (-611), (199);
+    SELECT min(x), typeof(min(x)) FROM t;
+}
+expect {
+    -3.9|text
+}
+
+test issue-2041-text-column-through-temp-table {
+    CREATE TABLE s(a);
+    INSERT INTO s VALUES (-3.90), (-611), (199);
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t SELECT a FROM s;
+    INSERT INTO t SELECT x FROM t;
+    SELECT min(x), typeof(min(x)), count(*) FROM t;
+}
+expect {
+    -3.9|text|6
+}
+
+test temp-table-with-column-list-and-different-affinity {
+    CREATE TABLE t(a INTEGER, b TEXT, c REAL);
+    INSERT INTO t(a, b, c) VALUES ('5', 6, '7');
+    INSERT INTO t(c, a, b) SELECT a, b, c FROM t;
+    SELECT a, typeof(a), b, typeof(b), CAST(c AS TEXT), typeof(c) FROM t ORDER BY rowid;
+}
+expect {
+    5|integer|6|text|7.0|real
+    6|integer|7.0|text|5.0|real
+}
+
+test temp-table-with-after-insert-trigger {
+    CREATE TABLE s(a);
+    INSERT INTO s VALUES ('12'), (3.5), ('abc');
+    CREATE TABLE t(x INTEGER);
+    CREATE TABLE log(v);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (typeof(new.x)); END;
+    INSERT INTO t SELECT a FROM s;
+    SELECT x, typeof(x) FROM t ORDER BY rowid;
+    SELECT v FROM log ORDER BY rowid;
+}
+expect {
+    12|integer
+    3.5|real
+    abc|text
+    integer
+    real
+    text
+}
+
+@requires strict "uses STRICT tables"
+test strict-before-trigger-sees-converted-values-from-insert-select {
+    CREATE TABLE st(a INTEGER, b REAL) STRICT;
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON st BEGIN INSERT INTO lg VALUES (typeof(new.a)||typeof(new.b)); END;
+    CREATE TRIGGER tr2 BEFORE INSERT ON st WHEN new.a = 3 BEGIN INSERT INTO lg VALUES ('when'); END;
+    INSERT INTO st SELECT '3', 4;
+    SELECT v FROM lg ORDER BY rowid;
+}
+expect {
+    when
+    integerreal
+}
+
+@requires strict "uses STRICT tables"
+test strict-before-trigger-sees-converted-values-from-values {
+    CREATE TABLE st(a INTEGER, b REAL) STRICT;
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON st BEGIN INSERT INTO lg VALUES (typeof(new.a)||typeof(new.b)); END;
+    CREATE TRIGGER tr2 BEFORE INSERT ON st WHEN new.a = 3 BEGIN INSERT INTO lg VALUES ('when'); END;
+    INSERT INTO st VALUES ('3', 4);
+    SELECT v FROM lg ORDER BY rowid;
+}
+expect {
+    when
+    integerreal
+}
+
+@requires strict "uses STRICT tables"
+test strict-before-trigger-sees-converted-values-when-reading-the-target {
+    CREATE TABLE st(a INTEGER, b REAL) STRICT;
+    CREATE TABLE lg(v);
+    INSERT INTO st VALUES (1, 1.5);
+    CREATE TRIGGER tr BEFORE INSERT ON st BEGIN INSERT INTO lg VALUES (typeof(new.a)||typeof(new.b)); END;
+    INSERT INTO st SELECT '3', 4 FROM st;
+    SELECT v FROM lg ORDER BY rowid;
+}
+expect {
+    integerreal
+}
+
+@requires strict "uses STRICT tables"
+test strict-after-trigger-sees-converted-values-from-insert-select {
+    CREATE TABLE st(a INTEGER, b REAL) STRICT;
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr AFTER INSERT ON st BEGIN INSERT INTO lg VALUES (typeof(new.a)||typeof(new.b)); END;
+    INSERT INTO st SELECT '3', 4;
+    SELECT v FROM lg ORDER BY rowid;
+}
+expect {
+    integerreal
+}
+
+test non-strict-before-and-after-triggers-see-converted-values-from-insert-select {
+    CREATE TABLE nt(a INTEGER, b REAL, c TEXT);
+    CREATE TABLE lg(v);
+    CREATE TRIGGER trb BEFORE INSERT ON nt BEGIN INSERT INTO lg VALUES ('before ' || typeof(new.a) || typeof(new.b) || typeof(new.c)); END;
+    CREATE TRIGGER trw BEFORE INSERT ON nt WHEN new.a = 3 BEGIN INSERT INTO lg VALUES ('when'); END;
+    CREATE TRIGGER tra AFTER INSERT ON nt BEGIN INSERT INTO lg VALUES ('after ' || typeof(new.a) || typeof(new.b) || typeof(new.c)); END;
+    INSERT INTO nt SELECT '3', 4, 5;
+    SELECT v FROM lg ORDER BY rowid;
+}
+expect {
+    when
+    before integerrealtext
+    after integerrealtext
+}
+
+test before-trigger-sees-integer-rowid-alias-from-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (new.id); END;
+    INSERT INTO t VALUES ('10'), ('3.0'), (' 7 '), (12.0), (NULL);
+    SELECT v, typeof(v) FROM lg ORDER BY rowid;
+}
+expect {
+    10|integer
+    3|integer
+    7|integer
+    12|integer
+    -1|integer
+}
+
+test before-trigger-sees-integer-rowid-alias-from-insert-select {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (new.id); END;
+    INSERT INTO t SELECT '9' UNION ALL SELECT '3.0' UNION ALL SELECT ' 7 ' UNION ALL SELECT 12.0;
+    SELECT v, typeof(v) FROM lg ORDER BY rowid;
+}
+expect {
+    9|integer
+    3|integer
+    7|integer
+    12|integer
+}
+
+test before-trigger-sees-integer-rowid-with-when-clause {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t WHEN new.id = 9 BEGIN INSERT INTO lg VALUES ('when ' || typeof(new.id)); END;
+    INSERT INTO t SELECT '9';
+    DELETE FROM t;
+    INSERT INTO t VALUES ('9.0');
+    SELECT v FROM lg ORDER BY rowid;
+}
+expect {
+    when integer
+    when integer
+}
+
+test before-trigger-sees-integer-rowid-named-in-column-list {
+    CREATE TABLE t(x);
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (new.rowid); END;
+    INSERT INTO t(oid, x) VALUES ('5', 1);
+    INSERT INTO t(_rowid_, x) SELECT '6', 2;
+    SELECT v, typeof(v) FROM lg ORDER BY rowid;
+}
+expect {
+    5|integer
+    6|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-before-trigger-sees-integer-rowid-alias {
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (new.id); END;
+    INSERT INTO t SELECT '9';
+    INSERT INTO t VALUES ('10');
+    SELECT v, typeof(v) FROM lg ORDER BY rowid;
+}
+expect {
+    9|integer
+    10|integer
+}
+
+test before-trigger-sees-generated-column-computed-from-integer-rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g AS (typeof(id)), s AS (typeof(id)) STORED);
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (new.g || new.s || new.id); END;
+    INSERT INTO t(id) SELECT '5';
+    INSERT INTO t(id) VALUES ('6');
+    INSERT INTO t(id) VALUES (NULL);
+    INSERT INTO t(id) SELECT NULL FROM t WHERE id = 5;
+    SELECT v FROM lg ORDER BY rowid;
+    SELECT id, g, s FROM t ORDER BY id;
+}
+expect {
+    integerinteger5
+    integerinteger6
+    integerinteger-1
+    integerinteger-1
+    5|integer|integer
+    6|integer|integer
+    7|integer|integer
+    8|integer|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-before-trigger-sees-generated-column-computed-from-converted-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, g TEXT AS (typeof(id) || typeof(a)), s INT AS (id + a) STORED) STRICT;
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (new.g || typeof(new.s) || new.s); END;
+    INSERT INTO t(id, a) SELECT '5', '1';
+    INSERT INTO t(id, a) VALUES ('6', '2');
+    INSERT INTO t(id, a) VALUES (NULL, '3');
+    SELECT v FROM lg ORDER BY rowid;
+    SELECT id, a, g, s FROM t ORDER BY id;
+}
+expect {
+    integerintegerinteger6
+    integerintegerinteger8
+    integerintegerinteger2
+    5|1|integerinteger|6
+    6|2|integerinteger|8
+    7|3|integerinteger|10
+}
+
+test before-trigger-does-not-change-the-row-that-is-inserted {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INT);
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (new.id || typeof(new.a) || typeof(new.b)); END;
+    CREATE TRIGGER ta AFTER INSERT ON t BEGIN INSERT INTO lg VALUES (new.id || typeof(new.a) || typeof(new.b)); END;
+    INSERT INTO t VALUES (NULL, 1, '2'), ('3.0', 4.5, 'x'), (NULL, NULL, 6.0);
+    SELECT v FROM lg ORDER BY rowid;
+    SELECT id, typeof(id), a, typeof(b) FROM t ORDER BY id;
+}
+expect {
+    -1textinteger
+    1textinteger
+    3texttext
+    3texttext
+    -1nullinteger
+    4nullinteger
+    1|integer|1|integer
+    3|integer|4.5|text
+    4|integer||integer
+}
+
+test rowid-that-is-not-an-integer-fails-before-the-before-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN SELECT RAISE(IGNORE); END;
+    INSERT INTO t VALUES ('abc', 1);
+}
+expect error {
+}
+
+test not-null-is-checked-after-the-before-trigger {
+    CREATE TABLE t(a INT NOT NULL, b INT);
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (typeof(new.a) || typeof(new.b)); END;
+    INSERT OR IGNORE INTO t VALUES (NULL, '7');
+    INSERT OR IGNORE INTO t SELECT NULL, '8';
+    SELECT v FROM lg ORDER BY rowid;
+    SELECT count(*) FROM t;
+}
+expect {
+    nullinteger
+    nullinteger
+    0
+}

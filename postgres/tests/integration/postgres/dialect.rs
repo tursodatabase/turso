@@ -1,6 +1,44 @@
 use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
+#[test]
+fn postgres_cannot_attach_a_sqlite_database() {
+    use std::sync::Arc;
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenOptions, SessionRole};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sqlite.db");
+    {
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE t(a REAL, b INTEGER); CREATE INDEX t_a ON t(a); \
+             INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);",
+            )
+            .unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let db = Database::open(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true)),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(format!("ATTACH '{}' AS aux", path.display()))
+        .expect_err("a PostgreSQL connection must not attach a SQLite file");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    assert_eq!(sqlite.execute("DELETE FROM t WHERE b = 1", []).unwrap(), 1);
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_ctes_ignore_search_path(db: TempDatabase) {
     let conn = db.connect_postgres();
@@ -1173,7 +1211,7 @@ fn test_postgres_add_column_with_a_default_of_the_wrong_type_fails(db: TempDatab
     assert!(
         error
             .to_string()
-            .contains("cannot store TEXT value in INTEGER column"),
+            .contains("column \"n\" is of type integer but default expression is of type text"),
         "{error}"
     );
     assert!(conn.query("SELECT n FROM t").is_err());
@@ -4209,20 +4247,19 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
     assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
     drop(rows);
 
-    // unknown type: error
+    // unknown type: the statement fails, as in PostgreSQL
     let mut rows = conn
         .query("SELECT message, sql_error_code FROM pg_input_error_info('x', 'nonexistent_type')")
         .unwrap()
         .unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    assert_eq!(
-        row.get_value(0).to_string(),
-        "type \"nonexistent_type\" does not exist"
+    let error = rows.step().unwrap_err();
+    assert_eq!(error.sqlstate, "42704", "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("type \"nonexistent_type\" does not exist"),
+        "{error}"
     );
-    assert_eq!(row.get_value(1).to_string(), "42704");
     drop(rows);
 
     // oid: valid
@@ -4582,7 +4619,7 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
 
     let mut rows = conn
         .inner()
-        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' AND name NOT IN ('sqlite_sequence', 'pg_description') ORDER BY name")
+        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' AND name NOT IN ('sqlite_sequence', 'pg_description', 'pg_class') ORDER BY name")
         .unwrap();
     let mut stored = Vec::new();
     while let StepResult::Row = rows.step().unwrap() {
@@ -4606,4 +4643,47 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
             ),
         ]
     );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_oid_param_is_read_as_oid(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (o oid)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4294967295)").unwrap();
+
+    let count = |sql: &str, value: Value| {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(std::num::NonZero::new(1).unwrap(), value)
+            .unwrap();
+        stmt.run_collect_rows()
+    };
+    let one = vec![vec![Value::from_i64(1)]];
+    let none = vec![vec![Value::from_i64(0)]];
+    for sql in [
+        "SELECT count(*) FROM t WHERE o = $1",
+        "SELECT count(*) FROM t WHERE $1 = o",
+        "SELECT count(*) FROM t WHERE o IN ($1)",
+    ] {
+        for value in [
+            Value::from_i64(-1),
+            Value::from_i64(4294967295),
+            Value::from_text("-1".to_owned()),
+            Value::from_text("4294967295".to_owned()),
+        ] {
+            assert_eq!(
+                count(sql, value.clone()).unwrap(),
+                one,
+                "{sql} with {value:?}"
+            );
+        }
+    }
+    assert_eq!(
+        count("SELECT count(*) FROM t WHERE o > $1", Value::from_i64(-1)).unwrap(),
+        none
+    );
+    assert!(count(
+        "SELECT count(*) FROM t WHERE o = $1",
+        Value::from_i64(4294967296)
+    )
+    .is_err());
 }

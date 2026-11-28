@@ -13,16 +13,25 @@
 
 use turso_core::ast;
 use turso_core::schema::BTreeTable;
+use turso_core::Connection;
+use turso_core::{walk_expr_mut, WalkControl};
 use turso_pg_parser::quote_identifier;
 use turso_pg_parser::translator::role_keyword;
 
-use crate::catalog::pg_type_oid;
+use crate::catalog::{pg_type_oid, regclass_text};
 use crate::functions::quote_literal;
+use crate::pg_type::regtype_text;
+use turso_pg_parser::RegKind;
 
 /// PostgreSQL's text of `condition`, a condition on the columns of `table`,
 /// or None when it has a form this module does not print.
-pub(crate) fn condition_text(condition: &ast::Expr, table: &BTreeTable) -> Option<String> {
-    let printed = Printer { table }.expr(condition)?;
+pub(crate) fn condition_text(
+    conn: &Connection,
+    condition: &ast::Expr,
+    table: &BTreeTable,
+) -> Option<String> {
+    let condition = name_reg_constants(conn, condition);
+    let printed = Printer { table }.expr(&condition)?;
     Some(printed.typed_text(None))
 }
 
@@ -32,11 +41,23 @@ pub(crate) fn condition_text(condition: &ast::Expr, table: &BTreeTable) -> Optio
 /// cast of the whole expression to the column's type, so `7` stays `7` in a
 /// `bigint` column, but a quoted literal takes the column's type.
 pub(crate) fn default_text(
+    conn: &Connection,
     default: &ast::Expr,
     table: &BTreeTable,
     declared_type: &str,
 ) -> Option<String> {
-    let printed = Printer { table }.expr(default)?;
+    if let Some(kind) = reg_kind(declared_type) {
+        if let ast::Expr::Literal(ast::Literal::String(quoted)) = default {
+            let oid = unquote(quoted)?.parse().ok()?;
+            return Some(format!(
+                "{}::{}",
+                quote_literal(&reg_constant_text(conn, kind, oid)),
+                kind.type_name()
+            ));
+        }
+    }
+    let default = name_reg_constants(conn, default);
+    let printed = Printer { table }.expr(&default)?;
     if printed.ty != PgType::UnknownLiteral {
         return Some(printed.text);
     }
@@ -213,6 +234,48 @@ fn operands(lhs: &Printed, rhs: &Printed) -> Option<(String, String, PgType)> {
     None
 }
 
+/// The reg type that `type_name` names, when it is regclass or regtype.
+fn reg_kind(type_name: &str) -> Option<RegKind> {
+    [RegKind::Class, RegKind::Type]
+        .into_iter()
+        .find(|kind| type_name.eq_ignore_ascii_case(kind.type_name()))
+}
+
+/// The name that PostgreSQL prints for the oid `oid` of a reg type of `kind`.
+fn reg_constant_text(conn: &Connection, kind: RegKind, oid: i64) -> String {
+    match kind {
+        RegKind::Class => regclass_text(conn, oid),
+        RegKind::Type => regtype_text(conn, oid),
+    }
+}
+
+/// `expr` with each regclass or regtype constant written as the name of its
+/// relation or type. A statement stores such a constant as the oid, which
+/// PostgreSQL prints as the name, in the form the search path of the session
+/// finds it by.
+pub(crate) fn name_reg_constants(conn: &Connection, expr: &ast::Expr) -> ast::Expr {
+    let mut expr = expr.clone();
+    walk_expr_mut(&mut expr, &mut |expr| {
+        if let ast::Expr::Cast {
+            expr: operand,
+            type_name: Some(type_name),
+        } = expr
+        {
+            if let Some(kind) = reg_kind(&type_name.name) {
+                if let ast::Expr::Literal(ast::Literal::String(quoted)) = operand.as_mut() {
+                    if let Some(oid) = unquote(quoted).and_then(|text| text.parse().ok()) {
+                        let name = reg_constant_text(conn, kind, oid);
+                        *quoted = format!("'{}'", name.replace('\'', "''"));
+                    }
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("naming reg constants does not fail");
+    expr
+}
+
 struct Printer<'a> {
     table: &'a BTreeTable,
 }
@@ -226,6 +289,20 @@ impl Printer<'_> {
             },
             ast::Expr::Id(name) | ast::Expr::Qualified(_, name) => self.column(name),
             ast::Expr::Literal(literal) => literal_text(literal),
+            ast::Expr::Cast {
+                expr,
+                type_name: Some(type_name),
+            } if reg_kind(&type_name.name).is_some() => match expr.as_ref() {
+                ast::Expr::Literal(literal @ ast::Literal::String(_)) => Some(Printed::new(
+                    format!(
+                        "{}::{}",
+                        literal_text(literal)?.text,
+                        reg_kind(&type_name.name)?.type_name()
+                    ),
+                    PgType::Other,
+                )),
+                _ => None,
+            },
             ast::Expr::Cast {
                 expr,
                 type_name: Some(type_name),
@@ -701,8 +778,24 @@ mod tests {
         .unwrap()
     }
 
+    fn connection() -> crate::PgConnection {
+        let (io, db) = crate::open_database(
+            ":memory:",
+            None,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap();
+        drop(io);
+        crate::PgConnection::connect(&db).unwrap()
+    }
+
     fn text(stored: &str) -> Option<String> {
-        condition_text(&parse_condition(stored).unwrap(), &table())
+        condition_text(
+            connection().inner(),
+            &parse_condition(stored).unwrap(),
+            &table(),
+        )
     }
 
     /// The pairs are what the engine stores for a condition and what
@@ -790,7 +883,7 @@ mod tests {
         ] {
             let default = parse_condition(stored).unwrap();
             assert_eq!(
-                default_text(&default, &table(), declared_type).as_deref(),
+                default_text(connection().inner(), &default, &table(), declared_type).as_deref(),
                 Some(expected),
                 "{stored}"
             );
@@ -815,7 +908,7 @@ mod tests {
         ] {
             let default = ast::Expr::Literal(ast::Literal::Numeric(stored.to_string()));
             assert_eq!(
-                default_text(&default, &table(), "INT").as_deref(),
+                default_text(connection().inner(), &default, &table(), "INT").as_deref(),
                 Some(expected),
                 "{stored}"
             );
@@ -833,7 +926,7 @@ mod tests {
         ] {
             let default = parse_condition(stored).unwrap();
             assert_eq!(
-                default_text(&default, &table(), declared_type),
+                default_text(connection().inner(), &default, &table(), declared_type),
                 None,
                 "{stored}"
             );

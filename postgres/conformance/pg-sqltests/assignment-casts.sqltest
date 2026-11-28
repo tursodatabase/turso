@@ -1,0 +1,651 @@
+# A value written to a column is converted to the type of the column as an
+# assignment cast. Each way of writing a value has a test, and a value with no
+# assignment cast to the column type fails with 42804.
+
+@database :memory:
+
+test insert-many-rows-with-no-cast-to-the-column-type {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES (20260101), (20260102);
+}
+@sqlstate 42804
+expect error {}
+
+test insert-many-rows-of-text-literals-into-an-integer-column {
+    CREATE TABLE t (n int);
+    INSERT INTO t VALUES ('1'), ('2');
+    SELECT n FROM t ORDER BY n;
+}
+expect {
+    1
+    2
+}
+
+test upsert-set-with-no-cast-to-the-column-type {
+    CREATE TABLE t (id int PRIMARY KEY, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01Z');
+    INSERT INTO t VALUES (1, '2026-01-02Z') ON CONFLICT (id) DO UPDATE SET ts = 5;
+}
+@sqlstate 42804
+expect error {}
+
+test upsert-set-of-a-text-literal-into-an-integer-column {
+    CREATE TABLE t (id int PRIMARY KEY, n int);
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = '7';
+    SELECT n FROM t;
+}
+expect {
+    7
+}
+
+test update-set-of-a-text-literal-into-an-integer-column {
+    CREATE TABLE t (n int);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET n = '7';
+    SELECT n FROM t;
+}
+expect {
+    7
+}
+
+test create-table-refuses-an-integer-default-of-a-timestamp-column {
+    CREATE TABLE t (id int, ts timestamptz DEFAULT 5);
+}
+@sqlstate 42804
+expect error {
+    column "ts" is of type timestamp with time zone but default expression is of type integer
+}
+
+test create-table-refuses-an-integer-default-of-a-boolean-column {
+    CREATE TABLE t (a int, b boolean DEFAULT 1);
+}
+@sqlstate 42804
+expect error {
+    column "b" is of type boolean but default expression is of type integer
+}
+
+test create-table-refuses-a-boolean-default-of-an-integer-column {
+    CREATE TABLE t (a int, n int DEFAULT (1 < 2));
+}
+@sqlstate 42804
+expect error {
+    column "n" is of type integer but default expression is of type boolean
+}
+
+test create-table-refuses-a-text-default-of-a-smallint-column {
+    CREATE TABLE t (a int, "N" smallint DEFAULT '5'::text);
+}
+@sqlstate 42804
+expect error {
+    column "N" is of type smallint but default expression is of type text
+}
+
+test add-column-to-an-empty-table-refuses-a-default-with-no-cast {
+    CREATE TABLE t (a int);
+    ALTER TABLE t ADD COLUMN b boolean DEFAULT 1;
+}
+@sqlstate 42804
+expect error {
+    column "b" is of type boolean but default expression is of type integer
+}
+
+test a-default-of-another-type-with-an-assignment-cast-is-accepted {
+    CREATE TABLE t (id int, n int DEFAULT 1.5, s text DEFAULT 5, x text DEFAULT (1 < 2), i smallint DEFAULT 7::bigint, ts timestamp DEFAULT now());
+    INSERT INTO t (id) VALUES (1);
+    SELECT n, s, x, i, ts IS NOT NULL FROM t;
+}
+expect {
+    2|5|true|7|t
+}
+
+test upsert-computes-a-stored-generated-column-as-the-column-type {
+    CREATE TABLE t (k int PRIMARY KEY, g text GENERATED ALWAYS AS (k > 6) STORED);
+    INSERT INTO t (k) VALUES (5);
+    INSERT INTO t (k) VALUES (5) ON CONFLICT (k) DO UPDATE SET k = 7;
+    SELECT k, g FROM t;
+}
+expect {
+    7|true
+}
+
+test stored-generated-column-with-no-cast-to-the-column-type {
+    CREATE TABLE t (a int, g timestamptz GENERATED ALWAYS AS (5) STORED);
+    INSERT INTO t (a) VALUES (1);
+}
+@sqlstate 42804
+expect error {}
+
+test insert-boolean-expressions-into-a-boolean-column {
+    CREATE TABLE t (id int, b boolean);
+    INSERT INTO t VALUES
+        (1, 1 > 0), (2, 1 IS NULL), (3, NOT true), (4, 2 BETWEEN 1 AND 3),
+        (5, 1 IN (1, 2)), (6, 'x' LIKE 'x'), (7, EXISTS (SELECT 1)), (8, true AND false),
+        (9, 'a' ~* 'A'), (10, 'abc' SIMILAR TO 'a%'), (11, ARRAY[1] && ARRAY[1]);
+    SELECT id, b FROM t ORDER BY id;
+}
+expect {
+    1|t
+    2|f
+    3|f
+    4|t
+    5|t
+    6|t
+    7|t
+    8|f
+    9|t
+    10|t
+    11|t
+}
+
+test insert-select-a-comparison-into-a-boolean-column {
+    CREATE TABLE s (a int);
+    INSERT INTO s VALUES (1), (9);
+    CREATE TABLE t (b boolean);
+    INSERT INTO t SELECT a > 5 FROM s;
+    SELECT b FROM t ORDER BY b;
+}
+expect {
+    f
+    t
+}
+
+test update-sets-a-boolean-column-from-a-comparison {
+    CREATE TABLE t (a int, b boolean);
+    INSERT INTO t VALUES (1, true);
+    UPDATE t SET b = (a > 5);
+    SELECT b FROM t;
+}
+expect {
+    f
+}
+
+test update-toggles-a-boolean-column {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (true);
+    UPDATE t SET b = NOT b;
+    SELECT b FROM t;
+}
+expect {
+    f
+}
+
+test boolean-default-expression {
+    CREATE TABLE t (id int, b boolean DEFAULT (1 > 0));
+    INSERT INTO t (id) VALUES (1);
+    SELECT b FROM t;
+}
+expect {
+    t
+}
+
+test text-cast-of-a-comparison {
+    SELECT (1 > 0)::text;
+}
+expect {
+    true
+}
+
+test an-integer-is-not-a-boolean-on-assignment {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (1);
+}
+@sqlstate 42804
+expect error {}
+
+test a-text-literal-is-read-as-a-boolean-on-assignment {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('yes'), ('f');
+    SELECT b FROM t ORDER BY b;
+}
+expect {
+    f
+    t
+}
+
+test insert-a-boolean-into-a-text-column {
+    CREATE TABLE t (t text);
+    INSERT INTO t VALUES (true), (1 > 2);
+    UPDATE t SET t = (2 > 1) WHERE t = 'false';
+    SELECT t FROM t;
+}
+expect {
+    true
+    true
+}
+
+test insert-many-rows-casts-each-value-from-its-own-type-to-an-integer {
+    CREATE TABLE t (id int, n int);
+    INSERT INTO t VALUES (1, '7'), (2, 2.5), (3, 3.5::float8), (4, (SELECT 4.5));
+    SELECT id, n FROM t ORDER BY id;
+}
+expect {
+    1|7
+    2|3
+    3|4
+    4|5
+}
+
+test insert-many-rows-casts-each-value-from-its-own-type-to-text {
+    CREATE TABLE t (id int, t text);
+    INSERT INTO t (t, id) VALUES ('a', 1), (2 < 3, 2), (4, 3);
+    SELECT id, t FROM t ORDER BY id;
+}
+expect {
+    1|a
+    2|true
+    3|4
+}
+
+test insert-many-rows-with-one-value-that-has-no-cast-to-the-column-type {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (true), (1);
+}
+@sqlstate 42804
+expect error {}
+
+test insert-many-rows-with-one-text-literal-that-is-not-an-integer {
+    CREATE TABLE t (n int);
+    INSERT INTO t VALUES (2.5), ('2.5');
+}
+@sqlstate 22P02
+expect error {}
+
+test insert-select-from-the-target-casts-a-boolean-to-text {
+    CREATE TABLE q (x boolean, t text);
+    INSERT INTO q (x) VALUES (true);
+    INSERT INTO q (t) SELECT x FROM q;
+    SELECT t FROM q WHERE t IS NOT NULL;
+}
+expect {
+    true
+}
+
+test write-a-float8-to-a-text-column {
+    CREATE TABLE t (id int, c text);
+    INSERT INTO t VALUES (1, 3::float8), (2, 1e20::float8), (3, 1e-5::float8), (4, 'Infinity'::float8);
+    INSERT INTO t VALUES (5, 3::float8);
+    INSERT INTO t SELECT 6, x FROM (SELECT 4::float8 AS x) s;
+    UPDATE t SET c = 5::float8 WHERE id = 1;
+    SELECT id, c FROM t ORDER BY id;
+}
+expect {
+    1|5
+    2|1e+20
+    3|1e-05
+    4|Infinity
+    5|3
+    6|4
+}
+
+test insert-select-a-numeric-column-into-an-integer-column-rounds-half-away-from-zero {
+    CREATE TABLE n (y numeric(10,2));
+    INSERT INTO n VALUES (4.5), (-4.5);
+    CREATE TABLE t (c int);
+    INSERT INTO t SELECT y FROM n;
+    SELECT c FROM t ORDER BY c;
+}
+expect {
+    -5
+    5
+}
+
+# A numeric without a type modifier is a REAL, which rounds half to even.
+@compat-gap "cast:numeric -> int4"
+test insert-select-a-numeric-column-without-a-modifier-into-an-integer-column {
+    CREATE TABLE n (x numeric);
+    INSERT INTO n VALUES (4.5);
+    CREATE TABLE t (c int);
+    INSERT INTO t SELECT x FROM n;
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+expect @tursopg {
+    4
+}
+
+test insert-select-from-another-table-casts-a-boolean-to-text {
+    CREATE TABLE s (x boolean);
+    INSERT INTO s VALUES (true);
+    CREATE TABLE t (t text);
+    INSERT INTO t SELECT x FROM s;
+    SELECT t FROM t;
+}
+expect {
+    true
+}
+
+test insert-select-from-the-target-casts-an-integer-to-numeric {
+    CREATE TABLE q (i int, n numeric(5,2));
+    INSERT INTO q VALUES (7, 1);
+    INSERT INTO q (n) SELECT i FROM q;
+    SELECT n FROM q ORDER BY n;
+}
+expect {
+    1.00
+    7.00
+}
+
+test insert-select-a-numeric-with-a-scale-into-an-integer-column {
+    CREATE TABLE n (y numeric(10,2));
+    INSERT INTO n VALUES (3), (2.5);
+    CREATE TABLE t (c int);
+    INSERT INTO t SELECT y FROM n;
+    SELECT c FROM t ORDER BY c;
+}
+expect {
+    3
+    3
+}
+
+test update-from-casts-a-boolean-to-text {
+    CREATE TABLE s (a int, x text);
+    CREATE TABLE src (k int, v boolean);
+    INSERT INTO s VALUES (1, 'old');
+    INSERT INTO src VALUES (1, true);
+    UPDATE s SET x = src.v FROM src WHERE src.k = s.a;
+    SELECT x FROM s;
+}
+expect {
+    true
+}
+
+test update-from-with-no-cast-to-the-column-type {
+    CREATE TABLE s (a int, n int);
+    CREATE TABLE src (k int, v boolean);
+    INSERT INTO s VALUES (1, 0);
+    INSERT INTO src VALUES (1, true);
+    UPDATE s SET n = src.v FROM src WHERE src.k = s.a;
+}
+@sqlstate 42804
+expect error {}
+
+test add-column-default-is-cast-for-the-rows-that-exist {
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN x text DEFAULT true;
+    INSERT INTO t (a) VALUES (2);
+    SELECT a, x FROM t ORDER BY a;
+}
+expect {
+    1|true
+    2|true
+}
+
+test add-column-default-with-no-cast-to-the-column-type {
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN n int DEFAULT true;
+}
+@sqlstate 42804
+expect error {
+    column "n" is of type integer but default expression is of type boolean
+}
+
+test add-column-default-of-another-type-is-cast-for-the-rows-that-exist {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN n int DEFAULT 2.5;
+    ALTER TABLE t ADD COLUMN f float8 DEFAULT 5;
+    ALTER TABLE t ADD COLUMN s text DEFAULT 7;
+    INSERT INTO t (id) VALUES (2);
+    SELECT id, n, f + 0.5, s, n + 1 FROM t ORDER BY id;
+}
+expect {
+    1|3|5.5|7|4
+    2|3|5.5|7|4
+}
+
+test add-column-default-that-is-not-an-integer-fails-for-the-rows-that-exist {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN n int DEFAULT 'abc';
+}
+@sqlstate 22P02
+expect error {}
+
+# The result of a function has no type that core can name, so the engine
+# stores it by its own rules, which take a float that is a whole number.
+test write-function-results-to-integer-columns {
+    CREATE TABLE t (id int, i int, s smallint);
+    INSERT INTO t (id, i) SELECT 1, avg(x) FROM (VALUES (1), (3)) v(x);
+    INSERT INTO t (id, i, s) VALUES (2, round(2.5), round(2.5));
+    INSERT INTO t (id, i) SELECT 3, sum(x) FROM (VALUES (1.5), (2.5)) v(x);
+    INSERT INTO t (id, i) VALUES (4, sqrt(16)), (5, power(2, 3));
+    UPDATE t SET i = round(7.5) WHERE id = 5;
+    SELECT id, i, s IS NULL FROM t ORDER BY id;
+}
+expect {
+    1|2|t
+    2|3|f
+    3|4|t
+    4|4|t
+    5|8|t
+}
+
+@compat-gap "cast:numeric -> int4"
+test write-a-function-result-with-a-fraction-to-an-integer-column {
+    CREATE TABLE t (i int);
+    INSERT INTO t VALUES (round(2.567, 1));
+    SELECT i FROM t;
+}
+expect {
+    3
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+# The engine's float cannot hold NaN, so every write of NaN fails. PostgreSQL
+# stores NaN.
+
+@compat-gap "type:float8"
+test insert-nan-into-a-float8-column {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('NaN');
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test insert-nan-into-a-not-null-float8-column {
+    CREATE TABLE t (x float8 NOT NULL);
+    INSERT INTO t VALUES ('NaN');
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float4"
+test insert-nan-into-a-real-column {
+    CREATE TABLE t (x real);
+    INSERT INTO t VALUES ('NaN');
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:numeric"
+test insert-nan-into-a-numeric-column {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('NaN');
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test insert-many-rows-with-nan-into-a-float8-column {
+    CREATE TABLE t (id int, x float8);
+    INSERT INTO t VALUES (1, 1.5), (2, 'NaN');
+    SELECT x FROM t WHERE id = 2;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test update-sets-nan-in-a-float8-column {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (1.5);
+    UPDATE t SET x = 'NaN';
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test update-sets-nan-in-a-not-null-float8-column {
+    CREATE TABLE t (x float8 NOT NULL);
+    INSERT INTO t VALUES (1.5);
+    UPDATE t SET x = 'NaN';
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test upsert-sets-nan-in-a-float8-column {
+    CREATE TABLE t (id int PRIMARY KEY, x float8);
+    INSERT INTO t VALUES (1, 1.5);
+    INSERT INTO t VALUES (1, 2.5) ON CONFLICT (id) DO UPDATE SET x = 'NaN';
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test upsert-sets-nan-in-a-not-null-float8-column {
+    CREATE TABLE t (id int PRIMARY KEY, x float8 NOT NULL);
+    INSERT INTO t VALUES (1, 1.5);
+    INSERT INTO t VALUES (1, 2.5) ON CONFLICT (id) DO UPDATE SET x = 'NaN';
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test column-default-of-nan {
+    CREATE TABLE t (id int, x float8 DEFAULT 'NaN');
+    INSERT INTO t (id) VALUES (1);
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test write-infinity-to-float8-and-real-columns {
+    CREATE TABLE t (x float8, y real);
+    INSERT INTO t VALUES ('Infinity', '-Infinity');
+    UPDATE t SET x = '-Infinity', y = 'inf';
+    SELECT x::text, y::text FROM t;
+}
+expect {
+    -Infinity|Infinity
+}
+
+# A product of a numeric and an integer is a REAL in the engine, which
+# rounds half to even.
+@compat-gap "operator:numeric * int4"
+test insert-a-numeric-product-that-is-a-tie-into-an-integer-column {
+    CREATE TABLE t (c int);
+    INSERT INTO t VALUES (4.5 * 1);
+    SELECT c FROM t;
+}
+expect {
+    5
+}
+expect @tursopg {
+    4
+}
+
+test insert-a-decimal-literal-that-rounds-above-bigint-fails {
+    CREATE TABLE t (i int8);
+    INSERT INTO t VALUES (9223372036854775807.5);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+# The literal reads as the REAL 2^63 before the cast sees it, so a write
+# cannot tell it from 9223372036854775807.5 and refuses both.
+@compat-gap "cast:numeric -> int8"
+test insert-a-decimal-literal-that-rounds-to-the-largest-bigint {
+    CREATE TABLE t (i int8);
+    INSERT INTO t VALUES (9223372036854775807.4);
+    SELECT i FROM t;
+}
+expect {
+    9223372036854775807
+}
+@sqlstate 22003
+expect @tursopg error {}
+
+@compat-gap "type:float8"
+test add-column-default-of-nan-for-the-rows-that-exist {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN x float8 DEFAULT 'NaN';
+    SELECT x FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# The value is converted before NOT NULL is checked, so a value that cannot
+# be converted fails with the error of the conversion.
+test insert-reports-a-bad-value-before-a-null-in-a-not-null-column {
+    CREATE TABLE t (a int NOT NULL, b int);
+    INSERT INTO t VALUES (NULL, 'abc');
+}
+@sqlstate 22P02
+expect error {}
+
+test update-reports-a-bad-value-before-a-null-in-a-not-null-column {
+    CREATE TABLE t (a int NOT NULL, b int);
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET a = NULL, b = 'abc';
+}
+@sqlstate 22P02
+expect error {}
+
+test upsert-reports-a-bad-value-before-a-null-in-a-not-null-column {
+    CREATE TABLE t (id int PRIMARY KEY, a int NOT NULL, b int);
+    INSERT INTO t VALUES (1, 1, 1);
+    INSERT INTO t VALUES (1, 2, 2) ON CONFLICT (id) DO UPDATE SET a = NULL, b = 'abc';
+}
+@sqlstate 22P02
+expect error {}

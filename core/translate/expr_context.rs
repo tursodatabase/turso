@@ -1,6 +1,10 @@
 use crate::ast::{Expr, TableInternalId};
 
-use crate::{schema::Schema, vdbe::affinity::Affinity, LimboError, Result};
+use crate::{
+    schema::{BTreeTable, Schema},
+    vdbe::affinity::Affinity,
+    LimboError, Result,
+};
 
 use super::{
     catalog::CatalogContext,
@@ -32,6 +36,17 @@ pub(crate) trait ExprProperties<
 pub(crate) struct ExprContext<'a, 'schema> {
     tables: TableMetadata<'a>,
     resolver: &'a Resolver<'schema>,
+    /// Set for an expression stored in the schema: its columns are those of
+    /// this table, in place of a statement's tables.
+    schema_table: Option<SchemaTable<'a>>,
+}
+
+/// The table that an expression stored in the schema reads, and whether a
+/// comparison of a timestamp with a timestamptz is refused there.
+#[derive(Clone, Copy)]
+struct SchemaTable<'a> {
+    table: &'a BTreeTable,
+    refuse_timestamp_with_timestamptz: bool,
 }
 
 impl<'a, 'schema> ExprContext<'a, 'schema> {
@@ -42,7 +57,38 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
         Self {
             tables: TableMetadata::new(tables),
             resolver,
+            schema_table: None,
         }
+    }
+
+    /// The context of an expression stored in the schema, such as a generated
+    /// column or an index expression of `table`, whose columns are resolved
+    /// as [crate::schema::resolve_gencol_expr_columns] does.
+    pub(crate) fn over_schema_table(
+        table: &'a BTreeTable,
+        resolver: &'a Resolver<'schema>,
+        refuse_timestamp_with_timestamptz: bool,
+    ) -> Self {
+        Self {
+            tables: TableMetadata::new(None),
+            resolver,
+            schema_table: Some(SchemaTable {
+                table,
+                refuse_timestamp_with_timestamptz,
+            }),
+        }
+    }
+
+    /// Whether this expression may compare a timestamp with a timestamptz.
+    pub(crate) fn compares_timestamp_with_timestamptz(&self) -> bool {
+        !self
+            .schema_table
+            .is_some_and(|schema| schema.refuse_timestamp_with_timestamptz)
+            && self
+                .resolver
+                .catalog
+                .dialect
+                .compares_timestamp_with_timestamptz()
     }
 
     pub(crate) fn expr_collation(&self, expr: &Expr) -> Result<CollationSeq> {
@@ -52,6 +98,13 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
     /// What `type_of` needs to know the type of an expression here, such as
     /// the custom type of a column.
     pub(crate) fn type_env(&self) -> TypeEnv<'_> {
+        if let Some(schema) = &self.schema_table {
+            return TypeEnv::over_table(
+                schema.table,
+                self.resolver.schema(),
+                self.resolver.catalog.symbol_table,
+            );
+        }
         TypeEnv::new(self.tables.tables, self.resolver)
     }
 

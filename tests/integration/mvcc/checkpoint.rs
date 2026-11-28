@@ -2050,6 +2050,125 @@ fn test_checkpoint_after_create_and_drop_sequence() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// A checkpoint of an attached database compacts the sequences of that database,
+/// not those of `main`. Before, it read the sequences of `main` and looked up their
+/// root pages in the MVCC store of the attached database.
+#[test]
+fn test_attached_checkpoint_ignores_main_sequences() {
+    // An AUTOINCREMENT table has an internal sequence too.
+    for main_sequence_sql in [
+        &["CREATE SEQUENCE s"][..],
+        &[
+            "CREATE TABLE m(id INTEGER PRIMARY KEY AUTOINCREMENT, x)",
+            "INSERT INTO m(x) VALUES (1)",
+        ],
+    ] {
+        let db =
+            MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+        let aux_dir = tempfile::TempDir::new().unwrap();
+        let aux_path = aux_dir.path().join("aux.db");
+        let conn = db.connect();
+
+        for sql in main_sequence_sql {
+            conn.execute(sql).unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE aux.t(x)").unwrap();
+        // No table of aux has the root page of the backing table of the sequence.
+        assert_eq!(
+            get_rows(&conn, "PRAGMA aux.wal_checkpoint(TRUNCATE)"),
+            vec![vec![
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0)
+            ]],
+            "{main_sequence_sql:?}"
+        );
+    }
+}
+
+#[test]
+fn test_attached_checkpoint_keeps_rows_of_table_at_main_sequence_root_page() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+    let conn = db.connect();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    conn.execute("PRAGMA aux.journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE aux.a(x)").unwrap();
+    conn.execute("INSERT INTO aux.a VALUES ('one'), ('two'), ('three')")
+        .unwrap();
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    conn.execute("SELECT nextval('s')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // `aux.a` and the backing table of `s` in main have the same root page.
+    let root_of = |sql: &str| get_rows(&conn, sql)[0][0].clone();
+    assert_eq!(
+        root_of("SELECT rootpage FROM aux.sqlite_schema WHERE name = 'a'"),
+        root_of("SELECT rootpage FROM main.sqlite_schema WHERE name = '__turso_internal_seq_s'")
+    );
+    conn.execute("INSERT INTO aux.a VALUES ('four')").unwrap();
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+    let expected = vec![
+        vec![Value::from_i64(1), Value::build_text("one")],
+        vec![Value::from_i64(2), Value::build_text("two")],
+        vec![Value::from_i64(3), Value::build_text("three")],
+        vec![Value::from_i64(4), Value::build_text("four")],
+    ];
+    assert_eq!(
+        get_rows(&conn, "SELECT rowid, x FROM aux.a ORDER BY rowid"),
+        expected
+    );
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT rowid, x FROM aux.a ORDER BY rowid"),
+        expected
+    );
+}
+
+/// A checkpoint of an attached database compacts the backing tables of the
+/// sequences of that database to one row, as a checkpoint of `main` does for `main`.
+#[test]
+fn test_attached_checkpoint_compacts_attached_sequences() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+    let conn = db.connect();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    conn.execute("PRAGMA aux.journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE SEQUENCE aux.s").unwrap();
+    // The first checkpoint gives the backing table a positive root page. The
+    // second one compacts the rows that the nextval calls after it appended.
+    for _ in 0..2 {
+        for _ in 0..2 {
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            conn.execute("SELECT nextval('aux.s')").unwrap();
+            conn.execute("COMMIT").unwrap();
+        }
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    assert_eq!(
+        get_rows(&conn, "SELECT value FROM aux.__turso_internal_seq_s"),
+        vec![vec![Value::from_i64(4)]]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT nextval('aux.s')"),
+        vec![vec![Value::from_i64(5)]]
+    );
+}
+
 #[test]
 fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -6394,4 +6513,97 @@ fn checkpoint_with_queued_log_truncate_resets_log_offset() {
         get_rows(&conn, "SELECT id, v FROM t"),
         vec![vec![Value::from_i64(1), Value::build_text("a")]]
     );
+}
+
+/// With the passive checkpoint flag on, an explicit TRUNCATE that finds another checkpoint
+/// in progress must return Busy. Before, it did no work and returned `0|0|0`, which is also
+/// the result of a TRUNCATE that empties the logical log.
+#[test]
+fn truncate_returns_busy_while_another_checkpoint_runs() {
+    let (db, other) = run_while_auto_checkpoint_paused("PRAGMA wal_checkpoint(TRUNCATE)");
+
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        db.get_mvcc_store().get_logical_log_file().size().unwrap(),
+        0
+    );
+}
+
+/// An explicit PASSIVE checkpoint must also return Busy. Only the commit auto-checkpoint
+/// does no work when another checkpoint is in progress.
+#[test]
+fn explicit_passive_returns_busy_while_another_checkpoint_runs() {
+    let (db, other) = run_while_auto_checkpoint_paused("PRAGMA wal_checkpoint(PASSIVE)");
+
+    let rows = get_rows(&other, "PRAGMA wal_checkpoint(PASSIVE)");
+    assert_eq!(rows[0][0].as_int(), Some(0), "busy column: {rows:?}");
+    assert_eq!(
+        db.get_mvcc_store().get_logical_log_file().size().unwrap(),
+        0
+    );
+}
+
+/// `PRAGMA journal_mode = wal` runs a TRUNCATE checkpoint before it leaves MVCC. Before,
+/// the contended checkpoint did no work, the mode changed with the row still only in the
+/// logical log, and the paused INSERT then panicked.
+#[test]
+fn journal_mode_wal_returns_busy_while_another_checkpoint_runs() {
+    let (_db, other) = run_while_auto_checkpoint_paused("PRAGMA journal_mode = 'wal'");
+
+    let rows = get_rows(&other, "PRAGMA journal_mode");
+    assert_eq!(rows[0][0].to_string(), "mvcc");
+    let rows = get_rows(&other, "PRAGMA journal_mode = 'wal'");
+    assert_eq!(rows[0][0].to_string(), "wal");
+    let rows = get_rows(&other, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1, "row lost after journal_mode = wal: {rows:?}");
+}
+
+/// Commits a row on one connection and stops the commit's auto-checkpoint after it sets
+/// `checkpoint_in_progress`. Runs `sql` on a second connection and checks that it returns
+/// Busy. Then lets the auto-checkpoint finish and checks that the row is there. Returns the
+/// database and the second connection.
+fn run_while_auto_checkpoint_paused(sql: &str) -> (MvccTestDbNoConn, Arc<Connection>) {
+    use turso_core::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeCollectTableRows.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut insert = conn.prepare("INSERT INTO t VALUES (1, 'x')").unwrap();
+    let pager_io = conn.get_pager().io.clone();
+    while !injector.is_empty() {
+        match insert.step().unwrap() {
+            StepResult::IO => pager_io.step().unwrap(),
+            StepResult::Yield => {}
+            other => panic!("INSERT finished before its auto-checkpoint stopped: {other:?}"),
+        }
+    }
+
+    let other = db.connect();
+    let result = other
+        .prepare(sql)
+        .and_then(|mut stmt| stmt.run_collect_rows());
+    // `journal_mode = wal` drops the MV store when it succeeds.
+    let log_size = db
+        .get_db()
+        .get_mv_store()
+        .as_ref()
+        .map(|store| store.get_logical_log_file().size().unwrap());
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "contended `{sql}` must return Busy, got {result:?}, logical log size {log_size:?}"
+    );
+
+    drive_statement_to_done(&mut insert, &pager_io);
+    conn.set_yield_injector(None);
+    drop(insert);
+
+    let rows = get_rows(&other, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1, "row lost: {rows:?}");
+    (db, other)
 }

@@ -11,7 +11,7 @@ pub(crate) fn object_name(
 ) -> Result<String, ParseError> {
     let names = extract_key_columns(names)?;
     if names.is_empty() {
-        return Err(ParseError::ParseError(format!("missing {kind} name")));
+        return Err(ParseError::internal_error(format!("missing {kind} name")));
     }
     unqualified_name(&names, allowed_schema)
         .cloned()
@@ -32,7 +32,10 @@ pub(crate) fn extract_key_columns(
     let mut cols = Vec::new();
     for key_node in keys {
         let Some(Node::String(s)) = &key_node.node else {
-            return Err(ParseError::ParseError("expected a name".into()));
+            return Err(ParseError::sqlstate(
+                crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "expected a name",
+            ));
         };
         cols.push(s.sval.clone());
     }
@@ -66,10 +69,10 @@ pub(crate) fn is_default_schema(schema: &str) -> bool {
 /// an object stored under them would be in no schema the catalogs show.
 pub(crate) fn schema_qualifier(schema: &str) -> Result<&str, ParseError> {
     if schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("temp") {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_SCHEMA_NAME,
-            message: format!("schema \"{schema}\" does not exist"),
-        });
+        return Err(ParseError::sqlstate(
+            SQLSTATE_INVALID_SCHEMA_NAME,
+            format!("schema \"{schema}\" does not exist"),
+        ));
     }
     Ok(map_schema_name(schema))
 }

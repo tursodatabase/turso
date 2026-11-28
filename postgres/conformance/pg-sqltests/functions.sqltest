@@ -126,6 +126,30 @@ expect {
     E'a\\\\b'
 }
 
+# PostgreSQL joins every argument that is not NULL, so an empty one keeps its
+# place and its separator. SQLite does not: see
+# sqlite/conformance/sqlite-sqltests/concat.sqltest.
+test concat-ws-joins-empty-arguments {
+    SELECT '[' || concat_ws(',', '', 'a') || ']';
+    SELECT '[' || concat_ws(',', 'a', '', 'b') || ']';
+    SELECT '[' || concat_ws(',', NULL, '', 'a') || ']';
+    SELECT '[' || concat_ws(',', '', '', 'a') || ']';
+    SELECT '[' || concat_ws(',', 'a', '', '') || ']';
+    SELECT '[' || concat_ws('', '', 'a') || ']';
+    SELECT '[' || concat_ws(',', '', '') || ']';
+    SELECT '[' || concat_ws(',', NULL, NULL) || ']';
+}
+expect {
+    [,a]
+    [a,,b]
+    [,a]
+    [,,a]
+    [a,,]
+    [a]
+    [,]
+    []
+}
+
 test current-schema-default {
     SELECT current_schema();
 }
@@ -354,7 +378,6 @@ expect {
 test pg-input-is-valid-reads-date-and-time-as-the-types-do {
     SELECT CASE WHEN pg_input_is_valid('Jan 5 2024', 'date') THEN 'valid' ELSE 'invalid' END;
     SELECT CASE WHEN pg_input_is_valid('2024-02-30', 'date') THEN 'valid' ELSE 'invalid' END;
-    SELECT CASE WHEN pg_input_is_valid('9:30', 'time') THEN 'valid' ELSE 'invalid' END;
     SELECT CASE WHEN pg_input_is_valid('2024-01-05T10:00+02', 'timestamptz') THEN 'valid' ELSE 'invalid' END;
     SELECT CASE WHEN pg_input_is_valid('zzz', 'timestamp') THEN 'valid' ELSE 'invalid' END;
 }
@@ -362,8 +385,51 @@ expect {
     valid
     invalid
     valid
-    valid
     invalid
+}
+
+# tursopg has no time type: pg_type has no row for it. A type of PostgreSQL
+# that tursopg does not have is refused as not supported.
+@compat-gap "type:time"
+test pg-input-is-valid-reads-time {
+    SELECT pg_input_is_valid('9:30', 'time');
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+@compat-gap "type:interval"
+test pg-input-is-valid-reads-interval {
+    SELECT pg_input_is_valid('1 day', 'pg_catalog.interval'), pg_input_is_valid('{1 day}', '_interval');
+}
+expect {
+    t|t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "pg_catalog.interval" is not supported
+}
+
+# Autofixer #12562: pg_class is also a composite row type. PostgreSQL's
+# record_in rejects '1' as a malformed record, so this returns false.
+# FIXME(pg-class): Flip this gap when the pg_class work registers relation
+# row types in pg_type and connects their field metadata to record_in.
+# Keep the test and its PostgreSQL result; remove @compat-gap and the
+# expect @tursopg block. See exec_pg_input_is_valid in frontend/functions.rs.
+@compat-gap "type:pg_class"
+test pg-input-is-valid-catalog-row-type {
+    SELECT pg_input_is_valid('1', 'pg_class');
+}
+expect {
+    f
+}
+@sqlstate 42704
+expect @tursopg error {
+    type "pg_class" does not exist
 }
 
 test pg-input-error-info-date-out-of-range {
@@ -378,6 +444,164 @@ test pg-input-error-info-date-bad-syntax {
 }
 expect {
     invalid input syntax for type date: "zzz"|22007
+}
+
+# The type name of pg_input_is_valid and pg_input_error_info is read as a
+# statement reads a type name: the grammar turns the SQL spellings into the
+# name of the pg_type row, and the name is looked up.
+
+test pg-input-type-name-in-each-sql-spelling {
+    SELECT pg_input_is_valid('1', 'INTEGER'), pg_input_is_valid('1', 'int'), pg_input_is_valid('1', 'int4'),
+        pg_input_is_valid('1', 'pg_catalog.int4'), pg_input_is_valid('1', '"int4"'),
+        pg_input_is_valid('1', 'double precision'), pg_input_is_valid('t', 'boolean'),
+        pg_input_is_valid('ab', 'character varying(4)'), pg_input_is_valid('abcde', 'varchar(4)');
+}
+expect {
+    t|t|t|t|t|t|t|t|f
+}
+
+test pg-input-type-name-takes-a-modifier-where-the-type-has-typmodin {
+    SELECT pg_input_is_valid('1', 'numeric(3)'), pg_input_is_valid('1', 'varchar(3)'), pg_input_is_valid('1', 'bpchar(3)');
+}
+expect {
+    t|t|t
+}
+
+test pg-input-type-name-refuses-a-modifier-on-a-type-that-takes-none {
+    SELECT pg_input_is_valid('1', 'int4(3)');
+}
+@sqlstate 42601
+expect error {
+    type modifier is not allowed for type "int4"
+}
+
+test pg-input-type-name-refuses-a-modifier-on-text {
+    SELECT pg_input_is_valid('x', 'text(3)');
+}
+@sqlstate 42601
+expect error {
+    type modifier is not allowed for type "text"
+}
+
+test pg-input-type-name-refuses-a-modifier-and-names-the-schema {
+    SELECT pg_input_is_valid('1', 'pg_catalog.int4(3)');
+}
+@sqlstate 42601
+expect error {
+    type modifier is not allowed for type "pg_catalog.int4"
+}
+
+test pg-input-type-name-refuses-a-modifier-on-a-spelling-of-the-grammar {
+    SELECT pg_input_is_valid('1', 'integer(3)');
+}
+@sqlstate 42601
+expect error {
+    syntax error at or near
+}
+@sqlstate 42601
+expect @tursopg error {
+    invalid type name "integer\(3\)"
+}
+
+test pg-type-typmodin-names-the-function-that-reads-a-modifier {
+    SELECT typname, typmodin FROM pg_type WHERE typname IN ('int4', 'varchar', '_varchar', 'numeric', 'timestamptz', 'text') ORDER BY typname;
+}
+expect {
+    _varchar|varchartypmodin
+    int4|-
+    numeric|numerictypmodin
+    text|-
+    timestamptz|timestamptztypmodin
+    varchar|varchartypmodin
+}
+
+test pg-input-type-name-null-is-null {
+    SELECT pg_input_is_valid('1', NULL) IS NULL;
+}
+expect {
+    t
+}
+
+test pg-input-is-valid-refuses-a-type-that-does-not-exist {
+    SELECT pg_input_is_valid('1', 'nosuchtype');
+}
+@sqlstate 42704
+expect error {
+    type "nosuchtype" does not exist
+}
+
+test pg-input-error-info-refuses-a-type-that-does-not-exist {
+    SELECT * FROM pg_input_error_info('x', 'nosuchtype');
+}
+@sqlstate 42704
+expect error {
+    type "nosuchtype" does not exist
+}
+
+# tinyint is a type name of SQLite and not of PostgreSQL.
+test pg-input-error-info-refuses-tinyint {
+    SELECT * FROM pg_input_error_info('x', 'tinyint');
+}
+@sqlstate 42704
+expect error {
+    type "tinyint" does not exist
+}
+
+# integer is a word of the grammar. Quoted, it is the name of no type.
+test pg-input-is-valid-refuses-a-quoted-sql-spelling {
+    SELECT pg_input_is_valid('1', '"integer"');
+}
+@sqlstate 42704
+expect error {
+    type "integer" does not exist
+}
+
+test pg-input-is-valid-refuses-a-quoted-name-in-capitals {
+    SELECT pg_input_is_valid('1', '"INT4"');
+}
+@sqlstate 42704
+expect error {
+    type "INT4" does not exist
+}
+
+test pg-input-is-valid-names-the-schema-of-a-type-that-does-not-exist {
+    SELECT pg_input_is_valid('1', 'pg_catalog.nosuchtype');
+}
+@sqlstate 42704
+expect error {
+    type "pg_catalog.nosuchtype" does not exist
+}
+
+# The built-in types are in pg_catalog.
+test pg-input-is-valid-refuses-a-built-in-type-in-another-schema {
+    SELECT pg_input_is_valid('1', 'public.int4');
+}
+@sqlstate 42704
+expect error {
+    type "public.int4" does not exist
+}
+
+test pg-input-is-valid-refuses-text-after-the-type-name {
+    SELECT pg_input_is_valid('1', 'int4 x');
+}
+@sqlstate 42601
+expect error {}
+
+test pg-input-is-valid-refuses-an-empty-type-name {
+    SELECT pg_input_is_valid('1', '');
+}
+@sqlstate 42601
+expect error {
+    invalid type name ""
+}
+
+test pg-input-error-info-of-an-integer {
+    SELECT message, sql_error_code FROM pg_input_error_info('x', 'integer');
+    SELECT message IS NULL, sql_error_code IS NULL FROM pg_input_error_info('1', 'integer');
+}
+expect {
+    invalid input syntax for type integer: "x"|22P02
+    t|t
 }
 
 test current-setting-numeric-parameter-name-errors {
@@ -1101,6 +1325,13 @@ test acldefault-non-ascii-object-kind-errors {
 @sqlstate XX000
 expect error {}
 
+test format-type-of-name {
+    SELECT format_type(19, -1);
+}
+expect {
+    name
+}
+
 test format-type-expanded {
     SELECT format_type(16, -1);
     SELECT format_type(23, -1);
@@ -1138,6 +1369,34 @@ expect {
     integer[]
     text[]
     character varying(50)
+}
+
+test format-type-of-an-oid-that-is-not-a-type {
+    SELECT format_type(0, NULL), format_type(99999, NULL);
+}
+expect {
+    -|???
+}
+
+test format-type-names-the-types-that-tursopg-has-no-row-for {
+    SELECT format_type(18, -1), format_type(19, -1), format_type(1083, -1), format_type(1186, -1), format_type(2278, -1);
+}
+expect {
+    "char"|name|time without time zone|interval|void
+}
+
+test format-type-prints-the-array-of-a-type {
+    SELECT format_type(1000, -1), format_type(1007, -1), format_type(1009, -1), format_type(1016, -1), format_type(1231, -1);
+}
+expect {
+    boolean[]|integer[]|text[]|bigint[]|numeric[]
+}
+
+test format-type-prints-the-modifier-of-a-type {
+    SELECT format_type(1043, 9), format_type(1043, -1), format_type(1042, 7), format_type(1700, 655366), format_type(1700, -1);
+}
+expect {
+    character varying(5)|character varying|character(3)|numeric(10,2)|numeric
 }
 
 test pg-type-is-visible {
@@ -2291,7 +2550,6 @@ expect {
     1
 }
 
-@compat-gap "operator:timestamptz + int4"
 test now-plus-an-integer-errors {
     SELECT now() + 1;
 }
@@ -2299,7 +2557,7 @@ test now-plus-an-integer-errors {
 expect error {
     operator does not exist: timestamp with time zone \+ integer
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {
     operator does not exist: timestamptz \+ integer
 }
@@ -3048,6 +3306,32 @@ expect {
     1
 }
 
+# date_trunc of a timestamp column returns a timestamp, which prints without
+# an offset.
+test date-trunc-timestamp-group-by-day {
+    CREATE TABLE trunc_timestamp_events (at timestamp);
+    INSERT INTO trunc_timestamp_events VALUES ('2026-10-08 01:00:00'), ('2026-10-08 23:59:59.999999'),
+        ('2026-10-09 00:00:00'), (NULL);
+    SELECT date_trunc('day', at), count(*) FROM trunc_timestamp_events GROUP BY 1 ORDER BY 1 NULLS LAST;
+}
+expect {
+    2026-10-08 00:00:00|2
+    2026-10-09 00:00:00|1
+    |1
+}
+
+# date_trunc of a domain over timestamptz resolves the domain as its base type,
+# including in a CHECK constraint.
+test date-trunc-domain-over-timestamptz {
+    CREATE DOMAIN dtz AS timestamptz;
+    CREATE TABLE trunc_dtz (b dtz, CHECK (date_trunc('day', b) IS NOT NULL));
+    INSERT INTO trunc_dtz VALUES ('2020-03-04 05:06:07+00');
+    SELECT date_trunc('day', b) FROM trunc_dtz;
+}
+expect {
+    2020-03-04 00:00:00+00
+}
+
 # date_trunc accepts the unit spellings of PostgreSQL's interval unit table,
 # in any letter case. A name longer than 10 characters matches on its first 10.
 test date-trunc-unit-aliases {
@@ -3179,4 +3463,46 @@ test date-trunc-century-millennium-low-years {
 }
 expect {
     0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0010-01-01 00:00:00+00
+}
+
+# A column of the column definition list is read as its type, by the cast
+# from text to that type.
+test json-to-record-reads-a-column-as-its-type {
+    SELECT a + 1, b || 'y', e + 1 FROM json_to_record('{"a":1,"b":"x","e":7}') AS x(a int, b text, e bigint);
+}
+expect {
+    2|xy|8
+}
+
+test json-to-record-fraction-in-an-integer-column-fails {
+    SELECT a FROM json_to_record('{"a":1.5}') AS x(a int);
+}
+@sqlstate 22P02
+expect error {}
+
+test pg-input-is-valid-agrees-with-a-cast-to-float8-on-infinity {
+    SELECT pg_input_is_valid('inf', 'float8'), pg_input_is_valid('+inf', 'float8'), pg_input_is_valid(' -Infinity ', 'float8');
+    SELECT pg_input_is_valid('1e999', 'float8'), pg_input_is_valid('abc', 'float8'), pg_input_is_valid('1e39', 'float4');
+    SELECT '+inf'::float8 > 0, '-Infinity'::float8 < 0;
+}
+expect {
+    t|t|t
+    f|f|f
+    t|t
+}
+
+test gen-random-uuid-format {
+    SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
+}
+expect {
+    t
+}
+
+test to-char-null-timestamptz-row {
+    CREATE TABLE to_char_times (at timestamptz);
+    INSERT INTO to_char_times VALUES (NULL);
+    SELECT to_char(at, 'YYYY') IS NULL FROM to_char_times;
+}
+expect {
+    t
 }

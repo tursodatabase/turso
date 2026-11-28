@@ -1362,13 +1362,9 @@ impl BTreeCursor {
         Self::new(pager, root_page, num_columns)
     }
 
-    /// Moves the cursor to the heap, into an allocation retired by an earlier
-    /// cursor on the same pager when the pool has one.
-    pub fn into_boxed(self) -> Box<Self> {
-        match self.pager.take_cursor_allocation() {
-            Some(allocation) => Box::write(allocation, self),
-            None => Box::new(self),
-        }
+    /// Like [Self::new_table], but on the heap (see [Self::new_boxed_with_index_info]).
+    pub fn new_table_boxed(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Box<Self> {
+        Self::new_boxed_with_index_info(pager, root_page, num_columns, None)
     }
 
     pub fn new_without_rowid_table(
@@ -1377,6 +1373,24 @@ impl BTreeCursor {
         table: &BTreeTable,
         num_columns: usize,
     ) -> Self {
+        let index_info = Self::without_rowid_index_info(table);
+        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+    }
+
+    /// Like [Self::new_without_rowid_table], but on the heap (see
+    /// [Self::new_boxed_with_index_info]).
+    pub fn new_without_rowid_table_boxed(
+        pager: Arc<Pager>,
+        root_page: i64,
+        table: &BTreeTable,
+        num_columns: usize,
+    ) -> Box<Self> {
+        let index_info = Self::without_rowid_index_info(table);
+        Self::new_boxed_with_index_info(pager, root_page, num_columns, Some(index_info))
+    }
+
+    /// The key of a WITHOUT ROWID table: its primary key columns.
+    fn without_rowid_index_info(table: &BTreeTable) -> Arc<IndexInfo> {
         let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
             let (_, column) = table
                 .get_column(col_name)
@@ -1387,11 +1401,10 @@ impl BTreeCursor {
                 nulls_order: None,
             }
         });
-        let index_info = Arc::new(
+        Arc::new(
             IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
                 .expect(crate::alloc::ALLOC_ERR_MSG),
-        );
-        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+        )
     }
 
     pub fn new_index(
@@ -1416,7 +1429,31 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Result<Box<Self>> {
         let index_info = Arc::new(IndexInfo::new_from_index(index)?);
-        Ok(Self::new_with_index_info(pager, root_page, num_columns, Some(index_info)).into_boxed())
+        Ok(Self::new_boxed_with_index_info(
+            pager,
+            root_page,
+            num_columns,
+            Some(index_info),
+        ))
+    }
+
+    /// Builds the cursor on the heap, in an allocation retired by an earlier
+    /// cursor on the same pager when the pool has one. The allocation is
+    /// taken before the cursor is built, so that the cursor is written into
+    /// it and is not built on the stack and copied.
+    fn new_boxed_with_index_info(
+        pager: Arc<Pager>,
+        root_page: i64,
+        num_columns: usize,
+        index_info: Option<Arc<IndexInfo>>,
+    ) -> Box<Self> {
+        let allocation = pager
+            .take_cursor_allocation()
+            .unwrap_or_else(Box::new_uninit);
+        Box::write(
+            allocation,
+            Self::new_with_index_info(pager, root_page, num_columns, index_info),
+        )
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
@@ -2611,7 +2648,7 @@ impl BTreeCursor {
         Ok(IOResult::Done(outcome.result))
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn try_start_seek_on_current_table_leaf(
         &mut self,
         rowid: i64,
@@ -2625,7 +2662,21 @@ impl BTreeCursor {
         {
             return Ok(CurrentTableLeafSeek::SearchFromRoot);
         }
+        self.start_seek_on_current_table_leaf(rowid, seek_op)
+    }
 
+    /// The part of [Self::try_start_seek_on_current_table_leaf] after the
+    /// checks of the cursor state: it reads the cells of the current leaf.
+    ///
+    /// This function is not inlined, so that `seek` stays small. The checks
+    /// before it are inlined: a cursor that is not on a row fails them, and
+    /// a call for each such seek costs more than the checks.
+    #[inline(never)]
+    fn start_seek_on_current_table_leaf(
+        &mut self,
+        rowid: i64,
+        seek_op: SeekOp,
+    ) -> Result<CurrentTableLeafSeek> {
         let (seek, cell_count) = {
             let page = self.stack.top_ref();
             turso_debug_assert!(page.is_loaded(), "the current table leaf must be loaded");
@@ -5500,10 +5551,22 @@ impl BTreeCursor {
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    #[inline(always)]
     fn clear_overflow_pages(&mut self, first_overflow_page: Option<u32>) -> IOResultOr<()> {
         if first_overflow_page.is_none() && matches!(self.overflow_state, OverflowState::Start) {
             return Ok(IOResult::Done(()));
         }
+        self.free_overflow_pages(first_overflow_page)
+    }
+
+    /// The part of [Self::clear_overflow_pages] for a cell with overflow pages,
+    /// or for a free of overflow pages that is in progress.
+    ///
+    /// This function is not inlined. Most cells have no overflow pages, and
+    /// with this code inlined, each overwrite or delete of a cell saved and
+    /// restored the registers that only this code uses.
+    #[inline(never)]
+    fn free_overflow_pages(&mut self, first_overflow_page: Option<u32>) -> IOResultOr<()> {
         // `database_size` is invariant for the duration of this invocation, so
         // read the page-1 header at most once and reuse it for every overflow
         // page validation below instead of re-reading it per `ReadNext`.
@@ -6487,12 +6550,30 @@ impl BTreeCursor {
     /// written (`None` when unknown); peers backing incremental blob handles use it
     /// to expire exactly when their own row is hit (sqlite3's
     /// invalidateIncrblobCursors, btree.c:672).
+    #[inline(always)]
     fn drive_pending_peer_save(&mut self, written_rowid: Option<i64>) -> IOResultOr<()> {
+        // BTCF_Multiple fast path (sqlite3 btree.c:9348).
+        if self.pending_peer_save.is_none()
+            && matches!(self.state, CursorState::None)
+            && !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(IOResult::Done(()));
+        }
+        self.save_peer_positions(written_rowid)
+    }
+
+    /// The part of [Self::drive_pending_peer_save] after its fast check: the
+    /// cursor has peers, a save is in progress, or the cursor is in an
+    /// operation.
+    ///
+    /// This function is not inlined. Most cursors have no peers, and with this
+    /// code inlined, each write saved and restored the registers that only this
+    /// code uses.
+    #[inline(never)]
+    fn save_peer_positions(&mut self, written_rowid: Option<i64>) -> IOResultOr<()> {
         if self.pending_peer_save.is_none() && matches!(self.state, CursorState::None) {
-            // BTCF_Multiple fast path (sqlite3 btree.c:9348).
-            if !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed) {
-                return Ok(IOResult::Done(()));
-            }
+            // In this state, `drive_pending_peer_save` calls this function only
+            // when the cursor has peers.
             let dyn_ref: &dyn CursorTrait = self;
             let peers = self.pager.snapshot_peers_for_root(dyn_ref);
             if peers.is_empty() {
@@ -6563,10 +6644,23 @@ impl BTreeCursor {
     /// peer-deleted cursor is still recoverable via Rewind/Seek, whereas our
     /// Invalid is reserved for cursors that can never be repositioned.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    #[inline(always)]
     fn restore_context(&mut self) -> IOResultOr<()> {
         if !self.needs_restore() {
             return Ok(IOResult::Done(()));
         }
+        self.restore_saved_context()
+    }
+
+    /// The part of [Self::restore_context] for a cursor that has a saved
+    /// position to restore.
+    ///
+    /// This function is not inlined. The cursor operations call
+    /// [Self::restore_context] each time, and in most calls there is nothing to
+    /// restore. With this code inlined, each of these calls saved and restored
+    /// the registers that only this code uses.
+    #[inline(never)]
+    fn restore_saved_context(&mut self) -> IOResultOr<()> {
         if let CursorValidState::RequireAdvance(direction) = self.valid_state {
             return_if_io!(match direction {
                 // Avoid calling next()/prev() directly because they immediately call restore_context()

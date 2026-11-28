@@ -407,7 +407,7 @@ test real-nan-raw-value-inside-json-build-object {
 expect {
     NaN|{"v" : "NaN"}
 }
-@sqlstate 23000
+@sqlstate 0A000
 expect @tursopg error {}
 
 # C-31: numeric 'NaN': raw value, inside json_build_object
@@ -420,7 +420,7 @@ test numeric-nan-raw-value-inside-json-build-object {
 expect {
     NaN|{"v" : "NaN"}
 }
-@sqlstate 23000
+@sqlstate 0A000
 expect @tursopg error {}
 
 # C-32: double precision 'Infinity': raw value, inside json_build_object
@@ -433,7 +433,7 @@ test double-precision-infinity-raw-value-inside-json {
 expect {
     Infinity|{"v" : "Infinity"}
 }
-@sqlstate 23000
+@sqlstate 42883
 expect @tursopg error {}
 
 # C-40: json_agg of mixed-type row
@@ -462,7 +462,7 @@ expect @tursopg error {}
 
 # C-42: ::text cast of each type
 @setup t_b_n_ts_j_jb_arr_u_with_rows
-@compat-gap "cast:bool -> text"
+@compat-gap "cast:jsonb -> text"
 test text-cast-of-each-type {
     SELECT b::text, n::text, ts::text, jb::text, arr::text, u::text FROM t;
 }
@@ -470,7 +470,7 @@ expect {
     true|1.50|2026-10-08 12:00:00+00|{"y": 2}|{a}|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 expect @tursopg {
-    1|1.50|2026-10-08 12:00:00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    true|1.50|2026-10-08 12:00:00+00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
 # C-43: result column type of bool comparison via pg_typeof
@@ -510,5 +510,5 @@ expect {
     b"}|t
 }
 expect @tursopg {
-    {"a\nb"}|1
+    {"a\nb"}|t
 }

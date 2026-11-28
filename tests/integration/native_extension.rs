@@ -1782,6 +1782,57 @@ fn native_writes_yield_and_keep_existing_transaction_callbacks() {
 }
 
 #[test]
+fn native_insert_returning_writes_and_returns_every_row() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_store",
+        VTabKind::VirtualTable,
+        RowsModule {
+            queue: queue.clone(),
+            rows: rows.clone(),
+            events: events.clone(),
+            writable: true,
+        },
+    ));
+    conn.execute("CREATE VIRTUAL TABLE store USING native_store")
+        .unwrap();
+    let mut insert = conn
+        .prepare("INSERT INTO store(value) VALUES (13), (27) RETURNING value, rowid")
+        .unwrap();
+    assert_eq!(
+        collect(&mut insert, &queue),
+        vec![
+            vec![Value::from_i64(13), Value::from_i64(-1)],
+            vec![Value::from_i64(27), Value::from_i64(-1)],
+        ]
+    );
+    assert_eq!(*rows.lock(), vec![(1, 13), (2, 27)]);
+}
+
+#[test]
+fn native_insert_select_from_same_table_passes_values_without_affinity() {
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "text_store",
+        VTabKind::VirtualTable,
+        TextStoreModule { rows: rows.clone() },
+    ));
+    conn.execute("CREATE VIRTUAL TABLE store USING text_store")
+        .unwrap();
+    conn.execute("INSERT INTO store VALUES ('a')").unwrap();
+    // The SELECT reads the table the INSERT writes to, so the rows go through
+    // a temporary table, which must not apply the TEXT affinity of `value`.
+    conn.execute("INSERT INTO store SELECT 5 FROM store")
+        .unwrap();
+    assert_eq!(
+        *rows.lock(),
+        vec![Value::build_text("a"), Value::from_i64(5)]
+    );
+}
+
+#[test]
 fn abandoned_native_write_does_not_apply_the_pending_update() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
@@ -2643,6 +2694,107 @@ impl TableUpdate for RowsUpdate {
     }
 }
 
+/// A writable module with one TEXT column that stores the values it receives
+/// unchanged.
+#[derive(Clone, Debug)]
+struct TextStoreModule {
+    rows: Arc<Mutex<Vec<Value>>>,
+}
+
+impl VirtualTableModule for TextStoreModule {
+    type Table = TextStoreTable;
+
+    fn schema(&self, _args: &[Value]) -> Result<String> {
+        Ok("CREATE TABLE x(value TEXT)".into())
+    }
+
+    fn create(&self, _args: &[Value]) -> Result<Self::Table> {
+        Ok(TextStoreTable {
+            rows: self.rows.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct TextStoreTable {
+    rows: Arc<Mutex<Vec<Value>>>,
+}
+
+impl VirtualTable for TextStoreTable {
+    type Cursor = TextStoreCursor;
+
+    fn open(&self, _connection: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(TextStoreCursor {
+            rows: self.rows.lock().clone(),
+            index: 0,
+        })
+    }
+
+    fn best_index(
+        &self,
+        _constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        Ok(IndexInfo::default())
+    }
+
+    fn readonly(&self) -> bool {
+        false
+    }
+
+    fn create_update(&mut self, args: Vec<Value>) -> Result<Box<dyn TableUpdate>> {
+        Ok(Box::new(TextStoreUpdate {
+            args,
+            rows: self.rows.clone(),
+        }))
+    }
+}
+
+struct TextStoreCursor {
+    rows: Vec<Value>,
+    index: usize,
+}
+
+impl VirtualTableCursor for TextStoreCursor {
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<&str>,
+        _idx_num: i32,
+    ) -> IOResultOr<bool> {
+        self.index = 0;
+        Ok(IOResult::Done(!self.rows.is_empty()))
+    }
+
+    fn next(&mut self) -> IOResultOr<bool> {
+        self.index += 1;
+        Ok(IOResult::Done(self.index < self.rows.len()))
+    }
+
+    fn column(&mut self, column: usize) -> IOResultOr<Value> {
+        assert_eq!(column, 0);
+        Ok(IOResult::Done(self.rows[self.index].clone()))
+    }
+
+    fn rowid(&self) -> i64 {
+        self.index as i64 + 1
+    }
+}
+
+struct TextStoreUpdate {
+    args: Vec<Value>,
+    rows: Arc<Mutex<Vec<Value>>>,
+}
+
+impl TableUpdate for TextStoreUpdate {
+    fn step(&mut self) -> IOResultOr<Option<i64>> {
+        assert_eq!(self.args[0], Value::Null, "only INSERT is supported");
+        let mut rows = self.rows.lock();
+        rows.push(self.args[2].clone());
+        Ok(IOResult::Done(Some(rows.len() as i64)))
+    }
+}
+
 fn integer(value: &Value) -> i64 {
     let Value::Numeric(Numeric::Integer(value)) = value else {
         panic!("expected integer, got {value:?}");
@@ -2920,7 +3072,8 @@ fn declared_return_type_of_extension_functions_matches_what_they_return() {
             })
             .1;
         let expected = match return_type {
-            ReturnType::Integer => "integer",
+            // A function that answers a condition returns the integer 1 or 0.
+            ReturnType::Integer | ReturnType::Boolean => "integer",
             ReturnType::Real => "real",
             ReturnType::Text => "text",
             ReturnType::Blob => "blob",

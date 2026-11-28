@@ -88,7 +88,25 @@ impl VirtualTable {
         name: &str,
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
-        let module = syms.resolve_vtab_module(name);
+        Self::function_of_module(dialect, name, syms.resolve_vtab_module(name))
+    }
+
+    /// The overlay of the stored table `name`: a table-valued function of
+    /// `module` that has the name of the table. See
+    /// [`crate::OpenOptions::table_overlay`].
+    pub(crate) fn overlay(
+        dialect: &dyn crate::dialect::Dialect,
+        name: &str,
+        module: &Arc<crate::ext::VTabImpl>,
+    ) -> crate::Result<Arc<VirtualTable>> {
+        Self::function_of_module(dialect, name, Some(module))
+    }
+
+    fn function_of_module(
+        dialect: &dyn crate::dialect::Dialect,
+        name: &str,
+        module: Option<&Arc<crate::ext::VTabImpl>>,
+    ) -> crate::Result<Arc<VirtualTable>> {
         let (vtab_type, schema) = if module.is_some() {
             crate::ext::create_virtual_table(
                 name,
@@ -112,6 +130,25 @@ impl VirtualTable {
             innocuous: module.is_some_and(|module| module.implementation.innocuous()),
         };
         Ok(Arc::new(vtab))
+    }
+
+    /// Whether the overlay has the columns of `stored`, its stored table: the
+    /// same names in the same order, and after them only HIDDEN columns.
+    /// See [`crate::OpenOptions::table_overlay`].
+    pub(crate) fn has_columns_of(&self, stored: &crate::schema::BTreeTable) -> bool {
+        let stored_columns = stored.columns();
+        self.columns.len() >= stored_columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(stored_columns)
+                .all(|(overlay, stored)| match (&overlay.name, &stored.name) {
+                    (Some(overlay), Some(stored)) => overlay.eq_ignore_ascii_case(stored),
+                    _ => false,
+                })
+            && self.columns[stored_columns.len()..]
+                .iter()
+                .all(|column| column.hidden())
     }
 
     pub fn table(

@@ -2,12 +2,12 @@
 
 use crate::ast;
 use crate::dialect::{
-    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateSequence,
-    CreateTable, CreateTrigger, CreateView, CreateVirtualTable, DropIndex, DropSequence, DropTable,
-    DropTrigger, DropView, TableText,
+    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateSchema,
+    CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable,
+    DropIndex, DropSchema, DropSequence, DropTable, DropTrigger, DropType, DropView, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -66,6 +66,10 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::CreateVirtualTable(table) => {
                 emit_create_virtual_table_row(program, ctx, table)
             }
+            CatalogCmd::CreateType(ty) => emit_create_type_row(program, ctx, ty),
+            CatalogCmd::DropType(ty) => emit_delete_type_row(program, ctx, ty),
+            CatalogCmd::CreateSchema(schema) => emit_create_schema_row(program, ctx, schema),
+            CatalogCmd::DropSchema(schema) => emit_delete_schema_row(program, ctx, schema),
         }
     }
 }
@@ -977,6 +981,282 @@ fn emit_create_virtual_table_row(
     )
 }
 
+/// Writes the row of a new type or domain into the types table. It creates
+/// the table first when the database has none.
+fn emit_create_type_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    ty: &CreateType<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let types_table: Arc<BTreeTable>;
+    let types_root_page: RegisterOrLiteral<i64>;
+    if let Some(existing) = resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+    {
+        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
+        types_table = existing;
+    } else {
+        let created = emit_create_internal_table(
+            program,
+            resolver,
+            TURSO_TYPES_TABLE_NAME,
+            &format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)"),
+        )?;
+        (types_table, types_root_page) = (created.table, created.root_page);
+    }
+
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: types_cursor_id,
+        root_page: types_root_page,
+        db: MAIN_DB_ID,
+    });
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: types_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    let name_reg = program.emit_string8_new_reg(ty.name.to_string());
+    program.emit_string8_new_reg(ty.sql.to_string());
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(name_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: types_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+    });
+    Ok(())
+}
+
+/// Deletes the row of a type or domain from the types table.
+fn emit_delete_type_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    ty: &DropType<'_>,
+) -> Result<()> {
+    let types_table = ctx
+        .resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+        .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {}", ty.name)))?;
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: types_cursor_id,
+        root_page: types_table.root_page.into(),
+        db: MAIN_DB_ID,
+    });
+
+    let name_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: name_reg,
+        value: ty.name.to_string(),
+    });
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: types_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    let col0_reg = program.alloc_register();
+    program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
+
+    let skip_delete_label = program.allocate_label();
+
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+
+    program.emit_insn(Insn::Delete {
+        cursor_id: types_cursor_id,
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(skip_delete_label);
+
+    program.emit_insn(Insn::Next {
+        cursor_id: types_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(end_loop_label);
+    Ok(())
+}
+
+/// Writes the row of a new namespace into the namespaces table.
+fn emit_create_schema_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    schema: &CreateSchema<'_>,
+) -> Result<()> {
+    let cursor_id = open_namespaces_table_for_writing(program, ctx.resolver)?;
+    emit_namespace_row(program, cursor_id, schema.id, schema.name);
+    Ok(())
+}
+
+/// Deletes the row of a namespace from the namespaces table. The statement
+/// fails when the table has no row for the namespace.
+fn emit_delete_schema_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    schema: &DropSchema<'_>,
+) -> Result<()> {
+    let cursor_id = open_namespaces_table_for_writing(program, ctx.resolver)?;
+    let id_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        dest: id_reg,
+        value: i64::from(schema.id.as_u32()),
+    });
+    let missing_row_label = program.allocate_label();
+    let delete_done_label = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: cursor_id,
+        rowid_reg: id_reg,
+        target_pc: missing_row_label,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id,
+        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: delete_done_label,
+    });
+    program.preassign_label_to_next_insn(missing_row_label);
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: crate::error::SQLITE_ERROR,
+        description: format!(
+            "{TURSO_NAMESPACES_TABLE_NAME} has no row for namespace {}",
+            schema.name
+        ),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(delete_done_label);
+    Ok(())
+}
+
+/// Opens the namespaces table of the main database for writing. A database
+/// that has never created or dropped a namespace has no namespaces table
+/// yet, so it is created first with a row for each namespace the database
+/// has, which are its default namespaces.
+fn open_namespaces_table_for_writing(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let existing = resolver.with_schema(MAIN_DB_ID, |s| {
+        s.get_btree_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
+    });
+    let created = existing.is_none();
+    let (table, root_page) = match existing {
+        Some(table) => {
+            let root_page = RegisterOrLiteral::Literal(table.root_page);
+            (table, root_page)
+        }
+        None => {
+            let created = emit_create_internal_table(
+                program,
+                resolver,
+                TURSO_NAMESPACES_TABLE_NAME,
+                &format!(
+                    "CREATE TABLE {TURSO_NAMESPACES_TABLE_NAME}(id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+                ),
+            )?;
+            (created.table, created.root_page)
+        }
+    };
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page,
+        db: MAIN_DB_ID,
+    });
+    if created {
+        let namespaces = resolver.with_schema(MAIN_DB_ID, |s| {
+            s.namespaces()
+                .map(|(id, name)| (id, name.to_string()))
+                .collect::<Vec<_>>()
+        });
+        for (id, name) in namespaces {
+            emit_namespace_row(program, cursor_id, id, &name);
+        }
+    }
+    Ok(cursor_id)
+}
+
+/// Inserts the row of namespace `id` called `name` into the namespaces
+/// table open at `cursor_id`, failing if the table has a row with that id.
+fn emit_namespace_row(program: &mut ProgramBuilder, cursor_id: usize, id: NamespaceId, name: &str) {
+    let id_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        dest: id_reg,
+        value: i64::from(id.as_u32()),
+    });
+    let insert_label = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: cursor_id,
+        rowid_reg: id_reg,
+        target_pc: insert_label,
+    });
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
+        description: format!("UNIQUE constraint failed: {TURSO_NAMESPACES_TABLE_NAME}.id"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(insert_label);
+    // The id is the rowid, so the record keeps NULL for it, as SQLite does
+    // for an INTEGER PRIMARY KEY column.
+    let record_start_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::Null {
+        dest: record_start_reg,
+        dest_end: None,
+    });
+    program.emit_insn(Insn::String8 {
+        value: name.to_string(),
+        dest: record_start_reg + 1,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(record_start_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: id_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
+    });
+}
+
 /// Creates one of the engine's own tables in the main database the first
 /// time it is used: a new B-tree, its row in `sqlite_schema`, and the table
 /// in the in-memory schema. Returns the table and the root page that the new
@@ -987,7 +1267,7 @@ fn emit_create_virtual_table_row(
 /// `Pager::rollback`). It has to precede `ParseSchema`: if a later
 /// instruction fails, the schema would otherwise keep the table while the
 /// rollback removed its page.
-pub(crate) fn emit_create_internal_table(
+fn emit_create_internal_table(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table_name: &str,
@@ -1030,9 +1310,9 @@ pub(crate) fn emit_create_internal_table(
 }
 
 /// A table that [`emit_create_internal_table`] creates.
-pub(crate) struct InternalTable {
-    pub(crate) table: Arc<BTreeTable>,
-    pub(crate) root_page: RegisterOrLiteral<i64>,
+struct InternalTable {
+    table: Arc<BTreeTable>,
+    root_page: RegisterOrLiteral<i64>,
 }
 
 /// Opens `sqlite_schema` of the given database for writing and returns the

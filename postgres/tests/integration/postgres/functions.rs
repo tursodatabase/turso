@@ -429,7 +429,7 @@ fn test_pg_setting_change_stays_when_its_statement_is_reset_after_a_row(db: Temp
 }
 
 #[turso_macros::test(mvcc)]
-fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
+fn test_pg_is_in_recovery_returns_temporary_true(db: TempDatabase) {
     let conn = db.connect_postgres();
     assert_eq!(
         query_text(
@@ -442,7 +442,7 @@ fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
         "SELECT pg_catalog.pg_is_in_recovery()",
         "SELECT pg_is_in_recovery() AS recovery",
     ] {
-        assert_eq!(query_text(&conn, sql), ["t"]);
+        assert_eq!(query_integer(&conn, sql), [1]);
     }
     assert!(conn.prepare("SELECT pg_is_in_recovery(1)").is_err());
 
@@ -452,7 +452,7 @@ fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
             .unwrap()
             .run_collect_rows()
             .unwrap(),
-        vec![vec![Value::build_text("t")]]
+        vec![vec![Value::from_i64(1)]]
     );
 }
 
@@ -675,11 +675,10 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     assert_eq!(
         rows,
         [
-            ("format_type", 1, "i"),
-            ("format_type", 2, "i"),
-            ("now", 0, "v"),
-            ("pg_get_constraintdef", 1, "v"),
-            ("pg_get_constraintdef", 2, "v"),
+            ("format_type", 2, "s"),
+            ("now", 0, "s"),
+            ("pg_get_constraintdef", 1, "s"),
+            ("pg_get_constraintdef", 2, "s"),
             ("quote_ident", 1, "i"),
         ]
         .into_iter()
@@ -1000,6 +999,62 @@ fn test_pg_containment_with_parameters(db: TempDatabase) {
     ] {
         let mut stmt = conn.prepare(sql).unwrap();
         stmt.bind_at(param(1), Value::build_text(value)).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(expected_id)]],
+            "{sql} with $1 = {value}"
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_key_and_path_operators_with_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb)")
+        .unwrap();
+    conn.execute(
+        r#"INSERT INTO items VALUES (1, '{"dims":{"w":20},"tags":["red"]}'), (2, '{"qty":2,"1":"x"}')"#,
+    )
+    .unwrap();
+    let param = |index| std::num::NonZero::new(index).unwrap();
+
+    for (sql, value, expected_id) in [
+        (
+            "SELECT id FROM items WHERE data ? $1",
+            Value::build_text("qty"),
+            2,
+        ),
+        // The server binds a parameter without a type, such as 1, as a
+        // number. It is the text of a key, as PostgreSQL reads such a
+        // parameter of ? as text.
+        (
+            "SELECT id FROM items WHERE data ? $1",
+            Value::from_i64(1),
+            2,
+        ),
+        (
+            "SELECT id FROM items WHERE data ?| $1",
+            Value::build_text("{zzz,tags}"),
+            1,
+        ),
+        (
+            "SELECT id FROM items WHERE data ?& $1",
+            Value::build_text("{qty,1}"),
+            2,
+        ),
+        (
+            "SELECT id FROM items WHERE data #>> $1 = '20'",
+            Value::build_text("{dims,w}"),
+            1,
+        ),
+        (
+            "SELECT id FROM items WHERE data #> $1 IS NOT NULL",
+            Value::build_text("{tags,0}"),
+            1,
+        ),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(param(1), value.clone()).unwrap();
         assert_eq!(
             stmt.run_collect_rows().unwrap(),
             vec![vec![Value::from_i64(expected_id)]],

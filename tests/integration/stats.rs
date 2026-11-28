@@ -1,3 +1,4 @@
+use asserting::prelude::*;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::SessionRole;
@@ -9,6 +10,9 @@ use turso_core::OpenFlags;
 use turso_core::PlatformIO;
 use turso_core::IO;
 use turso_sqlite::SqliteDialect;
+
+use crate::assertions::AssertQueryPlan;
+use crate::common::limbo_exec_rows;
 
 /// Regression test for #11581: once a database has `sqlite_stat1`, opening
 /// a new connection must not deep-clone the whole schema just to install
@@ -168,21 +172,322 @@ fn connections_share_schema_without_stat1() {
     assert_eq!(connections.len(), 5);
 }
 
+/// Regression test for #12397: a NULL `tbl` row in `sqlite_stat1` must not
+/// fail stats loading on reopen and discard valid statistics.
+#[test]
+fn reopen_loads_valid_stats_when_stat1_has_null_tbl_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_null_tbl.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE t(a, b);
+             CREATE INDEX ia ON t(a);
+             CREATE INDEX ib ON t(b);
+             ANALYZE;
+             INSERT INTO sqlite_stat1 VALUES
+                 ('t', 'ia', '2000 2000'),
+                 ('t', 'ib', '2000 1'),
+                 (NULL, NULL, NULL);",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+    let t = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "t")
+        .expect("valid stats for table t must survive a NULL tbl row");
+    assert_eq!(t.row_count, Some(2000));
+    assert_eq!(
+        t.index_stats
+            .get("ia")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![2000]
+    );
+    assert_eq!(
+        t.index_stats
+            .get("ib")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![1]
+    );
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
+}
+
+/// Regression test for #12397: non-text `tbl` rows that do not match any table
+/// must be skipped instead of failing stats loading on reopen.
+#[test]
+fn reopen_loads_valid_stats_when_stat1_has_non_text_tbl_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_non_text_tbl.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE t(a, b);
+             CREATE INDEX ia ON t(a);
+             CREATE INDEX ib ON t(b);
+             ANALYZE;
+             INSERT INTO sqlite_stat1 VALUES
+                 (123, 'x', '10 1'),
+                 (1.5, 'x', '10 1'),
+                 (X'fffe', 'x', '10 1'),
+                 ('t', 'ia', '2000 2000'),
+                 ('t', 'ib', '2000 1');",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+    let t = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "t")
+        .expect("valid stats for table t must survive non-text tbl rows");
+    assert_eq!(
+        t.index_stats
+            .get("ib")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![1]
+    );
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
+}
+
+/// Regression test for #12397: non-text `tbl`, `idx`, and `stat` values in
+/// `sqlite_stat1` are coerced to text on reopen (like SQLite's analysisLoader).
+#[test]
+fn reopen_coerces_non_text_stat1_columns_to_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_coerced.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE \"123\"(a, b);
+             CREATE INDEX \"111\" ON \"123\"(a);
+             CREATE INDEX \"222\" ON \"123\"(b);
+             CREATE TABLE counts(x);
+             CREATE TABLE blob_t(a, b);
+             CREATE INDEX bia ON blob_t(a);
+             CREATE INDEX bib ON blob_t(b);
+             ANALYZE;
+             INSERT INTO sqlite_stat1 VALUES
+                 (123, 111, '2000 2000'),
+                 (123, 222, '2000 1'),
+                 ('counts', NULL, 50000),
+                 (X'626c6f625f74', X'626961', X'323030302032303030'),
+                 (X'626c6f625f74', X'626962', X'323030302031');",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+
+    let t123 = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "123")
+        .expect("integer tbl 123 must match table \"123\"");
+    assert_eq!(
+        t123.index_stats
+            .get("111")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![2000]
+    );
+    assert_eq!(
+        t123.index_stats
+            .get("222")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![1]
+    );
+
+    let counts = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "counts")
+        .expect("integer stat 50000 must populate row_count");
+    assert_eq!(counts.row_count, Some(50000));
+
+    let blob_t = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "blob_t")
+        .expect("blob tbl/idx/stat must coerce to UTF-8 text");
+    assert_eq!(
+        blob_t
+            .index_stats
+            .get("bia")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![2000]
+    );
+    assert_eq!(
+        blob_t
+            .index_stats
+            .get("bib")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![1]
+    );
+}
+
+/// Regression test for #12397: matching SQLite's analysisLoader, a `sqlite_stat1`
+/// row whose `idx` does not match any index on `tbl` (whether non-text or text)
+/// sets the table's row count from the first number in `stat`.
+#[test]
+fn reopen_unmatched_idx_sets_table_row_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_unmatched_idx.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE x(a);
+             CREATE TABLE y(a);
+             CREATE INDEX xa ON x(a);
+             CREATE INDEX ya ON y(a);
+             CREATE TABLE z(a);
+             ANALYZE;
+             DELETE FROM sqlite_stat1;
+             INSERT INTO sqlite_stat1 VALUES
+                 ('x', 1, '1000000'),
+                 ('y', 1, '10'),
+                 ('z', 'nosuchidx', '42');",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "x")
+            .unwrap()
+            .row_count,
+        Some(1_000_000)
+    );
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "y")
+            .unwrap()
+            .row_count,
+        Some(10)
+    );
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "z")
+            .unwrap()
+            .row_count,
+        Some(42)
+    );
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM x, y WHERE x.a = y.a",
+    ))
+    .has_table_access_order(["y", "x"])
+    .uses_index("xa");
+}
+
+/// Regression test for #12397: VACUUM schema reparse also preserves valid
+/// statistics when `sqlite_stat1` contains a NULL `tbl` row.
+#[test]
+fn vacuum_preserves_valid_stats_when_stat1_has_null_tbl_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_vacuum.db");
+    let db = open_db_at(
+        path.to_str().unwrap(),
+        DatabaseOpts::new().with_vacuum(true),
+    );
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE t(a, b);
+         CREATE INDEX ia ON t(a);
+         CREATE INDEX ib ON t(b);
+         ANALYZE;
+         INSERT INTO sqlite_stat1 VALUES
+             ('t', 'ia', '2000 2000'),
+             ('t', 'ib', '2000 1'),
+             (NULL, NULL, NULL);
+         VACUUM;",
+    )
+    .unwrap();
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
+}
+
 /// Open a fresh temporary database for the stats tests above.
 fn open_db() -> (tempfile::TempDir, Arc<Database>) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stats.db");
+    let db = open_db_at(path.to_str().unwrap(), DatabaseOpts::new());
+    (dir, db)
+}
+
+/// Open a database at the given path with the supplied options.
+fn open_db_at(path: &str, opts: DatabaseOpts) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file_with_flags(
+    Database::open_file_with_flags(
         io,
-        path.to_str().unwrap(),
+        path,
         OpenFlags::default(),
-        DatabaseOpts::new(),
+        opts,
         None,
         Arc::new(SqliteDialect),
     )
-    .unwrap();
-    (dir, db)
+    .unwrap()
 }
 
 /// Create table `t` (2 rows, 2 indexes) and ANALYZE it on a fresh

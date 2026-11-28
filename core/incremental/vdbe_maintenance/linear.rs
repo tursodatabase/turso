@@ -49,6 +49,7 @@ pub(super) fn emit_filter(
         connection.dialect().get_internal_dialect(),
         None,
         RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
     let (table_references, binding_remap) = stream_table_references(program, &input.schema);
 
@@ -397,6 +398,7 @@ fn emit_project_rows(
         connection.dialect().get_internal_dialect(),
         None,
         RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
     let (table_references, binding_remap) = stream_table_references(program, &input.schema);
 

@@ -19,8 +19,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN orders AS o
+|--MATERIALIZE scalar_subquery_t2
+|  `--SCAN order_items AS oi USING COVERING INDEX idx_order_items_order
 `--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN
-   `--SCAN order_items AS oi USING COVERING INDEX idx_order_items_order
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4            p5  comment

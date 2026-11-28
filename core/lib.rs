@@ -119,6 +119,10 @@ use schema::Schema;
 use std::time::Duration;
 use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
+pub use translate::collate::{
+    GENERATION_EXPRESSION_NOT_IMMUTABLE, INDEX_EXPRESSION_NOT_IMMUTABLE,
+    INDEX_PREDICATE_NOT_IMMUTABLE,
+};
 pub use translate::emitter::TransactionMode;
 use turso_macros::AtomicEnum;
 
@@ -148,11 +152,12 @@ pub(crate) use database::{DatabaseCatalog, InitState};
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
-    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, Dialect, DropColumn,
-    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
-    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes,
-    TableText, TempTriggerOfRenamedTable,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSchema, CreateSequence,
+    CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent,
+    DependentObject, Dialect, DropColumn, DropIndex, DropSchema, DropSequence, DropTable,
+    DropTrigger, DropType, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn,
+    RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes, TableText,
+    TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
@@ -210,12 +215,13 @@ pub use turso_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
-pub use util::IOExt;
+pub use util::{database_path_from_uri, IOExt};
 pub use vdbe::array::{
     array_contains_all, array_values_from_any, parse_text_array_of_texts, text_array_literal,
 };
 pub use vdbe::builder::{CursorType, ProgramBuilder};
 pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
+pub use vdbe::metrics::CursorWork;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,

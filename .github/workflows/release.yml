@@ -219,7 +219,9 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          zip_paths=(target/distrib/*-pc-windows-msvc.zip)
+          # Only the CLI archives hold tursodb.exe. The turso_sqlite3 archives
+          # hold a static library, which is not signed.
+          zip_paths=(target/distrib/turso_cli-*-pc-windows-msvc.zip)
           if (( ${#zip_paths[@]} == 0 )); then
             echo "No Windows release archives found to sign" >&2
             exit 1

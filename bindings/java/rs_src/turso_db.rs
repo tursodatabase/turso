@@ -1,4 +1,4 @@
-use crate::errors::{Result, TursoError, TURSO_ETC};
+use crate::errors::{Result, TursoError, SQLITE_MISUSE, TURSO_ETC};
 use crate::turso_connection::TursoConnection;
 use crate::utils::set_err_msg_and_throw_exception;
 use jni::objects::{JByteArray, JObject, JString};
@@ -93,7 +93,8 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
 }
 
 /// Opens a database with encryption support.
-/// cipher and hexkey can be null for unencrypted databases.
+/// cipher and hexkey must both be set, or both be null for an unencrypted database.
+/// Throws an exception if only one of them is null.
 #[no_mangle]
 #[allow(clippy::arc_with_non_send_sync)]
 pub extern "system" fn Java_tech_turso_core_TursoDB_openWithEncryptionUtf8<'local>(
@@ -104,6 +105,17 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openWithEncryptionUtf8<'loca
     cipher: JString<'local>,
     hexkey: JString<'local>,
 ) -> jlong {
+    // Without this check, one null value would open the database without encryption.
+    if cipher.is_null() != hexkey.is_null() {
+        set_err_msg_and_throw_exception(
+            &mut env,
+            obj,
+            SQLITE_MISUSE,
+            "encryption cipher and key must both be set, or both be null".to_string(),
+        );
+        return -1;
+    }
+
     let io = match turso_core::PlatformIO::new() {
         Ok(io) => Arc::new(io),
         Err(e) => {

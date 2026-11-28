@@ -122,6 +122,13 @@ pub fn plan_windows(
     prepare_window_subquery(program, plan, resolver, connection, windows, 0)
 }
 
+/// Plans the subquery of the first window in `windows`, and the subqueries of
+/// the windows after it, which nest in one another.
+///
+/// This function is on the stack one time for each window. The work before
+/// and after the planning of the next window is in functions that are not
+/// inlined, and the plan of the subquery is in a [Box], so that the frame
+/// stays small.
 fn prepare_window_subquery(
     program: &mut ProgramBuilder,
     outer_plan: &mut SelectPlan,
@@ -139,6 +146,49 @@ fn prepare_window_subquery(
         return Ok(());
     }
 
+    let (current_window, mut inner_plan, subquery_id) = split_window_layer(
+        program,
+        outer_plan,
+        resolver,
+        windows,
+        processed_window_count,
+    )?;
+
+    // Each window adds one level of subquery, so it counts as a nested query.
+    let nested_query = resolver.enter_nested_query()?;
+    prepare_window_subquery(
+        program,
+        &mut inner_plan,
+        resolver,
+        connection,
+        windows,
+        processed_window_count + 1,
+    )?;
+    drop(nested_query);
+
+    add_window_subquery(
+        outer_plan,
+        current_window,
+        inner_plan,
+        subquery_id,
+        processed_window_count,
+        resolver,
+    )
+}
+
+/// Takes the first window of `windows`, and moves the FROM clause, the WHERE
+/// clause, the GROUP BY clause and the aggregates of `outer_plan` into a new
+/// inner plan. The inner plan returns the rows in the order of the window.
+/// Rewrites the expressions of `outer_plan` to read the columns of the inner
+/// plan. Returns the window, the inner plan and the ID of its subquery.
+#[inline(never)]
+fn split_window_layer(
+    program: &mut ProgramBuilder,
+    outer_plan: &mut SelectPlan,
+    resolver: &Resolver,
+    windows: &mut Vec<Window>,
+    processed_window_count: usize,
+) -> crate::Result<(Box<Window>, Box<SelectPlan>, TableInternalId)> {
     // Layer windows in their declaration order: the first-declared window
     // becomes the outermost subquery (its PARTITION/ORDER drives the
     // user-visible row order), and later-declared windows nest deeper. Each
@@ -223,6 +273,7 @@ fn prepare_window_subquery(
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         });
     }
 
@@ -236,7 +287,7 @@ fn prepare_window_subquery(
         outer_plan.table_references.outer_query_refs().to_vec(),
     );
 
-    let mut inner_plan = SelectPlan {
+    let inner_plan = Box::new(SelectPlan {
         join_order: mem::replace(&mut outer_plan.join_order, new_join_order),
         table_references: mem::replace(&mut outer_plan.table_references, new_table_references),
         result_columns: subquery_result_columns,
@@ -256,23 +307,23 @@ fn prepare_window_subquery(
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-    };
+    });
+    Ok((Box::new(current_window), inner_plan, subquery_id))
+}
 
-    // Each window adds one level of subquery, so it counts as a nested query.
-    let nested_query = resolver.enter_nested_query()?;
-    prepare_window_subquery(
-        program,
-        &mut inner_plan,
-        resolver,
-        connection,
-        windows,
-        processed_window_count + 1,
-    )?;
-    drop(nested_query);
-
+/// Adds the subquery of a window, with its planned inner plan, to `outer_plan`.
+#[inline(never)]
+fn add_window_subquery(
+    outer_plan: &mut SelectPlan,
+    current_window: Box<Window>,
+    inner_plan: Box<SelectPlan>,
+    subquery_id: TableInternalId,
+    processed_window_count: usize,
+    resolver: &Resolver,
+) -> crate::Result<()> {
     let subquery = JoinedTable::new_subquery(
         format!("window_subquery_{processed_window_count}"),
-        inner_plan,
+        *inner_plan,
         None,
         subquery_id,
         resolver,
@@ -287,7 +338,7 @@ fn prepare_window_subquery(
         {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}
     );
 
-    outer_plan.window = Some(Box::new(current_window));
+    outer_plan.window = Some(current_window);
     outer_plan.table_references.add_joined_table(subquery);
 
     Ok(())
@@ -585,6 +636,7 @@ fn push_new_subquery_column(
         alias: None,
         implicit_column_name: None,
         contains_aggregates,
+        values_condition_type: None,
     });
 }
 
@@ -2816,7 +2868,9 @@ enum RangeType {
 fn range_type(ty: &ExprType) -> RangeType {
     match ty {
         ExprType::Null | ExprType::Untyped => RangeType::ReadWhenRun,
-        ExprType::Builtin(BuiltinType::Integer) => RangeType::Sqlite(RangeOffsets::Integer),
+        ExprType::Builtin(BuiltinType::Integer | BuiltinType::Boolean) => {
+            RangeType::Sqlite(RangeOffsets::Integer)
+        }
         ExprType::Builtin(BuiltinType::Decimal) => RangeType::Sqlite(RangeOffsets::Numeric),
         ExprType::Builtin(
             BuiltinType::Real

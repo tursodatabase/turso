@@ -716,6 +716,214 @@ fn dialect_owns_builtin_scalar_function_behavior() {
     conn.close().unwrap();
 }
 
+/// A dialect that is SQLite's but has no `-` and no `<` for a text operand,
+/// and reads a string literal next to an integer as an integer.
+struct NoMinusForTextDialect;
+
+impl Dialect for NoMinusForTextDialect {
+    fn name(&self) -> &'static str {
+        "no-minus-for-text"
+    }
+
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
+        turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+        turso_core::schema::BTreeTable::from_stored_sql(self, sql, root_page, false)
+    }
+
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+        turso_core::dialect::parse_table_sql_ast(self, sql)
+    }
+
+    fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        turso_core::dialect::table_sql_for_replay(self, sql)
+    }
+
+    fn format_table_sql(
+        &self,
+        _input: &str,
+        tbl_name: &QualifiedName,
+        body: &CreateTableBody,
+    ) -> Result<String> {
+        turso_core::dialect::format_table_sql(tbl_name, body)
+    }
+
+    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
+    }
+
+    fn choose_list_operator(
+        &self,
+        _op: &str,
+        operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<Option<OperatorChoice>> {
+        let values = operands().len() - 1;
+        if values > 1 {
+            return Err(LimboError::ParseError(format!(
+                "no IN list of {values} values"
+            )));
+        }
+        Ok(None)
+    }
+
+    fn choose_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<OperatorChoice> {
+        let operands = operands();
+        let type_names: Vec<String> = operands
+            .iter()
+            .map(|operand| match operand {
+                OperandType::Registered(ty) => ty.name.to_ascii_lowercase(),
+                OperandType::Engine { ty, .. } => ty.sql_name().to_ascii_lowercase(),
+                OperandType::StringLiteral(_) => "literal".to_string(),
+                OperandType::Untyped => "untyped".to_string(),
+                OperandType::Unnamed => "unnamed".to_string(),
+            })
+            .collect();
+        if matches!(op, "-" | "<") && type_names.iter().any(|name| name == "text") {
+            return Err(LimboError::ParseError(format!(
+                "no operator {op} for {}",
+                type_names.join(" and ")
+            )));
+        }
+        let has_integer = operands.iter().any(|operand| {
+            matches!(
+                operand,
+                OperandType::Engine {
+                    ty: EngineType::Integer,
+                    ..
+                }
+            )
+        });
+        let integer = turso_core::ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        };
+        Ok(if has_integer {
+            OperatorChoice::Chosen(ChosenOperator {
+                id: 0,
+                operands: vec![integer; operands.len()],
+                cast_operands: vec![],
+                function: None,
+            })
+        } else {
+            OperatorChoice::LeftToTheEngine
+        })
+    }
+}
+
+#[test]
+fn dialect_chooses_the_values_of_an_in_list_that_read_no_column_together() {
+    let options = OpenOptions::new(Arc::new(NoMinusForTextDialect))
+        .db_opts(DatabaseOpts::new().with_custom_types(true));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (s TEXT, i INTEGER) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('5', 7)").unwrap();
+
+    let error = |sql: &str| conn.prepare(sql).err().map(|error| error.to_string());
+    for sql in [
+        "SELECT i IN (1, 2) FROM t",
+        "SELECT i IN (s, 1, 2) FROM t",
+        "SELECT i NOT IN (1, 2, 3) FROM t",
+    ] {
+        let error = error(sql).unwrap_or_else(|| panic!("{sql} did not fail"));
+        assert!(error.contains("no IN list of"), "{sql}: {error}");
+    }
+    for sql in ["SELECT i IN (1) FROM t", "SELECT i IN (s, 7) FROM t"] {
+        assert!(error(sql).is_none(), "{sql}");
+    }
+    conn.close().unwrap();
+}
+
+#[test]
+fn dialect_refuses_an_operator_by_the_types_of_its_operands() {
+    let options = OpenOptions::new(Arc::new(NoMinusForTextDialect))
+        .db_opts(DatabaseOpts::new().with_custom_types(true));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (s TEXT, i INTEGER) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('5', 7)").unwrap();
+
+    let error = |sql: &str| conn.prepare(sql).err().map(|error| error.to_string());
+    for (sql, message) in [
+        ("SELECT s - 1 FROM t", "no operator - for text and integer"),
+        ("SELECT 1 - s FROM t", "no operator - for integer and text"),
+        ("SELECT -s FROM t", "no operator - for text"),
+        (
+            "SELECT s - 'a' FROM t",
+            "no operator - for text and literal",
+        ),
+        ("SELECT s < 1 FROM t", "no operator < for text and integer"),
+        (
+            "SELECT (i, s) < (1, 1) FROM t",
+            "no operator < for text and integer",
+        ),
+        (
+            "SELECT 1 FROM t WHERE 0 AND i < s",
+            "no operator < for integer and text",
+        ),
+    ] {
+        let error = error(sql).unwrap_or_else(|| panic!("{sql} did not fail"));
+        assert!(error.contains(message), "{sql}: {error}");
+    }
+
+    let rows = conn
+        .prepare("SELECT i - 1, -i, i < 1, s + 1, s > 1, 7 = '7', i IN ('7') FROM t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::from_i64(6),
+            Value::from_i64(-7),
+            Value::from_i64(0),
+            Value::from_i64(6),
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::from_i64(1),
+        ]]
+    );
+    conn.close().unwrap();
+}
+
 #[test]
 fn dialect_scalar_function_resolves_and_executes() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -1284,8 +1492,206 @@ fn cast_conversion_of_a_type_runs_in_a_cast_and_not_in_a_column() {
     conn.close().unwrap();
 }
 
-/// A dialect that registers two types written in Rust: `loud`, and a
-/// `boolean` that replaces the type of core.
+/// A comparison is reported as the type that a dialect registers for
+/// conditions.
+#[test]
+fn conditions_are_reported_as_the_type_a_dialect_registers_for_them() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-conditions.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER, f truth) STRICT")
+        .unwrap();
+
+    let declared_names = |sql: &str| -> Vec<String> {
+        let stmt = conn.prepare(sql).unwrap();
+        (0..stmt.num_columns())
+            .map(|index| {
+                stmt.get_column_type_info(index)
+                    .unwrap()
+                    .unwrap()
+                    .declared_name
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        declared_names(
+            "SELECT a < 2, NOT a, a IN (1, 2), a IS NULL, a BETWEEN 1 AND 2, \
+             'a' LIKE 'a', EXISTS (SELECT 1), a < 2 AND a > 0 FROM t"
+        ),
+        vec!["truth"; 8]
+    );
+    // A condition keeps its type through a subquery, and with a value of
+    // the type in a CASE.
+    assert_eq!(
+        declared_names(
+            "SELECT x, CASE WHEN x THEN f ELSE a < 2 END FROM (SELECT a < 2 AS x, a, f FROM t)"
+        ),
+        vec!["truth"; 2]
+    );
+    // A condition keeps its type in a VALUES list.
+    assert_eq!(declared_names("VALUES (1 < 2), (NOT 1)"), vec!["truth"]);
+    assert_eq!(
+        declared_names("SELECT column1 FROM (VALUES (1 < 2))"),
+        vec!["truth"]
+    );
+    assert_eq!(
+        declared_names("WITH c AS (VALUES (1 < 2)) SELECT * FROM c"),
+        vec!["truth"]
+    );
+    assert_eq!(
+        declared_names("VALUES (1 < 2) UNION ALL VALUES (NOT 1)"),
+        vec!["truth"]
+    );
+    // A condition and an integer in a CASE give an integer.
+    assert_eq!(
+        declared_names("SELECT CASE WHEN a THEN a < 2 ELSE 5 END FROM t"),
+        vec!["INTEGER"]
+    );
+    // A condition has the operators of the type, and truth declares none.
+    for sql in ["SELECT (a < 2) + 1 FROM t", "SELECT f + 1 FROM t"] {
+        let error = conn.prepare(sql).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("operator does not exist: truth + integer"),
+            "{error}"
+        );
+    }
+
+    // The value is still the integer 1 or 0.
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    let rows = conn
+        .prepare("SELECT a < 2, a > 2 FROM t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(0)]]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn schema_has_at_most_one_type_of_conditions() {
+    let builder = || {
+        turso_core::schema::builtin::schema_builder(true)
+            .unwrap()
+            .builtin_type(&Truth)
+    };
+    assert!(builder().unwrap().builtin_type(&Truth).is_ok());
+    let Err(error) = builder().unwrap().builtin_type(&Verdict) else {
+        panic!("a second type of conditions was accepted");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("truth and verdict are both the type of conditions"),
+        "{error}"
+    );
+}
+
+/// A primary key of a type that can be a rowid alias is the rowid of its
+/// table, and the type still checks the values written to it.
+#[test]
+fn primary_key_of_a_type_that_can_be_a_rowid_alias_is_the_rowid() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-rowid-alias.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (k percent PRIMARY KEY, v TEXT) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (7, 'a')").unwrap();
+    let rows = |sql: &str| conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+
+    assert_eq!(
+        rows("SELECT rowid, k FROM t"),
+        vec![vec![Value::from_i64(7), Value::from_i64(7)]]
+    );
+    assert_eq!(
+        rows("SELECT count(*) FROM sqlite_schema WHERE type = 'index'"),
+        vec![vec![Value::from_i64(0)]]
+    );
+
+    for sql in [
+        "INSERT INTO t VALUES (101, 'b')",
+        "UPDATE t SET k = 101",
+        "INSERT INTO t VALUES (7, 'b') ON CONFLICT (k) DO UPDATE SET k = 101",
+    ] {
+        let error = conn.execute(sql).unwrap_err();
+        assert!(
+            error.to_string().contains("101 is not a percent"),
+            "{sql}: {error}"
+        );
+    }
+    assert_eq!(rows("SELECT k FROM t"), vec![vec![Value::from_i64(7)]]);
+
+    // A key of a type that does not say so has an index of its own.
+    conn.execute("CREATE TABLE u (k truth PRIMARY KEY) STRICT")
+        .unwrap();
+    assert_eq!(
+        rows("SELECT count(*) FROM sqlite_schema WHERE type = 'index'"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    conn.close().unwrap();
+}
+
+/// The function that a dialect names for an operator runs it, and the result
+/// has the type the dialect gives.
+#[test]
+fn function_a_dialect_names_for_an_operator_runs_it() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(
+        &io,
+        "dialect-operator-function.db",
+        Arc::new(RustTypesDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (p percent, q percent) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (30, 40)").unwrap();
+    let row = |sql: &str| conn.prepare(sql).unwrap().run_collect_rows().unwrap()[0].clone();
+
+    // `+` of two percents is the larger one. The result is a percent, so the
+    // second `+` is too.
+    assert_eq!(
+        row("SELECT p + q, p + q + p FROM t"),
+        vec![Value::from_i64(40), Value::from_i64(40)]
+    );
+    // The dialect names no function for `-`, and the type has none.
+    let error = conn.prepare("SELECT q - p FROM t").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("operator does not exist: percent - percent"),
+        "{error}"
+    );
+    conn.close().unwrap();
+}
+
+#[test]
+fn a_type_with_an_encode_cannot_be_a_rowid_alias() {
+    let Err(error) = turso_core::schema::builtin::schema_builder(true)
+        .unwrap()
+        .builtin_type(&EncodedRowid)
+    else {
+        panic!("a rowid alias type with an ENCODE was accepted");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("must have BASE integer and no ENCODE or DECODE"),
+        "{error}"
+    );
+}
+
+/// A dialect that registers four types written in Rust: `loud`, a
+/// `boolean` that replaces the type of core, `truth`, the type of
+/// conditions, and `percent`, whose primary key is the rowid.
 struct RustTypesDialect;
 
 impl Dialect for RustTypesDialect {
@@ -1332,7 +1738,35 @@ impl Dialect for RustTypesDialect {
     ) -> Result<turso_core::schema::SchemaBuilder> {
         turso_core::schema::builtin::schema_builder(enable_custom_types)?
             .builtin_type(&Loud)?
-            .builtin_type(&SiNoBoolean)
+            .builtin_type(&SiNoBoolean)?
+            .builtin_type(&Truth)?
+            .builtin_type(&Percent)
+    }
+
+    fn choose_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<OperatorChoice> {
+        let is_percent = |operand: &OperandType| matches!(operand, OperandType::Registered(ty) if ty.name == "percent");
+        let operands = operands();
+        if op != "+" || !operands.iter().all(is_percent) {
+            return Ok(OperatorChoice::LeftToTheEngine);
+        }
+        let percent = turso_core::ast::Type {
+            name: "percent".to_string(),
+            size: None,
+            array_dimensions: 0,
+        };
+        Ok(OperatorChoice::Chosen(ChosenOperator {
+            id: 0,
+            operands: vec![percent.clone(); operands.len()],
+            cast_operands: vec![],
+            function: Some(OperatorFunction {
+                name: "max".to_string(),
+                result: percent,
+            }),
+        }))
     }
 }
 
@@ -1407,6 +1841,106 @@ impl Type for SiNoBoolean {
     }
 }
 
+/// The type of conditions: it stores the integers 1 and 0 as they are.
+#[derive(Debug)]
+struct Truth;
+
+impl Type for Truth {
+    fn name(&self) -> &str {
+        "truth"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn is_type_of_conditions(&self) -> bool {
+        true
+    }
+}
+
+/// A second type of conditions, which a schema refuses.
+#[derive(Debug)]
+struct Verdict;
+
+impl Type for Verdict {
+    fn name(&self) -> &str {
+        "verdict"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn is_type_of_conditions(&self) -> bool {
+        true
+    }
+}
+
+/// An integer from 0 to 100. A primary key of the type is the rowid.
+#[derive(Debug)]
+struct Percent;
+
+impl Type for Percent {
+    fn name(&self) -> &str {
+        "percent"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn coerce(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| match value {
+            Value::Numeric(Numeric::Integer(0..=100)) => Ok(value.clone()),
+            other => Err(LimboError::Constraint(format!("{other} is not a percent"))),
+        }))
+    }
+
+    fn can_be_rowid_alias(&self) -> bool {
+        true
+    }
+}
+
+/// A type that says its primary key is the rowid although it has an ENCODE,
+/// which a schema refuses.
+#[derive(Debug)]
+struct EncodedRowid;
+
+impl Type for EncodedRowid {
+    fn name(&self) -> &str {
+        "encoded_rowid"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn encode(&self) -> Option<Conversion> {
+        Some(Conversion::Unchanged)
+    }
+
+    fn can_be_rowid_alias(&self) -> bool {
+        true
+    }
+}
+
 fn value_param(ty: &str) -> turso_core::ast::TypeParam {
     turso_core::ast::TypeParam {
         name: "value".to_string(),
@@ -1414,9 +1948,11 @@ fn value_param(ty: &str) -> turso_core::ast::TypeParam {
     }
 }
 
-/// A dialect that is SQLite's with catalog `C`.
+/// A dialect that is SQLite's with catalog `C`, and with namespaces when
+/// `namespaces` is set.
 struct DialectWithCatalog<C> {
     catalog: C,
+    namespaces: bool,
 }
 
 impl<C: turso_core::Catalog + 'static> Dialect for DialectWithCatalog<C> {
@@ -1449,6 +1985,10 @@ impl<C: turso_core::Catalog + 'static> Dialect for DialectWithCatalog<C> {
 
     fn catalog(&self) -> &dyn turso_core::Catalog {
         &self.catalog
+    }
+
+    fn supports_namespaces(&self) -> bool {
+        self.namespaces
     }
 }
 
@@ -1512,6 +2052,7 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
         catalog: CatalogWithAStep {
             table_seen_by_each_load: table_seen_by_each_load.clone(),
         },
+        namespaces: false,
     });
     let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
     let conn = db
@@ -1526,7 +2067,7 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
 }
 
 /// A catalog that stores what SQLite's stores and notes the commands about
-/// triggers and virtual tables that it gets.
+/// triggers, virtual tables, types and schemas that it gets.
 struct NotesCommands {
     commands: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -1557,6 +2098,30 @@ impl turso_core::Catalog for NotesCommands {
                     .unwrap()
                     .push(format!("create virtual table {}", table.name));
             }
+            turso_core::CatalogCmd::CreateType(ty) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create type {}: {}", ty.name, ty.sql));
+            }
+            turso_core::CatalogCmd::DropType(ty) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop type {}", ty.name));
+            }
+            turso_core::CatalogCmd::CreateSchema(schema) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create schema {}", schema.name));
+            }
+            turso_core::CatalogCmd::DropSchema(schema) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop schema {}", schema.name));
+            }
             _ => {}
         }
         turso_core::SqliteCatalog.emit(program, ctx, cmd)
@@ -1570,6 +2135,7 @@ fn the_catalog_gets_a_new_trigger_and_a_dropped_trigger() {
         catalog: NotesCommands {
             commands: commands.clone(),
         },
+        namespaces: false,
     });
     let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
     let conn = db
@@ -1597,6 +2163,7 @@ fn the_catalog_gets_a_new_virtual_table() {
         catalog: NotesCommands {
             commands: commands.clone(),
         },
+        namespaces: false,
     });
     let options = OpenOptions::new(dialect).native_module(
         "one_row",
@@ -1612,4 +2179,71 @@ fn the_catalog_gets_a_new_virtual_table() {
         .unwrap();
 
     assert_eq!(*commands.lock().unwrap(), ["create virtual table v"]);
+}
+
+#[test]
+fn the_catalog_gets_new_and_dropped_types_and_domains() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+        namespaces: false,
+    });
+    let options = OpenOptions::new(dialect).db_opts(DatabaseOpts::new().with_custom_types(true));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+        .unwrap();
+    conn.execute("CREATE DOMAIN positive AS integer CHECK (value > 0)")
+        .unwrap();
+    conn.execute("DROP TYPE cents").unwrap();
+    conn.execute("DROP DOMAIN positive").unwrap();
+
+    let commands = commands.lock().unwrap();
+    let names: Vec<&str> = commands
+        .iter()
+        .map(|command| command.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "create type cents",
+            "create type positive",
+            "drop type cents",
+            "drop type positive"
+        ]
+    );
+    assert!(commands[0].contains("CREATE TYPE cents"), "{}", commands[0]);
+    assert!(
+        commands[1].contains("CREATE DOMAIN positive"),
+        "{}",
+        commands[1]
+    );
+}
+
+#[test]
+fn the_catalog_gets_a_new_schema_and_a_dropped_schema() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+        namespaces: true,
+    });
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.create_namespace("app").unwrap();
+    conn.drop_namespace("app").unwrap();
+
+    assert_eq!(
+        *commands.lock().unwrap(),
+        ["create schema app", "drop schema app"]
+    );
 }

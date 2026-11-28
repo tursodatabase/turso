@@ -31,7 +31,7 @@ use turso_core::{
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_DUPLICATE_OBJECT,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_OBJECT_IN_USE, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_OBJECT_IN_USE, SQLSTATE_READ_ONLY_SQL_TRANSACTION,
 };
 
 use crate::auth_members::{emit_memberships_delete, Membership, Memberships};
@@ -451,13 +451,7 @@ pub(crate) fn translate_drop_role(
             // PostgreSQL would find them and refuse to drop them.
             None if is_predefined_role(name) => None,
             None if if_exists => continue,
-            None => {
-                return Err(sqlstate_error(
-                    SQLSTATE_UNDEFINED_OBJECT,
-                    format!("role \"{name}\" does not exist"),
-                    None,
-                ))
-            }
+            None => return Err(crate::auth_members::role_does_not_exist(name)),
         };
         if !named.iter().any(|(other, _)| *other == name.as_str()) {
             named.push((name, role));
@@ -594,8 +588,10 @@ fn open_authid_cursors(
     schema: &Schema,
 ) -> turso_core::Result<(usize, usize)> {
     let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME) else {
-        return Err(LimboError::ParseError(
-            "the database has no roles table".to_string(),
+        return Err(sqlstate_error(
+            SQLSTATE_READ_ONLY_SQL_TRANSACTION,
+            "the database has no roles table",
+            None,
         ));
     };
     let name_index = schema

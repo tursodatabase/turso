@@ -95,7 +95,7 @@ test alter-column-set-default {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-05: ALTER COLUMN DROP DEFAULT
@@ -106,7 +106,7 @@ test alter-column-drop-default {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-06: ALTER COLUMN SET NOT NULL
@@ -117,7 +117,7 @@ test alter-column-set-not-null {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-07: ALTER COLUMN DROP NOT NULL
@@ -128,7 +128,7 @@ test alter-column-drop-not-null {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-08: ALTER COLUMN TYPE
@@ -150,7 +150,7 @@ test add-constraint-unique {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-10: ADD CONSTRAINT FOREIGN KEY
@@ -162,7 +162,7 @@ test add-constraint-foreign-key {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-11: ADD CONSTRAINT CHECK
@@ -173,7 +173,7 @@ test add-constraint-check {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-12: DROP CONSTRAINT
@@ -184,7 +184,7 @@ test drop-constraint {
 }
 expect {
 }
-@sqlstate 42601
+@sqlstate 0A000
 expect @tursopg error {}
 
 # E-13: ALTER TABLE RENAME TO
@@ -250,29 +250,21 @@ expect {
 
 # E-19: 't'::regclass resolves
 @setup t_id
-@compat-gap "type:regclass"
 test t-regclass-resolves {
     SELECT 't'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 't');
 }
 expect {
     t
 }
-expect @tursopg {
-    0
-}
 
 # E-20: view in pg_class relkind v
 @setup t_id_view_v
-@compat-gap "syntax:catalog"
 test view-in-pg-class-relkind-v {
     SELECT relname, relkind FROM pg_class WHERE relname IN ('t', 'v') ORDER BY relname;
 }
 expect {
     t|r
     v|v
-}
-expect @tursopg {
-    t|r
 }
 
 # E-21: pg_views
@@ -289,16 +281,12 @@ expect @tursopg error {}
 
 # E-22: view columns in pg_attribute
 @setup t_id_view_v
-@compat-gap "syntax:catalog"
 test view-columns-in-pg-attribute {
     SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'v' AND a.attnum > 0;
 }
 expect {
     id|integer
 }
-expect @tursopg {
-}
-
 # E-23: pg_enum
 @setup type_mood
 @compat-gap "syntax:catalog"
@@ -322,7 +310,6 @@ expect {
 }
 
 # E-25: enum column atttypid/format_type
-@compat-gap "function:format_type"
 test enum-column-atttypid-format-type {
     CREATE TYPE mood AS ENUM ('happy', 'sad');
     CREATE TABLE t (m mood);
@@ -330,9 +317,6 @@ test enum-column-atttypid-format-type {
 }
 expect {
     mood
-}
-expect @tursopg {
-    unknown
 }
 
 # E-26: domain in pg_type typtype d
@@ -345,7 +329,6 @@ expect {
 }
 
 # E-27: domain column format_type
-@compat-gap "function:format_type"
 test domain-column-format-type {
     CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
     CREATE TABLE t (n posint);
@@ -353,9 +336,6 @@ test domain-column-format-type {
 }
 expect {
     posint
-}
-expect @tursopg {
-    unknown
 }
 
 # E-28: serial column default in pg_attrdef
@@ -373,7 +353,6 @@ expect @tursopg {
 
 # E-29: serial internal tables visible
 @setup t_id_serial
-@compat-gap "syntax:catalog"
 test serial-internal-tables-visible {
     SELECT relname, relkind FROM pg_class WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') ORDER BY relname;
 }
@@ -381,11 +360,6 @@ expect {
     t|r
     t_id_seq|S
     t_pkey|i
-}
-expect @tursopg {
-    __turso_internal_pk_index_t|i
-    t|r
-    t_id_seq|S
 }
 
 # E-30: format_type with typmod
@@ -505,7 +479,7 @@ expect {
     c_pid_fkey|t|{2}|{1}
 }
 expect @tursopg {
-    c_pid_fkey|1|2|1
+    c_pid_fkey|t|2|1
 }
 
 # E-40: COMMENT ON TABLE + obj_description
@@ -830,20 +804,6 @@ expect {
     1
 }
 
-# E-73: omitted nullable uuid column stays NULL
-@compat-gap "type:uuid"
-test omitted-nullable-uuid-column-stays-null {
-    CREATE TABLE t (id int PRIMARY KEY, u uuid);
-    INSERT INTO t (id) VALUES (1);
-    SELECT id, u IS NULL FROM t;
-}
-expect {
-    1|t
-}
-expect @tursopg {
-    1|1
-}
-
 # E-74: quoted identifier keeps its case in pg_class
 test quoted-identifier-keeps-its-case-in-pg-class {
     CREATE TABLE "Todos" (id int);
@@ -1052,17 +1012,12 @@ expect {
 expect @tursopg error {}
 
 # E-100: pg_indexes names of PRIMARY KEY and UNIQUE indexes
-# The primary key index name has the same cause as E-29.
-@compat-gap "syntax:catalog"
 test pg-indexes-names-of-primary-key-and-unique-indexes {
     CREATE TABLE u (id text PRIMARY KEY, e text UNIQUE);
     SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('u_e_key', 'u_pkey');
 }
 expect {
     2
-}
-expect @tursopg {
-    0
 }
 
 # E-101: conkey of a two-column UNIQUE constraint as text
@@ -1121,16 +1076,11 @@ expect @tursopg {
 }
 
 # E-105: regclass cast of an unknown name
-# Fails because every regclass cast returns 0, see E-19.
-@compat-gap "type:regclass"
 test regclass-cast-of-an-unknown-name {
     SELECT 'nosuch'::regclass;
 }
 @sqlstate 42P01
 expect error {}
-expect @tursopg {
-    0
-}
 
 # E-106: pg_class row level security flags
 test pg-class-row-level-security-flags {

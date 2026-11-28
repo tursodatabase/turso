@@ -1,0 +1,29 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH RECURSIVE chain(id) AS (
+          SELECT id FROM employees WHERE manager_id IS NULL
+          UNION ALL
+          SELECT e.id FROM employees e JOIN chain ON e.manager_id = chain.id
+      )
+      SELECT a.id, b.id FROM chain a JOIN chain b ON a.id < b.id;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - a.id
+  - chain
+  - e.manager_id
+  - employees
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--MATERIALIZE chain
+|  |--SETUP
+|  |  `--SEARCH employees USING COVERING INDEX idx_employees_manager (manager_id=?)
+|  `--RECURSIVE STEP
+|     |--SCAN chain
+|     `--SEARCH e USING COVERING INDEX idx_employees_manager (manager_id=?)
+|--SCAN chain AS a
+`--SEARCH b USING INDEX ephemeral_subquery_t8 (id>?)

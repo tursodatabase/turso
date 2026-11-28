@@ -171,6 +171,152 @@ fn test_bootstrap_completes_interrupted_checkpoint_with_committed_wal() {
     assert_eq!(wal_len, 0);
 }
 
+/// Reads the database file, the WAL and the logical log; a missing file reads as `None`.
+fn read_db_files(db_path: &str) -> Vec<Option<Vec<u8>>> {
+    ["", "-wal", "-log"]
+        .iter()
+        .map(|suffix| std::fs::read(format!("{db_path}{suffix}")).ok())
+        .collect()
+}
+
+/// Opens `db_path` read-only with `opts`, returns the ids of table `t`, and checks that the
+/// open left the database file, the WAL and the logical log unchanged.
+fn read_only_open_ids(db_path: &str, opts: DatabaseOpts) -> turso_core::Result<Vec<i64>> {
+    let files_before = read_db_files(db_path);
+    let result = (|| {
+        let db = Database::open_file_with_flags(
+            Arc::new(PlatformIO::new().unwrap()),
+            db_path,
+            OpenFlags::default() | OpenFlags::ReadOnly,
+            opts,
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        let ids = get_rows(&conn, "SELECT id FROM t ORDER BY id")
+            .iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        conn.close()?;
+        Ok(ids)
+    })();
+    assert_eq!(
+        read_db_files(db_path),
+        files_before,
+        "a read-only open must not change the database files"
+    );
+    result
+}
+
+/// What this test checks: a read-only open reads the committed WAL frames that a passive or
+/// automatic checkpoint leaves after a clean close, and replays the logical-log frames above
+/// the boundary those WAL frames store, without writing any file.
+/// Why this matters: the open used to fail with `Corrupt`, so a read-only open of such a
+/// database was impossible.
+#[test]
+fn test_read_only_open_reads_wal_left_by_passive_checkpoint() {
+    let passive = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
+    let cases: [(&str, &[i64]); 3] = [
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY);
+             INSERT INTO t VALUES (7);
+             PRAGMA wal_checkpoint(PASSIVE);",
+            &[7],
+        ),
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY);
+             INSERT INTO t VALUES (7);
+             PRAGMA wal_checkpoint(PASSIVE);
+             INSERT INTO t VALUES (8);",
+            &[7, 8],
+        ),
+        (
+            "PRAGMA mvcc_checkpoint_threshold = 1;
+             CREATE TABLE t(id INTEGER PRIMARY KEY);
+             INSERT INTO t VALUES (7);",
+            &[7],
+        ),
+    ];
+    for (setup, expected) in cases {
+        for read_only_opts in [passive, DatabaseOpts::new()] {
+            let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+            let db_path = db.path().to_string();
+            {
+                let conn = db.connect();
+                conn.execute(setup).unwrap();
+                conn.close().unwrap();
+            }
+            db.close();
+            let wal_len = wal_path_for_db(&db_path).metadata().unwrap().len();
+            assert!(wal_len > 0, "the checkpoint must leave WAL frames");
+
+            let ids = read_only_open_ids(&db_path, read_only_opts)
+                .unwrap_or_else(|err| panic!("read-only open after {setup:?} failed: {err}"));
+            assert_eq!(ids, expected, "setup: {setup:?}");
+        }
+    }
+}
+
+/// What this test checks: a read-only open of a database whose TRUNCATE checkpoint stopped
+/// after its pager commit reads the WAL in place and skips the logical-log frames that the
+/// WAL already holds; a later read-write open still completes the checkpoint.
+/// Why this matters: replaying those frames again would duplicate rows, and a read-only open
+/// that changed the files could break the later recovery.
+#[test]
+fn test_read_only_open_after_interrupted_checkpoint_reads_wal_in_place() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        advance_checkpoint_until_wal_has_commit_frame(db.get_mvcc_store(), &conn);
+        let log_file = db.get_mvcc_store().get_logical_log_file();
+        assert!(log_file.size().unwrap() > LOG_HDR_SIZE as u64);
+    }
+    db.close();
+
+    let ids = read_only_open_ids(&db_path, DatabaseOpts::new()).unwrap();
+    assert_eq!(ids, [1, 2]);
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    let wal_len = wal_path_for_db(&db_path)
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert_eq!(
+        wal_len, 0,
+        "the read-write open must complete the checkpoint"
+    );
+}
+
+/// What this test checks: a read-only open of a database with committed WAL frames and a torn
+/// logical-log header fails with `Corrupt` and changes no file.
+/// Why this matters: reading the WAL in place must not skip the header check that a
+/// read-write open makes.
+#[test]
+fn test_read_only_open_rejects_torn_log_header_with_committed_wal() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        advance_checkpoint_until_wal_has_commit_frame(db.get_mvcc_store(), &conn);
+    }
+    overwrite_log_header_byte(&db_path, 0, 0x00);
+    db.close();
+
+    let err = read_only_open_ids(&db_path, DatabaseOpts::new()).unwrap_err();
+    assert!(matches!(err, LimboError::Corrupt(_)), "got {err:?}");
+}
+
 /// What this test checks: Checkpoint pager commit writes data pages and metadata row in the same WAL transaction.
 /// Why this matters: This is the atomicity mechanism replacing logical-log header checkpoint timestamps.
 #[test]

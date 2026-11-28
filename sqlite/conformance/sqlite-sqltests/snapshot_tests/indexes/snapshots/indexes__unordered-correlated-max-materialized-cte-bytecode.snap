@@ -21,14 +21,15 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN products
+|--MATERIALIZE prices
+|  `--SCAN products
 |--SCAN prices AS p1
 `--CORRELATED SCALAR SUBQUERY 1
    `--SEARCH p2 USING INDEX ephemeral_subquery_t7 (price<?)
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4           p5  comment
-   0  Init                0  55   0                0  Start at 55
+   0  Init                0  56   0                0  Start at 56
    1  Gosub               3   3   0                0
    2  Goto                0  14   0                0
    3  Once               13   0   0                0  goto 13
@@ -43,17 +44,17 @@ addr  opcode             p1  p2  p3  p4           p5  comment
   12  Next                1   7   0                1
   13  Return              3   0   0                0
   14  Gosub               3   3   0                0
-  15  Rewind              0  54   0                0  Rewind  ephemeral()
+  15  Rewind              0  55   0                0  Rewind  ephemeral()
   16    Column            0   0   2                0  r[2]=ephemeral().price
   17    Copy              2   9   0                0  r[9]=r[2]
-  18    Ge                9  10  53  Binary        0  if r[9]>=r[10] goto 53
+  18    Ge                9  10  54  Binary        0  if r[9]>=r[10] goto 54
   19    BeginSubrtn      11   0   0                0  r[11]=NULL
   20    Null              0   1   0                0  r[1]=NULL
   21    Gosub             3   3   0                0
   22    OpenDup           2   0   0                0  new_cursor=2, original_cursor=0
   23    Null              0  14   0                0  r[14]=NULL
   24    Integer           1  15   0                0  r[15]=1; LIMIT counter
-  25    IfNot            15  50   0                0  if !r[15] goto 50
+  25    IfNot            15  51   0                0  if !r[15] goto 51
   26    Once             34   0   0                0  goto 34
   27    OpenAutoindex     3   0   0                0  cursor=3
   28    Rewind            2  34   0                0  Rewind  ephemeral()
@@ -78,11 +79,12 @@ addr  opcode             p1  p2  p3  p4           p5  comment
   47    AggFinal          0  14   0  max           0  accum=r[14]
   48    Copy             14  13   0                0  r[13]=r[14]
   49    Copy             13   1   0                0  r[1]=r[13]
-  50    Return           11   0   1                0
-  51    Copy              1   7   0                0  r[7]=r[1]
-  52    ResultRow         7   1   0                0  output=r[7]
-  53  Next                0  16   0                0
-  54  Halt                0   0   0                0
-  55  Transaction         0   1   1                0  iDb=0 tx_mode=Read
-  56  Integer           100  10   0                0  r[10]=100
-  57  Goto                0   1   0                0
+  50    DecrJumpZero     15  51   0                0  if (--r[15]==0) goto 51
+  51    Return           11   0   1                0
+  52    Copy              1   7   0                0  r[7]=r[1]
+  53    ResultRow         7   1   0                0  output=r[7]
+  54  Next                0  16   0                0
+  55  Halt                0   0   0                0
+  56  Transaction         0   1   1                0  iDb=0 tx_mode=Read
+  57  Integer           100  10   0                0  r[10]=100
+  58  Goto                0   1   0                0

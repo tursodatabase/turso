@@ -433,6 +433,7 @@ impl ProgramBuilderFlags {
     const READS_STORED_VALUES: u16 = 1 << 9;
     const WRITES_STORED_VALUES: u16 = 1 << 10;
     const HIDES_CONSTRAINT_VALUES: u16 = 1 << 11;
+    const READS_DATABASE_FILE: u16 = 1 << 12;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -504,6 +505,17 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_readonly(&mut self, v: bool) {
         self.set(Self::READONLY, v)
+    }
+
+    #[inline]
+    /// Whether the builder emitted an opcode that reads or writes a database
+    /// file, mirroring SQLite's `Vdbe.bIsReader`.
+    pub const fn reads_database_file(self) -> bool {
+        self.get(Self::READS_DATABASE_FILE)
+    }
+    #[inline]
+    pub const fn set_reads_database_file(&mut self, v: bool) {
+        self.set(Self::READS_DATABASE_FILE, v)
     }
 
     #[inline]
@@ -1544,6 +1556,7 @@ impl ProgramBuilder {
             alias: Some(col_name),
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         });
     }
 
@@ -1553,6 +1566,8 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
+        self.flags
+            .set_reads_database_file(self.flags.reads_database_file() | insn.reads_database_file());
         // Any function can raise at runtime, and so can the conversion of a
         // type; see Self::may_abort.
         if matches!(insn, Insn::Function { .. } | Insn::TypeConversion { .. }) {
@@ -1772,15 +1787,27 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn with_cte_materialization_eqp<T>(
+    /// Runs `emit`, which fills the table of a FROM clause subquery or CTE,
+    /// under a `MATERIALIZE <name>` step of the query plan. For a CTE, the
+    /// plan steps of the body are also listed in `cte_materializations`.
+    pub fn with_materialization_eqp<T>(
         &mut self,
-        cte_id: usize,
+        cte_id: Option<usize>,
         name: &str,
         emit: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        emit_explain!(
+            self,
+            true,
+            EqpDetail::Materialize {
+                cte_id,
+                name: name.to_string(),
+            }
+        );
         let insns_start = self.insns.len();
         let emitted = emit(self)?;
-        if self.mode.is_explain_query_plan() {
+        self.pop_current_parent_explain();
+        if let (Some(cte_id), true) = (cte_id, self.mode.is_explain_query_plan()) {
             let node_ids: Vec<usize> = (insns_start..self.insns.len())
                 .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
                 .collect();
@@ -2106,6 +2133,9 @@ impl ProgramBuilder {
                 }
                 Insn::IfPos { target_pc, .. } => {
                     resolve(target_pc, "IfPos")?;
+                }
+                Insn::IfNeg { target_pc, .. } => {
+                    resolve(target_pc, "IfNeg")?;
                 }
                 Insn::Next { pc_if_next, .. } => {
                     resolve(pc_if_next, "Next")?;
@@ -2765,6 +2795,7 @@ impl ProgramBuilder {
             parameters: self.parameters,
             change_cnt_on,
             readonly: self.flags.readonly(),
+            reads_database_file: self.flags.reads_database_file(),
             result_columns: self.result_columns,
             result_column_types: self.result_column_types,
             table_references: self.table_references,

@@ -27,18 +27,18 @@ pub use crate::functions::builtin::{
 pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
-    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, DropColumn,
-    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
-    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
-    TempTriggerOfRenamedTable,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSchema, CreateSequence,
+    CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent,
+    DependentObject, DropColumn, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
+    DropType, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn, RenameTable,
+    RewrittenTrigger, RewrittenView, TableText, TempTriggerOfRenamedTable,
 };
 
 use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 use crate::{
     function::ScalarFunc,
     namespace::NamespaceId,
-    schema::{BTreeTable, Schema, SchemaBuilder},
+    schema::{BTreeTable, Schema, SchemaBuilder, TypeDef},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::Register,
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
@@ -321,6 +321,18 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a comparison of a `timestamp` with a `timestamptz` is allowed.
+    ///
+    /// FIXME(pg-catalog): HACK. This stands in for pg_operator's comparison
+    /// operators of the two types and for pg_cast's implicit cast of timestamp
+    /// to timestamptz. It is correct ONLY while both types store the same UTC
+    /// text and the session time zone is always UTC. Delete it with the
+    /// pg_operator and pg_cast lookup. The SQLite frontend has no such cast,
+    /// so the comparison is an error there.
+    fn compares_timestamp_with_timestamptz(&self) -> bool {
+        false
+    }
+
     /// Whether `t.c` reads only the nearest query that has a table named `t`.
     ///
     /// SQLite keeps searching outer queries when that table has no column
@@ -500,6 +512,11 @@ pub trait Dialect: Send + Sync + 'static {
         &[]
     }
 
+    /// Checks whether this dialect permits ATTACH and DETACH.
+    fn validate_attach(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether `PRAGMA capture_data_changes_conn` may create its change
     /// tables in a database of this dialect.
     ///
@@ -587,7 +604,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, timestamp, json and inet to numbers, booleans and bytea. A lookup in a pg_cast table replaces this.
+    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, json and inet to numbers, booleans and bytea. It decides a CAST only when `apply_cast` gives `CastDecision::EngineRules`, which the PostgreSQL frontend gives for the types of its `ENGINE_RULE_TYPES`. It also decides what such a column stores, which no cast table covers. Rows for these types in the frontend's cast table replace the CAST half.
     /// Whether a CAST from a custom type that reads text and has an ENCODE
     /// (such as date, timestamp, json or inet) is refused when its target does
     /// not read text.
@@ -657,6 +674,232 @@ pub trait Dialect: Send + Sync + 'static {
     fn json_contains_function(&self) -> Option<&'static str> {
         None
     }
+
+    /// Chooses the operator `op` for operands of the given types: one type
+    /// for a prefix operator, two for the others. `op` is an arithmetic, bit
+    /// or comparison operator. An error refuses the operator. `operands` gives
+    /// the types, and is only called by a dialect that needs them.
+    fn choose_operator(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<OperatorChoice> {
+        Ok(OperatorChoice::LeftToTheEngine)
+    }
+
+    /// Chooses the `=` of `x IN (a, b, ...)` for the values that read no
+    /// column, when the dialect picks one type for `x` and all of them at
+    /// once. `operands` gives the types of `x` and then of each value, and is
+    /// only called by a dialect that needs them. `None` compares each value
+    /// with `x` alone through [Dialect::choose_operator], as SQLite does, and
+    /// so is a value that reads a column.
+    fn choose_list_operator(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<Option<OperatorChoice>> {
+        Ok(None)
+    }
+
+    /// The error for an operator that no function runs for operands of these
+    /// types, such as `date * 2`. `operand_types` has one name for a prefix
+    /// operator and two for the others.
+    fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
+        LimboError::ParseError(undefined_operator_message(op, operand_types))
+    }
+
+    /// Decides a cast of `operand` to the type `target`, as written. `source`
+    /// gives the type of the operand, and is only called by a dialect that
+    /// needs it.
+    fn apply_cast(
+        &self,
+        _operand: &ast::Expr,
+        _source: &dyn Fn() -> CastSource,
+        _target: &TypeRef,
+        _context: CastContext,
+    ) -> Result<CastDecision> {
+        Ok(CastDecision::EngineRules)
+    }
+
+    /// Whether a statement converts the new values of a row to the types of
+    /// their columns before it checks NOT NULL.
+    ///
+    /// PostgreSQL does, so a value that its conversion turns into NULL fails
+    /// the check. SQLite checks NOT NULL first, unless the table is STRICT
+    /// and has generated columns.
+    fn converts_values_before_not_null(&self) -> bool {
+        false
+    }
+
+    /// Fails when the DEFAULT of the column `column_name` cannot be written to
+    /// a column of the type `column_type`. `source` gives the type of the
+    /// DEFAULT.
+    fn check_column_default(
+        &self,
+        _column_name: &str,
+        _source: &dyn Fn() -> CastSource,
+        _column_type: &TypeRef,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The message of the default [Dialect::undefined_operator_error].
+pub fn undefined_operator_message(op: &str, operand_types: &[String]) -> String {
+    match operand_types {
+        [operand] => format!("operator does not exist: {op} {operand}"),
+        [left, right] => format!("operator does not exist: {left} {op} {right}"),
+        _ => unreachable!("an operator has one or two operands"),
+    }
+}
+
+/// What a dialect decided for an operator.
+#[derive(Debug, Clone)]
+pub enum OperatorChoice {
+    /// The engine's own rules run the operator. SQLite always gives this.
+    LeftToTheEngine,
+    /// The dialect's operator runs. The engine reads each operand that is a
+    /// string literal as the type the operator takes.
+    Chosen(ChosenOperator),
+}
+
+/// The operator a dialect chose: which operator it is, the type it takes for
+/// each operand, and the function that runs it.
+///
+/// FIXME(registered-types): The engine reads `id` for nothing yet. It can read a string literal as a type but cannot cast any other operand, so a dialect names a function only when the operands already have the types the function takes. Once every type is registered, the operand casts come from the operator that `id` names too.
+#[derive(Debug, Clone)]
+pub struct ChosenOperator {
+    /// The dialect's own identifier of the operator: the oid of its pg_operator row for PostgreSQL.
+    pub id: i64,
+    pub operands: Vec<ast::Type>,
+    /// Which operands are cast to their type in `operands` when they are not
+    /// string literals. Empty when only string literals are cast.
+    pub cast_operands: Vec<bool>,
+    /// `None` when the engine's own rules run the operator.
+    pub function: Option<OperatorFunction>,
+}
+
+/// The function that runs an operator: it takes the operands in order.
+#[derive(Debug, Clone)]
+pub struct OperatorFunction {
+    pub name: String,
+    /// The type of the value the function returns.
+    pub result: ast::Type,
+}
+
+/// What is known about the type of an operand.
+#[derive(Debug, Clone)]
+pub enum OperandType {
+    /// A string literal, with its text. Its type comes from where it is used.
+    StringLiteral(String),
+    /// A parameter. Its type comes from where it is used.
+    Untyped,
+    /// A type registered in the schema, such as `smallint`, `date` or `uuid`.
+    /// The name is exactly the type of the value.
+    Registered(ast::Type),
+    /// FIXME(registered-types): The engine's own storage type of a value that has no registered type. One engine type stands for several types that the dialect tells apart: see [EngineType]. Once those types are registered, they are `Registered`, and this variant and the workarounds in `postgres/frontend/operators.rs` go away.
+    Engine {
+        ty: EngineType,
+        array_dimensions: u32,
+    },
+    /// FIXME(registered-types): Every value has a registered type, so this variant goes away.
+    /// A value that nothing declares a type for: NULL, a subquery, or a value
+    /// read from a column of a table that is not STRICT.
+    Unnamed,
+}
+
+/// The types that the engine stores without registering them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineType {
+    /// An integer column, an integer expression or a boolean when the schema
+    /// registers no type for conditions. A dialect with a 32-bit and a 64-bit
+    /// integer cannot tell them apart: `count(*)` is the same type as an
+    /// integer column.
+    Integer,
+    /// A real number. A dialect with a single and a double precision cannot
+    /// tell them apart.
+    Real,
+    /// A decimal number written in the statement, such as `0.5`.
+    Decimal,
+    /// A number that may be an integer or a real.
+    Number,
+    /// Text. It is also the type of a value that a cast to a registered type
+    /// such as uuid, json or inet gives.
+    Text,
+    Blob,
+}
+
+impl EngineType {
+    /// The SQL name that a CAST to this type uses.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Decimal | Self::Number => "NUMERIC",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+        }
+    }
+}
+
+/// Where a cast is written, from the narrowest to the widest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+/// What is known about the type of a cast operand.
+#[derive(Debug, Clone)]
+pub enum CastSource {
+    /// A string literal or a parameter. Its type comes from where it is used.
+    Untyped,
+    Typed(TypeRef),
+    /// A value that nothing declares a type for, such as NULL.
+    Unnamed,
+}
+
+/// A type in a cast: the type of the operand, or the target.
+#[derive(Debug, Clone)]
+pub struct TypeRef {
+    pub identity: TypeIdentity,
+    /// 0 for a type that is not an array.
+    pub array_dimensions: u32,
+}
+
+/// How core knows a type.
+#[derive(Debug, Clone)]
+pub enum TypeIdentity {
+    /// A type of the schema's type registry. Every name and alias of the type
+    /// gives this one definition.
+    Registered(Arc<TypeDef>),
+    /// A type that is not registered, by the name it is written with, such
+    /// as `INTEGER`. The same name can stand for different types in a column,
+    /// in a CAST and as the type of an expression.
+    Name(String),
+}
+
+impl TypeRef {
+    /// The name of the type: the one it is registered with, or the one it is
+    /// written with.
+    pub fn name(&self) -> &str {
+        match &self.identity {
+            TypeIdentity::Registered(type_def) => &type_def.name,
+            TypeIdentity::Name(name) => name,
+        }
+    }
+}
+
+/// What `Dialect::apply_cast` decides about a cast.
+#[derive(Debug, Clone)]
+pub enum CastDecision {
+    /// The dialect decided the cast. The engine casts this operand, which
+    /// may be the operand of the cast wrapped in a conversion, to the target
+    /// and checks nothing else.
+    Applied(ast::Expr),
+    /// The dialect leaves the cast to the rules of the engine.
+    EngineRules,
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

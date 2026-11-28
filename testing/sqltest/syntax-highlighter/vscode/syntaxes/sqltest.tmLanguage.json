@@ -69,7 +69,7 @@
     },
     "directive-skip-file-if": {
       "name": "meta.directive.skip-file-if.sqltest",
-      "begin": "(@skip-file-if)\\s+(mvcc|sqlite|postgres)\\s+(\")",
+      "begin": "(@skip-file-if)\\s+(mvcc|sqlite|postgres|debug)\\s+(\")",
       "beginCaptures": {
         "1": { "name": "keyword.control.directive.sqltest" },
         "2": { "name": "constant.language.sqltest" },
@@ -169,7 +169,7 @@
     },
     "decorator-skip-if": {
       "name": "meta.decorator.skip-if.sqltest",
-      "begin": "(@skip-if)\\s+(mvcc|sqlite|postgres)\\s+(\")",
+      "begin": "(@skip-if)\\s+(mvcc|sqlite|postgres|debug)\\s+(\")",
       "beginCaptures": {
         "1": { "name": "keyword.control.directive.sqltest" },
         "2": { "name": "constant.language.sqltest" },

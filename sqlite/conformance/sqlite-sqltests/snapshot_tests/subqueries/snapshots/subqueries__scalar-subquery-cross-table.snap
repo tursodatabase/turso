@@ -16,8 +16,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
+|--MATERIALIZE scalar_subquery_t2
+|  `--SCAN orders USING COVERING INDEX idx_orders_customer
 `--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN
-   `--SCAN orders USING COVERING INDEX idx_orders_customer
 
 BYTECODE
 addr  opcode         p1  p2  p3  p4            p5  comment

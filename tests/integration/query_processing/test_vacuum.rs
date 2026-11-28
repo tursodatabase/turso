@@ -408,6 +408,46 @@ fn test_auto_vacuum_pragma_applies_to_fresh_database() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// On a fresh database, `PRAGMA auto_vacuum` runs without a transaction, so it
+/// must not leave page 1 dirty. A dirty page 1 made the rollback of the next
+/// read that was dropped before it finished panic, which kept the statement
+/// counted as active and blocked every later checkpoint on the connection.
+#[test]
+fn test_auto_vacuum_pragma_on_fresh_database_leaves_no_dirty_page() -> anyhow::Result<()> {
+    for (pragma_value, expected_mode) in [("full", 1), ("incremental", 2)] {
+        let opts = DatabaseOpts::new().with_autovacuum(true);
+        let tmp_db = TempDatabase::builder().with_opts(opts).build();
+        let conn = tmp_db.connect_limbo();
+
+        conn.execute(format!("PRAGMA auto_vacuum = {pragma_value}"))?;
+
+        let mut stmt = conn.prepare("PRAGMA page_count")?;
+        loop {
+            match stmt.step()? {
+                StepResult::Row => break,
+                StepResult::IO => stmt._io().step()?,
+                other => panic!("unexpected step result for PRAGMA page_count: {other:?}"),
+            }
+        }
+        drop(stmt);
+
+        let rows: Vec<(i64, i64, i64)> = conn.exec_rows("PRAGMA wal_checkpoint(TRUNCATE)");
+        assert_eq!(rows, vec![(0, 0, 0)], "auto_vacuum = {pragma_value}");
+
+        // Writing page 1 stores the header that the pragma set up.
+        conn.execute("PRAGMA user_version = 1")?;
+        drop(conn);
+        let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, opts);
+        let reopened_conn = reopened.connect_limbo();
+        assert_eq!(
+            scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"),
+            expected_mode,
+            "auto_vacuum = {pragma_value}"
+        );
+    }
+    Ok(())
+}
+
 /// SQLite fixes the auto-vacuum mode as soon as page 1 exists, even when the
 /// database has no tables yet. `PRAGMA user_version` writes page 1, so a
 /// later `PRAGMA auto_vacuum=1` must be silently ignored, just like it is

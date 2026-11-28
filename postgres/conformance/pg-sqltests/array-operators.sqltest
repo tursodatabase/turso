@@ -1,0 +1,17 @@
+# The array operators = ANY, @>, <@ and &&.
+
+@database :memory:
+
+test eq-any-int-array-literal {
+    SELECT 1 = ANY('{1,2}'::int[]), 3 = ANY('{1,2}'::int[]);
+}
+expect {
+    t|f
+}
+
+test array-array-literal {
+    SELECT ARRAY[1,2] @> ARRAY[1], ARRAY['a'] <@ ARRAY['a','b'], ARRAY[1] && ARRAY[2];
+}
+expect {
+    t|t|f
+}

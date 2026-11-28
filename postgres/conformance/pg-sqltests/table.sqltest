@@ -865,8 +865,8 @@ expect {
 
 @compat-gap "type:_date"
 test array-columns-hold-element-values {
-    -- tursopg prints a boolean result as 1, PostgreSQL as t, so every
-    -- boolean is cast to int.
+    -- Every boolean is cast to int: the test was written when tursopg
+    -- printed a boolean result as 1.
     CREATE TABLE array_values (
         id int PRIMARY KEY,
         u uuid, us uuid[],
@@ -1531,3 +1531,30 @@ test drop-view-of-a-missing-view {
 }
 @sqlstate 42P01
 expect error {}
+
+test integer-primary-key-refuses-an-update-to-null {
+    CREATE TABLE i (id integer PRIMARY KEY, v text);
+    INSERT INTO i VALUES (5, 'a');
+    UPDATE i SET id = NULL;
+}
+@sqlstate 23502
+expect error {
+    null value in column "id" of relation "i" violates not-null constraint
+}
+
+test integer-primary-key-refuses-an-upsert-to-null {
+    CREATE TABLE i (id integer PRIMARY KEY, v text);
+    INSERT INTO i VALUES (5, 'a');
+    INSERT INTO i VALUES (5, 'b') ON CONFLICT (id) DO UPDATE SET id = NULL;
+}
+@sqlstate 23502
+expect error {}
+
+test omitted-nullable-uuid-column-stays-null {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT id, u IS NULL FROM t;
+}
+expect {
+    1|t
+}

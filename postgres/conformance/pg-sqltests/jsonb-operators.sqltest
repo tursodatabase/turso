@@ -246,46 +246,164 @@ expect {
 }
 
 # An index expression can use only core functions, and -> and ->> run
-# functions of the PostgreSQL frontend.
+# functions of the PostgreSQL frontend. Thus tursopg refuses them in an index
+# with 0A000.
 
 # TODO let expression indexes use frontend functions
 @setup items_with_jsonb_rows
-@skip-if postgres "Expression indexes can't use functions from frontends yet"
-test jsonb-text-arrow-in-index-expression-errors {
+@compat-gap "syntax:create-index"
+test jsonb-text-arrow-in-index-expression {
     CREATE INDEX items_qty ON items ((data ->> 'qty'));
+    SELECT id FROM items WHERE data ->> 'qty' = '2';
+}
+expect {
+    2
 }
 @sqlstate 0A000
-expect error {}
+expect @tursopg error {}
 
 # TODO let expression indexes use frontend functions
 @setup items_with_jsonb_rows
-@skip-if postgres "Expression indexes can't use functions from frontends yet"
-test jsonb-arrow-in-partial-index-errors {
+@compat-gap "syntax:create-index"
+test jsonb-arrow-in-partial-index {
     CREATE INDEX items_dims ON items (id) WHERE data -> 'dims' IS NOT NULL;
+    SELECT count(*) FROM items WHERE data -> 'dims' IS NOT NULL;
+}
+expect {
+    2
 }
 @sqlstate 0A000
-expect error {}
+expect @tursopg error {}
 
-# A generation expression can use only core functions too. The column reads a
-# text column, because a generated column cannot read a column of a custom
-# type such as jsonb.
+# A generation expression can use only core functions too, so tursopg refuses
+# -> and ->> there with 0A000. The column reads a text column, because a
+# generated column cannot read a column of a custom type such as jsonb.
 
 # TODO let generated columns use frontend functions
-@skip-if postgres "Generated columns can't use functions from frontends yet"
-test jsonb-text-arrow-in-generated-column-errors {
+@compat-gap "syntax:generated-column"
+test jsonb-text-arrow-in-generated-column {
     CREATE TABLE gen_items (data text, name text GENERATED ALWAYS AS (data::jsonb ->> 'name') STORED);
+    INSERT INTO gen_items (data) VALUES ('{"name":"pear"}');
+    SELECT name FROM gen_items;
+}
+expect {
+    pear
 }
 @sqlstate 0A000
-expect error {}
+expect @tursopg error {}
 
 # TODO let generated columns use frontend functions
-@skip-if postgres "Generated columns can't use functions from frontends yet"
-test jsonb-arrow-in-added-generated-column-errors {
+@compat-gap "syntax:generated-column"
+test jsonb-arrow-in-added-generated-column {
     CREATE TABLE gen_items_2 (data text);
     ALTER TABLE gen_items_2 ADD COLUMN dims text GENERATED ALWAYS AS (data::jsonb -> 'dims') STORED;
+    INSERT INTO gen_items_2 VALUES ('{"dims":[1]}');
+    SELECT dims FROM gen_items_2;
+}
+expect {
+    [1]
 }
 @sqlstate 0A000
+expect @tursopg error {}
+
+# Known differences of -> and ->>
+
+# ->> writes a number as jsonb writes it, also for a json value, where the
+# json type of PostgreSQL keeps the text of the input.
+@compat-gap "operator:json ->> text"
+test json-text-arrow-keeps-the-text-of-a-number {
+    SELECT '{"n":1e2}'::json ->> 'n';
+}
+expect {
+    1e2
+}
+expect @tursopg {
+    100
+}
+
+# A number with more digits than numeric allows makes ->> fail, also for a
+# json value, which PostgreSQL does not read as numeric.
+@compat-gap "operator:json ->> text"
+test json-text-arrow-of-number-past-the-limits-of-numeric {
+    SELECT '{"n":1e-20000}'::json ->> 'n';
+}
+expect {
+    1e-20000
+}
+@sqlstate 22003
+expect @tursopg error {}
+
+# -> gives the text of a number as it is stored, where jsonb of PostgreSQL
+# writes it as numeric does.
+@compat-gap "operator:jsonb -> text"
+test jsonb-arrow-keeps-the-text-of-a-number {
+    SELECT '{"n":1e2}'::jsonb -> 'n';
+}
+expect {
+    100
+}
+expect @tursopg {
+    1e2
+}
+
+# tursopg checks the types of the operands of -> and ->> for each value when
+# the query runs. Thus a text left operand and a bigint key work, and a table
+# without rows gives no error, where PostgreSQL fails with 42883.
+@compat-gap "operator:text -> text"
+test text-arrow {
+    SELECT '{"a":1}'::text -> 'a';
+}
+@sqlstate 42883
 expect error {}
+expect @tursopg {
+    1
+}
+
+@compat-gap "operator:jsonb -> int8"
+test jsonb-arrow-with-bigint-key {
+    SELECT '[1,2]'::jsonb -> 1::bigint;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    2
+}
+
+@compat-gap "operator:int4 -> text"
+test integer-arrow-on-a-table-without-rows {
+    CREATE TABLE no_rows (n int);
+    SELECT n -> 'a' FROM no_rows;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+}
+
+# jsonb of PostgreSQL reads a scalar as an array with one element, so the
+# index 0 finds the scalar. tursopg finds nothing, as PostgreSQL does for json.
+@compat-gap "operator:jsonb ->> int4"
+test jsonb-text-arrow-of-scalar-with-index-0 {
+    SELECT coalesce('"x"'::jsonb ->> 0, 'none');
+}
+expect {
+    x
+}
+expect @tursopg {
+    none
+}
+
+# -> returns text in tursopg, not jsonb, so || joins text on its result,
+# where PostgreSQL joins jsonb values.
+@compat-gap "operator:jsonb -> text"
+test jsonb-arrow-result-is-text {
+    SELECT ('{"a":[1]}'::jsonb -> 'a') || '[2]';
+}
+expect {
+    [1, 2]
+}
+expect @tursopg {
+    [1][2]
+}
 
 # @>
 
@@ -414,8 +532,8 @@ expect {
 
 # More rules of @> and <@
 
-# The tests that follow cast each comparison to int, so that the result does
-# not depend on B-04, where a boolean prints as 0 or 1 instead of f or t.
+# The tests that follow cast each comparison to int. They were written when
+# tursopg printed a boolean as 0 or 1 instead of f or t.
 
 # A scalar document is an array with one element in jsonb, so a scalar
 # contains an equal scalar, and an array contains each of its elements.
@@ -598,3 +716,93 @@ expect {
 expect @tursopg {
     -1
 }
+
+test of-a-json-boolean-is-the-text-true {
+    SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
+}
+expect {
+    true|f
+}
+
+# Known differences of @> and <@
+
+# tursopg compares a json or text value as jsonb, where PostgreSQL has @> only
+# for jsonb and for arrays.
+@compat-gap "operator:json @> json"
+test json-contains {
+    SELECT '{"a":1}'::json @> '{"a":1}';
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+@compat-gap "operator:text @> text"
+test text-contains {
+    SELECT '{"a":1}'::text @> '{"a":1}';
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+# PostgreSQL has @> for jsonb and for arrays, so it cannot choose one for two
+# string literals. tursopg compares them as jsonb.
+@compat-gap "operator:unknown @> unknown"
+test contains-of-two-string-literals {
+    SELECT '{"a":1}' @> '{"a":1}';
+}
+@sqlstate 42725
+expect error {}
+expect @tursopg {
+    t
+}
+
+# tursopg compares two values that are arrays and not JSON documents as
+# arrays. `{}` is also an empty array, so `'{}'::jsonb @> '{a}'` is false,
+# where PostgreSQL reads `{a}` as jsonb and fails with 22P02.
+@compat-gap "operator:jsonb @> jsonb"
+test jsonb-contains-of-array-literal-that-is-not-json {
+    SELECT ('{}'::jsonb @> '{a}')::int;
+}
+@sqlstate 22P02
+expect error {}
+expect @tursopg {
+    0
+}
+
+# Operators and functions of jsonb that tursopg does not have
+
+@compat-gap "operator:jsonb @@ jsonpath"
+test jsonb-matches-jsonpath {
+    SELECT '{"a":1}'::jsonb @@ '$.a == 1';
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "operator:jsonb #- _text"
+test jsonb-delete-path {
+    SELECT '{"a":{"b":1}}'::jsonb #- '{a,b}';
+}
+expect {
+    {"a": {}}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# jsonb_insert() of tursopg is the function of SQLite, which takes a JSON
+# path.
+@compat-gap "function:jsonb_insert"
+test jsonb-insert {
+    SELECT jsonb_insert('{"a":[1]}', '{a,0}', '0');
+}
+expect {
+    {"a": [0, 1]}
+}
+@sqlstate 42601
+expect @tursopg error {}

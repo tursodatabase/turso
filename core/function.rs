@@ -127,13 +127,18 @@ pub enum ExtFunc {
         /// Whether a call also gets the type name of each argument, such as
         /// `boolean[]`, as one more text argument per argument, after them.
         receives_argument_types: bool,
-        /// Called at compile time with the type name of each argument, with
-        /// domain names kept, where `receives_argument_types` passes the
-        /// domain's base type; an error refuses the statement.
+        /// FIXME(pg-catalog): HACK. Set only by
+        /// `ExternalFunc::checking_argument_types`, for
+        /// pg_timestamp_plus_interval and date_trunc. Called at compile time
+        /// with the type name of each argument, with a domain replaced by its
+        /// base type, as `receives_argument_types` passes it; an error refuses
+        /// the statement.
         check_argument_types: Option<ArgumentTypeCheck>,
-        /// Whether the result has the type of the first argument, instead of
-        /// `return_type`.
-        returns_first_argument_type: bool,
+        /// FIXME(pg-catalog): HACK. Set only by
+        /// `ExternalFunc::returning_argument_type`, for
+        /// pg_timestamp_plus_interval and date_trunc. The index of the argument
+        /// whose type the result has, instead of `return_type`.
+        returns_argument_type: Option<usize>,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -142,8 +147,13 @@ pub enum ExtFunc {
     },
 }
 
-/// A function called at compile time with the type name of each argument,
-/// with domain names kept; an error refuses the statement.
+/// FIXME(pg-catalog): HACK. The type of the check that
+/// `ExternalFunc::checking_argument_types` sets, for
+/// pg_timestamp_plus_interval and date_trunc. A function called at
+/// compile time with the type name of each argument, with a domain replaced
+/// by its base type;
+/// an error refuses the statement. A pg_proc and pg_operator lookup replaces
+/// it.
 pub type ArgumentTypeCheck = fn(&[String]) -> crate::Result<()>;
 
 #[derive(Debug)]
@@ -220,9 +230,9 @@ impl ExtFunc {
     pub fn result_type(&self) -> ResultType {
         match self {
             Self::NativeScalar {
-                returns_first_argument_type: true,
+                returns_argument_type: Some(index),
                 ..
-            } => ResultType::FirstArgument,
+            } => ResultType::Argument(*index),
             _ => match self.return_type() {
                 Some(return_type) => ResultType::Declared(return_type),
                 None => ResultType::Unknown,
@@ -1286,8 +1296,6 @@ impl ScalarFunc {
             Self::Changes
             | Self::TotalChanges
             | Self::LastInsertRowid
-            | Self::Glob
-            | Self::Like
             | Self::Instr
             | Self::Random
             | Self::Length
@@ -1304,13 +1312,15 @@ impl ScalarFunc {
             | Self::BooleanToInt
             | Self::DateDiff
             | Self::ArrayLength
-            | Self::ArrayContains
             | Self::ArrayPosition
-            | Self::ArrayOverlap
-            | Self::ArrayContainsAll
             | Self::NextVal
             | Self::CurrVal
             | Self::SetVal => ResultType::Declared(ReturnType::Integer),
+            Self::Glob
+            | Self::Like
+            | Self::ArrayContains
+            | Self::ArrayOverlap
+            | Self::ArrayContainsAll => ResultType::Declared(ReturnType::Boolean),
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => ResultType::Declared(ReturnType::Integer),
             Self::JulianDay => ResultType::Declared(ReturnType::Real),
@@ -2051,6 +2061,9 @@ impl Deterministic for Func {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnType {
     Integer,
+    /// 1 or 0: the function answers a condition, as `like` and
+    /// `array_contains` do. See `BuiltinType::Boolean`.
+    Boolean,
     Real,
     Text,
     Blob,
@@ -2075,6 +2088,11 @@ pub enum ResultType {
     Declared(ReturnType),
     /// The first argument, unchanged: `nullif(x, y)` and `likely(x)` return x.
     FirstArgument,
+    /// FIXME(pg-catalog): HACK. Only `ExternalFunc::returning_argument_type`
+    /// gives it, for pg_timestamp_plus_interval (index 0) and date_trunc
+    /// (index 1); a pg_proc and pg_operator lookup replaces it. The argument
+    /// at this index, unchanged.
+    Argument(usize),
     /// One of the arguments, unchanged: `coalesce`, `ifnull`, `min`, `max`.
     OneOfTheArguments,
     /// One of the values of `iif(c1, v1, c2, v2, ..., else)`: every second

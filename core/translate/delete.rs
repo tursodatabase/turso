@@ -41,6 +41,9 @@ fn validate_delete(
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
+    if resolver.table_overlay(namespace, tbl_name).is_some() {
+        crate::bail_parse_error!("table {tbl_name} may not be modified");
+    }
     let table = match resolver.with_schema(namespace.database_id, |s| {
         s.get_table(namespace.id, tbl_name)
     }) {
@@ -291,6 +294,11 @@ pub fn prepare_delete_plan(
     let database_id = namespace.database_id;
     let btree_table_for_triggers = table.btree();
     let table = if let Some(table) = table.virtual_table() {
+        // SQLite runs RETURNING on a virtual table as a BEFORE trigger, which it
+        // allows only for INSERT (sqlite3TriggersExist).
+        if !returning.is_empty() {
+            crate::bail_parse_error!("DELETE RETURNING is not available on virtual tables");
+        }
         Table::Virtual(table)
     } else if let Some(table) = table.btree() {
         Table::BTree(table)
@@ -521,6 +529,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         }],
         where_clause: std::mem::take(&mut plan.where_clause),
         group_by: None,

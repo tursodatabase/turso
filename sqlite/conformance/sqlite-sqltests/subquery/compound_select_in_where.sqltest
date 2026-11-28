@@ -1,12 +1,8 @@
 @database :memory:
 
 # Regression tests for compound SELECT (UNION / UNION ALL / INTERSECT /
-# EXCEPT) inside WHERE-clause IN subqueries. Previously these were rejected at
-# parse time; the query planner now threads compound selects through the IN
-# subquery code path.
-#
-# EXISTS and scalar (RowValue) subqueries still reject compound selects at
-# parse time and are intentionally not covered here.
+# EXCEPT) inside IN, EXISTS and scalar subqueries. Previously these were
+# rejected at parse time.
 
 setup fruits {
     CREATE TABLE fruit (id INTEGER PRIMARY KEY, name TEXT);
@@ -142,4 +138,154 @@ expect {
     1|apple
     2|banana
     3|cherry
+}
+
+# -----------------------------------------------------------------------------
+# EXISTS and scalar subqueries with a compound SELECT
+# -----------------------------------------------------------------------------
+
+setup two_tables {
+    CREATE TABLE a(id INTEGER, x TEXT);
+    CREATE TABLE b(id INTEGER, x TEXT);
+    INSERT INTO b VALUES(1, 'y');
+}
+
+@setup two_tables
+test scalar-union-all-with-limit {
+    SELECT (SELECT x FROM a WHERE id = 1 UNION ALL SELECT x FROM b WHERE id = 1 LIMIT 1);
+}
+expect {
+    y
+}
+
+@setup two_tables
+test exists-union {
+    SELECT EXISTS(SELECT 1 FROM a UNION SELECT 1 FROM b);
+}
+expect {
+    1
+}
+
+@setup two_tables
+test exists-each-compound-operator {
+    SELECT EXISTS(SELECT 1 FROM a UNION ALL SELECT 1 FROM a),
+           EXISTS(SELECT 1 FROM b INTERSECT SELECT 1 FROM a),
+           EXISTS(SELECT 1 FROM b EXCEPT SELECT 1 FROM b),
+           EXISTS(SELECT x FROM b EXCEPT SELECT 'q'),
+           NOT EXISTS(SELECT 1 FROM a UNION SELECT 1 FROM b);
+}
+expect {
+    0|0|0|1|0
+}
+
+@setup two_tables
+test exists-compound-with-limit-and-offset {
+    SELECT EXISTS(SELECT 1 FROM b UNION SELECT 2 LIMIT 0),
+           EXISTS(SELECT 1 FROM b UNION SELECT 2 LIMIT 1 OFFSET 1),
+           EXISTS(SELECT 1 FROM b UNION SELECT 2 LIMIT 1 OFFSET 2),
+           EXISTS(SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 1 OFFSET 1),
+           EXISTS(SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 1 OFFSET 2);
+}
+expect {
+    0|1|0|1|0
+}
+
+@setup two_tables
+test correlated-exists-compound {
+    SELECT id,
+           EXISTS(SELECT 1 FROM a UNION ALL SELECT 1 FROM b WHERE b.id = o.id),
+           EXISTS(SELECT 1 WHERE o.id = 1 INTERSECT SELECT 1),
+           EXISTS(SELECT 1 EXCEPT SELECT 1 WHERE o.id = 1)
+    FROM (SELECT 1 AS id UNION SELECT 2) o;
+}
+expect {
+    1|1|1|0
+    2|0|0|1
+}
+
+@setup two_tables
+test exists-compound-in-where {
+    SELECT id FROM (SELECT 1 AS id UNION SELECT 2) o
+    WHERE EXISTS(SELECT 1 FROM a WHERE a.id = o.id UNION SELECT 1 FROM b WHERE b.id = o.id);
+}
+expect {
+    1
+}
+
+@setup two_tables
+test correlated-scalar-compound-with-order-by {
+    SELECT id, (SELECT x FROM b WHERE b.id = o.id UNION SELECT 'z' ORDER BY 1)
+    FROM (SELECT 1 AS id UNION SELECT 2) o;
+}
+expect {
+    1|y
+    2|z
+}
+
+test scalar-compound-order-by-limit-offset {
+    SELECT (SELECT 3 UNION SELECT 1 UNION SELECT 2),
+           (SELECT 3 UNION SELECT 1 UNION SELECT 2 ORDER BY 1 DESC),
+           (SELECT 3 UNION SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 1 OFFSET 1),
+           (SELECT 3 UNION ALL SELECT 1 UNION ALL SELECT 2 LIMIT 1 OFFSET 2),
+           (SELECT 3 INTERSECT SELECT 3),
+           quote((SELECT 3 EXCEPT SELECT 3)),
+           quote((SELECT 3 UNION ALL SELECT 1 LIMIT 0)),
+           quote((SELECT 3 UNION ALL SELECT 1 LIMIT '0')),
+           (SELECT 3 UNION ALL SELECT 1 LIMIT -1);
+}
+expect {
+    1|3|2|2|3|NULL|NULL|NULL|3
+}
+
+test correlated-scalar-compound-with-offset {
+    SELECT id, (SELECT o.id UNION ALL SELECT o.id + 10 LIMIT 1 OFFSET 1)
+    FROM (SELECT 1 AS id UNION SELECT 2) o;
+}
+expect {
+    1|11
+    2|12
+}
+
+test row-value-compound {
+    SELECT (1, 2) = (SELECT 3, 4 UNION SELECT 1, 2), (3, 4) = (SELECT 3, 4 UNION SELECT 1, 2 ORDER BY 1 DESC);
+}
+expect {
+    1|1
+}
+
+# The compound takes the affinity of its last SELECT, as in SQLite.
+test scalar-compound-affinity-of-last-select {
+    CREATE TABLE t(v TEXT);
+    INSERT INTO t VALUES('q');
+    SELECT (SELECT 1 UNION ALL SELECT v FROM t) = '1',
+           (SELECT v FROM t WHERE 0 UNION ALL SELECT 1) = '1';
+}
+expect {
+    1|0
+}
+
+@setup two_tables
+test compound-subqueries-in-update-and-delete {
+    INSERT INTO b VALUES(2, 'w');
+    UPDATE b SET x = (SELECT b.x || '1' UNION SELECT 'a' ORDER BY 1 DESC);
+    DELETE FROM b WHERE NOT EXISTS(SELECT 1 FROM a UNION SELECT 1 WHERE b.id = 1);
+    SELECT id, x FROM b;
+}
+expect {
+    1|y1
+}
+
+# The single row of an aggregate without GROUP BY counts against the LIMIT
+# that a scalar subquery adds, so the later SELECTs do not replace it.
+test scalar-compound-first-select-is-ungrouped-aggregate {
+    CREATE TABLE t(id INTEGER);
+    INSERT INTO t VALUES(1), (2);
+    SELECT (SELECT count(*) FROM t UNION ALL SELECT 9),
+           (SELECT max(id) FROM t UNION ALL SELECT 9),
+           (SELECT sum(id) FROM t UNION ALL SELECT 9 UNION ALL SELECT 10),
+           (SELECT 1 FROM t WHERE 0 UNION ALL SELECT count(*) FROM t UNION ALL SELECT 9),
+           9 IN (SELECT count(*) FROM t UNION ALL SELECT 9 LIMIT 1);
+}
+expect {
+    2|2|3|2|0
 }

@@ -57,6 +57,211 @@ fn position_in_form_returns_index() {
     );
 }
 
+/// A semicolon at the end of a line inside a quoted string that spans
+/// lines does not end the statement.
+#[test]
+fn quoted_string_over_several_lines_with_semicolons() {
+    let output = run_tursopg(
+        b"SELECT length('a\nb;\nc') + 100 AS a;\nSELECT length($$a\nb;\nc$$) + 200 AS b;\nSELECT 'done' AS c;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    for expected in ["106", "206", "done"] {
+        assert!(out.contains(expected), "expected {expected}: {out}");
+    }
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+/// A semicolon at the end of a line inside a nested block comment, or after
+/// an escaped quote of an `E''` string, does not end the statement, as in
+/// psql.
+#[test]
+fn nested_comment_and_escape_string_over_several_lines() {
+    let output = run_tursopg(
+        b"SELECT /* a /* b */ ;\n */ 101 AS n;\nSELECT length(E'a\\';\nb') + 200 AS e;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    for expected in ["101", "205"] {
+        assert!(out.contains(expected), "expected {expected}: {out}");
+    }
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+/// An escaped quote in an `E''` string, and an identifier with `$` in it,
+/// do not leave the shell inside a quoted string: each statement runs when
+/// its line ends, and so does the backslash command after it.
+#[test]
+fn escape_string_and_identifier_with_dollar_end_their_statements() {
+    let output = run_tursopg(
+        b"SELECT E'a\\'b' AS x;\nSELECT 2 AS y;\n\\echo hi\nSELECT 1 AS a$b$;\nSELECT 3 AS z;\n\\echo bye\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    let positions: Vec<usize> = ["a'b", "hi", "a$b$", "z", "bye"]
+        .iter()
+        .map(|expected| {
+            out.find(expected)
+                .unwrap_or_else(|| panic!("expected {expected}: {out}"))
+        })
+        .collect();
+    assert!(positions.is_sorted(), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+/// `\;` puts a semicolon into the statement without ending it, as in
+/// psql, so both statements go to the server together, and the next line
+/// is a statement of its own.
+#[test]
+fn backslash_semicolon_does_not_end_the_statement() {
+    let output = run_tursopg(b"SELECT 1 AS a \\; SELECT 2 AS b;\nSELECT 3 AS c;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains(" c "), "{out}");
+    assert!(out.contains('3'), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+    assert!(!out.contains("invalid command"), "{out}");
+}
+
+/// Each statement of a line runs on its own, as in psql: an error in one
+/// does not keep the one before it from running and printing its rows.
+#[test]
+fn statements_of_one_line_run_one_at_a_time() {
+    let output = run_tursopg(b"SELECT 1 AS one; selecgt 2;\nSELECT 3 AS three;\n");
+    let out = stdout(&output);
+    let one = out
+        .find(" one")
+        .unwrap_or_else(|| panic!("expected one: {out}"));
+    let three = out
+        .find(" three")
+        .unwrap_or_else(|| panic!("expected three: {out}"));
+    assert!(one < three, "{out}");
+}
+
+/// A meta-command after a statement on the same line runs after it, as in
+/// psql. The shell dropped it, so `\q` did not quit.
+#[test]
+fn meta_command_after_statement_on_same_line_runs() {
+    let output =
+        run_tursopg(b"SELECT 1 AS one; \\echo hi\nSELECT 2 AS two; \\q\nSELECT 3 AS three;\n");
+    let out = stdout(&output);
+    let one = out
+        .find(" one")
+        .unwrap_or_else(|| panic!("expected one: {out}"));
+    let hi = out
+        .find("hi\n")
+        .unwrap_or_else(|| panic!("expected hi: {out}"));
+    let two = out
+        .find(" two")
+        .unwrap_or_else(|| panic!("expected two: {out}"));
+    assert!(one < hi && hi < two, "{out}");
+    assert!(!out.contains("three"), "{out}");
+}
+
+/// A meta-command runs when psql reads it, also after a comment line or
+/// inside an unfinished statement, which it does not end. The shell sent
+/// it to the server as SQL.
+#[test]
+fn meta_command_inside_statement_runs() {
+    let output = run_tursopg(b"-- comment\n\\echo hi\nSELECT 1\n\\echo there\nAS a;\n");
+    let out = stdout(&output);
+    let hi = out
+        .find("hi\n")
+        .unwrap_or_else(|| panic!("expected hi: {out}"));
+    let there = out
+        .find("there\n")
+        .unwrap_or_else(|| panic!("expected there: {out}"));
+    let a = out
+        .find(" a")
+        .unwrap_or_else(|| panic!("expected a: {out}"));
+    assert!(hi < there && there < a, "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+/// As in psql, `--` comments before a statement are not part of it, so a
+/// script that ends with a comment sends no empty statement. The shell
+/// printed "No statements found" and exited with status 1.
+#[test]
+fn script_that_ends_with_a_comment_succeeds() {
+    let output = run_tursopg(b"SELECT 1 AS a;\n-- note\n");
+    let out = stdout(&output);
+    assert!(out.contains(" a"), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+    assert!(output.status.success(), "{out}");
+}
+
+/// As in psql, a meta-command's arguments end at a backslash: after `\\`,
+/// SQL follows, and another backslash starts the next meta-command. The
+/// shell took the rest of the line as the meta-command.
+#[test]
+fn meta_command_ends_at_a_backslash() {
+    let output = run_tursopg(b"\\echo hi \\echo there\n\\x \\\\ SELECT 1 AS a;\n");
+    let out = stdout(&output);
+    let hi = out
+        .find("hi\n")
+        .unwrap_or_else(|| panic!("expected hi: {out}"));
+    let there = out
+        .find("there\n")
+        .unwrap_or_else(|| panic!("expected there: {out}"));
+    assert!(hi < there, "{out}");
+    assert!(!out.contains("\\echo"), "{out}");
+    assert!(out.contains("Expanded display is on."), "{out}");
+    assert!(out.contains("RECORD 1"), "{out}");
+}
+
+/// A query of comments alone is empty, as the server reads it: psql
+/// prints nothing for it. The shell printed "No statements found" and
+/// exited with status 1.
+#[test]
+fn statement_of_only_comments_is_empty() {
+    let output = run_tursopg(b"/* c */;\nSELECT 1 AS a;\n/* note */\n");
+    let out = stdout(&output);
+    assert!(out.contains(" a"), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+    assert!(output.status.success(), "{out}");
+}
+
+/// psql drops the rest of the line after a meta-command that is unknown or
+/// fails, also after `\\`. The shell ran it.
+#[test]
+fn failed_meta_command_drops_the_rest_of_its_line() {
+    let output = run_tursopg(
+        b"\\bogus \\\\ SELECT 1 AS one;\n\\d nosuch \\\\ SELECT 2 AS two;\nSELECT 3 AS three;\n",
+    );
+    let out = stdout(&output);
+    assert!(!out.contains("one"), "{out}");
+    assert!(!out.contains("two"), "{out}");
+    assert!(out.contains("three"), "{out}");
+}
+
+/// A statement that goes on after a meta-command keeps its line break, as
+/// in psql, also after a meta-command that fails. The shell dropped the
+/// line break, so the last word before the meta-command joined the first
+/// word of the next line.
+#[test]
+fn statement_keeps_its_line_break_after_a_meta_command() {
+    let output =
+        run_tursopg(b"SELECT 7 AS v\\echo hi\nWHERE true;\nSELECT 8 AS w\\bogus\nWHERE true;\n");
+    let out = stdout(&output);
+    assert!(out.contains("hi\n"), "{out}");
+    assert!(out.contains(" v "), "{out}");
+    assert!(out.contains(" w "), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+/// CREATE TRIGGER is an ordinary statement in PostgreSQL. The shell read it
+/// as SQLite's CREATE TRIGGER, whose body ends with `END;`, and so took every
+/// statement after it as part of the trigger.
+#[test]
+fn statement_after_create_trigger_runs() {
+    let output = run_tursopg(
+        b"CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();\nSELECT 42 AS after_trigger;\n",
+    );
+    let out = stdout(&output);
+    assert!(out.contains("after_trigger"), "{out}");
+    assert!(out.contains("42"), "{out}");
+}
+
 #[test]
 fn create_table_then_select() {
     let output = run_tursopg(
@@ -405,6 +610,79 @@ fn dv_empty_database() {
         out.contains("No views found"),
         "expected 'No views found', got: {out}"
     );
+}
+
+#[test]
+fn dv_lists_user_views_without_catalog_views() {
+    let output = run_tursopg(
+        b"CREATE VIEW pg_user_view AS SELECT 1 AS x;\nCREATE SCHEMA reporting;\nCREATE VIEW reporting.user_view AS SELECT 2 AS x;\nSET search_path = reporting, public;\n\\dv\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("pg_user_view"), "{out}");
+    assert!(
+        out.lines()
+            .any(|line| line.split('|').any(|cell| cell.trim() == "user_view")),
+        "{out}"
+    );
+    for catalog in ["pg_indexes", "pg_roles", "pg_tables", "pg_settings"] {
+        assert!(!out.contains(catalog), "\\dv listed {catalog}: {out}");
+    }
+}
+
+#[test]
+fn dv_uses_the_search_path_and_postgres_columns() {
+    let output = run_tursopg(
+        b"CREATE SCHEMA first_schema;\nCREATE SCHEMA second_schema;\nCREATE SCHEMA hidden_schema;\nCREATE TABLE first_schema.shadowed (x int);\nCREATE VIEW second_schema.shadowed AS SELECT 1 AS x;\nCREATE VIEW second_schema.visible_view AS SELECT 2 AS x;\nCREATE VIEW hidden_schema.hidden_view AS SELECT 3 AS x;\nSET search_path = first_schema, second_schema;\n\\dv\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    for value in [
+        "Schema",
+        "Name",
+        "Type",
+        "Owner",
+        "second_schema",
+        "visible_view",
+    ] {
+        assert!(out.contains(value), "missing {value}: {out}");
+    }
+    assert!(
+        out.lines().any(|line| {
+            line.split('|')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>()
+                == ["second_schema", "visible_view", "view", "postgres"]
+        }),
+        "{out}"
+    );
+    for name in ["shadowed", "hidden_view", "pg_tables"] {
+        assert!(!out.contains(name), "\\dv listed {name}: {out}");
+    }
+}
+
+#[test]
+fn dv_qualifies_catalogs_when_a_user_relation_shadows_pg_class() {
+    let output = run_tursopg(
+        b"CREATE VIEW public.pg_class AS SELECT 1 AS x;\nSET search_path = public, pg_catalog;\n\\dv\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("pg_class"), "{out}");
+    assert!(out.contains("public"), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+#[test]
+fn dv_with_an_empty_search_path_lists_no_views() {
+    let output = run_tursopg(
+        b"CREATE VIEW public.hidden_view AS SELECT 1 AS x;\nSET search_path = '';\n\\dv\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("No views found"), "{out}");
+    assert!(!out.contains("hidden_view"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,6 +1515,7 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // PostgreSQL versions, so test expectations stay valid. Only the OIDs the
 // current wire tests assert against are declared; add more here as new
 // tests need them.
+const OID_BOOL: u32 = 16;
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
 const OID_FLOAT8: u32 = 701;
@@ -1573,19 +1852,60 @@ fn wire_bitwise_ops_report_int4() {
     });
 }
 
-/// Comparison and logical ops return INT4 — SQLite returns 0/1 as INTEGER
-/// at runtime; tursopg's wire layer reports INT4 here. A future change
-/// could map these to BOOL OID, but for now stable + assertable.
+/// Comparison and logical operators report BOOL, as PostgreSQL does. The
+/// engine computes them as the integers 1 and 0.
 #[test]
-fn wire_comparison_and_logical_report_int4() {
+fn wire_comparison_and_logical_report_bool() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_BOOL]);
         // Nested: arithmetic feeding a comparison still propagates correctly.
-        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_BOOL]);
+    });
+}
+
+/// Every kind of condition reports BOOL and prints t or f, in a plain query
+/// and in a described prepared statement.
+#[test]
+fn wire_conditions_of_every_kind_report_bool() {
+    with_pg_client(|c| {
+        for sql in [
+            "SELECT 'abc' ~ 'b'",
+            "SELECT 'abc' ~* 'B'",
+            "SELECT 'abc' !~ 'b'",
+            "SELECT 'abc' !~* 'B'",
+            "SELECT 'abc' SIMILAR TO '%b%'",
+            "SELECT ARRAY[1, 2] && ARRAY[2]",
+            "SELECT ARRAY[1, 2] @> ARRAY[2]",
+            "SELECT 1 = ANY(ARRAY[1, 2])",
+            "SELECT 'abc' LIKE 'a%'",
+            "SELECT 1 BETWEEN 0 AND 2",
+            "SELECT 1 IN (1, 2)",
+            "SELECT 1 IS NULL",
+            "SELECT EXISTS (SELECT 1)",
+            "SELECT pg_is_in_recovery()",
+            "SELECT count(*) > 0 FROM (SELECT 1) AS s",
+            "SELECT * FROM (VALUES (1 < 2), (false)) AS v(x)",
+            "SELECT x FROM (SELECT 1 < 2 AS x UNION ALL SELECT false) AS s",
+            "VALUES (1 < 2)",
+            "WITH c AS (VALUES (1 < 2)) SELECT * FROM c",
+            "SELECT CASE WHEN 1 < 2 THEN 1 < 3 ELSE false END",
+            "SELECT coalesce(NULL, 1 < 2)",
+        ] {
+            assert_eq!(c.query_column_oids(sql), vec![OID_BOOL], "{sql}");
+            let text = c.query_single_text(sql);
+            assert!(text == "t" || text == "f", "{sql} printed {text}");
+            c.send_extended(sql, true);
+            let response = c.read_until_ready();
+            assert_eq!(
+                extract_row_description_oids(&response),
+                vec![OID_BOOL],
+                "{sql}"
+            );
+        }
     });
 }
 
@@ -1609,7 +1929,7 @@ fn wire_unary_and_parens_propagate() {
         assert_eq!(c.query_column_oids("SELECT -42"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT +5"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT (1 + 2) * 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_BOOL]);
     });
 }
 

@@ -1,7 +1,7 @@
 # Turso SQL conformance test Makefile
 #
-# The .sqltest corpora live here; the sqltest runner crate lives in
-# testing/sqltest. The targets that run all tests also run
+# The .sqltest corpora live here; the sqltest runner crates live in
+# testing/sqltest and testing/sqltest-sqlite. The targets that run all tests also run
 # testing/shared-sqltests, the corpus for both the SQLite and the
 # PostgreSQL frontends. All sqltest invocations run with this directory as
 # the working directory so that relative @database paths in the corpora
@@ -10,7 +10,7 @@
 # Paths
 ROOT_DIR := $(shell cd ../.. && pwd)
 SQLITE := $(ROOT_DIR)/.sqlite3/sqlite3
-RUNNER_DIR := $(ROOT_DIR)/testing/sqltest
+RUNNER_DIR := $(ROOT_DIR)/testing/sqltest-sqlite
 
 # Use release mode in CI, debug mode locally
 ifdef CI
@@ -114,7 +114,7 @@ run-turso-tests: build
 
 # Run example tests
 run-examples: build
-	$(TEST_RUNNER) run $(RUNNER_DIR)/examples --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run $(ROOT_DIR)/testing/sqltest/examples --binary $(TURSODB) $(MVCC_FLAG)
 
 # Install SQLite binary
 install-sqlite:

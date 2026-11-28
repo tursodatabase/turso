@@ -126,12 +126,7 @@ pub fn translate(
     // invariant as unmarked schema rows. They look names up in every
     // database, like SQLite does, whatever the connection's search path
     // says.
-    let is_engine_statement = matches!(
-        origin,
-        crate::statement::StatementOrigin::InternalHelper
-            | crate::statement::StatementOrigin::EngineMetadataRead
-            | crate::statement::StatementOrigin::EngineSchemaWrite
-    );
+    let is_engine_statement = origin.is_engine();
     let search_path = if is_engine_statement {
         None
     } else {
@@ -161,8 +156,10 @@ pub fn translate(
         },
         search_path.as_deref(),
         row_security_role,
+        origin,
     );
     resolver.automatic_index = connection.automatic_index();
+    resolver.defer_foreign_keys = connection.defer_foreign_keys();
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
@@ -264,8 +261,14 @@ pub fn translate_inner(
     result
 }
 
+/// Translates one statement for [translate_inner], its only caller. The
+/// compilation of nested triggers and foreign key actions recurses through
+/// [translate_inner] one time for each level. This function is always
+/// inlined: in some builds, LLVM did not inline it, and the two frames
+/// together were more than twice as large as the one frame.
+#[inline(always)]
 fn translate_statement(
-    stmt: ast::Stmt,
+    mut stmt: ast::Stmt,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -337,7 +340,6 @@ fn translate_statement(
         None
     };
 
-    let mut stmt = stmt;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && sequence::bind_sequence_names_in_stored_expressions(&mut stmt, resolver)?;
     if resolver.catalog.dialect.binds_names_at_create() {
@@ -510,7 +512,14 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            schema::translate_create_type(
+                &type_name,
+                &body,
+                if_not_exists,
+                resolver,
+                connection,
+                program,
+            )?
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
@@ -531,6 +540,7 @@ fn translate_statement(
                 default,
                 if_not_exists,
                 resolver,
+                connection,
                 program,
             )?
         }
@@ -541,7 +551,9 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+            schema::translate_drop_type(
+                &type_name, if_exists, false, resolver, connection, program,
+            )?
         }
         ast::Stmt::DropDomain {
             if_exists,
@@ -550,7 +562,14 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+            schema::translate_drop_type(
+                &domain_name,
+                if_exists,
+                true,
+                resolver,
+                connection,
+                program,
+            )?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
@@ -647,10 +666,10 @@ fn translate_statement(
             )?;
         }
         ast::Stmt::CreateSchema { name } => {
-            schema::translate_create_schema(&name, resolver, program)?;
+            schema::translate_create_schema(&name, resolver, connection, program)?;
         }
         ast::Stmt::DropSchema { name } => {
-            schema::translate_drop_schema(&name, resolver, program)?;
+            schema::translate_drop_schema(&name, resolver, connection, program)?;
         }
         ast::Stmt::CreatePolicy(policy) => {
             row_security::translate_create_policy(&policy, resolver, program, connection)?;

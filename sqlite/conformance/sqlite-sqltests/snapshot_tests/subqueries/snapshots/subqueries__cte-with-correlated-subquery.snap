@@ -25,9 +25,10 @@ info:
 QUERY PLAN
 |--SCAN employees AS e
 `--CORRELATED SCALAR SUBQUERY 1
+   |--MATERIALIZE dept_avg
+   |  |--SCAN employees
+   |  `--USE SORTER FOR GROUP BY
    `--SEARCH da USING INDEX ephemeral_subquery_t6 (department=?)
-      |--SCAN employees
-      `--USE SORTER FOR GROUP BY
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4              p5  comment

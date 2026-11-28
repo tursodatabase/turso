@@ -616,32 +616,6 @@ fn update_pragma(
                 ));
             };
             pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
-            let largest_root_page_number_reg = program.alloc_register();
-            program.emit_insn(Insn::ReadCookie {
-                db: database_id,
-                dest: largest_root_page_number_reg,
-                cookie: Cookie::LargestRootPageNumber,
-            });
-            let set_cookie_label = program.allocate_label();
-            program.emit_insn(Insn::If {
-                reg: largest_root_page_number_reg,
-                target_pc: set_cookie_label,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::Halt {
-                constraint_info: None,
-                err_code: 0,
-                description: "Early halt because auto vacuum mode is not enabled".to_string(),
-                on_error: None,
-                description_reg: None,
-            });
-            program.preassign_label_to_next_insn(set_cookie_label);
-            program.emit_insn(Insn::SetCookie {
-                db: database_id,
-                cookie: Cookie::IncrementalVacuum,
-                value: i32::from(u8::from(auto_vacuum_mode)) - 1,
-                p5: 0,
-            });
             Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
@@ -784,6 +758,11 @@ fn update_pragma(
         PragmaName::CountChanges => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_count_changes(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::DeferForeignKeys => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_defer_foreign_keys(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::IgnoreCheckConstraints => {
@@ -1828,6 +1807,14 @@ fn query_pragma(
         PragmaName::CountChanges => {
             let register = program.alloc_register();
             let enabled = connection.get_count_changes();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::DeferForeignKeys => {
+            let enabled = connection.defer_foreign_keys();
+            let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());

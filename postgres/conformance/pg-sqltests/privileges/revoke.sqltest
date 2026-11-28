@@ -892,5 +892,5 @@ test a-role-still-reads-a-catalog-view-after-a-refused-revoke {
     SELECT count(*) > 0 FROM pg_roles;
 }
 expect {
-    1
+    t
 }

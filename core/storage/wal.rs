@@ -26,7 +26,7 @@ use super::sqlite3_ondisk::{
 };
 use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
-use crate::io::CompletionGroup;
+use crate::io::{start_in_group, CompletionGroup};
 use crate::io::{File, IO};
 use crate::storage::database::DatabaseStorage;
 use crate::storage::page_transform::{
@@ -3951,11 +3951,7 @@ impl Wal for WalFile {
         });
 
         let c = Completion::new_read(raw_buf, complete);
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        let file = self.coordination.wal_file()?;
-        file.pread(offset, c)
+        start_in_group(group, c, |c| self.coordination.wal_file()?.pread(offset, c))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -4502,8 +4498,9 @@ impl Wal for WalFile {
                     tracing::warn!("WAL truncate of orphaned frames failed: {err}");
                 }
             });
-            group.add(&c);
-            let _trunc_c = file.truncate(WAL_HEADER_SIZE as u64, c)?;
+            let _trunc_c = start_in_group(Some(&mut group), c, |c| {
+                file.truncate(WAL_HEADER_SIZE as u64, c)
+            })?;
         }
         Ok(Some(group.build()))
     }
@@ -5868,7 +5865,23 @@ impl WalFileShared {
                     ?reason,
                     "rebuilding WAL state from disk because persisted authority is not provably reusable"
                 );
-                return sqlite3_ondisk::build_shared_wal(&file, io);
+                let shared = sqlite3_ondisk::build_shared_wal(&file, io)?;
+                if snapshot.max_frame > 0
+                    && authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+                {
+                    // The snapshot claims frames that do not match the WAL file, for
+                    // example because a crash lost them. No other process has the
+                    // WAL open, so no writer can add them later. Like SQLite's
+                    // wal-index recovery, let the WAL file decide: publish the disk
+                    // scan, so that readers do not look up frames that do not exist.
+                    authority.install_snapshot(
+                        ShmWalCoordination::local_authority_snapshot_from_shared(
+                            &shared.read(),
+                            snapshot,
+                        ),
+                    );
+                }
+                return Ok(shared);
             }
         }
         if authority.frame_index_overflowed() {

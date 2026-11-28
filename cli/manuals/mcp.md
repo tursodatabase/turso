@@ -42,7 +42,9 @@ The examples below show the `arguments` object for each tool.
 Open or create a database file. Creates parent directories if needed.
 
 **Parameters:**
-- `path` (string, required): Path to the database file (absolute or relative). Use `:memory:` for an in-memory database.
+- `path` (string, required): Path to the database file (absolute or relative), or a `file:` URI. Use `:memory:` for an in-memory database.
+
+The tool reads `path` as the `.open` command of the shell does: a `file:` URI, or a path that ends with `?key=value` parameters, is a URI. The tool does not create parent directories for a URI. It opens the database with the options that `tursodb` was started with; for example, the `cipher` and `hexkey` URI parameters work only with `--experimental-encryption`. Messages show the path without the URI parameters, because they can hold the key.
 
 **Example:**
 ```json
