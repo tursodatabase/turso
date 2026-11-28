@@ -2955,6 +2955,24 @@ test to-json-takes-one-argument {
 expect error {
 }
 
+test row-to-json-of-a-row-takes-at-most-two-arguments {
+    CREATE TABLE row_to_json_arguments (id int);
+    INSERT INTO row_to_json_arguments VALUES (1);
+    SELECT row_to_json(row_to_json_arguments, true, true) FROM row_to_json_arguments;
+}
+@sqlstate 42883
+expect error {
+}
+
+test to-jsonb-of-a-row-takes-one-argument {
+    CREATE TABLE to_jsonb_arguments (id int);
+    INSERT INTO to_jsonb_arguments VALUES (1);
+    SELECT to_jsonb(to_jsonb_arguments, true) FROM to_jsonb_arguments;
+}
+@sqlstate 42883
+expect error {
+}
+
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test to-json-scalar {
     SELECT to_json(s), to_jsonb(n) FROM t WHERE id = 1;

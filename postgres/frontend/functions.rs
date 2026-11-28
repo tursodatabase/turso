@@ -1862,11 +1862,19 @@ pub(crate) fn expand_record_call(
     args: &[Box<ast::Expr>],
     rows: Vec<Option<RowArgument>>,
 ) -> Result<ast::Expr> {
+    // The most arguments that the function takes, and whether its result is
+    // jsonb.
+    let (most_args, gives_jsonb) = match name.to_ascii_lowercase().as_str() {
+        "to_json" => (1, false),
+        "to_jsonb" => (1, true),
+        "row_to_json" => (2, false),
+        _ => unreachable!("{name}() is not a function of a record"),
+    };
     let mut rows = rows.into_iter();
     let (Some(Some(row)), pretty) = (rows.next(), args.get(1)) else {
         return Err(undefined_function(name, &vec!["record"; args.len()]));
     };
-    if rows.any(|row| row.is_some()) || (name != "row_to_json" && args.len() > 1) {
+    if rows.any(|row| row.is_some()) || args.len() > most_args {
         return Err(undefined_function(name, &vec!["record"; args.len()]));
     }
     let number = |n: &str| ast::Expr::Literal(ast::Literal::Numeric(n.into()));
@@ -1901,9 +1909,10 @@ pub(crate) fn expand_record_call(
         record_args.push(*value);
     }
     let record = function_call(PG_RECORD_TO_JSON_FUNCTION, record_args);
-    Ok(match name {
-        "to_jsonb" => function_call("to_jsonb", vec![record]),
-        _ => record,
+    Ok(if gives_jsonb {
+        function_call("to_jsonb", vec![record])
+    } else {
+        record
     })
 }
 
